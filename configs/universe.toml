@@ -1,0 +1,2 @@
+assets = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+market_types = ["updown", "above_below", "range"]

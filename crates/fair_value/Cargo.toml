@@ -1,0 +1,8 @@
+[package]
+name = "fair_value"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+core_types = { path = "../core_types" }

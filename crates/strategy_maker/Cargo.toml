@@ -1,0 +1,9 @@
+[package]
+name = "strategy_maker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+core_types = { path = "../core_types" }
+serde.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "infra_clock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
