@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,9 +39,10 @@ def gate_pass(live: Dict[str, Any]) -> bool:
 
 
 def run_param_regression(args: argparse.Namespace) -> None:
+    script_path = Path(__file__).resolve().parent / "param_regression.py"
     cmd = [
-        "python",
-        "scripts/param_regression.py",
+        sys.executable,
+        str(script_path),
         "--base-url",
         args.base_url,
         "--window-sec",
