@@ -40,6 +40,7 @@ use tokio::sync::{mpsc, RwLock};
 
 mod stats_utils;
 mod control_api;
+mod gate_eval;
 mod orchestration;
 use stats_utils::{
     estimate_uptime_pct, freshness_ms, now_ns, percentile, push_capped, robust_filter_iqr,
@@ -1216,7 +1217,8 @@ impl ShadowStats {
             latency,
             market_scorecard: scorecard,
         };
-        live.gate_fail_reasons = compute_gate_fail_reasons(&live, Self::GATE_MIN_OUTCOMES);
+        live.gate_fail_reasons =
+            gate_eval::compute_gate_fail_reasons(&live, Self::GATE_MIN_OUTCOMES);
         live.gate_ready = live.window_outcomes >= Self::GATE_MIN_OUTCOMES;
         live
     }
@@ -1331,113 +1333,6 @@ fn build_engine_pnl_row(engine: &str, values: &[f64]) -> EnginePnlRow {
         p10_usdc,
         positive_ratio,
     }
-}
-
-fn compute_gate_fail_reasons(live: &ShadowLiveReport, min_outcomes: usize) -> Vec<String> {
-    let mut failed = Vec::new();
-    if live.window_outcomes < min_outcomes {
-        failed.push(format!(
-            "gate_not_ready outcomes {} < {}",
-            live.window_outcomes, min_outcomes
-        ));
-    }
-    if live.fillability_10ms < 0.60 {
-        failed.push(format!(
-            "fillability@10ms {:.3} < 0.600",
-            live.fillability_10ms
-        ));
-    }
-    if live.net_edge_p50_bps <= 0.0 {
-        failed.push(format!("net_edge_p50 {:.3} <= 0", live.net_edge_p50_bps));
-    }
-    if live.net_edge_p10_bps < -1.0 {
-        failed.push(format!("net_edge_p10 {:.3} < -1", live.net_edge_p10_bps));
-    }
-    if live.net_markout_10s_usdc_p50 <= 0.0 {
-        failed.push(format!(
-            "net_markout_10s_usdc_p50 {:.6} <= 0",
-            live.net_markout_10s_usdc_p50
-        ));
-    }
-    if live.roi_notional_10s_bps_p50 <= 0.0 {
-        failed.push(format!(
-            "roi_notional_10s_bps_p50 {:.6} <= 0",
-            live.roi_notional_10s_bps_p50
-        ));
-    }
-    if live.executed_over_eligible < 0.60 {
-        failed.push(format!(
-            "executed_over_eligible {:.4} < 0.60",
-            live.executed_over_eligible
-        ));
-    }
-    if live.ev_net_usdc_p50 <= 0.0 {
-        failed.push(format!("ev_net_usdc_p50 {:.6} <= 0", live.ev_net_usdc_p50));
-    }
-    if live.ev_positive_ratio < 0.55 {
-        failed.push(format!(
-            "ev_positive_ratio {:.4} < 0.55",
-            live.ev_positive_ratio
-        ));
-    }
-    if live.quote_block_ratio >= 0.10 {
-        failed.push(format!(
-            "quote_block_ratio {:.4} >= 0.10",
-            live.quote_block_ratio
-        ));
-    }
-    if live.policy_block_ratio >= 0.10 {
-        failed.push(format!(
-            "policy_block_ratio {:.4} >= 0.10",
-            live.policy_block_ratio
-        ));
-    }
-    if live.strategy_uptime_pct < 99.0 {
-        failed.push(format!("uptime {:.2}% < 99%", live.strategy_uptime_pct));
-    }
-    if live.data_valid_ratio < 0.999 {
-        failed.push(format!("data_valid_ratio {:.5} < 0.999", live.data_valid_ratio));
-    }
-    if live.seq_gap_rate > 0.001 {
-        failed.push(format!("seq_gap_rate {:.5} > 0.001", live.seq_gap_rate));
-    }
-    if live.ts_inversion_rate > 0.0005 {
-        failed.push(format!(
-            "ts_inversion_rate {:.5} > 0.0005",
-            live.ts_inversion_rate
-        ));
-    }
-    if live.latency.feed_in_p99_ms >= 800.0 {
-        failed.push(format!(
-            "feed_in_p99 {:.3}ms >= 800ms",
-            live.latency.feed_in_p99_ms
-        ));
-    }
-    if live.decision_compute_p99_ms >= 2.0 {
-        failed.push(format!(
-            "decision_compute_p99 {:.3}ms >= 2ms",
-            live.decision_compute_p99_ms
-        ));
-    }
-    if live.tick_to_ack_p99_ms >= 450.0 {
-        failed.push(format!(
-            "tick_to_ack_p99 {:.3}ms >= 450ms",
-            live.tick_to_ack_p99_ms
-        ));
-    }
-    if live.ref_ticks_total == 0 {
-        failed.push("ref_ticks_total == 0".to_string());
-    }
-    if live.book_ticks_total == 0 {
-        failed.push("book_ticks_total == 0".to_string());
-    }
-    if live.ref_freshness_ms > 1_000 {
-        failed.push(format!("ref_freshness_ms {} > 1000", live.ref_freshness_ms));
-    }
-    if live.book_freshness_ms > 1_500 {
-        failed.push(format!("book_freshness_ms {} > 1500", live.book_freshness_ms));
-    }
-    failed
 }
 
 fn main() -> Result<()> {
