@@ -1612,9 +1612,39 @@ fn spawn_strategy_engine(
                     shared.shadow_stats.push_parse_us(parse_us).await;
                     latest_ticks.insert(tick.symbol.clone(), tick);
                 }
-                EngineEvent::BookTop(book) => {
+                EngineEvent::BookTop(mut book) => {
                     let parse_us = dispatch_start.elapsed().as_secs_f64() * 1_000_000.0;
                     shared.shadow_stats.push_parse_us(parse_us).await;
+                    // Coalesce bursty queue traffic to the freshest observable state.
+                    // This trims local backlog and avoids spending cycles on superseded snapshots.
+                    let mut coalesced = 0_u64;
+                    while coalesced < 256 {
+                        match rx.try_recv() {
+                            Ok(EngineEvent::BookTop(next_book)) => {
+                                book = next_book;
+                                coalesced += 1;
+                            }
+                            Ok(EngineEvent::RefTick(next_tick)) => {
+                                latest_ticks.insert(next_tick.symbol.clone(), next_tick);
+                                coalesced += 1;
+                            }
+                            Ok(_) => {
+                                // This subscriber doesn't consume other event kinds.
+                                // Drain them here to keep queue pressure bounded.
+                                coalesced += 1;
+                            }
+                            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                                shared.shadow_stats.record_issue("bus_lagged").await;
+                                break;
+                            }
+                            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                        }
+                    }
+                    if coalesced > 0 {
+                        metrics::counter!("runtime.coalesced_events").increment(coalesced);
+                    }
+
                     let backlog_depth = rx.len() as f64;
                     shared.shadow_stats.push_event_backlog(backlog_depth).await;
                     metrics::histogram!("runtime.event_backlog_depth").record(backlog_depth);
