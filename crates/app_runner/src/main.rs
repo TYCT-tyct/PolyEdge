@@ -1641,12 +1641,16 @@ fn spawn_strategy_engine(
 
                     let symbol = pick_market_symbol(&shared, &book).await;
                     let Some(symbol) = symbol else {
-                        {
-                            let mut states = shared.tox_state.write().await;
-                            let st = states.entry(book.market_id.clone()).or_default();
-                            st.symbol_missing = st.symbol_missing.saturating_add(1);
+                        if market_is_tracked(&shared, &book).await {
+                            {
+                                let mut states = shared.tox_state.write().await;
+                                let st = states.entry(book.market_id.clone()).or_default();
+                                st.symbol_missing = st.symbol_missing.saturating_add(1);
+                            }
+                            shared.shadow_stats.record_issue("symbol_missing").await;
+                        } else {
+                            shared.shadow_stats.record_issue("market_untracked").await;
                         }
-                        shared.shadow_stats.record_issue("symbol_missing").await;
                         if last_symbol_retry_refresh.elapsed() >= Duration::from_secs(15) {
                             refresh_market_symbol_map(&shared).await;
                             last_symbol_retry_refresh = Instant::now();
@@ -2371,6 +2375,19 @@ async fn pick_market_symbol(shared: &EngineShared, book: &BookTop) -> Option<Str
         .get(&book.token_id_yes)
         .cloned()
         .or_else(|| token_map.get(&book.token_id_no).cloned())
+}
+
+async fn market_is_tracked(shared: &EngineShared, book: &BookTop) -> bool {
+    if shared
+        .market_to_symbol
+        .read()
+        .await
+        .contains_key(&book.market_id)
+    {
+        return true;
+    }
+    let token_map = shared.token_to_symbol.read().await;
+    token_map.contains_key(&book.token_id_yes) || token_map.contains_key(&book.token_id_no)
 }
 
 fn inventory_for_market(portfolio: &PortfolioBook, market_id: &str) -> InventoryState {
