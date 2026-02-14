@@ -729,7 +729,7 @@ impl ShadowStats {
             pnl_10s_p50_bps_raw: pnl_10s_p50_raw,
             pnl_10s_p50_bps_robust: pnl_10s_p50_robust,
             pnl_10s_sample_count,
-            pnl_10s_outlier_ratio: pnl_10s_outlier_ratio,
+            pnl_10s_outlier_ratio,
             quote_block_ratio: block_ratio,
             policy_block_ratio,
             queue_depth_p99: percentile(&queue_depth, 0.99).unwrap_or(0.0),

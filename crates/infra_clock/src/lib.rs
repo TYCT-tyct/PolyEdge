@@ -88,6 +88,10 @@ impl NtpOffsetMonitor {
     pub fn len(&self) -> usize {
         self.history.read().len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.history.read().is_empty()
+    }
 }
 
 pub fn sleep_until(deadline: Instant) {

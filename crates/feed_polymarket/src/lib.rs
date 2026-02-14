@@ -504,14 +504,14 @@ fn now_ns() -> i64 {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum WsEnvelope {
-    One(WsEvent),
+    One(Box<WsEvent>),
     Many(Vec<WsEvent>),
 }
 
 impl WsEnvelope {
     fn into_events(self) -> Vec<WsEvent> {
         match self {
-            Self::One(v) => vec![v],
+            Self::One(v) => vec![*v],
             Self::Many(v) => v,
         }
     }
