@@ -151,6 +151,7 @@ mod tests {
             bid_no: 1.0 - ask,
             ask_no: 1.0 - bid,
             ts_ms: 1,
+            recv_ts_local_ns: 1_000_000,
         }
     }
 

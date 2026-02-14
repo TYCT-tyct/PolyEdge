@@ -31,6 +31,8 @@ pub struct BookTop {
     pub bid_no: f64,
     pub ask_no: f64,
     pub ts_ms: i64,
+    #[serde(default)]
+    pub recv_ts_local_ns: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -1561,7 +1561,7 @@ fn spawn_strategy_engine(
                 EngineEvent::RefTick(tick) => {
                     let parse_us = dispatch_start.elapsed().as_secs_f64() * 1_000_000.0;
                     shared.shadow_stats.push_parse_us(parse_us).await;
-                    latest_ticks.insert(tick.symbol.clone(), tick);
+                    insert_latest_tick(&mut latest_ticks, tick);
                 }
                 EngineEvent::BookTop(mut book) => {
                     let parse_us = dispatch_start.elapsed().as_secs_f64() * 1_000_000.0;
@@ -1569,14 +1569,16 @@ fn spawn_strategy_engine(
                     // Coalesce bursty queue traffic to the freshest observable state.
                     // This trims local backlog and avoids spending cycles on superseded snapshots.
                     let mut coalesced = 0_u64;
-                    while coalesced < 256 {
+                    let dynamic_cap = rx.len().saturating_add(64).min(4_096);
+                    let max_coalesced = dynamic_cap.max(256);
+                    while coalesced < max_coalesced as u64 {
                         match rx.try_recv() {
                             Ok(EngineEvent::BookTop(next_book)) => {
                                 book = next_book;
                                 coalesced += 1;
                             }
                             Ok(EngineEvent::RefTick(next_tick)) => {
-                                latest_ticks.insert(next_tick.symbol.clone(), next_tick);
+                                insert_latest_tick(&mut latest_ticks, next_tick);
                                 coalesced += 1;
                             }
                             Ok(_) => {
@@ -2719,28 +2721,73 @@ impl TokenBucket {
 fn estimate_feed_latency(tick: &RefTick, book: &BookTop) -> FeedLatencySample {
     let now = now_ns();
     let now_ms = now / 1_000_000;
-    let source_anchor_ms = tick
-        .event_ts_exchange_ms
-        .max(tick.event_ts_ms)
-        .max(book.ts_ms);
-    let source_latency_ms = (now_ms - source_anchor_ms).max(0) as f64;
-    let local_backlog_ms = if tick.recv_ts_local_ns > 0 {
-        ((now - tick.recv_ts_local_ns).max(0) as f64) / 1_000_000.0
+    let tick_source_ms = tick.event_ts_exchange_ms.max(tick.event_ts_ms);
+    let tick_ingest_ms = (tick.recv_ts_ms - tick_source_ms).max(0) as f64;
+    let book_recv_ms = if book.recv_ts_local_ns > 0 {
+        (book.recv_ts_local_ns / 1_000_000).max(0)
+    } else {
+        now_ms
+    };
+    let book_ingest_ms = (book_recv_ms - book.ts_ms).max(0) as f64;
+    let source_latency_ms = tick_ingest_ms.max(book_ingest_ms);
+
+    let latest_recv_ns = if book.recv_ts_local_ns > 0 {
+        tick.recv_ts_local_ns.max(book.recv_ts_local_ns)
+    } else {
+        tick.recv_ts_local_ns
+    };
+    let local_backlog_ms = if latest_recv_ns > 0 {
+        ((now - latest_recv_ns).max(0) as f64) / 1_000_000.0
     } else {
         (now_ms - tick.recv_ts_ms.max(book.ts_ms)).max(0) as f64
     };
-    if tick.recv_ts_local_ns > 0 {
-        return FeedLatencySample {
-            feed_in_ms: local_backlog_ms,
-            source_latency_ms,
-            local_backlog_ms,
-        };
-    }
-    let feed_in_ms = (now_ms - tick.recv_ts_ms.max(book.ts_ms)).max(0) as f64;
+
+    let feed_in_ms = source_latency_ms + local_backlog_ms;
     FeedLatencySample {
         feed_in_ms,
         source_latency_ms,
         local_backlog_ms,
+    }
+}
+
+fn ref_source_rank(source: &str) -> u8 {
+    match source {
+        "binance_ws" => 3,
+        "coinbase_ws" => 2,
+        "bybit_ws" => 1,
+        _ => 0,
+    }
+}
+
+fn ref_event_ts_ms(tick: &RefTick) -> i64 {
+    tick.event_ts_exchange_ms.max(tick.event_ts_ms)
+}
+
+fn should_replace_ref_tick(current: &RefTick, next: &RefTick) -> bool {
+    let current_event = ref_event_ts_ms(current);
+    let next_event = ref_event_ts_ms(next);
+    if next_event + 50 < current_event {
+        return false;
+    }
+    if next_event > current_event + 1 {
+        return true;
+    }
+    if next.recv_ts_local_ns > current.recv_ts_local_ns + 1_000_000 {
+        return true;
+    }
+    ref_source_rank(next.source.as_str()) >= ref_source_rank(current.source.as_str())
+}
+
+fn insert_latest_tick(latest_ticks: &mut HashMap<String, RefTick>, tick: RefTick) {
+    match latest_ticks.get(tick.symbol.as_str()) {
+        Some(current) => {
+            if should_replace_ref_tick(current, &tick) {
+                latest_ticks.insert(tick.symbol.clone(), tick);
+            }
+        }
+        None => {
+            latest_ticks.insert(tick.symbol.clone(), tick);
+        }
     }
 }
 
@@ -4266,6 +4313,7 @@ mod tests {
             bid_no: 0.49,
             ask_no: 0.51,
             ts_ms: 1,
+            recv_ts_local_ns: 1_000_000,
         };
         let maker = QuoteIntent {
             market_id: "m".to_string(),
@@ -4286,5 +4334,39 @@ mod tests {
     fn normalize_reject_code_sanitizes_non_alnum() {
         let normalized = normalize_reject_code("HTTP 429/Too Many Requests");
         assert_eq!(normalized, "http_429_too_many_requests");
+    }
+
+    #[test]
+    fn estimate_feed_latency_separates_source_and_backlog() {
+        let now = now_ns();
+        let now_ms = now / 1_000_000;
+        let tick = RefTick {
+            source: "binance_ws".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            event_ts_ms: now_ms - 300,
+            recv_ts_ms: now_ms - 200,
+            event_ts_exchange_ms: now_ms - 300,
+            recv_ts_local_ns: now - 200_000_000,
+            price: 70_000.0,
+        };
+        let book = BookTop {
+            market_id: "m".to_string(),
+            token_id_yes: "yes".to_string(),
+            token_id_no: "no".to_string(),
+            bid_yes: 0.49,
+            ask_yes: 0.51,
+            bid_no: 0.49,
+            ask_no: 0.51,
+            ts_ms: now_ms - 40,
+            recv_ts_local_ns: now - 20_000_000,
+        };
+
+        let sample = estimate_feed_latency(&tick, &book);
+        assert!(sample.source_latency_ms >= 95.0);
+        assert!(sample.source_latency_ms <= 110.0);
+        assert!(sample.local_backlog_ms >= 10.0);
+        assert!(sample.local_backlog_ms <= 40.0);
+        assert!(sample.feed_in_ms >= sample.source_latency_ms);
+        assert!((sample.feed_in_ms - (sample.source_latency_ms + sample.local_backlog_ms)).abs() < 3.0);
     }
 }

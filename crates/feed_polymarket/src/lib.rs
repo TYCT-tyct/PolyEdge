@@ -649,6 +649,7 @@ impl MarketState {
             bid_no: self.no.bid,
             ask_no: self.no.ask,
             ts_ms: self.yes.ts_exchange_ms.max(self.no.ts_exchange_ms),
+            recv_ts_local_ns: self.yes.recv_ts_local_ns.max(self.no.recv_ts_local_ns),
         }
     }
 }

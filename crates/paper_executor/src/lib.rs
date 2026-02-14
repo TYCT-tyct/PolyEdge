@@ -111,6 +111,7 @@ mod tests {
             bid_no: 0.46,
             ask_no: 0.5,
             ts_ms: 2,
+            recv_ts_local_ns: 2_000_000,
         });
         assert_eq!(fills.len(), 1);
     }

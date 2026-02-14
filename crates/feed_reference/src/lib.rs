@@ -95,7 +95,11 @@ async fn run_binance_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> R
         .map(|s| format!("{}@trade", s.to_lowercase()))
         .collect::<Vec<_>>()
         .join("/");
-    let endpoint = format!("wss://stream.binance.com:9443/stream?streams={streams}");
+    let ws_base = std::env::var("POLYEDGE_BINANCE_WS_BASE")
+        .ok()
+        .filter(|v| v.starts_with("ws://") || v.starts_with("wss://"))
+        .unwrap_or_else(|| "wss://stream.binance.com:9443".to_string());
+    let endpoint = format!("{}/stream?streams={streams}", ws_base.trim_end_matches('/'));
 
     let (mut ws, _) = connect_async(&endpoint)
         .await
