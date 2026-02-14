@@ -85,10 +85,14 @@ pwsh -File .\scripts\remote_deploy_validate.ps1 -RemoteHost 13.43.23.190 -KeyPat
 - `policy_block_ratio`
 - `window_id/window_shots/window_outcomes`
 - `gate_ready/gate_fail_reasons`
+- `data_valid_ratio/seq_gap_rate/ts_inversion_rate/stale_tick_drop_ratio`
 - `tick_to_decision_p50_ms/p90_ms/p99_ms`
 - `ack_only_p50_ms/p90_ms/p99_ms`
 - `tick_to_ack_p99_ms`
+- `decision_queue_wait_p99_ms/decision_compute_p99_ms`
+- `source_latency_p99_ms/local_backlog_p99_ms`
 - `pnl_10s_p50_bps_raw/pnl_10s_p50_bps_robust`
+- `net_markout_10s_usdc_p50/roi_notional_10s_bps_p50`
 - `pnl_10s_sample_count/pnl_10s_outlier_ratio`
 - `queue_depth_p99/event_backlog_p99`
 
