@@ -93,6 +93,12 @@ python scripts/long_regression_orchestrator.py --profile quick --base-url http:/
 python scripts/long_regression_orchestrator.py --profile quick --max-estimated-sec 1800 --max-runtime-sec 1800
 ```
 
+Storm / fault-tolerance test (bounded runtime, no infinite loop):
+
+```bash
+python scripts/storm_test.py --base-url http://127.0.0.1:8080 --duration-sec 300 --burst-rps 20 --concurrency 8 --max-runtime-sec 600 --fail-fast-threshold 20
+```
+
 Cross-region A/B comparison:
 
 ```bash
@@ -123,6 +129,11 @@ pwsh -File .\scripts\remote_deploy_validate.ps1 -RemoteHost 13.43.23.190 -KeyPat
 - `queue_depth_p99/event_backlog_p99`
 
 Metric formulas, units, and gate thresholds are defined in `docs/metrics_contract.md`.
+CI validates contract drift with:
+
+```bash
+python scripts/validate_metrics_contract.py
+```
 
 ## Runtime Perf Profile
 

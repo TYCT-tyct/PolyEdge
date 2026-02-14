@@ -39,6 +39,8 @@ use strategy_maker::{MakerConfig, MakerQuotePolicy};
 use tokio::sync::{mpsc, RwLock};
 
 mod stats_utils;
+mod control_api;
+mod orchestration;
 use stats_utils::{
     estimate_uptime_pct, freshness_ms, now_ns, percentile, push_capped, robust_filter_iqr,
     value_to_f64,
@@ -68,6 +70,14 @@ struct FeeRateEntry {
     fetched_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct ScoringState {
+    scoring_true: u64,
+    scoring_total: u64,
+    rebate_bps_est: f64,
+    fetched_at: Instant,
+}
+
 #[derive(Clone)]
 struct EngineShared {
     latest_books: Arc<RwLock<HashMap<String, BookTop>>>,
@@ -75,13 +85,17 @@ struct EngineShared {
     token_to_symbol: Arc<RwLock<HashMap<String, String>>>,
     fee_cache: Arc<RwLock<HashMap<String, FeeRateEntry>>>,
     fee_refresh_inflight: Arc<RwLock<HashMap<String, Instant>>>,
+    scoring_cache: Arc<RwLock<HashMap<String, ScoringState>>>,
+    scoring_refresh_inflight: Arc<RwLock<HashMap<String, Instant>>>,
     http: Client,
+    clob_endpoint: String,
     strategy_cfg: Arc<RwLock<MakerConfig>>,
     fair_value_cfg: Arc<StdRwLock<BasisMrConfig>>,
     toxicity_cfg: Arc<RwLock<ToxicityConfig>>,
     risk_limits: Arc<RwLock<RiskLimits>>,
     universe_symbols: Arc<Vec<String>>,
     rate_limit_rps: f64,
+    scoring_rebate_factor: f64,
     tox_state: Arc<RwLock<HashMap<String, MarketToxicState>>>,
     shadow_stats: Arc<ShadowStats>,
 }
@@ -1492,19 +1506,29 @@ async fn async_main() -> Result<()> {
         perf_profile: perf_profile.clone(),
     };
 
+    let scoring_rebate_factor = std::env::var("POLYEDGE_SCORING_REBATE_FACTOR")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.25)
+        .clamp(0.0, 1.0);
+
     let shared = Arc::new(EngineShared {
         latest_books: Arc::new(RwLock::new(HashMap::new())),
         market_to_symbol: Arc::new(RwLock::new(HashMap::new())),
         token_to_symbol: Arc::new(RwLock::new(HashMap::new())),
         fee_cache: Arc::new(RwLock::new(HashMap::new())),
         fee_refresh_inflight: Arc::new(RwLock::new(HashMap::new())),
+        scoring_cache: Arc::new(RwLock::new(HashMap::new())),
+        scoring_refresh_inflight: Arc::new(RwLock::new(HashMap::new())),
         http: Client::new(),
+        clob_endpoint: execution_cfg.clob_endpoint.clone(),
         strategy_cfg,
         fair_value_cfg,
         toxicity_cfg,
         risk_limits,
         universe_symbols: universe_symbols.clone(),
         rate_limit_rps: execution_cfg.rate_limit_rps.max(0.1),
+        scoring_rebate_factor,
         tox_state,
         shadow_stats,
     });
@@ -1523,35 +1547,15 @@ async fn async_main() -> Result<()> {
         paused.clone(),
         shared.clone(),
     );
-    spawn_periodic_report_persistor(
+    orchestration::spawn_periodic_report_persistor(
         shared.shadow_stats.clone(),
         shared.tox_state.clone(),
         execution.clone(),
         shared.toxicity_cfg.clone(),
     );
-    spawn_data_reconcile_task(bus.clone(), paused.clone(), shared.shadow_stats.clone());
+    orchestration::spawn_data_reconcile_task(bus.clone(), paused.clone(), shared.shadow_stats.clone());
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/metrics", get(metrics))
-        .route("/state/positions", get(positions))
-        .route("/state/pnl", get(pnl))
-        .route("/report/shadow/live", get(report_shadow_live))
-        .route("/report/shadow/final", get(report_shadow_final))
-        .route("/report/pnl/by_engine", get(report_pnl_by_engine))
-        .route("/report/toxicity/live", get(report_toxicity_live))
-        .route("/report/toxicity/final", get(report_toxicity_final))
-        .route("/control/pause", post(pause))
-        .route("/control/resume", post(resume))
-        .route("/control/flatten", post(flatten))
-        .route("/control/reset_shadow", post(reset_shadow))
-        .route("/control/reload_strategy", post(reload_strategy))
-        .route("/control/reload_taker", post(reload_taker))
-        .route("/control/reload_allocator", post(reload_allocator))
-        .route("/control/reload_toxicity", post(reload_toxicity))
-        .route("/control/reload_risk", post(reload_risk))
-        .route("/control/reload_perf_profile", post(reload_perf_profile))
-        .with_state(state);
+    let app = control_api::build_router(state);
 
     let addr: SocketAddr = "0.0.0.0:8080".parse()?;
     tracing::info!(%addr, "control api started");
@@ -1686,98 +1690,6 @@ fn spawn_market_feed(bus: RingBus<EngineEvent>, stats: Arc<ShadowStats>) {
                     tracing::warn!(?err, "market feed event error");
                 }
             }
-        }
-    });
-}
-
-fn spawn_periodic_report_persistor(
-    stats: Arc<ShadowStats>,
-    tox_state: Arc<RwLock<HashMap<String, MarketToxicState>>>,
-    execution: Arc<ClobExecution>,
-    toxicity_cfg: Arc<RwLock<ToxicityConfig>>,
-) {
-    tokio::spawn(async move {
-        let mut last_final = Instant::now() - Duration::from_secs(600);
-        loop {
-            let live = stats.build_live_report().await;
-            persist_live_report_files(&live);
-            let engine_pnl = stats.build_engine_pnl_report().await;
-            persist_engine_pnl_report(&engine_pnl);
-            let tox_live = build_toxicity_live_report(
-                tox_state.clone(),
-                stats.clone(),
-                execution.clone(),
-                toxicity_cfg.clone(),
-            )
-            .await;
-            persist_toxicity_report_files(&tox_live);
-
-            if last_final.elapsed() >= Duration::from_secs(300) {
-                let final_report = stats.build_final_report().await;
-                persist_final_report_files(&final_report);
-                last_final = Instant::now();
-            }
-
-            tokio::time::sleep(Duration::from_secs(30)).await;
-        }
-    });
-}
-
-fn spawn_data_reconcile_task(
-    bus: RingBus<EngineEvent>,
-    paused: Arc<RwLock<bool>>,
-    stats: Arc<ShadowStats>,
-) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(600));
-        loop {
-            interval.tick().await;
-            let live = stats.build_live_report().await;
-            let ref_lines = count_jsonl_lines(&dataset_path("raw", "ref_ticks.jsonl"));
-            let book_lines = count_jsonl_lines(&dataset_path("raw", "book_tops.jsonl"));
-            let ref_expected = live.ref_ticks_total as i64;
-            let book_expected = live.book_ticks_total as i64;
-            let ref_gap_ratio = if ref_expected <= 0 {
-                0.0
-            } else {
-                ((ref_lines - ref_expected).abs() as f64) / (ref_expected as f64)
-            };
-            let book_gap_ratio = if book_expected <= 0 {
-                0.0
-            } else {
-                ((book_lines - book_expected).abs() as f64) / (book_expected as f64)
-            };
-            let reconcile_fail = ref_gap_ratio > 0.05
-                || book_gap_ratio > 0.05
-                || live.data_valid_ratio < 0.999
-                || live.seq_gap_rate > 0.001
-                || live.ts_inversion_rate > 0.0005;
-
-            if reconcile_fail {
-                stats.set_observe_only(true);
-                *paused.write().await = true;
-                let _ = bus.publish(EngineEvent::Control(ControlCommand::Pause));
-            }
-
-            append_jsonl(
-                &dataset_path("reports", "data_reconcile.jsonl"),
-                &serde_json::json!({
-                    "ts_ms": Utc::now().timestamp_millis(),
-                    "window_id": live.window_id,
-                    "data_valid_ratio": live.data_valid_ratio,
-                    "seq_gap_rate": live.seq_gap_rate,
-                    "ts_inversion_rate": live.ts_inversion_rate,
-                    "stale_tick_drop_ratio": live.stale_tick_drop_ratio,
-                    "ref_lines": ref_lines,
-                    "book_lines": book_lines,
-                    "ref_expected": ref_expected,
-                    "book_expected": book_expected,
-                    "ref_gap_ratio": ref_gap_ratio,
-                    "book_gap_ratio": book_gap_ratio,
-                    "reconcile_fail": reconcile_fail,
-                    "observe_only": stats.observe_only()
-                }),
-            );
         }
     });
 }
@@ -2264,7 +2176,8 @@ fn spawn_strategy_engine(
                         intent.size = intent.size.min(decision.capped_size);
 
                         let edge_gross = edge_for_side(&signal, &intent.side);
-                        let rebate_est_bps = estimate_rebate_bps(&book.market_id, fee_bps);
+                        let rebate_est_bps =
+                            get_rebate_bps_cached(&shared, &book.market_id, fee_bps).await;
                         let edge_net = edge_gross - fee_bps + rebate_est_bps;
                         if edge_net < effective_min_edge_bps {
                             shared
@@ -2328,6 +2241,17 @@ fn spawn_strategy_engine(
                                 }
                                 intent.size = accepted_size;
                                 shared.shadow_stats.mark_executed();
+                                if execution.is_live() && execution_style == ExecutionStyle::Maker {
+                                    maybe_spawn_scoring_refresh(
+                                        &shared,
+                                        &book.market_id,
+                                        &ack_v2.order_id,
+                                        fee_bps,
+                                        Instant::now(),
+                                        Duration::from_secs(2),
+                                    )
+                                    .await;
+                                }
                                 let ack_only_ms = if ack_v2.exchange_latency_ms > 0.0 {
                                     ack_v2.exchange_latency_ms
                                 } else {
@@ -2875,11 +2799,6 @@ fn cooldown_secs_for_score(tox_score: f64, cfg: &ToxicityConfig) -> u64 {
         .round() as u64
 }
 
-fn estimate_rebate_bps(_market_id: &str, _fee_bps: f64) -> f64 {
-    // Keep conservative by default; avoid optimistic rebate assumptions.
-    0.0
-}
-
 fn net_markout(markout_bps: Option<f64>, shot: &ShadowShot) -> Option<f64> {
     markout_bps.map(|v| v - shot.fee_paid_bps + shot.rebate_est_bps)
 }
@@ -3029,6 +2948,18 @@ async fn get_fee_rate_bps_cached(shared: &EngineShared, market_id: &str) -> f64 
     cached_fee
 }
 
+async fn get_rebate_bps_cached(shared: &EngineShared, market_id: &str, fee_bps: f64) -> f64 {
+    const TTL: Duration = Duration::from_secs(120);
+    let now = Instant::now();
+    let maybe = shared.scoring_cache.read().await.get(market_id).cloned();
+    match maybe {
+        Some(entry) if now.duration_since(entry.fetched_at) <= TTL => {
+            entry.rebate_bps_est.clamp(0.0, fee_bps.max(0.0))
+        }
+        _ => 0.0,
+    }
+}
+
 async fn maybe_spawn_fee_refresh(
     shared: &EngineShared,
     market_id: &str,
@@ -3056,10 +2987,11 @@ async fn maybe_spawn_fee_refresh(
 
     let market = market_id.to_string();
     let http = shared.http.clone();
+    let clob_endpoint = shared.clob_endpoint.clone();
     let fee_cache = shared.fee_cache.clone();
     let inflight = shared.fee_refresh_inflight.clone();
     tokio::spawn(async move {
-        if let Some(fee_bps) = fetch_fee_rate_bps(&http, &market).await {
+        if let Some(fee_bps) = fetch_fee_rate_bps(&http, &clob_endpoint, &market).await {
             fee_cache.write().await.insert(
                 market.clone(),
                 FeeRateEntry {
@@ -3072,11 +3004,91 @@ async fn maybe_spawn_fee_refresh(
     });
 }
 
-async fn fetch_fee_rate_bps(http: &Client, market_id: &str) -> Option<f64> {
+async fn maybe_spawn_scoring_refresh(
+    shared: &EngineShared,
+    market_id: &str,
+    order_id: &str,
+    fee_bps: f64,
+    now: Instant,
+    refresh_backoff: Duration,
+) {
+    if market_id.is_empty() || order_id.is_empty() {
+        return;
+    }
+    {
+        let inflight = shared.scoring_refresh_inflight.read().await;
+        if let Some(last_attempt) = inflight.get(market_id) {
+            if now.duration_since(*last_attempt) < refresh_backoff {
+                return;
+            }
+        }
+    }
+    {
+        let mut inflight = shared.scoring_refresh_inflight.write().await;
+        if let Some(last_attempt) = inflight.get(market_id) {
+            if now.duration_since(*last_attempt) < refresh_backoff {
+                return;
+            }
+        }
+        inflight.insert(market_id.to_string(), now);
+    }
+
+    let market = market_id.to_string();
+    let order = order_id.to_string();
+    let http = shared.http.clone();
+    let clob_endpoint = shared.clob_endpoint.clone();
+    let scoring_cache = shared.scoring_cache.clone();
+    let inflight = shared.scoring_refresh_inflight.clone();
+    let rebate_factor = shared.scoring_rebate_factor;
+    tokio::spawn(async move {
+        if let Some((scoring_ok, raw)) =
+            fetch_order_scoring(&http, &clob_endpoint, &order).await
+        {
+            let mut cache = scoring_cache.write().await;
+            let mut entry = cache.get(&market).cloned().unwrap_or(ScoringState {
+                scoring_true: 0,
+                scoring_total: 0,
+                rebate_bps_est: 0.0,
+                fetched_at: Instant::now(),
+            });
+            entry.scoring_total = entry.scoring_total.saturating_add(1);
+            if scoring_ok {
+                entry.scoring_true = entry.scoring_true.saturating_add(1);
+            }
+            let hit_ratio = if entry.scoring_total == 0 {
+                0.0
+            } else {
+                (entry.scoring_true as f64 / entry.scoring_total as f64).clamp(0.0, 1.0)
+            };
+            entry.rebate_bps_est = (fee_bps.max(0.0) * hit_ratio * rebate_factor).clamp(0.0, fee_bps.max(0.0));
+            entry.fetched_at = Instant::now();
+            let log_row = serde_json::json!({
+                "ts_ms": Utc::now().timestamp_millis(),
+                "market_id": market,
+                "order_id": order,
+                "scoring_ok": scoring_ok,
+                "scoring_true": entry.scoring_true,
+                "scoring_total": entry.scoring_total,
+                "hit_ratio": hit_ratio,
+                "rebate_bps_est": entry.rebate_bps_est,
+                "raw": raw
+            });
+            cache.insert(market.clone(), entry);
+            append_jsonl(
+                &dataset_path("normalized", "scoring_feedback.jsonl"),
+                &log_row,
+            );
+        }
+        inflight.write().await.remove(&market);
+    });
+}
+
+async fn fetch_fee_rate_bps(http: &Client, clob_endpoint: &str, market_id: &str) -> Option<f64> {
+    let base = clob_endpoint.trim_end_matches('/');
     let endpoints = [
-        format!("https://clob.polymarket.com/fee-rate?market_id={market_id}"),
-        format!("https://clob.polymarket.com/fee-rate?market={market_id}"),
-        format!("https://clob.polymarket.com/fee-rate?token_id={market_id}"),
+        format!("{base}/fee-rate?market_id={market_id}"),
+        format!("{base}/fee-rate?market={market_id}"),
+        format!("{base}/fee-rate?token_id={market_id}"),
     ];
 
     for url in endpoints {
@@ -3098,6 +3110,40 @@ async fn fetch_fee_rate_bps(http: &Client, market_id: &str) -> Option<f64> {
         if candidate.is_some() {
             return candidate;
         }
+    }
+    None
+}
+
+async fn fetch_order_scoring(
+    http: &Client,
+    clob_endpoint: &str,
+    order_id: &str,
+) -> Option<(bool, serde_json::Value)> {
+    let base = clob_endpoint.trim_end_matches('/');
+    let endpoints = [
+        format!("{base}/order-scoring?order_id={order_id}"),
+        format!("{base}/order-scoring?orderId={order_id}"),
+        format!("{base}/orders-scoring?order_id={order_id}"),
+    ];
+    for url in endpoints {
+        let Ok(resp) = http.get(&url).send().await else {
+            continue;
+        };
+        let Ok(resp) = resp.error_for_status() else {
+            continue;
+        };
+        let Ok(value) = resp.json::<serde_json::Value>().await else {
+            continue;
+        };
+        let scoring = value
+            .get("scoring")
+            .and_then(|v| v.as_bool())
+            .or_else(|| value.get("is_scoring").and_then(|v| v.as_bool()))
+            .or_else(|| value.get("isScoring").and_then(|v| v.as_bool()))
+            .or_else(|| value.get("eligible").and_then(|v| v.as_bool()))
+            .or_else(|| value.as_bool())
+            .unwrap_or(false);
+        return Some((scoring, value));
     }
     None
 }
@@ -3216,428 +3262,6 @@ fn aggressive_price_for_side(book: &BookTop, side: &OrderSide) -> f64 {
         OrderSide::BuyNo => book.ask_no,
         OrderSide::SellNo => book.bid_no,
     }
-}
-
-async fn health(State(state): State<AppState>) -> Json<HealthResp> {
-    Json(HealthResp {
-        status: "ok",
-        paused: *state.paused.read().await,
-    })
-}
-
-async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
-    let body = state.prometheus.render();
-    ([("content-type", "text/plain; version=0.0.4")], body)
-}
-
-async fn positions(State(state): State<AppState>) -> Json<HashMap<String, portfolio::Position>> {
-    Json(state.portfolio.positions())
-}
-
-async fn pnl(State(state): State<AppState>) -> Json<core_types::PnLSnapshot> {
-    Json(state.portfolio.snapshot())
-}
-
-async fn pause(State(state): State<AppState>) -> impl IntoResponse {
-    *state.paused.write().await = true;
-    let _ = state
-        .bus
-        .publish(EngineEvent::Control(ControlCommand::Pause));
-    Json(serde_json::json!({"ok": true, "paused": true}))
-}
-
-async fn resume(State(state): State<AppState>) -> impl IntoResponse {
-    *state.paused.write().await = false;
-    let _ = state
-        .bus
-        .publish(EngineEvent::Control(ControlCommand::Resume));
-    Json(serde_json::json!({"ok": true, "paused": false}))
-}
-
-async fn flatten(State(state): State<AppState>) -> impl IntoResponse {
-    match state.execution.flatten_all().await {
-        Ok(_) => {
-            let _ = state
-                .bus
-                .publish(EngineEvent::Control(ControlCommand::Flatten));
-            Json(serde_json::json!({"ok": true})).into_response()
-        }
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"ok": false, "error": err.to_string()})),
-        )
-            .into_response(),
-    }
-}
-
-async fn reset_shadow(State(state): State<AppState>) -> impl IntoResponse {
-    let window_id = state.shadow_stats.reset().await;
-    state.tox_state.write().await.clear();
-    Json(serde_json::json!({"ok": true, "shadow_reset": true, "window_id": window_id}))
-}
-
-async fn reload_strategy(
-    State(state): State<AppState>,
-    Json(req): Json<StrategyReloadReq>,
-) -> Json<StrategyReloadResp> {
-    let mut cfg = state.strategy_cfg.write().await;
-    if let Some(v) = req.min_edge_bps {
-        cfg.min_edge_bps = v.max(0.0);
-    }
-    if let Some(v) = req.ttl_ms {
-        cfg.ttl_ms = v.max(50);
-    }
-    if let Some(v) = req.inventory_skew {
-        cfg.inventory_skew = v.clamp(0.0, 1.0);
-    }
-    if let Some(v) = req.base_quote_size {
-        cfg.base_quote_size = v.max(0.01);
-    }
-    if let Some(v) = req.max_spread {
-        cfg.max_spread = v.max(0.0001);
-    }
-    if let Some(v) = req.taker_trigger_bps {
-        cfg.taker_trigger_bps = v.max(0.0);
-    }
-    if let Some(v) = req.taker_max_slippage_bps {
-        cfg.taker_max_slippage_bps = v.max(0.0);
-    }
-    if let Some(v) = req.stale_tick_filter_ms {
-        cfg.stale_tick_filter_ms = v.clamp(50.0, 5_000.0);
-    }
-    if let Some(v) = req.market_tier_profile {
-        cfg.market_tier_profile = v;
-    }
-    if let Some(v) = req.capital_fraction_kelly {
-        cfg.capital_fraction_kelly = v.clamp(0.01, 1.0);
-    }
-    if let Some(v) = req.variance_penalty_lambda {
-        cfg.variance_penalty_lambda = v.clamp(0.0, 5.0);
-    }
-    let mut fair_cfg = state
-        .fair_value_cfg
-        .read()
-        .map(|g| g.clone())
-        .unwrap_or_else(|_| BasisMrConfig::default());
-    if let Some(v) = req.basis_k_revert {
-        fair_cfg.k_revert = v.clamp(0.0, 5.0);
-    }
-    if let Some(v) = req.basis_z_cap {
-        fair_cfg.z_cap = v.clamp(0.5, 8.0);
-    }
-    if let Some(v) = req.basis_min_confidence {
-        fair_cfg.min_confidence = v.clamp(0.0, 1.0);
-    }
-    if let Ok(mut guard) = state.fair_value_cfg.write() {
-        *guard = fair_cfg.clone();
-    }
-    let maker_cfg = cfg.clone();
-    drop(cfg);
-    append_jsonl(
-        &dataset_path("reports", "strategy_reload.jsonl"),
-        &serde_json::json!({
-            "ts_ms": Utc::now().timestamp_millis(),
-            "maker": maker_cfg,
-            "fair_value": fair_cfg
-        }),
-    );
-    Json(StrategyReloadResp {
-        maker: maker_cfg,
-        fair_value: fair_cfg,
-    })
-}
-
-async fn reload_taker(
-    State(state): State<AppState>,
-    Json(req): Json<TakerReloadReq>,
-) -> Json<TakerReloadResp> {
-    let mut cfg = state.strategy_cfg.write().await;
-    if let Some(v) = req.trigger_bps {
-        cfg.taker_trigger_bps = v.max(0.0);
-    }
-    if let Some(v) = req.max_slippage_bps {
-        cfg.taker_max_slippage_bps = v.max(0.0);
-    }
-    if let Some(v) = req.stale_tick_filter_ms {
-        cfg.stale_tick_filter_ms = v.clamp(50.0, 5_000.0);
-    }
-    if let Some(v) = req.market_tier_profile {
-        cfg.market_tier_profile = v;
-    }
-    let resp = TakerReloadResp {
-        trigger_bps: cfg.taker_trigger_bps,
-        max_slippage_bps: cfg.taker_max_slippage_bps,
-        stale_tick_filter_ms: cfg.stale_tick_filter_ms,
-        market_tier_profile: cfg.market_tier_profile.clone(),
-    };
-    append_jsonl(
-        &dataset_path("reports", "taker_reload.jsonl"),
-        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "taker": resp}),
-    );
-    Json(resp)
-}
-
-async fn reload_allocator(
-    State(state): State<AppState>,
-    Json(req): Json<AllocatorReloadReq>,
-) -> Json<AllocatorReloadResp> {
-    let mut allocator = state.allocator_cfg.write().await;
-    if let Some(v) = req.capital_fraction_kelly {
-        allocator.capital_fraction_kelly = v.clamp(0.01, 1.0);
-    }
-    if let Some(v) = req.variance_penalty_lambda {
-        allocator.variance_penalty_lambda = v.clamp(0.0, 5.0);
-    }
-    if let Some(v) = req.active_top_n_markets {
-        allocator.active_top_n_markets = v.clamp(1, 128);
-    }
-    if let Some(v) = req.taker_weight {
-        allocator.taker_weight = v.max(0.0);
-    }
-    if let Some(v) = req.maker_weight {
-        allocator.maker_weight = v.max(0.0);
-    }
-    if let Some(v) = req.arb_weight {
-        allocator.arb_weight = v.max(0.0);
-    }
-    let sum = allocator.taker_weight + allocator.maker_weight + allocator.arb_weight;
-    if sum > 0.0 {
-        allocator.taker_weight /= sum;
-        allocator.maker_weight /= sum;
-        allocator.arb_weight /= sum;
-    } else {
-        *allocator = AllocatorConfig::default();
-    }
-
-    {
-        let mut strategy = state.strategy_cfg.write().await;
-        strategy.capital_fraction_kelly = allocator.capital_fraction_kelly;
-        strategy.variance_penalty_lambda = allocator.variance_penalty_lambda;
-    }
-    {
-        let mut tox = state.toxicity_cfg.write().await;
-        tox.active_top_n_markets = allocator.active_top_n_markets;
-    }
-
-    let resp = AllocatorReloadResp {
-        allocator: allocator.clone(),
-    };
-    append_jsonl(
-        &dataset_path("reports", "allocator_reload.jsonl"),
-        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "allocator": resp.allocator}),
-    );
-    Json(resp)
-}
-
-async fn reload_risk(
-    State(state): State<AppState>,
-    Json(req): Json<RiskReloadReq>,
-) -> Json<RiskReloadResp> {
-    let mut cfg = state.risk_limits.write().await;
-    if let Some(v) = req.max_market_notional {
-        cfg.max_market_notional = v.max(0.0);
-    }
-    if let Some(v) = req.max_asset_notional {
-        cfg.max_asset_notional = v.max(0.0);
-    }
-    if let Some(v) = req.max_open_orders {
-        cfg.max_open_orders = v.max(1);
-    }
-    if let Some(v) = req.daily_drawdown_cap_pct {
-        cfg.max_drawdown_pct = v.clamp(0.001, 1.0);
-    }
-    if let Some(v) = req.max_loss_streak {
-        cfg.max_loss_streak = v.max(1);
-    }
-    if let Some(v) = req.cooldown_sec {
-        cfg.cooldown_sec = v.max(1);
-    }
-    append_jsonl(
-        &dataset_path("reports", "risk_reload.jsonl"),
-        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "risk": *cfg}),
-    );
-    Json(RiskReloadResp { risk: cfg.clone() })
-}
-
-async fn reload_toxicity(
-    State(state): State<AppState>,
-    Json(req): Json<ToxicityReloadReq>,
-) -> Json<ToxicityConfig> {
-    let mut cfg = state.toxicity_cfg.write().await;
-    if let Some(v) = req.safe_threshold {
-        cfg.safe_threshold = v.clamp(0.0, 1.0);
-    }
-    if let Some(v) = req.caution_threshold {
-        cfg.caution_threshold = v.clamp(0.0, 1.0);
-    }
-    if let Some(v) = req.cooldown_min_sec {
-        cfg.cooldown_min_sec = v.max(1);
-    }
-    if let Some(v) = req.cooldown_max_sec {
-        cfg.cooldown_max_sec = v.max(cfg.cooldown_min_sec);
-    }
-    if let Some(v) = req.min_market_score {
-        cfg.min_market_score = v.clamp(0.0, 100.0);
-    }
-    if let Some(v) = req.active_top_n_markets {
-        cfg.active_top_n_markets = v;
-    }
-    if let Some(v) = req.markout_1s_caution_bps {
-        cfg.markout_1s_caution_bps = v;
-    }
-    if let Some(v) = req.markout_5s_caution_bps {
-        cfg.markout_5s_caution_bps = v;
-    }
-    if let Some(v) = req.markout_10s_caution_bps {
-        cfg.markout_10s_caution_bps = v;
-    }
-    if let Some(v) = req.markout_1s_danger_bps {
-        cfg.markout_1s_danger_bps = v;
-    }
-    if let Some(v) = req.markout_5s_danger_bps {
-        cfg.markout_5s_danger_bps = v;
-    }
-    if let Some(v) = req.markout_10s_danger_bps {
-        cfg.markout_10s_danger_bps = v;
-    }
-    if cfg.safe_threshold > cfg.caution_threshold {
-        let safe = cfg.safe_threshold;
-        cfg.safe_threshold = cfg.caution_threshold;
-        cfg.caution_threshold = safe;
-    }
-    if cfg.markout_1s_caution_bps < cfg.markout_1s_danger_bps {
-        let v = cfg.markout_1s_caution_bps;
-        cfg.markout_1s_caution_bps = cfg.markout_1s_danger_bps;
-        cfg.markout_1s_danger_bps = v;
-    }
-    if cfg.markout_5s_caution_bps < cfg.markout_5s_danger_bps {
-        let v = cfg.markout_5s_caution_bps;
-        cfg.markout_5s_caution_bps = cfg.markout_5s_danger_bps;
-        cfg.markout_5s_danger_bps = v;
-    }
-    if cfg.markout_10s_caution_bps < cfg.markout_10s_danger_bps {
-        let v = cfg.markout_10s_caution_bps;
-        cfg.markout_10s_caution_bps = cfg.markout_10s_danger_bps;
-        cfg.markout_10s_danger_bps = v;
-    }
-    append_jsonl(
-        &dataset_path("reports", "toxicity_reload.jsonl"),
-        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "config": *cfg}),
-    );
-    Json(cfg.clone())
-}
-
-async fn reload_perf_profile(
-    State(state): State<AppState>,
-    Json(req): Json<PerfProfileReloadReq>,
-) -> Json<PerfProfile> {
-    let mut cfg = state.perf_profile.write().await;
-    if let Some(v) = req.tail_guard {
-        cfg.tail_guard = v.clamp(0.50, 0.9999);
-    }
-    if let Some(v) = req.io_flush_batch {
-        cfg.io_flush_batch = v.clamp(1, 4096);
-    }
-    if let Some(v) = req.io_queue_capacity {
-        cfg.io_queue_capacity = v.clamp(256, 262_144);
-    }
-    if let Some(v) = req.json_mode {
-        cfg.json_mode = v;
-    }
-    if let Some(v) = req.io_drop_on_full {
-        cfg.io_drop_on_full = v;
-        JSONL_DROP_ON_FULL.store(v, Ordering::Relaxed);
-    }
-    append_jsonl(
-        &dataset_path("reports", "perf_profile_reload.jsonl"),
-        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "config": *cfg}),
-    );
-    Json(cfg.clone())
-}
-
-async fn report_shadow_live(State(state): State<AppState>) -> Json<ShadowLiveReport> {
-    let live = state.shadow_stats.build_live_report().await;
-    persist_live_report_files(&live);
-    Json(live)
-}
-
-async fn report_shadow_final(State(state): State<AppState>) -> Json<ShadowFinalReport> {
-    let final_report = state.shadow_stats.build_final_report().await;
-    persist_final_report_files(&final_report);
-    Json(final_report)
-}
-
-async fn report_pnl_by_engine(State(state): State<AppState>) -> Json<EnginePnlReport> {
-    let report = state.shadow_stats.build_engine_pnl_report().await;
-    persist_engine_pnl_report(&report);
-    Json(report)
-}
-
-async fn report_toxicity_live(State(state): State<AppState>) -> Json<ToxicityLiveReport> {
-    let live = build_toxicity_live_report(
-        state.tox_state.clone(),
-        state.shadow_stats.clone(),
-        state.execution.clone(),
-        state.toxicity_cfg.clone(),
-    )
-    .await;
-    persist_toxicity_report_files(&live);
-    Json(live)
-}
-
-async fn report_toxicity_final(State(state): State<AppState>) -> Json<ToxicityFinalReport> {
-    let cfg = state.toxicity_cfg.read().await.clone();
-    let live = build_toxicity_live_report(
-        state.tox_state.clone(),
-        state.shadow_stats.clone(),
-        state.execution.clone(),
-        state.toxicity_cfg.clone(),
-    )
-    .await;
-    let mut failed = Vec::new();
-    if live
-        .rows
-        .iter()
-        .filter(|r| r.active_for_quoting)
-        .any(|r| r.regime == ToxicRegime::Danger || r.market_score < cfg.min_market_score)
-    {
-        failed.push("active_market_danger_or_low_score_present".to_string());
-    }
-    if live.average_tox_score > 0.65 {
-        failed.push("average_tox_score_above_0.65".to_string());
-    }
-    let p50_markout = percentile(
-        &live
-            .rows
-            .iter()
-            .map(|r| r.markout_10s_bps)
-            .collect::<Vec<_>>(),
-        0.50,
-    )
-    .unwrap_or(0.0);
-    let p25_markout = percentile(
-        &live
-            .rows
-            .iter()
-            .map(|r| r.markout_10s_bps)
-            .collect::<Vec<_>>(),
-        0.25,
-    )
-    .unwrap_or(0.0);
-    if p50_markout <= 0.0 {
-        failed.push(format!("pnl_10s_p50_bps {:.4} <= 0", p50_markout));
-    }
-    if p25_markout <= -20.0 {
-        failed.push(format!("pnl_10s_p25_bps {:.4} <= -20", p25_markout));
-    }
-    let pass = failed.is_empty();
-    let final_report = ToxicityFinalReport {
-        pass,
-        failed_reasons: failed,
-        live,
-    };
-    persist_toxicity_report_files(&final_report.live);
-    Json(final_report)
 }
 
 async fn build_toxicity_live_report(

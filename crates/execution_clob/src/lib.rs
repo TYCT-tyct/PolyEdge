@@ -58,6 +58,10 @@ impl ClobExecution {
         self.open_orders.read().len()
     }
 
+    pub fn is_live(&self) -> bool {
+        matches!(self.mode, ExecutionMode::Live)
+    }
+
     pub fn open_order_notional_for_market(&self, market_id: &str) -> f64 {
         self.prune_expired_orders();
         self.open_orders
@@ -181,13 +185,35 @@ impl ExecutionVenue for ClobExecution {
                     .and_then(|v| v.as_f64())
                     .or_else(|| payload_value.get("size").and_then(|v| v.as_f64()))
                     .unwrap_or(intent.size);
+                let mut accepted = payload_value
+                    .get("accepted")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let mut reject_code = payload_value
+                    .get("reject_code")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| payload_value.get("reason").and_then(|v| v.as_str()))
+                    .or_else(|| payload_value.get("error").and_then(|v| v.as_str()))
+                    .map(ToString::to_string);
+
+                if accepted_size <= 0.0 {
+                    accepted = false;
+                    reject_code.get_or_insert_with(|| "zero_fill".to_string());
+                }
+                if accepted && matches!(intent.tif, core_types::OrderTimeInForce::Fok) {
+                    let missing = intent.size - accepted_size;
+                    if missing > 1e-9 {
+                        accepted = false;
+                        reject_code.get_or_insert_with(|| "fok_partial_fill".to_string());
+                    }
+                }
 
                 Ok(OrderAckV2 {
                     order_id,
                     market_id: intent.market_id,
-                    accepted: true,
+                    accepted,
                     accepted_size: accepted_size.max(0.0),
-                    reject_code: None,
+                    reject_code,
                     exchange_latency_ms,
                     ts_ms: Utc::now().timestamp_millis(),
                 })
