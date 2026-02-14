@@ -114,23 +114,39 @@ def evaluate_alerts(
             }
         )
 
-    gate_fail_reasons = []
-    if float(live.get("fillability_10ms", 0.0)) < 0.60:
-        gate_fail_reasons.append("fillability_10ms<0.60")
-    if float(live.get("net_edge_p50_bps", 0.0)) <= 0.0:
-        gate_fail_reasons.append("net_edge_p50_bps<=0")
-    pnl_robust = float(
-        live.get("pnl_10s_p50_bps_robust", live.get("pnl_10s_p50_bps", 0.0))
-    )
-    if pnl_robust <= 0.0:
-        gate_fail_reasons.append("pnl_10s_p50_bps_robust<=0")
-    if gate_fail_reasons:
+    gate_ready = bool(live.get("gate_ready", False))
+    window_outcomes = int(live.get("window_outcomes", 0))
+    if not gate_ready:
         alerts.append(
             {
-                "type": "gate_pressure",
-                "detail": ",".join(gate_fail_reasons),
+                "type": "gate_not_ready",
+                "detail": f"window_outcomes={window_outcomes} (insufficient sample)",
             }
         )
+    else:
+        gate_fail_reasons = []
+        if float(live.get("fillability_10ms", 0.0)) < 0.60:
+            gate_fail_reasons.append("fillability_10ms<0.60")
+        if float(live.get("net_edge_p50_bps", 0.0)) <= 0.0:
+            gate_fail_reasons.append("net_edge_p50_bps<=0")
+        pnl_robust = float(
+            live.get("pnl_10s_p50_bps_robust", live.get("pnl_10s_p50_bps", 0.0))
+        )
+        if pnl_robust <= 0.0:
+            gate_fail_reasons.append("pnl_10s_p50_bps_robust<=0")
+        reported = live.get("gate_fail_reasons")
+        if isinstance(reported, list):
+            for reason in reported:
+                text = str(reason)
+                if text and text not in gate_fail_reasons:
+                    gate_fail_reasons.append(text)
+        if gate_fail_reasons:
+            alerts.append(
+                {
+                    "type": "gate_pressure",
+                    "detail": ",".join(gate_fail_reasons),
+                }
+            )
 
     avg_tox = float(toxicity.get("average_tox_score", 0.0)) if toxicity else 0.0
     danger_count = int(toxicity.get("danger_count", 0)) if toxicity else 0

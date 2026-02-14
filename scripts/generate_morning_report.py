@@ -76,6 +76,10 @@ def build_recommendations(live: Dict[str, Any], alert_count: Counter[str]) -> Li
         recs.append("Reference feed stale. Check exchange WS subscriptions and region routing.")
     if int(live.get("book_freshness_ms", 10**9)) > 5000:
         recs.append("Polymarket book feed stale. Check CLOB WS health and reconnect loop.")
+    if not bool(live.get("gate_ready", False)):
+        recs.append(
+            "Gate sample not ready yet. Extend shadow window before concluding strategy quality."
+        )
     if float(live.get("tick_to_ack_p99_ms", 0.0)) > 450.0:
         recs.append("E2E p99 too high. Investigate tail latency and network jitter.")
     pnl_robust = float(live.get("pnl_10s_p50_bps_robust", live.get("pnl_10s_p50_bps", 0.0)))
@@ -122,6 +126,11 @@ def write_report(
     blocked = int(live.get("quote_blocked", 0))
     block_ratio = float(live.get("quote_block_ratio", 0.0))
     policy_block_ratio = float(live.get("policy_block_ratio", 0.0))
+    gate_ready = bool(live.get("gate_ready", False))
+    gate_fail_reasons = live.get("gate_fail_reasons", []) or []
+    window_id = int(live.get("window_id", 0))
+    window_shots = int(live.get("window_shots", 0))
+    window_outcomes = int(live.get("window_outcomes", 0))
     pnl_raw = float(live.get("pnl_10s_p50_bps_raw", live.get("pnl_10s_p50_bps", 0.0)))
     pnl_robust = float(live.get("pnl_10s_p50_bps_robust", pnl_raw))
     pnl_outlier_ratio = float(live.get("pnl_10s_outlier_ratio", 0.0))
@@ -132,6 +141,10 @@ def write_report(
     lines.append(f"# PolyEdge Morning Report ({day}, UTC)")
     lines.append("")
     lines.append("## Core Snapshot")
+    lines.append(f"- window_id: {window_id}")
+    lines.append(f"- window_shots: {window_shots}")
+    lines.append(f"- window_outcomes: {window_outcomes}")
+    lines.append(f"- gate_ready: {str(gate_ready).lower()}")
     lines.append(f"- quote_attempted: {attempted}")
     lines.append(f"- quote_blocked: {blocked}")
     lines.append(f"- quote_block_ratio: {block_ratio:.4f}")
@@ -153,6 +166,8 @@ def write_report(
     lines.append(f"- event_backlog_p99: {event_backlog_p99:.3f}")
     lines.append(f"- ref_freshness_ms: {int(live.get('ref_freshness_ms', -1))}")
     lines.append(f"- book_freshness_ms: {int(live.get('book_freshness_ms', -1))}")
+    if gate_fail_reasons:
+        lines.append(f"- gate_fail_reasons: {','.join(str(v) for v in gate_fail_reasons)}")
     lines.append("")
 
     lines.append("## Latency Breakdown")
