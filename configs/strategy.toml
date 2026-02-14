@@ -8,7 +8,7 @@ ttl_ms = 400
 [taker]
 trigger_bps = 8.0
 max_slippage_bps = 25.0
-stale_tick_filter_ms = 500
+stale_tick_filter_ms = 450
 market_tier_profile = "balanced"
 
 [online_calibration]
