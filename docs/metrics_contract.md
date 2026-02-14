@@ -28,6 +28,7 @@ This file is the single source of truth for live gate/report metrics.
 
 - `quote_block_ratio = quote_blocked / (quote_attempted + quote_blocked)` (`0` when denominator is `0`).
 - `policy_block_ratio = policy_blocked / (quote_attempted + policy_blocked)` (`0` when denominator is `0`).
+- `policy_blocked` only counts hard risk blocks (`risk:*`, `risk_capped_zero`), not strategy suppression (`no_quote_*`).
 
 ## EV / PnL Metrics
 
@@ -61,4 +62,3 @@ This file is the single source of truth for live gate/report metrics.
 - `policy_block_ratio < 0.10`
 - `ev_net_usdc_p50 > 0`
 - `roi_notional_10s_bps_p50 > 0`
-

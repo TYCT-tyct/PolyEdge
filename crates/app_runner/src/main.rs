@@ -816,7 +816,7 @@ fn is_quote_reject_reason(reason: &str) -> bool {
 }
 
 fn is_policy_block_reason(reason: &str) -> bool {
-    reason.starts_with("risk:") || reason == "risk_capped_zero" || reason == "no_quote_policy"
+    reason.starts_with("risk:") || reason == "risk_capped_zero"
 }
 
 fn classify_execution_error_reason(err: &anyhow::Error) -> &'static str {
@@ -4250,6 +4250,7 @@ fn persist_final_report_files(report: &ShadowFinalReport) {
         "formulas": {
             "quote_block_ratio": "quote_blocked / (quote_attempted + quote_blocked)",
             "policy_block_ratio": "policy_blocked / (quote_attempted + policy_blocked)",
+            "policy_blocked_scope": "risk:* and risk_capped_zero only",
             "executed_over_eligible": "executed_count / eligible_count",
             "ev_net_usdc_p50": "p50(net_markout_10s_usdc)",
             "ev_positive_ratio": "count(net_markout_10s_usdc > 0) / count(valid outcomes)"
