@@ -42,6 +42,71 @@ def parse_int_grid(raw: str) -> List[int]:
         out.append(int(token))
     return out
 
+PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "quick": {
+        "window_sec": 120,
+        "poll_interval_sec": 3.0,
+        "eval_window_sec": 120,
+        "max_trials": 2,
+        "max_runtime_sec": 480,
+        "heartbeat_sec": 15.0,
+        "fail_fast_threshold": 1,
+        "min_outcomes": 20,
+        "min_edge_grid": "4.5,5.0",
+        "ttl_grid": "350,400",
+        "basis_k_grid": "0.8",
+        "basis_z_grid": "3.0",
+        "safe_threshold_grid": "0.35",
+        "caution_threshold_grid": "0.65",
+        "warmup_sec": 5,
+        "max_estimated_sec": 900,
+    },
+    "standard": {
+        "window_sec": 300,
+        "poll_interval_sec": 10.0,
+        "eval_window_sec": 300,
+        "max_trials": 12,
+        "max_runtime_sec": 0,
+        "heartbeat_sec": 30.0,
+        "fail_fast_threshold": 0,
+        "min_outcomes": 30,
+        "min_edge_grid": "5,7,9",
+        "ttl_grid": "250,400,700",
+        "basis_k_grid": "0.70,0.85,1.00",
+        "basis_z_grid": "2.0,3.0",
+        "safe_threshold_grid": "0.35",
+        "caution_threshold_grid": "0.65",
+        "warmup_sec": 15,
+        "max_estimated_sec": 0,
+    },
+    "deep": {
+        "window_sec": 600,
+        "poll_interval_sec": 10.0,
+        "eval_window_sec": 600,
+        "max_trials": 24,
+        "max_runtime_sec": 0,
+        "heartbeat_sec": 30.0,
+        "fail_fast_threshold": 0,
+        "min_outcomes": 50,
+        "min_edge_grid": "4.5,5,6,7,9",
+        "ttl_grid": "250,350,500,700",
+        "basis_k_grid": "0.70,0.80,0.90,1.00",
+        "basis_z_grid": "2.0,2.5,3.0",
+        "safe_threshold_grid": "0.30,0.35",
+        "caution_threshold_grid": "0.60,0.65",
+        "warmup_sec": 20,
+        "max_estimated_sec": 0,
+    },
+}
+
+
+def apply_profile_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    profile = PROFILE_DEFAULTS[args.profile]
+    for key, default_value in profile.items():
+        if getattr(args, key) is None:
+            setattr(args, key, default_value)
+    return args
+
 
 def percentile(values: List[float], p: float) -> float:
     if not values:
@@ -443,29 +508,36 @@ def write_fixlist(path: Path, best: TrialResult | None) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="PolyEdge parameter regression")
+    p.add_argument("--profile", choices=["quick", "standard", "deep"], default="quick")
     p.add_argument("--base-url", default="http://127.0.0.1:8080")
     p.add_argument("--out-root", default="datasets/reports")
     p.add_argument("--run-id", default=default_run_id())
-    p.add_argument("--window-sec", type=int, default=300)
-    p.add_argument("--poll-interval-sec", type=float, default=10.0)
-    p.add_argument("--eval-window-sec", type=int, default=300)
-    p.add_argument("--max-trials", type=int, default=12)
-    p.add_argument("--max-runtime-sec", type=int, default=0)
-    p.add_argument("--heartbeat-sec", type=float, default=30.0)
-    p.add_argument("--fail-fast-threshold", type=int, default=0)
-    p.add_argument("--min-outcomes", type=int, default=30)
-    p.add_argument("--min-edge-grid", default="5,7,9")
-    p.add_argument("--ttl-grid", default="250,400,700")
-    p.add_argument("--basis-k-grid", default="0.70,0.85,1.00")
-    p.add_argument("--basis-z-grid", default="2.0,3.0")
-    p.add_argument("--safe-threshold-grid", default="0.35")
-    p.add_argument("--caution-threshold-grid", default="0.65")
-    p.add_argument("--warmup-sec", type=int, default=15)
+    p.add_argument("--window-sec", type=int, default=None)
+    p.add_argument("--poll-interval-sec", type=float, default=None)
+    p.add_argument("--eval-window-sec", type=int, default=None)
+    p.add_argument("--max-trials", type=int, default=None)
+    p.add_argument("--max-runtime-sec", type=int, default=None)
+    p.add_argument("--heartbeat-sec", type=float, default=None)
+    p.add_argument("--fail-fast-threshold", type=int, default=None)
+    p.add_argument("--min-outcomes", type=int, default=None)
+    p.add_argument("--min-edge-grid", default=None)
+    p.add_argument("--ttl-grid", default=None)
+    p.add_argument("--basis-k-grid", default=None)
+    p.add_argument("--basis-z-grid", default=None)
+    p.add_argument("--safe-threshold-grid", default=None)
+    p.add_argument("--caution-threshold-grid", default=None)
+    p.add_argument("--warmup-sec", type=int, default=None)
+    p.add_argument(
+        "--max-estimated-sec",
+        type=int,
+        default=None,
+        help="Hard cap for estimated total runtime; trims trial count automatically when exceeded",
+    )
     return p.parse_args()
 
 
 def main() -> int:
-    args = parse_args()
+    args = apply_profile_defaults(parse_args())
     day_dir = Path(args.out_root) / utc_day()
     session = requests.Session()
     started = time.monotonic()
@@ -479,6 +551,22 @@ def main() -> int:
 
     combos = list(itertools.product(edge_grid, ttl_grid, k_grid, z_grid, safe_grid, caution_grid))
     combos = combos[: max(1, args.max_trials)]
+
+    per_trial_sec = max(1, int(args.warmup_sec + min(args.window_sec, args.eval_window_sec)))
+    estimated_full_sec = per_trial_sec * len(combos)
+    if args.max_estimated_sec and args.max_estimated_sec > 0 and estimated_full_sec > args.max_estimated_sec:
+        allowed_trials = max(1, int(args.max_estimated_sec // per_trial_sec))
+        if allowed_trials < len(combos):
+            print(
+                f"[budget] estimated={estimated_full_sec}s exceeds cap={args.max_estimated_sec}s; "
+                f"trimming trials {len(combos)} -> {allowed_trials}"
+            )
+            combos = combos[:allowed_trials]
+            estimated_full_sec = per_trial_sec * len(combos)
+    print(
+        f"[profile] {args.profile} trials={len(combos)} per_trial~{per_trial_sec}s "
+        f"estimated~{estimated_full_sec}s max_runtime={args.max_runtime_sec}s"
+    )
 
     rows: List[TrialResult] = []
     consecutive_failures = 0

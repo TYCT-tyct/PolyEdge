@@ -21,6 +21,59 @@ def default_run_id() -> str:
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"long-reg-{ts}-{os.getpid()}"
 
+PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "quick": {
+        "cycles": 2,
+        "max_cycles": 2,
+        "max_runtime_sec": 1200,
+        "window_sec": 180,
+        "eval_window_sec": 90,
+        "poll_interval_sec": 3.0,
+        "heartbeat_sec": 15.0,
+        "max_trials": 2,
+        "fail_fast_threshold": 1,
+        "cooldown_sec": 30,
+        "min_outcomes": 20,
+        "max_estimated_sec": 1800,
+    },
+    "standard": {
+        "cycles": 4,
+        "max_cycles": 0,
+        "max_runtime_sec": 0,
+        "window_sec": 1800,
+        "eval_window_sec": 120,
+        "poll_interval_sec": 10.0,
+        "heartbeat_sec": 30.0,
+        "max_trials": 12,
+        "fail_fast_threshold": 0,
+        "cooldown_sec": 120,
+        "min_outcomes": 30,
+        "max_estimated_sec": 0,
+    },
+    "deep": {
+        "cycles": 8,
+        "max_cycles": 0,
+        "max_runtime_sec": 0,
+        "window_sec": 2400,
+        "eval_window_sec": 180,
+        "poll_interval_sec": 10.0,
+        "heartbeat_sec": 30.0,
+        "max_trials": 16,
+        "fail_fast_threshold": 0,
+        "cooldown_sec": 120,
+        "min_outcomes": 40,
+        "max_estimated_sec": 0,
+    },
+}
+
+
+def apply_profile_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    profile = PROFILE_DEFAULTS[args.profile]
+    for key, value in profile.items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
+    return args
+
 
 def post_json(session: requests.Session, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     resp = session.post(url, json=payload, timeout=8)
@@ -61,6 +114,8 @@ def run_param_regression(args: argparse.Namespace, cycle: int, budget_sec: int) 
         str(script_path),
         "--base-url",
         args.base_url,
+        "--profile",
+        args.profile,
         "--run-id",
         trial_run_id,
         "--window-sec",
@@ -146,25 +201,32 @@ def pick_gate_snapshot(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Long-run shadow regression orchestrator")
+    p.add_argument("--profile", choices=["quick", "standard", "deep"], default="quick")
     p.add_argument("--run-id", default=default_run_id())
     p.add_argument("--base-url", default="http://127.0.0.1:8080")
-    p.add_argument("--cycles", type=int, default=4)
-    p.add_argument("--max-cycles", type=int, default=0)
-    p.add_argument("--max-runtime-sec", type=int, default=0)
-    p.add_argument("--window-sec", type=int, default=1800)
-    p.add_argument("--eval-window-sec", type=int, default=120)
-    p.add_argument("--poll-interval-sec", type=float, default=10.0)
-    p.add_argument("--heartbeat-sec", type=float, default=30.0)
-    p.add_argument("--max-trials", type=int, default=12)
-    p.add_argument("--fail-fast-threshold", type=int, default=0)
+    p.add_argument("--cycles", type=int, default=None)
+    p.add_argument("--max-cycles", type=int, default=None)
+    p.add_argument("--max-runtime-sec", type=int, default=None)
+    p.add_argument("--window-sec", type=int, default=None)
+    p.add_argument("--eval-window-sec", type=int, default=None)
+    p.add_argument("--poll-interval-sec", type=float, default=None)
+    p.add_argument("--heartbeat-sec", type=float, default=None)
+    p.add_argument("--max-trials", type=int, default=None)
+    p.add_argument("--fail-fast-threshold", type=int, default=None)
     p.add_argument("--out-root", default="datasets/reports")
-    p.add_argument("--cooldown-sec", type=int, default=120)
-    p.add_argument("--min-outcomes", type=int, default=30)
+    p.add_argument("--cooldown-sec", type=int, default=None)
+    p.add_argument("--min-outcomes", type=int, default=None)
+    p.add_argument(
+        "--max-estimated-sec",
+        type=int,
+        default=None,
+        help="Hard cap for estimated total runtime; trims cycle count automatically when exceeded",
+    )
     return p.parse_args()
 
 
 def main() -> int:
-    args = parse_args()
+    args = apply_profile_defaults(parse_args())
     started = time.monotonic()
     next_heartbeat = started + max(1.0, args.heartbeat_sec)
     session = requests.Session()
@@ -174,6 +236,22 @@ def main() -> int:
 
     best_trial: Dict[str, Any] | None = None
     cycle_cap = args.max_cycles if args.max_cycles > 0 else args.cycles
+    per_cycle_trial_sec = max(1, int(min(args.window_sec, args.eval_window_sec)))
+    per_cycle_sec = max(1, int(args.cooldown_sec + args.max_trials * per_cycle_trial_sec + args.eval_window_sec))
+    estimated_total_sec = per_cycle_sec * cycle_cap
+    if args.max_estimated_sec and args.max_estimated_sec > 0 and estimated_total_sec > args.max_estimated_sec:
+        allowed_cycles = max(1, int(args.max_estimated_sec // per_cycle_sec))
+        if allowed_cycles < cycle_cap:
+            print(
+                f"[budget] estimated={estimated_total_sec}s exceeds cap={args.max_estimated_sec}s; "
+                f"trimming cycles {cycle_cap} -> {allowed_cycles}"
+            )
+            cycle_cap = allowed_cycles
+            estimated_total_sec = per_cycle_sec * cycle_cap
+    print(
+        f"[profile] {args.profile} cycles={cycle_cap} per_cycle~{per_cycle_sec}s "
+        f"estimated~{estimated_total_sec}s max_runtime={args.max_runtime_sec}s"
+    )
     consecutive_failures = 0
     for cycle in range(1, cycle_cap + 1):
         if args.max_runtime_sec > 0 and (time.monotonic() - started) >= args.max_runtime_sec:

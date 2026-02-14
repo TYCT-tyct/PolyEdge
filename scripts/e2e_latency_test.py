@@ -16,6 +16,12 @@ from latency_probe.models import SYMBOL_TO_NAME
 from latency_probe.stats import print_stat_block, summarize
 from latency_probe.ws_probe import has_delta, run_ws_latency
 
+PROFILE_DEFAULTS: Dict[str, Dict[str, float]] = {
+    "quick": {"seconds": 60, "poll_interval": 2.0},
+    "standard": {"seconds": 120, "poll_interval": 2.0},
+    "deep": {"seconds": 300, "poll_interval": 2.0},
+}
+
 
 def collect_engine_metrics(base_url: str, seconds: int, poll_interval: float) -> Dict[str, Any]:
     session = requests.Session()
@@ -111,13 +117,22 @@ def collect_engine_metrics(base_url: str, seconds: int, poll_interval: float) ->
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="WS-first latency benchmark")
+    parser.add_argument("--profile", default="quick", choices=["quick", "standard", "deep"])
     parser.add_argument("--symbol", default="BTCUSDT", choices=list(SYMBOL_TO_NAME.keys()))
     parser.add_argument("--mode", default="ws-first", choices=["ws-first"])
     parser.add_argument("--base-url", default="http://127.0.0.1:8080")
-    parser.add_argument("--seconds", type=int, default=120)
-    parser.add_argument("--poll-interval", type=float, default=2.0)
+    parser.add_argument("--seconds", type=int, default=None)
+    parser.add_argument("--poll-interval", type=float, default=None)
     parser.add_argument("--json-out", default="")
     args = parser.parse_args()
+    profile_defaults = PROFILE_DEFAULTS[args.profile]
+    if args.seconds is None:
+        args.seconds = int(profile_defaults["seconds"])
+    if args.poll_interval is None:
+        args.poll_interval = float(profile_defaults["poll_interval"])
+    print(
+        f"[profile] {args.profile} seconds={args.seconds} poll_interval={args.poll_interval}"
+    )
 
     print("=== ENGINE WS-FIRST METRICS ===")
     engine = collect_engine_metrics(args.base_url, args.seconds, args.poll_interval)
