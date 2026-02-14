@@ -594,9 +594,7 @@ fn is_quote_reject_reason(reason: &str) -> bool {
 }
 
 fn is_policy_block_reason(reason: &str) -> bool {
-    reason.starts_with("risk:")
-        || reason.starts_with("market_")
-        || reason == "risk_capped_zero"
+    reason.starts_with("risk:") || reason == "risk_capped_zero" || reason == "no_quote_policy"
 }
 
 fn classify_execution_error_reason(err: &anyhow::Error) -> &'static str {
