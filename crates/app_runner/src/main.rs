@@ -1367,7 +1367,11 @@ async fn async_main() -> Result<()> {
         shared.shadow_stats.clone(),
         (*universe_symbols).clone(),
     );
-    spawn_market_feed(bus.clone(), shared.shadow_stats.clone());
+    spawn_market_feed(
+        bus.clone(),
+        shared.shadow_stats.clone(),
+        (*universe_symbols).clone(),
+    );
     spawn_strategy_engine(
         bus.clone(),
         portfolio,
@@ -1465,10 +1469,10 @@ fn spawn_reference_feed(
     });
 }
 
-fn spawn_market_feed(bus: RingBus<EngineEvent>, stats: Arc<ShadowStats>) {
+fn spawn_market_feed(bus: RingBus<EngineEvent>, stats: Arc<ShadowStats>, symbols: Vec<String>) {
     const TS_INVERSION_TOLERANCE_MS: i64 = 250;
     tokio::spawn(async move {
-        let feed = PolymarketFeed::new(Duration::from_millis(50));
+        let feed = PolymarketFeed::new_with_symbols(Duration::from_millis(50), symbols);
         let Ok(mut stream) = feed.stream_books().await else {
             tracing::error!("market feed failed to start");
             return;

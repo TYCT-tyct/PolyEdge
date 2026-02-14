@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -35,14 +36,24 @@ pub struct PolymarketFeed {
     http: Client,
     pub endpoints: PolymarketEndpoints,
     reconnect_backoff: Duration,
+    symbols: Vec<String>,
 }
 
 impl PolymarketFeed {
     pub fn new(_poll_interval: Duration) -> Self {
+        Self::new_with_symbols(_poll_interval, Vec::new())
+    }
+
+    pub fn new_with_symbols(_poll_interval: Duration, symbols: Vec<String>) -> Self {
         Self {
             http: Client::new(),
             endpoints: PolymarketEndpoints::default(),
             reconnect_backoff: Duration::from_secs(1),
+            symbols: symbols
+                .into_iter()
+                .map(|s| s.trim().to_ascii_uppercase())
+                .filter(|s| !s.is_empty())
+                .collect(),
         }
     }
 
@@ -74,6 +85,14 @@ impl PolymarketFeed {
             ("TONUSDT", ["toncoin", "ton"]),
             ("NEARUSDT", ["near", "near"]),
         ];
+        let allowed_symbols: HashSet<String> = if self.symbols.is_empty() {
+            aliases
+                .iter()
+                .map(|(symbol, _)| (*symbol).to_string())
+                .collect()
+        } else {
+            self.symbols.iter().cloned().collect()
+        };
 
         let markets: Vec<GammaMarket> = self
             .http
@@ -110,6 +129,7 @@ impl PolymarketFeed {
 
             let matched_symbol = aliases
                 .iter()
+                .filter(|(symbol, _)| allowed_symbols.contains(*symbol))
                 .find(|(_, keys)| text.contains(keys[0]) || text.contains(keys[1]))
                 .map(|(s, _)| (*s).to_string());
             let Some(_symbol) = matched_symbol else {
