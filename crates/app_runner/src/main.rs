@@ -33,6 +33,7 @@ use portfolio::PortfolioBook;
 use reqwest::Client;
 use risk_engine::{DefaultRiskManager, RiskLimits};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use strategy_maker::{MakerConfig, MakerQuotePolicy};
 use tokio::sync::{mpsc, RwLock};
 
@@ -266,9 +267,15 @@ struct GateEvaluation {
     gate_ready: bool,
     min_outcomes: usize,
     pass: bool,
+    data_valid_ratio: f64,
+    seq_gap_rate: f64,
+    ts_inversion_rate: f64,
+    stale_tick_drop_ratio: f64,
     fillability_10ms: f64,
     net_edge_p50_bps: f64,
     net_edge_p10_bps: f64,
+    net_markout_10s_usdc_p50: f64,
+    roi_notional_10s_bps_p50: f64,
     pnl_10s_p50_bps_raw: f64,
     pnl_10s_p50_bps_robust: f64,
     pnl_10s_sample_count: usize,
@@ -277,6 +284,10 @@ struct GateEvaluation {
     policy_block_ratio: f64,
     strategy_uptime_pct: f64,
     tick_to_ack_p99_ms: f64,
+    decision_queue_wait_p99_ms: f64,
+    decision_compute_p99_ms: f64,
+    source_latency_p99_ms: f64,
+    local_backlog_p99_ms: f64,
     failed_reasons: Vec<String>,
 }
 
@@ -294,6 +305,12 @@ struct LatencyBreakdown {
     risk_p50_us: f64,
     risk_p90_us: f64,
     risk_p99_us: f64,
+    decision_queue_wait_p50_ms: f64,
+    decision_queue_wait_p90_ms: f64,
+    decision_queue_wait_p99_ms: f64,
+    decision_compute_p50_ms: f64,
+    decision_compute_p90_ms: f64,
+    decision_compute_p99_ms: f64,
     tick_to_decision_p50_ms: f64,
     tick_to_decision_p90_ms: f64,
     tick_to_decision_p99_ms: f64,
@@ -309,6 +326,12 @@ struct LatencyBreakdown {
     shadow_fill_p50_ms: f64,
     shadow_fill_p90_ms: f64,
     shadow_fill_p99_ms: f64,
+    source_latency_p50_ms: f64,
+    source_latency_p90_ms: f64,
+    source_latency_p99_ms: f64,
+    local_backlog_p50_ms: f64,
+    local_backlog_p90_ms: f64,
+    local_backlog_p99_ms: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -318,10 +341,15 @@ struct ShadowLiveReport {
     window_outcomes: usize,
     gate_ready: bool,
     gate_fail_reasons: Vec<String>,
+    observe_only: bool,
     started_at_ms: i64,
     elapsed_sec: u64,
     total_shots: usize,
     total_outcomes: usize,
+    data_valid_ratio: f64,
+    seq_gap_rate: f64,
+    ts_inversion_rate: f64,
+    stale_tick_drop_ratio: f64,
     quote_attempted: u64,
     quote_blocked: u64,
     policy_blocked: u64,
@@ -338,6 +366,8 @@ struct ShadowLiveReport {
     pnl_10s_p50_bps: f64,
     pnl_10s_p50_bps_raw: f64,
     pnl_10s_p50_bps_robust: f64,
+    net_markout_10s_usdc_p50: f64,
+    roi_notional_10s_bps_p50: f64,
     pnl_10s_sample_count: usize,
     pnl_10s_outlier_ratio: f64,
     quote_block_ratio: f64,
@@ -347,6 +377,10 @@ struct ShadowLiveReport {
     tick_to_decision_p50_ms: f64,
     tick_to_decision_p90_ms: f64,
     tick_to_decision_p99_ms: f64,
+    decision_queue_wait_p99_ms: f64,
+    decision_compute_p99_ms: f64,
+    source_latency_p99_ms: f64,
+    local_backlog_p99_ms: f64,
     ack_only_p50_ms: f64,
     ack_only_p90_ms: f64,
     ack_only_p99_ms: f64,
@@ -377,6 +411,8 @@ struct MarketScoreRow {
     net_edge_p50_bps: f64,
     net_edge_p10_bps: f64,
     pnl_10s_p50_bps: f64,
+    net_markout_10s_usdc_p50: f64,
+    roi_notional_10s_bps_p50: f64,
 }
 
 struct ShadowStats {
@@ -393,10 +429,14 @@ struct ShadowStats {
     last_book_tick_ms: AtomicI64,
     shots: RwLock<Vec<ShadowShot>>,
     outcomes: RwLock<Vec<ShadowOutcome>>,
+    decision_queue_wait_ms: RwLock<Vec<f64>>,
+    decision_compute_ms: RwLock<Vec<f64>>,
     tick_to_decision_ms: RwLock<Vec<f64>>,
     ack_only_ms: RwLock<Vec<f64>>,
     tick_to_ack_ms: RwLock<Vec<f64>>,
     feed_in_ms: RwLock<Vec<f64>>,
+    source_latency_ms: RwLock<Vec<f64>>,
+    local_backlog_ms: RwLock<Vec<f64>>,
     signal_us: RwLock<Vec<f64>>,
     quote_us: RwLock<Vec<f64>>,
     risk_us: RwLock<Vec<f64>>,
@@ -405,6 +445,12 @@ struct ShadowStats {
     event_backlog: RwLock<Vec<f64>>,
     parse_us: RwLock<Vec<f64>>,
     io_queue_depth: RwLock<Vec<f64>>,
+    data_total: AtomicU64,
+    data_invalid: AtomicU64,
+    seq_gap: AtomicU64,
+    ts_inversion: AtomicU64,
+    stale_tick_dropped: AtomicU64,
+    observe_only: AtomicBool,
 }
 
 impl ShadowStats {
@@ -427,10 +473,14 @@ impl ShadowStats {
             last_book_tick_ms: AtomicI64::new(0),
             shots: RwLock::new(Vec::new()),
             outcomes: RwLock::new(Vec::new()),
+            decision_queue_wait_ms: RwLock::new(Vec::new()),
+            decision_compute_ms: RwLock::new(Vec::new()),
             tick_to_decision_ms: RwLock::new(Vec::new()),
             ack_only_ms: RwLock::new(Vec::new()),
             tick_to_ack_ms: RwLock::new(Vec::new()),
             feed_in_ms: RwLock::new(Vec::new()),
+            source_latency_ms: RwLock::new(Vec::new()),
+            local_backlog_ms: RwLock::new(Vec::new()),
             signal_us: RwLock::new(Vec::new()),
             quote_us: RwLock::new(Vec::new()),
             risk_us: RwLock::new(Vec::new()),
@@ -439,6 +489,12 @@ impl ShadowStats {
             event_backlog: RwLock::new(Vec::new()),
             parse_us: RwLock::new(Vec::new()),
             io_queue_depth: RwLock::new(Vec::new()),
+            data_total: AtomicU64::new(0),
+            data_invalid: AtomicU64::new(0),
+            seq_gap: AtomicU64::new(0),
+            ts_inversion: AtomicU64::new(0),
+            stale_tick_dropped: AtomicU64::new(0),
+            observe_only: AtomicBool::new(false),
         }
     }
 
@@ -457,10 +513,14 @@ impl ShadowStats {
         self.blocked_reasons.write().await.clear();
         self.shots.write().await.clear();
         self.outcomes.write().await.clear();
+        self.decision_queue_wait_ms.write().await.clear();
+        self.decision_compute_ms.write().await.clear();
         self.tick_to_decision_ms.write().await.clear();
         self.ack_only_ms.write().await.clear();
         self.tick_to_ack_ms.write().await.clear();
         self.feed_in_ms.write().await.clear();
+        self.source_latency_ms.write().await.clear();
+        self.local_backlog_ms.write().await.clear();
         self.signal_us.write().await.clear();
         self.quote_us.write().await.clear();
         self.risk_us.write().await.clear();
@@ -469,22 +529,42 @@ impl ShadowStats {
         self.event_backlog.write().await.clear();
         self.parse_us.write().await.clear();
         self.io_queue_depth.write().await.clear();
+        self.data_total.store(0, Ordering::Relaxed);
+        self.data_invalid.store(0, Ordering::Relaxed);
+        self.seq_gap.store(0, Ordering::Relaxed);
+        self.ts_inversion.store(0, Ordering::Relaxed);
+        self.stale_tick_dropped.store(0, Ordering::Relaxed);
+        self.observe_only.store(false, Ordering::Relaxed);
         window_id
     }
 
     async fn push_shot(&self, shot: ShadowShot) {
+        let ingest_seq = next_normalized_ingest_seq();
+        let source_seq = shot.t0_ns.max(0) as u64;
         append_jsonl(
             &dataset_path("normalized", "shadow_shots.jsonl"),
-            &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "shot": shot}),
+            &serde_json::json!({
+                "ts_ms": Utc::now().timestamp_millis(),
+                "source_seq": source_seq,
+                "ingest_seq": ingest_seq,
+                "shot": shot
+            }),
         );
         let mut shots = self.shots.write().await;
         push_capped(&mut shots, shot, Self::SHADOW_CAP);
     }
 
     async fn push_outcome(&self, outcome: ShadowOutcome) {
+        let ingest_seq = next_normalized_ingest_seq();
+        let source_seq = outcome.ts_ns.max(0) as u64;
         append_jsonl(
             &dataset_path("normalized", "shadow_outcomes.jsonl"),
-            &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "outcome": outcome}),
+            &serde_json::json!({
+                "ts_ms": Utc::now().timestamp_millis(),
+                "source_seq": source_seq,
+                "ingest_seq": ingest_seq,
+                "outcome": outcome
+            }),
         );
         let mut outcomes = self.outcomes.write().await;
         push_capped(&mut outcomes, outcome, Self::SHADOW_CAP);
@@ -492,6 +572,16 @@ impl ShadowStats {
 
     async fn push_tick_to_decision_ms(&self, ms: f64) {
         let mut v = self.tick_to_decision_ms.write().await;
+        push_capped(&mut v, ms, Self::SAMPLE_CAP);
+    }
+
+    async fn push_decision_queue_wait_ms(&self, ms: f64) {
+        let mut v = self.decision_queue_wait_ms.write().await;
+        push_capped(&mut v, ms, Self::SAMPLE_CAP);
+    }
+
+    async fn push_decision_compute_ms(&self, ms: f64) {
+        let mut v = self.decision_compute_ms.write().await;
         push_capped(&mut v, ms, Self::SAMPLE_CAP);
     }
 
@@ -507,6 +597,16 @@ impl ShadowStats {
 
     async fn push_feed_in_ms(&self, ms: f64) {
         let mut v = self.feed_in_ms.write().await;
+        push_capped(&mut v, ms, Self::SAMPLE_CAP);
+    }
+
+    async fn push_source_latency_ms(&self, ms: f64) {
+        let mut v = self.source_latency_ms.write().await;
+        push_capped(&mut v, ms, Self::SAMPLE_CAP);
+    }
+
+    async fn push_local_backlog_ms(&self, ms: f64) {
+        let mut v = self.local_backlog_ms.write().await;
         push_capped(&mut v, ms, Self::SAMPLE_CAP);
     }
 
@@ -587,6 +687,33 @@ impl ShadowStats {
         self.book_ticks_total.fetch_add(1, Ordering::Relaxed);
         self.last_book_tick_ms.store(ts_ms, Ordering::Relaxed);
     }
+
+    fn mark_data_validity(&self, valid: bool) {
+        self.data_total.fetch_add(1, Ordering::Relaxed);
+        if !valid {
+            self.data_invalid.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn mark_seq_gap(&self) {
+        self.seq_gap.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn mark_ts_inversion(&self) {
+        self.ts_inversion.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn mark_stale_tick_dropped(&self) {
+        self.stale_tick_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn observe_only(&self) -> bool {
+        self.observe_only.load(Ordering::Relaxed)
+    }
+
+    fn set_observe_only(&self, v: bool) {
+        self.observe_only.store(v, Ordering::Relaxed);
+    }
 }
 
 fn is_quote_reject_reason(reason: &str) -> bool {
@@ -618,10 +745,14 @@ impl ShadowStats {
         const PRIMARY_DELAY_MS: u64 = 10;
         let shots = self.shots.read().await.clone();
         let outcomes = self.outcomes.read().await.clone();
+        let decision_queue_wait_ms = self.decision_queue_wait_ms.read().await.clone();
+        let decision_compute_ms = self.decision_compute_ms.read().await.clone();
         let tick_to_decision_ms = self.tick_to_decision_ms.read().await.clone();
         let ack_only_ms = self.ack_only_ms.read().await.clone();
         let tick_to_ack_ms = self.tick_to_ack_ms.read().await.clone();
         let feed_in_ms = self.feed_in_ms.read().await.clone();
+        let source_latency_ms = self.source_latency_ms.read().await.clone();
+        let local_backlog_ms = self.local_backlog_ms.read().await.clone();
         let signal_us = self.signal_us.read().await.clone();
         let quote_us = self.quote_us.read().await.clone();
         let risk_us = self.risk_us.read().await.clone();
@@ -644,27 +775,41 @@ impl ShadowStats {
             .iter()
             .filter(|o| o.delay_ms == PRIMARY_DELAY_MS)
             .collect::<Vec<_>>();
+        let outcomes_primary_valid = outcomes_primary
+            .iter()
+            .filter(|o| !o.is_stale_tick)
+            .collect::<Vec<_>>();
         let net_edges = shots_primary
             .iter()
             .map(|s| s.edge_net_bps)
             .collect::<Vec<_>>();
         let net_edge_p50 = percentile(&net_edges, 0.50).unwrap_or(0.0);
         let net_edge_p10 = percentile(&net_edges, 0.10).unwrap_or(0.0);
-        let pnl_1s = outcomes_primary
+        let pnl_1s = outcomes_primary_valid
             .iter()
             .filter_map(|o| o.net_markout_1s_bps.or(o.pnl_1s_bps))
             .collect::<Vec<_>>();
-        let pnl_5s = outcomes_primary
+        let pnl_5s = outcomes_primary_valid
             .iter()
             .filter_map(|o| o.net_markout_5s_bps.or(o.pnl_5s_bps))
             .collect::<Vec<_>>();
-        let pnl_10s = outcomes_primary
+        let pnl_10s = outcomes_primary_valid
             .iter()
             .filter_map(|o| o.net_markout_10s_bps.or(o.pnl_10s_bps))
+            .collect::<Vec<_>>();
+        let net_markout_10s_usdc = outcomes_primary_valid
+            .iter()
+            .filter_map(|o| o.net_markout_10s_usdc)
+            .collect::<Vec<_>>();
+        let roi_notional_10s_bps = outcomes_primary_valid
+            .iter()
+            .filter_map(|o| o.roi_notional_10s_bps)
             .collect::<Vec<_>>();
         let pnl_1s_p50 = percentile(&pnl_1s, 0.50).unwrap_or(0.0);
         let pnl_5s_p50 = percentile(&pnl_5s, 0.50).unwrap_or(0.0);
         let pnl_10s_p50_raw = percentile(&pnl_10s, 0.50).unwrap_or(0.0);
+        let net_markout_10s_usdc_p50 = percentile(&net_markout_10s_usdc, 0.50).unwrap_or(0.0);
+        let roi_notional_10s_bps_p50 = percentile(&roi_notional_10s_bps, 0.50).unwrap_or(0.0);
         let (pnl_10s_filtered, pnl_10s_outlier_ratio) = robust_filter_iqr(&pnl_10s);
         let pnl_10s_p50_robust = percentile(&pnl_10s_filtered, 0.50).unwrap_or(pnl_10s_p50_raw);
         let pnl_10s_sample_count = pnl_10s.len();
@@ -694,6 +839,31 @@ impl ShadowStats {
         let last_book_tick_ms = self.last_book_tick_ms.load(Ordering::Relaxed);
         let ref_freshness_ms = freshness_ms(now_ms, last_ref_tick_ms);
         let book_freshness_ms = freshness_ms(now_ms, last_book_tick_ms);
+        let data_total = self.data_total.load(Ordering::Relaxed);
+        let data_invalid = self.data_invalid.load(Ordering::Relaxed);
+        let seq_gap = self.seq_gap.load(Ordering::Relaxed);
+        let ts_inversion = self.ts_inversion.load(Ordering::Relaxed);
+        let stale_tick_dropped = self.stale_tick_dropped.load(Ordering::Relaxed);
+        let data_valid_ratio = if data_total == 0 {
+            1.0
+        } else {
+            1.0 - (data_invalid as f64 / data_total as f64)
+        };
+        let seq_gap_rate = if data_total == 0 {
+            0.0
+        } else {
+            seq_gap as f64 / data_total as f64
+        };
+        let ts_inversion_rate = if data_total == 0 {
+            0.0
+        } else {
+            ts_inversion as f64 / data_total as f64
+        };
+        let stale_tick_drop_ratio = if data_total == 0 {
+            0.0
+        } else {
+            stale_tick_dropped as f64 / data_total as f64
+        };
 
         let latency = LatencyBreakdown {
             feed_in_p50_ms: percentile(&feed_in_ms, 0.50).unwrap_or(0.0),
@@ -708,6 +878,12 @@ impl ShadowStats {
             risk_p50_us: percentile(&risk_us, 0.50).unwrap_or(0.0),
             risk_p90_us: percentile(&risk_us, 0.90).unwrap_or(0.0),
             risk_p99_us: percentile(&risk_us, 0.99).unwrap_or(0.0),
+            decision_queue_wait_p50_ms: percentile(&decision_queue_wait_ms, 0.50).unwrap_or(0.0),
+            decision_queue_wait_p90_ms: percentile(&decision_queue_wait_ms, 0.90).unwrap_or(0.0),
+            decision_queue_wait_p99_ms: percentile(&decision_queue_wait_ms, 0.99).unwrap_or(0.0),
+            decision_compute_p50_ms: percentile(&decision_compute_ms, 0.50).unwrap_or(0.0),
+            decision_compute_p90_ms: percentile(&decision_compute_ms, 0.90).unwrap_or(0.0),
+            decision_compute_p99_ms: percentile(&decision_compute_ms, 0.99).unwrap_or(0.0),
             tick_to_decision_p50_ms: percentile(&tick_to_decision_ms, 0.50).unwrap_or(0.0),
             tick_to_decision_p90_ms: percentile(&tick_to_decision_ms, 0.90).unwrap_or(0.0),
             tick_to_decision_p99_ms: percentile(&tick_to_decision_ms, 0.99).unwrap_or(0.0),
@@ -723,6 +899,12 @@ impl ShadowStats {
             shadow_fill_p50_ms: percentile(&shadow_fill_ms, 0.50).unwrap_or(0.0),
             shadow_fill_p90_ms: percentile(&shadow_fill_ms, 0.90).unwrap_or(0.0),
             shadow_fill_p99_ms: percentile(&shadow_fill_ms, 0.99).unwrap_or(0.0),
+            source_latency_p50_ms: percentile(&source_latency_ms, 0.50).unwrap_or(0.0),
+            source_latency_p90_ms: percentile(&source_latency_ms, 0.90).unwrap_or(0.0),
+            source_latency_p99_ms: percentile(&source_latency_ms, 0.99).unwrap_or(0.0),
+            local_backlog_p50_ms: percentile(&local_backlog_ms, 0.50).unwrap_or(0.0),
+            local_backlog_p90_ms: percentile(&local_backlog_ms, 0.90).unwrap_or(0.0),
+            local_backlog_p99_ms: percentile(&local_backlog_ms, 0.99).unwrap_or(0.0),
         };
 
         let mut live = ShadowLiveReport {
@@ -731,10 +913,15 @@ impl ShadowStats {
             window_outcomes: outcomes.len(),
             gate_ready: outcomes.len() >= Self::GATE_MIN_OUTCOMES,
             gate_fail_reasons: Vec::new(),
+            observe_only: self.observe_only(),
             started_at_ms: self.started_at_ms.load(Ordering::Relaxed),
             elapsed_sec: elapsed.as_secs(),
             total_shots: shots.len(),
             total_outcomes: outcomes.len(),
+            data_valid_ratio,
+            seq_gap_rate,
+            ts_inversion_rate,
+            stale_tick_drop_ratio,
             quote_attempted: attempted,
             quote_blocked: blocked,
             policy_blocked,
@@ -751,6 +938,8 @@ impl ShadowStats {
             pnl_10s_p50_bps: pnl_10s_p50_raw,
             pnl_10s_p50_bps_raw: pnl_10s_p50_raw,
             pnl_10s_p50_bps_robust: pnl_10s_p50_robust,
+            net_markout_10s_usdc_p50,
+            roi_notional_10s_bps_p50,
             pnl_10s_sample_count,
             pnl_10s_outlier_ratio,
             quote_block_ratio: block_ratio,
@@ -760,6 +949,10 @@ impl ShadowStats {
             tick_to_decision_p50_ms: latency.tick_to_decision_p50_ms,
             tick_to_decision_p90_ms: latency.tick_to_decision_p90_ms,
             tick_to_decision_p99_ms: latency.tick_to_decision_p99_ms,
+            decision_queue_wait_p99_ms: latency.decision_queue_wait_p99_ms,
+            decision_compute_p99_ms: latency.decision_compute_p99_ms,
+            source_latency_p99_ms: latency.source_latency_p99_ms,
+            local_backlog_p99_ms: latency.local_backlog_p99_ms,
             ack_only_p50_ms: latency.ack_only_p50_ms,
             ack_only_p90_ms: latency.ack_only_p90_ms,
             ack_only_p99_ms: latency.ack_only_p99_ms,
@@ -787,9 +980,15 @@ impl ShadowStats {
             gate_ready: live.gate_ready,
             min_outcomes: Self::GATE_MIN_OUTCOMES,
             pass: failed.is_empty(),
+            data_valid_ratio: live.data_valid_ratio,
+            seq_gap_rate: live.seq_gap_rate,
+            ts_inversion_rate: live.ts_inversion_rate,
+            stale_tick_drop_ratio: live.stale_tick_drop_ratio,
             fillability_10ms: live.fillability_10ms,
             net_edge_p50_bps: live.net_edge_p50_bps,
             net_edge_p10_bps: live.net_edge_p10_bps,
+            net_markout_10s_usdc_p50: live.net_markout_10s_usdc_p50,
+            roi_notional_10s_bps_p50: live.roi_notional_10s_bps_p50,
             pnl_10s_p50_bps_raw: live.pnl_10s_p50_bps_raw,
             pnl_10s_p50_bps_robust: live.pnl_10s_p50_bps_robust,
             pnl_10s_sample_count: live.pnl_10s_sample_count,
@@ -798,6 +997,10 @@ impl ShadowStats {
             policy_block_ratio: live.policy_block_ratio,
             strategy_uptime_pct: live.strategy_uptime_pct,
             tick_to_ack_p99_ms: live.tick_to_ack_p99_ms,
+            decision_queue_wait_p99_ms: live.decision_queue_wait_p99_ms,
+            decision_compute_p99_ms: live.decision_compute_p99_ms,
+            source_latency_p99_ms: live.latency.source_latency_p99_ms,
+            local_backlog_p99_ms: live.latency.local_backlog_p99_ms,
             failed_reasons: failed,
         };
         ShadowFinalReport { live, gate }
@@ -824,10 +1027,16 @@ fn compute_gate_fail_reasons(live: &ShadowLiveReport, min_outcomes: usize) -> Ve
     if live.net_edge_p10_bps < -1.0 {
         failed.push(format!("net_edge_p10 {:.3} < -1", live.net_edge_p10_bps));
     }
-    if live.pnl_10s_p50_bps_robust <= 0.0 {
+    if live.net_markout_10s_usdc_p50 <= 0.0 {
         failed.push(format!(
-            "pnl_10s_p50_robust {:.3} <= 0",
-            live.pnl_10s_p50_bps_robust
+            "net_markout_10s_usdc_p50 {:.6} <= 0",
+            live.net_markout_10s_usdc_p50
+        ));
+    }
+    if live.roi_notional_10s_bps_p50 <= 0.0 {
+        failed.push(format!(
+            "roi_notional_10s_bps_p50 {:.6} <= 0",
+            live.roi_notional_10s_bps_p50
         ));
     }
     if live.quote_block_ratio >= 0.10 {
@@ -836,14 +1045,38 @@ fn compute_gate_fail_reasons(live: &ShadowLiveReport, min_outcomes: usize) -> Ve
             live.quote_block_ratio
         ));
     }
-    if live.policy_block_ratio >= 0.30 {
+    if live.policy_block_ratio >= 0.10 {
         failed.push(format!(
-            "policy_block_ratio {:.4} >= 0.30",
+            "policy_block_ratio {:.4} >= 0.10",
             live.policy_block_ratio
         ));
     }
     if live.strategy_uptime_pct < 99.0 {
         failed.push(format!("uptime {:.2}% < 99%", live.strategy_uptime_pct));
+    }
+    if live.data_valid_ratio < 0.999 {
+        failed.push(format!("data_valid_ratio {:.5} < 0.999", live.data_valid_ratio));
+    }
+    if live.seq_gap_rate > 0.001 {
+        failed.push(format!("seq_gap_rate {:.5} > 0.001", live.seq_gap_rate));
+    }
+    if live.ts_inversion_rate > 0.0005 {
+        failed.push(format!(
+            "ts_inversion_rate {:.5} > 0.0005",
+            live.ts_inversion_rate
+        ));
+    }
+    if live.latency.feed_in_p99_ms >= 800.0 {
+        failed.push(format!(
+            "feed_in_p99 {:.3}ms >= 800ms",
+            live.latency.feed_in_p99_ms
+        ));
+    }
+    if live.decision_compute_p99_ms >= 2.0 {
+        failed.push(format!(
+            "decision_compute_p99 {:.3}ms >= 2ms",
+            live.decision_compute_p99_ms
+        ));
     }
     if live.tick_to_ack_p99_ms >= 450.0 {
         failed.push(format!(
@@ -930,7 +1163,7 @@ async fn async_main() -> Result<()> {
         portfolio,
         execution.clone(),
         shadow,
-        paused,
+        paused.clone(),
         shared.clone(),
     );
     spawn_periodic_report_persistor(
@@ -939,6 +1172,7 @@ async fn async_main() -> Result<()> {
         execution.clone(),
         shared.toxicity_cfg.clone(),
     );
+    spawn_data_reconcile_task(bus.clone(), paused.clone(), shared.shadow_stats.clone());
 
     let app = Router::new()
         .route("/health", get(health))
@@ -981,15 +1215,46 @@ fn spawn_reference_feed(bus: RingBus<EngineEvent>, stats: Arc<ShadowStats>) {
             tracing::error!("reference feed failed to start");
             return;
         };
+        let mut ingest_seq: u64 = 0;
+        let mut last_source_ts_by_symbol: HashMap<String, i64> = HashMap::new();
 
         while let Some(item) = stream.next().await {
             match item {
                 Ok(tick) => {
+                    ingest_seq = ingest_seq.saturating_add(1);
+                    let source_ts = tick.event_ts_exchange_ms.max(tick.event_ts_ms);
+                    let source_seq = source_ts.max(0) as u64;
+                    let valid = !tick.symbol.is_empty()
+                        && tick.price.is_finite()
+                        && tick.price > 0.0
+                        && source_seq > 0;
+                    stats.mark_data_validity(valid);
+                    if let Some(prev) = last_source_ts_by_symbol.get(&tick.symbol).copied() {
+                        if source_ts < prev {
+                            stats.mark_ts_inversion();
+                        } else if source_ts - prev > 5_000 {
+                            stats.mark_seq_gap();
+                        }
+                    }
+                    last_source_ts_by_symbol.insert(tick.symbol.clone(), source_ts);
                     stats.mark_ref_tick(tick.recv_ts_ms);
+                    let tick_json = serde_json::to_value(&tick).unwrap_or(serde_json::json!({}));
+                    let hash = sha256_hex(&tick_json.to_string());
                     append_jsonl(
                         &dataset_path("raw", "ref_ticks.jsonl"),
-                        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "tick": tick}),
+                        &serde_json::json!({
+                            "ts_ms": Utc::now().timestamp_millis(),
+                            "source_seq": source_seq,
+                            "ingest_seq": ingest_seq,
+                            "valid": valid,
+                            "sha256": hash,
+                            "tick": tick_json
+                        }),
                     );
+                    if !valid {
+                        stats.record_issue("invalid_ref_tick").await;
+                        continue;
+                    }
                     let _ = bus.publish(EngineEvent::RefTick(tick));
                 }
                 Err(err) => {
@@ -1007,15 +1272,48 @@ fn spawn_market_feed(bus: RingBus<EngineEvent>, stats: Arc<ShadowStats>) {
             tracing::error!("market feed failed to start");
             return;
         };
+        let mut ingest_seq: u64 = 0;
+        let mut last_source_ts_by_market: HashMap<String, i64> = HashMap::new();
 
         while let Some(item) = stream.next().await {
             match item {
                 Ok(book) => {
+                    ingest_seq = ingest_seq.saturating_add(1);
+                    let source_ts = book.ts_ms;
+                    let source_seq = source_ts.max(0) as u64;
+                    let valid = !book.market_id.is_empty()
+                        && book.bid_yes.is_finite()
+                        && book.ask_yes.is_finite()
+                        && book.bid_no.is_finite()
+                        && book.ask_no.is_finite()
+                        && source_seq > 0;
+                    stats.mark_data_validity(valid);
+                    if let Some(prev) = last_source_ts_by_market.get(&book.market_id).copied() {
+                        if source_ts < prev {
+                            stats.mark_ts_inversion();
+                        } else if source_ts - prev > 5_000 {
+                            stats.mark_seq_gap();
+                        }
+                    }
+                    last_source_ts_by_market.insert(book.market_id.clone(), source_ts);
                     stats.mark_book_tick(book.ts_ms);
+                    let book_json = serde_json::to_value(&book).unwrap_or(serde_json::json!({}));
+                    let hash = sha256_hex(&book_json.to_string());
                     append_jsonl(
                         &dataset_path("raw", "book_tops.jsonl"),
-                        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "book": book}),
+                        &serde_json::json!({
+                            "ts_ms": Utc::now().timestamp_millis(),
+                            "source_seq": source_seq,
+                            "ingest_seq": ingest_seq,
+                            "valid": valid,
+                            "sha256": hash,
+                            "book": book_json
+                        }),
                     );
+                    if !valid {
+                        stats.record_issue("invalid_book_top").await;
+                        continue;
+                    }
                     let _ = bus.publish(EngineEvent::BookTop(book));
                 }
                 Err(err) => {
@@ -1053,6 +1351,65 @@ fn spawn_periodic_report_persistor(
             }
 
             tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    });
+}
+
+fn spawn_data_reconcile_task(
+    bus: RingBus<EngineEvent>,
+    paused: Arc<RwLock<bool>>,
+    stats: Arc<ShadowStats>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(600));
+        loop {
+            interval.tick().await;
+            let live = stats.build_live_report().await;
+            let ref_lines = count_jsonl_lines(&dataset_path("raw", "ref_ticks.jsonl"));
+            let book_lines = count_jsonl_lines(&dataset_path("raw", "book_tops.jsonl"));
+            let ref_expected = live.ref_ticks_total as i64;
+            let book_expected = live.book_ticks_total as i64;
+            let ref_gap_ratio = if ref_expected <= 0 {
+                0.0
+            } else {
+                ((ref_lines - ref_expected).abs() as f64) / (ref_expected as f64)
+            };
+            let book_gap_ratio = if book_expected <= 0 {
+                0.0
+            } else {
+                ((book_lines - book_expected).abs() as f64) / (book_expected as f64)
+            };
+            let reconcile_fail = ref_gap_ratio > 0.05
+                || book_gap_ratio > 0.05
+                || live.data_valid_ratio < 0.999
+                || live.seq_gap_rate > 0.001
+                || live.ts_inversion_rate > 0.0005;
+
+            if reconcile_fail {
+                stats.set_observe_only(true);
+                *paused.write().await = true;
+                let _ = bus.publish(EngineEvent::Control(ControlCommand::Pause));
+            }
+
+            append_jsonl(
+                &dataset_path("reports", "data_reconcile.jsonl"),
+                &serde_json::json!({
+                    "ts_ms": Utc::now().timestamp_millis(),
+                    "window_id": live.window_id,
+                    "data_valid_ratio": live.data_valid_ratio,
+                    "seq_gap_rate": live.seq_gap_rate,
+                    "ts_inversion_rate": live.ts_inversion_rate,
+                    "stale_tick_drop_ratio": live.stale_tick_drop_ratio,
+                    "ref_lines": ref_lines,
+                    "book_lines": book_lines,
+                    "ref_expected": ref_expected,
+                    "book_expected": book_expected,
+                    "ref_gap_ratio": ref_gap_ratio,
+                    "book_gap_ratio": book_gap_ratio,
+                    "reconcile_fail": reconcile_fail,
+                    "observe_only": stats.observe_only()
+                }),
+            );
         }
     });
 }
@@ -1114,14 +1471,24 @@ fn spawn_strategy_engine(
                     for fill in shadow.on_book(&book) {
                         portfolio.apply_fill(&fill);
                         let _ = bus.publish(EngineEvent::Fill(fill.clone()));
+                        let ingest_seq = next_normalized_ingest_seq();
                         append_jsonl(
                             &dataset_path("normalized", "fills.jsonl"),
-                            &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "fill": fill}),
+                            &serde_json::json!({
+                                "ts_ms": Utc::now().timestamp_millis(),
+                                "source_seq": Utc::now().timestamp_millis().max(0) as u64,
+                                "ingest_seq": ingest_seq,
+                                "fill": fill
+                            }),
                         );
                     }
 
                     if *paused.read().await {
                         shared.shadow_stats.record_issue("paused").await;
+                        continue;
+                    }
+                    if shared.shadow_stats.observe_only() {
+                        shared.shadow_stats.record_issue("observe_only").await;
                         continue;
                     }
 
@@ -1148,10 +1515,31 @@ fn spawn_strategy_engine(
                         continue;
                     };
 
-                    let feed_in_ms = estimate_feed_in_latency_ms(&tick, &book);
+                    let latency_sample = estimate_feed_latency(&tick, &book);
+                    let feed_in_ms = latency_sample.feed_in_ms;
                     shared.shadow_stats.push_feed_in_ms(feed_in_ms).await;
+                    shared
+                        .shadow_stats
+                        .push_source_latency_ms(latency_sample.source_latency_ms)
+                        .await;
+                    shared
+                        .shadow_stats
+                        .push_local_backlog_ms(latency_sample.local_backlog_ms)
+                        .await;
+                    shared
+                        .shadow_stats
+                        .push_decision_queue_wait_ms(latency_sample.local_backlog_ms)
+                        .await;
                     metrics::histogram!("latency.feed_in_ms").record(feed_in_ms);
-
+                    metrics::histogram!("latency.source_latency_ms")
+                        .record(latency_sample.source_latency_ms);
+                    metrics::histogram!("latency.local_backlog_ms")
+                        .record(latency_sample.local_backlog_ms);
+                    if feed_in_ms > 500.0 {
+                        shared.shadow_stats.mark_stale_tick_dropped();
+                        shared.shadow_stats.record_issue("stale_tick_dropped").await;
+                        continue;
+                    }
                     let tick_to_decision_start = Instant::now();
                     let signal_start = Instant::now();
                     let signal = fair.evaluate(&tick, &book);
@@ -1324,13 +1712,25 @@ fn spawn_strategy_engine(
 
                     let _ = bus.publish(EngineEvent::ToxicFeatures(tox_features.clone()));
                     let _ = bus.publish(EngineEvent::ToxicDecision(tox_decision.clone()));
+                    let ingest_seq_features = next_normalized_ingest_seq();
                     append_jsonl(
                         &dataset_path("normalized", "tox_features.jsonl"),
-                        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "features": tox_features}),
+                        &serde_json::json!({
+                            "ts_ms": Utc::now().timestamp_millis(),
+                            "source_seq": book.ts_ms.max(0) as u64,
+                            "ingest_seq": ingest_seq_features,
+                            "features": tox_features
+                        }),
                     );
+                    let ingest_seq_decisions = next_normalized_ingest_seq();
                     append_jsonl(
                         &dataset_path("normalized", "tox_decisions.jsonl"),
-                        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "decision": tox_decision}),
+                        &serde_json::json!({
+                            "ts_ms": Utc::now().timestamp_millis(),
+                            "source_seq": book.ts_ms.max(0) as u64,
+                            "ingest_seq": ingest_seq_decisions,
+                            "decision": tox_decision
+                        }),
                     );
                     let market_health = MarketHealth {
                         market_id: book.market_id.clone(),
@@ -1341,9 +1741,15 @@ fn spawn_strategy_engine(
                         queue_fill_proxy,
                         ts_ns: now_ns(),
                     };
+                    let ingest_seq_health = next_normalized_ingest_seq();
                     append_jsonl(
                         &dataset_path("normalized", "market_health.jsonl"),
-                        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "health": market_health}),
+                        &serde_json::json!({
+                            "ts_ms": Utc::now().timestamp_millis(),
+                            "source_seq": book.ts_ms.max(0) as u64,
+                            "ingest_seq": ingest_seq_health,
+                            "health": market_health
+                        }),
                     );
 
                     if market_score < tox_cfg.min_market_score {
@@ -1442,13 +1848,18 @@ fn spawn_strategy_engine(
                             continue;
                         }
 
-                        let tick_to_decision_ms =
+                        let decision_compute_ms =
                             tick_to_decision_start.elapsed().as_secs_f64() * 1_000.0;
+                        let tick_to_decision_ms = latency_sample.local_backlog_ms + decision_compute_ms;
                         let place_start = Instant::now();
                         match execution.place_order(intent.clone()).await {
                             Ok(ack) => {
                                 let ack_only_ms = place_start.elapsed().as_secs_f64() * 1_000.0;
                                 let tick_to_ack_ms = tick_to_decision_ms + ack_only_ms;
+                                shared
+                                    .shadow_stats
+                                    .push_decision_compute_ms(decision_compute_ms)
+                                    .await;
                                 shared
                                     .shadow_stats
                                     .push_tick_to_decision_ms(tick_to_decision_ms)
@@ -1460,6 +1871,10 @@ fn spawn_strategy_engine(
                                     .await;
                                 metrics::histogram!("latency.tick_to_decision_ms")
                                     .record(tick_to_decision_ms);
+                                metrics::histogram!("latency.decision_compute_ms")
+                                    .record(decision_compute_ms);
+                                metrics::histogram!("latency.decision_queue_wait_ms")
+                                    .record(latency_sample.local_backlog_ms);
                                 metrics::histogram!("latency.ack_only_ms").record(ack_only_ms);
                                 metrics::histogram!("latency.tick_to_ack_ms")
                                     .record(tick_to_ack_ms);
@@ -1600,6 +2015,9 @@ fn spawn_shadow_outcome_task(
         let net_markout_1s_bps = net_markout(pnl_1s_bps, &shot);
         let net_markout_5s_bps = net_markout(pnl_5s_bps, &shot);
         let net_markout_10s_bps = net_markout(pnl_10s_bps, &shot);
+        let entry_notional_usdc = estimate_entry_notional_usdc(&shot);
+        let net_markout_10s_usdc = bps_to_usdc(net_markout_10s_bps, entry_notional_usdc);
+        let roi_notional_10s_bps = roi_bps_from_usdc(net_markout_10s_usdc, entry_notional_usdc);
 
         let outcome = ShadowOutcome {
             shot_id: shot.shot_id.clone(),
@@ -1615,7 +2033,11 @@ fn spawn_shadow_outcome_task(
             net_markout_1s_bps,
             net_markout_5s_bps,
             net_markout_10s_bps,
+            entry_notional_usdc,
+            net_markout_10s_usdc,
+            roi_notional_10s_bps,
             queue_fill_prob,
+            is_stale_tick: false,
             is_outlier: false,
             robust_weight: 1.0,
             attribution,
@@ -1632,9 +2054,15 @@ fn spawn_shadow_outcome_task(
                 adverse_flag: outcome.net_markout_10s_bps.unwrap_or(0.0) < 0.0,
                 ts_ns: now_ns(),
             };
+            let ingest_seq = next_normalized_ingest_seq();
             append_jsonl(
                 &dataset_path("normalized", "quote_eval.jsonl"),
-                &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "eval": eval}),
+                &serde_json::json!({
+                    "ts_ms": Utc::now().timestamp_millis(),
+                    "source_seq": shot.t0_ns.max(0) as u64,
+                    "ingest_seq": ingest_seq,
+                    "eval": eval
+                }),
             );
             let _ = bus.publish(EngineEvent::QuoteEval(eval));
         }
@@ -1955,6 +2383,24 @@ fn net_markout(markout_bps: Option<f64>, shot: &ShadowShot) -> Option<f64> {
     markout_bps.map(|v| v - shot.fee_paid_bps + shot.rebate_est_bps)
 }
 
+fn estimate_entry_notional_usdc(shot: &ShadowShot) -> f64 {
+    (shot.intended_price.max(0.0) * shot.size.max(0.0)).max(0.0)
+}
+
+fn bps_to_usdc(bps: Option<f64>, notional_usdc: f64) -> Option<f64> {
+    if notional_usdc <= 0.0 {
+        return None;
+    }
+    bps.map(|v| (v / 10_000.0) * notional_usdc)
+}
+
+fn roi_bps_from_usdc(markout_usdc: Option<f64>, notional_usdc: f64) -> Option<f64> {
+    if notional_usdc <= 0.0 {
+        return None;
+    }
+    markout_usdc.map(|v| (v / notional_usdc) * 10_000.0)
+}
+
 async fn update_toxic_state_from_outcome(shared: &EngineShared, outcome: &ShadowOutcome) {
     if !outcome.fillable || outcome.delay_ms != 10 {
         return;
@@ -1989,14 +2435,39 @@ fn sigmoid(x: f64) -> f64 {
     }
 }
 
-fn estimate_feed_in_latency_ms(tick: &RefTick, book: &BookTop) -> f64 {
+#[derive(Debug, Clone, Copy, Default)]
+struct FeedLatencySample {
+    feed_in_ms: f64,
+    source_latency_ms: f64,
+    local_backlog_ms: f64,
+}
+
+fn estimate_feed_latency(tick: &RefTick, book: &BookTop) -> FeedLatencySample {
     let now = now_ns();
-    if tick.recv_ts_local_ns > 0 {
-        return ((now - tick.recv_ts_local_ns).max(0) as f64) / 1_000_000.0;
-    }
     let now_ms = now / 1_000_000;
-    let anchor = tick.recv_ts_ms.max(book.ts_ms);
-    (now_ms - anchor).max(0) as f64
+    let source_anchor_ms = tick
+        .event_ts_exchange_ms
+        .max(tick.event_ts_ms)
+        .max(book.ts_ms);
+    let source_latency_ms = (now_ms - source_anchor_ms).max(0) as f64;
+    let local_backlog_ms = if tick.recv_ts_local_ns > 0 {
+        ((now - tick.recv_ts_local_ns).max(0) as f64) / 1_000_000.0
+    } else {
+        (now_ms - tick.recv_ts_ms.max(book.ts_ms)).max(0) as f64
+    };
+    if tick.recv_ts_local_ns > 0 {
+        return FeedLatencySample {
+            feed_in_ms: local_backlog_ms,
+            source_latency_ms,
+            local_backlog_ms,
+        };
+    }
+    let feed_in_ms = (now_ms - tick.recv_ts_ms.max(book.ts_ms)).max(0) as f64;
+    FeedLatencySample {
+        feed_in_ms,
+        source_latency_ms,
+        local_backlog_ms,
+    }
 }
 
 async fn get_fee_rate_bps_cached(shared: &EngineShared, market_id: &str) -> f64 {
@@ -2692,6 +3163,19 @@ fn dataset_path(kind: &str, filename: &str) -> PathBuf {
     dataset_dir(kind).join(filename)
 }
 
+fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn count_jsonl_lines(path: &Path) -> i64 {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return 0;
+    };
+    raw.lines().filter(|l| !l.trim().is_empty()).count() as i64
+}
+
 #[derive(Debug)]
 struct JsonlWriteReq {
     path: PathBuf,
@@ -2702,6 +3186,11 @@ static JSONL_WRITER: OnceLock<mpsc::Sender<JsonlWriteReq>> = OnceLock::new();
 static JSONL_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
 static JSONL_QUEUE_CAP: AtomicU64 = AtomicU64::new(0);
 static JSONL_DROP_ON_FULL: AtomicBool = AtomicBool::new(true);
+static NORMALIZED_INGEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn next_normalized_ingest_seq() -> u64 {
+    NORMALIZED_INGEST_SEQ.fetch_add(1, Ordering::Relaxed) + 1
+}
 
 async fn init_jsonl_writer(perf_profile: Arc<RwLock<PerfProfile>>) {
     if JSONL_WRITER.get().is_some() {
@@ -2842,6 +3331,14 @@ fn persist_final_report_files(report: &ShadowFinalReport) {
         report.gate.net_edge_p10_bps
     ));
     md.push_str(&format!(
+        "- net_markout_10s_usdc_p50: {:.6}\n",
+        report.gate.net_markout_10s_usdc_p50
+    ));
+    md.push_str(&format!(
+        "- roi_notional_10s_bps_p50: {:.6}\n",
+        report.gate.roi_notional_10s_bps_p50
+    ));
+    md.push_str(&format!(
         "- pnl_10s_p50_bps_raw: {:.4}\n",
         report.gate.pnl_10s_p50_bps_raw
     ));
@@ -2870,6 +3367,22 @@ fn persist_final_report_files(report: &ShadowFinalReport) {
         report.gate.strategy_uptime_pct
     ));
     md.push_str(&format!(
+        "- data_valid_ratio: {:.5}\n",
+        report.gate.data_valid_ratio
+    ));
+    md.push_str(&format!(
+        "- seq_gap_rate: {:.5}\n",
+        report.gate.seq_gap_rate
+    ));
+    md.push_str(&format!(
+        "- ts_inversion_rate: {:.5}\n",
+        report.gate.ts_inversion_rate
+    ));
+    md.push_str(&format!(
+        "- stale_tick_drop_ratio: {:.5}\n",
+        report.gate.stale_tick_drop_ratio
+    ));
+    md.push_str(&format!(
         "- tick_to_ack_p99_ms: {:.4}\n\n",
         report.gate.tick_to_ack_p99_ms
     ));
@@ -2880,6 +3393,22 @@ fn persist_final_report_files(report: &ShadowFinalReport) {
     md.push_str(&format!(
         "- ack_only_p99_ms: {:.4}\n",
         report.live.ack_only_p99_ms
+    ));
+    md.push_str(&format!(
+        "- decision_queue_wait_p99_ms: {:.4}\n",
+        report.gate.decision_queue_wait_p99_ms
+    ));
+    md.push_str(&format!(
+        "- decision_compute_p99_ms: {:.4}\n",
+        report.gate.decision_compute_p99_ms
+    ));
+    md.push_str(&format!(
+        "- source_latency_p99_ms: {:.4}\n",
+        report.gate.source_latency_p99_ms
+    ));
+    md.push_str(&format!(
+        "- local_backlog_p99_ms: {:.4}\n",
+        report.gate.local_backlog_p99_ms
     ));
     md.push_str(&format!(
         "- queue_depth_p99: {:.4}\n",
@@ -2947,6 +3476,18 @@ fn persist_final_report_files(report: &ShadowFinalReport) {
         report.live.latency.risk_p99_us
     ));
     latency_rows.push_str(&format!(
+        "decision_queue_wait,{:.6},{:.6},{:.6},ms\n",
+        report.live.latency.decision_queue_wait_p50_ms,
+        report.live.latency.decision_queue_wait_p90_ms,
+        report.live.latency.decision_queue_wait_p99_ms
+    ));
+    latency_rows.push_str(&format!(
+        "decision_compute,{:.6},{:.6},{:.6},ms\n",
+        report.live.latency.decision_compute_p50_ms,
+        report.live.latency.decision_compute_p90_ms,
+        report.live.latency.decision_compute_p99_ms
+    ));
+    latency_rows.push_str(&format!(
         "tick_to_decision,{:.6},{:.6},{:.6},ms\n",
         report.live.latency.tick_to_decision_p50_ms,
         report.live.latency.tick_to_decision_p90_ms,
@@ -2982,14 +3523,26 @@ fn persist_final_report_files(report: &ShadowFinalReport) {
         report.live.latency.shadow_fill_p90_ms,
         report.live.latency.shadow_fill_p99_ms
     ));
+    latency_rows.push_str(&format!(
+        "source_latency,{:.6},{:.6},{:.6},ms\n",
+        report.live.latency.source_latency_p50_ms,
+        report.live.latency.source_latency_p90_ms,
+        report.live.latency.source_latency_p99_ms
+    ));
+    latency_rows.push_str(&format!(
+        "local_backlog,{:.6},{:.6},{:.6},ms\n",
+        report.live.latency.local_backlog_p50_ms,
+        report.live.latency.local_backlog_p90_ms,
+        report.live.latency.local_backlog_p99_ms
+    ));
     let _ = fs::write(latency_csv, latency_rows);
 
     let score_path = reports_dir.join("market_scorecard.csv");
     let mut score_rows = String::new();
-    score_rows.push_str("market_id,symbol,shots,outcomes,fillability_10ms,net_edge_p50_bps,net_edge_p10_bps,pnl_10s_p50_bps\n");
+    score_rows.push_str("market_id,symbol,shots,outcomes,fillability_10ms,net_edge_p50_bps,net_edge_p10_bps,pnl_10s_p50_bps,net_markout_10s_usdc_p50,roi_notional_10s_bps_p50\n");
     for row in &report.live.market_scorecard {
         score_rows.push_str(&format!(
-            "{},{},{},{},{:.6},{:.6},{:.6},{:.6}\n",
+            "{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}\n",
             row.market_id,
             row.symbol,
             row.shots,
@@ -2997,7 +3550,9 @@ fn persist_final_report_files(report: &ShadowFinalReport) {
             row.fillability_10ms,
             row.net_edge_p50_bps,
             row.net_edge_p10_bps,
-            row.pnl_10s_p50_bps
+            row.pnl_10s_p50_bps,
+            row.net_markout_10s_usdc_p50,
+            row.roi_notional_10s_bps_p50
         ));
     }
     let _ = fs::write(score_path, score_rows);
@@ -3097,6 +3652,14 @@ fn build_market_scorecard(shots: &[ShadowShot], outcomes: &[ShadowOutcome]) -> V
             .iter()
             .filter_map(|o| o.net_markout_10s_bps.or(o.pnl_10s_bps))
             .collect::<Vec<_>>();
+        let net_markout_10s_usdc = market_outcomes_primary
+            .iter()
+            .filter_map(|o| o.net_markout_10s_usdc)
+            .collect::<Vec<_>>();
+        let roi_notional_10s_bps = market_outcomes_primary
+            .iter()
+            .filter_map(|o| o.roi_notional_10s_bps)
+            .collect::<Vec<_>>();
 
         rows.push(MarketScoreRow {
             market_id,
@@ -3107,10 +3670,15 @@ fn build_market_scorecard(shots: &[ShadowShot], outcomes: &[ShadowOutcome]) -> V
             net_edge_p50_bps: percentile(&net_edges, 0.50).unwrap_or(0.0),
             net_edge_p10_bps: percentile(&net_edges, 0.10).unwrap_or(0.0),
             pnl_10s_p50_bps: percentile(&pnl_10s, 0.50).unwrap_or(0.0),
+            net_markout_10s_usdc_p50: percentile(&net_markout_10s_usdc, 0.50).unwrap_or(0.0),
+            roi_notional_10s_bps_p50: percentile(&roi_notional_10s_bps, 0.50).unwrap_or(0.0),
         });
     }
 
-    rows.sort_by(|a, b| b.net_edge_p50_bps.total_cmp(&a.net_edge_p50_bps));
+    rows.sort_by(|a, b| {
+        b.net_markout_10s_usdc_p50
+            .total_cmp(&a.net_markout_10s_usdc_p50)
+    });
     rows
 }
 

@@ -41,6 +41,9 @@ def evaluate_alerts(
     max_ref_freshness_ms: int,
     max_book_freshness_ms: int,
     max_tick_to_ack_p99_ms: float,
+    max_feed_in_p99_ms: float,
+    max_decision_compute_p99_ms: float,
+    min_data_valid_ratio: float,
     max_block_ratio: float,
     min_attempt_for_block_ratio: int,
 ) -> List[Dict[str, Any]]:
@@ -77,6 +80,36 @@ def evaluate_alerts(
                     f"tick_to_ack_p99_ms={tick_to_ack_p99:.3f} > "
                     f"{max_tick_to_ack_p99_ms:.3f}"
                 ),
+            }
+        )
+    feed_in_p99 = float((live.get("latency") or {}).get("feed_in_p99_ms", 0.0))
+    if feed_in_p99 > max_feed_in_p99_ms:
+        alerts.append(
+            {
+                "type": "feed_in_tail_high",
+                "detail": (
+                    f"feed_in_p99_ms={feed_in_p99:.3f} > "
+                    f"{max_feed_in_p99_ms:.3f}"
+                ),
+            }
+        )
+    decision_compute_p99 = float(live.get("decision_compute_p99_ms", 0.0))
+    if decision_compute_p99 > max_decision_compute_p99_ms:
+        alerts.append(
+            {
+                "type": "decision_compute_tail_high",
+                "detail": (
+                    f"decision_compute_p99_ms={decision_compute_p99:.3f} > "
+                    f"{max_decision_compute_p99_ms:.3f}"
+                ),
+            }
+        )
+    data_valid_ratio = float(live.get("data_valid_ratio", 1.0))
+    if data_valid_ratio < min_data_valid_ratio:
+        alerts.append(
+            {
+                "type": "data_valid_ratio_low",
+                "detail": f"data_valid_ratio={data_valid_ratio:.5f} < {min_data_valid_ratio:.5f}",
             }
         )
 
@@ -129,11 +162,9 @@ def evaluate_alerts(
             gate_fail_reasons.append("fillability_10ms<0.60")
         if float(live.get("net_edge_p50_bps", 0.0)) <= 0.0:
             gate_fail_reasons.append("net_edge_p50_bps<=0")
-        pnl_robust = float(
-            live.get("pnl_10s_p50_bps_robust", live.get("pnl_10s_p50_bps", 0.0))
-        )
-        if pnl_robust <= 0.0:
-            gate_fail_reasons.append("pnl_10s_p50_bps_robust<=0")
+        net_markout_usdc = float(live.get("net_markout_10s_usdc_p50", 0.0))
+        if net_markout_usdc <= 0.0:
+            gate_fail_reasons.append("net_markout_10s_usdc_p50<=0")
         reported = live.get("gate_fail_reasons")
         if isinstance(reported, list):
             for reason in reported:
@@ -188,7 +219,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-ref-freshness-ms", type=int, default=5000)
     p.add_argument("--max-book-freshness-ms", type=int, default=5000)
     p.add_argument("--max-tick-to-ack-p99-ms", type=float, default=450.0)
-    p.add_argument("--max-block-ratio", type=float, default=0.3)
+    p.add_argument("--max-feed-in-p99-ms", type=float, default=800.0)
+    p.add_argument("--max-decision-compute-p99-ms", type=float, default=2.0)
+    p.add_argument("--min-data-valid-ratio", type=float, default=0.999)
+    p.add_argument("--max-block-ratio", type=float, default=0.10)
     p.add_argument("--min-attempt-for-block-ratio", type=int, default=100)
     p.add_argument("--max-cycles", type=int, default=0)
     p.add_argument("--max-runtime-sec", type=int, default=0)
@@ -221,6 +255,9 @@ def run_once(session: requests.Session, args: argparse.Namespace) -> int:
             max_ref_freshness_ms=args.max_ref_freshness_ms,
             max_book_freshness_ms=args.max_book_freshness_ms,
             max_tick_to_ack_p99_ms=args.max_tick_to_ack_p99_ms,
+            max_feed_in_p99_ms=args.max_feed_in_p99_ms,
+            max_decision_compute_p99_ms=args.max_decision_compute_p99_ms,
+            min_data_valid_ratio=args.min_data_valid_ratio,
             max_block_ratio=args.max_block_ratio,
             min_attempt_for_block_ratio=args.min_attempt_for_block_ratio,
         )

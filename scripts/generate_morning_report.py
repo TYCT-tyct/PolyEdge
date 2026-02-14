@@ -82,9 +82,15 @@ def build_recommendations(live: Dict[str, Any], alert_count: Counter[str]) -> Li
         )
     if float(live.get("tick_to_ack_p99_ms", 0.0)) > 450.0:
         recs.append("E2E p99 too high. Investigate tail latency and network jitter.")
-    pnl_robust = float(live.get("pnl_10s_p50_bps_robust", live.get("pnl_10s_p50_bps", 0.0)))
-    if pnl_robust <= 0.0:
-        recs.append("Realized pnl_10s median is non-positive. Keep Shadow mode and retune edge/fees.")
+    if float((live.get("latency") or {}).get("feed_in_p99_ms", 0.0)) > 800.0:
+        recs.append("feed_in p99 too high. Enable strict stale tick filter and inspect source/local latency split.")
+    if float(live.get("decision_compute_p99_ms", 0.0)) > 2.0:
+        recs.append("decision_compute p99 too high. Reduce lock contention and hot-path logging.")
+    if float(live.get("data_valid_ratio", 1.0)) < 0.999:
+        recs.append("Data validity below 99.9%. Pause quoting and fix raw->normalized reconciliation.")
+    net_markout_usdc = float(live.get("net_markout_10s_usdc_p50", 0.0))
+    if net_markout_usdc <= 0.0:
+        recs.append("Median net markout (USDC) is non-positive. Keep Shadow mode and retune edge/fees.")
     if int(live.get("quote_attempted", 0)) > 100 and int(live.get("total_shots", 0)) == 0:
         recs.append("Many quote attempts but zero shadow shots. Re-check edge model vs fee/rebate.")
 
@@ -133,6 +139,8 @@ def write_report(
     window_outcomes = int(live.get("window_outcomes", 0))
     pnl_raw = float(live.get("pnl_10s_p50_bps_raw", live.get("pnl_10s_p50_bps", 0.0)))
     pnl_robust = float(live.get("pnl_10s_p50_bps_robust", pnl_raw))
+    net_markout_usdc = float(live.get("net_markout_10s_usdc_p50", 0.0))
+    roi_notional = float(live.get("roi_notional_10s_bps_p50", 0.0))
     pnl_outlier_ratio = float(live.get("pnl_10s_outlier_ratio", 0.0))
     queue_depth_p99 = float(live.get("queue_depth_p99", 0.0))
     event_backlog_p99 = float(live.get("event_backlog_p99", 0.0))
@@ -145,6 +153,11 @@ def write_report(
     lines.append(f"- window_shots: {window_shots}")
     lines.append(f"- window_outcomes: {window_outcomes}")
     lines.append(f"- gate_ready: {str(gate_ready).lower()}")
+    lines.append(f"- observe_only: {str(bool(live.get('observe_only', False))).lower()}")
+    lines.append(f"- data_valid_ratio: {float(live.get('data_valid_ratio', 1.0)):.5f}")
+    lines.append(f"- seq_gap_rate: {float(live.get('seq_gap_rate', 0.0)):.5f}")
+    lines.append(f"- ts_inversion_rate: {float(live.get('ts_inversion_rate', 0.0)):.5f}")
+    lines.append(f"- stale_tick_drop_ratio: {float(live.get('stale_tick_drop_ratio', 0.0)):.5f}")
     lines.append(f"- quote_attempted: {attempted}")
     lines.append(f"- quote_blocked: {blocked}")
     lines.append(f"- quote_block_ratio: {block_ratio:.4f}")
@@ -158,9 +171,19 @@ def write_report(
     lines.append(f"- pnl_5s_p50_bps: {float(live.get('pnl_5s_p50_bps', 0.0)):.4f}")
     lines.append(f"- pnl_10s_p50_bps_raw: {pnl_raw:.4f}")
     lines.append(f"- pnl_10s_p50_bps_robust: {pnl_robust:.4f}")
+    lines.append(f"- net_markout_10s_usdc_p50: {net_markout_usdc:.6f}")
+    lines.append(f"- roi_notional_10s_bps_p50: {roi_notional:.6f}")
     lines.append(f"- pnl_10s_outlier_ratio: {pnl_outlier_ratio:.4f}")
     lines.append(f"- tick_to_ack_p99_ms: {float(live.get('tick_to_ack_p99_ms', 0.0)):.3f}")
     lines.append(f"- tick_to_decision_p50_ms: {float(live.get('tick_to_decision_p50_ms', 0.0)):.3f}")
+    lines.append(
+        f"- decision_queue_wait_p99_ms: {float(live.get('decision_queue_wait_p99_ms', 0.0)):.3f}"
+    )
+    lines.append(
+        f"- decision_compute_p99_ms: {float(live.get('decision_compute_p99_ms', 0.0)):.3f}"
+    )
+    lines.append(f"- source_latency_p99_ms: {float(live.get('source_latency_p99_ms', 0.0)):.3f}")
+    lines.append(f"- local_backlog_p99_ms: {float(live.get('local_backlog_p99_ms', 0.0)):.3f}")
     lines.append(f"- ack_only_p50_ms: {float(live.get('ack_only_p50_ms', 0.0)):.3f}")
     lines.append(f"- queue_depth_p99: {queue_depth_p99:.3f}")
     lines.append(f"- event_backlog_p99: {event_backlog_p99:.3f}")

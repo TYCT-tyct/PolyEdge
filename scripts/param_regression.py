@@ -69,21 +69,30 @@ class TrialResult:
     pnl_10s_p50_bps_raw: float
     pnl_10s_p50_bps_robust: float
     pnl_10s_p25_bps_robust: float
+    net_markout_10s_usdc_p50: float
+    roi_notional_10s_bps_p50: float
     quote_block_ratio: float
     policy_block_ratio: float
     tick_to_ack_p99_ms: float
+    decision_compute_p99_ms: float
+    feed_in_p99_ms: float
+    data_valid_ratio: float
     net_edge_p50_bps: float
     gate_fail_reasons: List[str]
 
     def gate_pass(self) -> bool:
         return (
             self.gate_ready
-            and self.pnl_10s_p50_bps_robust > 0.0
+            and self.net_markout_10s_usdc_p50 > 0.0
+            and self.roi_notional_10s_bps_p50 > 0.0
             and self.pnl_10s_p25_bps_robust > -20.0
             and self.fillability_10ms >= 0.60
             and self.quote_block_ratio < 0.10
-            and self.policy_block_ratio < 0.30
+            and self.policy_block_ratio < 0.10
             and self.tick_to_ack_p99_ms < 450.0
+            and self.decision_compute_p99_ms < 2.0
+            and self.feed_in_p99_ms < 800.0
+            and self.data_valid_ratio >= 0.999
         )
 
 
@@ -94,12 +103,17 @@ def score_trial(row: TrialResult) -> float:
         score += 200.0
     if row.gate_pass():
         score += 1000.0
-    score += row.pnl_10s_p50_bps_robust * 0.5
+    score += row.net_markout_10s_usdc_p50 * 50.0
+    score += row.roi_notional_10s_bps_p50 * 0.3
+    score += row.pnl_10s_p50_bps_robust * 0.2
     score += row.fillability_10ms * 100.0
     score += row.net_edge_p50_bps * 0.1
     score -= row.quote_block_ratio * 300.0
     score -= row.policy_block_ratio * 120.0
     score -= row.tick_to_ack_p99_ms * 0.2
+    score -= row.feed_in_p99_ms * 0.05
+    score -= row.decision_compute_p99_ms * 20.0
+    score -= max(0.0, 0.999 - row.data_valid_ratio) * 10_000.0
     return score
 
 
@@ -160,9 +174,14 @@ def run_trial(
     fillability: List[float] = []
     pnl10: List[float] = []
     pnl10_raw: List[float] = []
+    net_markout_usdc: List[float] = []
+    roi_notional_bps: List[float] = []
     block_ratio: List[float] = []
     policy_block_ratio: List[float] = []
     tick_ack: List[float] = []
+    decision_compute_p99: List[float] = []
+    feed_in_p99: List[float] = []
+    data_valid_ratio: List[float] = []
     net_edge: List[float] = []
     gate_ready_vals: List[float] = []
     window_outcomes_vals: List[float] = []
@@ -179,9 +198,14 @@ def run_trial(
         pnl10.append(
             float(live.get("pnl_10s_p50_bps_robust", live.get("pnl_10s_p50_bps", 0.0)))
         )
+        net_markout_usdc.append(float(live.get("net_markout_10s_usdc_p50", 0.0)))
+        roi_notional_bps.append(float(live.get("roi_notional_10s_bps_p50", 0.0)))
         block_ratio.append(float(live.get("quote_block_ratio", 0.0)))
         policy_block_ratio.append(float(live.get("policy_block_ratio", 0.0)))
         tick_ack.append(float(live.get("tick_to_ack_p99_ms", 0.0)))
+        decision_compute_p99.append(float(live.get("decision_compute_p99_ms", 0.0)))
+        feed_in_p99.append(float((live.get("latency") or {}).get("feed_in_p99_ms", 0.0)))
+        data_valid_ratio.append(float(live.get("data_valid_ratio", 1.0)))
         net_edge.append(float(live.get("net_edge_p50_bps", 0.0)))
         gate_ready_vals.append(1.0 if bool(live.get("gate_ready", False)) else 0.0)
         window_outcomes_vals.append(float(live.get("window_outcomes", live.get("total_outcomes", 0.0))))
@@ -215,9 +239,14 @@ def run_trial(
         pnl_10s_p50_bps_raw=percentile(pnl10_raw, 0.50),
         pnl_10s_p50_bps_robust=percentile(pnl10, 0.50),
         pnl_10s_p25_bps_robust=percentile(pnl10, 0.25),
+        net_markout_10s_usdc_p50=percentile(net_markout_usdc, 0.50),
+        roi_notional_10s_bps_p50=percentile(roi_notional_bps, 0.50),
         quote_block_ratio=percentile(block_ratio, 0.50),
         policy_block_ratio=percentile(policy_block_ratio, 0.50),
         tick_to_ack_p99_ms=percentile(tick_ack, 0.50),
+        decision_compute_p99_ms=percentile(decision_compute_p99, 0.50),
+        feed_in_p99_ms=percentile(feed_in_p99, 0.50),
+        data_valid_ratio=percentile(data_valid_ratio, 0.50),
         net_edge_p50_bps=percentile(net_edge, 0.50),
         gate_fail_reasons=gate_fail_reasons,
     )
@@ -244,9 +273,14 @@ def write_ablation_csv(path: Path, rows: Iterable[TrialResult]) -> None:
                 "pnl_10s_p50_bps_raw",
                 "pnl_10s_p50_bps_robust",
                 "pnl_10s_p25_bps_robust",
+                "net_markout_10s_usdc_p50",
+                "roi_notional_10s_bps_p50",
                 "quote_block_ratio",
                 "policy_block_ratio",
                 "tick_to_ack_p99_ms",
+                "decision_compute_p99_ms",
+                "feed_in_p99_ms",
+                "data_valid_ratio",
                 "net_edge_p50_bps",
                 "gate_pass",
             ]
@@ -269,9 +303,14 @@ def write_ablation_csv(path: Path, rows: Iterable[TrialResult]) -> None:
                     f"{row.pnl_10s_p50_bps_raw:.6f}",
                     f"{row.pnl_10s_p50_bps_robust:.6f}",
                     f"{row.pnl_10s_p25_bps_robust:.6f}",
+                    f"{row.net_markout_10s_usdc_p50:.6f}",
+                    f"{row.roi_notional_10s_bps_p50:.6f}",
                     f"{row.quote_block_ratio:.6f}",
                     f"{row.policy_block_ratio:.6f}",
                     f"{row.tick_to_ack_p99_ms:.6f}",
+                    f"{row.decision_compute_p99_ms:.6f}",
+                    f"{row.feed_in_p99_ms:.6f}",
+                    f"{row.data_valid_ratio:.6f}",
                     f"{row.net_edge_p50_bps:.6f}",
                     row.gate_pass(),
                 ]
@@ -304,6 +343,7 @@ def write_summary_md(path: Path, rows: List[TrialResult]) -> None:
                 f"k={row.basis_k_revert}, z={row.basis_z_cap}, "
                 f"pnl10_raw_p50={row.pnl_10s_p50_bps_raw:.3f}, "
                 f"pnl10_robust_p50={row.pnl_10s_p50_bps_robust:.3f}, "
+                f"net_usdc_p50={row.net_markout_10s_usdc_p50:.4f}, "
                 f"fill10={row.fillability_10ms:.3f}, block={row.quote_block_ratio:.3f}, "
                 f"ready={row.gate_ready}, "
                 f"tick_to_ack_p99={row.tick_to_ack_p99_ms:.3f}, gate={row.gate_pass()}"
@@ -318,21 +358,29 @@ def write_fixlist(path: Path, best: TrialResult | None) -> None:
         lines.append("- No trial results. Check app health and API connectivity.")
     elif best.gate_pass():
         lines.append("- Conservative gate passed on best trial. Keep Shadow mode and extend soak run.")
-        if best.policy_block_ratio >= 0.30:
+        if best.policy_block_ratio >= 0.10:
             lines.append(
                 "- policy_block_ratio is still high. Strategy is profitable but opportunity suppression is excessive."
             )
     else:
-        if best.pnl_10s_p50_bps_robust <= 0.0:
-            lines.append("- pnl_10s_p50_bps_robust still <= 0. Increase edge threshold and reduce toxic markets.")
+        if best.net_markout_10s_usdc_p50 <= 0.0:
+            lines.append("- net_markout_10s_usdc_p50 still <= 0. Keep Shadow mode and reduce toxic market exposure.")
+        if best.roi_notional_10s_bps_p50 <= 0.0:
+            lines.append("- roi_notional_10s_bps_p50 <= 0. Raise min_edge_bps and tighten stale filters.")
         if best.pnl_10s_p25_bps_robust <= -20.0:
             lines.append("- pnl_10s_p25_bps_robust <= -20. Tighten toxicity danger threshold and shorter TTL.")
         if best.fillability_10ms < 0.60:
             lines.append("- fillability_10ms below 0.60. Revisit spread/size and queue proxy assumptions.")
         if best.quote_block_ratio >= 0.10:
             lines.append("- quote_block_ratio too high. Relax min_edge or widen active market top-N.")
-        if best.policy_block_ratio >= 0.30:
+        if best.policy_block_ratio >= 0.10:
             lines.append("- policy_block_ratio too high. Re-tune no_quote_policy and market rank gating.")
+        if best.data_valid_ratio < 0.999:
+            lines.append("- data_valid_ratio below 99.9%. Fix feed validity/reconcile pipeline before parameter tuning.")
+        if best.feed_in_p99_ms >= 800.0:
+            lines.append("- feed_in_p99_ms too high. Apply stale tick filter and investigate source/local backlog split.")
+        if best.decision_compute_p99_ms >= 2.0:
+            lines.append("- decision_compute_p99_ms too high. Reduce lock contention/log overhead on hot path.")
         if not best.gate_ready:
             lines.append("- gate_ready is false. Increase eval window or reduce min_outcomes.")
         if best.tick_to_ack_p99_ms >= 450.0:
@@ -423,7 +471,8 @@ def main() -> int:
         key=lambda r: (
             r.gate_pass(),
             r.gate_ready,
-            r.pnl_10s_p50_bps_robust,
+            r.net_markout_10s_usdc_p50,
+            r.roi_notional_10s_bps_p50,
             r.fillability_10ms,
             -r.quote_block_ratio,
             -r.tick_to_ack_p99_ms,

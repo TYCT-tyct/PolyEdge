@@ -25,15 +25,25 @@ def collect_engine_metrics(base_url: str, seconds: int, poll_interval: float) ->
 
     series: Dict[str, List[float]] = {
         "tick_to_decision_p99_ms": [],
+        "decision_queue_wait_p99_ms": [],
+        "decision_compute_p99_ms": [],
         "tick_to_ack_p99_ms": [],
         "ack_only_p99_ms": [],
         "feed_in_p50_ms": [],
+        "source_latency_p99_ms": [],
+        "local_backlog_p99_ms": [],
+        "data_valid_ratio": [],
+        "seq_gap_rate": [],
+        "ts_inversion_rate": [],
+        "stale_tick_drop_ratio": [],
         "quote_block_ratio": [],
         "policy_block_ratio": [],
         "queue_depth_p99": [],
         "event_backlog_p99": [],
         "pnl_10s_p50_bps_raw": [],
         "pnl_10s_p50_bps_robust": [],
+        "net_markout_10s_usdc_p50": [],
+        "roi_notional_10s_bps_p50": [],
         "pnl_10s_outlier_ratio": [],
         "gate_ready_ratio": [],
         "window_outcomes": [],
@@ -47,14 +57,24 @@ def collect_engine_metrics(base_url: str, seconds: int, poll_interval: float) ->
             latency = live.get("latency") or {}
             for key in (
                 "tick_to_decision_p99_ms",
+                "decision_queue_wait_p99_ms",
+                "decision_compute_p99_ms",
                 "tick_to_ack_p99_ms",
                 "ack_only_p99_ms",
+                "source_latency_p99_ms",
+                "local_backlog_p99_ms",
+                "data_valid_ratio",
+                "seq_gap_rate",
+                "ts_inversion_rate",
+                "stale_tick_drop_ratio",
                 "quote_block_ratio",
                 "policy_block_ratio",
                 "queue_depth_p99",
                 "event_backlog_p99",
                 "pnl_10s_p50_bps_raw",
                 "pnl_10s_p50_bps_robust",
+                "net_markout_10s_usdc_p50",
+                "roi_notional_10s_bps_p50",
                 "pnl_10s_outlier_ratio",
                 "window_outcomes",
             ):
@@ -92,9 +112,19 @@ def main() -> None:
     print(f"base_url={args.base_url} symbol={args.symbol} mode={args.mode}")
     print(f"samples={engine['samples']} failures={engine['failures']}")
     print_stat_block("tick_to_decision_p99", engine["stats"]["tick_to_decision_p99_ms"], "ms")
+    print_stat_block(
+        "decision_queue_wait_p99", engine["stats"]["decision_queue_wait_p99_ms"], "ms"
+    )
+    print_stat_block("decision_compute_p99", engine["stats"]["decision_compute_p99_ms"], "ms")
     print_stat_block("tick_to_ack_p99", engine["stats"]["tick_to_ack_p99_ms"], "ms")
     print_stat_block("ack_only_p99", engine["stats"]["ack_only_p99_ms"], "ms")
     print_stat_block("feed_in_p50", engine["stats"]["feed_in_p50_ms"], "ms")
+    print_stat_block("source_latency_p99", engine["stats"]["source_latency_p99_ms"], "ms")
+    print_stat_block("local_backlog_p99", engine["stats"]["local_backlog_p99_ms"], "ms")
+    print_stat_block("data_valid_ratio", engine["stats"]["data_valid_ratio"], "")
+    print_stat_block("seq_gap_rate", engine["stats"]["seq_gap_rate"], "")
+    print_stat_block("ts_inversion_rate", engine["stats"]["ts_inversion_rate"], "")
+    print_stat_block("stale_tick_drop_ratio", engine["stats"]["stale_tick_drop_ratio"], "")
     print_stat_block("quote_block_ratio", engine["stats"]["quote_block_ratio"], "")
     print_stat_block("policy_block_ratio", engine["stats"]["policy_block_ratio"], "")
     print_stat_block("queue_depth_p99", engine["stats"]["queue_depth_p99"], "")
@@ -102,6 +132,12 @@ def main() -> None:
     print_stat_block("pnl_10s_p50_bps_raw", engine["stats"]["pnl_10s_p50_bps_raw"], "bps")
     print_stat_block(
         "pnl_10s_p50_bps_robust", engine["stats"]["pnl_10s_p50_bps_robust"], "bps"
+    )
+    print_stat_block(
+        "net_markout_10s_usdc_p50", engine["stats"]["net_markout_10s_usdc_p50"], "usdc"
+    )
+    print_stat_block(
+        "roi_notional_10s_bps_p50", engine["stats"]["roi_notional_10s_bps_p50"], "bps"
     )
     print_stat_block("pnl_10s_outlier_ratio", engine["stats"]["pnl_10s_outlier_ratio"], "")
     print_stat_block("gate_ready_ratio", engine["stats"]["gate_ready_ratio"], "")

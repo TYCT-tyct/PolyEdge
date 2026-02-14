@@ -37,9 +37,13 @@ class RegionStats:
     tick_to_ack_p99_ms_p50: float
     tick_to_decision_p99_ms_p50: float
     quote_block_ratio_p50: float
-    pnl_10s_p50_bps_robust_p50: float
+    net_markout_10s_usdc_p50: float
+    roi_notional_10s_bps_p50: float
     fillability_10ms_p50: float
     feed_in_p50_ms_p50: float
+    feed_in_p99_ms_p50: float
+    decision_compute_p99_ms_p50: float
+    data_valid_ratio_p50: float
     gate_ready_ratio_p50: float
     window_outcomes_p50: float
 
@@ -57,9 +61,13 @@ def collect(
     tick_ack: List[float] = []
     tick_decision: List[float] = []
     block_ratio: List[float] = []
-    pnl_robust: List[float] = []
+    net_markout_usdc: List[float] = []
+    roi_notional_bps: List[float] = []
     fillability: List[float] = []
     feed_in: List[float] = []
+    feed_in_p99: List[float] = []
+    decision_compute_p99: List[float] = []
+    data_valid_ratio: List[float] = []
     gate_ready_ratio: List[float] = []
     window_outcomes: List[float] = []
     next_heartbeat = time.time() + max(1.0, heartbeat_sec)
@@ -74,11 +82,13 @@ def collect(
             tick_ack.append(float(live.get("tick_to_ack_p99_ms", 0.0)))
             tick_decision.append(float(live.get("tick_to_decision_p99_ms", 0.0)))
             block_ratio.append(float(live.get("quote_block_ratio", 0.0)))
-            pnl_robust.append(
-                float(live.get("pnl_10s_p50_bps_robust", live.get("pnl_10s_p50_bps", 0.0)))
-            )
+            net_markout_usdc.append(float(live.get("net_markout_10s_usdc_p50", 0.0)))
+            roi_notional_bps.append(float(live.get("roi_notional_10s_bps_p50", 0.0)))
             fillability.append(float(live.get("fillability_10ms", 0.0)))
             feed_in.append(float(latency.get("feed_in_p50_ms", 0.0)))
+            feed_in_p99.append(float(latency.get("feed_in_p99_ms", 0.0)))
+            decision_compute_p99.append(float(live.get("decision_compute_p99_ms", 0.0)))
+            data_valid_ratio.append(float(live.get("data_valid_ratio", 1.0)))
             gate_ready_ratio.append(1.0 if bool(live.get("gate_ready", False)) else 0.0)
             window_outcomes.append(
                 float(live.get("window_outcomes", live.get("total_outcomes", 0.0)))
@@ -105,9 +115,13 @@ def collect(
         tick_to_ack_p99_ms_p50=percentile(tick_ack, 0.50),
         tick_to_decision_p99_ms_p50=percentile(tick_decision, 0.50),
         quote_block_ratio_p50=percentile(block_ratio, 0.50),
-        pnl_10s_p50_bps_robust_p50=percentile(pnl_robust, 0.50),
+        net_markout_10s_usdc_p50=percentile(net_markout_usdc, 0.50),
+        roi_notional_10s_bps_p50=percentile(roi_notional_bps, 0.50),
         fillability_10ms_p50=percentile(fillability, 0.50),
         feed_in_p50_ms_p50=percentile(feed_in, 0.50),
+        feed_in_p99_ms_p50=percentile(feed_in_p99, 0.50),
+        decision_compute_p99_ms_p50=percentile(decision_compute_p99, 0.50),
+        data_valid_ratio_p50=percentile(data_valid_ratio, 0.50),
         gate_ready_ratio_p50=percentile(gate_ready_ratio, 0.50),
         window_outcomes_p50=percentile(window_outcomes, 0.50),
     )
@@ -178,9 +192,13 @@ def main() -> int:
         f"- tick_to_ack_p99_ms_p50: {a.tick_to_ack_p99_ms_p50:.3f}",
         f"- tick_to_decision_p99_ms_p50: {a.tick_to_decision_p99_ms_p50:.3f}",
         f"- quote_block_ratio_p50: {a.quote_block_ratio_p50:.4f}",
-        f"- pnl_10s_p50_bps_robust_p50: {a.pnl_10s_p50_bps_robust_p50:.4f}",
+        f"- net_markout_10s_usdc_p50: {a.net_markout_10s_usdc_p50:.6f}",
+        f"- roi_notional_10s_bps_p50: {a.roi_notional_10s_bps_p50:.4f}",
         f"- fillability_10ms_p50: {a.fillability_10ms_p50:.4f}",
         f"- feed_in_p50_ms_p50: {a.feed_in_p50_ms_p50:.3f}",
+        f"- feed_in_p99_ms_p50: {a.feed_in_p99_ms_p50:.3f}",
+        f"- decision_compute_p99_ms_p50: {a.decision_compute_p99_ms_p50:.3f}",
+        f"- data_valid_ratio_p50: {a.data_valid_ratio_p50:.5f}",
         f"- gate_ready_ratio_p50: {a.gate_ready_ratio_p50:.4f}",
         f"- window_outcomes_p50: {a.window_outcomes_p50:.1f}",
         "",
@@ -190,9 +208,13 @@ def main() -> int:
         f"- tick_to_ack_p99_ms_p50: {b.tick_to_ack_p99_ms_p50:.3f}",
         f"- tick_to_decision_p99_ms_p50: {b.tick_to_decision_p99_ms_p50:.3f}",
         f"- quote_block_ratio_p50: {b.quote_block_ratio_p50:.4f}",
-        f"- pnl_10s_p50_bps_robust_p50: {b.pnl_10s_p50_bps_robust_p50:.4f}",
+        f"- net_markout_10s_usdc_p50: {b.net_markout_10s_usdc_p50:.6f}",
+        f"- roi_notional_10s_bps_p50: {b.roi_notional_10s_bps_p50:.4f}",
         f"- fillability_10ms_p50: {b.fillability_10ms_p50:.4f}",
         f"- feed_in_p50_ms_p50: {b.feed_in_p50_ms_p50:.3f}",
+        f"- feed_in_p99_ms_p50: {b.feed_in_p99_ms_p50:.3f}",
+        f"- decision_compute_p99_ms_p50: {b.decision_compute_p99_ms_p50:.3f}",
+        f"- data_valid_ratio_p50: {b.data_valid_ratio_p50:.5f}",
         f"- gate_ready_ratio_p50: {b.gate_ready_ratio_p50:.4f}",
         f"- window_outcomes_p50: {b.window_outcomes_p50:.1f}",
         "",

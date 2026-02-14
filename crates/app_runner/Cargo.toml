@@ -26,6 +26,7 @@ risk_engine = { path = "../risk_engine" }
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 strategy_maker = { path = "../strategy_maker" }
 tokio.workspace = true
 tracing.workspace = true

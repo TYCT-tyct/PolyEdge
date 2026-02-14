@@ -41,10 +41,15 @@ def gate_pass(live: Dict[str, Any], min_outcomes: int) -> bool:
     outcomes = int(live.get("window_outcomes", live.get("total_outcomes", 0)) or 0)
     return (
         outcomes >= min_outcomes
-        and float(live.get("pnl_10s_p50_bps_robust", live.get("pnl_10s_p50_bps", 0.0))) > 0.0
+        and float(live.get("net_markout_10s_usdc_p50", 0.0)) > 0.0
+        and float(live.get("roi_notional_10s_bps_p50", 0.0)) > 0.0
         and float(live.get("fillability_10ms", 0.0)) >= 0.60
         and float(live.get("quote_block_ratio", 1.0)) < 0.10
+        and float(live.get("policy_block_ratio", 1.0)) < 0.10
         and float(live.get("tick_to_ack_p99_ms", 9999.0)) < 450.0
+        and float(live.get("decision_compute_p99_ms", 9999.0)) < 2.0
+        and float((live.get("latency") or {}).get("feed_in_p99_ms", 9999.0)) < 800.0
+        and float(live.get("data_valid_ratio", 0.0)) >= 0.999
     )
 
 
@@ -216,10 +221,13 @@ def main() -> int:
                 "window_outcomes": int(live.get("window_outcomes", live.get("total_outcomes", 0)) or 0),
                 "fillability_10ms": float(live.get("fillability_10ms", 0.0)),
                 "quote_block_ratio": float(live.get("quote_block_ratio", 0.0)),
+                "policy_block_ratio": float(live.get("policy_block_ratio", 0.0)),
                 "tick_to_ack_p99_ms": float(live.get("tick_to_ack_p99_ms", 0.0)),
-                "pnl_10s_p50_bps_robust": float(
-                    live.get("pnl_10s_p50_bps_robust", live.get("pnl_10s_p50_bps", 0.0))
-                ),
+                "decision_compute_p99_ms": float(live.get("decision_compute_p99_ms", 0.0)),
+                "feed_in_p99_ms": float((live.get("latency") or {}).get("feed_in_p99_ms", 0.0)),
+                "data_valid_ratio": float(live.get("data_valid_ratio", 1.0)),
+                "net_markout_10s_usdc_p50": float(live.get("net_markout_10s_usdc_p50", 0.0)),
+                "roi_notional_10s_bps_p50": float(live.get("roi_notional_10s_bps_p50", 0.0)),
                 "gate_fail_reasons": live.get("gate_fail_reasons") or [],
             },
             "min_outcomes": args.min_outcomes,
@@ -231,7 +239,7 @@ def main() -> int:
             f.write(json.dumps(row, ensure_ascii=True) + "\n")
         print(
             f"[cycle {cycle}/{cycle_cap}] gate_pass={passed} "
-            f"pnl10_robust={row['live']['pnl_10s_p50_bps_robust']:.3f}"
+            f"net_usdc={row['live']['net_markout_10s_usdc_p50']:.6f}"
         )
         now = time.monotonic()
         if now >= next_heartbeat:

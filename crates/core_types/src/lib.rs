@@ -304,7 +304,15 @@ pub struct ShadowOutcome {
     pub net_markout_5s_bps: Option<f64>,
     pub net_markout_10s_bps: Option<f64>,
     #[serde(default)]
+    pub entry_notional_usdc: f64,
+    #[serde(default)]
+    pub net_markout_10s_usdc: Option<f64>,
+    #[serde(default)]
+    pub roi_notional_10s_bps: Option<f64>,
+    #[serde(default)]
     pub queue_fill_prob: f64,
+    #[serde(default)]
+    pub is_stale_tick: bool,
     #[serde(default)]
     pub is_outlier: bool,
     #[serde(default = "default_robust_weight")]
