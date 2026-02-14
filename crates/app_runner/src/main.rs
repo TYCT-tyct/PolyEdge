@@ -1381,7 +1381,7 @@ fn spawn_reference_feed(
             return;
         };
         let mut ingest_seq: u64 = 0;
-        let mut last_source_ts_by_symbol: HashMap<String, i64> = HashMap::new();
+        let mut last_source_ts_by_stream: HashMap<String, i64> = HashMap::new();
 
         while let Some(item) = stream.next().await {
             match item {
@@ -1394,14 +1394,15 @@ fn spawn_reference_feed(
                         && tick.price > 0.0
                         && source_seq > 0;
                     stats.mark_data_validity(valid);
-                    if let Some(prev) = last_source_ts_by_symbol.get(&tick.symbol).copied() {
+                    let stream_key = format!("{}:{}", tick.source, tick.symbol);
+                    if let Some(prev) = last_source_ts_by_stream.get(&stream_key).copied() {
                         if source_ts < prev {
                             stats.mark_ts_inversion();
                         } else if source_ts - prev > 5_000 {
                             stats.mark_seq_gap();
                         }
                     }
-                    last_source_ts_by_symbol.insert(tick.symbol.clone(), source_ts);
+                    last_source_ts_by_stream.insert(stream_key, source_ts);
                     stats.mark_ref_tick(tick.recv_ts_ms);
                     let tick_json = serde_json::to_value(&tick).unwrap_or(serde_json::json!({}));
                     let hash = sha256_hex(&tick_json.to_string());
