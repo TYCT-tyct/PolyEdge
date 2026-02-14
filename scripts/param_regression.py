@@ -206,6 +206,18 @@ def post_json(session: requests.Session, url: str, payload: Dict[str, Any], time
     return resp.json()
 
 
+def post_json_optional(
+    session: requests.Session, url: str, payload: Dict[str, Any], timeout: float = 5.0
+) -> Dict[str, Any]:
+    try:
+        return post_json(session, url, payload, timeout=timeout)
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else None
+        if status in (404, 405):
+            return {}
+        raise
+
+
 def run_trial(
     session: requests.Session,
     base_url: str,
@@ -235,6 +247,28 @@ def run_trial(
             "ttl_ms": ttl_ms,
             "basis_k_revert": basis_k_revert,
             "basis_z_cap": basis_z_cap,
+        },
+    )
+    post_json_optional(
+        session,
+        f"{base}/control/reload_taker",
+        {
+            "trigger_bps": max(1.0, min_edge_bps),
+            "max_slippage_bps": 25.0,
+            "stale_tick_filter_ms": 450.0,
+            "market_tier_profile": "balanced",
+        },
+    )
+    post_json_optional(
+        session,
+        f"{base}/control/reload_allocator",
+        {
+            "capital_fraction_kelly": 0.35,
+            "variance_penalty_lambda": 0.25,
+            "active_top_n_markets": 8,
+            "taker_weight": 0.7,
+            "maker_weight": 0.2,
+            "arb_weight": 0.1,
         },
     )
     post_json(

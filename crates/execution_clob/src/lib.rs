@@ -5,7 +5,9 @@ use std::time::Instant;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use chrono::Utc;
-use core_types::{new_id, ExecutionVenue, OrderAck, QuoteIntent};
+use core_types::{
+    new_id, ExecutionVenue, OrderAck, OrderAckV2, OrderIntentV2, QuoteIntent,
+};
 use parking_lot::RwLock;
 use reqwest::Client;
 
@@ -88,21 +90,42 @@ impl ClobExecution {
 #[async_trait]
 impl ExecutionVenue for ClobExecution {
     async fn place_order(&self, intent: QuoteIntent) -> Result<OrderAck> {
+        let ack_v2 = self.place_order_v2(OrderIntentV2::from(intent)).await?;
+        Ok(OrderAck {
+            order_id: ack_v2.order_id,
+            market_id: ack_v2.market_id,
+            accepted: ack_v2.accepted,
+            ts_ms: ack_v2.ts_ms,
+        })
+    }
+
+    async fn place_order_v2(&self, intent: OrderIntentV2) -> Result<OrderAckV2> {
+        let started = Instant::now();
         match self.mode {
             ExecutionMode::Paper => {
                 self.prune_expired_orders();
                 let order_id = new_id();
+                let paper_intent = QuoteIntent {
+                    market_id: intent.market_id.clone(),
+                    side: intent.side.clone(),
+                    price: intent.price,
+                    size: intent.size,
+                    ttl_ms: intent.ttl_ms,
+                };
                 self.open_orders.write().insert(
                     order_id.clone(),
                     PaperOpenOrder {
-                        intent: intent.clone(),
+                        intent: paper_intent,
                         created_at: Instant::now(),
                     },
                 );
-                Ok(OrderAck {
+                Ok(OrderAckV2 {
                     order_id,
                     market_id: intent.market_id,
                     accepted: true,
+                    accepted_size: intent.size,
+                    reject_code: None,
+                    exchange_latency_ms: started.elapsed().as_secs_f64() * 1_000.0,
                     ts_ms: Utc::now().timestamp_millis(),
                 })
             }
@@ -113,6 +136,12 @@ impl ExecutionVenue for ClobExecution {
                     "price": intent.price,
                     "size": intent.size,
                     "ttl_ms": intent.ttl_ms,
+                    "style": intent.style.to_string(),
+                    "tif": intent.tif.to_string(),
+                    "max_slippage_bps": intent.max_slippage_bps,
+                    "fee_rate_bps": intent.fee_rate_bps,
+                    "expected_edge_net_bps": intent.expected_edge_net_bps,
+                    "hold_to_resolution": intent.hold_to_resolution,
                 });
 
                 let res = self
@@ -121,16 +150,45 @@ impl ExecutionVenue for ClobExecution {
                     .json(&payload)
                     .send()
                     .await?;
+                let status = res.status();
+                let exchange_latency_ms = started.elapsed().as_secs_f64() * 1_000.0;
 
-                if !res.status().is_success() {
-                    bail!("live order rejected: {}", res.status());
+                if !status.is_success() {
+                    return Ok(OrderAckV2 {
+                        order_id: new_id(),
+                        market_id: intent.market_id,
+                        accepted: false,
+                        accepted_size: 0.0,
+                        reject_code: Some(format!("http_{}", status.as_u16())),
+                        exchange_latency_ms,
+                        ts_ms: Utc::now().timestamp_millis(),
+                    });
                 }
 
-                let order_id = new_id();
-                Ok(OrderAck {
+                let payload_value = res
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                let order_id = payload_value
+                    .get("order_id")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| payload_value.get("id").and_then(|v| v.as_str()))
+                    .or_else(|| payload_value.get("orderID").and_then(|v| v.as_str()))
+                    .map(ToString::to_string)
+                    .unwrap_or_else(new_id);
+                let accepted_size = payload_value
+                    .get("accepted_size")
+                    .and_then(|v| v.as_f64())
+                    .or_else(|| payload_value.get("size").and_then(|v| v.as_f64()))
+                    .unwrap_or(intent.size);
+
+                Ok(OrderAckV2 {
                     order_id,
                     market_id: intent.market_id,
                     accepted: true,
+                    accepted_size: accepted_size.max(0.0),
+                    reject_code: None,
+                    exchange_latency_ms,
                     ts_ms: Utc::now().timestamp_millis(),
                 })
             }

@@ -7,6 +7,8 @@ pub struct RiskLimits {
     pub max_asset_notional: f64,
     pub max_open_orders: usize,
     pub max_drawdown_pct: f64,
+    pub max_loss_streak: u32,
+    pub cooldown_sec: u64,
 }
 
 impl Default for RiskLimits {
@@ -16,6 +18,8 @@ impl Default for RiskLimits {
             max_asset_notional: 100.0,
             max_open_orders: 20,
             max_drawdown_pct: 0.01,
+            max_loss_streak: 5,
+            cooldown_sec: 60,
         }
     }
 }

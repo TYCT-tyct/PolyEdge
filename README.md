@@ -33,11 +33,16 @@ pwsh -File .\scripts\cargo_msvc.ps1 test -q
 - `GET /state/pnl`
 - `GET /report/shadow/live`
 - `GET /report/shadow/final`
+- `GET /report/pnl/by_engine`
+- `GET /report/toxicity/live`
+- `GET /report/toxicity/final`
 - `POST /control/pause`
 - `POST /control/resume`
 - `POST /control/flatten`
 - `POST /control/reset_shadow`
 - `POST /control/reload_strategy`
+- `POST /control/reload_taker`
+- `POST /control/reload_allocator`
 - `POST /control/reload_risk`
 - `POST /control/reload_toxicity`
 - `POST /control/reload_perf_profile`
@@ -136,6 +141,7 @@ Runtime report files are written to `datasets/reports/<utc-date>/`:
 - `report_shadow_12h.md`
 - `latency_breakdown_12h.csv`
 - `market_scorecard.csv`
+- `engine_pnl_breakdown.csv`
 - `next_fixlist.md`
 - `truth_manifest.json`
 - `region_ab_compare.md` / `region_ab_compare.json`

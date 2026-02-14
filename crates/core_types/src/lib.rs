@@ -117,6 +117,54 @@ impl fmt::Display for OrderSide {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionStyle {
+    Maker,
+    Taker,
+    Arb,
+}
+
+impl fmt::Display for ExecutionStyle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Maker => "maker",
+            Self::Taker => "taker",
+            Self::Arb => "arb",
+        };
+        f.write_str(value)
+    }
+}
+
+fn default_execution_style() -> ExecutionStyle {
+    ExecutionStyle::Maker
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum OrderTimeInForce {
+    Fak,
+    Fok,
+    Gtc,
+    PostOnly,
+}
+
+impl fmt::Display for OrderTimeInForce {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Fak => "FAK",
+            Self::Fok => "FOK",
+            Self::Gtc => "GTC",
+            Self::PostOnly => "POST_ONLY",
+        };
+        f.write_str(value)
+    }
+}
+
+fn default_order_tif() -> OrderTimeInForce {
+    OrderTimeInForce::PostOnly
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QuoteIntent {
     pub market_id: String,
@@ -131,6 +179,59 @@ pub struct OrderAck {
     pub order_id: String,
     pub market_id: String,
     pub accepted: bool,
+    pub ts_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OrderIntentV2 {
+    pub market_id: String,
+    pub side: OrderSide,
+    pub price: f64,
+    pub size: f64,
+    pub ttl_ms: u64,
+    #[serde(default = "default_execution_style")]
+    pub style: ExecutionStyle,
+    #[serde(default = "default_order_tif")]
+    pub tif: OrderTimeInForce,
+    #[serde(default)]
+    pub max_slippage_bps: f64,
+    #[serde(default)]
+    pub fee_rate_bps: f64,
+    #[serde(default)]
+    pub expected_edge_net_bps: f64,
+    #[serde(default)]
+    pub hold_to_resolution: bool,
+}
+
+impl From<QuoteIntent> for OrderIntentV2 {
+    fn from(value: QuoteIntent) -> Self {
+        Self {
+            market_id: value.market_id,
+            side: value.side,
+            price: value.price,
+            size: value.size,
+            ttl_ms: value.ttl_ms,
+            style: ExecutionStyle::Maker,
+            tif: OrderTimeInForce::PostOnly,
+            max_slippage_bps: 0.0,
+            fee_rate_bps: 0.0,
+            expected_edge_net_bps: 0.0,
+            hold_to_resolution: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OrderAckV2 {
+    pub order_id: String,
+    pub market_id: String,
+    pub accepted: bool,
+    #[serde(default)]
+    pub accepted_size: f64,
+    #[serde(default)]
+    pub reject_code: Option<String>,
+    #[serde(default)]
+    pub exchange_latency_ms: f64,
     pub ts_ms: i64,
 }
 
@@ -270,6 +371,13 @@ pub struct RateBudgetState {
     pub last_refill_ns: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct EnginePnLBreakdown {
+    pub maker_usdc: f64,
+    pub taker_usdc: f64,
+    pub arb_usdc: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GateContext {
     pub window_id: u64,
@@ -309,6 +417,8 @@ pub struct ShadowShot {
     pub market_id: String,
     pub symbol: String,
     pub side: OrderSide,
+    #[serde(default = "default_execution_style")]
+    pub execution_style: ExecutionStyle,
     #[serde(default)]
     pub survival_probe_price: f64,
     pub intended_price: f64,
@@ -333,6 +443,8 @@ pub struct ShadowOutcome {
     pub side: OrderSide,
     pub delay_ms: u64,
     pub fillable: bool,
+    #[serde(default = "default_execution_style")]
+    pub execution_style: ExecutionStyle,
     pub slippage_bps: Option<f64>,
     pub pnl_1s_bps: Option<f64>,
     pub pnl_5s_bps: Option<f64>,
@@ -445,6 +557,30 @@ pub trait ToxicityModel: Send + Sync {
 #[async_trait]
 pub trait ExecutionVenue: Send + Sync {
     async fn place_order(&self, intent: QuoteIntent) -> Result<OrderAck>;
+    async fn place_order_v2(&self, intent: OrderIntentV2) -> Result<OrderAckV2> {
+        let ack = self
+            .place_order(QuoteIntent {
+                market_id: intent.market_id.clone(),
+                side: intent.side.clone(),
+                price: intent.price,
+                size: intent.size,
+                ttl_ms: intent.ttl_ms,
+            })
+            .await?;
+        Ok(OrderAckV2 {
+            order_id: ack.order_id,
+            market_id: ack.market_id,
+            accepted: ack.accepted,
+            accepted_size: if ack.accepted { intent.size } else { 0.0 },
+            reject_code: if ack.accepted {
+                None
+            } else {
+                Some("rejected".to_string())
+            },
+            exchange_latency_ms: 0.0,
+            ts_ms: ack.ts_ms,
+        })
+    }
     async fn cancel_order(&self, order_id: &str, market_id: &str) -> Result<()>;
     async fn flatten_all(&self) -> Result<()>;
 }

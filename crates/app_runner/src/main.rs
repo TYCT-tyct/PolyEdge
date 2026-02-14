@@ -15,8 +15,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use core_types::{
-    new_id, BookTop, ControlCommand, EdgeAttribution, EngineEvent, ExecutionVenue, FairValueModel,
-    InventoryState, MarketFeed, MarketHealth, OrderSide, QuoteEval, QuotePolicy, RefPriceFeed,
+    new_id, BookTop, ControlCommand, EdgeAttribution, EngineEvent, EnginePnLBreakdown,
+    ExecutionStyle, ExecutionVenue, FairValueModel, InventoryState, MarketFeed, MarketHealth,
+    OrderAck, OrderIntentV2, OrderSide, OrderTimeInForce, QuoteEval, QuotePolicy, RefPriceFeed,
     RefTick, RiskContext, RiskManager, ShadowOutcome, ShadowShot, ToxicDecision, ToxicFeatures,
     ToxicRegime,
 };
@@ -54,6 +55,7 @@ struct AppState {
     strategy_cfg: Arc<RwLock<MakerConfig>>,
     fair_value_cfg: Arc<StdRwLock<BasisMrConfig>>,
     toxicity_cfg: Arc<RwLock<ToxicityConfig>>,
+    allocator_cfg: Arc<RwLock<AllocatorConfig>>,
     risk_limits: Arc<RwLock<RiskLimits>>,
     tox_state: Arc<RwLock<HashMap<String, MarketToxicState>>>,
     shadow_stats: Arc<ShadowStats>,
@@ -122,6 +124,60 @@ struct RiskReloadReq {
     daily_drawdown_cap_pct: Option<f64>,
     max_loss_streak: Option<u32>,
     cooldown_sec: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TakerReloadReq {
+    trigger_bps: Option<f64>,
+    max_slippage_bps: Option<f64>,
+    stale_tick_filter_ms: Option<f64>,
+    market_tier_profile: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TakerReloadResp {
+    trigger_bps: f64,
+    max_slippage_bps: f64,
+    stale_tick_filter_ms: f64,
+    market_tier_profile: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AllocatorReloadReq {
+    capital_fraction_kelly: Option<f64>,
+    variance_penalty_lambda: Option<f64>,
+    active_top_n_markets: Option<usize>,
+    taker_weight: Option<f64>,
+    maker_weight: Option<f64>,
+    arb_weight: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AllocatorConfig {
+    capital_fraction_kelly: f64,
+    variance_penalty_lambda: f64,
+    active_top_n_markets: usize,
+    taker_weight: f64,
+    maker_weight: f64,
+    arb_weight: f64,
+}
+
+impl Default for AllocatorConfig {
+    fn default() -> Self {
+        Self {
+            capital_fraction_kelly: 0.35,
+            variance_penalty_lambda: 0.25,
+            active_top_n_markets: 8,
+            taker_weight: 0.7,
+            maker_weight: 0.2,
+            arb_weight: 0.1,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct AllocatorReloadResp {
+    allocator: AllocatorConfig,
 }
 
 #[derive(Debug, Serialize)]
@@ -456,6 +512,23 @@ struct ShadowLiveReport {
 struct ShadowFinalReport {
     live: ShadowLiveReport,
     gate: GateEvaluation,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct EnginePnlRow {
+    engine: String,
+    samples: usize,
+    total_usdc: f64,
+    p50_usdc: f64,
+    p10_usdc: f64,
+    positive_ratio: f64,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct EnginePnlReport {
+    window_id: u64,
+    breakdown: EnginePnLBreakdown,
+    rows: Vec<EnginePnlRow>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -819,6 +892,53 @@ fn is_policy_block_reason(reason: &str) -> bool {
     reason.starts_with("risk:") || reason == "risk_capped_zero"
 }
 
+fn classify_execution_style(book: &BookTop, intent: &core_types::QuoteIntent) -> ExecutionStyle {
+    match intent.side {
+        OrderSide::BuyYes => {
+            if intent.price >= book.ask_yes {
+                ExecutionStyle::Taker
+            } else {
+                ExecutionStyle::Maker
+            }
+        }
+        OrderSide::SellYes => {
+            if intent.price <= book.bid_yes {
+                ExecutionStyle::Taker
+            } else {
+                ExecutionStyle::Maker
+            }
+        }
+        OrderSide::BuyNo => {
+            if intent.price >= book.ask_no {
+                ExecutionStyle::Taker
+            } else {
+                ExecutionStyle::Maker
+            }
+        }
+        OrderSide::SellNo => {
+            if intent.price <= book.bid_no {
+                ExecutionStyle::Taker
+            } else {
+                ExecutionStyle::Maker
+            }
+        }
+    }
+}
+
+fn normalize_reject_code(raw: &str) -> String {
+    let normalized = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    normalized.trim_matches('_').to_string()
+}
+
 fn classify_execution_error_reason(err: &anyhow::Error) -> &'static str {
     let msg = err.to_string().to_ascii_lowercase();
     if msg.contains("429") {
@@ -1127,6 +1247,76 @@ impl ShadowStats {
         };
         ShadowFinalReport { live, gate }
     }
+
+    async fn build_engine_pnl_report(&self) -> EnginePnlReport {
+        const PRIMARY_DELAY_MS: u64 = 10;
+        let shots = self.shots.read().await.clone();
+        let outcomes = self.outcomes.read().await.clone();
+        let mut style_by_shot = HashMap::<String, ExecutionStyle>::new();
+        for shot in shots.iter().filter(|s| s.delay_ms == PRIMARY_DELAY_MS) {
+            style_by_shot.insert(shot.shot_id.clone(), shot.execution_style.clone());
+        }
+
+        let mut maker = Vec::<f64>::new();
+        let mut taker = Vec::<f64>::new();
+        let mut arb = Vec::<f64>::new();
+
+        for outcome in outcomes
+            .iter()
+            .filter(|o| o.delay_ms == PRIMARY_DELAY_MS && !o.is_stale_tick)
+        {
+            let Some(markout) = outcome.net_markout_10s_usdc else {
+                continue;
+            };
+            let style = style_by_shot
+                .get(&outcome.shot_id)
+                .cloned()
+                .unwrap_or_else(|| outcome.execution_style.clone());
+            match style {
+                ExecutionStyle::Maker => maker.push(markout),
+                ExecutionStyle::Taker => taker.push(markout),
+                ExecutionStyle::Arb => arb.push(markout),
+            }
+        }
+
+        let maker_total = maker.iter().sum::<f64>();
+        let taker_total = taker.iter().sum::<f64>();
+        let arb_total = arb.iter().sum::<f64>();
+
+        EnginePnlReport {
+            window_id: self.window_id.load(Ordering::Relaxed),
+            breakdown: EnginePnLBreakdown {
+                maker_usdc: maker_total,
+                taker_usdc: taker_total,
+                arb_usdc: arb_total,
+            },
+            rows: vec![
+                build_engine_pnl_row("maker", &maker),
+                build_engine_pnl_row("taker", &taker),
+                build_engine_pnl_row("arb", &arb),
+            ],
+        }
+    }
+}
+
+fn build_engine_pnl_row(engine: &str, values: &[f64]) -> EnginePnlRow {
+    let samples = values.len();
+    let total_usdc = values.iter().sum::<f64>();
+    let p50_usdc = percentile(values, 0.50).unwrap_or(0.0);
+    let p10_usdc = percentile(values, 0.10).unwrap_or(0.0);
+    let positive_ratio = if values.is_empty() {
+        0.0
+    } else {
+        values.iter().filter(|v| **v > 0.0).count() as f64 / values.len() as f64
+    };
+    EnginePnlRow {
+        engine: engine.to_string(),
+        samples,
+        total_usdc,
+        p50_usdc,
+        p10_usdc,
+        positive_ratio,
+    }
 }
 
 fn compute_gate_fail_reasons(live: &ShadowLiveReport, min_outcomes: usize) -> Vec<String> {
@@ -1269,6 +1459,16 @@ async fn async_main() -> Result<()> {
     let toxicity_cfg = Arc::new(RwLock::new(ToxicityConfig::default()));
     let risk_limits = Arc::new(RwLock::new(load_risk_limits_config()));
     let perf_profile = Arc::new(RwLock::new(load_perf_profile_config()));
+    let allocator_cfg = {
+        let strategy = strategy_cfg.read().await.clone();
+        let tox = toxicity_cfg.read().await.clone();
+        Arc::new(RwLock::new(AllocatorConfig {
+            capital_fraction_kelly: strategy.capital_fraction_kelly,
+            variance_penalty_lambda: strategy.variance_penalty_lambda,
+            active_top_n_markets: tox.active_top_n_markets,
+            ..AllocatorConfig::default()
+        }))
+    };
     let tox_state = Arc::new(RwLock::new(HashMap::new()));
     let shadow_stats = Arc::new(ShadowStats::new());
     let paused = Arc::new(RwLock::new(false));
@@ -1285,6 +1485,7 @@ async fn async_main() -> Result<()> {
         strategy_cfg: strategy_cfg.clone(),
         fair_value_cfg: fair_value_cfg.clone(),
         toxicity_cfg: toxicity_cfg.clone(),
+        allocator_cfg: allocator_cfg.clone(),
         risk_limits: risk_limits.clone(),
         tox_state: tox_state.clone(),
         shadow_stats: shadow_stats.clone(),
@@ -1337,6 +1538,7 @@ async fn async_main() -> Result<()> {
         .route("/state/pnl", get(pnl))
         .route("/report/shadow/live", get(report_shadow_live))
         .route("/report/shadow/final", get(report_shadow_final))
+        .route("/report/pnl/by_engine", get(report_pnl_by_engine))
         .route("/report/toxicity/live", get(report_toxicity_live))
         .route("/report/toxicity/final", get(report_toxicity_final))
         .route("/control/pause", post(pause))
@@ -1344,6 +1546,8 @@ async fn async_main() -> Result<()> {
         .route("/control/flatten", post(flatten))
         .route("/control/reset_shadow", post(reset_shadow))
         .route("/control/reload_strategy", post(reload_strategy))
+        .route("/control/reload_taker", post(reload_taker))
+        .route("/control/reload_allocator", post(reload_allocator))
         .route("/control/reload_toxicity", post(reload_toxicity))
         .route("/control/reload_risk", post(reload_risk))
         .route("/control/reload_perf_profile", post(reload_perf_profile))
@@ -1497,6 +1701,8 @@ fn spawn_periodic_report_persistor(
         loop {
             let live = stats.build_live_report().await;
             persist_live_report_files(&live);
+            let engine_pnl = stats.build_engine_pnl_report().await;
+            persist_engine_pnl_report(&engine_pnl);
             let tox_live = build_toxicity_live_report(
                 tox_state.clone(),
                 stats.clone(),
@@ -2092,10 +2298,41 @@ fn spawn_strategy_engine(
                             intent_decision_start.elapsed().as_secs_f64() * 1_000.0;
                         let tick_to_decision_ms = latency_sample.local_backlog_ms + decision_compute_ms;
                         let place_start = Instant::now();
-                        match execution.place_order(intent.clone()).await {
-                            Ok(ack) => {
+                        let execution_style = classify_execution_style(&book, &intent);
+                        let tif = match execution_style {
+                            ExecutionStyle::Maker => OrderTimeInForce::PostOnly,
+                            ExecutionStyle::Taker | ExecutionStyle::Arb => OrderTimeInForce::Fak,
+                        };
+                        let v2_intent = OrderIntentV2 {
+                            market_id: intent.market_id.clone(),
+                            side: intent.side.clone(),
+                            price: intent.price,
+                            size: intent.size,
+                            ttl_ms: intent.ttl_ms,
+                            style: execution_style.clone(),
+                            tif,
+                            max_slippage_bps: cfg.taker_max_slippage_bps,
+                            fee_rate_bps: fee_bps,
+                            expected_edge_net_bps: edge_net,
+                            hold_to_resolution: false,
+                        };
+                        match execution.place_order_v2(v2_intent).await {
+                            Ok(ack_v2) if ack_v2.accepted => {
+                                let accepted_size = ack_v2.accepted_size.max(0.0).min(intent.size);
+                                if accepted_size <= 0.0 {
+                                    shared
+                                        .shadow_stats
+                                        .mark_blocked_with_reason("exchange_reject_zero_size")
+                                        .await;
+                                    continue;
+                                }
+                                intent.size = accepted_size;
                                 shared.shadow_stats.mark_executed();
-                                let ack_only_ms = place_start.elapsed().as_secs_f64() * 1_000.0;
+                                let ack_only_ms = if ack_v2.exchange_latency_ms > 0.0 {
+                                    ack_v2.exchange_latency_ms
+                                } else {
+                                    place_start.elapsed().as_secs_f64() * 1_000.0
+                                };
                                 let tick_to_ack_ms = tick_to_decision_ms + ack_only_ms;
                                 shared
                                     .shadow_stats
@@ -2120,6 +2357,12 @@ fn spawn_strategy_engine(
                                 metrics::histogram!("latency.tick_to_ack_ms")
                                     .record(tick_to_ack_ms);
 
+                                let ack = OrderAck {
+                                    order_id: ack_v2.order_id,
+                                    market_id: ack_v2.market_id,
+                                    accepted: true,
+                                    ts_ms: ack_v2.ts_ms,
+                                };
                                 let _ = bus.publish(EngineEvent::OrderAck(ack.clone()));
                                 shadow.register_order(&ack, intent.clone());
 
@@ -2129,6 +2372,7 @@ fn spawn_strategy_engine(
                                         market_id: intent.market_id.clone(),
                                         symbol: symbol.clone(),
                                         side: intent.side.clone(),
+                                        execution_style: execution_style.clone(),
                                         // Use taker top-of-book only for "opportunity survival" probing.
                                         // Keep intended_price as maker entry for markout/PnL attribution.
                                         survival_probe_price: aggressive_price_for_side(
@@ -2151,6 +2395,18 @@ fn spawn_strategy_engine(
                                     let _ = bus.publish(EngineEvent::ShadowShot(shot.clone()));
                                     spawn_shadow_outcome_task(shared.clone(), bus.clone(), shot);
                                 }
+                            }
+                            Ok(ack_v2) => {
+                                let reject_code = ack_v2
+                                    .reject_code
+                                    .as_deref()
+                                    .map(normalize_reject_code)
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                shared
+                                    .shadow_stats
+                                    .mark_blocked_with_reason(&format!("exchange_reject_{reject_code}"))
+                                    .await;
+                                metrics::counter!("execution.place_rejected").increment(1);
                             }
                             Err(err) => {
                                 let reason = classify_execution_error_reason(&err);
@@ -2267,6 +2523,7 @@ fn spawn_shadow_outcome_task(
             side: shot.side.clone(),
             delay_ms: shot.delay_ms,
             fillable,
+            execution_style: shot.execution_style.clone(),
             slippage_bps,
             pnl_1s_bps,
             pnl_5s_bps,
@@ -3090,6 +3347,88 @@ async fn reload_strategy(
     })
 }
 
+async fn reload_taker(
+    State(state): State<AppState>,
+    Json(req): Json<TakerReloadReq>,
+) -> Json<TakerReloadResp> {
+    let mut cfg = state.strategy_cfg.write().await;
+    if let Some(v) = req.trigger_bps {
+        cfg.taker_trigger_bps = v.max(0.0);
+    }
+    if let Some(v) = req.max_slippage_bps {
+        cfg.taker_max_slippage_bps = v.max(0.0);
+    }
+    if let Some(v) = req.stale_tick_filter_ms {
+        cfg.stale_tick_filter_ms = v.clamp(50.0, 5_000.0);
+    }
+    if let Some(v) = req.market_tier_profile {
+        cfg.market_tier_profile = v;
+    }
+    let resp = TakerReloadResp {
+        trigger_bps: cfg.taker_trigger_bps,
+        max_slippage_bps: cfg.taker_max_slippage_bps,
+        stale_tick_filter_ms: cfg.stale_tick_filter_ms,
+        market_tier_profile: cfg.market_tier_profile.clone(),
+    };
+    append_jsonl(
+        &dataset_path("reports", "taker_reload.jsonl"),
+        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "taker": resp}),
+    );
+    Json(resp)
+}
+
+async fn reload_allocator(
+    State(state): State<AppState>,
+    Json(req): Json<AllocatorReloadReq>,
+) -> Json<AllocatorReloadResp> {
+    let mut allocator = state.allocator_cfg.write().await;
+    if let Some(v) = req.capital_fraction_kelly {
+        allocator.capital_fraction_kelly = v.clamp(0.01, 1.0);
+    }
+    if let Some(v) = req.variance_penalty_lambda {
+        allocator.variance_penalty_lambda = v.clamp(0.0, 5.0);
+    }
+    if let Some(v) = req.active_top_n_markets {
+        allocator.active_top_n_markets = v.clamp(1, 128);
+    }
+    if let Some(v) = req.taker_weight {
+        allocator.taker_weight = v.max(0.0);
+    }
+    if let Some(v) = req.maker_weight {
+        allocator.maker_weight = v.max(0.0);
+    }
+    if let Some(v) = req.arb_weight {
+        allocator.arb_weight = v.max(0.0);
+    }
+    let sum = allocator.taker_weight + allocator.maker_weight + allocator.arb_weight;
+    if sum > 0.0 {
+        allocator.taker_weight /= sum;
+        allocator.maker_weight /= sum;
+        allocator.arb_weight /= sum;
+    } else {
+        *allocator = AllocatorConfig::default();
+    }
+
+    {
+        let mut strategy = state.strategy_cfg.write().await;
+        strategy.capital_fraction_kelly = allocator.capital_fraction_kelly;
+        strategy.variance_penalty_lambda = allocator.variance_penalty_lambda;
+    }
+    {
+        let mut tox = state.toxicity_cfg.write().await;
+        tox.active_top_n_markets = allocator.active_top_n_markets;
+    }
+
+    let resp = AllocatorReloadResp {
+        allocator: allocator.clone(),
+    };
+    append_jsonl(
+        &dataset_path("reports", "allocator_reload.jsonl"),
+        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "allocator": resp.allocator}),
+    );
+    Json(resp)
+}
+
 async fn reload_risk(
     State(state): State<AppState>,
     Json(req): Json<RiskReloadReq>,
@@ -3107,8 +3446,12 @@ async fn reload_risk(
     if let Some(v) = req.daily_drawdown_cap_pct {
         cfg.max_drawdown_pct = v.clamp(0.001, 1.0);
     }
-    let _ = req.max_loss_streak;
-    let _ = req.cooldown_sec;
+    if let Some(v) = req.max_loss_streak {
+        cfg.max_loss_streak = v.max(1);
+    }
+    if let Some(v) = req.cooldown_sec {
+        cfg.cooldown_sec = v.max(1);
+    }
     append_jsonl(
         &dataset_path("reports", "risk_reload.jsonl"),
         &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "risk": *cfg}),
@@ -3222,6 +3565,12 @@ async fn report_shadow_final(State(state): State<AppState>) -> Json<ShadowFinalR
     let final_report = state.shadow_stats.build_final_report().await;
     persist_final_report_files(&final_report);
     Json(final_report)
+}
+
+async fn report_pnl_by_engine(State(state): State<AppState>) -> Json<EnginePnlReport> {
+    let report = state.shadow_stats.build_engine_pnl_report().await;
+    persist_engine_pnl_report(&report);
+    Json(report)
 }
 
 async fn report_toxicity_live(State(state): State<AppState>) -> Json<ToxicityLiveReport> {
@@ -3634,12 +3983,30 @@ fn load_risk_limits_config() -> RiskLimits {
                         cfg.max_open_orders = parsed.max(1);
                     }
                 }
+                "max_loss_streak" => {
+                    if let Ok(parsed) = val.parse::<u32>() {
+                        cfg.max_loss_streak = parsed.max(1);
+                    }
+                }
+                "cooldown_sec" => {
+                    if let Ok(parsed) = val.parse::<u64>() {
+                        cfg.cooldown_sec = parsed.max(1);
+                    }
+                }
                 _ => {}
             }
         }
         if key == "drawdown_stop_pct" {
             if let Ok(parsed) = val.parse::<f64>() {
                 cfg.max_drawdown_pct = parsed.clamp(0.001, 1.0);
+            }
+        } else if key == "max_loss_streak" {
+            if let Ok(parsed) = val.parse::<u32>() {
+                cfg.max_loss_streak = parsed.max(1);
+            }
+        } else if key == "cooldown_sec" {
+            if let Ok(parsed) = val.parse::<u64>() {
+                cfg.cooldown_sec = parsed.max(1);
             }
         }
     }
@@ -3948,6 +4315,33 @@ fn persist_live_report_files(live: &ShadowLiveReport) {
     if let Ok(raw) = serde_json::to_string_pretty(live) {
         let _ = fs::write(live_json_path, raw);
     }
+}
+
+fn persist_engine_pnl_report(report: &EnginePnlReport) {
+    let reports_dir = dataset_dir("reports");
+    let _ = fs::create_dir_all(&reports_dir);
+
+    let json_path = reports_dir.join("engine_pnl_breakdown_latest.json");
+    if let Ok(raw) = serde_json::to_string_pretty(report) {
+        let _ = fs::write(json_path, raw);
+    }
+
+    let csv_path = reports_dir.join("engine_pnl_breakdown.csv");
+    let mut rows = String::new();
+    rows.push_str("window_id,engine,samples,total_usdc,p50_usdc,p10_usdc,positive_ratio\n");
+    for row in &report.rows {
+        rows.push_str(&format!(
+            "{},{},{},{:.6},{:.6},{:.6},{:.6}\n",
+            report.window_id,
+            row.engine,
+            row.samples,
+            row.total_usdc,
+            row.p50_usdc,
+            row.p10_usdc,
+            row.positive_ratio
+        ));
+    }
+    let _ = fs::write(csv_path, rows);
 }
 
 fn persist_final_report_files(report: &ShadowFinalReport) {
