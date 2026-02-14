@@ -2021,6 +2021,25 @@ fn spawn_strategy_engine(
                                 .await;
                             continue;
                         }
+
+                        let mut force_taker = false;
+                        if should_force_taker(&cfg, &tox_decision, edge_net, signal.confidence) {
+                            let aggressive_price = aggressive_price_for_side(&book, &intent.side);
+                            let passive_price = intent.price.max(1e-6);
+                            let price_move_bps =
+                                ((aggressive_price - intent.price).abs() / passive_price) * 10_000.0;
+                            if price_move_bps <= cfg.taker_max_slippage_bps.max(0.0) {
+                                intent.price = aggressive_price;
+                                intent.ttl_ms = intent.ttl_ms.min(150);
+                                force_taker = true;
+                            } else {
+                                shared
+                                    .shadow_stats
+                                    .mark_blocked_with_reason("taker_slippage_budget")
+                                    .await;
+                                continue;
+                            }
+                        }
                         let per_market_rps = (shared.rate_limit_rps / 8.0).max(0.5);
                         let market_bucket =
                             market_rate_budget.entry(book.market_id.clone()).or_insert_with(|| {
@@ -2046,7 +2065,11 @@ fn spawn_strategy_engine(
                             intent_decision_start.elapsed().as_secs_f64() * 1_000.0;
                         let tick_to_decision_ms = latency_sample.local_backlog_ms + decision_compute_ms;
                         let place_start = Instant::now();
-                        let execution_style = classify_execution_style(&book, &intent);
+                        let execution_style = if force_taker {
+                            ExecutionStyle::Taker
+                        } else {
+                            classify_execution_style(&book, &intent)
+                        };
                         let tif = match execution_style {
                             ExecutionStyle::Maker => OrderTimeInForce::PostOnly,
                             ExecutionStyle::Taker | ExecutionStyle::Arb => OrderTimeInForce::Fak,
@@ -2579,6 +2602,35 @@ fn adaptive_max_spread(base_max_spread: f64, tox_score: f64, markout_samples: us
         return (base_max_spread * 1.2).clamp(0.003, 0.08);
     }
     (base_max_spread * (1.0 - tox_score * 0.35)).clamp(0.002, base_max_spread)
+}
+
+fn should_force_taker(
+    cfg: &MakerConfig,
+    tox: &ToxicDecision,
+    edge_net_bps: f64,
+    confidence: f64,
+) -> bool {
+    if edge_net_bps < cfg.taker_trigger_bps.max(0.0) {
+        return false;
+    }
+    if matches!(tox.regime, ToxicRegime::Danger) {
+        return false;
+    }
+
+    let profile = cfg.market_tier_profile.to_ascii_lowercase();
+    let aggressive_profile = profile.contains("taker")
+        || profile.contains("aggressive")
+        || profile.contains("latency");
+
+    if matches!(tox.regime, ToxicRegime::Caution) && !aggressive_profile {
+        return false;
+    }
+
+    if confidence < 0.55 && !aggressive_profile {
+        return false;
+    }
+
+    true
 }
 
 fn estimate_queue_fill_proxy(tox_score: f64, spread_yes: f64, feed_in_ms: f64) -> f64 {
@@ -4385,5 +4437,32 @@ mod tests {
         assert!(sample.local_backlog_ms <= 40.0);
         assert!(sample.feed_in_ms >= sample.source_latency_ms);
         assert!((sample.feed_in_ms - (sample.source_latency_ms + sample.local_backlog_ms)).abs() < 3.0);
+    }
+
+    #[test]
+    fn should_force_taker_respects_profile_and_regime() {
+        let mut cfg = MakerConfig::default();
+        cfg.taker_trigger_bps = 10.0;
+        cfg.market_tier_profile = "balanced".to_string();
+
+        let safe = ToxicDecision {
+            market_id: "m".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            tox_score: 0.1,
+            regime: ToxicRegime::Safe,
+            reason_codes: vec![],
+            ts_ns: 1,
+        };
+        assert!(should_force_taker(&cfg, &safe, 12.0, 0.8));
+        assert!(!should_force_taker(&cfg, &safe, 8.0, 0.8));
+        assert!(!should_force_taker(&cfg, &safe, 12.0, 0.4));
+
+        let caution = ToxicDecision {
+            regime: ToxicRegime::Caution,
+            ..safe.clone()
+        };
+        assert!(!should_force_taker(&cfg, &caution, 12.0, 0.8));
+        cfg.market_tier_profile = "latency_aggressive".to_string();
+        assert!(should_force_taker(&cfg, &caution, 12.0, 0.8));
     }
 }
