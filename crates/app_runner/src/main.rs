@@ -320,8 +320,8 @@ struct MarketScoreRow {
 }
 
 struct ShadowStats {
-    started_at: Instant,
-    started_at_ms: i64,
+    started_at: RwLock<Instant>,
+    started_at_ms: AtomicI64,
     quote_attempted: AtomicU64,
     quote_blocked: AtomicU64,
     blocked_reasons: RwLock<HashMap<String, u64>>,
@@ -344,8 +344,8 @@ struct ShadowStats {
 impl ShadowStats {
     fn new() -> Self {
         Self {
-            started_at: Instant::now(),
-            started_at_ms: Utc::now().timestamp_millis(),
+            started_at: RwLock::new(Instant::now()),
+            started_at_ms: AtomicI64::new(Utc::now().timestamp_millis()),
             quote_attempted: AtomicU64::new(0),
             quote_blocked: AtomicU64::new(0),
             blocked_reasons: RwLock::new(HashMap::new()),
@@ -364,6 +364,29 @@ impl ShadowStats {
             risk_us: RwLock::new(Vec::new()),
             shadow_fill_ms: RwLock::new(Vec::new()),
         }
+    }
+
+    async fn reset(&self) {
+        *self.started_at.write().await = Instant::now();
+        self.started_at_ms
+            .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
+        self.quote_attempted.store(0, Ordering::Relaxed);
+        self.quote_blocked.store(0, Ordering::Relaxed);
+        self.ref_ticks_total.store(0, Ordering::Relaxed);
+        self.book_ticks_total.store(0, Ordering::Relaxed);
+        self.last_ref_tick_ms.store(0, Ordering::Relaxed);
+        self.last_book_tick_ms.store(0, Ordering::Relaxed);
+        self.blocked_reasons.write().await.clear();
+        self.shots.write().await.clear();
+        self.outcomes.write().await.clear();
+        self.tick_to_decision_ms.write().await.clear();
+        self.ack_only_ms.write().await.clear();
+        self.tick_to_ack_ms.write().await.clear();
+        self.feed_in_ms.write().await.clear();
+        self.signal_us.write().await.clear();
+        self.quote_us.write().await.clear();
+        self.risk_us.write().await.clear();
+        self.shadow_fill_ms.write().await.clear();
     }
 
     async fn push_shot(&self, shot: ShadowShot) {
@@ -445,6 +468,7 @@ impl ShadowStats {
 }
 impl ShadowStats {
     async fn build_live_report(&self) -> ShadowLiveReport {
+        const PRIMARY_DELAY_MS: u64 = 10;
         let shots = self.shots.read().await.clone();
         let outcomes = self.outcomes.read().await.clone();
         let tick_to_decision_ms = self.tick_to_decision_ms.read().await.clone();
@@ -461,18 +485,29 @@ impl ShadowStats {
         let fillability_10 = fillability_ratio(&outcomes, 10);
         let fillability_25 = fillability_ratio(&outcomes, 25);
 
-        let net_edges = shots.iter().map(|s| s.edge_net_bps).collect::<Vec<_>>();
+        let shots_primary = shots
+            .iter()
+            .filter(|s| s.delay_ms == PRIMARY_DELAY_MS)
+            .collect::<Vec<_>>();
+        let outcomes_primary = outcomes
+            .iter()
+            .filter(|o| o.delay_ms == PRIMARY_DELAY_MS)
+            .collect::<Vec<_>>();
+        let net_edges = shots_primary
+            .iter()
+            .map(|s| s.edge_net_bps)
+            .collect::<Vec<_>>();
         let net_edge_p50 = percentile(&net_edges, 0.50).unwrap_or(0.0);
         let net_edge_p10 = percentile(&net_edges, 0.10).unwrap_or(0.0);
-        let pnl_1s = outcomes
+        let pnl_1s = outcomes_primary
             .iter()
             .filter_map(|o| o.net_markout_1s_bps.or(o.pnl_1s_bps))
             .collect::<Vec<_>>();
-        let pnl_5s = outcomes
+        let pnl_5s = outcomes_primary
             .iter()
             .filter_map(|o| o.net_markout_5s_bps.or(o.pnl_5s_bps))
             .collect::<Vec<_>>();
-        let pnl_10s = outcomes
+        let pnl_10s = outcomes_primary
             .iter()
             .filter_map(|o| o.net_markout_10s_bps.or(o.pnl_10s_bps))
             .collect::<Vec<_>>();
@@ -488,7 +523,8 @@ impl ShadowStats {
             blocked as f64 / (attempted + blocked) as f64
         };
 
-        let uptime_pct = estimate_uptime_pct(self.started_at.elapsed());
+        let elapsed = self.started_at.read().await.elapsed();
+        let uptime_pct = estimate_uptime_pct(elapsed);
         let tick_to_ack_p99 = percentile(&tick_to_ack_ms, 0.99).unwrap_or(0.0);
         let scorecard = build_market_scorecard(&shots, &outcomes);
         let ref_ticks_total = self.ref_ticks_total.load(Ordering::Relaxed);
@@ -527,8 +563,8 @@ impl ShadowStats {
         };
 
         ShadowLiveReport {
-            started_at_ms: self.started_at_ms,
-            elapsed_sec: self.started_at.elapsed().as_secs(),
+            started_at_ms: self.started_at_ms.load(Ordering::Relaxed),
+            elapsed_sec: elapsed.as_secs(),
             total_shots: shots.len(),
             total_outcomes: outcomes.len(),
             quote_attempted: attempted,
@@ -705,6 +741,7 @@ async fn main() -> Result<()> {
         .route("/control/pause", post(pause))
         .route("/control/resume", post(resume))
         .route("/control/flatten", post(flatten))
+        .route("/control/reset_shadow", post(reset_shadow))
         .route("/control/reload_strategy", post(reload_strategy))
         .route("/control/reload_toxicity", post(reload_toxicity))
         .with_state(state);
@@ -1672,7 +1709,7 @@ fn net_markout(markout_bps: Option<f64>, shot: &ShadowShot) -> Option<f64> {
 }
 
 async fn update_toxic_state_from_outcome(shared: &EngineShared, outcome: &ShadowOutcome) {
-    if !outcome.fillable {
+    if !outcome.fillable || outcome.delay_ms != 10 {
         return;
     }
     let mut states = shared.tox_state.write().await;
@@ -1931,6 +1968,12 @@ async fn flatten(State(state): State<AppState>) -> impl IntoResponse {
         )
             .into_response(),
     }
+}
+
+async fn reset_shadow(State(state): State<AppState>) -> impl IntoResponse {
+    state.shadow_stats.reset().await;
+    state.tox_state.write().await.clear();
+    Json(serde_json::json!({"ok": true, "shadow_reset": true}))
 }
 
 async fn reload_strategy(
@@ -2539,6 +2582,7 @@ fn fillability_ratio(outcomes: &[ShadowOutcome], delay_ms: u64) -> f64 {
 }
 
 fn build_market_scorecard(shots: &[ShadowShot], outcomes: &[ShadowOutcome]) -> Vec<MarketScoreRow> {
+    const PRIMARY_DELAY_MS: u64 = 10;
     let mut keys: HashMap<(String, String), ()> = HashMap::new();
     for shot in shots {
         keys.insert((shot.market_id.clone(), shot.symbol.clone()), ());
@@ -2559,12 +2603,20 @@ fn build_market_scorecard(shots: &[ShadowShot], outcomes: &[ShadowOutcome]) -> V
             .filter(|o| o.market_id == market_id && o.symbol == symbol)
             .cloned()
             .collect::<Vec<_>>();
+        let market_shots_primary = market_shots
+            .iter()
+            .filter(|s| s.delay_ms == PRIMARY_DELAY_MS)
+            .collect::<Vec<_>>();
+        let market_outcomes_primary = market_outcomes
+            .iter()
+            .filter(|o| o.delay_ms == PRIMARY_DELAY_MS)
+            .collect::<Vec<_>>();
 
-        let net_edges = market_shots
+        let net_edges = market_shots_primary
             .iter()
             .map(|s| s.edge_net_bps)
             .collect::<Vec<_>>();
-        let pnl_10s = market_outcomes
+        let pnl_10s = market_outcomes_primary
             .iter()
             .filter_map(|o| o.net_markout_10s_bps.or(o.pnl_10s_bps))
             .collect::<Vec<_>>();
@@ -2572,8 +2624,8 @@ fn build_market_scorecard(shots: &[ShadowShot], outcomes: &[ShadowOutcome]) -> V
         rows.push(MarketScoreRow {
             market_id,
             symbol,
-            shots: market_shots.len(),
-            outcomes: market_outcomes.len(),
+            shots: market_shots_primary.len(),
+            outcomes: market_outcomes_primary.len(),
             fillability_10ms: fillability_ratio(&market_outcomes, 10),
             net_edge_p50_bps: percentile(&net_edges, 0.50).unwrap_or(0.0),
             net_edge_p10_bps: percentile(&net_edges, 0.10).unwrap_or(0.0),

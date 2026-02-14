@@ -96,8 +96,10 @@ def run_trial(
     basis_z_cap: float,
     safe_threshold: float,
     caution_threshold: float,
+    warmup_sec: int,
 ) -> TrialResult:
     base = base_url.rstrip("/")
+    post_json(session, f"{base}/control/reset_shadow", {})
     post_json(
         session,
         f"{base}/control/reload_strategy",
@@ -116,6 +118,8 @@ def run_trial(
             "caution_threshold": caution_threshold,
         },
     )
+    if warmup_sec > 0:
+        time.sleep(warmup_sec)
 
     fillability: List[float] = []
     pnl10: List[float] = []
@@ -248,6 +252,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--basis-z-grid", default="2.0,3.0")
     p.add_argument("--safe-threshold-grid", default="0.35")
     p.add_argument("--caution-threshold-grid", default="0.65")
+    p.add_argument("--warmup-sec", type=int, default=15)
     return p.parse_args()
 
 
@@ -283,6 +288,7 @@ def main() -> int:
             basis_z_cap=z,
             safe_threshold=safe,
             caution_threshold=caution,
+            warmup_sec=args.warmup_sec,
         )
         rows.append(row)
 
