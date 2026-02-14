@@ -29,8 +29,11 @@ def get_json(session: requests.Session, url: str) -> Dict[str, Any]:
     return resp.json()
 
 
-def gate_pass(live: Dict[str, Any]) -> bool:
+def gate_pass(live: Dict[str, Any], min_outcomes: int) -> bool:
+    outcomes = int(live.get("total_outcomes", 0) or 0)
     return (
+        outcomes >= min_outcomes
+        and
         float(live.get("pnl_10s_p50_bps_robust", live.get("pnl_10s_p50_bps", 0.0))) > 0.0
         and float(live.get("fillability_10ms", 0.0)) >= 0.60
         and float(live.get("quote_block_ratio", 1.0)) < 0.10
@@ -91,6 +94,28 @@ def reset_shadow(session: requests.Session, base_url: str) -> None:
     post_json(session, f"{base}/control/reset_shadow", {})
 
 
+def collect_live_window(
+    session: requests.Session,
+    base_url: str,
+    eval_window_sec: int,
+    poll_interval_sec: float,
+) -> List[Dict[str, Any]]:
+    base = base_url.rstrip("/")
+    samples: List[Dict[str, Any]] = []
+    deadline = time.monotonic() + max(1, eval_window_sec)
+    while time.monotonic() < deadline:
+        samples.append(get_json(session, f"{base}/report/shadow/live"))
+        time.sleep(max(0.2, poll_interval_sec))
+    if not samples:
+        samples.append(get_json(session, f"{base}/report/shadow/live"))
+    return samples
+
+
+def pick_gate_snapshot(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
+    # Prefer the richest sample in-window to reduce small-sample artifacts.
+    return max(samples, key=lambda item: int(item.get("total_outcomes", 0) or 0))
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Long-run shadow regression orchestrator")
     p.add_argument("--base-url", default="http://127.0.0.1:8080")
@@ -100,6 +125,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-trials", type=int, default=12)
     p.add_argument("--out-root", default="datasets/reports")
     p.add_argument("--cooldown-sec", type=int, default=120)
+    p.add_argument("--eval-window-sec", type=int, default=120)
+    p.add_argument("--min-outcomes", type=int, default=30)
     return p.parse_args()
 
 
@@ -121,8 +148,14 @@ def main() -> int:
         # Use cycle-local statistics for gate decision; avoid cumulative contamination.
         reset_shadow(session, args.base_url)
         time.sleep(max(10, args.cooldown_sec))
-        live = get_json(session, f"{args.base_url.rstrip('/')}/report/shadow/live")
-        passed = gate_pass(live)
+        samples = collect_live_window(
+            session,
+            args.base_url,
+            args.eval_window_sec,
+            args.poll_interval_sec,
+        )
+        live = pick_gate_snapshot(samples)
+        passed = gate_pass(live, args.min_outcomes)
 
         if passed:
             best_trial = trial
@@ -143,6 +176,7 @@ def main() -> int:
                 ),
             },
             "rollback_applied": (not passed and best_trial is not None),
+            "eval_samples": len(samples),
         }
         with audit_file.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=True) + "\n")
