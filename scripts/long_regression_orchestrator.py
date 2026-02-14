@@ -33,7 +33,7 @@ PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "max_trials": 2,
         "fail_fast_threshold": 1,
         "cooldown_sec": 30,
-        "min_outcomes": 20,
+        "min_outcomes": 10,
         "max_estimated_sec": 1800,
     },
     "standard": {

@@ -51,7 +51,7 @@ PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "max_runtime_sec": 480,
         "heartbeat_sec": 15.0,
         "fail_fast_threshold": 1,
-        "min_outcomes": 20,
+        "min_outcomes": 10,
         "min_edge_grid": "4.5,5.0",
         "ttl_grid": "350,400",
         "basis_k_grid": "0.8",
