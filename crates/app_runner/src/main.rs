@@ -446,7 +446,9 @@ impl ShadowStats {
     }
 
     async fn mark_blocked_with_reason(&self, reason: &str) {
-        self.mark_blocked();
+        if is_quote_reject_reason(reason) {
+            self.mark_blocked();
+        }
         let mut reasons = self.blocked_reasons.write().await;
         *reasons.entry(reason.to_string()).or_insert(0) += 1;
     }
@@ -465,6 +467,14 @@ impl ShadowStats {
         self.book_ticks_total.fetch_add(1, Ordering::Relaxed);
         self.last_book_tick_ms.store(ts_ms, Ordering::Relaxed);
     }
+}
+
+fn is_quote_reject_reason(reason: &str) -> bool {
+    reason.starts_with("risk:")
+        || matches!(
+            reason,
+            "risk_capped_zero" | "edge_below_threshold" | "execution_error"
+        )
 }
 impl ShadowStats {
     async fn build_live_report(&self) -> ShadowLiveReport {
