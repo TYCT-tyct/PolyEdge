@@ -1392,7 +1392,7 @@ fn spawn_reference_feed(
                     stats.mark_data_validity(valid);
                     let stream_key = format!("{}:{}", tick.source, tick.symbol);
                     if let Some(prev) = last_source_ts_by_stream.get(&stream_key).copied() {
-                        if source_ts < prev {
+                        if source_ts + 50 < prev {
                             stats.mark_ts_inversion();
                         }
                     }
@@ -1449,7 +1449,7 @@ fn spawn_market_feed(bus: RingBus<EngineEvent>, stats: Arc<ShadowStats>) {
                         && source_seq > 0;
                     stats.mark_data_validity(valid);
                     if let Some(prev) = last_source_ts_by_market.get(&book.market_id).copied() {
-                        if source_ts < prev {
+                        if source_ts + 50 < prev {
                             stats.mark_ts_inversion();
                         }
                     }
@@ -1706,7 +1706,6 @@ fn spawn_strategy_engine(
                         shared.shadow_stats.record_issue("stale_tick_dropped").await;
                         continue;
                     }
-                    let tick_to_decision_start = Instant::now();
                     let signal_start = Instant::now();
                     let signal = fair.evaluate(&tick, &book);
                     if signal.edge_bps_bid > 0.0 || signal.edge_bps_ask > 0.0 {
@@ -1986,6 +1985,7 @@ fn spawn_strategy_engine(
                     let drawdown = portfolio.snapshot().max_drawdown_pct;
 
                     for mut intent in intents.drain(..) {
+                        let intent_decision_start = Instant::now();
                         shared.shadow_stats.mark_attempted();
 
                         let risk_start = Instant::now();
@@ -2055,7 +2055,7 @@ fn spawn_strategy_engine(
                         shared.shadow_stats.mark_eligible();
 
                         let decision_compute_ms =
-                            tick_to_decision_start.elapsed().as_secs_f64() * 1_000.0;
+                            intent_decision_start.elapsed().as_secs_f64() * 1_000.0;
                         let tick_to_decision_ms = latency_sample.local_backlog_ms + decision_compute_ms;
                         let place_start = Instant::now();
                         match execution.place_order(intent.clone()).await {
