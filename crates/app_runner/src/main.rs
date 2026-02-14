@@ -793,10 +793,6 @@ impl ShadowStats {
         }
     }
 
-    fn mark_seq_gap(&self) {
-        self.seq_gap.fetch_add(1, Ordering::Relaxed);
-    }
-
     fn mark_ts_inversion(&self) {
         self.ts_inversion.fetch_add(1, Ordering::Relaxed);
     }
@@ -1398,8 +1394,6 @@ fn spawn_reference_feed(
                     if let Some(prev) = last_source_ts_by_stream.get(&stream_key).copied() {
                         if source_ts < prev {
                             stats.mark_ts_inversion();
-                        } else if source_ts - prev > 5_000 {
-                            stats.mark_seq_gap();
                         }
                     }
                     last_source_ts_by_stream.insert(stream_key, source_ts);
@@ -1457,8 +1451,6 @@ fn spawn_market_feed(bus: RingBus<EngineEvent>, stats: Arc<ShadowStats>) {
                     if let Some(prev) = last_source_ts_by_market.get(&book.market_id).copied() {
                         if source_ts < prev {
                             stats.mark_ts_inversion();
-                        } else if source_ts - prev > 5_000 {
-                            stats.mark_seq_gap();
                         }
                     }
                     last_source_ts_by_market.insert(book.market_id.clone(), source_ts);
