@@ -315,6 +315,7 @@ struct ShadowLiveReport {
     total_outcomes: usize,
     quote_attempted: u64,
     quote_blocked: u64,
+    policy_blocked: u64,
     fillability_5ms: f64,
     fillability_10ms: f64,
     fillability_25ms: f64,
@@ -375,6 +376,7 @@ struct ShadowStats {
     started_at_ms: AtomicI64,
     quote_attempted: AtomicU64,
     quote_blocked: AtomicU64,
+    policy_blocked: AtomicU64,
     blocked_reasons: RwLock<HashMap<String, u64>>,
     ref_ticks_total: AtomicU64,
     book_ticks_total: AtomicU64,
@@ -408,6 +410,7 @@ impl ShadowStats {
             started_at_ms: AtomicI64::new(Utc::now().timestamp_millis()),
             quote_attempted: AtomicU64::new(0),
             quote_blocked: AtomicU64::new(0),
+            policy_blocked: AtomicU64::new(0),
             blocked_reasons: RwLock::new(HashMap::new()),
             ref_ticks_total: AtomicU64::new(0),
             book_ticks_total: AtomicU64::new(0),
@@ -437,6 +440,7 @@ impl ShadowStats {
             .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
         self.quote_attempted.store(0, Ordering::Relaxed);
         self.quote_blocked.store(0, Ordering::Relaxed);
+        self.policy_blocked.store(0, Ordering::Relaxed);
         self.ref_ticks_total.store(0, Ordering::Relaxed);
         self.book_ticks_total.store(0, Ordering::Relaxed);
         self.last_ref_tick_ms.store(0, Ordering::Relaxed);
@@ -545,9 +549,16 @@ impl ShadowStats {
         self.quote_blocked.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn mark_policy_blocked(&self) {
+        self.policy_blocked.fetch_add(1, Ordering::Relaxed);
+    }
+
     async fn mark_blocked_with_reason(&self, reason: &str) {
         if is_quote_reject_reason(reason) {
             self.mark_blocked();
+        }
+        if is_policy_block_reason(reason) {
+            self.mark_policy_blocked();
         }
         let mut reasons = self.blocked_reasons.write().await;
         *reasons.entry(reason.to_string()).or_insert(0) += 1;
@@ -570,11 +581,14 @@ impl ShadowStats {
 }
 
 fn is_quote_reject_reason(reason: &str) -> bool {
+    reason == "execution_error" || reason.starts_with("exchange_reject")
+}
+
+fn is_policy_block_reason(reason: &str) -> bool {
     reason.starts_with("risk:")
-        || matches!(
-            reason,
-            "risk_capped_zero" | "edge_below_threshold" | "execution_error"
-        )
+        || reason.starts_with("market_")
+        || reason.starts_with("no_quote_")
+        || matches!(reason, "risk_capped_zero" | "edge_below_threshold")
 }
 impl ShadowStats {
     async fn build_live_report(&self) -> ShadowLiveReport {
@@ -634,26 +648,16 @@ impl ShadowStats {
 
         let attempted = self.quote_attempted.load(Ordering::Relaxed);
         let blocked = self.quote_blocked.load(Ordering::Relaxed);
-        let block_ratio = if attempted + blocked == 0 {
+        let policy_blocked = self.policy_blocked.load(Ordering::Relaxed);
+        let block_ratio = if attempted == 0 {
             0.0
         } else {
-            blocked as f64 / (attempted + blocked) as f64
+            blocked as f64 / attempted as f64
         };
-        let policy_blocked = blocked_reason_counts
-            .iter()
-            .filter(|(k, _)| {
-                k.starts_with("no_quote_")
-                    || k.starts_with("market_")
-                    || *k == "paused"
-                    || *k == "tick_missing"
-                    || *k == "symbol_missing"
-            })
-            .map(|(_, v)| *v)
-            .sum::<u64>();
-        let policy_block_ratio = if attempted + blocked == 0 {
+        let policy_block_ratio = if attempted + policy_blocked == 0 {
             0.0
         } else {
-            policy_blocked as f64 / (attempted + blocked) as f64
+            policy_blocked as f64 / (attempted + policy_blocked) as f64
         };
 
         let elapsed = self.started_at.read().await.elapsed();
@@ -710,6 +714,7 @@ impl ShadowStats {
             total_outcomes: outcomes.len(),
             quote_attempted: attempted,
             quote_blocked: blocked,
+            policy_blocked,
             fillability_5ms: fillability_5,
             fillability_10ms: fillability_10,
             fillability_25ms: fillability_25,
@@ -1038,6 +1043,7 @@ fn spawn_strategy_engine(
         let mut market_inventory: HashMap<String, InventoryState> = HashMap::new();
         let mut rx = bus.subscribe();
         let mut last_discovery_refresh = Instant::now() - Duration::from_secs(3600);
+        let mut last_symbol_retry_refresh = Instant::now() - Duration::from_secs(3600);
         refresh_market_symbol_map(&shared).await;
 
         loop {
@@ -1098,6 +1104,10 @@ fn spawn_strategy_engine(
                             st.symbol_missing = st.symbol_missing.saturating_add(1);
                         }
                         shared.shadow_stats.record_issue("symbol_missing").await;
+                        if last_symbol_retry_refresh.elapsed() >= Duration::from_secs(15) {
+                            refresh_market_symbol_map(&shared).await;
+                            last_symbol_retry_refresh = Instant::now();
+                        }
                         continue;
                     };
                     let tick = latest_ticks
@@ -1264,7 +1274,10 @@ fn spawn_strategy_engine(
                             let st = states.entry(book.market_id.clone()).or_default();
                             st.no_quote = st.no_quote.saturating_add(1);
                         }
-                        shared.shadow_stats.record_issue("no_quote_spread").await;
+                        shared
+                            .shadow_stats
+                            .mark_blocked_with_reason("no_quote_spread")
+                            .await;
                         continue;
                     }
                     if signal.confidence <= 0.0 {
@@ -1275,7 +1288,7 @@ fn spawn_strategy_engine(
                         }
                         shared
                             .shadow_stats
-                            .record_issue("no_quote_confidence")
+                            .mark_blocked_with_reason("no_quote_confidence")
                             .await;
                         continue;
                     }
@@ -1337,9 +1350,15 @@ fn spawn_strategy_engine(
                         let edge_blocked = signal.edge_bps_bid < effective_min_edge_bps
                             && signal.edge_bps_ask < effective_min_edge_bps;
                         if edge_blocked {
-                            shared.shadow_stats.record_issue("no_quote_edge").await;
+                            shared
+                                .shadow_stats
+                                .mark_blocked_with_reason("no_quote_edge")
+                                .await;
                         } else {
-                            shared.shadow_stats.record_issue("no_quote_policy").await;
+                            shared
+                                .shadow_stats
+                                .mark_blocked_with_reason("no_quote_policy")
+                                .await;
                         }
                         continue;
                     }
@@ -2830,9 +2849,10 @@ fn persist_final_report_files(report: &ShadowFinalReport) {
         report.live.event_backlog_p99
     ));
     md.push_str(&format!(
-        "- quote_attempted: {}\n- quote_blocked: {}\n- ref_ticks_total: {}\n- book_ticks_total: {}\n- ref_freshness_ms: {}\n- book_freshness_ms: {}\n\n",
+        "- quote_attempted: {}\n- quote_blocked: {}\n- policy_blocked: {}\n- ref_ticks_total: {}\n- book_ticks_total: {}\n- ref_freshness_ms: {}\n- book_freshness_ms: {}\n\n",
         report.live.quote_attempted,
         report.live.quote_blocked,
+        report.live.policy_blocked,
         report.live.ref_ticks_total,
         report.live.book_ticks_total,
         report.live.ref_freshness_ms,
