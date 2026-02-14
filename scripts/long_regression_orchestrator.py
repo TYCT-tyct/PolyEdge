@@ -86,6 +86,11 @@ def apply_trial(session: requests.Session, base_url: str, trial: Dict[str, Any])
     )
 
 
+def reset_shadow(session: requests.Session, base_url: str) -> None:
+    base = base_url.rstrip("/")
+    post_json(session, f"{base}/control/reset_shadow", {})
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Long-run shadow regression orchestrator")
     p.add_argument("--base-url", default="http://127.0.0.1:8080")
@@ -113,6 +118,8 @@ def main() -> int:
             raise RuntimeError("No best trial found after param_regression")
 
         apply_trial(session, args.base_url, trial)
+        # Use cycle-local statistics for gate decision; avoid cumulative contamination.
+        reset_shadow(session, args.base_url)
         time.sleep(max(10, args.cooldown_sec))
         live = get_json(session, f"{args.base_url.rstrip('/')}/report/shadow/live")
         passed = gate_pass(live)
