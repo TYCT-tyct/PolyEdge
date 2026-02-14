@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -14,6 +15,10 @@ import requests
 
 def utc_day() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def default_run_id() -> str:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"ab-{ts}-{os.getpid()}"
 
 
 def percentile(values: List[float], p: float) -> float:
@@ -35,9 +40,18 @@ class RegionStats:
     pnl_10s_p50_bps_robust_p50: float
     fillability_10ms_p50: float
     feed_in_p50_ms_p50: float
+    gate_ready_ratio_p50: float
+    window_outcomes_p50: float
 
 
-def collect(base_url: str, name: str, seconds: int, poll_interval: float) -> RegionStats:
+def collect(
+    base_url: str,
+    name: str,
+    seconds: int,
+    poll_interval: float,
+    heartbeat_sec: float,
+    fail_fast_threshold: int,
+) -> RegionStats:
     session = requests.Session()
     deadline = time.time() + max(1, seconds)
     tick_ack: List[float] = []
@@ -46,18 +60,43 @@ def collect(base_url: str, name: str, seconds: int, poll_interval: float) -> Reg
     pnl_robust: List[float] = []
     fillability: List[float] = []
     feed_in: List[float] = []
+    gate_ready_ratio: List[float] = []
+    window_outcomes: List[float] = []
+    next_heartbeat = time.time() + max(1.0, heartbeat_sec)
+    consecutive_errors = 0
 
     while time.time() < deadline:
-        resp = session.get(f"{base_url.rstrip('/')}/report/shadow/live", timeout=5)
-        resp.raise_for_status()
-        live = resp.json()
-        latency = live.get("latency") or {}
-        tick_ack.append(float(live.get("tick_to_ack_p99_ms", 0.0)))
-        tick_decision.append(float(live.get("tick_to_decision_p99_ms", 0.0)))
-        block_ratio.append(float(live.get("quote_block_ratio", 0.0)))
-        pnl_robust.append(float(live.get("pnl_10s_p50_bps_robust", live.get("pnl_10s_p50_bps", 0.0))))
-        fillability.append(float(live.get("fillability_10ms", 0.0)))
-        feed_in.append(float(latency.get("feed_in_p50_ms", 0.0)))
+        try:
+            resp = session.get(f"{base_url.rstrip('/')}/report/shadow/live", timeout=5)
+            resp.raise_for_status()
+            live = resp.json()
+            latency = live.get("latency") or {}
+            tick_ack.append(float(live.get("tick_to_ack_p99_ms", 0.0)))
+            tick_decision.append(float(live.get("tick_to_decision_p99_ms", 0.0)))
+            block_ratio.append(float(live.get("quote_block_ratio", 0.0)))
+            pnl_robust.append(
+                float(live.get("pnl_10s_p50_bps_robust", live.get("pnl_10s_p50_bps", 0.0)))
+            )
+            fillability.append(float(live.get("fillability_10ms", 0.0)))
+            feed_in.append(float(latency.get("feed_in_p50_ms", 0.0)))
+            gate_ready_ratio.append(1.0 if bool(live.get("gate_ready", False)) else 0.0)
+            window_outcomes.append(
+                float(live.get("window_outcomes", live.get("total_outcomes", 0.0)))
+            )
+            consecutive_errors = 0
+        except Exception:
+            consecutive_errors += 1
+            if fail_fast_threshold > 0 and consecutive_errors >= fail_fast_threshold:
+                raise RuntimeError(
+                    f"{name}: fail-fast threshold reached ({consecutive_errors}) while collecting"
+                )
+        now = time.time()
+        if now >= next_heartbeat:
+            print(
+                f"[heartbeat] region={name} samples={len(tick_ack)} "
+                f"errors={consecutive_errors}"
+            )
+            next_heartbeat = now + max(1.0, heartbeat_sec)
         time.sleep(max(1.0, poll_interval))
 
     return RegionStats(
@@ -69,6 +108,8 @@ def collect(base_url: str, name: str, seconds: int, poll_interval: float) -> Reg
         pnl_10s_p50_bps_robust_p50=percentile(pnl_robust, 0.50),
         fillability_10ms_p50=percentile(fillability, 0.50),
         feed_in_p50_ms_p50=percentile(feed_in, 0.50),
+        gate_ready_ratio_p50=percentile(gate_ready_ratio, 0.50),
+        window_outcomes_p50=percentile(window_outcomes, 0.50),
     )
 
 
@@ -78,16 +119,37 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--base-b", required=True, help="Region B base url, e.g. http://us-host:8080")
     p.add_argument("--name-a", default="eu-west-2")
     p.add_argument("--name-b", default="us-east-1")
+    p.add_argument("--run-id", default=default_run_id())
     p.add_argument("--seconds", type=int, default=600)
+    p.add_argument("--max-runtime-sec", type=int, default=0)
     p.add_argument("--poll-interval", type=float, default=10.0)
+    p.add_argument("--heartbeat-sec", type=float, default=30.0)
+    p.add_argument("--fail-fast-threshold", type=int, default=3)
     p.add_argument("--out-root", default="datasets/reports")
     return p.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    a = collect(args.base_a, args.name_a, args.seconds, args.poll_interval)
-    b = collect(args.base_b, args.name_b, args.seconds, args.poll_interval)
+    seconds = args.seconds
+    if args.max_runtime_sec > 0:
+        seconds = min(seconds, args.max_runtime_sec)
+    a = collect(
+        args.base_a,
+        args.name_a,
+        seconds,
+        args.poll_interval,
+        args.heartbeat_sec,
+        args.fail_fast_threshold,
+    )
+    b = collect(
+        args.base_b,
+        args.name_b,
+        seconds,
+        args.poll_interval,
+        args.heartbeat_sec,
+        args.fail_fast_threshold,
+    )
 
     winner = a if a.tick_to_ack_p99_ms_p50 < b.tick_to_ack_p99_ms_p50 else b
     day_dir = Path(args.out_root) / utc_day()
@@ -97,6 +159,8 @@ def main() -> int:
 
     payload: Dict[str, Any] = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "run_id": args.run_id,
+        "seconds": seconds,
         "region_a": a.__dict__,
         "region_b": b.__dict__,
         "winner_by_tick_to_ack_p99": winner.name,
@@ -117,6 +181,8 @@ def main() -> int:
         f"- pnl_10s_p50_bps_robust_p50: {a.pnl_10s_p50_bps_robust_p50:.4f}",
         f"- fillability_10ms_p50: {a.fillability_10ms_p50:.4f}",
         f"- feed_in_p50_ms_p50: {a.feed_in_p50_ms_p50:.3f}",
+        f"- gate_ready_ratio_p50: {a.gate_ready_ratio_p50:.4f}",
+        f"- window_outcomes_p50: {a.window_outcomes_p50:.1f}",
         "",
         "## Region B",
         f"- name: {b.name}",
@@ -127,6 +193,8 @@ def main() -> int:
         f"- pnl_10s_p50_bps_robust_p50: {b.pnl_10s_p50_bps_robust_p50:.4f}",
         f"- fillability_10ms_p50: {b.fillability_10ms_p50:.4f}",
         f"- feed_in_p50_ms_p50: {b.feed_in_p50_ms_p50:.3f}",
+        f"- gate_ready_ratio_p50: {b.gate_ready_ratio_p50:.4f}",
+        f"- window_outcomes_p50: {b.window_outcomes_p50:.1f}",
         "",
     ]
     out_md.write_text("\n".join(md), encoding="utf-8")

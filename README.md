@@ -70,7 +70,7 @@ python scripts/long_regression_orchestrator.py --base-url http://127.0.0.1:8080 
 Cross-region A/B comparison:
 
 ```bash
-python scripts/ab_region_compare.py --base-a http://<eu-host>:8080 --base-b http://<us-host>:8080 --seconds 600
+python scripts/ab_region_compare.py --base-a http://<eu-host>:8080 --base-b http://<us-host>:8080 --seconds 600 --run-id ab1 --heartbeat-sec 30 --fail-fast-threshold 3
 ```
 
 ## Key Live Metrics
