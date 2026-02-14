@@ -72,6 +72,7 @@ struct EngineShared {
     market_to_symbol: Arc<RwLock<HashMap<String, String>>>,
     token_to_symbol: Arc<RwLock<HashMap<String, String>>>,
     fee_cache: Arc<RwLock<HashMap<String, FeeRateEntry>>>,
+    fee_refresh_inflight: Arc<RwLock<HashMap<String, Instant>>>,
     http: Client,
     strategy_cfg: Arc<RwLock<MakerConfig>>,
     fair_value_cfg: Arc<StdRwLock<BasisMrConfig>>,
@@ -1295,6 +1296,7 @@ async fn async_main() -> Result<()> {
         market_to_symbol: Arc::new(RwLock::new(HashMap::new())),
         token_to_symbol: Arc::new(RwLock::new(HashMap::new())),
         fee_cache: Arc::new(RwLock::new(HashMap::new())),
+        fee_refresh_inflight: Arc::new(RwLock::new(HashMap::new())),
         http: Client::new(),
         strategy_cfg,
         fair_value_cfg,
@@ -2745,24 +2747,70 @@ fn estimate_feed_latency(tick: &RefTick, book: &BookTop) -> FeedLatencySample {
 }
 
 async fn get_fee_rate_bps_cached(shared: &EngineShared, market_id: &str) -> f64 {
+    const DEFAULT_FEE_BPS: f64 = 2.0;
     const TTL: Duration = Duration::from_secs(60);
-    if let Some(entry) = shared.fee_cache.read().await.get(market_id).cloned() {
-        if entry.fetched_at.elapsed() < TTL {
-            return entry.fee_bps;
+    const REFRESH_BACKOFF: Duration = Duration::from_secs(3);
+
+    let now = Instant::now();
+    let (cached_fee, needs_refresh) = if let Some(entry) =
+        shared.fee_cache.read().await.get(market_id).cloned()
+    {
+        (
+            entry.fee_bps,
+            now.duration_since(entry.fetched_at) >= TTL || entry.fee_bps <= 0.0,
+        )
+    } else {
+        (DEFAULT_FEE_BPS, true)
+    };
+
+    if needs_refresh {
+        maybe_spawn_fee_refresh(shared, market_id, now, REFRESH_BACKOFF).await;
+    }
+
+    cached_fee
+}
+
+async fn maybe_spawn_fee_refresh(
+    shared: &EngineShared,
+    market_id: &str,
+    now: Instant,
+    refresh_backoff: Duration,
+) {
+    {
+        let inflight = shared.fee_refresh_inflight.read().await;
+        if let Some(last_attempt) = inflight.get(market_id) {
+            if now.duration_since(*last_attempt) < refresh_backoff {
+                return;
+            }
         }
     }
 
-    let fee_bps = fetch_fee_rate_bps(&shared.http, market_id)
-        .await
-        .unwrap_or(2.0);
-    shared.fee_cache.write().await.insert(
-        market_id.to_string(),
-        FeeRateEntry {
-            fee_bps,
-            fetched_at: Instant::now(),
-        },
-    );
-    fee_bps
+    {
+        let mut inflight = shared.fee_refresh_inflight.write().await;
+        if let Some(last_attempt) = inflight.get(market_id) {
+            if now.duration_since(*last_attempt) < refresh_backoff {
+                return;
+            }
+        }
+        inflight.insert(market_id.to_string(), now);
+    }
+
+    let market = market_id.to_string();
+    let http = shared.http.clone();
+    let fee_cache = shared.fee_cache.clone();
+    let inflight = shared.fee_refresh_inflight.clone();
+    tokio::spawn(async move {
+        if let Some(fee_bps) = fetch_fee_rate_bps(&http, &market).await {
+            fee_cache.write().await.insert(
+                market.clone(),
+                FeeRateEntry {
+                    fee_bps,
+                    fetched_at: Instant::now(),
+                },
+            );
+        }
+        inflight.write().await.remove(&market);
+    });
 }
 
 async fn fetch_fee_rate_bps(http: &Client, market_id: &str) -> Option<f64> {

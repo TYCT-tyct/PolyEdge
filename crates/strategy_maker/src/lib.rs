@@ -28,7 +28,7 @@ impl Default for MakerConfig {
             ttl_ms: 400,
             taker_trigger_bps: 8.0,
             taker_max_slippage_bps: 25.0,
-            stale_tick_filter_ms: 450.0,
+            stale_tick_filter_ms: 400.0,
             market_tier_profile: "balanced".to_string(),
             capital_fraction_kelly: 0.35,
             variance_penalty_lambda: 0.25,
