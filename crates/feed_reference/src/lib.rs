@@ -3,6 +3,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use core_types::{DynStream, RefPriceFeed, RefPriceWsFeed, RefTick};
 use futures::{SinkExt, StreamExt};
+use rand::Rng;
 use reqwest::Client;
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -45,7 +46,7 @@ impl RefPriceWsFeed for MultiSourceRefFeed {
                 if let Err(err) = run_binance_stream(&binance_symbols, &tx_binance).await {
                     tracing::warn!(?err, "binance ws stream failed; reconnecting");
                 }
-                tokio::time::sleep(backoff).await;
+                sleep_with_jitter(backoff).await;
             }
         });
 
@@ -56,7 +57,7 @@ impl RefPriceWsFeed for MultiSourceRefFeed {
                 if let Err(err) = run_bybit_stream(&bybit_symbols, &tx_bybit).await {
                     tracing::warn!(?err, "bybit ws stream failed; reconnecting");
                 }
-                tokio::time::sleep(backoff).await;
+                sleep_with_jitter(backoff).await;
             }
         });
 
@@ -67,7 +68,7 @@ impl RefPriceWsFeed for MultiSourceRefFeed {
                 if let Err(err) = run_coinbase_stream(&coinbase_symbols, &tx_coinbase).await {
                     tracing::warn!(?err, "coinbase ws stream failed; reconnecting");
                 }
-                tokio::time::sleep(backoff).await;
+                sleep_with_jitter(backoff).await;
             }
         });
 
@@ -76,6 +77,12 @@ impl RefPriceWsFeed for MultiSourceRefFeed {
         let stream = ReceiverStream::new(rx).map(Ok);
         Ok(Box::pin(stream))
     }
+}
+
+async fn sleep_with_jitter(base: Duration) {
+    let base_ms = base.as_millis() as u64;
+    let jitter_ms = rand::rng().random_range(0..=300);
+    tokio::time::sleep(Duration::from_millis(base_ms.saturating_add(jitter_ms))).await;
 }
 
 async fn run_binance_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> Result<()> {

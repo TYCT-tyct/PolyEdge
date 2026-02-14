@@ -29,6 +29,17 @@ impl Default for DiscoveryConfig {
                 "ETHUSDT".to_string(),
                 "SOLUSDT".to_string(),
                 "XRPUSDT".to_string(),
+                "BNBUSDT".to_string(),
+                "DOGEUSDT".to_string(),
+                "ADAUSDT".to_string(),
+                "AVAXUSDT".to_string(),
+                "LINKUSDT".to_string(),
+                "MATICUSDT".to_string(),
+                "LTCUSDT".to_string(),
+                "DOTUSDT".to_string(),
+                "TRXUSDT".to_string(),
+                "TONUSDT".to_string(),
+                "NEARUSDT".to_string(),
             ],
             endpoint: "https://gamma-api.polymarket.com/markets".to_string(),
         }
@@ -101,11 +112,22 @@ impl MarketDiscovery {
 }
 
 fn detect_symbol(text: &str, allowed_symbols: &[String]) -> Option<String> {
-    let aliases: [(&str, [&str; 3]); 4] = [
+    let aliases: [(&str, [&str; 3]); 15] = [
         ("BTCUSDT", ["BITCOIN", "BTC", "XBT"]),
         ("ETHUSDT", ["ETHEREUM", "ETH", "ETHER"]),
         ("SOLUSDT", ["SOLANA", "SOL", "SOLAN"]),
         ("XRPUSDT", ["RIPPLE", "XRP", "XRP"]),
+        ("BNBUSDT", ["BINANCE", "BNB", "BNB"]),
+        ("DOGEUSDT", ["DOGECOIN", "DOGE", "DOGE"]),
+        ("ADAUSDT", ["CARDANO", "ADA", "ADA"]),
+        ("AVAXUSDT", ["AVALANCHE", "AVAX", "AVAX"]),
+        ("LINKUSDT", ["CHAINLINK", "LINK", "LINK"]),
+        ("MATICUSDT", ["POLYGON", "MATIC", "POL"]),
+        ("LTCUSDT", ["LITECOIN", "LTC", "LTC"]),
+        ("DOTUSDT", ["POLKADOT", "DOT", "DOT"]),
+        ("TRXUSDT", ["TRON", "TRX", "TRX"]),
+        ("TONUSDT", ["TONCOIN", "TON", "TON"]),
+        ("NEARUSDT", ["NEAR", "NEAR", "NEAR"]),
     ];
 
     for (symbol, keys) in aliases {

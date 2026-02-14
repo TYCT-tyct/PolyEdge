@@ -54,6 +54,7 @@ struct AppState {
     strategy_cfg: Arc<RwLock<MakerConfig>>,
     fair_value_cfg: Arc<StdRwLock<BasisMrConfig>>,
     toxicity_cfg: Arc<RwLock<ToxicityConfig>>,
+    risk_limits: Arc<RwLock<RiskLimits>>,
     tox_state: Arc<RwLock<HashMap<String, MarketToxicState>>>,
     shadow_stats: Arc<ShadowStats>,
     perf_profile: Arc<RwLock<PerfProfile>>,
@@ -75,6 +76,9 @@ struct EngineShared {
     strategy_cfg: Arc<RwLock<MakerConfig>>,
     fair_value_cfg: Arc<StdRwLock<BasisMrConfig>>,
     toxicity_cfg: Arc<RwLock<ToxicityConfig>>,
+    risk_limits: Arc<RwLock<RiskLimits>>,
+    universe_symbols: Arc<Vec<String>>,
+    rate_limit_rps: f64,
     tox_state: Arc<RwLock<HashMap<String, MarketToxicState>>>,
     shadow_stats: Arc<ShadowStats>,
 }
@@ -95,12 +99,33 @@ struct StrategyReloadReq {
     basis_k_revert: Option<f64>,
     basis_z_cap: Option<f64>,
     basis_min_confidence: Option<f64>,
+    taker_trigger_bps: Option<f64>,
+    taker_max_slippage_bps: Option<f64>,
+    stale_tick_filter_ms: Option<f64>,
+    market_tier_profile: Option<String>,
+    capital_fraction_kelly: Option<f64>,
+    variance_penalty_lambda: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
 struct StrategyReloadResp {
     maker: MakerConfig,
     fair_value: BasisMrConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct RiskReloadReq {
+    max_market_notional: Option<f64>,
+    max_asset_notional: Option<f64>,
+    max_open_orders: Option<usize>,
+    daily_drawdown_cap_pct: Option<f64>,
+    max_loss_streak: Option<u32>,
+    cooldown_sec: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct RiskReloadResp {
+    risk: RiskLimits,
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,6 +151,25 @@ struct PerfProfileReloadReq {
     io_queue_capacity: Option<usize>,
     json_mode: Option<String>,
     io_drop_on_full: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExecutionConfig {
+    mode: String,
+    rate_limit_rps: f64,
+    http_timeout_ms: u64,
+    clob_endpoint: String,
+}
+
+impl Default for ExecutionConfig {
+    fn default() -> Self {
+        Self {
+            mode: "paper".to_string(),
+            rate_limit_rps: 15.0,
+            http_timeout_ms: 3000,
+            clob_endpoint: "https://clob.polymarket.com".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,6 +324,12 @@ struct GateEvaluation {
     pnl_10s_p50_bps_robust: f64,
     pnl_10s_sample_count: usize,
     pnl_10s_outlier_ratio: f64,
+    eligible_count: u64,
+    executed_count: u64,
+    executed_over_eligible: f64,
+    ev_net_usdc_p50: f64,
+    ev_net_usdc_p10: f64,
+    ev_positive_ratio: f64,
     quote_block_ratio: f64,
     policy_block_ratio: f64,
     strategy_uptime_pct: f64,
@@ -370,6 +420,12 @@ struct ShadowLiveReport {
     roi_notional_10s_bps_p50: f64,
     pnl_10s_sample_count: usize,
     pnl_10s_outlier_ratio: f64,
+    eligible_count: u64,
+    executed_count: u64,
+    executed_over_eligible: f64,
+    ev_net_usdc_p50: f64,
+    ev_net_usdc_p10: f64,
+    ev_positive_ratio: f64,
     quote_block_ratio: f64,
     policy_block_ratio: f64,
     queue_depth_p99: f64,
@@ -422,6 +478,12 @@ struct ShadowStats {
     quote_attempted: AtomicU64,
     quote_blocked: AtomicU64,
     policy_blocked: AtomicU64,
+    seen_count: AtomicU64,
+    candidate_count: AtomicU64,
+    quoted_count: AtomicU64,
+    eligible_count: AtomicU64,
+    executed_count: AtomicU64,
+    filled_count: AtomicU64,
     blocked_reasons: RwLock<HashMap<String, u64>>,
     ref_ticks_total: AtomicU64,
     book_ticks_total: AtomicU64,
@@ -466,6 +528,12 @@ impl ShadowStats {
             quote_attempted: AtomicU64::new(0),
             quote_blocked: AtomicU64::new(0),
             policy_blocked: AtomicU64::new(0),
+            seen_count: AtomicU64::new(0),
+            candidate_count: AtomicU64::new(0),
+            quoted_count: AtomicU64::new(0),
+            eligible_count: AtomicU64::new(0),
+            executed_count: AtomicU64::new(0),
+            filled_count: AtomicU64::new(0),
             blocked_reasons: RwLock::new(HashMap::new()),
             ref_ticks_total: AtomicU64::new(0),
             book_ticks_total: AtomicU64::new(0),
@@ -506,6 +574,12 @@ impl ShadowStats {
         self.quote_attempted.store(0, Ordering::Relaxed);
         self.quote_blocked.store(0, Ordering::Relaxed);
         self.policy_blocked.store(0, Ordering::Relaxed);
+        self.seen_count.store(0, Ordering::Relaxed);
+        self.candidate_count.store(0, Ordering::Relaxed);
+        self.quoted_count.store(0, Ordering::Relaxed);
+        self.eligible_count.store(0, Ordering::Relaxed);
+        self.executed_count.store(0, Ordering::Relaxed);
+        self.filled_count.store(0, Ordering::Relaxed);
         self.ref_ticks_total.store(0, Ordering::Relaxed);
         self.book_ticks_total.store(0, Ordering::Relaxed);
         self.last_ref_tick_ms.store(0, Ordering::Relaxed);
@@ -652,6 +726,30 @@ impl ShadowStats {
 
     fn mark_attempted(&self) {
         self.quote_attempted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn mark_seen(&self) {
+        self.seen_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn mark_candidate(&self) {
+        self.candidate_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn mark_quoted(&self, n: u64) {
+        self.quoted_count.fetch_add(n, Ordering::Relaxed);
+    }
+
+    fn mark_eligible(&self) {
+        self.eligible_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn mark_executed(&self) {
+        self.executed_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn mark_filled(&self, n: u64) {
+        self.filled_count.fetch_add(n, Ordering::Relaxed);
     }
 
     fn mark_blocked(&self) {
@@ -810,6 +908,14 @@ impl ShadowStats {
         let pnl_10s_p50_raw = percentile(&pnl_10s, 0.50).unwrap_or(0.0);
         let net_markout_10s_usdc_p50 = percentile(&net_markout_10s_usdc, 0.50).unwrap_or(0.0);
         let roi_notional_10s_bps_p50 = percentile(&roi_notional_10s_bps, 0.50).unwrap_or(0.0);
+        let ev_net_usdc_p50 = percentile(&net_markout_10s_usdc, 0.50).unwrap_or(0.0);
+        let ev_net_usdc_p10 = percentile(&net_markout_10s_usdc, 0.10).unwrap_or(0.0);
+        let ev_positive_ratio = if net_markout_10s_usdc.is_empty() {
+            0.0
+        } else {
+            net_markout_10s_usdc.iter().filter(|v| **v > 0.0).count() as f64
+                / net_markout_10s_usdc.len() as f64
+        };
         let (pnl_10s_filtered, pnl_10s_outlier_ratio) = robust_filter_iqr(&pnl_10s);
         let pnl_10s_p50_robust = percentile(&pnl_10s_filtered, 0.50).unwrap_or(pnl_10s_p50_raw);
         let pnl_10s_sample_count = pnl_10s.len();
@@ -817,6 +923,13 @@ impl ShadowStats {
         let attempted = self.quote_attempted.load(Ordering::Relaxed);
         let blocked = self.quote_blocked.load(Ordering::Relaxed);
         let policy_blocked = self.policy_blocked.load(Ordering::Relaxed);
+        let eligible_count = self.eligible_count.load(Ordering::Relaxed);
+        let executed_count = self.executed_count.load(Ordering::Relaxed);
+        let executed_over_eligible = if eligible_count == 0 {
+            0.0
+        } else {
+            executed_count as f64 / eligible_count as f64
+        };
         let block_ratio = if attempted == 0 {
             0.0
         } else {
@@ -942,6 +1055,12 @@ impl ShadowStats {
             roi_notional_10s_bps_p50,
             pnl_10s_sample_count,
             pnl_10s_outlier_ratio,
+            eligible_count,
+            executed_count,
+            executed_over_eligible,
+            ev_net_usdc_p50,
+            ev_net_usdc_p10,
+            ev_positive_ratio,
             quote_block_ratio: block_ratio,
             policy_block_ratio,
             queue_depth_p99: percentile(&queue_depth, 0.99).unwrap_or(0.0),
@@ -993,6 +1112,12 @@ impl ShadowStats {
             pnl_10s_p50_bps_robust: live.pnl_10s_p50_bps_robust,
             pnl_10s_sample_count: live.pnl_10s_sample_count,
             pnl_10s_outlier_ratio: live.pnl_10s_outlier_ratio,
+            eligible_count: live.eligible_count,
+            executed_count: live.executed_count,
+            executed_over_eligible: live.executed_over_eligible,
+            ev_net_usdc_p50: live.ev_net_usdc_p50,
+            ev_net_usdc_p10: live.ev_net_usdc_p10,
+            ev_positive_ratio: live.ev_positive_ratio,
             quote_block_ratio: live.quote_block_ratio,
             policy_block_ratio: live.policy_block_ratio,
             strategy_uptime_pct: live.strategy_uptime_pct,
@@ -1037,6 +1162,21 @@ fn compute_gate_fail_reasons(live: &ShadowLiveReport, min_outcomes: usize) -> Ve
         failed.push(format!(
             "roi_notional_10s_bps_p50 {:.6} <= 0",
             live.roi_notional_10s_bps_p50
+        ));
+    }
+    if live.executed_over_eligible < 0.60 {
+        failed.push(format!(
+            "executed_over_eligible {:.4} < 0.60",
+            live.executed_over_eligible
+        ));
+    }
+    if live.ev_net_usdc_p50 <= 0.0 {
+        failed.push(format!("ev_net_usdc_p50 {:.6} <= 0", live.ev_net_usdc_p50));
+    }
+    if live.ev_positive_ratio < 0.55 {
+        failed.push(format!(
+            "ev_positive_ratio {:.4} < 0.55",
+            live.ev_positive_ratio
         ));
     }
     if live.quote_block_ratio >= 0.10 {
@@ -1112,20 +1252,30 @@ async fn async_main() -> Result<()> {
     let prometheus = init_metrics();
     ensure_dataset_dirs();
 
+    let execution_cfg = load_execution_config();
+    let universe_cfg = load_universe_config();
     let bus = RingBus::new(16_384);
     let portfolio = Arc::new(PortfolioBook::default());
-    let execution = Arc::new(ClobExecution::new(
-        ExecutionMode::Paper,
-        "https://clob.polymarket.com".to_string(),
+    let exec_mode = if execution_cfg.mode.eq_ignore_ascii_case("live") {
+        ExecutionMode::Live
+    } else {
+        ExecutionMode::Paper
+    };
+    let execution = Arc::new(ClobExecution::new_with_timeout(
+        exec_mode,
+        execution_cfg.clob_endpoint.clone(),
+        Duration::from_millis(execution_cfg.http_timeout_ms),
     ));
     let shadow = Arc::new(ShadowExecutor::default());
-    let strategy_cfg = Arc::new(RwLock::new(MakerConfig::default()));
+    let strategy_cfg = Arc::new(RwLock::new(load_strategy_config()));
     let fair_value_cfg = Arc::new(StdRwLock::new(load_fair_value_config()));
     let toxicity_cfg = Arc::new(RwLock::new(ToxicityConfig::default()));
+    let risk_limits = Arc::new(RwLock::new(load_risk_limits_config()));
     let perf_profile = Arc::new(RwLock::new(load_perf_profile_config()));
     let tox_state = Arc::new(RwLock::new(HashMap::new()));
     let shadow_stats = Arc::new(ShadowStats::new());
     let paused = Arc::new(RwLock::new(false));
+    let universe_symbols = Arc::new(universe_cfg.assets.clone());
     init_jsonl_writer(perf_profile.clone()).await;
 
     let state = AppState {
@@ -1138,6 +1288,7 @@ async fn async_main() -> Result<()> {
         strategy_cfg: strategy_cfg.clone(),
         fair_value_cfg: fair_value_cfg.clone(),
         toxicity_cfg: toxicity_cfg.clone(),
+        risk_limits: risk_limits.clone(),
         tox_state: tox_state.clone(),
         shadow_stats: shadow_stats.clone(),
         perf_profile: perf_profile.clone(),
@@ -1152,11 +1303,18 @@ async fn async_main() -> Result<()> {
         strategy_cfg,
         fair_value_cfg,
         toxicity_cfg,
+        risk_limits,
+        universe_symbols: universe_symbols.clone(),
+        rate_limit_rps: execution_cfg.rate_limit_rps.max(0.1),
         tox_state,
         shadow_stats,
     });
 
-    spawn_reference_feed(bus.clone(), shared.shadow_stats.clone());
+    spawn_reference_feed(
+        bus.clone(),
+        shared.shadow_stats.clone(),
+        (*universe_symbols).clone(),
+    );
     spawn_market_feed(bus.clone(), shared.shadow_stats.clone());
     spawn_strategy_engine(
         bus.clone(),
@@ -1189,6 +1347,7 @@ async fn async_main() -> Result<()> {
         .route("/control/reset_shadow", post(reset_shadow))
         .route("/control/reload_strategy", post(reload_strategy))
         .route("/control/reload_toxicity", post(reload_toxicity))
+        .route("/control/reload_risk", post(reload_risk))
         .route("/control/reload_perf_profile", post(reload_perf_profile))
         .with_state(state);
 
@@ -1202,15 +1361,21 @@ fn install_rustls_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
-fn spawn_reference_feed(bus: RingBus<EngineEvent>, stats: Arc<ShadowStats>) {
+fn spawn_reference_feed(
+    bus: RingBus<EngineEvent>,
+    stats: Arc<ShadowStats>,
+    symbols: Vec<String>,
+) {
     tokio::spawn(async move {
         let feed = MultiSourceRefFeed::new(Duration::from_millis(50));
-        let symbols = vec![
-            "BTCUSDT".to_string(),
-            "ETHUSDT".to_string(),
-            "SOLUSDT".to_string(),
-            "XRPUSDT".to_string(),
-        ];
+        if symbols.is_empty() {
+            tracing::warn!("reference feed symbols empty; using fallback BTCUSDT");
+        }
+        let symbols = if symbols.is_empty() {
+            vec!["BTCUSDT".to_string()]
+        } else {
+            symbols
+        };
         let Ok(mut stream) = feed.stream_ticks(symbols).await else {
             tracing::error!("reference feed failed to start");
             return;
@@ -1424,9 +1589,13 @@ fn spawn_strategy_engine(
 ) {
     tokio::spawn(async move {
         let fair = BasisMrFairValue::new(shared.fair_value_cfg.clone());
-        let risk = DefaultRiskManager::new(RiskLimits::default());
         let mut latest_ticks: HashMap<String, RefTick> = HashMap::new();
         let mut market_inventory: HashMap<String, InventoryState> = HashMap::new();
+        let mut market_rate_budget: HashMap<String, TokenBucket> = HashMap::new();
+        let mut global_rate_budget = TokenBucket::new(
+            shared.rate_limit_rps,
+            (shared.rate_limit_rps * 2.0).max(1.0),
+        );
         let mut rx = bus.subscribe();
         let mut last_discovery_refresh = Instant::now() - Duration::from_secs(3600);
         let mut last_symbol_retry_refresh = Instant::now() - Duration::from_secs(3600);
@@ -1468,7 +1637,9 @@ fn spawn_strategy_engine(
                         .await
                         .insert(book.market_id.clone(), book.clone());
 
-                    for fill in shadow.on_book(&book) {
+                    let fills = shadow.on_book(&book);
+                    shared.shadow_stats.mark_filled(fills.len() as u64);
+                    for fill in fills {
                         portfolio.apply_fill(&fill);
                         let _ = bus.publish(EngineEvent::Fill(fill.clone()));
                         let ingest_seq = next_normalized_ingest_seq();
@@ -1514,6 +1685,7 @@ fn spawn_strategy_engine(
                         shared.shadow_stats.record_issue("tick_missing").await;
                         continue;
                     };
+                    shared.shadow_stats.mark_seen();
 
                     let latency_sample = estimate_feed_latency(&tick, &book);
                     let feed_in_ms = latency_sample.feed_in_ms;
@@ -1535,7 +1707,8 @@ fn spawn_strategy_engine(
                         .record(latency_sample.source_latency_ms);
                     metrics::histogram!("latency.local_backlog_ms")
                         .record(latency_sample.local_backlog_ms);
-                    if feed_in_ms > 500.0 {
+                    let stale_tick_filter_ms = shared.strategy_cfg.read().await.stale_tick_filter_ms;
+                    if feed_in_ms > stale_tick_filter_ms {
                         shared.shadow_stats.mark_stale_tick_dropped();
                         shared.shadow_stats.record_issue("stale_tick_dropped").await;
                         continue;
@@ -1543,6 +1716,9 @@ fn spawn_strategy_engine(
                     let tick_to_decision_start = Instant::now();
                     let signal_start = Instant::now();
                     let signal = fair.evaluate(&tick, &book);
+                    if signal.edge_bps_bid > 0.0 || signal.edge_bps_ask > 0.0 {
+                        shared.shadow_stats.mark_candidate();
+                    }
                     let signal_us = signal_start.elapsed().as_secs_f64() * 1_000_000.0;
                     shared.shadow_stats.push_signal_us(signal_us).await;
                     metrics::histogram!("latency.signal_us").record(signal_us);
@@ -1772,6 +1948,21 @@ fn spawn_strategy_engine(
                     let policy = MakerQuotePolicy::new(effective_cfg);
                     let mut intents =
                         policy.build_quotes_with_toxicity(&signal, &inventory, &tox_decision);
+                    if !intents.is_empty() {
+                        let markout_dispersion = (markout_10s_p50 - markout_10s_p25).abs();
+                        let var_penalty = (cfg.variance_penalty_lambda
+                            * (markout_dispersion / 200.0).clamp(0.0, 1.0))
+                        .clamp(0.0, 0.90);
+                        let kelly_scale =
+                            (cfg.capital_fraction_kelly * signal.confidence * (1.0 - var_penalty))
+                                .clamp(0.05, 1.0);
+                        for intent in &mut intents {
+                            intent.size = (intent.size * kelly_scale).max(0.01);
+                        }
+                    }
+                    if !intents.is_empty() {
+                        shared.shadow_stats.mark_quoted(intents.len() as u64);
+                    }
                     let quote_us = quote_start.elapsed().as_secs_f64() * 1_000_000.0;
                     shared.shadow_stats.push_quote_us(quote_us).await;
                     metrics::histogram!("latency.quote_us").record(quote_us);
@@ -1814,6 +2005,8 @@ fn spawn_strategy_engine(
                             asset_notional: inventory.exposure_notional + pending_total_exposure,
                             drawdown_pct: drawdown,
                         };
+                        let limits = shared.risk_limits.read().await.clone();
+                        let risk = DefaultRiskManager::new(limits);
                         let decision = risk.evaluate(&ctx);
                         let risk_us = risk_start.elapsed().as_secs_f64() * 1_000_000.0;
                         shared.shadow_stats.push_risk_us(risk_us).await;
@@ -1847,6 +2040,26 @@ fn spawn_strategy_engine(
                                 .await;
                             continue;
                         }
+                        let per_market_rps = (shared.rate_limit_rps / 8.0).max(0.5);
+                        let market_bucket =
+                            market_rate_budget.entry(book.market_id.clone()).or_insert_with(|| {
+                                TokenBucket::new(per_market_rps, (per_market_rps * 2.0).max(1.0))
+                            });
+                        if !global_rate_budget.try_take(1.0) {
+                            shared
+                                .shadow_stats
+                                .mark_blocked_with_reason("rate_budget_global")
+                                .await;
+                            continue;
+                        }
+                        if !market_bucket.try_take(1.0) {
+                            shared
+                                .shadow_stats
+                                .mark_blocked_with_reason("rate_budget_market")
+                                .await;
+                            continue;
+                        }
+                        shared.shadow_stats.mark_eligible();
 
                         let decision_compute_ms =
                             tick_to_decision_start.elapsed().as_secs_f64() * 1_000.0;
@@ -1854,6 +2067,7 @@ fn spawn_strategy_engine(
                         let place_start = Instant::now();
                         match execution.place_order(intent.clone()).await {
                             Ok(ack) => {
+                                shared.shadow_stats.mark_executed();
                                 let ack_only_ms = place_start.elapsed().as_secs_f64() * 1_000.0;
                                 let tick_to_ack_ms = tick_to_decision_ms + ack_only_ms;
                                 shared
@@ -2071,7 +2285,10 @@ fn spawn_shadow_outcome_task(
 }
 
 async fn refresh_market_symbol_map(shared: &EngineShared) {
-    let discovery = MarketDiscovery::new(DiscoveryConfig::default());
+    let discovery = MarketDiscovery::new(DiscoveryConfig {
+        symbols: (*shared.universe_symbols).clone(),
+        ..DiscoveryConfig::default()
+    });
     match discovery.discover().await {
         Ok(markets) => {
             let mut market_map = HashMap::new();
@@ -2442,6 +2659,40 @@ struct FeedLatencySample {
     local_backlog_ms: f64,
 }
 
+#[derive(Debug, Clone)]
+struct TokenBucket {
+    rps: f64,
+    burst: f64,
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new(rps: f64, burst: f64) -> Self {
+        let rps = rps.max(0.1);
+        let burst = burst.max(1.0);
+        Self {
+            rps,
+            burst,
+            tokens: burst,
+            last_refill: Instant::now(),
+        }
+    }
+
+    fn try_take(&mut self, n: f64) -> bool {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_refill).as_secs_f64();
+        self.last_refill = now;
+        self.tokens = (self.tokens + dt * self.rps).clamp(0.0, self.burst);
+        if self.tokens >= n {
+            self.tokens -= n;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 fn estimate_feed_latency(tick: &RefTick, book: &BookTop) -> FeedLatencySample {
     let now = now_ns();
     let now_ms = now / 1_000_000;
@@ -2715,6 +2966,24 @@ async fn reload_strategy(
     if let Some(v) = req.max_spread {
         cfg.max_spread = v.max(0.0001);
     }
+    if let Some(v) = req.taker_trigger_bps {
+        cfg.taker_trigger_bps = v.max(0.0);
+    }
+    if let Some(v) = req.taker_max_slippage_bps {
+        cfg.taker_max_slippage_bps = v.max(0.0);
+    }
+    if let Some(v) = req.stale_tick_filter_ms {
+        cfg.stale_tick_filter_ms = v.clamp(50.0, 5_000.0);
+    }
+    if let Some(v) = req.market_tier_profile {
+        cfg.market_tier_profile = v;
+    }
+    if let Some(v) = req.capital_fraction_kelly {
+        cfg.capital_fraction_kelly = v.clamp(0.01, 1.0);
+    }
+    if let Some(v) = req.variance_penalty_lambda {
+        cfg.variance_penalty_lambda = v.clamp(0.0, 5.0);
+    }
     let mut fair_cfg = state
         .fair_value_cfg
         .read()
@@ -2746,6 +3015,32 @@ async fn reload_strategy(
         maker: maker_cfg,
         fair_value: fair_cfg,
     })
+}
+
+async fn reload_risk(
+    State(state): State<AppState>,
+    Json(req): Json<RiskReloadReq>,
+) -> Json<RiskReloadResp> {
+    let mut cfg = state.risk_limits.write().await;
+    if let Some(v) = req.max_market_notional {
+        cfg.max_market_notional = v.max(0.0);
+    }
+    if let Some(v) = req.max_asset_notional {
+        cfg.max_asset_notional = v.max(0.0);
+    }
+    if let Some(v) = req.max_open_orders {
+        cfg.max_open_orders = v.max(1);
+    }
+    if let Some(v) = req.daily_drawdown_cap_pct {
+        cfg.max_drawdown_pct = v.clamp(0.001, 1.0);
+    }
+    let _ = req.max_loss_streak;
+    let _ = req.cooldown_sec;
+    append_jsonl(
+        &dataset_path("reports", "risk_reload.jsonl"),
+        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "risk": *cfg}),
+    );
+    Json(RiskReloadResp { risk: cfg.clone() })
 }
 
 async fn reload_toxicity(
@@ -3089,6 +3384,279 @@ fn load_fair_value_config() -> BasisMrConfig {
     cfg
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UniverseConfig {
+    assets: Vec<String>,
+    market_types: Vec<String>,
+    tier_whitelist: Vec<String>,
+    tier_blacklist: Vec<String>,
+}
+
+impl Default for UniverseConfig {
+    fn default() -> Self {
+        Self {
+            assets: vec![
+                "BTCUSDT".to_string(),
+                "ETHUSDT".to_string(),
+                "SOLUSDT".to_string(),
+                "XRPUSDT".to_string(),
+            ],
+            market_types: vec![
+                "updown".to_string(),
+                "above_below".to_string(),
+                "range".to_string(),
+            ],
+            tier_whitelist: Vec::new(),
+            tier_blacklist: Vec::new(),
+        }
+    }
+}
+
+fn parse_toml_array_of_strings(val: &str) -> Vec<String> {
+    let trimmed = val.trim();
+    if !(trimmed.starts_with('[') && trimmed.ends_with(']')) {
+        return Vec::new();
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    inner
+        .split(',')
+        .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+}
+
+fn load_strategy_config() -> MakerConfig {
+    let path = Path::new("configs/strategy.toml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return MakerConfig::default();
+    };
+    let mut cfg = MakerConfig::default();
+    let mut in_maker = false;
+    let mut in_taker = false;
+    let mut in_online = false;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_maker = line == "[maker]";
+            in_taker = line == "[taker]";
+            in_online = line == "[online_calibration]";
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim().trim_matches('"');
+        if in_maker {
+            match key {
+                "base_quote_size" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.base_quote_size = parsed.max(0.01);
+                    }
+                }
+                "min_edge_bps" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.min_edge_bps = parsed.max(0.0);
+                    }
+                }
+                "inventory_skew" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.inventory_skew = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "max_spread" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.max_spread = parsed.max(0.0001);
+                    }
+                }
+                "ttl_ms" => {
+                    if let Ok(parsed) = val.parse::<u64>() {
+                        cfg.ttl_ms = parsed.max(50);
+                    }
+                }
+                _ => {}
+            }
+        } else if in_taker {
+            match key {
+                "trigger_bps" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.taker_trigger_bps = parsed.max(0.0);
+                    }
+                }
+                "max_slippage_bps" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.taker_max_slippage_bps = parsed.max(0.0);
+                    }
+                }
+                "stale_tick_filter_ms" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.stale_tick_filter_ms = parsed.clamp(50.0, 5_000.0);
+                    }
+                }
+                "market_tier_profile" => {
+                    cfg.market_tier_profile = val.to_string();
+                }
+                _ => {}
+            }
+        } else if in_online {
+            match key {
+                "capital_fraction_kelly" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.capital_fraction_kelly = parsed.clamp(0.01, 1.0);
+                    }
+                }
+                "variance_penalty_lambda" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.variance_penalty_lambda = parsed.clamp(0.0, 5.0);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    cfg
+}
+
+fn load_risk_limits_config() -> RiskLimits {
+    let path = Path::new("configs/risk.toml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        let mut defaults = RiskLimits::default();
+        defaults.max_drawdown_pct = 0.015;
+        return defaults;
+    };
+    let mut cfg = RiskLimits::default();
+    cfg.max_drawdown_pct = 0.015;
+    let mut in_max = false;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_max = line == "[max]";
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim().trim_matches('"');
+        if in_max {
+            match key {
+                "market_notional" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.max_market_notional = parsed.max(0.0);
+                    }
+                }
+                "asset_notional" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.max_asset_notional = parsed.max(0.0);
+                    }
+                }
+                "open_orders" => {
+                    if let Ok(parsed) = val.parse::<usize>() {
+                        cfg.max_open_orders = parsed.max(1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if key == "drawdown_stop_pct" {
+            if let Ok(parsed) = val.parse::<f64>() {
+                cfg.max_drawdown_pct = parsed.clamp(0.001, 1.0);
+            }
+        }
+    }
+    cfg
+}
+
+fn load_execution_config() -> ExecutionConfig {
+    let path = Path::new("configs/execution.toml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return ExecutionConfig::default();
+    };
+    let mut cfg = ExecutionConfig::default();
+    let mut in_execution = false;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_execution = line == "[execution]";
+            continue;
+        }
+        if !in_execution {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim().trim_matches('"');
+        match key {
+            "mode" => cfg.mode = val.to_string(),
+            "rate_limit_rps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.rate_limit_rps = parsed.max(0.1);
+                }
+            }
+            "http_timeout_ms" => {
+                if let Ok(parsed) = val.parse::<u64>() {
+                    cfg.http_timeout_ms = parsed.max(100);
+                }
+            }
+            "clob_endpoint" => cfg.clob_endpoint = val.to_string(),
+            _ => {}
+        }
+    }
+    cfg
+}
+
+fn load_universe_config() -> UniverseConfig {
+    let path = Path::new("configs/universe.toml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return UniverseConfig::default();
+    };
+    let mut cfg = UniverseConfig::default();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim();
+        match key {
+            "assets" => {
+                let parsed = parse_toml_array_of_strings(val);
+                if !parsed.is_empty() {
+                    cfg.assets = parsed;
+                }
+            }
+            "market_types" => {
+                let parsed = parse_toml_array_of_strings(val);
+                if !parsed.is_empty() {
+                    cfg.market_types = parsed;
+                }
+            }
+            "tier_whitelist" => {
+                cfg.tier_whitelist = parse_toml_array_of_strings(val);
+            }
+            "tier_blacklist" => {
+                cfg.tier_blacklist = parse_toml_array_of_strings(val);
+            }
+            _ => {}
+        }
+    }
+    cfg
+}
+
 fn load_perf_profile_config() -> PerfProfile {
     let path = Path::new("configs/latency.toml");
     let Ok(raw) = fs::read_to_string(path) else {
@@ -3339,6 +3907,30 @@ fn persist_final_report_files(report: &ShadowFinalReport) {
         report.gate.roi_notional_10s_bps_p50
     ));
     md.push_str(&format!(
+        "- ev_net_usdc_p50: {:.6}\n",
+        report.gate.ev_net_usdc_p50
+    ));
+    md.push_str(&format!(
+        "- ev_net_usdc_p10: {:.6}\n",
+        report.gate.ev_net_usdc_p10
+    ));
+    md.push_str(&format!(
+        "- ev_positive_ratio: {:.4}\n",
+        report.gate.ev_positive_ratio
+    ));
+    md.push_str(&format!(
+        "- executed_over_eligible: {:.4}\n",
+        report.gate.executed_over_eligible
+    ));
+    md.push_str(&format!(
+        "- eligible_count: {}\n",
+        report.gate.eligible_count
+    ));
+    md.push_str(&format!(
+        "- executed_count: {}\n",
+        report.gate.executed_count
+    ));
+    md.push_str(&format!(
         "- pnl_10s_p50_bps_raw: {:.4}\n",
         report.gate.pnl_10s_p50_bps_raw
     ));
@@ -3568,6 +4160,46 @@ fn persist_final_report_files(report: &ShadowFinalReport) {
         }
     }
     let _ = fs::write(fixlist_path, fixlist);
+
+    let truth_manifest_path = reports_dir.join("truth_manifest.json");
+    let truth_manifest = serde_json::json!({
+        "generated_at_utc": Utc::now().to_rfc3339(),
+        "metrics_contract_version": "2026-02-14.v1",
+        "window": {
+            "window_id": report.live.window_id,
+            "window_shots": report.live.window_shots,
+            "window_outcomes": report.live.window_outcomes,
+            "gate_ready": report.live.gate_ready,
+        },
+        "data_chain": {
+            "raw_fields": ["sha256", "source_seq", "ingest_seq", "event_ts_exchange_ms", "recv_ts_local_ns"],
+            "normalized_fields": ["source_seq", "ingest_seq", "market_id", "symbol", "delay_ms", "fillable", "net_markout_10s_usdc"],
+            "invalid_excluded_from_gate": true
+        },
+        "formulas": {
+            "quote_block_ratio": "quote_blocked / (quote_attempted + quote_blocked)",
+            "policy_block_ratio": "policy_blocked / (quote_attempted + policy_blocked)",
+            "executed_over_eligible": "executed_count / eligible_count",
+            "ev_net_usdc_p50": "p50(net_markout_10s_usdc)",
+            "ev_positive_ratio": "count(net_markout_10s_usdc > 0) / count(valid outcomes)"
+        },
+        "hard_gates": {
+            "data_valid_ratio_min": 0.999,
+            "seq_gap_rate_max": 0.001,
+            "ts_inversion_rate_max": 0.0005,
+            "tick_to_ack_p99_ms_max": 450.0,
+            "decision_compute_p99_ms_max": 2.0,
+            "feed_in_p99_ms_max": 800.0,
+            "executed_over_eligible_min": 0.60,
+            "quote_block_ratio_max": 0.10,
+            "policy_block_ratio_max": 0.10,
+            "ev_net_usdc_p50_min": 0.0,
+            "roi_notional_10s_bps_p50_min": 0.0
+        }
+    });
+    if let Ok(raw) = serde_json::to_string_pretty(&truth_manifest) {
+        let _ = fs::write(truth_manifest_path, raw);
+    }
 }
 
 fn persist_toxicity_report_files(report: &ToxicityLiveReport) {

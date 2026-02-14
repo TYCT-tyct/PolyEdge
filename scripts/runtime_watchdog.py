@@ -46,6 +46,7 @@ def evaluate_alerts(
     min_data_valid_ratio: float,
     max_block_ratio: float,
     min_attempt_for_block_ratio: int,
+    min_executed_over_eligible: float,
 ) -> List[Dict[str, Any]]:
     alerts: List[Dict[str, Any]] = []
 
@@ -137,7 +138,6 @@ def evaluate_alerts(
                 ),
             }
         )
-
     total_shots = int(live.get("total_shots", 0))
     if attempted >= min_attempt_for_block_ratio and total_shots == 0:
         alerts.append(
@@ -148,6 +148,17 @@ def evaluate_alerts(
         )
 
     gate_ready = bool(live.get("gate_ready", False))
+    executed_over_eligible = float(live.get("executed_over_eligible", 0.0))
+    if gate_ready and executed_over_eligible < min_executed_over_eligible:
+        alerts.append(
+            {
+                "type": "execution_funnel_low",
+                "detail": (
+                    f"executed_over_eligible={executed_over_eligible:.4f} < "
+                    f"{min_executed_over_eligible:.4f}"
+                ),
+            }
+        )
     window_outcomes = int(live.get("window_outcomes", 0))
     if not gate_ready:
         alerts.append(
@@ -224,6 +235,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-data-valid-ratio", type=float, default=0.999)
     p.add_argument("--max-block-ratio", type=float, default=0.10)
     p.add_argument("--min-attempt-for-block-ratio", type=int, default=100)
+    p.add_argument("--min-executed-over-eligible", type=float, default=0.60)
     p.add_argument("--max-cycles", type=int, default=0)
     p.add_argument("--max-runtime-sec", type=int, default=0)
     p.add_argument("--heartbeat-sec", type=float, default=60.0)
@@ -260,6 +272,7 @@ def run_once(session: requests.Session, args: argparse.Namespace) -> int:
             min_data_valid_ratio=args.min_data_valid_ratio,
             max_block_ratio=args.max_block_ratio,
             min_attempt_for_block_ratio=args.min_attempt_for_block_ratio,
+            min_executed_over_eligible=args.min_executed_over_eligible,
         )
         write_jsonl(monitor_file, record)
         for a in alerts:

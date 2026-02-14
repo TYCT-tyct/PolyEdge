@@ -69,8 +69,14 @@ class TrialResult:
     pnl_10s_p50_bps_raw: float
     pnl_10s_p50_bps_robust: float
     pnl_10s_p25_bps_robust: float
+    ev_net_usdc_p50: float
+    ev_net_usdc_p10: float
+    ev_positive_ratio: float
     net_markout_10s_usdc_p50: float
     roi_notional_10s_bps_p50: float
+    eligible_count: int
+    executed_count: int
+    executed_over_eligible: float
     quote_block_ratio: float
     policy_block_ratio: float
     tick_to_ack_p99_ms: float
@@ -83,10 +89,13 @@ class TrialResult:
     def gate_pass(self) -> bool:
         return (
             self.gate_ready
+            and self.ev_net_usdc_p50 > 0.0
+            and self.ev_positive_ratio >= 0.55
             and self.net_markout_10s_usdc_p50 > 0.0
             and self.roi_notional_10s_bps_p50 > 0.0
             and self.pnl_10s_p25_bps_robust > -20.0
             and self.fillability_10ms >= 0.60
+            and self.executed_over_eligible >= 0.60
             and self.quote_block_ratio < 0.10
             and self.policy_block_ratio < 0.10
             and self.tick_to_ack_p99_ms < 450.0
@@ -103,6 +112,8 @@ def score_trial(row: TrialResult) -> float:
         score += 200.0
     if row.gate_pass():
         score += 1000.0
+    score += row.ev_net_usdc_p50 * 40.0
+    score += row.ev_positive_ratio * 120.0
     score += row.net_markout_10s_usdc_p50 * 50.0
     score += row.roi_notional_10s_bps_p50 * 0.3
     score += row.pnl_10s_p50_bps_robust * 0.2
@@ -114,6 +125,7 @@ def score_trial(row: TrialResult) -> float:
     score -= row.feed_in_p99_ms * 0.05
     score -= row.decision_compute_p99_ms * 20.0
     score -= max(0.0, 0.999 - row.data_valid_ratio) * 10_000.0
+    score -= max(0.0, 0.60 - row.executed_over_eligible) * 500.0
     return score
 
 
@@ -174,8 +186,13 @@ def run_trial(
     fillability: List[float] = []
     pnl10: List[float] = []
     pnl10_raw: List[float] = []
+    ev_net_usdc: List[float] = []
+    ev_positive_ratio: List[float] = []
     net_markout_usdc: List[float] = []
     roi_notional_bps: List[float] = []
+    eligible_count_vals: List[float] = []
+    executed_count_vals: List[float] = []
+    executed_over_eligible_vals: List[float] = []
     block_ratio: List[float] = []
     policy_block_ratio: List[float] = []
     tick_ack: List[float] = []
@@ -198,8 +215,13 @@ def run_trial(
         pnl10.append(
             float(live.get("pnl_10s_p50_bps_robust", live.get("pnl_10s_p50_bps", 0.0)))
         )
+        ev_net_usdc.append(float(live.get("ev_net_usdc_p50", live.get("net_markout_10s_usdc_p50", 0.0))))
+        ev_positive_ratio.append(float(live.get("ev_positive_ratio", 0.0)))
         net_markout_usdc.append(float(live.get("net_markout_10s_usdc_p50", 0.0)))
         roi_notional_bps.append(float(live.get("roi_notional_10s_bps_p50", 0.0)))
+        eligible_count_vals.append(float(live.get("eligible_count", 0.0)))
+        executed_count_vals.append(float(live.get("executed_count", 0.0)))
+        executed_over_eligible_vals.append(float(live.get("executed_over_eligible", 0.0)))
         block_ratio.append(float(live.get("quote_block_ratio", 0.0)))
         policy_block_ratio.append(float(live.get("policy_block_ratio", 0.0)))
         tick_ack.append(float(live.get("tick_to_ack_p99_ms", 0.0)))
@@ -239,8 +261,14 @@ def run_trial(
         pnl_10s_p50_bps_raw=percentile(pnl10_raw, 0.50),
         pnl_10s_p50_bps_robust=percentile(pnl10, 0.50),
         pnl_10s_p25_bps_robust=percentile(pnl10, 0.25),
+        ev_net_usdc_p50=percentile(ev_net_usdc, 0.50),
+        ev_net_usdc_p10=percentile(ev_net_usdc, 0.10),
+        ev_positive_ratio=percentile(ev_positive_ratio, 0.50),
         net_markout_10s_usdc_p50=percentile(net_markout_usdc, 0.50),
         roi_notional_10s_bps_p50=percentile(roi_notional_bps, 0.50),
+        eligible_count=int(percentile(eligible_count_vals, 0.50)),
+        executed_count=int(percentile(executed_count_vals, 0.50)),
+        executed_over_eligible=percentile(executed_over_eligible_vals, 0.50),
         quote_block_ratio=percentile(block_ratio, 0.50),
         policy_block_ratio=percentile(policy_block_ratio, 0.50),
         tick_to_ack_p99_ms=percentile(tick_ack, 0.50),
@@ -273,8 +301,14 @@ def write_ablation_csv(path: Path, rows: Iterable[TrialResult]) -> None:
                 "pnl_10s_p50_bps_raw",
                 "pnl_10s_p50_bps_robust",
                 "pnl_10s_p25_bps_robust",
+                "ev_net_usdc_p50",
+                "ev_net_usdc_p10",
+                "ev_positive_ratio",
                 "net_markout_10s_usdc_p50",
                 "roi_notional_10s_bps_p50",
+                "eligible_count",
+                "executed_count",
+                "executed_over_eligible",
                 "quote_block_ratio",
                 "policy_block_ratio",
                 "tick_to_ack_p99_ms",
@@ -303,8 +337,14 @@ def write_ablation_csv(path: Path, rows: Iterable[TrialResult]) -> None:
                     f"{row.pnl_10s_p50_bps_raw:.6f}",
                     f"{row.pnl_10s_p50_bps_robust:.6f}",
                     f"{row.pnl_10s_p25_bps_robust:.6f}",
+                    f"{row.ev_net_usdc_p50:.6f}",
+                    f"{row.ev_net_usdc_p10:.6f}",
+                    f"{row.ev_positive_ratio:.6f}",
                     f"{row.net_markout_10s_usdc_p50:.6f}",
                     f"{row.roi_notional_10s_bps_p50:.6f}",
+                    row.eligible_count,
+                    row.executed_count,
+                    f"{row.executed_over_eligible:.6f}",
                     f"{row.quote_block_ratio:.6f}",
                     f"{row.policy_block_ratio:.6f}",
                     f"{row.tick_to_ack_p99_ms:.6f}",
@@ -343,8 +383,11 @@ def write_summary_md(path: Path, rows: List[TrialResult]) -> None:
                 f"k={row.basis_k_revert}, z={row.basis_z_cap}, "
                 f"pnl10_raw_p50={row.pnl_10s_p50_bps_raw:.3f}, "
                 f"pnl10_robust_p50={row.pnl_10s_p50_bps_robust:.3f}, "
+                f"ev_usdc_p50={row.ev_net_usdc_p50:.4f}, "
+                f"ev_pos_ratio={row.ev_positive_ratio:.3f}, "
                 f"net_usdc_p50={row.net_markout_10s_usdc_p50:.4f}, "
                 f"fill10={row.fillability_10ms:.3f}, block={row.quote_block_ratio:.3f}, "
+                f"exec_over_eligible={row.executed_over_eligible:.3f}, "
                 f"ready={row.gate_ready}, "
                 f"tick_to_ack_p99={row.tick_to_ack_p99_ms:.3f}, gate={row.gate_pass()}"
             )
@@ -363,6 +406,12 @@ def write_fixlist(path: Path, best: TrialResult | None) -> None:
                 "- policy_block_ratio is still high. Strategy is profitable but opportunity suppression is excessive."
             )
     else:
+        if best.ev_net_usdc_p50 <= 0.0:
+            lines.append("- ev_net_usdc_p50 <= 0. Current opportunity quality is not truly positive after friction.")
+        if best.ev_positive_ratio < 0.55:
+            lines.append("- ev_positive_ratio < 0.55. Too many candidate trades are negative EV.")
+        if best.executed_over_eligible < 0.60:
+            lines.append("- executed_over_eligible < 0.60. Execution funnel is leaking too much under pressure.")
         if best.net_markout_10s_usdc_p50 <= 0.0:
             lines.append("- net_markout_10s_usdc_p50 still <= 0. Keep Shadow mode and reduce toxic market exposure.")
         if best.roi_notional_10s_bps_p50 <= 0.0:
@@ -471,6 +520,9 @@ def main() -> int:
         key=lambda r: (
             r.gate_pass(),
             r.gate_ready,
+            r.ev_net_usdc_p50,
+            r.ev_positive_ratio,
+            r.executed_over_eligible,
             r.net_markout_10s_usdc_p50,
             r.roi_notional_10s_bps_p50,
             r.fillability_10ms,

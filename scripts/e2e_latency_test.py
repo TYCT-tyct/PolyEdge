@@ -42,6 +42,12 @@ def collect_engine_metrics(base_url: str, seconds: int, poll_interval: float) ->
         "event_backlog_p99": [],
         "pnl_10s_p50_bps_raw": [],
         "pnl_10s_p50_bps_robust": [],
+        "ev_net_usdc_p50": [],
+        "ev_net_usdc_p10": [],
+        "ev_positive_ratio": [],
+        "eligible_count": [],
+        "executed_count": [],
+        "executed_over_eligible": [],
         "net_markout_10s_usdc_p50": [],
         "roi_notional_10s_bps_p50": [],
         "pnl_10s_outlier_ratio": [],
@@ -73,6 +79,12 @@ def collect_engine_metrics(base_url: str, seconds: int, poll_interval: float) ->
                 "event_backlog_p99",
                 "pnl_10s_p50_bps_raw",
                 "pnl_10s_p50_bps_robust",
+                "ev_net_usdc_p50",
+                "ev_net_usdc_p10",
+                "ev_positive_ratio",
+                "eligible_count",
+                "executed_count",
+                "executed_over_eligible",
                 "net_markout_10s_usdc_p50",
                 "roi_notional_10s_bps_p50",
                 "pnl_10s_outlier_ratio",
@@ -132,6 +144,14 @@ def main() -> None:
     print_stat_block("pnl_10s_p50_bps_raw", engine["stats"]["pnl_10s_p50_bps_raw"], "bps")
     print_stat_block(
         "pnl_10s_p50_bps_robust", engine["stats"]["pnl_10s_p50_bps_robust"], "bps"
+    )
+    print_stat_block("ev_net_usdc_p50", engine["stats"]["ev_net_usdc_p50"], "usdc")
+    print_stat_block("ev_net_usdc_p10", engine["stats"]["ev_net_usdc_p10"], "usdc")
+    print_stat_block("ev_positive_ratio", engine["stats"]["ev_positive_ratio"], "")
+    print_stat_block("eligible_count", engine["stats"]["eligible_count"], "")
+    print_stat_block("executed_count", engine["stats"]["executed_count"], "")
+    print_stat_block(
+        "executed_over_eligible", engine["stats"]["executed_over_eligible"], ""
     )
     print_stat_block(
         "net_markout_10s_usdc_p50", engine["stats"]["net_markout_10s_usdc_p50"], "usdc"

@@ -2,3 +2,4 @@
 mode = "paper"
 rate_limit_rps = 15
 http_timeout_ms = 3000
+clob_endpoint = "https://clob.polymarket.com"

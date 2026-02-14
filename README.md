@@ -38,6 +38,7 @@ pwsh -File .\scripts\cargo_msvc.ps1 test -q
 - `POST /control/flatten`
 - `POST /control/reset_shadow`
 - `POST /control/reload_strategy`
+- `POST /control/reload_risk`
 - `POST /control/reload_toxicity`
 - `POST /control/reload_perf_profile`
 
@@ -96,6 +97,8 @@ pwsh -File .\scripts\remote_deploy_validate.ps1 -RemoteHost 13.43.23.190 -KeyPat
 - `pnl_10s_sample_count/pnl_10s_outlier_ratio`
 - `queue_depth_p99/event_backlog_p99`
 
+Metric formulas, units, and gate thresholds are defined in `docs/metrics_contract.md`.
+
 ## Runtime Perf Profile
 
 `configs/latency.toml` runtime section supports:
@@ -114,5 +117,6 @@ Runtime report files are written to `datasets/reports/<utc-date>/`:
 - `latency_breakdown_12h.csv`
 - `market_scorecard.csv`
 - `next_fixlist.md`
+- `truth_manifest.json`
 - `region_ab_compare.md` / `region_ab_compare.json`
 - `long_regression_audit.jsonl`

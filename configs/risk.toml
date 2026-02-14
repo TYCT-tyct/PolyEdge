@@ -3,4 +3,4 @@ market_notional = 50.0
 asset_notional = 100.0
 open_orders = 20
 
-drawdown_stop_pct = 0.01
+drawdown_stop_pct = 0.015

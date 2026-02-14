@@ -234,6 +234,43 @@ pub struct MarketHealth {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OpportunityEval {
+    pub market_id: String,
+    pub symbol: String,
+    pub delay_ms: u64,
+    pub ev_net_usdc: f64,
+    pub fee_usdc: f64,
+    pub slippage_usdc: f64,
+    pub stale: bool,
+    pub ts_ns: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ExecutionFunnel {
+    pub seen: u64,
+    pub candidate: u64,
+    pub quoted: u64,
+    pub accepted: u64,
+    pub filled: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CapitalState {
+    pub equity_usdc: f64,
+    pub alloc_usdc: f64,
+    pub kelly_fraction: f64,
+    pub drawdown_pct: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RateBudgetState {
+    pub rps_limit: f64,
+    pub burst: f64,
+    pub tokens: f64,
+    pub last_refill_ns: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GateContext {
     pub window_id: u64,
     pub min_outcomes: usize,

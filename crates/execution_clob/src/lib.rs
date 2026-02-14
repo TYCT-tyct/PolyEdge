@@ -31,9 +31,21 @@ struct PaperOpenOrder {
 
 impl ClobExecution {
     pub fn new(mode: ExecutionMode, clob_endpoint: String) -> Self {
+        Self::new_with_timeout(mode, clob_endpoint, std::time::Duration::from_millis(3_000))
+    }
+
+    pub fn new_with_timeout(
+        mode: ExecutionMode,
+        clob_endpoint: String,
+        timeout: std::time::Duration,
+    ) -> Self {
+        let http = Client::builder()
+            .timeout(timeout)
+            .build()
+            .unwrap_or_else(|_| Client::new());
         Self {
             mode,
-            http: Client::new(),
+            http,
             clob_endpoint,
             open_orders: Arc::new(RwLock::new(HashMap::new())),
         }

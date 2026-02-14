@@ -86,6 +86,10 @@ def build_recommendations(live: Dict[str, Any], alert_count: Counter[str]) -> Li
         recs.append("feed_in p99 too high. Enable strict stale tick filter and inspect source/local latency split.")
     if float(live.get("decision_compute_p99_ms", 0.0)) > 2.0:
         recs.append("decision_compute p99 too high. Reduce lock contention and hot-path logging.")
+    if float(live.get("executed_over_eligible", 0.0)) < 0.60:
+        recs.append(
+            "Execution funnel below threshold. Add market-level rate budget and revisit taker trigger."
+        )
     if float(live.get("data_valid_ratio", 1.0)) < 0.999:
         recs.append("Data validity below 99.9%. Pause quoting and fix raw->normalized reconciliation.")
     net_markout_usdc = float(live.get("net_markout_10s_usdc_p50", 0.0))
@@ -140,6 +144,12 @@ def write_report(
     pnl_raw = float(live.get("pnl_10s_p50_bps_raw", live.get("pnl_10s_p50_bps", 0.0)))
     pnl_robust = float(live.get("pnl_10s_p50_bps_robust", pnl_raw))
     net_markout_usdc = float(live.get("net_markout_10s_usdc_p50", 0.0))
+    ev_net_usdc_p50 = float(live.get("ev_net_usdc_p50", net_markout_usdc))
+    ev_net_usdc_p10 = float(live.get("ev_net_usdc_p10", 0.0))
+    ev_positive_ratio = float(live.get("ev_positive_ratio", 0.0))
+    eligible_count = int(live.get("eligible_count", 0))
+    executed_count = int(live.get("executed_count", 0))
+    executed_over_eligible = float(live.get("executed_over_eligible", 0.0))
     roi_notional = float(live.get("roi_notional_10s_bps_p50", 0.0))
     pnl_outlier_ratio = float(live.get("pnl_10s_outlier_ratio", 0.0))
     queue_depth_p99 = float(live.get("queue_depth_p99", 0.0))
@@ -172,6 +182,12 @@ def write_report(
     lines.append(f"- pnl_10s_p50_bps_raw: {pnl_raw:.4f}")
     lines.append(f"- pnl_10s_p50_bps_robust: {pnl_robust:.4f}")
     lines.append(f"- net_markout_10s_usdc_p50: {net_markout_usdc:.6f}")
+    lines.append(f"- ev_net_usdc_p50: {ev_net_usdc_p50:.6f}")
+    lines.append(f"- ev_net_usdc_p10: {ev_net_usdc_p10:.6f}")
+    lines.append(f"- ev_positive_ratio: {ev_positive_ratio:.4f}")
+    lines.append(f"- eligible_count: {eligible_count}")
+    lines.append(f"- executed_count: {executed_count}")
+    lines.append(f"- executed_over_eligible: {executed_over_eligible:.4f}")
     lines.append(f"- roi_notional_10s_bps_p50: {roi_notional:.6f}")
     lines.append(f"- pnl_10s_outlier_ratio: {pnl_outlier_ratio:.4f}")
     lines.append(f"- tick_to_ack_p99_ms: {float(live.get('tick_to_ack_p99_ms', 0.0)):.3f}")

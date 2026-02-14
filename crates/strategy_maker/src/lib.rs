@@ -10,6 +10,12 @@ pub struct MakerConfig {
     pub inventory_skew: f64,
     pub max_spread: f64,
     pub ttl_ms: u64,
+    pub taker_trigger_bps: f64,
+    pub taker_max_slippage_bps: f64,
+    pub stale_tick_filter_ms: f64,
+    pub market_tier_profile: String,
+    pub capital_fraction_kelly: f64,
+    pub variance_penalty_lambda: f64,
 }
 
 impl Default for MakerConfig {
@@ -20,6 +26,12 @@ impl Default for MakerConfig {
             inventory_skew: 0.15,
             max_spread: 0.03,
             ttl_ms: 400,
+            taker_trigger_bps: 8.0,
+            taker_max_slippage_bps: 25.0,
+            stale_tick_filter_ms: 500.0,
+            market_tier_profile: "balanced".to_string(),
+            capital_fraction_kelly: 0.35,
+            variance_penalty_lambda: 0.25,
         }
     }
 }

@@ -7,6 +7,7 @@ use core_types::{
     OrderbookStateDigest, PolymarketBookWsFeed,
 };
 use futures::{SinkExt, StreamExt};
+use rand::Rng;
 use reqwest::Client;
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -56,11 +57,22 @@ impl PolymarketFeed {
 
     async fn discover_target_markets(&self) -> Result<HashMap<String, MarketState>> {
         let mut out = HashMap::<String, MarketState>::new();
-        let aliases: [(&str, [&str; 2]); 4] = [
+        let aliases: [(&str, [&str; 2]); 15] = [
             ("BTCUSDT", ["bitcoin", "btc"]),
             ("ETHUSDT", ["ethereum", "eth"]),
             ("SOLUSDT", ["solana", "sol"]),
-            ("XRPUSDT", ["xrp", "xrp"]),
+            ("XRPUSDT", ["ripple", "xrp"]),
+            ("BNBUSDT", ["binance", "bnb"]),
+            ("DOGEUSDT", ["dogecoin", "doge"]),
+            ("ADAUSDT", ["cardano", "ada"]),
+            ("AVAXUSDT", ["avalanche", "avax"]),
+            ("LINKUSDT", ["chainlink", "link"]),
+            ("MATICUSDT", ["polygon", "matic"]),
+            ("LTCUSDT", ["litecoin", "ltc"]),
+            ("DOTUSDT", ["polkadot", "dot"]),
+            ("TRXUSDT", ["tron", "trx"]),
+            ("TONUSDT", ["toncoin", "ton"]),
+            ("NEARUSDT", ["near", "near"]),
         ];
 
         let markets: Vec<GammaMarket> = self
@@ -152,7 +164,7 @@ impl PolymarketFeed {
                 if let Err(err) = this.run_market_loop(&tx).await {
                     tracing::warn!(?err, "polymarket market ws loop failed; reconnecting");
                 }
-                tokio::time::sleep(this.reconnect_backoff).await;
+                sleep_with_jitter(this.reconnect_backoff).await;
             }
         });
 
@@ -259,7 +271,7 @@ impl PolymarketBookWsFeed for PolymarketFeed {
                 if let Err(err) = run_book_update_loop(&endpoint, &token_ids, &tx).await {
                     tracing::warn!(?err, "book update ws loop failed; reconnecting");
                 }
-                tokio::time::sleep(backoff).await;
+                sleep_with_jitter(backoff).await;
             }
         });
 
@@ -493,6 +505,12 @@ fn top_level_price(value: Option<&Vec<WsLevel>>) -> Option<f64> {
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+async fn sleep_with_jitter(base: Duration) {
+    let base_ms = base.as_millis() as u64;
+    let jitter_ms = rand::rng().random_range(0..=300);
+    tokio::time::sleep(Duration::from_millis(base_ms.saturating_add(jitter_ms))).await;
 }
 
 fn now_ns() -> i64 {

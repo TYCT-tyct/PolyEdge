@@ -1,2 +1,20 @@
-assets = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+assets = [
+  "BTCUSDT",
+  "ETHUSDT",
+  "SOLUSDT",
+  "XRPUSDT",
+  "BNBUSDT",
+  "DOGEUSDT",
+  "ADAUSDT",
+  "AVAXUSDT",
+  "LINKUSDT",
+  "MATICUSDT",
+  "LTCUSDT",
+  "DOTUSDT",
+  "TRXUSDT",
+  "TONUSDT",
+  "NEARUSDT",
+]
 market_types = ["updown", "above_below", "range"]
+tier_whitelist = []
+tier_blacklist = []
