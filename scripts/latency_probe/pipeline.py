@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# NOTE: This module is kept for legacy REST comparison only.
+# The primary benchmark path is scripts/e2e_latency_test.py in ws-first mode.
+
 import json
 import time
 import uuid
@@ -216,8 +219,8 @@ def evaluate_signal(ref_price: float, book: Dict[str, float]) -> Dict[str, float
     normalized = max(-0.5, min(0.5, (ref_price / 100_000.0) - 0.5))
     jump = max(-0.02, min(0.02, normalized * 35.0 / 10_000.0))
     fair_yes = max(0.001, min(0.999, mid_yes + jump))
-    edge_bps_bid = ((fair_yes - book["ask_yes"]) / spread) * 10_000.0
-    edge_bps_ask = ((book["bid_yes"] - fair_yes) / spread) * 10_000.0
+    edge_bps_bid = ((fair_yes - book["ask_yes"]) / max(book["ask_yes"], 1e-4)) * 10_000.0
+    edge_bps_ask = ((book["bid_yes"] - fair_yes) / max(book["bid_yes"], 1e-4)) * 10_000.0
     confidence = max(0.0, min(1.0, 1.0 - spread * 10.0))
     return {
         "fair_yes": fair_yes,

@@ -19,6 +19,13 @@ pub struct JsonlRecorder {
 
 impl JsonlRecorder {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
+        if let Some(parent) = path.as_ref().parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .context("create recorder dir")?;
+            }
+        }
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -92,6 +99,8 @@ mod tests {
                     symbol: "BTCUSDT".to_string(),
                     event_ts_ms: 1,
                     recv_ts_ms: 1,
+                    event_ts_exchange_ms: 1,
+                    recv_ts_local_ns: 1_000_000,
                     price: 1.0,
                 }),
             })

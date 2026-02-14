@@ -14,6 +14,10 @@ pub struct RefTick {
     pub symbol: String,
     pub event_ts_ms: i64,
     pub recv_ts_ms: i64,
+    #[serde(default)]
+    pub event_ts_exchange_ms: i64,
+    #[serde(default)]
+    pub recv_ts_local_ns: i64,
     pub price: f64,
 }
 
@@ -27,6 +31,61 @@ pub struct BookTop {
     pub bid_no: f64,
     pub ask_no: f64,
     pub ts_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum BookSide {
+    Bid,
+    Ask,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BookLevel {
+    pub price: f64,
+    pub size: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BookSnapshot {
+    pub market_id: String,
+    pub asset_id: String,
+    pub bids: Vec<BookLevel>,
+    pub asks: Vec<BookLevel>,
+    pub ts_exchange_ms: i64,
+    pub recv_ts_local_ns: i64,
+    pub hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BookDelta {
+    pub market_id: String,
+    pub asset_id: String,
+    pub side: BookSide,
+    pub price: f64,
+    pub size: f64,
+    pub best_bid: Option<f64>,
+    pub best_ask: Option<f64>,
+    pub ts_exchange_ms: i64,
+    pub recv_ts_local_ns: i64,
+    pub hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OrderbookStateDigest {
+    pub market_id: String,
+    pub asset_id: String,
+    pub best_bid: f64,
+    pub best_ask: f64,
+    pub spread: f64,
+    pub ts_exchange_ms: i64,
+    pub recv_ts_local_ns: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum BookUpdate {
+    Snapshot(BookSnapshot),
+    Delta(BookDelta),
+    Digest(OrderbookStateDigest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -121,6 +180,114 @@ pub struct RiskContext {
     pub drawdown_pct: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum ToxicRegime {
+    Safe,
+    Caution,
+    Danger,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToxicFeatures {
+    pub market_id: String,
+    pub symbol: String,
+    pub markout_1s: f64,
+    pub markout_5s: f64,
+    pub markout_10s: f64,
+    pub spread_bps: f64,
+    pub microprice_drift: f64,
+    pub stale_ms: f64,
+    pub imbalance: f64,
+    pub cancel_burst: f64,
+    pub ts_ns: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToxicDecision {
+    pub market_id: String,
+    pub symbol: String,
+    pub tox_score: f64,
+    pub regime: ToxicRegime,
+    pub reason_codes: Vec<String>,
+    pub ts_ns: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuoteEval {
+    pub market_id: String,
+    pub symbol: String,
+    pub survival_10ms: f64,
+    pub maker_markout_10s_bps: f64,
+    pub adverse_flag: bool,
+    pub ts_ns: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MarketHealth {
+    pub market_id: String,
+    pub symbol: String,
+    pub symbol_missing_rate: f64,
+    pub no_quote_rate: f64,
+    pub pending_exposure: f64,
+    pub queue_fill_proxy: f64,
+    pub ts_ns: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum EdgeAttribution {
+    StaleQuote,
+    BookMoved,
+    SpreadTooWide,
+    LiquidityThin,
+    LatencyTail,
+    FeeOverrun,
+    AdverseSelection,
+    InventoryBias,
+    SignalLag,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ShadowShot {
+    pub shot_id: String,
+    pub market_id: String,
+    pub symbol: String,
+    pub side: OrderSide,
+    pub intended_price: f64,
+    pub size: f64,
+    pub edge_gross_bps: f64,
+    pub edge_net_bps: f64,
+    pub fee_paid_bps: f64,
+    pub rebate_est_bps: f64,
+    #[serde(default)]
+    pub tox_score: f64,
+    pub delay_ms: u64,
+    pub t0_ns: i64,
+    pub min_edge_bps: f64,
+    pub ttl_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ShadowOutcome {
+    pub shot_id: String,
+    pub market_id: String,
+    pub symbol: String,
+    pub side: OrderSide,
+    pub delay_ms: u64,
+    pub fillable: bool,
+    pub slippage_bps: Option<f64>,
+    pub pnl_1s_bps: Option<f64>,
+    pub pnl_5s_bps: Option<f64>,
+    pub pnl_10s_bps: Option<f64>,
+    pub net_markout_1s_bps: Option<f64>,
+    pub net_markout_5s_bps: Option<f64>,
+    pub net_markout_10s_bps: Option<f64>,
+    #[serde(default)]
+    pub queue_fill_prob: f64,
+    pub attribution: EdgeAttribution,
+    pub ts_ns: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ControlCommand {
     Pause,
@@ -132,10 +299,18 @@ pub enum ControlCommand {
 pub enum EngineEvent {
     RefTick(RefTick),
     BookTop(BookTop),
+    BookSnapshot(BookSnapshot),
+    BookDelta(BookDelta),
+    BookDigest(OrderbookStateDigest),
     Signal(Signal),
+    ToxicFeatures(ToxicFeatures),
+    ToxicDecision(ToxicDecision),
     QuoteIntent(QuoteIntent),
+    QuoteEval(QuoteEval),
     OrderAck(OrderAck),
     Fill(FillEvent),
+    ShadowShot(ShadowShot),
+    ShadowOutcome(ShadowOutcome),
     Pnl(PnLSnapshot),
     Control(ControlCommand),
 }
@@ -162,12 +337,35 @@ pub trait RefPriceFeed: Send + Sync {
     async fn stream_ticks(&self, symbols: Vec<String>) -> Result<DynStream<RefTick>>;
 }
 
+#[async_trait]
+pub trait RefPriceWsFeed: Send + Sync {
+    async fn stream_ticks_ws(&self, symbols: Vec<String>) -> Result<DynStream<RefTick>>;
+}
+
+#[async_trait]
+pub trait PolymarketBookWsFeed: Send + Sync {
+    async fn stream_book(&self, token_ids: Vec<String>) -> Result<DynStream<BookUpdate>>;
+}
+
 pub trait FairValueModel: Send + Sync {
     fn evaluate(&self, tick: &RefTick, book: &BookTop) -> Signal;
 }
 
 pub trait QuotePolicy: Send + Sync {
     fn build_quotes(&self, signal: &Signal, inventory: &InventoryState) -> Vec<QuoteIntent>;
+
+    fn build_quotes_with_toxicity(
+        &self,
+        signal: &Signal,
+        inventory: &InventoryState,
+        _toxicity: &ToxicDecision,
+    ) -> Vec<QuoteIntent> {
+        self.build_quotes(signal, inventory)
+    }
+}
+
+pub trait ToxicityModel: Send + Sync {
+    fn evaluate(&self, features: &ToxicFeatures) -> ToxicDecision;
 }
 
 #[async_trait]
@@ -207,6 +405,8 @@ mod tests {
             symbol: "BTCUSDT".to_string(),
             event_ts_ms: 1,
             recv_ts_ms: 2,
+            event_ts_exchange_ms: 1,
+            recv_ts_local_ns: 2,
             price: 50000.0,
         });
 

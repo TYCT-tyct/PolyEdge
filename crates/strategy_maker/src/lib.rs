@@ -1,4 +1,6 @@
-use core_types::{InventoryState, OrderSide, QuoteIntent, QuotePolicy, Signal};
+use core_types::{
+    InventoryState, OrderSide, QuoteIntent, QuotePolicy, Signal, ToxicDecision, ToxicRegime,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,10 +16,10 @@ impl Default for MakerConfig {
     fn default() -> Self {
         Self {
             base_quote_size: 2.0,
-            min_edge_bps: 3.0,
+            min_edge_bps: 5.0,
             inventory_skew: 0.15,
             max_spread: 0.03,
-            ttl_ms: 1500,
+            ttl_ms: 400,
         }
     }
 }
@@ -42,7 +44,7 @@ impl QuotePolicy for MakerQuotePolicy {
     fn build_quotes(&self, signal: &Signal, inventory: &InventoryState) -> Vec<QuoteIntent> {
         let mut out = Vec::new();
 
-        if signal.confidence <= 0.05 {
+        if signal.confidence <= 0.0 {
             return out;
         }
 
@@ -72,6 +74,46 @@ impl QuotePolicy for MakerQuotePolicy {
 
         out
     }
+
+    fn build_quotes_with_toxicity(
+        &self,
+        signal: &Signal,
+        inventory: &InventoryState,
+        toxicity: &ToxicDecision,
+    ) -> Vec<QuoteIntent> {
+        let mut quotes = self.build_quotes(signal, inventory);
+        if quotes.is_empty() {
+            return quotes;
+        }
+
+        match toxicity.regime {
+            ToxicRegime::Safe => quotes,
+            ToxicRegime::Danger => Vec::new(),
+            ToxicRegime::Caution => {
+                let tox = toxicity.tox_score.clamp(0.0, 1.0);
+                let spread_mult = 1.0 + tox * 1.5;
+                let size_mult = (1.0 - tox).max(0.2) * 0.5;
+                let ttl_ms = lerp_u64(600, 120, tox);
+                for q in &mut quotes {
+                    let pad = 0.005 * spread_mult;
+                    q.price = match q.side {
+                        OrderSide::BuyYes | OrderSide::BuyNo => (q.price - pad).clamp(0.001, 0.999),
+                        OrderSide::SellYes | OrderSide::SellNo => {
+                            (q.price + pad).clamp(0.001, 0.999)
+                        }
+                    };
+                    q.size = (q.size * size_mult).max(self.cfg.base_quote_size * 0.2);
+                    q.ttl_ms = ttl_ms.max(50);
+                }
+                quotes
+            }
+        }
+    }
+}
+
+fn lerp_u64(from: u64, to: u64, t: f64) -> u64 {
+    let t = t.clamp(0.0, 1.0);
+    ((from as f64) + (to as f64 - from as f64) * t).round() as u64
 }
 
 #[cfg(test)]
@@ -96,5 +138,33 @@ mod tests {
         };
         let intents = policy.build_quotes(&signal, &inventory);
         assert_eq!(intents.len(), 2);
+    }
+
+    #[test]
+    fn danger_regime_blocks_quotes() {
+        let policy = MakerQuotePolicy::new(MakerConfig::default());
+        let signal = Signal {
+            market_id: "m".to_string(),
+            fair_yes: 0.5,
+            edge_bps_bid: 10.0,
+            edge_bps_ask: 10.0,
+            confidence: 0.9,
+        };
+        let inventory = InventoryState {
+            market_id: "m".to_string(),
+            net_yes: 0.0,
+            net_no: 0.0,
+            exposure_notional: 0.0,
+        };
+        let tox = ToxicDecision {
+            market_id: "m".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            tox_score: 0.9,
+            regime: ToxicRegime::Danger,
+            reason_codes: vec!["markout_10s_negative".to_string()],
+            ts_ns: 1,
+        };
+        let intents = policy.build_quotes_with_toxicity(&signal, &inventory, &tox);
+        assert!(intents.is_empty());
     }
 }

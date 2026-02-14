@@ -25,6 +25,46 @@ pwsh -File .\scripts\setup_windows.ps1
 - `GET /metrics`
 - `GET /state/positions`
 - `GET /state/pnl`
+- `GET /report/shadow/live`
+- `GET /report/shadow/final`
 - `POST /control/pause`
 - `POST /control/resume`
 - `POST /control/flatten`
+- `POST /control/reload_strategy`
+- `POST /control/reload_toxicity`
+
+## Benchmarks
+
+Primary benchmark (WS-first, uses live runtime metrics + market WS lag):
+
+```bash
+python scripts/e2e_latency_test.py --mode ws-first --base-url http://127.0.0.1:8080 --symbol BTCUSDT --seconds 120
+```
+
+Legacy REST comparison:
+
+```bash
+python scripts/legacy_rest_probe.py --symbol BTCUSDT --iterations 80
+```
+
+Conservative parameter regression:
+
+```bash
+python scripts/param_regression.py --base-url http://127.0.0.1:8080 --window-sec 300 --max-trials 12
+```
+
+## Key Live Metrics
+
+- `quote_block_ratio`
+- `tick_to_decision_p50_ms/p90_ms/p99_ms`
+- `ack_only_p50_ms/p90_ms/p99_ms`
+- `tick_to_ack_p99_ms`
+
+## Report Artifacts
+
+Runtime report files are written to `datasets/reports/<utc-date>/`:
+
+- `report_shadow_12h.md`
+- `latency_breakdown_12h.csv`
+- `market_scorecard.csv`
+- `next_fixlist.md`

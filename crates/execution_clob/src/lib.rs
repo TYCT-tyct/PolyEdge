@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
@@ -19,7 +20,13 @@ pub struct ClobExecution {
     mode: ExecutionMode,
     http: Client,
     clob_endpoint: String,
-    open_orders: Arc<RwLock<HashMap<String, QuoteIntent>>>,
+    open_orders: Arc<RwLock<HashMap<String, PaperOpenOrder>>>,
+}
+
+#[derive(Debug, Clone)]
+struct PaperOpenOrder {
+    intent: QuoteIntent,
+    created_at: Instant,
 }
 
 impl ClobExecution {
@@ -33,7 +40,36 @@ impl ClobExecution {
     }
 
     pub fn open_orders_count(&self) -> usize {
+        self.prune_expired_orders();
         self.open_orders.read().len()
+    }
+
+    pub fn open_order_notional_for_market(&self, market_id: &str) -> f64 {
+        self.prune_expired_orders();
+        self.open_orders
+            .read()
+            .values()
+            .filter(|o| o.intent.market_id == market_id)
+            .map(|o| o.intent.size * o.intent.price.abs())
+            .sum()
+    }
+
+    pub fn open_order_notional_total(&self) -> f64 {
+        self.prune_expired_orders();
+        self.open_orders
+            .read()
+            .values()
+            .map(|o| o.intent.size * o.intent.price.abs())
+            .sum()
+    }
+
+    fn prune_expired_orders(&self) {
+        let mut orders = self.open_orders.write();
+        let now = Instant::now();
+        orders.retain(|_, o| {
+            let ttl = std::time::Duration::from_millis(o.intent.ttl_ms.max(1));
+            now.duration_since(o.created_at) < ttl
+        });
     }
 }
 
@@ -42,10 +78,15 @@ impl ExecutionVenue for ClobExecution {
     async fn place_order(&self, intent: QuoteIntent) -> Result<OrderAck> {
         match self.mode {
             ExecutionMode::Paper => {
+                self.prune_expired_orders();
                 let order_id = new_id();
-                self.open_orders
-                    .write()
-                    .insert(order_id.clone(), intent.clone());
+                self.open_orders.write().insert(
+                    order_id.clone(),
+                    PaperOpenOrder {
+                        intent: intent.clone(),
+                        created_at: Instant::now(),
+                    },
+                );
                 Ok(OrderAck {
                     order_id,
                     market_id: intent.market_id,
