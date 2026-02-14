@@ -3407,6 +3407,50 @@ fn parse_toml_array_of_strings(val: &str) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
+fn parse_toml_array_for_key(raw: &str, key: &str) -> Option<Vec<String>> {
+    let mut collecting = false;
+    let mut buf = String::new();
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        if !collecting {
+            let Some((k, v)) = trimmed.split_once('=') else {
+                continue;
+            };
+            if k.trim() != key {
+                continue;
+            }
+            let value = v.trim();
+            buf.push_str(value);
+            collecting = !(value.starts_with('[') && value.ends_with(']'));
+            if !collecting {
+                break;
+            }
+            continue;
+        }
+
+        // Keep concatenating multiline array items until closing ']'.
+        buf.push_str(trimmed);
+        if trimmed.ends_with(']') {
+            break;
+        }
+    }
+
+    if buf.is_empty() {
+        return None;
+    }
+    let parsed = parse_toml_array_of_strings(&buf);
+    if parsed.is_empty() {
+        None
+    } else {
+        Some(parsed)
+    }
+}
+
 fn load_strategy_config() -> MakerConfig {
     let path = Path::new("configs/strategy.toml");
     let Ok(raw) = fs::read_to_string(path) else {
@@ -3622,37 +3666,17 @@ fn load_universe_config() -> UniverseConfig {
         return UniverseConfig::default();
     };
     let mut cfg = UniverseConfig::default();
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((k, v)) = line.split_once('=') else {
-            continue;
-        };
-        let key = k.trim();
-        let val = v.trim();
-        match key {
-            "assets" => {
-                let parsed = parse_toml_array_of_strings(val);
-                if !parsed.is_empty() {
-                    cfg.assets = parsed;
-                }
-            }
-            "market_types" => {
-                let parsed = parse_toml_array_of_strings(val);
-                if !parsed.is_empty() {
-                    cfg.market_types = parsed;
-                }
-            }
-            "tier_whitelist" => {
-                cfg.tier_whitelist = parse_toml_array_of_strings(val);
-            }
-            "tier_blacklist" => {
-                cfg.tier_blacklist = parse_toml_array_of_strings(val);
-            }
-            _ => {}
-        }
+    if let Some(parsed) = parse_toml_array_for_key(&raw, "assets") {
+        cfg.assets = parsed;
+    }
+    if let Some(parsed) = parse_toml_array_for_key(&raw, "market_types") {
+        cfg.market_types = parsed;
+    }
+    if let Some(parsed) = parse_toml_array_for_key(&raw, "tier_whitelist") {
+        cfg.tier_whitelist = parsed;
+    }
+    if let Some(parsed) = parse_toml_array_for_key(&raw, "tier_blacklist") {
+        cfg.tier_blacklist = parsed;
     }
     cfg
 }
@@ -4464,5 +4488,38 @@ mod tests {
         assert!(!should_force_taker(&cfg, &caution, 12.0, 0.8));
         cfg.market_tier_profile = "latency_aggressive".to_string();
         assert!(should_force_taker(&cfg, &caution, 12.0, 0.8));
+    }
+
+    #[test]
+    fn parse_toml_array_for_key_handles_multiline_arrays() {
+        let raw = r#"
+assets = [
+  "BTCUSDT",
+  "ETHUSDT",
+  "XRPUSDT",
+]
+market_types = ["updown", "range"]
+"#;
+        let assets = parse_toml_array_for_key(raw, "assets").unwrap_or_default();
+        assert_eq!(
+            assets,
+            vec![
+                "BTCUSDT".to_string(),
+                "ETHUSDT".to_string(),
+                "XRPUSDT".to_string()
+            ]
+        );
+        let market_types = parse_toml_array_for_key(raw, "market_types").unwrap_or_default();
+        assert_eq!(
+            market_types,
+            vec!["updown".to_string(), "range".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_toml_array_for_key_returns_none_for_missing_or_empty() {
+        let raw = "foo = 1\nassets = []\n";
+        assert!(parse_toml_array_for_key(raw, "missing").is_none());
+        assert!(parse_toml_array_for_key(raw, "assets").is_none());
     }
 }
