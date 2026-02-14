@@ -3,7 +3,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
@@ -35,6 +35,12 @@ use risk_engine::{DefaultRiskManager, RiskLimits};
 use serde::{Deserialize, Serialize};
 use strategy_maker::{MakerConfig, MakerQuotePolicy};
 use tokio::sync::{mpsc, RwLock};
+
+mod stats_utils;
+use stats_utils::{
+    estimate_uptime_pct, freshness_ms, now_ns, percentile, push_capped, robust_filter_iqr,
+    value_to_f64,
+};
 
 #[derive(Clone)]
 struct AppState {
@@ -118,6 +124,7 @@ struct PerfProfileReloadReq {
     io_flush_batch: Option<usize>,
     io_queue_capacity: Option<usize>,
     json_mode: Option<String>,
+    io_drop_on_full: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +133,7 @@ struct PerfProfile {
     io_flush_batch: usize,
     io_queue_capacity: usize,
     json_mode: String,
+    io_drop_on_full: bool,
 }
 
 impl Default for PerfProfile {
@@ -135,6 +143,7 @@ impl Default for PerfProfile {
             io_flush_batch: 64,
             io_queue_capacity: 16_384,
             json_mode: "typed".to_string(),
+            io_drop_on_full: true,
         }
     }
 }
@@ -1950,14 +1959,6 @@ fn push_rolling(dst: &mut Vec<f64>, value: f64, cap: usize) {
     }
 }
 
-fn push_capped<T>(dst: &mut Vec<T>, value: T, cap: usize) {
-    dst.push(value);
-    if dst.len() > cap {
-        let drop_n = dst.len() - cap;
-        dst.drain(0..drop_n);
-    }
-}
-
 fn sigmoid(x: f64) -> f64 {
     if x >= 0.0 {
         1.0 / (1.0 + (-x).exp())
@@ -2340,6 +2341,10 @@ async fn reload_perf_profile(
     if let Some(v) = req.json_mode {
         cfg.json_mode = v;
     }
+    if let Some(v) = req.io_drop_on_full {
+        cfg.io_drop_on_full = v;
+        JSONL_DROP_ON_FULL.store(v, Ordering::Relaxed);
+    }
     append_jsonl(
         &dataset_path("reports", "perf_profile_reload.jsonl"),
         &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "config": *cfg}),
@@ -2636,6 +2641,11 @@ fn load_perf_profile_config() -> PerfProfile {
             "json_mode" => {
                 cfg.json_mode = val.to_string();
             }
+            "io_drop_on_full" => {
+                if let Ok(parsed) = val.parse::<bool>() {
+                    cfg.io_drop_on_full = parsed;
+                }
+            }
             _ => {}
         }
     }
@@ -2670,6 +2680,7 @@ struct JsonlWriteReq {
 static JSONL_WRITER: OnceLock<mpsc::Sender<JsonlWriteReq>> = OnceLock::new();
 static JSONL_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
 static JSONL_QUEUE_CAP: AtomicU64 = AtomicU64::new(0);
+static JSONL_DROP_ON_FULL: AtomicBool = AtomicBool::new(true);
 
 async fn init_jsonl_writer(perf_profile: Arc<RwLock<PerfProfile>>) {
     if JSONL_WRITER.get().is_some() {
@@ -2678,6 +2689,7 @@ async fn init_jsonl_writer(perf_profile: Arc<RwLock<PerfProfile>>) {
     let cfg = perf_profile.read().await.clone();
     let (tx, mut rx) = mpsc::channel::<JsonlWriteReq>(cfg.io_queue_capacity.max(256));
     JSONL_QUEUE_CAP.store(cfg.io_queue_capacity.max(256) as u64, Ordering::Relaxed);
+    JSONL_DROP_ON_FULL.store(cfg.io_drop_on_full, Ordering::Relaxed);
     if JSONL_WRITER.set(tx.clone()).is_err() {
         return;
     }
@@ -2755,9 +2767,17 @@ fn append_jsonl(path: &Path, value: &serde_json::Value) {
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 metrics::counter!("io.jsonl.queue_full").increment(1);
+                if JSONL_DROP_ON_FULL.load(Ordering::Relaxed) {
+                    metrics::counter!("io.jsonl.dropped").increment(1);
+                    return;
+                }
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 metrics::counter!("io.jsonl.queue_closed").increment(1);
+                if JSONL_DROP_ON_FULL.load(Ordering::Relaxed) {
+                    metrics::counter!("io.jsonl.dropped").increment(1);
+                    return;
+                }
             }
         }
     }
@@ -3071,62 +3091,6 @@ fn build_market_scorecard(shots: &[ShadowShot], outcomes: &[ShadowOutcome]) -> V
 
     rows.sort_by(|a, b| b.net_edge_p50_bps.total_cmp(&a.net_edge_p50_bps));
     rows
-}
-
-fn percentile(values: &[f64], p: f64) -> Option<f64> {
-    if values.is_empty() {
-        return None;
-    }
-    let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.total_cmp(b));
-    let idx = ((sorted.len() - 1) as f64 * p.clamp(0.0, 1.0)).round() as usize;
-    sorted.get(idx).copied()
-}
-
-fn robust_filter_iqr(values: &[f64]) -> (Vec<f64>, f64) {
-    if values.len() < 5 {
-        return (values.to_vec(), 0.0);
-    }
-    let q1 = percentile(values, 0.25).unwrap_or(0.0);
-    let q3 = percentile(values, 0.75).unwrap_or(0.0);
-    let iqr = (q3 - q1).max(1e-9);
-    let lower = q1 - 1.5 * iqr;
-    let upper = q3 + 1.5 * iqr;
-    let filtered = values
-        .iter()
-        .copied()
-        .filter(|v| *v >= lower && *v <= upper)
-        .collect::<Vec<_>>();
-    if filtered.is_empty() {
-        return (values.to_vec(), 0.0);
-    }
-    let outlier_ratio = (values.len().saturating_sub(filtered.len())) as f64 / values.len() as f64;
-    (filtered, outlier_ratio)
-}
-
-fn freshness_ms(now_ms: i64, last_ms: i64) -> i64 {
-    if last_ms <= 0 {
-        return i64::MAX;
-    }
-    (now_ms - last_ms).max(0)
-}
-
-fn estimate_uptime_pct(_elapsed: Duration) -> f64 {
-    100.0
-}
-
-fn value_to_f64(v: &serde_json::Value) -> Option<f64> {
-    match v {
-        serde_json::Value::String(s) => s.parse::<f64>().ok(),
-        serde_json::Value::Number(n) => n.as_f64(),
-        _ => None,
-    }
-}
-
-fn now_ns() -> i64 {
-    Utc::now()
-        .timestamp_nanos_opt()
-        .unwrap_or_else(|| Utc::now().timestamp_millis() * 1_000_000)
 }
 
 #[cfg(test)]

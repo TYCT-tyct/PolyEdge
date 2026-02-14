@@ -86,6 +86,16 @@ python scripts/ab_region_compare.py --base-a http://<eu-host>:8080 --base-b http
 - `pnl_10s_sample_count/pnl_10s_outlier_ratio`
 - `queue_depth_p99/event_backlog_p99`
 
+## Runtime Perf Profile
+
+`configs/latency.toml` runtime section supports:
+
+- `tail_guard`
+- `io_flush_batch`
+- `io_queue_capacity`
+- `json_mode`
+- `io_drop_on_full` (when `true`, JSONL queue overflow drops records instead of blocking hot path I/O)
+
 ## Report Artifacts
 
 Runtime report files are written to `datasets/reports/<utc-date>/`:

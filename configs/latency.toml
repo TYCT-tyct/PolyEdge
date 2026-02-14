@@ -9,3 +9,4 @@ tail_guard = 0.99
 io_flush_batch = 64
 io_queue_capacity = 16384
 json_mode = "typed"
+io_drop_on_full = true
