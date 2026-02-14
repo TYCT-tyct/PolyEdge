@@ -1712,6 +1712,12 @@ fn spawn_strategy_engine(
 
                     let latency_sample = estimate_feed_latency(&tick, &book);
                     let feed_in_ms = latency_sample.feed_in_ms;
+                    let stale_tick_filter_ms = shared.strategy_cfg.read().await.stale_tick_filter_ms;
+                    if feed_in_ms > stale_tick_filter_ms {
+                        shared.shadow_stats.mark_stale_tick_dropped();
+                        shared.shadow_stats.record_issue("stale_tick_dropped").await;
+                        continue;
+                    }
                     shared.shadow_stats.push_feed_in_ms(feed_in_ms).await;
                     shared
                         .shadow_stats
@@ -1730,12 +1736,6 @@ fn spawn_strategy_engine(
                         .record(latency_sample.source_latency_ms);
                     metrics::histogram!("latency.local_backlog_ms")
                         .record(latency_sample.local_backlog_ms);
-                    let stale_tick_filter_ms = shared.strategy_cfg.read().await.stale_tick_filter_ms;
-                    if feed_in_ms > stale_tick_filter_ms {
-                        shared.shadow_stats.mark_stale_tick_dropped();
-                        shared.shadow_stats.record_issue("stale_tick_dropped").await;
-                        continue;
-                    }
                     let signal_start = Instant::now();
                     let signal = fair.evaluate(&tick, &book);
                     if signal.edge_bps_bid > 0.0 || signal.edge_bps_ask > 0.0 {
