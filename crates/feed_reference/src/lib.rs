@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use core_types::{DynStream, RefPriceFeed, RefPriceWsFeed, RefTick};
 use futures::{SinkExt, StreamExt};
 use reqwest::Client;
-use serde_json::Value;
+use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tungstenite::connect_async;
@@ -108,21 +108,13 @@ async fn run_binance_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> R
             Message::Frame(_) => continue,
         };
 
-        let Ok(payload) = serde_json::from_str::<Value>(&text) else {
+        let Ok(payload) = serde_json::from_str::<BinanceWsMessage>(&text) else {
             continue;
         };
-        let data = payload.get("data").unwrap_or(&payload);
-
-        let symbol = data.get("s").and_then(Value::as_str).map(ToOwned::to_owned);
-        let price = data
-            .get("p")
-            .and_then(Value::as_str)
-            .and_then(|s| s.parse::<f64>().ok());
-        let event_ts = data.get("E").and_then(Value::as_i64).unwrap_or_else(now_ms);
-
-        let (Some(symbol), Some(price)) = (symbol, price) else {
-            continue;
-        };
+        let trade = payload.into_trade();
+        let symbol = trade.symbol;
+        let price = trade.price;
+        let event_ts = trade.event_ts.unwrap_or_else(now_ms);
 
         let tick = RefTick {
             source: "binance_ws".to_string(),
@@ -176,39 +168,31 @@ async fn run_bybit_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> Res
             Message::Frame(_) => continue,
         };
 
-        let Ok(payload) = serde_json::from_str::<Value>(&text) else {
+        let Ok(payload) = serde_json::from_str::<BybitWsMessage>(&text) else {
             continue;
         };
-
-        if payload.get("success").is_some() {
+        if payload.success.is_some() {
             continue;
         }
-
-        let topic = payload
-            .get("topic")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        let topic = payload.topic.as_deref().unwrap_or_default();
         if !topic.starts_with("tickers.") {
             continue;
         }
 
-        let data = payload.get("data").unwrap_or(&Value::Null);
-        let symbol = data
-            .get("symbol")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
+        let symbol = payload
+            .data
+            .as_ref()
+            .and_then(|d| d.symbol.clone())
             .or_else(|| topic.split('.').nth(1).map(ToOwned::to_owned));
-
-        let price = data
-            .get("lastPrice")
-            .or_else(|| data.get("markPrice"))
-            .and_then(Value::as_str)
-            .and_then(|s| s.parse::<f64>().ok());
-
+        let price = payload
+            .data
+            .as_ref()
+            .and_then(|d| d.last_price.as_deref())
+            .or_else(|| payload.data.as_ref().and_then(|d| d.mark_price.as_deref()))
+            .and_then(parse_f64_str);
         let event_ts = payload
-            .get("ts")
-            .and_then(Value::as_i64)
-            .or_else(|| data.get("ts").and_then(Value::as_i64))
+            .ts
+            .or_else(|| payload.data.as_ref().and_then(|d| d.ts))
             .unwrap_or_else(now_ms);
 
         let (Some(symbol), Some(price)) = (symbol, price) else {
@@ -274,33 +258,22 @@ async fn run_coinbase_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> 
             Message::Frame(_) => continue,
         };
 
-        let Ok(payload) = serde_json::from_str::<Value>(&text) else {
+        let Ok(payload) = serde_json::from_str::<CoinbaseWsMessage>(&text) else {
             continue;
         };
-
-        let msg_type = payload
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        let msg_type = payload.kind.as_deref().unwrap_or_default();
         if msg_type != "ticker" {
             continue;
         }
-
-        let product_id = payload
-            .get("product_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        let product_id = payload.product_id.as_deref().unwrap_or_default();
         let Some(symbol) = from_coinbase_pair(product_id) else {
             continue;
         };
 
-        let price = payload
-            .get("price")
-            .and_then(Value::as_str)
-            .and_then(|s| s.parse::<f64>().ok());
+        let price = payload.price.as_deref().and_then(parse_f64_str);
         let event_ts = payload
-            .get("time")
-            .and_then(Value::as_str)
+            .time
+            .as_deref()
             .and_then(parse_rfc3339_ms)
             .unwrap_or_else(now_ms);
 
@@ -330,6 +303,90 @@ fn parse_rfc3339_ms(value: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(value)
         .ok()
         .map(|dt| dt.timestamp_millis())
+}
+
+fn parse_f64_str(value: &str) -> Option<f64> {
+    value.parse::<f64>().ok()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum BinanceWsMessage {
+    Envelope { data: BinanceTrade },
+    Trade(BinanceTrade),
+}
+
+impl BinanceWsMessage {
+    fn into_trade(self) -> BinanceTrade {
+        match self {
+            Self::Envelope { data } => data,
+            Self::Trade(data) => data,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceTrade {
+    #[serde(rename = "s")]
+    symbol: String,
+    #[serde(rename = "p", deserialize_with = "de_f64_from_str")]
+    price: f64,
+    #[serde(rename = "E")]
+    event_ts: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BybitWsMessage {
+    #[serde(default)]
+    success: Option<bool>,
+    #[serde(default)]
+    topic: Option<String>,
+    #[serde(default)]
+    ts: Option<i64>,
+    #[serde(default)]
+    data: Option<BybitTickData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BybitTickData {
+    #[serde(default)]
+    symbol: Option<String>,
+    #[serde(rename = "lastPrice", default)]
+    last_price: Option<String>,
+    #[serde(rename = "markPrice", default)]
+    mark_price: Option<String>,
+    #[serde(default)]
+    ts: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CoinbaseWsMessage {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    product_id: Option<String>,
+    #[serde(default)]
+    price: Option<String>,
+    #[serde(default)]
+    time: Option<String>,
+}
+
+fn de_f64_from_str<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr {
+        Num(f64),
+        Str(String),
+    }
+    match NumOrStr::deserialize(deserializer)? {
+        NumOrStr::Num(v) => Ok(v),
+        NumOrStr::Str(s) => s
+            .parse::<f64>()
+            .map_err(|e| serde::de::Error::custom(format!("invalid f64 string: {e}"))),
+    }
 }
 
 fn to_coinbase_pair(symbol: &str) -> Option<String> {

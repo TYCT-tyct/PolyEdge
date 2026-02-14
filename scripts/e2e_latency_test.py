@@ -29,7 +29,12 @@ def collect_engine_metrics(base_url: str, seconds: int, poll_interval: float) ->
         "ack_only_p99_ms": [],
         "feed_in_p50_ms": [],
         "quote_block_ratio": [],
-        "pnl_10s_p50_bps": [],
+        "policy_block_ratio": [],
+        "queue_depth_p99": [],
+        "event_backlog_p99": [],
+        "pnl_10s_p50_bps_raw": [],
+        "pnl_10s_p50_bps_robust": [],
+        "pnl_10s_outlier_ratio": [],
     }
 
     while time.time() < deadline:
@@ -43,7 +48,12 @@ def collect_engine_metrics(base_url: str, seconds: int, poll_interval: float) ->
                 "tick_to_ack_p99_ms",
                 "ack_only_p99_ms",
                 "quote_block_ratio",
-                "pnl_10s_p50_bps",
+                "policy_block_ratio",
+                "queue_depth_p99",
+                "event_backlog_p99",
+                "pnl_10s_p50_bps_raw",
+                "pnl_10s_p50_bps_robust",
+                "pnl_10s_outlier_ratio",
             ):
                 value = live.get(key)
                 if isinstance(value, (int, float)):
@@ -82,7 +92,14 @@ def main() -> None:
     print_stat_block("ack_only_p99", engine["stats"]["ack_only_p99_ms"], "ms")
     print_stat_block("feed_in_p50", engine["stats"]["feed_in_p50_ms"], "ms")
     print_stat_block("quote_block_ratio", engine["stats"]["quote_block_ratio"], "")
-    print_stat_block("pnl_10s_p50_bps", engine["stats"]["pnl_10s_p50_bps"], "bps")
+    print_stat_block("policy_block_ratio", engine["stats"]["policy_block_ratio"], "")
+    print_stat_block("queue_depth_p99", engine["stats"]["queue_depth_p99"], "")
+    print_stat_block("event_backlog_p99", engine["stats"]["event_backlog_p99"], "")
+    print_stat_block("pnl_10s_p50_bps_raw", engine["stats"]["pnl_10s_p50_bps_raw"], "bps")
+    print_stat_block(
+        "pnl_10s_p50_bps_robust", engine["stats"]["pnl_10s_p50_bps_robust"], "bps"
+    )
+    print_stat_block("pnl_10s_outlier_ratio", engine["stats"]["pnl_10s_outlier_ratio"], "")
 
     print("\n=== WS FEED LATENCY (RECV - SOURCE TS) ===")
     ws = asyncio.run(run_ws_latency(args.seconds, args.symbol))

@@ -3,3 +3,9 @@ feed_ingest_p99_ms = 2
 signal_to_quote_p99_ms = 1
 risk_check_p99_us = 200
 place_cancel_encode_sign_p99_us = 500
+
+[runtime]
+tail_guard = 0.99
+io_flush_batch = 64
+io_queue_capacity = 16384
+json_mode = "typed"

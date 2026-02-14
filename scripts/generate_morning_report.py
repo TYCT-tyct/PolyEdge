@@ -78,7 +78,8 @@ def build_recommendations(live: Dict[str, Any], alert_count: Counter[str]) -> Li
         recs.append("Polymarket book feed stale. Check CLOB WS health and reconnect loop.")
     if float(live.get("tick_to_ack_p99_ms", 0.0)) > 450.0:
         recs.append("E2E p99 too high. Investigate tail latency and network jitter.")
-    if float(live.get("pnl_10s_p50_bps", 0.0)) <= 0.0:
+    pnl_robust = float(live.get("pnl_10s_p50_bps_robust", live.get("pnl_10s_p50_bps", 0.0)))
+    if pnl_robust <= 0.0:
         recs.append("Realized pnl_10s median is non-positive. Keep Shadow mode and retune edge/fees.")
     if int(live.get("quote_attempted", 0)) > 100 and int(live.get("total_shots", 0)) == 0:
         recs.append("Many quote attempts but zero shadow shots. Re-check edge model vs fee/rebate.")
@@ -120,6 +121,12 @@ def write_report(
     attempted = int(live.get("quote_attempted", 0))
     blocked = int(live.get("quote_blocked", 0))
     block_ratio = float(live.get("quote_block_ratio", 0.0))
+    policy_block_ratio = float(live.get("policy_block_ratio", 0.0))
+    pnl_raw = float(live.get("pnl_10s_p50_bps_raw", live.get("pnl_10s_p50_bps", 0.0)))
+    pnl_robust = float(live.get("pnl_10s_p50_bps_robust", pnl_raw))
+    pnl_outlier_ratio = float(live.get("pnl_10s_outlier_ratio", 0.0))
+    queue_depth_p99 = float(live.get("queue_depth_p99", 0.0))
+    event_backlog_p99 = float(live.get("event_backlog_p99", 0.0))
 
     lines = []
     lines.append(f"# PolyEdge Morning Report ({day}, UTC)")
@@ -128,6 +135,7 @@ def write_report(
     lines.append(f"- quote_attempted: {attempted}")
     lines.append(f"- quote_blocked: {blocked}")
     lines.append(f"- quote_block_ratio: {block_ratio:.4f}")
+    lines.append(f"- policy_block_ratio: {policy_block_ratio:.4f}")
     lines.append(f"- total_shots: {int(live.get('total_shots', 0))}")
     lines.append(f"- total_outcomes: {int(live.get('total_outcomes', 0))}")
     lines.append(f"- fillability_10ms: {float(live.get('fillability_10ms', 0.0)):.4f}")
@@ -135,10 +143,14 @@ def write_report(
     lines.append(f"- net_edge_p10_bps: {float(live.get('net_edge_p10_bps', 0.0)):.4f}")
     lines.append(f"- pnl_1s_p50_bps: {float(live.get('pnl_1s_p50_bps', 0.0)):.4f}")
     lines.append(f"- pnl_5s_p50_bps: {float(live.get('pnl_5s_p50_bps', 0.0)):.4f}")
-    lines.append(f"- pnl_10s_p50_bps: {float(live.get('pnl_10s_p50_bps', 0.0)):.4f}")
+    lines.append(f"- pnl_10s_p50_bps_raw: {pnl_raw:.4f}")
+    lines.append(f"- pnl_10s_p50_bps_robust: {pnl_robust:.4f}")
+    lines.append(f"- pnl_10s_outlier_ratio: {pnl_outlier_ratio:.4f}")
     lines.append(f"- tick_to_ack_p99_ms: {float(live.get('tick_to_ack_p99_ms', 0.0)):.3f}")
     lines.append(f"- tick_to_decision_p50_ms: {float(live.get('tick_to_decision_p50_ms', 0.0)):.3f}")
     lines.append(f"- ack_only_p50_ms: {float(live.get('ack_only_p50_ms', 0.0)):.3f}")
+    lines.append(f"- queue_depth_p99: {queue_depth_p99:.3f}")
+    lines.append(f"- event_backlog_p99: {event_backlog_p99:.3f}")
     lines.append(f"- ref_freshness_ms: {int(live.get('ref_freshness_ms', -1))}")
     lines.append(f"- book_freshness_ms: {int(live.get('book_freshness_ms', -1))}")
     lines.append("")

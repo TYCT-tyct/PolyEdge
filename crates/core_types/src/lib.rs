@@ -286,8 +286,16 @@ pub struct ShadowOutcome {
     pub net_markout_10s_bps: Option<f64>,
     #[serde(default)]
     pub queue_fill_prob: f64,
+    #[serde(default)]
+    pub is_outlier: bool,
+    #[serde(default = "default_robust_weight")]
+    pub robust_weight: f64,
     pub attribution: EdgeAttribution,
     pub ts_ns: i64,
+}
+
+fn default_robust_weight() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -57,16 +57,18 @@ class TrialResult:
     caution_threshold: float
     samples: int
     fillability_10ms: float
-    pnl_10s_p50_bps: float
-    pnl_10s_p25_bps: float
+    pnl_10s_p50_bps_raw: float
+    pnl_10s_p50_bps_robust: float
+    pnl_10s_p25_bps_robust: float
     quote_block_ratio: float
+    policy_block_ratio: float
     tick_to_ack_p99_ms: float
     net_edge_p50_bps: float
 
     def gate_pass(self) -> bool:
         return (
-            self.pnl_10s_p50_bps > 0.0
-            and self.pnl_10s_p25_bps > -20.0
+            self.pnl_10s_p50_bps_robust > 0.0
+            and self.pnl_10s_p25_bps_robust > -20.0
             and self.fillability_10ms >= 0.60
             and self.quote_block_ratio < 0.10
             and self.tick_to_ack_p99_ms < 450.0
@@ -123,7 +125,9 @@ def run_trial(
 
     fillability: List[float] = []
     pnl10: List[float] = []
+    pnl10_raw: List[float] = []
     block_ratio: List[float] = []
+    policy_block_ratio: List[float] = []
     tick_ack: List[float] = []
     net_edge: List[float] = []
 
@@ -131,8 +135,12 @@ def run_trial(
     while time.time() < deadline:
         live = fetch_json(session, f"{base}/report/shadow/live")
         fillability.append(float(live.get("fillability_10ms", 0.0)))
-        pnl10.append(float(live.get("pnl_10s_p50_bps", 0.0)))
+        pnl10_raw.append(float(live.get("pnl_10s_p50_bps_raw", live.get("pnl_10s_p50_bps", 0.0))))
+        pnl10.append(
+            float(live.get("pnl_10s_p50_bps_robust", live.get("pnl_10s_p50_bps", 0.0)))
+        )
         block_ratio.append(float(live.get("quote_block_ratio", 0.0)))
+        policy_block_ratio.append(float(live.get("policy_block_ratio", 0.0)))
         tick_ack.append(float(live.get("tick_to_ack_p99_ms", 0.0)))
         net_edge.append(float(live.get("net_edge_p50_bps", 0.0)))
         time.sleep(max(1.0, poll_interval_sec))
@@ -146,9 +154,11 @@ def run_trial(
         caution_threshold=caution_threshold,
         samples=len(fillability),
         fillability_10ms=percentile(fillability, 0.50),
-        pnl_10s_p50_bps=percentile(pnl10, 0.50),
-        pnl_10s_p25_bps=percentile(pnl10, 0.25),
+        pnl_10s_p50_bps_raw=percentile(pnl10_raw, 0.50),
+        pnl_10s_p50_bps_robust=percentile(pnl10, 0.50),
+        pnl_10s_p25_bps_robust=percentile(pnl10, 0.25),
         quote_block_ratio=percentile(block_ratio, 0.50),
+        policy_block_ratio=percentile(policy_block_ratio, 0.50),
         tick_to_ack_p99_ms=percentile(tick_ack, 0.50),
         net_edge_p50_bps=percentile(net_edge, 0.50),
     )
@@ -168,9 +178,11 @@ def write_ablation_csv(path: Path, rows: Iterable[TrialResult]) -> None:
                 "caution_threshold",
                 "samples",
                 "fillability_10ms",
-                "pnl_10s_p50_bps",
-                "pnl_10s_p25_bps",
+                "pnl_10s_p50_bps_raw",
+                "pnl_10s_p50_bps_robust",
+                "pnl_10s_p25_bps_robust",
                 "quote_block_ratio",
+                "policy_block_ratio",
                 "tick_to_ack_p99_ms",
                 "net_edge_p50_bps",
                 "gate_pass",
@@ -187,9 +199,11 @@ def write_ablation_csv(path: Path, rows: Iterable[TrialResult]) -> None:
                     row.caution_threshold,
                     row.samples,
                     f"{row.fillability_10ms:.6f}",
-                    f"{row.pnl_10s_p50_bps:.6f}",
-                    f"{row.pnl_10s_p25_bps:.6f}",
+                    f"{row.pnl_10s_p50_bps_raw:.6f}",
+                    f"{row.pnl_10s_p50_bps_robust:.6f}",
+                    f"{row.pnl_10s_p25_bps_robust:.6f}",
                     f"{row.quote_block_ratio:.6f}",
+                    f"{row.policy_block_ratio:.6f}",
                     f"{row.tick_to_ack_p99_ms:.6f}",
                     f"{row.net_edge_p50_bps:.6f}",
                     row.gate_pass(),
@@ -209,12 +223,13 @@ def write_summary_md(path: Path, rows: List[TrialResult]) -> None:
     lines.append("## Top Trials")
     for i, row in enumerate(top, start=1):
         lines.append(
-            f"- #{i} edge={row.min_edge_bps}, ttl={row.ttl_ms}, "
-            f"k={row.basis_k_revert}, z={row.basis_z_cap}, "
-            f"pnl10_p50={row.pnl_10s_p50_bps:.3f}, "
-            f"fill10={row.fillability_10ms:.3f}, block={row.quote_block_ratio:.3f}, "
-            f"tick_to_ack_p99={row.tick_to_ack_p99_ms:.3f}, gate={row.gate_pass()}"
-        )
+                f"- #{i} edge={row.min_edge_bps}, ttl={row.ttl_ms}, "
+                f"k={row.basis_k_revert}, z={row.basis_z_cap}, "
+                f"pnl10_raw_p50={row.pnl_10s_p50_bps_raw:.3f}, "
+                f"pnl10_robust_p50={row.pnl_10s_p50_bps_robust:.3f}, "
+                f"fill10={row.fillability_10ms:.3f}, block={row.quote_block_ratio:.3f}, "
+                f"tick_to_ack_p99={row.tick_to_ack_p99_ms:.3f}, gate={row.gate_pass()}"
+            )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -226,10 +241,10 @@ def write_fixlist(path: Path, best: TrialResult | None) -> None:
     elif best.gate_pass():
         lines.append("- Conservative gate passed on best trial. Keep Shadow mode and extend soak run.")
     else:
-        if best.pnl_10s_p50_bps <= 0.0:
-            lines.append("- pnl_10s_p50_bps still <= 0. Increase edge threshold and reduce toxic markets.")
-        if best.pnl_10s_p25_bps <= -20.0:
-            lines.append("- pnl_10s_p25_bps <= -20. Tighten toxicity danger threshold and shorter TTL.")
+        if best.pnl_10s_p50_bps_robust <= 0.0:
+            lines.append("- pnl_10s_p50_bps_robust still <= 0. Increase edge threshold and reduce toxic markets.")
+        if best.pnl_10s_p25_bps_robust <= -20.0:
+            lines.append("- pnl_10s_p25_bps_robust <= -20. Tighten toxicity danger threshold and shorter TTL.")
         if best.fillability_10ms < 0.60:
             lines.append("- fillability_10ms below 0.60. Revisit spread/size and queue proxy assumptions.")
         if best.quote_block_ratio >= 0.10:
@@ -295,7 +310,7 @@ def main() -> int:
     rows.sort(
         key=lambda r: (
             r.gate_pass(),
-            r.pnl_10s_p50_bps,
+            r.pnl_10s_p50_bps_robust,
             r.fillability_10ms,
             -r.quote_block_ratio,
             -r.tick_to_ack_p99_ms,

@@ -30,8 +30,10 @@ pwsh -File .\scripts\setup_windows.ps1
 - `POST /control/pause`
 - `POST /control/resume`
 - `POST /control/flatten`
+- `POST /control/reset_shadow`
 - `POST /control/reload_strategy`
 - `POST /control/reload_toxicity`
+- `POST /control/reload_perf_profile`
 
 ## Benchmarks
 
@@ -56,9 +58,13 @@ python scripts/param_regression.py --base-url http://127.0.0.1:8080 --window-sec
 ## Key Live Metrics
 
 - `quote_block_ratio`
+- `policy_block_ratio`
 - `tick_to_decision_p50_ms/p90_ms/p99_ms`
 - `ack_only_p50_ms/p90_ms/p99_ms`
 - `tick_to_ack_p99_ms`
+- `pnl_10s_p50_bps_raw/pnl_10s_p50_bps_robust`
+- `pnl_10s_sample_count/pnl_10s_outlier_ratio`
+- `queue_depth_p99/event_backlog_p99`
 
 ## Report Artifacts
 

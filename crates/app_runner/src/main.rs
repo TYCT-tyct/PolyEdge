@@ -4,7 +4,7 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -34,7 +34,7 @@ use reqwest::Client;
 use risk_engine::{DefaultRiskManager, RiskLimits};
 use serde::{Deserialize, Serialize};
 use strategy_maker::{MakerConfig, MakerQuotePolicy};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 
 #[derive(Clone)]
 struct AppState {
@@ -49,6 +49,7 @@ struct AppState {
     toxicity_cfg: Arc<RwLock<ToxicityConfig>>,
     tox_state: Arc<RwLock<HashMap<String, MarketToxicState>>>,
     shadow_stats: Arc<ShadowStats>,
+    perf_profile: Arc<RwLock<PerfProfile>>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +70,7 @@ struct EngineShared {
     toxicity_cfg: Arc<RwLock<ToxicityConfig>>,
     tox_state: Arc<RwLock<HashMap<String, MarketToxicState>>>,
     shadow_stats: Arc<ShadowStats>,
+    perf_profile: Arc<RwLock<PerfProfile>>,
 }
 
 #[derive(Serialize)]
@@ -109,6 +111,33 @@ struct ToxicityReloadReq {
     markout_1s_danger_bps: Option<f64>,
     markout_5s_danger_bps: Option<f64>,
     markout_10s_danger_bps: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PerfProfileReloadReq {
+    tail_guard: Option<f64>,
+    io_flush_batch: Option<usize>,
+    io_queue_capacity: Option<usize>,
+    json_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PerfProfile {
+    tail_guard: f64,
+    io_flush_batch: usize,
+    io_queue_capacity: usize,
+    json_mode: String,
+}
+
+impl Default for PerfProfile {
+    fn default() -> Self {
+        Self {
+            tail_guard: 0.99,
+            io_flush_batch: 64,
+            io_queue_capacity: 16_384,
+            json_mode: "typed".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,8 +258,12 @@ struct GateEvaluation {
     fillability_10ms: f64,
     net_edge_p50_bps: f64,
     net_edge_p10_bps: f64,
-    pnl_10s_p50_bps: f64,
+    pnl_10s_p50_bps_raw: f64,
+    pnl_10s_p50_bps_robust: f64,
+    pnl_10s_sample_count: usize,
+    pnl_10s_outlier_ratio: f64,
     quote_block_ratio: f64,
+    policy_block_ratio: f64,
     strategy_uptime_pct: f64,
     tick_to_ack_p99_ms: f64,
     failed_reasons: Vec<String>,
@@ -259,6 +292,9 @@ struct LatencyBreakdown {
     tick_to_ack_p50_ms: f64,
     tick_to_ack_p90_ms: f64,
     tick_to_ack_p99_ms: f64,
+    parse_p99_us: f64,
+    io_queue_p99_ms: f64,
+    bus_lag_p99_ms: f64,
     shadow_fill_p50_ms: f64,
     shadow_fill_p90_ms: f64,
     shadow_fill_p99_ms: f64,
@@ -283,7 +319,14 @@ struct ShadowLiveReport {
     pnl_1s_p50_bps: f64,
     pnl_5s_p50_bps: f64,
     pnl_10s_p50_bps: f64,
+    pnl_10s_p50_bps_raw: f64,
+    pnl_10s_p50_bps_robust: f64,
+    pnl_10s_sample_count: usize,
+    pnl_10s_outlier_ratio: f64,
     quote_block_ratio: f64,
+    policy_block_ratio: f64,
+    queue_depth_p99: f64,
+    event_backlog_p99: f64,
     tick_to_decision_p50_ms: f64,
     tick_to_decision_p90_ms: f64,
     tick_to_decision_p99_ms: f64,
@@ -339,9 +382,16 @@ struct ShadowStats {
     quote_us: RwLock<Vec<f64>>,
     risk_us: RwLock<Vec<f64>>,
     shadow_fill_ms: RwLock<Vec<f64>>,
+    queue_depth: RwLock<Vec<f64>>,
+    event_backlog: RwLock<Vec<f64>>,
+    parse_us: RwLock<Vec<f64>>,
+    io_queue_depth: RwLock<Vec<f64>>,
 }
 
 impl ShadowStats {
+    const SHADOW_CAP: usize = 200_000;
+    const SAMPLE_CAP: usize = 65_536;
+
     fn new() -> Self {
         Self {
             started_at: RwLock::new(Instant::now()),
@@ -363,6 +413,10 @@ impl ShadowStats {
             quote_us: RwLock::new(Vec::new()),
             risk_us: RwLock::new(Vec::new()),
             shadow_fill_ms: RwLock::new(Vec::new()),
+            queue_depth: RwLock::new(Vec::new()),
+            event_backlog: RwLock::new(Vec::new()),
+            parse_us: RwLock::new(Vec::new()),
+            io_queue_depth: RwLock::new(Vec::new()),
         }
     }
 
@@ -387,6 +441,10 @@ impl ShadowStats {
         self.quote_us.write().await.clear();
         self.risk_us.write().await.clear();
         self.shadow_fill_ms.write().await.clear();
+        self.queue_depth.write().await.clear();
+        self.event_backlog.write().await.clear();
+        self.parse_us.write().await.clear();
+        self.io_queue_depth.write().await.clear();
     }
 
     async fn push_shot(&self, shot: ShadowShot) {
@@ -394,7 +452,8 @@ impl ShadowStats {
             &dataset_path("normalized", "shadow_shots.jsonl"),
             &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "shot": shot}),
         );
-        self.shots.write().await.push(shot);
+        let mut shots = self.shots.write().await;
+        push_capped(&mut shots, shot, Self::SHADOW_CAP);
     }
 
     async fn push_outcome(&self, outcome: ShadowOutcome) {
@@ -402,39 +461,68 @@ impl ShadowStats {
             &dataset_path("normalized", "shadow_outcomes.jsonl"),
             &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "outcome": outcome}),
         );
-        self.outcomes.write().await.push(outcome);
+        let mut outcomes = self.outcomes.write().await;
+        push_capped(&mut outcomes, outcome, Self::SHADOW_CAP);
     }
 
     async fn push_tick_to_decision_ms(&self, ms: f64) {
-        self.tick_to_decision_ms.write().await.push(ms);
+        let mut v = self.tick_to_decision_ms.write().await;
+        push_capped(&mut v, ms, Self::SAMPLE_CAP);
     }
 
     async fn push_ack_only_ms(&self, ms: f64) {
-        self.ack_only_ms.write().await.push(ms);
+        let mut v = self.ack_only_ms.write().await;
+        push_capped(&mut v, ms, Self::SAMPLE_CAP);
     }
 
     async fn push_tick_to_ack_ms(&self, ms: f64) {
-        self.tick_to_ack_ms.write().await.push(ms);
+        let mut v = self.tick_to_ack_ms.write().await;
+        push_capped(&mut v, ms, Self::SAMPLE_CAP);
     }
 
     async fn push_feed_in_ms(&self, ms: f64) {
-        self.feed_in_ms.write().await.push(ms);
+        let mut v = self.feed_in_ms.write().await;
+        push_capped(&mut v, ms, Self::SAMPLE_CAP);
     }
 
     async fn push_signal_us(&self, us: f64) {
-        self.signal_us.write().await.push(us);
+        let mut v = self.signal_us.write().await;
+        push_capped(&mut v, us, Self::SAMPLE_CAP);
     }
 
     async fn push_quote_us(&self, us: f64) {
-        self.quote_us.write().await.push(us);
+        let mut v = self.quote_us.write().await;
+        push_capped(&mut v, us, Self::SAMPLE_CAP);
     }
 
     async fn push_risk_us(&self, us: f64) {
-        self.risk_us.write().await.push(us);
+        let mut v = self.risk_us.write().await;
+        push_capped(&mut v, us, Self::SAMPLE_CAP);
     }
 
     async fn push_shadow_fill_ms(&self, ms: f64) {
-        self.shadow_fill_ms.write().await.push(ms);
+        let mut v = self.shadow_fill_ms.write().await;
+        push_capped(&mut v, ms, Self::SAMPLE_CAP);
+    }
+
+    async fn push_queue_depth(&self, depth: f64) {
+        let mut v = self.queue_depth.write().await;
+        push_capped(&mut v, depth, Self::SAMPLE_CAP);
+    }
+
+    async fn push_event_backlog(&self, depth: f64) {
+        let mut v = self.event_backlog.write().await;
+        push_capped(&mut v, depth, Self::SAMPLE_CAP);
+    }
+
+    async fn push_parse_us(&self, us: f64) {
+        let mut v = self.parse_us.write().await;
+        push_capped(&mut v, us, Self::SAMPLE_CAP);
+    }
+
+    async fn push_io_queue_depth(&self, depth: f64) {
+        let mut v = self.io_queue_depth.write().await;
+        push_capped(&mut v, depth, Self::SAMPLE_CAP);
     }
 
     fn mark_attempted(&self) {
@@ -489,6 +577,10 @@ impl ShadowStats {
         let quote_us = self.quote_us.read().await.clone();
         let risk_us = self.risk_us.read().await.clone();
         let shadow_fill_ms = self.shadow_fill_ms.read().await.clone();
+        let queue_depth = self.queue_depth.read().await.clone();
+        let event_backlog = self.event_backlog.read().await.clone();
+        let parse_us = self.parse_us.read().await.clone();
+        let io_queue_depth = self.io_queue_depth.read().await.clone();
         let blocked_reason_counts = self.blocked_reasons.read().await.clone();
 
         let fillability_5 = fillability_ratio(&outcomes, 5);
@@ -523,7 +615,10 @@ impl ShadowStats {
             .collect::<Vec<_>>();
         let pnl_1s_p50 = percentile(&pnl_1s, 0.50).unwrap_or(0.0);
         let pnl_5s_p50 = percentile(&pnl_5s, 0.50).unwrap_or(0.0);
-        let pnl_10s_p50 = percentile(&pnl_10s, 0.50).unwrap_or(0.0);
+        let pnl_10s_p50_raw = percentile(&pnl_10s, 0.50).unwrap_or(0.0);
+        let (pnl_10s_filtered, pnl_10s_outlier_ratio) = robust_filter_iqr(&pnl_10s);
+        let pnl_10s_p50_robust = percentile(&pnl_10s_filtered, 0.50).unwrap_or(pnl_10s_p50_raw);
+        let pnl_10s_sample_count = pnl_10s.len();
 
         let attempted = self.quote_attempted.load(Ordering::Relaxed);
         let blocked = self.quote_blocked.load(Ordering::Relaxed);
@@ -531,6 +626,22 @@ impl ShadowStats {
             0.0
         } else {
             blocked as f64 / (attempted + blocked) as f64
+        };
+        let policy_blocked = blocked_reason_counts
+            .iter()
+            .filter(|(k, _)| {
+                k.starts_with("no_quote_")
+                    || k.starts_with("market_")
+                    || *k == "paused"
+                    || *k == "tick_missing"
+                    || *k == "symbol_missing"
+            })
+            .map(|(_, v)| *v)
+            .sum::<u64>();
+        let policy_block_ratio = if attempted + blocked == 0 {
+            0.0
+        } else {
+            policy_blocked as f64 / (attempted + blocked) as f64
         };
 
         let elapsed = self.started_at.read().await.elapsed();
@@ -567,6 +678,9 @@ impl ShadowStats {
             tick_to_ack_p50_ms: percentile(&tick_to_ack_ms, 0.50).unwrap_or(0.0),
             tick_to_ack_p90_ms: percentile(&tick_to_ack_ms, 0.90).unwrap_or(0.0),
             tick_to_ack_p99_ms: tick_to_ack_p99,
+            parse_p99_us: percentile(&parse_us, 0.99).unwrap_or(0.0),
+            io_queue_p99_ms: percentile(&io_queue_depth, 0.99).unwrap_or(0.0),
+            bus_lag_p99_ms: percentile(&event_backlog, 0.99).unwrap_or(0.0),
             shadow_fill_p50_ms: percentile(&shadow_fill_ms, 0.50).unwrap_or(0.0),
             shadow_fill_p90_ms: percentile(&shadow_fill_ms, 0.90).unwrap_or(0.0),
             shadow_fill_p99_ms: percentile(&shadow_fill_ms, 0.99).unwrap_or(0.0),
@@ -589,8 +703,15 @@ impl ShadowStats {
             net_edge_p10_bps: net_edge_p10,
             pnl_1s_p50_bps: pnl_1s_p50,
             pnl_5s_p50_bps: pnl_5s_p50,
-            pnl_10s_p50_bps: pnl_10s_p50,
+            pnl_10s_p50_bps: pnl_10s_p50_raw,
+            pnl_10s_p50_bps_raw: pnl_10s_p50_raw,
+            pnl_10s_p50_bps_robust: pnl_10s_p50_robust,
+            pnl_10s_sample_count,
+            pnl_10s_outlier_ratio: pnl_10s_outlier_ratio,
             quote_block_ratio: block_ratio,
+            policy_block_ratio,
+            queue_depth_p99: percentile(&queue_depth, 0.99).unwrap_or(0.0),
+            event_backlog_p99: percentile(&event_backlog, 0.99).unwrap_or(0.0),
             tick_to_decision_p50_ms: latency.tick_to_decision_p50_ms,
             tick_to_decision_p90_ms: latency.tick_to_decision_p90_ms,
             tick_to_decision_p99_ms: latency.tick_to_decision_p99_ms,
@@ -625,8 +746,11 @@ impl ShadowStats {
         if live.net_edge_p10_bps < -1.0 {
             failed.push(format!("net_edge_p10 {:.3} < -1", live.net_edge_p10_bps));
         }
-        if live.pnl_10s_p50_bps <= 0.0 {
-            failed.push(format!("pnl_10s_p50 {:.3} <= 0", live.pnl_10s_p50_bps));
+        if live.pnl_10s_p50_bps_robust <= 0.0 {
+            failed.push(format!(
+                "pnl_10s_p50_robust {:.3} <= 0",
+                live.pnl_10s_p50_bps_robust
+            ));
         }
         if live.quote_block_ratio >= 0.10 {
             failed.push(format!(
@@ -664,8 +788,12 @@ impl ShadowStats {
             fillability_10ms: live.fillability_10ms,
             net_edge_p50_bps: live.net_edge_p50_bps,
             net_edge_p10_bps: live.net_edge_p10_bps,
-            pnl_10s_p50_bps: live.pnl_10s_p50_bps,
+            pnl_10s_p50_bps_raw: live.pnl_10s_p50_bps_raw,
+            pnl_10s_p50_bps_robust: live.pnl_10s_p50_bps_robust,
+            pnl_10s_sample_count: live.pnl_10s_sample_count,
+            pnl_10s_outlier_ratio: live.pnl_10s_outlier_ratio,
             quote_block_ratio: live.quote_block_ratio,
+            policy_block_ratio: live.policy_block_ratio,
             strategy_uptime_pct: live.strategy_uptime_pct,
             tick_to_ack_p99_ms: live.tick_to_ack_p99_ms,
             failed_reasons: failed,
@@ -691,9 +819,11 @@ async fn main() -> Result<()> {
     let strategy_cfg = Arc::new(RwLock::new(MakerConfig::default()));
     let fair_value_cfg = Arc::new(StdRwLock::new(load_fair_value_config()));
     let toxicity_cfg = Arc::new(RwLock::new(ToxicityConfig::default()));
+    let perf_profile = Arc::new(RwLock::new(load_perf_profile_config()));
     let tox_state = Arc::new(RwLock::new(HashMap::new()));
     let shadow_stats = Arc::new(ShadowStats::new());
     let paused = Arc::new(RwLock::new(false));
+    init_jsonl_writer(perf_profile.clone()).await;
 
     let state = AppState {
         paused: paused.clone(),
@@ -707,6 +837,7 @@ async fn main() -> Result<()> {
         toxicity_cfg: toxicity_cfg.clone(),
         tox_state: tox_state.clone(),
         shadow_stats: shadow_stats.clone(),
+        perf_profile: perf_profile.clone(),
     };
 
     let shared = Arc::new(EngineShared {
@@ -720,6 +851,7 @@ async fn main() -> Result<()> {
         toxicity_cfg,
         tox_state,
         shadow_stats,
+        perf_profile,
     });
 
     spawn_reference_feed(bus.clone(), shared.shadow_stats.clone());
@@ -754,6 +886,7 @@ async fn main() -> Result<()> {
         .route("/control/reset_shadow", post(reset_shadow))
         .route("/control/reload_strategy", post(reload_strategy))
         .route("/control/reload_toxicity", post(reload_toxicity))
+        .route("/control/reload_perf_profile", post(reload_perf_profile))
         .with_state(state);
 
     let addr: SocketAddr = "0.0.0.0:8080".parse()?;
@@ -882,12 +1015,26 @@ fn spawn_strategy_engine(
             let Ok(event) = recv else {
                 continue;
             };
+            let dispatch_start = Instant::now();
 
             match event {
                 EngineEvent::RefTick(tick) => {
+                    let parse_us = dispatch_start.elapsed().as_secs_f64() * 1_000_000.0;
+                    shared.shadow_stats.push_parse_us(parse_us).await;
                     latest_ticks.insert(tick.symbol.clone(), tick);
                 }
                 EngineEvent::BookTop(book) => {
+                    let parse_us = dispatch_start.elapsed().as_secs_f64() * 1_000_000.0;
+                    shared.shadow_stats.push_parse_us(parse_us).await;
+                    let backlog_depth = rx.len() as f64;
+                    shared.shadow_stats.push_event_backlog(backlog_depth).await;
+                    metrics::histogram!("runtime.event_backlog_depth").record(backlog_depth);
+                    let queue_depth = execution.open_orders_count() as f64;
+                    shared.shadow_stats.push_queue_depth(queue_depth).await;
+                    metrics::histogram!("runtime.open_order_depth").record(queue_depth);
+                    let io_depth = current_jsonl_queue_depth() as f64;
+                    shared.shadow_stats.push_io_queue_depth(io_depth).await;
+                    metrics::histogram!("runtime.jsonl_queue_depth").record(io_depth);
                     shared
                         .latest_books
                         .write()
@@ -1224,7 +1371,10 @@ fn spawn_strategy_engine(
                                     .push_tick_to_decision_ms(tick_to_decision_ms)
                                     .await;
                                 shared.shadow_stats.push_ack_only_ms(ack_only_ms).await;
-                                shared.shadow_stats.push_tick_to_ack_ms(tick_to_ack_ms).await;
+                                shared
+                                    .shadow_stats
+                                    .push_tick_to_ack_ms(tick_to_ack_ms)
+                                    .await;
                                 metrics::histogram!("latency.tick_to_decision_ms")
                                     .record(tick_to_decision_ms);
                                 metrics::histogram!("latency.ack_only_ms").record(ack_only_ms);
@@ -1243,7 +1393,8 @@ fn spawn_strategy_engine(
                                         // Use taker top-of-book only for "opportunity survival" probing.
                                         // Keep intended_price as maker entry for markout/PnL attribution.
                                         survival_probe_price: aggressive_price_for_side(
-                                            &book, &intent.side,
+                                            &book,
+                                            &intent.side,
                                         ),
                                         intended_price: intent.price,
                                         size: intent.size,
@@ -1381,6 +1532,8 @@ fn spawn_shadow_outcome_task(
             net_markout_5s_bps,
             net_markout_10s_bps,
             queue_fill_prob,
+            is_outlier: false,
+            robust_weight: 1.0,
             attribution,
             ts_ns: now_ns(),
         };
@@ -1736,6 +1889,14 @@ async fn update_toxic_state_from_outcome(shared: &EngineShared, outcome: &Shadow
 }
 
 fn push_rolling(dst: &mut Vec<f64>, value: f64, cap: usize) {
+    dst.push(value);
+    if dst.len() > cap {
+        let drop_n = dst.len() - cap;
+        dst.drain(0..drop_n);
+    }
+}
+
+fn push_capped<T>(dst: &mut Vec<T>, value: T, cap: usize) {
     dst.push(value);
     if dst.len() > cap {
         let drop_n = dst.len() - cap;
@@ -2108,6 +2269,30 @@ async fn reload_toxicity(
     Json(cfg.clone())
 }
 
+async fn reload_perf_profile(
+    State(state): State<AppState>,
+    Json(req): Json<PerfProfileReloadReq>,
+) -> Json<PerfProfile> {
+    let mut cfg = state.perf_profile.write().await;
+    if let Some(v) = req.tail_guard {
+        cfg.tail_guard = v.clamp(0.50, 0.9999);
+    }
+    if let Some(v) = req.io_flush_batch {
+        cfg.io_flush_batch = v.clamp(1, 4096);
+    }
+    if let Some(v) = req.io_queue_capacity {
+        cfg.io_queue_capacity = v.clamp(256, 262_144);
+    }
+    if let Some(v) = req.json_mode {
+        cfg.json_mode = v;
+    }
+    append_jsonl(
+        &dataset_path("reports", "perf_profile_reload.jsonl"),
+        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "config": *cfg}),
+    );
+    Json(cfg.clone())
+}
+
 async fn report_shadow_live(State(state): State<AppState>) -> Json<ShadowLiveReport> {
     let live = state.shadow_stats.build_live_report().await;
     persist_live_report_files(&live);
@@ -2353,6 +2538,56 @@ fn load_fair_value_config() -> BasisMrConfig {
     cfg
 }
 
+fn load_perf_profile_config() -> PerfProfile {
+    let path = Path::new("configs/latency.toml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return PerfProfile::default();
+    };
+
+    let mut cfg = PerfProfile::default();
+    let mut in_runtime = false;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_runtime = line == "[runtime]";
+            continue;
+        }
+        if !in_runtime {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim().trim_matches('"');
+        match key {
+            "tail_guard" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.tail_guard = parsed.clamp(0.50, 0.9999);
+                }
+            }
+            "io_flush_batch" => {
+                if let Ok(parsed) = val.parse::<usize>() {
+                    cfg.io_flush_batch = parsed.clamp(1, 4096);
+                }
+            }
+            "io_queue_capacity" => {
+                if let Ok(parsed) = val.parse::<usize>() {
+                    cfg.io_queue_capacity = parsed.clamp(256, 262_144);
+                }
+            }
+            "json_mode" => {
+                cfg.json_mode = val.to_string();
+            }
+            _ => {}
+        }
+    }
+    cfg
+}
+
 fn ensure_dataset_dirs() {
     for bucket in ["raw", "normalized", "reports"] {
         let path = dataset_dir(bucket);
@@ -2372,12 +2607,111 @@ fn dataset_path(kind: &str, filename: &str) -> PathBuf {
     dataset_dir(kind).join(filename)
 }
 
+#[derive(Debug)]
+struct JsonlWriteReq {
+    path: PathBuf,
+    line: String,
+}
+
+static JSONL_WRITER: OnceLock<mpsc::Sender<JsonlWriteReq>> = OnceLock::new();
+static JSONL_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
+static JSONL_QUEUE_CAP: AtomicU64 = AtomicU64::new(0);
+
+async fn init_jsonl_writer(perf_profile: Arc<RwLock<PerfProfile>>) {
+    if JSONL_WRITER.get().is_some() {
+        return;
+    }
+    let cfg = perf_profile.read().await.clone();
+    let (tx, mut rx) = mpsc::channel::<JsonlWriteReq>(cfg.io_queue_capacity.max(256));
+    JSONL_QUEUE_CAP.store(cfg.io_queue_capacity.max(256) as u64, Ordering::Relaxed);
+    if JSONL_WRITER.set(tx.clone()).is_err() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut batch = Vec::<JsonlWriteReq>::new();
+        let mut ticker = tokio::time::interval(Duration::from_millis(200));
+        loop {
+            tokio::select! {
+                maybe_req = rx.recv() => {
+                    match maybe_req {
+                        Some(req) => {
+                            batch.push(req);
+                            let flush_batch = perf_profile.read().await.io_flush_batch.max(1);
+                            if batch.len() >= flush_batch {
+                                let to_flush = std::mem::take(&mut batch);
+                                let _ = tokio::task::spawn_blocking(move || flush_jsonl_batch_sync(to_flush)).await;
+                            }
+                        }
+                        None => {
+                            if !batch.is_empty() {
+                                let to_flush = std::mem::take(&mut batch);
+                                let _ = tokio::task::spawn_blocking(move || flush_jsonl_batch_sync(to_flush)).await;
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ = ticker.tick() => {
+                    if !batch.is_empty() {
+                        let to_flush = std::mem::take(&mut batch);
+                        let _ = tokio::task::spawn_blocking(move || flush_jsonl_batch_sync(to_flush)).await;
+                    }
+                }
+            }
+            let cap = JSONL_QUEUE_CAP.load(Ordering::Relaxed) as usize;
+            JSONL_QUEUE_DEPTH.store(cap.saturating_sub(tx.capacity()) as u64, Ordering::Relaxed);
+        }
+    });
+}
+
+fn flush_jsonl_batch_sync(batch: Vec<JsonlWriteReq>) {
+    let mut grouped = HashMap::<PathBuf, Vec<String>>::new();
+    for req in batch {
+        grouped.entry(req.path).or_default().push(req.line);
+    }
+    for (path, lines) in grouped {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+            for line in lines {
+                let _ = writeln!(file, "{line}");
+            }
+        }
+    }
+}
+
+fn current_jsonl_queue_depth() -> u64 {
+    JSONL_QUEUE_DEPTH.load(Ordering::Relaxed)
+}
+
 fn append_jsonl(path: &Path, value: &serde_json::Value) {
+    let line = value.to_string();
+    if let Some(tx) = JSONL_WRITER.get() {
+        let req = JsonlWriteReq {
+            path: path.to_path_buf(),
+            line: line.clone(),
+        };
+        match tx.try_send(req) {
+            Ok(_) => {
+                let cap = JSONL_QUEUE_CAP.load(Ordering::Relaxed) as usize;
+                JSONL_QUEUE_DEPTH
+                    .store(cap.saturating_sub(tx.capacity()) as u64, Ordering::Relaxed);
+                return;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                metrics::counter!("io.jsonl.queue_full").increment(1);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                metrics::counter!("io.jsonl.queue_closed").increment(1);
+            }
+        }
+    }
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{value}");
+        let _ = writeln!(file, "{line}");
     }
 }
 
@@ -2413,12 +2747,28 @@ fn persist_final_report_files(report: &ShadowFinalReport) {
         report.gate.net_edge_p10_bps
     ));
     md.push_str(&format!(
-        "- pnl_10s_p50_bps: {:.4}\n",
-        report.gate.pnl_10s_p50_bps
+        "- pnl_10s_p50_bps_raw: {:.4}\n",
+        report.gate.pnl_10s_p50_bps_raw
+    ));
+    md.push_str(&format!(
+        "- pnl_10s_p50_bps_robust: {:.4}\n",
+        report.gate.pnl_10s_p50_bps_robust
+    ));
+    md.push_str(&format!(
+        "- pnl_10s_sample_count: {}\n",
+        report.gate.pnl_10s_sample_count
+    ));
+    md.push_str(&format!(
+        "- pnl_10s_outlier_ratio: {:.4}\n",
+        report.gate.pnl_10s_outlier_ratio
     ));
     md.push_str(&format!(
         "- quote_block_ratio: {:.4}\n",
         report.gate.quote_block_ratio
+    ));
+    md.push_str(&format!(
+        "- policy_block_ratio: {:.4}\n",
+        report.gate.policy_block_ratio
     ));
     md.push_str(&format!(
         "- strategy_uptime_pct: {:.2}\n",
@@ -2433,8 +2783,16 @@ fn persist_final_report_files(report: &ShadowFinalReport) {
         report.live.tick_to_decision_p99_ms
     ));
     md.push_str(&format!(
-        "- ack_only_p99_ms: {:.4}\n\n",
+        "- ack_only_p99_ms: {:.4}\n",
         report.live.ack_only_p99_ms
+    ));
+    md.push_str(&format!(
+        "- queue_depth_p99: {:.4}\n",
+        report.live.queue_depth_p99
+    ));
+    md.push_str(&format!(
+        "- event_backlog_p99: {:.4}\n\n",
+        report.live.event_backlog_p99
     ));
     md.push_str(&format!(
         "- quote_attempted: {}\n- quote_blocked: {}\n- ref_ticks_total: {}\n- book_ticks_total: {}\n- ref_freshness_ms: {}\n- book_freshness_ms: {}\n\n",
@@ -2509,6 +2867,18 @@ fn persist_final_report_files(report: &ShadowFinalReport) {
         report.live.latency.tick_to_ack_p50_ms,
         report.live.latency.tick_to_ack_p90_ms,
         report.live.latency.tick_to_ack_p99_ms
+    ));
+    latency_rows.push_str(&format!(
+        "parse,{:.6},{:.6},{:.6},us\n",
+        0.0, 0.0, report.live.latency.parse_p99_us
+    ));
+    latency_rows.push_str(&format!(
+        "io_queue,{:.6},{:.6},{:.6},count\n",
+        0.0, 0.0, report.live.latency.io_queue_p99_ms
+    ));
+    latency_rows.push_str(&format!(
+        "bus_lag,{:.6},{:.6},{:.6},count\n",
+        0.0, 0.0, report.live.latency.bus_lag_p99_ms
     ));
     latency_rows.push_str(&format!(
         "shadow_fill,{:.6},{:.6},{:.6},ms\n",
@@ -2658,6 +3028,27 @@ fn percentile(values: &[f64], p: f64) -> Option<f64> {
     sorted.get(idx).copied()
 }
 
+fn robust_filter_iqr(values: &[f64]) -> (Vec<f64>, f64) {
+    if values.len() < 5 {
+        return (values.to_vec(), 0.0);
+    }
+    let q1 = percentile(values, 0.25).unwrap_or(0.0);
+    let q3 = percentile(values, 0.75).unwrap_or(0.0);
+    let iqr = (q3 - q1).max(1e-9);
+    let lower = q1 - 1.5 * iqr;
+    let upper = q3 + 1.5 * iqr;
+    let filtered = values
+        .iter()
+        .copied()
+        .filter(|v| *v >= lower && *v <= upper)
+        .collect::<Vec<_>>();
+    if filtered.is_empty() {
+        return (values.to_vec(), 0.0);
+    }
+    let outlier_ratio = (values.len().saturating_sub(filtered.len())) as f64 / values.len() as f64;
+    (filtered, outlier_ratio)
+}
+
 fn freshness_ms(now_ms: i64, last_ms: i64) -> i64 {
     if last_ms <= 0 {
         return i64::MAX;
@@ -2681,4 +3072,33 @@ fn now_ns() -> i64 {
     Utc::now()
         .timestamp_nanos_opt()
         .unwrap_or_else(|| Utc::now().timestamp_millis() * 1_000_000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn robust_filter_marks_outliers() {
+        let values = vec![1.0, 1.1, 1.2, 1.3, 99.0];
+        let (filtered, outlier_ratio) = robust_filter_iqr(&values);
+        assert!(filtered.len() < values.len());
+        assert!(outlier_ratio > 0.0);
+    }
+
+    #[test]
+    fn robust_filter_small_sample_passthrough() {
+        let values = vec![1.0, 2.0, 3.0, 4.0];
+        let (filtered, outlier_ratio) = robust_filter_iqr(&values);
+        assert_eq!(filtered, values);
+        assert_eq!(outlier_ratio, 0.0);
+    }
+
+    #[test]
+    fn percentile_basic_behavior() {
+        let values = vec![1.0, 5.0, 3.0, 2.0, 4.0];
+        assert_eq!(percentile(&values, 0.50), Some(3.0));
+        assert_eq!(percentile(&values, 0.0), Some(1.0));
+        assert_eq!(percentile(&values, 1.0), Some(5.0));
+    }
 }

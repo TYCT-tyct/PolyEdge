@@ -83,12 +83,23 @@ def evaluate_alerts(
     attempted = int(live.get("quote_attempted", 0))
     blocked = int(live.get("quote_blocked", 0))
     block_ratio = float(live.get("quote_block_ratio", 0.0))
+    policy_block_ratio = float(live.get("policy_block_ratio", 0.0))
     if attempted >= min_attempt_for_block_ratio and block_ratio > max_block_ratio:
         alerts.append(
             {
                 "type": "quote_reject_ratio_high",
                 "detail": (
                     f"quote_block_ratio={block_ratio:.4f} > {max_block_ratio:.4f} "
+                    f"(attempted={attempted}, blocked={blocked})"
+                ),
+            }
+        )
+    if attempted >= min_attempt_for_block_ratio and policy_block_ratio > max_block_ratio:
+        alerts.append(
+            {
+                "type": "policy_block_ratio_high",
+                "detail": (
+                    f"policy_block_ratio={policy_block_ratio:.4f} > {max_block_ratio:.4f} "
                     f"(attempted={attempted}, blocked={blocked})"
                 ),
             }
@@ -108,8 +119,11 @@ def evaluate_alerts(
         gate_fail_reasons.append("fillability_10ms<0.60")
     if float(live.get("net_edge_p50_bps", 0.0)) <= 0.0:
         gate_fail_reasons.append("net_edge_p50_bps<=0")
-    if float(live.get("pnl_10s_p50_bps", 0.0)) <= 0.0:
-        gate_fail_reasons.append("pnl_10s_p50_bps<=0")
+    pnl_robust = float(
+        live.get("pnl_10s_p50_bps_robust", live.get("pnl_10s_p50_bps", 0.0))
+    )
+    if pnl_robust <= 0.0:
+        gate_fail_reasons.append("pnl_10s_p50_bps_robust<=0")
     if gate_fail_reasons:
         alerts.append(
             {
