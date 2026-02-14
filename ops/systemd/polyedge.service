@@ -1,0 +1,19 @@
+[Unit]
+Description=PolyEdge app_runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/PolyEdge
+Environment=RUST_LOG=info
+ExecStart=/usr/bin/env cargo run --release -p app_runner
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+StandardOutput=append:/var/log/polyedge/app_runner.log
+StandardError=append:/var/log/polyedge/app_runner.err.log
+
+[Install]
+WantedBy=multi-user.target

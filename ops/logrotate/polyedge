@@ -1,0 +1,9 @@
+/var/log/polyedge/*.log /var/log/polyedge/*.err.log {
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}

@@ -1,0 +1,9 @@
+[Unit]
+Description=PolyEdge Morning Summary Generator
+After=polyedge.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/PolyEdge
+ExecStart=/usr/bin/env python scripts/generate_morning_report.py

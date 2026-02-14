@@ -1,0 +1,10 @@
+[Unit]
+Description=Run PolyEdge Morning Report Daily
+
+[Timer]
+OnCalendar=*-*-* 07:00:00 UTC
+Persistent=true
+Unit=polyedge-morning-report.service
+
+[Install]
+WantedBy=timers.target

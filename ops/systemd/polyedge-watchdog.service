@@ -1,0 +1,17 @@
+[Unit]
+Description=PolyEdge Runtime Watchdog
+After=polyedge.service
+Requires=polyedge.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/PolyEdge
+ExecStart=/usr/bin/env python scripts/runtime_watchdog.py --base-url http://127.0.0.1:8080 --interval-sec 30
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/polyedge/watchdog.log
+StandardError=append:/var/log/polyedge/watchdog.err.log
+
+[Install]
+WantedBy=multi-user.target

@@ -19,6 +19,12 @@ On Windows, install prerequisites first:
 pwsh -File .\scripts\setup_windows.ps1
 ```
 
+If `cargo test` fails with `link.exe not found`, run cargo via VS Build Tools environment:
+
+```powershell
+pwsh -File .\scripts\cargo_msvc.ps1 test -q
+```
+
 ## Control API
 
 - `GET /health`
@@ -55,6 +61,18 @@ Conservative parameter regression:
 python scripts/param_regression.py --base-url http://127.0.0.1:8080 --window-sec 300 --max-trials 12
 ```
 
+Long-run orchestrator with rollback:
+
+```bash
+python scripts/long_regression_orchestrator.py --base-url http://127.0.0.1:8080 --cycles 4 --window-sec 1800
+```
+
+Cross-region A/B comparison:
+
+```bash
+python scripts/ab_region_compare.py --base-a http://<eu-host>:8080 --base-b http://<us-host>:8080 --seconds 600
+```
+
 ## Key Live Metrics
 
 - `quote_block_ratio`
@@ -74,3 +92,5 @@ Runtime report files are written to `datasets/reports/<utc-date>/`:
 - `latency_breakdown_12h.csv`
 - `market_scorecard.csv`
 - `next_fixlist.md`
+- `region_ab_compare.md` / `region_ab_compare.json`
+- `long_regression_audit.jsonl`
