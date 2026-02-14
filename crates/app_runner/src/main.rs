@@ -801,9 +801,15 @@ impl ShadowStats {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     install_rustls_provider();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     init_tracing("app_runner");
     let prometheus = init_metrics();
     ensure_dataset_dirs();
