@@ -1364,6 +1364,7 @@ fn spawn_reference_feed(
     stats: Arc<ShadowStats>,
     symbols: Vec<String>,
 ) {
+    const TS_INVERSION_TOLERANCE_MS: i64 = 250;
     tokio::spawn(async move {
         let feed = MultiSourceRefFeed::new(Duration::from_millis(50));
         if symbols.is_empty() {
@@ -1394,7 +1395,7 @@ fn spawn_reference_feed(
                     stats.mark_data_validity(valid);
                     let stream_key = format!("{}:{}", tick.source, tick.symbol);
                     if let Some(prev) = last_source_ts_by_stream.get(&stream_key).copied() {
-                        if source_ts + 50 < prev {
+                        if source_ts + TS_INVERSION_TOLERANCE_MS < prev {
                             stats.mark_ts_inversion();
                         }
                     }
@@ -1428,6 +1429,7 @@ fn spawn_reference_feed(
 }
 
 fn spawn_market_feed(bus: RingBus<EngineEvent>, stats: Arc<ShadowStats>) {
+    const TS_INVERSION_TOLERANCE_MS: i64 = 250;
     tokio::spawn(async move {
         let feed = PolymarketFeed::new(Duration::from_millis(50));
         let Ok(mut stream) = feed.stream_books().await else {
@@ -1451,7 +1453,7 @@ fn spawn_market_feed(bus: RingBus<EngineEvent>, stats: Arc<ShadowStats>) {
                         && source_seq > 0;
                     stats.mark_data_validity(valid);
                     if let Some(prev) = last_source_ts_by_market.get(&book.market_id).copied() {
-                        if source_ts + 50 < prev {
+                        if source_ts + TS_INVERSION_TOLERANCE_MS < prev {
                             stats.mark_ts_inversion();
                         }
                     }
