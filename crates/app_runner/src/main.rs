@@ -4785,6 +4785,7 @@ fn build_market_scorecard(shots: &[ShadowShot], outcomes: &[ShadowOutcome]) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core_types::QuoteIntent;
 
     #[test]
     fn robust_filter_marks_outliers() {
@@ -4808,5 +4809,38 @@ mod tests {
         assert_eq!(percentile(&values, 0.50), Some(3.0));
         assert_eq!(percentile(&values, 0.0), Some(1.0));
         assert_eq!(percentile(&values, 1.0), Some(5.0));
+    }
+
+    #[test]
+    fn classify_execution_style_for_yes_side() {
+        let book = BookTop {
+            market_id: "m".to_string(),
+            token_id_yes: "yes".to_string(),
+            token_id_no: "no".to_string(),
+            bid_yes: 0.49,
+            ask_yes: 0.51,
+            bid_no: 0.49,
+            ask_no: 0.51,
+            ts_ms: 1,
+        };
+        let maker = QuoteIntent {
+            market_id: "m".to_string(),
+            side: OrderSide::BuyYes,
+            price: 0.50,
+            size: 1.0,
+            ttl_ms: 300,
+        };
+        let taker = QuoteIntent {
+            price: 0.51,
+            ..maker.clone()
+        };
+        assert_eq!(classify_execution_style(&book, &maker), ExecutionStyle::Maker);
+        assert_eq!(classify_execution_style(&book, &taker), ExecutionStyle::Taker);
+    }
+
+    #[test]
+    fn normalize_reject_code_sanitizes_non_alnum() {
+        let normalized = normalize_reject_code("HTTP 429/Too Many Requests");
+        assert_eq!(normalized, "http_429_too_many_requests");
     }
 }
