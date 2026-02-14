@@ -253,6 +253,9 @@ struct ToxicityFinalReport {
 
 #[derive(Debug, Serialize)]
 struct GateEvaluation {
+    window_id: u64,
+    gate_ready: bool,
+    min_outcomes: usize,
     pass: bool,
     fillability_10ms: f64,
     net_edge_p50_bps: f64,
@@ -301,6 +304,11 @@ struct LatencyBreakdown {
 
 #[derive(Debug, Serialize)]
 struct ShadowLiveReport {
+    window_id: u64,
+    window_shots: usize,
+    window_outcomes: usize,
+    gate_ready: bool,
+    gate_fail_reasons: Vec<String>,
     started_at_ms: i64,
     elapsed_sec: u64,
     total_shots: usize,
@@ -362,6 +370,7 @@ struct MarketScoreRow {
 }
 
 struct ShadowStats {
+    window_id: AtomicU64,
     started_at: RwLock<Instant>,
     started_at_ms: AtomicI64,
     quote_attempted: AtomicU64,
@@ -390,9 +399,11 @@ struct ShadowStats {
 impl ShadowStats {
     const SHADOW_CAP: usize = 200_000;
     const SAMPLE_CAP: usize = 65_536;
+    const GATE_MIN_OUTCOMES: usize = 30;
 
     fn new() -> Self {
         Self {
+            window_id: AtomicU64::new(0),
             started_at: RwLock::new(Instant::now()),
             started_at_ms: AtomicI64::new(Utc::now().timestamp_millis()),
             quote_attempted: AtomicU64::new(0),
@@ -419,7 +430,8 @@ impl ShadowStats {
         }
     }
 
-    async fn reset(&self) {
+    async fn reset(&self) -> u64 {
+        let window_id = self.window_id.fetch_add(1, Ordering::Relaxed) + 1;
         *self.started_at.write().await = Instant::now();
         self.started_at_ms
             .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
@@ -444,6 +456,7 @@ impl ShadowStats {
         self.event_backlog.write().await.clear();
         self.parse_us.write().await.clear();
         self.io_queue_depth.write().await.clear();
+        window_id
     }
 
     async fn push_shot(&self, shot: ShadowShot) {
@@ -685,7 +698,12 @@ impl ShadowStats {
             shadow_fill_p99_ms: percentile(&shadow_fill_ms, 0.99).unwrap_or(0.0),
         };
 
-        ShadowLiveReport {
+        let mut live = ShadowLiveReport {
+            window_id: self.window_id.load(Ordering::Relaxed),
+            window_shots: shots.len(),
+            window_outcomes: outcomes.len(),
+            gate_ready: outcomes.len() >= Self::GATE_MIN_OUTCOMES,
+            gate_fail_reasons: Vec::new(),
             started_at_ms: self.started_at_ms.load(Ordering::Relaxed),
             elapsed_sec: elapsed.as_secs(),
             total_shots: shots.len(),
@@ -726,63 +744,20 @@ impl ShadowStats {
             blocked_reason_counts,
             latency,
             market_scorecard: scorecard,
-        }
+        };
+        live.gate_fail_reasons = compute_gate_fail_reasons(&live, Self::GATE_MIN_OUTCOMES);
+        live.gate_ready = live.window_outcomes >= Self::GATE_MIN_OUTCOMES;
+        live
     }
 
     async fn build_final_report(&self) -> ShadowFinalReport {
         let live = self.build_live_report().await;
-
-        let mut failed = Vec::new();
-        if live.fillability_10ms < 0.60 {
-            failed.push(format!(
-                "fillability@10ms {:.3} < 0.600",
-                live.fillability_10ms
-            ));
-        }
-        if live.net_edge_p50_bps <= 0.0 {
-            failed.push(format!("net_edge_p50 {:.3} <= 0", live.net_edge_p50_bps));
-        }
-        if live.net_edge_p10_bps < -1.0 {
-            failed.push(format!("net_edge_p10 {:.3} < -1", live.net_edge_p10_bps));
-        }
-        if live.pnl_10s_p50_bps_robust <= 0.0 {
-            failed.push(format!(
-                "pnl_10s_p50_robust {:.3} <= 0",
-                live.pnl_10s_p50_bps_robust
-            ));
-        }
-        if live.quote_block_ratio >= 0.10 {
-            failed.push(format!(
-                "quote_block_ratio {:.4} >= 0.10",
-                live.quote_block_ratio
-            ));
-        }
-        if live.strategy_uptime_pct < 99.0 {
-            failed.push(format!("uptime {:.2}% < 99%", live.strategy_uptime_pct));
-        }
-        if live.tick_to_ack_p99_ms >= 450.0 {
-            failed.push(format!(
-                "tick_to_ack_p99 {:.3}ms >= 450ms",
-                live.tick_to_ack_p99_ms
-            ));
-        }
-        if live.ref_ticks_total == 0 {
-            failed.push("ref_ticks_total == 0".to_string());
-        }
-        if live.book_ticks_total == 0 {
-            failed.push("book_ticks_total == 0".to_string());
-        }
-        if live.ref_freshness_ms > 1_000 {
-            failed.push(format!("ref_freshness_ms {} > 1000", live.ref_freshness_ms));
-        }
-        if live.book_freshness_ms > 1_500 {
-            failed.push(format!(
-                "book_freshness_ms {} > 1500",
-                live.book_freshness_ms
-            ));
-        }
+        let failed = live.gate_fail_reasons.clone();
 
         let gate = GateEvaluation {
+            window_id: live.window_id,
+            gate_ready: live.gate_ready,
+            min_outcomes: Self::GATE_MIN_OUTCOMES,
             pass: failed.is_empty(),
             fillability_10ms: live.fillability_10ms,
             net_edge_p50_bps: live.net_edge_p50_bps,
@@ -799,6 +774,62 @@ impl ShadowStats {
         };
         ShadowFinalReport { live, gate }
     }
+}
+
+fn compute_gate_fail_reasons(live: &ShadowLiveReport, min_outcomes: usize) -> Vec<String> {
+    let mut failed = Vec::new();
+    if live.window_outcomes < min_outcomes {
+        failed.push(format!(
+            "gate_not_ready outcomes {} < {}",
+            live.window_outcomes, min_outcomes
+        ));
+    }
+    if live.fillability_10ms < 0.60 {
+        failed.push(format!(
+            "fillability@10ms {:.3} < 0.600",
+            live.fillability_10ms
+        ));
+    }
+    if live.net_edge_p50_bps <= 0.0 {
+        failed.push(format!("net_edge_p50 {:.3} <= 0", live.net_edge_p50_bps));
+    }
+    if live.net_edge_p10_bps < -1.0 {
+        failed.push(format!("net_edge_p10 {:.3} < -1", live.net_edge_p10_bps));
+    }
+    if live.pnl_10s_p50_bps_robust <= 0.0 {
+        failed.push(format!(
+            "pnl_10s_p50_robust {:.3} <= 0",
+            live.pnl_10s_p50_bps_robust
+        ));
+    }
+    if live.quote_block_ratio >= 0.10 {
+        failed.push(format!(
+            "quote_block_ratio {:.4} >= 0.10",
+            live.quote_block_ratio
+        ));
+    }
+    if live.strategy_uptime_pct < 99.0 {
+        failed.push(format!("uptime {:.2}% < 99%", live.strategy_uptime_pct));
+    }
+    if live.tick_to_ack_p99_ms >= 450.0 {
+        failed.push(format!(
+            "tick_to_ack_p99 {:.3}ms >= 450ms",
+            live.tick_to_ack_p99_ms
+        ));
+    }
+    if live.ref_ticks_total == 0 {
+        failed.push("ref_ticks_total == 0".to_string());
+    }
+    if live.book_ticks_total == 0 {
+        failed.push("book_ticks_total == 0".to_string());
+    }
+    if live.ref_freshness_ms > 1_000 {
+        failed.push(format!("ref_freshness_ms {} > 1000", live.ref_freshness_ms));
+    }
+    if live.book_freshness_ms > 1_500 {
+        failed.push(format!("book_freshness_ms {} > 1500", live.book_freshness_ms));
+    }
+    failed
 }
 
 fn main() -> Result<()> {
@@ -2147,9 +2178,9 @@ async fn flatten(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn reset_shadow(State(state): State<AppState>) -> impl IntoResponse {
-    state.shadow_stats.reset().await;
+    let window_id = state.shadow_stats.reset().await;
     state.tox_state.write().await.clear();
-    Json(serde_json::json!({"ok": true, "shadow_reset": true}))
+    Json(serde_json::json!({"ok": true, "shadow_reset": true, "window_id": window_id}))
 }
 
 async fn reload_strategy(

@@ -234,6 +234,25 @@ pub struct MarketHealth {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GateContext {
+    pub window_id: u64,
+    pub min_outcomes: usize,
+    pub eval_window_sec: u64,
+    pub ready: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunAuditRow {
+    pub run_id: String,
+    pub cycle: u64,
+    pub trial: u64,
+    pub gate_ready: bool,
+    pub gate_pass: bool,
+    pub rollback_applied: bool,
+    pub ts_utc: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum EdgeAttribution {
     StaleQuote,
     BookMoved,

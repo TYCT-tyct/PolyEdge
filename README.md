@@ -58,13 +58,13 @@ python scripts/legacy_rest_probe.py --symbol BTCUSDT --iterations 80
 Conservative parameter regression:
 
 ```bash
-python scripts/param_regression.py --base-url http://127.0.0.1:8080 --window-sec 300 --max-trials 12
+python scripts/param_regression.py --base-url http://127.0.0.1:8080 --window-sec 300 --max-trials 12 --run-id r1 --max-runtime-sec 3600 --heartbeat-sec 30 --fail-fast-threshold 3
 ```
 
 Long-run orchestrator with rollback:
 
 ```bash
-python scripts/long_regression_orchestrator.py --base-url http://127.0.0.1:8080 --cycles 4 --window-sec 1800
+python scripts/long_regression_orchestrator.py --base-url http://127.0.0.1:8080 --cycles 4 --run-id long1 --max-runtime-sec 14400 --heartbeat-sec 60 --fail-fast-threshold 2
 ```
 
 Cross-region A/B comparison:
@@ -77,6 +77,8 @@ python scripts/ab_region_compare.py --base-a http://<eu-host>:8080 --base-b http
 
 - `quote_block_ratio`
 - `policy_block_ratio`
+- `window_id/window_shots/window_outcomes`
+- `gate_ready/gate_fail_reasons`
 - `tick_to_decision_p50_ms/p90_ms/p99_ms`
 - `ack_only_p50_ms/p90_ms/p99_ms`
 - `tick_to_ack_p99_ms`

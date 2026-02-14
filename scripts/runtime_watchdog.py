@@ -174,6 +174,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-tick-to-ack-p99-ms", type=float, default=450.0)
     p.add_argument("--max-block-ratio", type=float, default=0.3)
     p.add_argument("--min-attempt-for-block-ratio", type=int, default=100)
+    p.add_argument("--max-cycles", type=int, default=0)
+    p.add_argument("--max-runtime-sec", type=int, default=0)
+    p.add_argument("--heartbeat-sec", type=float, default=60.0)
+    p.add_argument("--fail-fast-threshold", type=int, default=0)
     p.add_argument("--once", action="store_true")
     return p.parse_args()
 
@@ -229,8 +233,32 @@ def main() -> int:
         return run_once(session, args)
 
     print("runtime_watchdog started")
+    started = time.monotonic()
+    next_heartbeat = started + max(1.0, args.heartbeat_sec)
+    cycles = 0
+    consecutive_failures = 0
     while True:
-        run_once(session, args)
+        rc = run_once(session, args)
+        cycles += 1
+        consecutive_failures = 0 if rc == 0 else consecutive_failures + 1
+        if args.fail_fast_threshold > 0 and consecutive_failures >= args.fail_fast_threshold:
+            print(
+                f"runtime_watchdog stop: fail-fast-threshold reached ({consecutive_failures})"
+            )
+            return 1
+        now = time.monotonic()
+        if args.max_cycles > 0 and cycles >= args.max_cycles:
+            print(f"runtime_watchdog stop: reached max-cycles={args.max_cycles}")
+            return 0
+        if args.max_runtime_sec > 0 and (now - started) >= args.max_runtime_sec:
+            print(f"runtime_watchdog stop: reached max-runtime-sec={args.max_runtime_sec}")
+            return 0
+        if now >= next_heartbeat:
+            elapsed = int(now - started)
+            print(
+                f"[heartbeat] cycles={cycles} elapsed={elapsed}s consecutive_failures={consecutive_failures}"
+            )
+            next_heartbeat = now + max(1.0, args.heartbeat_sec)
         time.sleep(max(1.0, args.interval_sec))
 
 

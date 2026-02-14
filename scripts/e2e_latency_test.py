@@ -35,6 +35,8 @@ def collect_engine_metrics(base_url: str, seconds: int, poll_interval: float) ->
         "pnl_10s_p50_bps_raw": [],
         "pnl_10s_p50_bps_robust": [],
         "pnl_10s_outlier_ratio": [],
+        "gate_ready_ratio": [],
+        "window_outcomes": [],
     }
 
     while time.time() < deadline:
@@ -54,10 +56,12 @@ def collect_engine_metrics(base_url: str, seconds: int, poll_interval: float) ->
                 "pnl_10s_p50_bps_raw",
                 "pnl_10s_p50_bps_robust",
                 "pnl_10s_outlier_ratio",
+                "window_outcomes",
             ):
                 value = live.get(key)
                 if isinstance(value, (int, float)):
                     series[key].append(float(value))
+            series["gate_ready_ratio"].append(1.0 if bool(live.get("gate_ready", False)) else 0.0)
             feed_p50 = latency.get("feed_in_p50_ms")
             if isinstance(feed_p50, (int, float)):
                 series["feed_in_p50_ms"].append(float(feed_p50))
@@ -100,6 +104,8 @@ def main() -> None:
         "pnl_10s_p50_bps_robust", engine["stats"]["pnl_10s_p50_bps_robust"], "bps"
     )
     print_stat_block("pnl_10s_outlier_ratio", engine["stats"]["pnl_10s_outlier_ratio"], "")
+    print_stat_block("gate_ready_ratio", engine["stats"]["gate_ready_ratio"], "")
+    print_stat_block("window_outcomes", engine["stats"]["window_outcomes"], "")
 
     print("\n=== WS FEED LATENCY (RECV - SOURCE TS) ===")
     ws = asyncio.run(run_ws_latency(args.seconds, args.symbol))
