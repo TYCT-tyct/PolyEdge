@@ -839,6 +839,12 @@ fn compute_gate_fail_reasons(live: &ShadowLiveReport, min_outcomes: usize) -> Ve
             live.quote_block_ratio
         ));
     }
+    if live.policy_block_ratio >= 0.30 {
+        failed.push(format!(
+            "policy_block_ratio {:.4} >= 0.30",
+            live.policy_block_ratio
+        ));
+    }
     if live.strategy_uptime_pct < 99.0 {
         failed.push(format!("uptime {:.2}% < 99%", live.strategy_uptime_pct));
     }

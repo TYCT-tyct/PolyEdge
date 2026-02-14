@@ -82,6 +82,7 @@ class TrialResult:
             and self.pnl_10s_p25_bps_robust > -20.0
             and self.fillability_10ms >= 0.60
             and self.quote_block_ratio < 0.10
+            and self.policy_block_ratio < 0.30
             and self.tick_to_ack_p99_ms < 450.0
         )
 
