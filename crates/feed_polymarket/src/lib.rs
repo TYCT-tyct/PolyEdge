@@ -574,13 +574,13 @@ where
     enum NumOrStr {
         Num(f64),
         Str(String),
-        Null(Option<()>),
+        Null,
     }
     let parsed = Option::<NumOrStr>::deserialize(deserializer)?;
     Ok(match parsed {
         Some(NumOrStr::Num(v)) => Some(v),
         Some(NumOrStr::Str(s)) => s.parse::<f64>().ok(),
-        Some(NumOrStr::Null(_)) | None => None,
+        Some(NumOrStr::Null) | None => None,
     })
 }
 
@@ -593,13 +593,13 @@ where
     enum NumOrStr {
         Num(i64),
         Str(String),
-        Null(Option<()>),
+        Null,
     }
     let parsed = Option::<NumOrStr>::deserialize(deserializer)?;
     Ok(match parsed {
         Some(NumOrStr::Num(v)) => Some(v),
         Some(NumOrStr::Str(s)) => s.parse::<i64>().ok(),
-        Some(NumOrStr::Null(_)) | None => None,
+        Some(NumOrStr::Null) | None => None,
     })
 }
 

@@ -70,7 +70,6 @@ struct EngineShared {
     toxicity_cfg: Arc<RwLock<ToxicityConfig>>,
     tox_state: Arc<RwLock<HashMap<String, MarketToxicState>>>,
     shadow_stats: Arc<ShadowStats>,
-    perf_profile: Arc<RwLock<PerfProfile>>,
 }
 
 #[derive(Serialize)]
@@ -851,7 +850,6 @@ async fn main() -> Result<()> {
         toxicity_cfg,
         tox_state,
         shadow_stats,
-        perf_profile,
     });
 
     spawn_reference_feed(bus.clone(), shared.shadow_stats.clone());
