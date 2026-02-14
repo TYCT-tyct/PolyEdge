@@ -40,11 +40,16 @@ use tokio::sync::{mpsc, RwLock};
 
 mod stats_utils;
 mod control_api;
+mod engine_core;
 mod gate_eval;
 mod orchestration;
 use stats_utils::{
     estimate_uptime_pct, freshness_ms, now_ns, percentile, push_capped, robust_filter_iqr,
     value_to_f64,
+};
+use engine_core::{
+    classify_execution_error_reason, classify_execution_style, edge_for_side,
+    is_policy_block_reason, is_quote_reject_reason, normalize_reject_code,
 };
 
 #[derive(Clone)]
@@ -899,77 +904,6 @@ impl ShadowStats {
     }
 }
 
-fn is_quote_reject_reason(reason: &str) -> bool {
-    reason.starts_with("execution_") || reason.starts_with("exchange_reject")
-}
-
-fn is_policy_block_reason(reason: &str) -> bool {
-    reason.starts_with("risk:") || reason == "risk_capped_zero"
-}
-
-fn classify_execution_style(book: &BookTop, intent: &core_types::QuoteIntent) -> ExecutionStyle {
-    match intent.side {
-        OrderSide::BuyYes => {
-            if intent.price >= book.ask_yes {
-                ExecutionStyle::Taker
-            } else {
-                ExecutionStyle::Maker
-            }
-        }
-        OrderSide::SellYes => {
-            if intent.price <= book.bid_yes {
-                ExecutionStyle::Taker
-            } else {
-                ExecutionStyle::Maker
-            }
-        }
-        OrderSide::BuyNo => {
-            if intent.price >= book.ask_no {
-                ExecutionStyle::Taker
-            } else {
-                ExecutionStyle::Maker
-            }
-        }
-        OrderSide::SellNo => {
-            if intent.price <= book.bid_no {
-                ExecutionStyle::Taker
-            } else {
-                ExecutionStyle::Maker
-            }
-        }
-    }
-}
-
-fn normalize_reject_code(raw: &str) -> String {
-    let normalized = raw
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    normalized.trim_matches('_').to_string()
-}
-
-fn classify_execution_error_reason(err: &anyhow::Error) -> &'static str {
-    let msg = err.to_string().to_ascii_lowercase();
-    if msg.contains("429") {
-        "exchange_reject_rate_limit"
-    } else if msg.contains("401") || msg.contains("403") {
-        "exchange_reject_auth"
-    } else if msg.contains("400") || msg.contains("422") {
-        "exchange_reject_bad_request"
-    } else if msg.contains("timeout") {
-        "execution_timeout"
-    } else if msg.contains("connection") || msg.contains("broken pipe") || msg.contains("closed") {
-        "execution_network"
-    } else {
-        "execution_error"
-    }
-}
 impl ShadowStats {
     async fn build_live_report(&self) -> ShadowLiveReport {
         const PRIMARY_DELAY_MS: u64 = 10;
@@ -2455,15 +2389,6 @@ fn inventory_for_market(portfolio: &PortfolioBook, market_id: &str) -> Inventory
         }
     }
 }
-fn edge_for_side(signal: &core_types::Signal, side: &OrderSide) -> f64 {
-    match side {
-        OrderSide::BuyYes => signal.edge_bps_bid,
-        OrderSide::SellYes => signal.edge_bps_ask,
-        OrderSide::BuyNo => signal.edge_bps_ask,
-        OrderSide::SellNo => signal.edge_bps_bid,
-    }
-}
-
 fn build_toxic_features(
     book: &BookTop,
     symbol: &str,
