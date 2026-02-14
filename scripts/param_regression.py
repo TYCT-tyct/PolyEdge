@@ -86,6 +86,22 @@ class TrialResult:
         )
 
 
+def score_trial(row: TrialResult) -> float:
+    """Single-score ranking used for best trial selection in reports."""
+    score = 0.0
+    if row.gate_ready:
+        score += 200.0
+    if row.gate_pass():
+        score += 1000.0
+    score += row.pnl_10s_p50_bps_robust * 0.5
+    score += row.fillability_10ms * 100.0
+    score += row.net_edge_p50_bps * 0.1
+    score -= row.quote_block_ratio * 300.0
+    score -= row.policy_block_ratio * 120.0
+    score -= row.tick_to_ack_p99_ms * 0.2
+    return score
+
+
 def fetch_json(session: requests.Session, url: str, timeout: float = 5.0) -> Dict[str, Any]:
     resp = session.get(url, timeout=timeout)
     resp.raise_for_status()
@@ -268,6 +284,16 @@ def write_summary_md(path: Path, rows: List[TrialResult]) -> None:
     lines.append("")
     lines.append(f"- generated_at_utc: {datetime.now(timezone.utc).isoformat()}")
     lines.append(f"- trials: {len(rows)}")
+    if rows:
+        best = rows[0]
+        lines.append(f"- best_score: {score_trial(best):.3f}")
+        lines.append(f"- best_gate_pass: {best.gate_pass()}")
+        lines.append(f"- best_gate_ready: {best.gate_ready}")
+        lines.append(
+            f"- best_params: edge={best.min_edge_bps}, ttl={best.ttl_ms}, "
+            f"k={best.basis_k_revert}, z={best.basis_z_cap}, "
+            f"safe={best.safe_threshold}, caution={best.caution_threshold}"
+        )
     lines.append("")
     top = rows[:5]
     lines.append("## Top Trials")
@@ -291,6 +317,10 @@ def write_fixlist(path: Path, best: TrialResult | None) -> None:
         lines.append("- No trial results. Check app health and API connectivity.")
     elif best.gate_pass():
         lines.append("- Conservative gate passed on best trial. Keep Shadow mode and extend soak run.")
+        if best.policy_block_ratio >= 0.30:
+            lines.append(
+                "- policy_block_ratio is still high. Strategy is profitable but opportunity suppression is excessive."
+            )
     else:
         if best.pnl_10s_p50_bps_robust <= 0.0:
             lines.append("- pnl_10s_p50_bps_robust still <= 0. Increase edge threshold and reduce toxic markets.")
@@ -300,6 +330,8 @@ def write_fixlist(path: Path, best: TrialResult | None) -> None:
             lines.append("- fillability_10ms below 0.60. Revisit spread/size and queue proxy assumptions.")
         if best.quote_block_ratio >= 0.10:
             lines.append("- quote_block_ratio too high. Relax min_edge or widen active market top-N.")
+        if best.policy_block_ratio >= 0.30:
+            lines.append("- policy_block_ratio too high. Re-tune no_quote_policy and market rank gating.")
         if not best.gate_ready:
             lines.append("- gate_ready is false. Increase eval window or reduce min_outcomes.")
         if best.tick_to_ack_p99_ms >= 450.0:
@@ -406,6 +438,7 @@ def main() -> int:
     write_fixlist(fixlist_path, rows[0] if rows else None)
 
     out_json = day_dir / "regression_summary.json"
+    best = rows[0] if rows else None
     out_json.write_text(
         json.dumps(
             {
@@ -413,6 +446,22 @@ def main() -> int:
                 "run_id": args.run_id,
                 "min_outcomes": args.min_outcomes,
                 "eval_window_sec": args.eval_window_sec,
+                "best_score": score_trial(best) if best else None,
+                "best_pass": best.gate_pass() if best else None,
+                "best_gate_ready": best.gate_ready if best else None,
+                "best_params": (
+                    {
+                        "min_edge_bps": best.min_edge_bps,
+                        "ttl_ms": best.ttl_ms,
+                        "basis_k_revert": best.basis_k_revert,
+                        "basis_z_cap": best.basis_z_cap,
+                        "safe_threshold": best.safe_threshold,
+                        "caution_threshold": best.caution_threshold,
+                        "policy_block_ratio": best.policy_block_ratio,
+                    }
+                    if best
+                    else None
+                ),
                 "trials": [row.__dict__ | {"gate_pass": row.gate_pass()} for row in rows],
             },
             ensure_ascii=True,

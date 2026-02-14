@@ -73,6 +73,12 @@ Cross-region A/B comparison:
 python scripts/ab_region_compare.py --base-a http://<eu-host>:8080 --base-b http://<us-host>:8080 --seconds 600 --run-id ab1 --heartbeat-sec 30 --fail-fast-threshold 3
 ```
 
+Remote deploy + validate (from Windows host):
+
+```powershell
+pwsh -File .\scripts\remote_deploy_validate.ps1 -Host 13.43.23.190 -KeyPath "C:\Users\Shini\Documents\test.pem" -BenchSeconds 180 -RegressionSeconds 1200 -Symbol BTCUSDT
+```
+
 ## Key Live Metrics
 
 - `quote_block_ratio`
