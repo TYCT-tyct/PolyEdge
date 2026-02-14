@@ -590,7 +590,7 @@ impl ShadowStats {
 }
 
 fn is_quote_reject_reason(reason: &str) -> bool {
-    reason == "execution_error" || reason.starts_with("exchange_reject")
+    reason.starts_with("execution_") || reason.starts_with("exchange_reject")
 }
 
 fn is_policy_block_reason(reason: &str) -> bool {
@@ -598,6 +598,23 @@ fn is_policy_block_reason(reason: &str) -> bool {
         || reason.starts_with("market_")
         || reason.starts_with("no_quote_")
         || matches!(reason, "risk_capped_zero" | "edge_below_threshold")
+}
+
+fn classify_execution_error_reason(err: &anyhow::Error) -> &'static str {
+    let msg = err.to_string().to_ascii_lowercase();
+    if msg.contains("429") {
+        "exchange_reject_rate_limit"
+    } else if msg.contains("401") || msg.contains("403") {
+        "exchange_reject_auth"
+    } else if msg.contains("400") || msg.contains("422") {
+        "exchange_reject_bad_request"
+    } else if msg.contains("timeout") {
+        "execution_timeout"
+    } else if msg.contains("connection") || msg.contains("broken pipe") || msg.contains("closed") {
+        "execution_network"
+    } else {
+        "execution_error"
+    }
 }
 impl ShadowStats {
     async fn build_live_report(&self) -> ShadowLiveReport {
@@ -1477,9 +1494,10 @@ fn spawn_strategy_engine(
                                 }
                             }
                             Err(err) => {
+                                let reason = classify_execution_error_reason(&err);
                                 shared
                                     .shadow_stats
-                                    .mark_blocked_with_reason("execution_error")
+                                    .mark_blocked_with_reason(reason)
                                     .await;
                                 tracing::warn!(?err, "place_order failed");
                                 metrics::counter!("execution.place_error").increment(1);
