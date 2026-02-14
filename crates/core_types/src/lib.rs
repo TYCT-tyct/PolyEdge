@@ -253,6 +253,8 @@ pub struct ShadowShot {
     pub market_id: String,
     pub symbol: String,
     pub side: OrderSide,
+    #[serde(default)]
+    pub survival_probe_price: f64,
     pub intended_price: f64,
     pub size: f64,
     pub edge_gross_bps: f64,

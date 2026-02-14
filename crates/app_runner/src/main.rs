@@ -1230,12 +1230,12 @@ fn spawn_strategy_engine(
                                         market_id: intent.market_id.clone(),
                                         symbol: symbol.clone(),
                                         side: intent.side.clone(),
-                                        // Shadow fillability is evaluated against top-of-book taker price
-                                        // to measure whether the observable opportunity survives our delay.
-                                        intended_price: aggressive_price_for_side(
-                                            &book,
-                                            &intent.side,
+                                        // Use taker top-of-book only for "opportunity survival" probing.
+                                        // Keep intended_price as maker entry for markout/PnL attribution.
+                                        survival_probe_price: aggressive_price_for_side(
+                                            &book, &intent.side,
                                         ),
+                                        intended_price: intent.price,
                                         size: intent.size,
                                         edge_gross_bps: edge_gross,
                                         edge_net_bps: edge_net,
@@ -1835,13 +1835,18 @@ fn evaluate_fillable(
     book: &BookTop,
     latency_ms: f64,
 ) -> (bool, Option<f64>, f64) {
-    let (crossable, fill_px) = match shot.side {
-        OrderSide::BuyYes => (shot.intended_price >= book.ask_yes, book.ask_yes),
-        OrderSide::SellYes => (shot.intended_price <= book.bid_yes, book.bid_yes),
-        OrderSide::BuyNo => (shot.intended_price >= book.ask_no, book.ask_no),
-        OrderSide::SellNo => (shot.intended_price <= book.bid_no, book.bid_no),
+    let probe_px = if shot.survival_probe_price > 0.0 {
+        shot.survival_probe_price
+    } else {
+        shot.intended_price
     };
-    if !crossable || shot.intended_price <= 0.0 {
+    let (crossable, fill_px) = match shot.side {
+        OrderSide::BuyYes => (probe_px >= book.ask_yes, book.ask_yes),
+        OrderSide::SellYes => (probe_px <= book.bid_yes, book.bid_yes),
+        OrderSide::BuyNo => (probe_px >= book.ask_no, book.ask_no),
+        OrderSide::SellNo => (probe_px <= book.bid_no, book.bid_no),
+    };
+    if !crossable || probe_px <= 0.0 {
         return (false, None, 0.0);
     }
     let queue_fill_prob = estimate_queue_fill_prob(shot, book, latency_ms);
@@ -1849,12 +1854,8 @@ fn evaluate_fillable(
         return (false, None, queue_fill_prob);
     }
     let mut slippage = match shot.side {
-        OrderSide::BuyYes | OrderSide::BuyNo => {
-            ((fill_px - shot.intended_price) / shot.intended_price) * 10_000.0
-        }
-        OrderSide::SellYes | OrderSide::SellNo => {
-            ((shot.intended_price - fill_px) / shot.intended_price) * 10_000.0
-        }
+        OrderSide::BuyYes | OrderSide::BuyNo => ((fill_px - probe_px) / probe_px) * 10_000.0,
+        OrderSide::SellYes | OrderSide::SellNo => ((probe_px - fill_px) / probe_px) * 10_000.0,
     };
     slippage += (1.0 - queue_fill_prob) * 8.0;
     (true, Some(slippage), queue_fill_prob)
