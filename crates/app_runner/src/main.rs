@@ -596,8 +596,7 @@ fn is_quote_reject_reason(reason: &str) -> bool {
 fn is_policy_block_reason(reason: &str) -> bool {
     reason.starts_with("risk:")
         || reason.starts_with("market_")
-        || reason.starts_with("no_quote_")
-        || matches!(reason, "risk_capped_zero" | "edge_below_threshold")
+        || reason == "risk_capped_zero"
 }
 
 fn classify_execution_error_reason(err: &anyhow::Error) -> &'static str {
