@@ -15,6 +15,7 @@ assets = [
   "TONUSDT",
   "NEARUSDT",
 ]
-market_types = ["updown", "above_below", "range"]
+market_types = ["updown"]
+timeframes = ["5m", "15m", "1h", "1d"]
 tier_whitelist = []
 tier_blacklist = []

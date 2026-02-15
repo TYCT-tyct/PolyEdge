@@ -18,6 +18,8 @@ pub struct MarketDescriptor {
 #[derive(Debug, Clone)]
 pub struct DiscoveryConfig {
     pub symbols: Vec<String>,
+    pub market_types: Vec<String>,
+    pub timeframes: Vec<String>,
     pub endpoint: String,
 }
 
@@ -40,6 +42,17 @@ impl Default for DiscoveryConfig {
                 "TRXUSDT".to_string(),
                 "TONUSDT".to_string(),
                 "NEARUSDT".to_string(),
+            ],
+            market_types: vec![
+                "updown".to_string(),
+                "above_below".to_string(),
+                "range".to_string(),
+            ],
+            timeframes: vec![
+                "5m".to_string(),
+                "15m".to_string(),
+                "1h".to_string(),
+                "1d".to_string(),
             ],
             endpoint: "https://gamma-api.polymarket.com/markets".to_string(),
         }
@@ -90,6 +103,29 @@ impl MarketDiscovery {
                 market.question.to_ascii_uppercase(),
                 market.slug.clone().unwrap_or_default().to_ascii_uppercase()
             );
+            let market_type = classify_market_type(&text);
+            if !self.cfg.market_types.is_empty()
+                && !self
+                    .cfg
+                    .market_types
+                    .iter()
+                    .any(|t| t.eq_ignore_ascii_case(market_type))
+            {
+                continue;
+            }
+            if !self.cfg.timeframes.is_empty() {
+                let Some(timeframe) = classify_timeframe(&text) else {
+                    continue;
+                };
+                if !self
+                    .cfg
+                    .timeframes
+                    .iter()
+                    .any(|t| t.eq_ignore_ascii_case(timeframe))
+                {
+                    continue;
+                }
+            }
             let Some(symbol) = detect_symbol(&text, &self.cfg.symbols) else {
                 continue;
             };
@@ -144,6 +180,35 @@ fn detect_symbol(text: &str, allowed_symbols: &[String]) -> Option<String> {
         if text.contains(needle) {
             return Some(symbol.clone());
         }
+    }
+    None
+}
+
+fn classify_market_type(text: &str) -> &'static str {
+    if text.contains("UP OR DOWN") || text.contains("UP/DOWN") {
+        return "updown";
+    }
+    if text.contains("ABOVE") || text.contains("BELOW") {
+        return "above_below";
+    }
+    if text.contains("BETWEEN") || text.contains("RANGE") {
+        return "range";
+    }
+    "other"
+}
+
+fn classify_timeframe(text: &str) -> Option<&'static str> {
+    if text.contains("15 MIN") || text.contains("15M") || text.contains("15 MINUTE") {
+        return Some("15m");
+    }
+    if text.contains("5 MIN") || text.contains("5M") || text.contains("5 MINUTE") {
+        return Some("5m");
+    }
+    if text.contains("1 HOUR") || text.contains("1H") || text.contains("60 MIN") {
+        return Some("1h");
+    }
+    if text.contains("1 DAY") || text.contains("1D") || text.contains("24 HOUR") {
+        return Some("1d");
     }
     None
 }
@@ -214,5 +279,20 @@ mod tests {
             detect_symbol("RIPPLE MOMENTUM", &symbols),
             Some("XRPUSDT".to_string())
         );
+    }
+
+    #[test]
+    fn classify_timeframe_and_type() {
+        assert_eq!(
+            classify_market_type("BITCOIN UP OR DOWN - 15 MINUTES"),
+            "updown"
+        );
+        assert_eq!(classify_timeframe("BITCOIN UP OR DOWN - 5 MINUTES"), Some("5m"));
+        assert_eq!(
+            classify_timeframe("ETHEREUM UP OR DOWN - 15 MINUTES"),
+            Some("15m")
+        );
+        assert_eq!(classify_timeframe("SOLANA UP OR DOWN - 1 HOUR"), Some("1h"));
+        assert_eq!(classify_timeframe("XRP UP OR DOWN - 1 DAY"), Some("1d"));
     }
 }

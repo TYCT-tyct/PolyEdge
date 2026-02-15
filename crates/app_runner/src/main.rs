@@ -100,6 +100,8 @@ struct EngineShared {
     toxicity_cfg: Arc<RwLock<ToxicityConfig>>,
     risk_limits: Arc<RwLock<RiskLimits>>,
     universe_symbols: Arc<Vec<String>>,
+    universe_market_types: Arc<Vec<String>>,
+    universe_timeframes: Arc<Vec<String>>,
     rate_limit_rps: f64,
     scoring_rebate_factor: f64,
     tox_state: Arc<RwLock<HashMap<String, MarketToxicState>>>,
@@ -1322,6 +1324,8 @@ async fn async_main() -> Result<()> {
     let shadow_stats = Arc::new(ShadowStats::new());
     let paused = Arc::new(RwLock::new(false));
     let universe_symbols = Arc::new(universe_cfg.assets.clone());
+    let universe_market_types = Arc::new(universe_cfg.market_types.clone());
+    let universe_timeframes = Arc::new(universe_cfg.timeframes.clone());
     init_jsonl_writer(perf_profile.clone()).await;
 
     let state = AppState {
@@ -1362,6 +1366,8 @@ async fn async_main() -> Result<()> {
         toxicity_cfg,
         risk_limits,
         universe_symbols: universe_symbols.clone(),
+        universe_market_types: universe_market_types.clone(),
+        universe_timeframes: universe_timeframes.clone(),
         rate_limit_rps: execution_cfg.rate_limit_rps.max(0.1),
         scoring_rebate_factor,
         tox_state,
@@ -2418,6 +2424,8 @@ fn spawn_shadow_outcome_task(
 async fn refresh_market_symbol_map(shared: &EngineShared) {
     let discovery = MarketDiscovery::new(DiscoveryConfig {
         symbols: (*shared.universe_symbols).clone(),
+        market_types: (*shared.universe_market_types).clone(),
+        timeframes: (*shared.universe_timeframes).clone(),
         ..DiscoveryConfig::default()
     });
     match discovery.discover().await {
@@ -3519,6 +3527,7 @@ fn load_fair_value_config() -> BasisMrConfig {
 struct UniverseConfig {
     assets: Vec<String>,
     market_types: Vec<String>,
+    timeframes: Vec<String>,
     tier_whitelist: Vec<String>,
     tier_blacklist: Vec<String>,
 }
@@ -3536,6 +3545,12 @@ impl Default for UniverseConfig {
                 "updown".to_string(),
                 "above_below".to_string(),
                 "range".to_string(),
+            ],
+            timeframes: vec![
+                "5m".to_string(),
+                "15m".to_string(),
+                "1h".to_string(),
+                "1d".to_string(),
             ],
             tier_whitelist: Vec::new(),
             tier_blacklist: Vec::new(),
@@ -3830,6 +3845,9 @@ fn load_universe_config() -> UniverseConfig {
     }
     if let Some(parsed) = parse_toml_array_for_key(&raw, "market_types") {
         cfg.market_types = parsed;
+    }
+    if let Some(parsed) = parse_toml_array_for_key(&raw, "timeframes") {
+        cfg.timeframes = parsed;
     }
     if let Some(parsed) = parse_toml_array_for_key(&raw, "tier_whitelist") {
         cfg.tier_whitelist = parsed;
@@ -4691,6 +4709,7 @@ assets = [
   "XRPUSDT",
 ]
 market_types = ["updown", "range"]
+timeframes = ["5m", "15m", "1h", "1d"]
 "#;
         let assets = parse_toml_array_for_key(raw, "assets").unwrap_or_default();
         assert_eq!(
@@ -4705,6 +4724,16 @@ market_types = ["updown", "range"]
         assert_eq!(
             market_types,
             vec!["updown".to_string(), "range".to_string()]
+        );
+        let timeframes = parse_toml_array_for_key(raw, "timeframes").unwrap_or_default();
+        assert_eq!(
+            timeframes,
+            vec![
+                "5m".to_string(),
+                "15m".to_string(),
+                "1h".to_string(),
+                "1d".to_string()
+            ]
         );
     }
 
