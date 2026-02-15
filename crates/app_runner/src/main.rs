@@ -1748,22 +1748,19 @@ fn spawn_strategy_engine(
                         continue;
                     };
                     let tick_anchor = pick_latest_tick(&latest_anchor_ticks, &symbol);
-                    let now_ms = Utc::now().timestamp_millis();
-                    let eval_tick = match tick_anchor {
-                        Some(anchor) => {
-                            let age_ms = now_ms - ref_event_ts_ms(anchor);
-                            if age_ms <= 5_000 {
-                                anchor
-                            } else {
-                                shared.shadow_stats.record_issue("anchor_stale").await;
-                                tick_fast
-                            }
+                    if let Some(anchor) = tick_anchor {
+                        let now_ms = Utc::now().timestamp_millis();
+                        let age_ms = now_ms - ref_event_ts_ms(anchor);
+                        if age_ms > 5_000 {
+                            shared.shadow_stats.record_issue("anchor_stale").await;
                         }
-                        None => {
-                            shared.shadow_stats.record_issue("anchor_missing").await;
-                            tick_fast
-                        }
-                    };
+                    } else {
+                        shared.shadow_stats.record_issue("anchor_missing").await;
+                    }
+                    // For latency-sensitive trading, evaluate fair value on the fastest observable
+                    // reference tick. The Chainlink anchor is tracked for correctness auditing and
+                    // can be used for future calibration, but should not slow down the trigger.
+                    let eval_tick = tick_fast;
                     shared.shadow_stats.mark_seen();
 
                     let latency_sample = estimate_feed_latency(tick_fast, &book);

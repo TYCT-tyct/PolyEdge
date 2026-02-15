@@ -72,7 +72,8 @@ async def run_ws_latency(seconds: int, symbol: str) -> Dict[str, float]:
                     chainlink_lags.append(recv_ms - float(ts))
 
     async def bin_task() -> None:
-        url = f"wss://stream.binance.com:9443/ws/{bin_symbol}@ticker"
+        # Keep this consistent with the Rust ref feed which uses `@trade`.
+        url = f"wss://stream.binance.com:9443/ws/{bin_symbol}@trade"
         async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_size=2**22) as ws:
             end = time.time() + seconds
             while time.time() < end:
