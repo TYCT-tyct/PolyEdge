@@ -16,6 +16,8 @@ pub struct MakerConfig {
     pub market_tier_profile: String,
     pub capital_fraction_kelly: f64,
     pub variance_penalty_lambda: f64,
+    pub min_eval_notional_usdc: f64,
+    pub min_expected_edge_usdc: f64,
 }
 
 impl Default for MakerConfig {
@@ -32,6 +34,8 @@ impl Default for MakerConfig {
             market_tier_profile: "balanced".to_string(),
             capital_fraction_kelly: 0.35,
             variance_penalty_lambda: 0.25,
+            min_eval_notional_usdc: 0.05,
+            min_expected_edge_usdc: 0.0002,
         }
     }
 }

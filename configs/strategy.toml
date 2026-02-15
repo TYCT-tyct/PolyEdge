@@ -14,6 +14,8 @@ market_tier_profile = "balanced_sol_guard"
 [online_calibration]
 capital_fraction_kelly = 0.35
 variance_penalty_lambda = 0.25
+min_eval_notional_usdc = 0.05
+min_expected_edge_usdc = 0.0002
 
 [fair_value.basis_mr]
 enabled = true

@@ -128,6 +128,8 @@ struct StrategyReloadReq {
     market_tier_profile: Option<String>,
     capital_fraction_kelly: Option<f64>,
     variance_penalty_lambda: Option<f64>,
+    min_eval_notional_usdc: Option<f64>,
+    min_expected_edge_usdc: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2048,6 +2050,23 @@ fn spawn_strategy_engine(
                                 .await;
                             continue;
                         }
+                        let intended_notional_usdc =
+                            (intent.price.max(0.0) * intent.size.max(0.0)).max(0.0);
+                        if intended_notional_usdc < cfg.min_eval_notional_usdc {
+                            shared
+                                .shadow_stats
+                                .mark_blocked_with_reason("tiny_notional")
+                                .await;
+                            continue;
+                        }
+                        let edge_net_usdc = (edge_net / 10_000.0) * intended_notional_usdc;
+                        if edge_net_usdc < cfg.min_expected_edge_usdc {
+                            shared
+                                .shadow_stats
+                                .mark_blocked_with_reason("edge_notional_too_small")
+                                .await;
+                            continue;
+                        }
 
                         let mut force_taker = false;
                         if should_force_taker(
@@ -3667,6 +3686,16 @@ fn load_strategy_config() -> MakerConfig {
                 "variance_penalty_lambda" => {
                     if let Ok(parsed) = val.parse::<f64>() {
                         cfg.variance_penalty_lambda = parsed.clamp(0.0, 5.0);
+                    }
+                }
+                "min_eval_notional_usdc" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.min_eval_notional_usdc = parsed.max(0.0);
+                    }
+                }
+                "min_expected_edge_usdc" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.min_expected_edge_usdc = parsed.max(0.0);
                     }
                 }
                 _ => {}

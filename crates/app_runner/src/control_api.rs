@@ -124,6 +124,12 @@ async fn reload_strategy(
     if let Some(v) = req.variance_penalty_lambda {
         cfg.variance_penalty_lambda = v.clamp(0.0, 5.0);
     }
+    if let Some(v) = req.min_eval_notional_usdc {
+        cfg.min_eval_notional_usdc = v.max(0.0);
+    }
+    if let Some(v) = req.min_expected_edge_usdc {
+        cfg.min_expected_edge_usdc = v.max(0.0);
+    }
     let mut fair_cfg = state
         .fair_value_cfg
         .read()
