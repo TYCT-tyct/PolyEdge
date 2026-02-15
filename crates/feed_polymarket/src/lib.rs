@@ -185,49 +185,62 @@ impl PolymarketFeed {
             .await
             .context("send polymarket subscribe")?;
 
-        while let Some(msg) = ws.next().await {
-            let msg = msg.context("polymarket ws read")?;
-            let text = match msg {
-                Message::Text(t) => t.to_string(),
-                Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
-                Message::Ping(v) => {
-                    let _ = ws.send(Message::Pong(v)).await;
-                    continue;
+        let mut ping = tokio::time::interval(Duration::from_secs(15));
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                _ = ping.tick() => {
+                    ws.send(Message::Ping(Vec::new().into()))
+                        .await
+                        .context("send polymarket ping")?;
                 }
-                Message::Pong(_) => continue,
-                Message::Close(_) => break,
-                Message::Frame(_) => continue,
-            };
+                msg = ws.next() => {
+                    let Some(msg) = msg else { break };
+                    let msg = msg.context("polymarket ws read")?;
+                    let text = match msg {
+                        Message::Text(t) => t.to_string(),
+                        Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
+                        Message::Ping(v) => {
+                            let _ = ws.send(Message::Pong(v)).await;
+                            continue;
+                        }
+                        Message::Pong(_) => continue,
+                        Message::Close(_) => break,
+                        Message::Frame(_) => continue,
+                    };
 
-            let Ok(payload) = serde_json::from_str::<WsEnvelope>(&text) else {
-                continue;
-            };
-
-            for event in payload.into_events() {
-                for update in parse_asset_updates(&event) {
-                    let Some((market_id, is_yes)) = asset_map.get(&update.asset_id).cloned() else {
+                    let Ok(payload) = serde_json::from_str::<WsEnvelope>(&text) else {
                         continue;
                     };
-                    let Some(state) = markets.get_mut(&market_id) else {
-                        continue;
-                    };
 
-                    let target = if is_yes {
-                        &mut state.yes
-                    } else {
-                        &mut state.no
-                    };
-                    if let Some(v) = update.best_bid {
-                        target.bid = v;
-                    }
-                    if let Some(v) = update.best_ask {
-                        target.ask = v;
-                    }
-                    target.ts_exchange_ms = update.ts_exchange_ms;
-                    target.recv_ts_local_ns = update.recv_ts_local_ns;
+                    for event in payload.into_events() {
+                        for update in parse_asset_updates(&event) {
+                            let Some((market_id, is_yes)) = asset_map.get(&update.asset_id).cloned() else {
+                                continue;
+                            };
+                            let Some(state) = markets.get_mut(&market_id) else {
+                                continue;
+                            };
 
-                    if tx.send(state.to_book_top()).await.is_err() {
-                        return Ok(());
+                            let target = if is_yes {
+                                &mut state.yes
+                            } else {
+                                &mut state.no
+                            };
+                            if let Some(v) = update.best_bid {
+                                target.bid = v;
+                            }
+                            if let Some(v) = update.best_ask {
+                                target.ask = v;
+                            }
+                            target.ts_exchange_ms = update.ts_exchange_ms;
+                            target.recv_ts_local_ns = update.recv_ts_local_ns;
+
+                            if tx.send(state.to_book_top()).await.is_err() {
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             }
@@ -290,53 +303,66 @@ async fn run_book_update_loop(
         .await
         .context("send polymarket subscribe")?;
 
-    while let Some(msg) = ws.next().await {
-        let msg = msg.context("polymarket book ws read")?;
-        let text = match msg {
-            Message::Text(t) => t.to_string(),
-            Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
-            Message::Ping(v) => {
-                let _ = ws.send(Message::Pong(v)).await;
-                continue;
+    let mut ping = tokio::time::interval(Duration::from_secs(15));
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            _ = ping.tick() => {
+                ws.send(Message::Ping(Vec::new().into()))
+                    .await
+                    .context("send polymarket book ping")?;
             }
-            Message::Pong(_) => continue,
-            Message::Close(_) => break,
-            Message::Frame(_) => continue,
-        };
-
-        let Ok(payload) = serde_json::from_str::<WsEnvelope>(&text) else {
-            continue;
-        };
-
-        for event in payload.into_events() {
-            if let Some(mut snapshot) = parse_snapshot(&event) {
-                if let Some(market_id) = token_market_map.get(&snapshot.asset_id) {
-                    snapshot.market_id = market_id.clone();
-                }
-                if tx.send(BookUpdate::Snapshot(snapshot)).await.is_err() {
-                    return Ok(());
-                }
-            }
-
-            for mut delta in parse_deltas(&event) {
-                if let Some(market_id) = token_market_map.get(&delta.asset_id) {
-                    delta.market_id = market_id.clone();
-                }
-                let digest = OrderbookStateDigest {
-                    market_id: delta.market_id.clone(),
-                    asset_id: delta.asset_id.clone(),
-                    best_bid: delta.best_bid.unwrap_or(0.0),
-                    best_ask: delta.best_ask.unwrap_or(1.0),
-                    spread: (delta.best_ask.unwrap_or(1.0) - delta.best_bid.unwrap_or(0.0))
-                        .max(0.0),
-                    ts_exchange_ms: delta.ts_exchange_ms,
-                    recv_ts_local_ns: delta.recv_ts_local_ns,
+            msg = ws.next() => {
+                let Some(msg) = msg else { break };
+                let msg = msg.context("polymarket book ws read")?;
+                let text = match msg {
+                    Message::Text(t) => t.to_string(),
+                    Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
+                    Message::Ping(v) => {
+                        let _ = ws.send(Message::Pong(v)).await;
+                        continue;
+                    }
+                    Message::Pong(_) => continue,
+                    Message::Close(_) => break,
+                    Message::Frame(_) => continue,
                 };
-                if tx.send(BookUpdate::Delta(delta)).await.is_err() {
-                    return Ok(());
-                }
-                if tx.send(BookUpdate::Digest(digest)).await.is_err() {
-                    return Ok(());
+
+                let Ok(payload) = serde_json::from_str::<WsEnvelope>(&text) else {
+                    continue;
+                };
+
+                for event in payload.into_events() {
+                    if let Some(mut snapshot) = parse_snapshot(&event) {
+                        if let Some(market_id) = token_market_map.get(&snapshot.asset_id) {
+                            snapshot.market_id = market_id.clone();
+                        }
+                        if tx.send(BookUpdate::Snapshot(snapshot)).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+
+                    for mut delta in parse_deltas(&event) {
+                        if let Some(market_id) = token_market_map.get(&delta.asset_id) {
+                            delta.market_id = market_id.clone();
+                        }
+                        let digest = OrderbookStateDigest {
+                            market_id: delta.market_id.clone(),
+                            asset_id: delta.asset_id.clone(),
+                            best_bid: delta.best_bid.unwrap_or(0.0),
+                            best_ask: delta.best_ask.unwrap_or(1.0),
+                            spread: (delta.best_ask.unwrap_or(1.0) - delta.best_bid.unwrap_or(0.0))
+                                .max(0.0),
+                            ts_exchange_ms: delta.ts_exchange_ms,
+                            recv_ts_local_ns: delta.recv_ts_local_ns,
+                        };
+                        if tx.send(BookUpdate::Delta(delta)).await.is_err() {
+                            return Ok(());
+                        }
+                        if tx.send(BookUpdate::Digest(digest)).await.is_err() {
+                            return Ok(());
+                        }
+                    }
                 }
             }
         }
