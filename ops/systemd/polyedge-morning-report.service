@@ -6,4 +6,4 @@ After=polyedge.service
 Type=oneshot
 User=ubuntu
 WorkingDirectory=/home/ubuntu/PolyEdge
-ExecStart=/usr/bin/env python scripts/generate_morning_report.py
+ExecStart=/usr/bin/env python3 scripts/generate_morning_report.py

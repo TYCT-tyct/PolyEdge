@@ -8,6 +8,8 @@ Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/PolyEdge
 Environment=RUST_LOG=info
+# systemd does not read shell rc files; ensure cargo is discoverable.
+Environment=PATH=/home/ubuntu/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/usr/bin/env cargo run --release -p app_runner
 Restart=always
 RestartSec=5
