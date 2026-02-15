@@ -527,6 +527,11 @@ struct ShadowLiveReport {
     book_ticks_total: u64,
     ref_freshness_ms: i64,
     book_freshness_ms: i64,
+    book_top_lag_p50_ms: f64,
+    book_top_lag_p90_ms: f64,
+    book_top_lag_p99_ms: f64,
+    book_top_lag_by_symbol_p50_ms: HashMap<String, f64>,
+    survival_10ms_by_symbol: HashMap<String, f64>,
     blocked_reason_counts: HashMap<String, u64>,
     latency: LatencyBreakdown,
     market_scorecard: Vec<MarketScoreRow>,
@@ -597,6 +602,8 @@ struct ShadowStats {
     feed_in_ms: RwLock<Vec<f64>>,
     source_latency_ms: RwLock<Vec<f64>>,
     local_backlog_ms: RwLock<Vec<f64>>,
+    book_top_lag_ms: RwLock<Vec<f64>>,
+    book_top_lag_by_symbol_ms: RwLock<HashMap<String, Vec<f64>>>,
     signal_us: RwLock<Vec<f64>>,
     quote_us: RwLock<Vec<f64>>,
     risk_us: RwLock<Vec<f64>>,
@@ -650,6 +657,8 @@ impl ShadowStats {
             feed_in_ms: RwLock::new(Vec::new()),
             source_latency_ms: RwLock::new(Vec::new()),
             local_backlog_ms: RwLock::new(Vec::new()),
+            book_top_lag_ms: RwLock::new(Vec::new()),
+            book_top_lag_by_symbol_ms: RwLock::new(HashMap::new()),
             signal_us: RwLock::new(Vec::new()),
             quote_us: RwLock::new(Vec::new()),
             risk_us: RwLock::new(Vec::new()),
@@ -699,6 +708,8 @@ impl ShadowStats {
         self.feed_in_ms.write().await.clear();
         self.source_latency_ms.write().await.clear();
         self.local_backlog_ms.write().await.clear();
+        self.book_top_lag_ms.write().await.clear();
+        self.book_top_lag_by_symbol_ms.write().await.clear();
         self.signal_us.write().await.clear();
         self.quote_us.write().await.clear();
         self.risk_us.write().await.clear();
@@ -793,6 +804,16 @@ impl ShadowStats {
     async fn push_local_backlog_ms(&self, ms: f64) {
         let mut v = self.local_backlog_ms.write().await;
         push_capped(&mut v, ms, Self::SAMPLE_CAP);
+    }
+
+    async fn push_book_top_lag_ms(&self, symbol: &str, ms: f64) {
+        let mut v = self.book_top_lag_ms.write().await;
+        push_capped(&mut v, ms, Self::SAMPLE_CAP);
+        drop(v);
+
+        let mut by_symbol = self.book_top_lag_by_symbol_ms.write().await;
+        let entry = by_symbol.entry(symbol.to_string()).or_default();
+        push_capped(entry, ms, 4_096);
     }
 
     async fn push_signal_us(&self, us: f64) {
@@ -973,6 +994,8 @@ impl ShadowStats {
         let feed_in_ms = self.feed_in_ms.read().await.clone();
         let source_latency_ms = self.source_latency_ms.read().await.clone();
         let local_backlog_ms = self.local_backlog_ms.read().await.clone();
+        let book_top_lag_ms = self.book_top_lag_ms.read().await.clone();
+        let book_top_lag_by_symbol_ms = self.book_top_lag_by_symbol_ms.read().await.clone();
         let signal_us = self.signal_us.read().await.clone();
         let quote_us = self.quote_us.read().await.clone();
         let risk_us = self.risk_us.read().await.clone();
@@ -986,6 +1009,9 @@ impl ShadowStats {
         let fillability_5 = fillability_ratio(&outcomes, 5);
         let fillability_10 = fillability_ratio(&outcomes, 10);
         let fillability_25 = fillability_ratio(&outcomes, 25);
+        let survival_5 = survival_ratio(&outcomes, 5);
+        let survival_10 = survival_ratio(&outcomes, 10);
+        let survival_25 = survival_ratio(&outcomes, 25);
 
         let shots_primary = shots
             .iter()
@@ -1092,6 +1118,28 @@ impl ShadowStats {
             stale_tick_dropped as f64 / data_total as f64
         };
 
+        let book_top_lag_p50_ms = percentile(&book_top_lag_ms, 0.50).unwrap_or(0.0);
+        let book_top_lag_p90_ms = percentile(&book_top_lag_ms, 0.90).unwrap_or(0.0);
+        let book_top_lag_p99_ms = percentile(&book_top_lag_ms, 0.99).unwrap_or(0.0);
+        let mut book_top_lag_by_symbol_p50_ms = HashMap::new();
+        for (sym, samples) in book_top_lag_by_symbol_ms {
+            book_top_lag_by_symbol_p50_ms.insert(sym, percentile(&samples, 0.50).unwrap_or(0.0));
+        }
+
+        let mut survival_10ms_by_symbol = HashMap::new();
+        let mut survival_counts: HashMap<String, (u64, u64)> = HashMap::new();
+        for o in &outcomes_primary_valid {
+            let o = *o;
+            let e = survival_counts.entry(o.symbol.clone()).or_insert((0, 0));
+            e.0 = e.0.saturating_add(1);
+            if o.survived {
+                e.1 = e.1.saturating_add(1);
+            }
+        }
+        for (sym, (n, s)) in survival_counts {
+            survival_10ms_by_symbol.insert(sym, if n == 0 { 0.0 } else { s as f64 / n as f64 });
+        }
+
         let latency = LatencyBreakdown {
             feed_in_p50_ms: percentile(&feed_in_ms, 0.50).unwrap_or(0.0),
             feed_in_p90_ms: percentile(&feed_in_ms, 0.90).unwrap_or(0.0),
@@ -1155,9 +1203,9 @@ impl ShadowStats {
             fillability_5ms: fillability_5,
             fillability_10ms: fillability_10,
             fillability_25ms: fillability_25,
-            survival_5ms: fillability_5,
-            survival_10ms: fillability_10,
-            survival_25ms: fillability_25,
+            survival_5ms: survival_5,
+            survival_10ms: survival_10,
+            survival_25ms: survival_25,
             net_edge_p50_bps: net_edge_p50,
             net_edge_p10_bps: net_edge_p10,
             pnl_1s_p50_bps: pnl_1s_p50,
@@ -1195,6 +1243,11 @@ impl ShadowStats {
             book_ticks_total,
             ref_freshness_ms,
             book_freshness_ms,
+            book_top_lag_p50_ms,
+            book_top_lag_p90_ms,
+            book_top_lag_p99_ms,
+            book_top_lag_by_symbol_p50_ms,
+            survival_10ms_by_symbol,
             blocked_reason_counts,
             latency,
             market_scorecard: scorecard,
@@ -1603,12 +1656,14 @@ fn spawn_strategy_engine(
     tokio::spawn(async move {
         let fair = BasisMrFairValue::new(shared.fair_value_cfg.clone());
         // Separate fast reference ticks (exchange WS) from anchor ticks (Chainlink RTDS).
-        // Fast ticks drive stale filtering + latency measurement, while anchor ticks drive fair value.
+        // Fast ticks drive stale filtering + fair value evaluation; anchor ticks are tracked for
+        // auditing/diagnostics so the trigger stays latency-sensitive.
         let mut latest_fast_ticks: HashMap<String, RefTick> = HashMap::new();
         let mut latest_anchor_ticks: HashMap<String, RefTick> = HashMap::new();
         let mut market_inventory: HashMap<String, InventoryState> = HashMap::new();
         let mut market_rate_budget: HashMap<String, TokenBucket> = HashMap::new();
         let mut untracked_issue_cooldown: HashMap<String, Instant> = HashMap::new();
+        let mut book_lag_sample_at: HashMap<String, Instant> = HashMap::new();
         let mut global_rate_budget = TokenBucket::new(
             shared.rate_limit_rps,
             (shared.rate_limit_rps * 2.0).max(1.0),
@@ -1762,6 +1817,24 @@ fn spawn_strategy_engine(
                     // can be used for future calibration, but should not slow down the trigger.
                     let eval_tick = tick_fast;
                     shared.shadow_stats.mark_seen();
+
+                    let book_top_lag_ms = if tick_fast.recv_ts_local_ns > 0 && book.recv_ts_local_ns > 0 {
+                        ((tick_fast.recv_ts_local_ns - book.recv_ts_local_ns).max(0) as f64)
+                            / 1_000_000.0
+                    } else {
+                        0.0
+                    };
+                    let should_sample_book_lag = book_lag_sample_at
+                        .get(&symbol)
+                        .map(|t| t.elapsed() >= Duration::from_millis(200))
+                        .unwrap_or(true);
+                    if should_sample_book_lag {
+                        book_lag_sample_at.insert(symbol.clone(), Instant::now());
+                        shared
+                            .shadow_stats
+                            .push_book_top_lag_ms(&symbol, book_top_lag_ms)
+                            .await;
+                    }
 
                     let latency_sample = estimate_feed_latency(tick_fast, &book);
                     let feed_in_ms = latency_sample.feed_in_ms;
@@ -1936,7 +2009,14 @@ fn spawn_strategy_engine(
                         tox_decision.tox_score,
                         markout_samples,
                     );
-                    if should_observe_only_symbol(&symbol, &cfg, &tox_decision, feed_in_ms, spread_yes) {
+                    if should_observe_only_symbol(
+                        &symbol,
+                        &cfg,
+                        &tox_decision,
+                        feed_in_ms,
+                        spread_yes,
+                        book_top_lag_ms,
+                    ) {
                         shared
                             .shadow_stats
                             .mark_blocked_with_reason("symbol_quality_guard")
@@ -2387,6 +2467,7 @@ fn spawn_shadow_outcome_task(
         metrics::histogram!("latency.shadow_fill_ms").record(latency_ms);
 
         let (
+            survived,
             fillable,
             slippage_bps,
             queue_fill_prob,
@@ -2395,14 +2476,15 @@ fn spawn_shadow_outcome_task(
             pnl_5s_bps,
             pnl_10s_bps,
         ) = if let Some(book) = book {
-            let (fillable, slippage_bps, queue_fill_prob) =
-                evaluate_fillable(&shot, &book, latency_ms);
+            let survived = evaluate_survival(&shot, &book);
+            let (fillable, slippage_bps, queue_fill_prob) = evaluate_fillable(&shot, &book, latency_ms);
             if fillable {
                 let p1 = pnl_after_horizon(&shared, &shot, Duration::from_secs(1)).await;
                 let p5 = pnl_after_horizon(&shared, &shot, Duration::from_secs(5)).await;
                 let p10 = pnl_after_horizon(&shared, &shot, Duration::from_secs(10)).await;
                 let attribution = classify_filled_outcome(shot.edge_net_bps, p10, slippage_bps);
                 (
+                    survived,
                     true,
                     slippage_bps,
                     queue_fill_prob,
@@ -2413,8 +2495,9 @@ fn spawn_shadow_outcome_task(
                 )
             } else {
                 let attribution =
-                    classify_unfilled_outcome(&book, latency_ms, shot.delay_ms, queue_fill_prob);
+                    classify_unfilled_outcome(&book, latency_ms, shot.delay_ms, survived, queue_fill_prob);
                 (
+                    survived,
                     false,
                     slippage_bps,
                     queue_fill_prob,
@@ -2426,6 +2509,7 @@ fn spawn_shadow_outcome_task(
             }
         } else {
             (
+                false,
                 false,
                 None,
                 0.0,
@@ -2448,6 +2532,7 @@ fn spawn_shadow_outcome_task(
             symbol: shot.symbol.clone(),
             side: shot.side.clone(),
             delay_ms: shot.delay_ms,
+            survived,
             fillable,
             execution_style: shot.execution_style.clone(),
             slippage_bps,
@@ -2473,7 +2558,7 @@ fn spawn_shadow_outcome_task(
             let eval = QuoteEval {
                 market_id: shot.market_id.clone(),
                 symbol: shot.symbol.clone(),
-                survival_10ms: if outcome.fillable { 1.0 } else { 0.0 },
+                survival_10ms: if outcome.survived { 1.0 } else { 0.0 },
                 maker_markout_10s_bps: outcome.net_markout_10s_bps.unwrap_or(0.0),
                 adverse_flag: outcome.net_markout_10s_bps.unwrap_or(0.0) < 0.0,
                 ts_ns: now_ns(),
@@ -2851,6 +2936,7 @@ fn should_observe_only_symbol(
     tox: &ToxicDecision,
     feed_in_ms: f64,
     spread_yes: f64,
+    book_top_lag_ms: f64,
 ) -> bool {
     if !symbol.eq_ignore_ascii_case("SOLUSDT") {
         return false;
@@ -2860,7 +2946,12 @@ fn should_observe_only_symbol(
         return false;
     }
 
-    matches!(tox.regime, ToxicRegime::Danger) || feed_in_ms > 250.0 || spread_yes > 0.020
+    // Keep SOL observe-only unless the local "ref lead vs book" lag is within a tight bound.
+    // This avoids letting one slow/volatile venue degrade the overall engine quality.
+    book_top_lag_ms > 130.0
+        || matches!(tox.regime, ToxicRegime::Danger)
+        || feed_in_ms > 250.0
+        || spread_yes > 0.020
 }
 
 fn estimate_queue_fill_proxy(tox_score: f64, spread_yes: f64, feed_in_ms: f64) -> f64 {
@@ -3391,6 +3482,23 @@ async fn pnl_after_horizon(
     Some(pnl)
 }
 
+fn evaluate_survival(shot: &ShadowShot, book: &BookTop) -> bool {
+    let probe_px = if shot.survival_probe_price > 0.0 {
+        shot.survival_probe_price
+    } else {
+        shot.intended_price
+    };
+    if probe_px <= 0.0 {
+        return false;
+    }
+    match shot.side {
+        OrderSide::BuyYes => probe_px >= book.ask_yes,
+        OrderSide::SellYes => probe_px <= book.bid_yes,
+        OrderSide::BuyNo => probe_px >= book.ask_no,
+        OrderSide::SellNo => probe_px <= book.bid_no,
+    }
+}
+
 fn evaluate_fillable(
     shot: &ShadowShot,
     book: &BookTop,
@@ -3426,11 +3534,15 @@ fn classify_unfilled_outcome(
     book: &BookTop,
     latency_ms: f64,
     delay_ms: u64,
+    survived: bool,
     queue_fill_prob: f64,
 ) -> EdgeAttribution {
     let spread = (book.ask_yes - book.bid_yes).max(0.0);
     if delay_ms >= 400 {
         return EdgeAttribution::StaleQuote;
+    }
+    if !survived {
+        return EdgeAttribution::BookMoved;
     }
     if book.ask_yes <= 0.0 || book.bid_yes <= 0.0 {
         return EdgeAttribution::LiquidityThin;
@@ -4605,6 +4717,18 @@ fn fillability_ratio(outcomes: &[ShadowOutcome], delay_ms: u64) -> f64 {
     filled as f64 / scoped.len() as f64
 }
 
+fn survival_ratio(outcomes: &[ShadowOutcome], delay_ms: u64) -> f64 {
+    let scoped = outcomes
+        .iter()
+        .filter(|o| o.delay_ms == delay_ms)
+        .collect::<Vec<_>>();
+    if scoped.is_empty() {
+        return 0.0;
+    }
+    let survived = scoped.iter().filter(|o| o.survived).count();
+    survived as f64 / scoped.len() as f64
+}
+
 fn build_market_scorecard(shots: &[ShadowShot], outcomes: &[ShadowOutcome]) -> Vec<MarketScoreRow> {
     const PRIMARY_DELAY_MS: u64 = 10;
     let mut keys: HashMap<(String, String), ()> = HashMap::new();
@@ -4826,9 +4950,11 @@ mod tests {
             reason_codes: vec![],
             ts_ns: 1,
         };
-        assert!(should_observe_only_symbol("SOLUSDT", &cfg, &tox, 260.0, 0.01));
-        assert!(should_observe_only_symbol("SOLUSDT", &cfg, &tox, 120.0, 0.03));
-        assert!(!should_observe_only_symbol("BTCUSDT", &cfg, &tox, 260.0, 0.03));
+        assert!(should_observe_only_symbol("SOLUSDT", &cfg, &tox, 120.0, 0.01, 180.0));
+        assert!(should_observe_only_symbol("SOLUSDT", &cfg, &tox, 260.0, 0.01, 80.0));
+        assert!(should_observe_only_symbol("SOLUSDT", &cfg, &tox, 120.0, 0.03, 80.0));
+        assert!(!should_observe_only_symbol("SOLUSDT", &cfg, &tox, 120.0, 0.01, 80.0));
+        assert!(!should_observe_only_symbol("BTCUSDT", &cfg, &tox, 260.0, 0.03, 999.0));
     }
 
     #[test]

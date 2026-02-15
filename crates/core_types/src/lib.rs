@@ -444,6 +444,10 @@ pub struct ShadowOutcome {
     pub symbol: String,
     pub side: OrderSide,
     pub delay_ms: u64,
+    /// Whether the opportunity still existed at the probe delay (price still crossable),
+    /// ignoring queue position / competition modeling.
+    #[serde(default)]
+    pub survived: bool,
     pub fillable: bool,
     #[serde(default = "default_execution_style")]
     pub execution_style: ExecutionStyle,

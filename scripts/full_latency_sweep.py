@@ -38,6 +38,7 @@ def collect_engine_series(base_url: str, seconds: int, poll_interval: float) -> 
     deadline = time.time() + max(1, seconds)
     samples = 0
     failures = 0
+    last_live: Dict[str, Any] | None = None
 
     series: Dict[str, List[float]] = {
         "tick_to_ack_p99_ms": [],
@@ -46,11 +47,16 @@ def collect_engine_series(base_url: str, seconds: int, poll_interval: float) -> 
         "feed_in_p99_ms": [],
         "source_latency_p99_ms": [],
         "local_backlog_p99_ms": [],
+        "book_top_lag_p50_ms": [],
+        "book_top_lag_p90_ms": [],
+        "book_top_lag_p99_ms": [],
         "quote_block_ratio": [],
         "policy_block_ratio": [],
         "executed_over_eligible": [],
         "ev_net_usdc_p50": [],
         "ev_positive_ratio": [],
+        "survival_10ms": [],
+        "fillability_10ms": [],
         "window_outcomes": [],
     }
 
@@ -59,6 +65,7 @@ def collect_engine_series(base_url: str, seconds: int, poll_interval: float) -> 
             resp = session.get(f"{base_url.rstrip('/')}/report/shadow/live", timeout=5)
             resp.raise_for_status()
             live = resp.json()
+            last_live = live
             latency = live.get("latency") or {}
 
             def push(key: str, value: Any) -> None:
@@ -74,6 +81,11 @@ def collect_engine_series(base_url: str, seconds: int, poll_interval: float) -> 
             push("ev_net_usdc_p50", live.get("ev_net_usdc_p50"))
             push("ev_positive_ratio", live.get("ev_positive_ratio"))
             push("window_outcomes", live.get("window_outcomes"))
+            push("survival_10ms", live.get("survival_10ms"))
+            push("fillability_10ms", live.get("fillability_10ms"))
+            push("book_top_lag_p50_ms", live.get("book_top_lag_p50_ms"))
+            push("book_top_lag_p90_ms", live.get("book_top_lag_p90_ms"))
+            push("book_top_lag_p99_ms", live.get("book_top_lag_p99_ms"))
 
             push("feed_in_p99_ms", latency.get("feed_in_p99_ms"))
             push("source_latency_p99_ms", live.get("source_latency_p99_ms"))
@@ -88,6 +100,13 @@ def collect_engine_series(base_url: str, seconds: int, poll_interval: float) -> 
         "samples": samples,
         "failures": failures,
         "stats": {k: summarize(v) for k, v in series.items()},
+        "last": {
+            "window_id": (last_live or {}).get("window_id"),
+            "gate_ready": (last_live or {}).get("gate_ready"),
+            "window_outcomes": (last_live or {}).get("window_outcomes"),
+            "book_top_lag_by_symbol_p50_ms": (last_live or {}).get("book_top_lag_by_symbol_p50_ms"),
+            "survival_10ms_by_symbol": (last_live or {}).get("survival_10ms_by_symbol"),
+        },
     }
 
 
