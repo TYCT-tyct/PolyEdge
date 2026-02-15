@@ -251,7 +251,10 @@ async fn reload_risk(
     State(state): State<AppState>,
     Json(req): Json<RiskReloadReq>,
 ) -> Json<RiskReloadResp> {
-    let mut cfg = state.risk_limits.write().await;
+    let mut cfg = state
+        .risk_limits
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
     if let Some(v) = req.max_market_notional {
         cfg.max_market_notional = v.max(0.0);
     }
@@ -270,11 +273,12 @@ async fn reload_risk(
     if let Some(v) = req.cooldown_sec {
         cfg.cooldown_sec = v.max(1);
     }
+    let snapshot = cfg.clone();
     append_jsonl(
         &dataset_path("reports", "risk_reload.jsonl"),
-        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "risk": *cfg}),
+        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "risk": snapshot}),
     );
-    Json(RiskReloadResp { risk: cfg.clone() })
+    Json(RiskReloadResp { risk: snapshot })
 }
 
 async fn reload_toxicity(

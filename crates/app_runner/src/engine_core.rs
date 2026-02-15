@@ -74,10 +74,3 @@ pub(super) fn classify_execution_error_reason(err: &anyhow::Error) -> &'static s
         "execution_error"
     }
 }
-
-pub(super) fn edge_for_side(signal: &core_types::Signal, side: &OrderSide) -> f64 {
-    match side {
-        OrderSide::BuyYes | OrderSide::SellNo => signal.edge_bps_bid,
-        OrderSide::SellYes | OrderSide::BuyNo => signal.edge_bps_ask,
-    }
-}

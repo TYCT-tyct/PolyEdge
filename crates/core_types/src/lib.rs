@@ -278,9 +278,12 @@ pub struct RiskContext {
     pub symbol: String,
     pub order_count: usize,
     pub proposed_size: f64,
+    pub proposed_notional_usdc: f64,
     pub market_notional: f64,
     pub asset_notional: f64,
     pub drawdown_pct: f64,
+    pub loss_streak: u32,
+    pub now_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

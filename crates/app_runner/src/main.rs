@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
@@ -17,9 +17,9 @@ use chrono::Utc;
 use core_types::{
     new_id, BookTop, ControlCommand, EdgeAttribution, EngineEvent, EnginePnLBreakdown,
     ExecutionStyle, ExecutionVenue, FairValueModel, InventoryState, MarketFeed, MarketHealth,
-    OrderAck, OrderIntentV2, OrderSide, OrderTimeInForce, QuoteEval, QuotePolicy, RefPriceFeed,
-    RefTick, RiskContext, RiskManager, ShadowOutcome, ShadowShot, ToxicDecision, ToxicFeatures,
-    ToxicRegime,
+    OrderAck, OrderIntentV2, OrderSide, OrderTimeInForce, QuoteEval, QuoteIntent, QuotePolicy,
+    RefPriceFeed, RefTick, RiskContext, RiskManager, ShadowOutcome, ShadowShot, ToxicDecision,
+    ToxicFeatures, ToxicRegime,
 };
 use execution_clob::{ClobExecution, ExecutionMode};
 use fair_value::{BasisMrConfig, BasisMrFairValue};
@@ -44,12 +44,12 @@ mod gate_eval;
 mod orchestration;
 mod stats_utils;
 use engine_core::{
-    classify_execution_error_reason, classify_execution_style, edge_for_side,
-    is_policy_block_reason, is_quote_reject_reason, normalize_reject_code,
+    classify_execution_error_reason, classify_execution_style, is_policy_block_reason,
+    is_quote_reject_reason, normalize_reject_code,
 };
 use stats_utils::{
-    freshness_ms, now_ns, percentile, policy_block_ratio, push_capped, quote_block_ratio,
-    robust_filter_iqr, value_to_f64,
+    freshness_ms, now_ns, percentile, percentile_deque, policy_block_ratio, push_capped,
+    quote_block_ratio, robust_filter_iqr, value_to_f64,
 };
 
 #[derive(Clone)]
@@ -64,7 +64,7 @@ struct AppState {
     fair_value_cfg: Arc<StdRwLock<BasisMrConfig>>,
     toxicity_cfg: Arc<RwLock<ToxicityConfig>>,
     allocator_cfg: Arc<RwLock<AllocatorConfig>>,
-    risk_limits: Arc<RwLock<RiskLimits>>,
+    risk_limits: Arc<StdRwLock<RiskLimits>>,
     tox_state: Arc<RwLock<HashMap<String, MarketToxicState>>>,
     shadow_stats: Arc<ShadowStats>,
     perf_profile: Arc<RwLock<PerfProfile>>,
@@ -98,7 +98,7 @@ struct EngineShared {
     strategy_cfg: Arc<RwLock<MakerConfig>>,
     fair_value_cfg: Arc<StdRwLock<BasisMrConfig>>,
     toxicity_cfg: Arc<RwLock<ToxicityConfig>>,
-    risk_limits: Arc<RwLock<RiskLimits>>,
+    risk_manager: Arc<DefaultRiskManager>,
     universe_symbols: Arc<Vec<String>>,
     universe_market_types: Arc<Vec<String>>,
     universe_timeframes: Arc<Vec<String>>,
@@ -326,9 +326,9 @@ impl Default for ToxicityConfig {
 #[derive(Debug, Clone)]
 struct MarketToxicState {
     symbol: String,
-    markout_1s: Vec<f64>,
-    markout_5s: Vec<f64>,
-    markout_10s: Vec<f64>,
+    markout_1s: VecDeque<f64>,
+    markout_5s: VecDeque<f64>,
+    markout_10s: VecDeque<f64>,
     attempted: u64,
     no_quote: u64,
     symbol_missing: u64,
@@ -341,9 +341,9 @@ impl Default for MarketToxicState {
     fn default() -> Self {
         Self {
             symbol: String::new(),
-            markout_1s: Vec::new(),
-            markout_5s: Vec::new(),
-            markout_10s: Vec::new(),
+            markout_1s: VecDeque::new(),
+            markout_5s: VecDeque::new(),
+            markout_10s: VecDeque::new(),
             attempted: 0,
             no_quote: 0,
             symbol_missing: 0,
@@ -677,6 +677,7 @@ struct ShadowStats {
     seq_gap: AtomicU64,
     ts_inversion: AtomicU64,
     stale_tick_dropped: AtomicU64,
+    loss_streak: AtomicU64,
     observe_only: AtomicBool,
     paused: AtomicBool,
     paused_since_ms: AtomicU64,
@@ -734,6 +735,7 @@ impl ShadowStats {
             seq_gap: AtomicU64::new(0),
             ts_inversion: AtomicU64::new(0),
             stale_tick_dropped: AtomicU64::new(0),
+            loss_streak: AtomicU64::new(0),
             observe_only: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             paused_since_ms: AtomicU64::new(0),
@@ -787,6 +789,7 @@ impl ShadowStats {
         self.seq_gap.store(0, Ordering::Relaxed);
         self.ts_inversion.store(0, Ordering::Relaxed);
         self.stale_tick_dropped.store(0, Ordering::Relaxed);
+        self.loss_streak.store(0, Ordering::Relaxed);
         self.observe_only.store(false, Ordering::Relaxed);
         self.paused.store(false, Ordering::Relaxed);
         self.paused_since_ms.store(0, Ordering::Relaxed);
@@ -811,6 +814,16 @@ impl ShadowStats {
     }
 
     async fn push_outcome(&self, outcome: ShadowOutcome) {
+        // Loss-streak only considers primary delay (10ms) *fillable* outcomes, so "no fills"
+        // does not trip risk controls.
+        const PRIMARY_DELAY_MS: u64 = 10;
+        if outcome.delay_ms == PRIMARY_DELAY_MS && outcome.fillable {
+            if outcome.net_markout_10s_usdc.unwrap_or(0.0) < 0.0 {
+                self.loss_streak.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.loss_streak.store(0, Ordering::Relaxed);
+            }
+        }
         let ingest_seq = next_normalized_ingest_seq();
         let source_seq = outcome.ts_ns.max(0) as u64;
         append_jsonl(
@@ -824,6 +837,10 @@ impl ShadowStats {
         );
         let mut outcomes = self.outcomes.write().await;
         push_capped(&mut outcomes, outcome, Self::SHADOW_CAP);
+    }
+
+    fn loss_streak(&self) -> u32 {
+        self.loss_streak.load(Ordering::Relaxed).min(u32::MAX as u64) as u32
     }
 
     async fn window_outcomes_len(&self) -> usize {
@@ -1494,7 +1511,7 @@ async fn async_main() -> Result<()> {
     let strategy_cfg = Arc::new(RwLock::new(load_strategy_config()));
     let fair_value_cfg = Arc::new(StdRwLock::new(load_fair_value_config()));
     let toxicity_cfg = Arc::new(RwLock::new(ToxicityConfig::default()));
-    let risk_limits = Arc::new(RwLock::new(load_risk_limits_config()));
+    let risk_limits = Arc::new(StdRwLock::new(load_risk_limits_config()));
     let perf_profile = Arc::new(RwLock::new(load_perf_profile_config()));
     let allocator_cfg = {
         let strategy = strategy_cfg.read().await.clone();
@@ -1534,9 +1551,11 @@ async fn async_main() -> Result<()> {
     let scoring_rebate_factor = std::env::var("POLYEDGE_SCORING_REBATE_FACTOR")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(0.25)
+        // Worst-case by default: assume no rebate unless we have hard evidence.
+        .unwrap_or(0.0)
         .clamp(0.0, 1.0);
 
+    let risk_manager = Arc::new(DefaultRiskManager::new(risk_limits.clone()));
     let shared = Arc::new(EngineShared {
         latest_books: Arc::new(RwLock::new(HashMap::new())),
         market_to_symbol: Arc::new(RwLock::new(HashMap::new())),
@@ -1550,7 +1569,7 @@ async fn async_main() -> Result<()> {
         strategy_cfg,
         fair_value_cfg,
         toxicity_cfg,
-        risk_limits,
+        risk_manager,
         universe_symbols: universe_symbols.clone(),
         universe_market_types: universe_market_types.clone(),
         universe_timeframes: universe_timeframes.clone(),
@@ -1642,19 +1661,21 @@ fn spawn_reference_feed(bus: RingBus<EngineEvent>, stats: Arc<ShadowStats>, symb
                     }
                     last_source_ts_by_stream.insert(stream_key, source_ts);
                     stats.mark_ref_tick(tick.recv_ts_ms);
-                    let tick_json = serde_json::to_value(&tick).unwrap_or(serde_json::json!({}));
-                    let hash = sha256_hex(&tick_json.to_string());
-                    append_jsonl(
-                        &dataset_path("raw", "ref_ticks.jsonl"),
-                        &serde_json::json!({
-                            "ts_ms": Utc::now().timestamp_millis(),
-                            "source_seq": source_seq,
-                            "ingest_seq": ingest_seq,
-                            "valid": valid,
-                            "sha256": hash,
-                            "tick": tick_json
-                        }),
+                    // Hot-path logging: avoid dynamic JSON trees + extra stringify passes.
+                    // Build a single JSONL line and hand it to the async writer.
+                    let tick_json =
+                        serde_json::to_string(&tick).unwrap_or_else(|_| "{}".to_string());
+                    let hash = sha256_hex(&tick_json);
+                    let line = format!(
+                        "{{\"ts_ms\":{},\"source_seq\":{},\"ingest_seq\":{},\"valid\":{},\"sha256\":\"{}\",\"tick\":{}}}",
+                        Utc::now().timestamp_millis(),
+                        source_seq,
+                        ingest_seq,
+                        valid,
+                        hash,
+                        tick_json
                     );
+                    append_jsonl_line(&dataset_path("raw", "ref_ticks.jsonl"), line);
                     if !valid {
                         stats.record_issue("invalid_ref_tick").await;
                         continue;
@@ -1711,19 +1732,19 @@ fn spawn_market_feed(
                     }
                     last_source_ts_by_market.insert(book.market_id.clone(), source_ts);
                     stats.mark_book_tick(book.ts_ms);
-                    let book_json = serde_json::to_value(&book).unwrap_or(serde_json::json!({}));
-                    let hash = sha256_hex(&book_json.to_string());
-                    append_jsonl(
-                        &dataset_path("raw", "book_tops.jsonl"),
-                        &serde_json::json!({
-                            "ts_ms": Utc::now().timestamp_millis(),
-                            "source_seq": source_seq,
-                            "ingest_seq": ingest_seq,
-                            "valid": valid,
-                            "sha256": hash,
-                            "book": book_json
-                        }),
+                    let book_json =
+                        serde_json::to_string(&book).unwrap_or_else(|_| "{}".to_string());
+                    let hash = sha256_hex(&book_json);
+                    let line = format!(
+                        "{{\"ts_ms\":{},\"source_seq\":{},\"ingest_seq\":{},\"valid\":{},\"sha256\":\"{}\",\"book\":{}}}",
+                        Utc::now().timestamp_millis(),
+                        source_seq,
+                        ingest_seq,
+                        valid,
+                        hash,
+                        book_json
                     );
+                    append_jsonl_line(&dataset_path("raw", "book_tops.jsonl"), line);
                     if !valid {
                         stats.record_issue("invalid_book_top").await;
                         continue;
@@ -1913,13 +1934,19 @@ fn spawn_strategy_engine(
 
                     // Positive value means: our fast reference tick arrived earlier than the
                     // Polymarket book update (i.e. the exploitable lag window).
-                    let book_top_lag_ms =
-                        if tick_fast.recv_ts_local_ns > 0 && book.recv_ts_local_ns > 0 {
-                            ((book.recv_ts_local_ns - tick_fast.recv_ts_local_ns).max(0) as f64)
-                                / 1_000_000.0
-                        } else {
-                            0.0
-                        };
+                    //
+                    // Guardrail: if the tick is already old, this is not a meaningful "lag window"
+                    // measurement and would inflate p50/p99. We only sample when the tick is fresh.
+                    let tick_age_ms = freshness_ms(Utc::now().timestamp_millis(), tick_fast.recv_ts_ms);
+                    let book_top_lag_ms = if tick_age_ms <= 1_500
+                        && tick_fast.recv_ts_local_ns > 0
+                        && book.recv_ts_local_ns > 0
+                    {
+                        ((book.recv_ts_local_ns - tick_fast.recv_ts_local_ns).max(0) as f64)
+                            / 1_000_000.0
+                    } else {
+                        0.0
+                    };
                     let should_sample_book_lag = book_lag_sample_at
                         .get(&symbol)
                         .map(|t| t.elapsed() >= Duration::from_millis(200))
@@ -2076,8 +2103,10 @@ fn spawn_strategy_engine(
                             st.last_regime = decision.regime.clone();
                             let score =
                                 compute_market_score(st, decision.tox_score, markout_samples);
-                            let markout_10s_p50 = percentile(&st.markout_10s, 0.50).unwrap_or(0.0);
-                            let markout_10s_p25 = percentile(&st.markout_10s, 0.25).unwrap_or(0.0);
+                            let markout_10s_p50 =
+                                percentile_deque(&st.markout_10s, 0.50).unwrap_or(0.0);
+                            let markout_10s_p25 =
+                                percentile_deque(&st.markout_10s, 0.25).unwrap_or(0.0);
                             let pending_exposure = pending_market_exposure;
                             let attempted = st.attempted.max(1);
                             let no_quote_rate = st.no_quote as f64 / attempted as f64;
@@ -2282,18 +2311,21 @@ fn spawn_strategy_engine(
                         shared.shadow_stats.mark_attempted();
 
                         let risk_start = Instant::now();
+                        let proposed_notional_usdc =
+                            (intent.price.max(0.0) * intent.size.max(0.0)).max(0.0);
                         let ctx = RiskContext {
                             market_id: intent.market_id.clone(),
                             symbol: symbol.clone(),
                             order_count: execution.open_orders_count(),
                             proposed_size: intent.size,
+                            proposed_notional_usdc,
                             market_notional: inventory.exposure_notional + pending_market_exposure,
                             asset_notional: inventory.exposure_notional + pending_total_exposure,
                             drawdown_pct: drawdown,
+                            loss_streak: shared.shadow_stats.loss_streak(),
+                            now_ms: Utc::now().timestamp_millis(),
                         };
-                        let limits = shared.risk_limits.read().await.clone();
-                        let risk = DefaultRiskManager::new(limits);
-                        let decision = risk.evaluate(&ctx);
+                        let decision = shared.risk_manager.evaluate(&ctx);
                         let risk_us = risk_start.elapsed().as_secs_f64() * 1_000_000.0;
                         shared.shadow_stats.push_risk_us(risk_us).await;
                         metrics::histogram!("latency.risk_us").record(risk_us);
@@ -2316,7 +2348,7 @@ fn spawn_strategy_engine(
                         }
                         intent.size = intent.size.min(decision.capped_size);
 
-                        let edge_gross = edge_for_side(&signal, &intent.side);
+                        let edge_gross = edge_for_intent(signal.fair_yes, &intent);
                         let rebate_est_bps =
                             get_rebate_bps_cached(&shared, &book.market_id, fee_bps).await;
                         let edge_net = edge_gross - fee_bps + rebate_est_bps;
@@ -2834,9 +2866,9 @@ fn build_toxic_features(
     ToxicFeatures {
         market_id: book.market_id.clone(),
         symbol: symbol.to_string(),
-        markout_1s: percentile(&state.markout_1s, 0.50).unwrap_or(0.0),
-        markout_5s: percentile(&state.markout_5s, 0.50).unwrap_or(0.0),
-        markout_10s: percentile(&state.markout_10s, 0.50).unwrap_or(0.0),
+        markout_1s: percentile_deque(&state.markout_1s, 0.50).unwrap_or(0.0),
+        markout_5s: percentile_deque(&state.markout_5s, 0.50).unwrap_or(0.0),
+        markout_10s: percentile_deque(&state.markout_10s, 0.50).unwrap_or(0.0),
         spread_bps,
         microprice_drift,
         stale_ms,
@@ -2942,7 +2974,7 @@ fn compute_market_score(state: &MarketToxicState, tox_score: f64, markout_sample
     let attempted = state.attempted.max(1);
     let no_quote_rate = state.no_quote as f64 / attempted as f64;
     let symbol_missing_rate = state.symbol_missing as f64 / attempted as f64;
-    let markout_10s = percentile(&state.markout_10s, 0.50).unwrap_or(0.0);
+    let markout_10s = percentile_deque(&state.markout_10s, 0.50).unwrap_or(0.0);
     if markout_samples < 20 {
         let warmup_score = 80.0 - no_quote_rate * 6.0 - symbol_missing_rate * 6.0;
         return warmup_score.clamp(45.0, 100.0);
@@ -3197,11 +3229,10 @@ async fn update_toxic_state_from_outcome(shared: &EngineShared, outcome: &Shadow
     }
 }
 
-fn push_rolling(dst: &mut Vec<f64>, value: f64, cap: usize) {
-    dst.push(value);
-    if dst.len() > cap {
-        let drop_n = dst.len() - cap;
-        dst.drain(0..drop_n);
+fn push_rolling(dst: &mut VecDeque<f64>, value: f64, cap: usize) {
+    dst.push_back(value);
+    while dst.len() > cap {
+        dst.pop_front();
     }
 }
 
@@ -3501,8 +3532,11 @@ async fn maybe_spawn_scoring_refresh(
             } else {
                 (entry.scoring_true as f64 / entry.scoring_total as f64).clamp(0.0, 1.0)
             };
-            entry.rebate_bps_est =
-                (fee_bps.max(0.0) * hit_ratio * rebate_factor).clamp(0.0, fee_bps.max(0.0));
+            // Conservative estimate: maker rebates are a fraction of taker fees and depend on
+            // scoring + market share. Default rebate_factor is 0.0 unless explicitly configured.
+            // Cap the pool fraction at 20% of fee_bps as a hard upper bound.
+            entry.rebate_bps_est = (fee_bps.max(0.0) * 0.20 * hit_ratio * rebate_factor)
+                .clamp(0.0, fee_bps.max(0.0));
             entry.fetched_at = Instant::now();
             let log_row = serde_json::json!({
                 "ts_ms": Utc::now().timestamp_millis(),
@@ -3731,6 +3765,15 @@ fn aggressive_price_for_side(book: &BookTop, side: &OrderSide) -> f64 {
     }
 }
 
+fn edge_for_intent(fair_yes: f64, intent: &QuoteIntent) -> f64 {
+    let px = intent.price.max(1e-6);
+    match intent.side {
+        // Expected edge vs. intended entry price in bps of entry.
+        OrderSide::BuyYes | OrderSide::BuyNo => ((fair_yes - px) / px) * 10_000.0,
+        OrderSide::SellYes | OrderSide::SellNo => ((px - fair_yes) / px) * 10_000.0,
+    }
+}
+
 async fn build_toxicity_live_report(
     tox_state: Arc<RwLock<HashMap<String, MarketToxicState>>>,
     shadow_stats: Arc<ShadowStats>,
@@ -3767,7 +3810,7 @@ async fn build_toxicity_live_report(
         let attempted = st.attempted.max(1);
         let no_quote_rate = st.no_quote as f64 / attempted as f64;
         let symbol_missing_rate = st.symbol_missing as f64 / attempted as f64;
-        let markout_10s_bps = percentile(&st.markout_10s, 0.50).unwrap_or(0.0);
+        let markout_10s_bps = percentile_deque(&st.markout_10s, 0.50).unwrap_or(0.0);
         let markout_samples = st
             .markout_1s
             .len()
@@ -4413,8 +4456,7 @@ fn append_jsonl_sync(path: &Path, line: &str) {
     }
 }
 
-fn append_jsonl(path: &Path, value: &serde_json::Value) {
-    let line = value.to_string();
+fn append_jsonl_line(path: &Path, line: String) {
     if let Some(tx) = JSONL_WRITER.get() {
         let req = JsonlWriteReq {
             path: path.to_path_buf(),
@@ -4423,8 +4465,7 @@ fn append_jsonl(path: &Path, value: &serde_json::Value) {
         match tx.try_send(req) {
             Ok(_) => {
                 let cap = JSONL_QUEUE_CAP.load(Ordering::Relaxed) as usize;
-                JSONL_QUEUE_DEPTH
-                    .store(cap.saturating_sub(tx.capacity()) as u64, Ordering::Relaxed);
+                JSONL_QUEUE_DEPTH.store(cap.saturating_sub(tx.capacity()) as u64, Ordering::Relaxed);
                 return;
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(req)) => {
@@ -4448,6 +4489,10 @@ fn append_jsonl(path: &Path, value: &serde_json::Value) {
         }
     }
     append_jsonl_sync(path, &line);
+}
+
+fn append_jsonl(path: &Path, value: &serde_json::Value) {
+    append_jsonl_line(path, value.to_string());
 }
 
 fn persist_live_report_files(live: &ShadowLiveReport) {

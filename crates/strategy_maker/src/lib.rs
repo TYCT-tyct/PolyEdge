@@ -30,7 +30,7 @@ impl Default for MakerConfig {
             ttl_ms: 400,
             taker_trigger_bps: 8.0,
             taker_max_slippage_bps: 25.0,
-            stale_tick_filter_ms: 400.0,
+            stale_tick_filter_ms: 2_000.0,
             market_tier_profile: "balanced".to_string(),
             capital_fraction_kelly: 0.35,
             variance_penalty_lambda: 0.25,
@@ -68,7 +68,12 @@ impl QuotePolicy for MakerQuotePolicy {
         let bid_price = (signal.fair_yes - 0.01 - shift).clamp(0.001, 0.999);
         let ask_price = (signal.fair_yes + 0.01 - shift).clamp(0.001, 0.999);
 
-        if signal.edge_bps_bid >= self.cfg.min_edge_bps {
+        // Maker quoting should be evaluated against the *intended quote price*, not the current
+        // taker top-of-book. Otherwise spreads keep "edge" negative and the strategy starves.
+        let bid_edge_bps = ((signal.fair_yes - bid_price) / bid_price.max(1e-6)) * 10_000.0;
+        let ask_edge_bps = ((ask_price - signal.fair_yes) / ask_price.max(1e-6)) * 10_000.0;
+
+        if bid_edge_bps >= self.cfg.min_edge_bps {
             out.push(QuoteIntent {
                 market_id: signal.market_id.clone(),
                 side: OrderSide::BuyYes,
@@ -78,7 +83,7 @@ impl QuotePolicy for MakerQuotePolicy {
             });
         }
 
-        if signal.edge_bps_ask >= self.cfg.min_edge_bps {
+        if ask_edge_bps >= self.cfg.min_edge_bps {
             out.push(QuoteIntent {
                 market_id: signal.market_id.clone(),
                 side: OrderSide::SellYes,

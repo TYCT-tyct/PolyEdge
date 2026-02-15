@@ -8,7 +8,7 @@ ttl_ms = 400
 [taker]
 trigger_bps = 7.0
 max_slippage_bps = 30.0
-stale_tick_filter_ms = 400
+stale_tick_filter_ms = 2000
 market_tier_profile = "balanced_sol_guard"
 
 [online_calibration]

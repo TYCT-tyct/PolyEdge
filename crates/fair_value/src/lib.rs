@@ -74,7 +74,9 @@ impl FairValueModel for BasisMrFairValue {
             .unwrap_or_else(|_| BasisMrConfig::default());
         let mid_yes = ((book.bid_yes + book.ask_yes) * 0.5).clamp(0.001, 0.999);
         let spread = (book.ask_yes - book.bid_yes).max(0.0001);
-        let key = format!("{}:{}", book.market_id, tick.symbol);
+        // Fix DESIGN-2: Key by symbol only (e.g. "BTCUSDT") to share specific fair value state
+        // across all markets (e.g. daily, 15m) for that asset. This prevents warmup reset on rollover.
+        let key = tick.symbol.clone();
 
         let mut map = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let st = map.entry(key).or_default();

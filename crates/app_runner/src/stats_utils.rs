@@ -1,4 +1,5 @@
 use chrono::Utc;
+use std::collections::VecDeque;
 
 pub fn push_capped<T>(dst: &mut Vec<T>, value: T, cap: usize) {
     dst.push(value);
@@ -13,6 +14,17 @@ pub fn percentile(values: &[f64], p: f64) -> Option<f64> {
         return None;
     }
     let mut v = values.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((v.len() as f64 - 1.0) * p.clamp(0.0, 1.0)).round() as usize;
+    v.get(idx).copied()
+}
+
+pub fn percentile_deque(values: &VecDeque<f64>, p: f64) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    // Avoid calling `percentile(&vec)` which would clone again internally.
+    let mut v: Vec<f64> = values.iter().copied().collect();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let idx = ((v.len() as f64 - 1.0) * p.clamp(0.0, 1.0)).round() as usize;
     v.get(idx).copied()
