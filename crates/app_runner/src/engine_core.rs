@@ -8,7 +8,10 @@ pub(super) fn is_policy_block_reason(reason: &str) -> bool {
     reason == "risk_capped_zero" || reason.starts_with("risk:")
 }
 
-pub(super) fn classify_execution_style(book: &BookTop, intent: &core_types::QuoteIntent) -> ExecutionStyle {
+pub(super) fn classify_execution_style(
+    book: &BookTop,
+    intent: &core_types::QuoteIntent,
+) -> ExecutionStyle {
     match intent.side {
         OrderSide::BuyYes => {
             if intent.price >= book.ask_yes {

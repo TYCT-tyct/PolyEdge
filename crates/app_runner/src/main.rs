@@ -38,18 +38,18 @@ use sha2::{Digest, Sha256};
 use strategy_maker::{MakerConfig, MakerQuotePolicy};
 use tokio::sync::{mpsc, RwLock};
 
-mod stats_utils;
 mod control_api;
 mod engine_core;
 mod gate_eval;
 mod orchestration;
-use stats_utils::{
-    freshness_ms, now_ns, percentile, policy_block_ratio, push_capped, quote_block_ratio,
-    robust_filter_iqr, value_to_f64,
-};
+mod stats_utils;
 use engine_core::{
     classify_execution_error_reason, classify_execution_style, edge_for_side,
     is_policy_block_reason, is_quote_reject_reason, normalize_reject_code,
+};
+use stats_utils::{
+    freshness_ms, now_ns, percentile, policy_block_ratio, push_capped, quote_block_ratio,
+    robust_filter_iqr, value_to_f64,
 };
 
 #[derive(Clone)]
@@ -490,6 +490,15 @@ struct ShadowLiveReport {
     survival_5ms: f64,
     survival_10ms: f64,
     survival_25ms: f64,
+    // Survival probe is an "orderless" latency-arb competitiveness metric:
+    // at T0 we observe a crossable top-of-book price, then check at +Δ whether
+    // it is still crossable. This intentionally does not depend on order acks.
+    survival_probe_5ms: f64,
+    survival_probe_10ms: f64,
+    survival_probe_25ms: f64,
+    survival_probe_5ms_n: u64,
+    survival_probe_10ms_n: u64,
+    survival_probe_25ms_n: u64,
     net_edge_p50_bps: f64,
     net_edge_p10_bps: f64,
     pnl_1s_p50_bps: f64,
@@ -532,6 +541,7 @@ struct ShadowLiveReport {
     book_top_lag_p99_ms: f64,
     book_top_lag_by_symbol_p50_ms: HashMap<String, f64>,
     survival_10ms_by_symbol: HashMap<String, f64>,
+    survival_probe_10ms_by_symbol: HashMap<String, f64>,
     blocked_reason_counts: HashMap<String, u64>,
     latency: LatencyBreakdown,
     market_scorecard: Vec<MarketScoreRow>,
@@ -574,6 +584,54 @@ struct MarketScoreRow {
     roi_notional_10s_bps_p50: f64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct SurvivalProbeCounters {
+    n_5: u64,
+    s_5: u64,
+    n_10: u64,
+    s_10: u64,
+    n_25: u64,
+    s_25: u64,
+}
+
+impl SurvivalProbeCounters {
+    fn record(&mut self, delay_ms: u64, survived: bool) {
+        let (n, s) = match delay_ms {
+            5 => (&mut self.n_5, &mut self.s_5),
+            10 => (&mut self.n_10, &mut self.s_10),
+            25 => (&mut self.n_25, &mut self.s_25),
+            _ => return,
+        };
+        *n = n.saturating_add(1);
+        if survived {
+            *s = s.saturating_add(1);
+        }
+    }
+
+    fn ratio(&self, delay_ms: u64) -> f64 {
+        let (n, s) = match delay_ms {
+            5 => (self.n_5, self.s_5),
+            10 => (self.n_10, self.s_10),
+            25 => (self.n_25, self.s_25),
+            _ => (0, 0),
+        };
+        if n == 0 {
+            0.0
+        } else {
+            s as f64 / n as f64
+        }
+    }
+
+    fn n(&self, delay_ms: u64) -> u64 {
+        match delay_ms {
+            5 => self.n_5,
+            10 => self.n_10,
+            25 => self.n_25,
+            _ => 0,
+        }
+    }
+}
+
 struct ShadowStats {
     window_id: AtomicU64,
     started_at: RwLock<Instant>,
@@ -604,6 +662,8 @@ struct ShadowStats {
     local_backlog_ms: RwLock<Vec<f64>>,
     book_top_lag_ms: RwLock<Vec<f64>>,
     book_top_lag_by_symbol_ms: RwLock<HashMap<String, Vec<f64>>>,
+    survival_probe_overall: RwLock<SurvivalProbeCounters>,
+    survival_probe_by_symbol: RwLock<HashMap<String, SurvivalProbeCounters>>,
     signal_us: RwLock<Vec<f64>>,
     quote_us: RwLock<Vec<f64>>,
     risk_us: RwLock<Vec<f64>>,
@@ -659,6 +719,8 @@ impl ShadowStats {
             local_backlog_ms: RwLock::new(Vec::new()),
             book_top_lag_ms: RwLock::new(Vec::new()),
             book_top_lag_by_symbol_ms: RwLock::new(HashMap::new()),
+            survival_probe_overall: RwLock::new(SurvivalProbeCounters::default()),
+            survival_probe_by_symbol: RwLock::new(HashMap::new()),
             signal_us: RwLock::new(Vec::new()),
             quote_us: RwLock::new(Vec::new()),
             risk_us: RwLock::new(Vec::new()),
@@ -710,6 +772,8 @@ impl ShadowStats {
         self.local_backlog_ms.write().await.clear();
         self.book_top_lag_ms.write().await.clear();
         self.book_top_lag_by_symbol_ms.write().await.clear();
+        *self.survival_probe_overall.write().await = SurvivalProbeCounters::default();
+        self.survival_probe_by_symbol.write().await.clear();
         self.signal_us.write().await.clear();
         self.quote_us.write().await.clear();
         self.risk_us.write().await.clear();
@@ -814,6 +878,16 @@ impl ShadowStats {
         let mut by_symbol = self.book_top_lag_by_symbol_ms.write().await;
         let entry = by_symbol.entry(symbol.to_string()).or_default();
         push_capped(entry, ms, 4_096);
+    }
+
+    async fn record_survival_probe(&self, symbol: &str, delay_ms: u64, survived: bool) {
+        {
+            let mut c = self.survival_probe_overall.write().await;
+            c.record(delay_ms, survived);
+        }
+        let mut by_symbol = self.survival_probe_by_symbol.write().await;
+        let entry = by_symbol.entry(symbol.to_string()).or_default();
+        entry.record(delay_ms, survived);
     }
 
     async fn push_signal_us(&self, us: f64) {
@@ -1005,6 +1079,8 @@ impl ShadowStats {
         let parse_us = self.parse_us.read().await.clone();
         let io_queue_depth = self.io_queue_depth.read().await.clone();
         let blocked_reason_counts = self.blocked_reasons.read().await.clone();
+        let survival_probe_overall = *self.survival_probe_overall.read().await;
+        let survival_probe_by_symbol = self.survival_probe_by_symbol.read().await.clone();
 
         let fillability_5 = fillability_ratio(&outcomes, 5);
         let fillability_10 = fillability_ratio(&outcomes, 10);
@@ -1012,6 +1088,12 @@ impl ShadowStats {
         let survival_5 = survival_ratio(&outcomes, 5);
         let survival_10 = survival_ratio(&outcomes, 10);
         let survival_25 = survival_ratio(&outcomes, 25);
+        let survival_probe_5 = survival_probe_overall.ratio(5);
+        let survival_probe_10 = survival_probe_overall.ratio(10);
+        let survival_probe_25 = survival_probe_overall.ratio(25);
+        let survival_probe_5_n = survival_probe_overall.n(5);
+        let survival_probe_10_n = survival_probe_overall.n(10);
+        let survival_probe_25_n = survival_probe_overall.n(25);
 
         let shots_primary = shots
             .iter()
@@ -1139,6 +1221,10 @@ impl ShadowStats {
         for (sym, (n, s)) in survival_counts {
             survival_10ms_by_symbol.insert(sym, if n == 0 { 0.0 } else { s as f64 / n as f64 });
         }
+        let mut survival_probe_10ms_by_symbol = HashMap::new();
+        for (sym, c) in survival_probe_by_symbol {
+            survival_probe_10ms_by_symbol.insert(sym, c.ratio(10));
+        }
 
         let latency = LatencyBreakdown {
             feed_in_p50_ms: percentile(&feed_in_ms, 0.50).unwrap_or(0.0),
@@ -1206,6 +1292,12 @@ impl ShadowStats {
             survival_5ms: survival_5,
             survival_10ms: survival_10,
             survival_25ms: survival_25,
+            survival_probe_5ms: survival_probe_5,
+            survival_probe_10ms: survival_probe_10,
+            survival_probe_25ms: survival_probe_25,
+            survival_probe_5ms_n: survival_probe_5_n,
+            survival_probe_10ms_n: survival_probe_10_n,
+            survival_probe_25ms_n: survival_probe_25_n,
             net_edge_p50_bps: net_edge_p50,
             net_edge_p10_bps: net_edge_p10,
             pnl_1s_p50_bps: pnl_1s_p50,
@@ -1248,6 +1340,7 @@ impl ShadowStats {
             book_top_lag_p99_ms,
             book_top_lag_by_symbol_p50_ms,
             survival_10ms_by_symbol,
+            survival_probe_10ms_by_symbol,
             blocked_reason_counts,
             latency,
             market_scorecard: scorecard,
@@ -1493,7 +1586,11 @@ async fn async_main() -> Result<()> {
         execution.clone(),
         shared.toxicity_cfg.clone(),
     );
-    orchestration::spawn_data_reconcile_task(bus.clone(), paused.clone(), shared.shadow_stats.clone());
+    orchestration::spawn_data_reconcile_task(
+        bus.clone(),
+        paused.clone(),
+        shared.shadow_stats.clone(),
+    );
 
     let app = control_api::build_router(state);
 
@@ -1507,11 +1604,7 @@ fn install_rustls_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
-fn spawn_reference_feed(
-    bus: RingBus<EngineEvent>,
-    stats: Arc<ShadowStats>,
-    symbols: Vec<String>,
-) {
+fn spawn_reference_feed(bus: RingBus<EngineEvent>, stats: Arc<ShadowStats>, symbols: Vec<String>) {
     const TS_INVERSION_TOLERANCE_MS: i64 = 250;
     tokio::spawn(async move {
         let feed = MultiSourceRefFeed::new(Duration::from_millis(50));
@@ -1824,9 +1917,9 @@ fn spawn_strategy_engine(
                         if tick_fast.recv_ts_local_ns > 0 && book.recv_ts_local_ns > 0 {
                             ((book.recv_ts_local_ns - tick_fast.recv_ts_local_ns).max(0) as f64)
                                 / 1_000_000.0
-                    } else {
-                        0.0
-                    };
+                        } else {
+                            0.0
+                        };
                     let should_sample_book_lag = book_lag_sample_at
                         .get(&symbol)
                         .map(|t| t.elapsed() >= Duration::from_millis(200))
@@ -1841,7 +1934,8 @@ fn spawn_strategy_engine(
 
                     let latency_sample = estimate_feed_latency(tick_fast, &book);
                     let feed_in_ms = latency_sample.feed_in_ms;
-                    let stale_tick_filter_ms = shared.strategy_cfg.read().await.stale_tick_filter_ms;
+                    let stale_tick_filter_ms =
+                        shared.strategy_cfg.read().await.stale_tick_filter_ms;
                     if feed_in_ms > stale_tick_filter_ms {
                         shared.shadow_stats.mark_stale_tick_dropped();
                         shared.shadow_stats.record_issue("stale_tick_dropped").await;
@@ -1874,6 +1968,29 @@ fn spawn_strategy_engine(
                     shared.shadow_stats.push_signal_us(signal_us).await;
                     metrics::histogram!("latency.signal_us").record(signal_us);
                     let _ = bus.publish(EngineEvent::Signal(signal.clone()));
+                    if should_sample_book_lag && book_top_lag_ms >= 5.0 {
+                        // "Orderless" survival probe: measure whether an observed top-of-book
+                        // price survives for +Δ ms, independent of order placement.
+                        let mid_yes = (book.bid_yes + book.ask_yes) * 0.5;
+                        let probe_side = if signal.fair_yes >= mid_yes {
+                            OrderSide::BuyYes
+                        } else {
+                            OrderSide::BuyNo
+                        };
+                        let probe_px = aggressive_price_for_side(&book, &probe_side);
+                        if probe_px > 0.0 {
+                            for delay_ms in [5_u64, 10_u64, 25_u64] {
+                                spawn_survival_probe_task(
+                                    shared.clone(),
+                                    book.market_id.clone(),
+                                    symbol.clone(),
+                                    probe_side.clone(),
+                                    probe_px,
+                                    delay_ms,
+                                );
+                            }
+                        }
+                    }
 
                     let cfg = shared.strategy_cfg.read().await.clone();
                     let tox_cfg = shared.toxicity_cfg.read().await.clone();
@@ -2242,8 +2359,9 @@ fn spawn_strategy_engine(
                         ) {
                             let aggressive_price = aggressive_price_for_side(&book, &intent.side);
                             let passive_price = intent.price.max(1e-6);
-                            let price_move_bps =
-                                ((aggressive_price - intent.price).abs() / passive_price) * 10_000.0;
+                            let price_move_bps = ((aggressive_price - intent.price).abs()
+                                / passive_price)
+                                * 10_000.0;
                             let taker_slippage_budget = adaptive_taker_slippage_bps(
                                 cfg.taker_max_slippage_bps,
                                 &cfg.market_tier_profile,
@@ -2266,8 +2384,9 @@ fn spawn_strategy_engine(
                             }
                         }
                         let per_market_rps = (shared.rate_limit_rps / 8.0).max(0.5);
-                        let market_bucket =
-                            market_rate_budget.entry(book.market_id.clone()).or_insert_with(|| {
+                        let market_bucket = market_rate_budget
+                            .entry(book.market_id.clone())
+                            .or_insert_with(|| {
                                 TokenBucket::new(per_market_rps, (per_market_rps * 2.0).max(1.0))
                             });
                         if !global_rate_budget.try_take(1.0) {
@@ -2288,7 +2407,8 @@ fn spawn_strategy_engine(
 
                         let decision_compute_ms =
                             intent_decision_start.elapsed().as_secs_f64() * 1_000.0;
-                        let tick_to_decision_ms = latency_sample.local_backlog_ms + decision_compute_ms;
+                        let tick_to_decision_ms =
+                            latency_sample.local_backlog_ms + decision_compute_ms;
                         let place_start = Instant::now();
                         let execution_style = if force_taker {
                             ExecutionStyle::Taker
@@ -2411,16 +2531,15 @@ fn spawn_strategy_engine(
                                     .unwrap_or_else(|| "unknown".to_string());
                                 shared
                                     .shadow_stats
-                                    .mark_blocked_with_reason(&format!("exchange_reject_{reject_code}"))
+                                    .mark_blocked_with_reason(&format!(
+                                        "exchange_reject_{reject_code}"
+                                    ))
                                     .await;
                                 metrics::counter!("execution.place_rejected").increment(1);
                             }
                             Err(err) => {
                                 let reason = classify_execution_error_reason(&err);
-                                shared
-                                    .shadow_stats
-                                    .mark_blocked_with_reason(reason)
-                                    .await;
+                                shared.shadow_stats.mark_blocked_with_reason(reason).await;
                                 tracing::warn!(?err, "place_order failed");
                                 metrics::counter!("execution.place_error").increment(1);
                             }
@@ -2480,7 +2599,8 @@ fn spawn_shadow_outcome_task(
             pnl_10s_bps,
         ) = if let Some(book) = book {
             let survived = evaluate_survival(&shot, &book);
-            let (fillable, slippage_bps, queue_fill_prob) = evaluate_fillable(&shot, &book, latency_ms);
+            let (fillable, slippage_bps, queue_fill_prob) =
+                evaluate_fillable(&shot, &book, latency_ms);
             if fillable {
                 let p1 = pnl_after_horizon(&shared, &shot, Duration::from_secs(1)).await;
                 let p5 = pnl_after_horizon(&shared, &shot, Duration::from_secs(5)).await;
@@ -2497,8 +2617,13 @@ fn spawn_shadow_outcome_task(
                     p10,
                 )
             } else {
-                let attribution =
-                    classify_unfilled_outcome(&book, latency_ms, shot.delay_ms, survived, queue_fill_prob);
+                let attribution = classify_unfilled_outcome(
+                    &book,
+                    latency_ms,
+                    shot.delay_ms,
+                    survived,
+                    queue_fill_prob,
+                );
                 (
                     survived,
                     false,
@@ -2579,6 +2704,28 @@ fn spawn_shadow_outcome_task(
             let _ = bus.publish(EngineEvent::QuoteEval(eval));
         }
         let _ = bus.publish(EngineEvent::ShadowOutcome(outcome));
+    });
+}
+
+fn spawn_survival_probe_task(
+    shared: Arc<EngineShared>,
+    market_id: String,
+    symbol: String,
+    side: OrderSide,
+    probe_px: f64,
+    delay_ms: u64,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        let book = shared.latest_books.read().await.get(&market_id).cloned();
+        let survived = match book {
+            Some(ref b) => is_crossable(&side, probe_px, b),
+            None => false,
+        };
+        shared
+            .shadow_stats
+            .record_survival_probe(&symbol, delay_ms, survived)
+            .await;
     });
 }
 
@@ -2863,9 +3010,8 @@ fn should_force_taker(
     symbol: &str,
 ) -> bool {
     let profile = cfg.market_tier_profile.to_ascii_lowercase();
-    let aggressive_profile = profile.contains("taker")
-        || profile.contains("aggressive")
-        || profile.contains("latency");
+    let aggressive_profile =
+        profile.contains("taker") || profile.contains("aggressive") || profile.contains("latency");
 
     let warmup_factor = if window_outcomes < gate_min_outcomes {
         let progress = (window_outcomes as f64 / gate_min_outcomes.max(1) as f64).clamp(0.0, 1.0);
@@ -2924,9 +3070,7 @@ fn adaptive_taker_slippage_bps(
     if aggressive {
         out *= 1.10;
     }
-    if symbol.eq_ignore_ascii_case("SOLUSDT")
-        && (profile.contains("sol_guard") || !aggressive)
-    {
+    if symbol.eq_ignore_ascii_case("SOLUSDT") && (profile.contains("sol_guard") || !aggressive) {
         out *= 0.80;
     }
 
@@ -3143,15 +3287,6 @@ fn estimate_feed_latency(tick: &RefTick, book: &BookTop) -> FeedLatencySample {
     }
 }
 
-fn ref_source_rank(source: &str) -> u8 {
-    match source {
-        "binance_ws" => 3,
-        "coinbase_ws" => 2,
-        "bybit_ws" => 1,
-        _ => 0,
-    }
-}
-
 fn is_anchor_ref_source(source: &str) -> bool {
     source == "chainlink_rtds"
 }
@@ -3169,10 +3304,9 @@ fn should_replace_ref_tick(current: &RefTick, next: &RefTick) -> bool {
     if next_event > current_event + 1 {
         return true;
     }
-    if next.recv_ts_local_ns > current.recv_ts_local_ns + 1_000_000 {
-        return true;
-    }
-    ref_source_rank(next.source.as_str()) >= ref_source_rank(current.source.as_str())
+    // If the event timestamps are effectively equal, keep the first-arriving tick for speed.
+    // (The later-arriving copy is usually strictly worse for latency-arb triggers.)
+    false
 }
 
 fn should_replace_anchor_tick(current: &RefTick, next: &RefTick) -> bool {
@@ -3240,16 +3374,15 @@ async fn get_fee_rate_bps_cached(shared: &EngineShared, market_id: &str) -> f64 
     const REFRESH_BACKOFF: Duration = Duration::from_secs(3);
 
     let now = Instant::now();
-    let (cached_fee, needs_refresh) = if let Some(entry) =
-        shared.fee_cache.read().await.get(market_id).cloned()
-    {
-        (
-            entry.fee_bps,
-            now.duration_since(entry.fetched_at) >= TTL || entry.fee_bps <= 0.0,
-        )
-    } else {
-        (DEFAULT_FEE_BPS, true)
-    };
+    let (cached_fee, needs_refresh) =
+        if let Some(entry) = shared.fee_cache.read().await.get(market_id).cloned() {
+            (
+                entry.fee_bps,
+                now.duration_since(entry.fetched_at) >= TTL || entry.fee_bps <= 0.0,
+            )
+        } else {
+            (DEFAULT_FEE_BPS, true)
+        };
 
     if needs_refresh {
         maybe_spawn_fee_refresh(shared, market_id, now, REFRESH_BACKOFF).await;
@@ -3351,9 +3484,7 @@ async fn maybe_spawn_scoring_refresh(
     let inflight = shared.scoring_refresh_inflight.clone();
     let rebate_factor = shared.scoring_rebate_factor;
     tokio::spawn(async move {
-        if let Some((scoring_ok, raw)) =
-            fetch_order_scoring(&http, &clob_endpoint, &order).await
-        {
+        if let Some((scoring_ok, raw)) = fetch_order_scoring(&http, &clob_endpoint, &order).await {
             let mut cache = scoring_cache.write().await;
             let mut entry = cache.get(&market).cloned().unwrap_or(ScoringState {
                 scoring_true: 0,
@@ -3370,7 +3501,8 @@ async fn maybe_spawn_scoring_refresh(
             } else {
                 (entry.scoring_true as f64 / entry.scoring_total as f64).clamp(0.0, 1.0)
             };
-            entry.rebate_bps_est = (fee_bps.max(0.0) * hit_ratio * rebate_factor).clamp(0.0, fee_bps.max(0.0));
+            entry.rebate_bps_est =
+                (fee_bps.max(0.0) * hit_ratio * rebate_factor).clamp(0.0, fee_bps.max(0.0));
             entry.fetched_at = Instant::now();
             let log_row = serde_json::json!({
                 "ts_ms": Utc::now().timestamp_millis(),
@@ -3491,10 +3623,14 @@ fn evaluate_survival(shot: &ShadowShot, book: &BookTop) -> bool {
     } else {
         shot.intended_price
     };
+    is_crossable(&shot.side, probe_px, book)
+}
+
+fn is_crossable(side: &OrderSide, probe_px: f64, book: &BookTop) -> bool {
     if probe_px <= 0.0 {
         return false;
     }
-    match shot.side {
+    match side {
         OrderSide::BuyYes => probe_px >= book.ask_yes,
         OrderSide::SellYes => probe_px <= book.bid_yes,
         OrderSide::BuyNo => probe_px >= book.ask_no,
@@ -4854,8 +4990,14 @@ mod tests {
             price: 0.51,
             ..maker.clone()
         };
-        assert_eq!(classify_execution_style(&book, &maker), ExecutionStyle::Maker);
-        assert_eq!(classify_execution_style(&book, &taker), ExecutionStyle::Taker);
+        assert_eq!(
+            classify_execution_style(&book, &maker),
+            ExecutionStyle::Maker
+        );
+        assert_eq!(
+            classify_execution_style(&book, &taker),
+            ExecutionStyle::Taker
+        );
     }
 
     #[test]
@@ -4895,7 +5037,9 @@ mod tests {
         assert!(sample.local_backlog_ms >= 10.0);
         assert!(sample.local_backlog_ms <= 40.0);
         assert!(sample.feed_in_ms >= sample.source_latency_ms);
-        assert!((sample.feed_in_ms - (sample.source_latency_ms + sample.local_backlog_ms)).abs() < 3.0);
+        assert!(
+            (sample.feed_in_ms - (sample.source_latency_ms + sample.local_backlog_ms)).abs() < 3.0
+        );
     }
 
     #[test]
@@ -4912,7 +5056,9 @@ mod tests {
             reason_codes: vec![],
             ts_ns: 1,
         };
-        assert!(should_force_taker(&cfg, &safe, 12.0, 0.8, 30, 0.1, 40, 30, "BTCUSDT"));
+        assert!(should_force_taker(
+            &cfg, &safe, 12.0, 0.8, 30, 0.1, 40, 30, "BTCUSDT"
+        ));
         assert!(!should_force_taker(
             &cfg, &safe, 8.0, 0.8, 30, 0.1, 40, 30, "BTCUSDT"
         ));
@@ -4953,11 +5099,21 @@ mod tests {
             reason_codes: vec![],
             ts_ns: 1,
         };
-        assert!(should_observe_only_symbol("SOLUSDT", &cfg, &tox, 120.0, 0.01, 180.0));
-        assert!(should_observe_only_symbol("SOLUSDT", &cfg, &tox, 260.0, 0.01, 80.0));
-        assert!(should_observe_only_symbol("SOLUSDT", &cfg, &tox, 120.0, 0.03, 80.0));
-        assert!(!should_observe_only_symbol("SOLUSDT", &cfg, &tox, 120.0, 0.01, 80.0));
-        assert!(!should_observe_only_symbol("BTCUSDT", &cfg, &tox, 260.0, 0.03, 999.0));
+        assert!(should_observe_only_symbol(
+            "SOLUSDT", &cfg, &tox, 120.0, 0.01, 180.0
+        ));
+        assert!(should_observe_only_symbol(
+            "SOLUSDT", &cfg, &tox, 260.0, 0.01, 80.0
+        ));
+        assert!(should_observe_only_symbol(
+            "SOLUSDT", &cfg, &tox, 120.0, 0.03, 80.0
+        ));
+        assert!(!should_observe_only_symbol(
+            "SOLUSDT", &cfg, &tox, 120.0, 0.01, 80.0
+        ));
+        assert!(!should_observe_only_symbol(
+            "BTCUSDT", &cfg, &tox, 260.0, 0.03, 999.0
+        ));
     }
 
     #[test]

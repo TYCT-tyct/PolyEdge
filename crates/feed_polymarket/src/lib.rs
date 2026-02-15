@@ -51,7 +51,12 @@ impl PolymarketFeed {
             _poll_interval,
             symbols,
             vec!["updown".to_string()],
-            vec!["5m".to_string(), "15m".to_string(), "1h".to_string(), "1d".to_string()],
+            vec![
+                "5m".to_string(),
+                "15m".to_string(),
+                "1h".to_string(),
+                "1d".to_string(),
+            ],
         )
     }
 
@@ -323,7 +328,9 @@ impl PolymarketBookWsFeed for PolymarketFeed {
         let (tx, rx) = mpsc::channel::<BookUpdate>(16_384);
         tokio::spawn(async move {
             loop {
-                if let Err(err) = run_book_update_loop(&endpoint, &gamma_endpoint, &token_ids, &tx).await {
+                if let Err(err) =
+                    run_book_update_loop(&endpoint, &gamma_endpoint, &token_ids, &tx).await
+                {
                     tracing::warn!(?err, "book update ws loop failed; reconnecting");
                 }
                 sleep_with_jitter(backoff).await;

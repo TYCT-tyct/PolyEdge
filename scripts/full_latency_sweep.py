@@ -55,7 +55,15 @@ def collect_engine_series(base_url: str, seconds: int, poll_interval: float) -> 
         "executed_over_eligible": [],
         "ev_net_usdc_p50": [],
         "ev_positive_ratio": [],
+        "survival_5ms": [],
         "survival_10ms": [],
+        "survival_25ms": [],
+        "survival_probe_5ms": [],
+        "survival_probe_10ms": [],
+        "survival_probe_25ms": [],
+        "survival_probe_5ms_n": [],
+        "survival_probe_10ms_n": [],
+        "survival_probe_25ms_n": [],
         "fillability_10ms": [],
         "window_outcomes": [],
     }
@@ -81,7 +89,15 @@ def collect_engine_series(base_url: str, seconds: int, poll_interval: float) -> 
             push("ev_net_usdc_p50", live.get("ev_net_usdc_p50"))
             push("ev_positive_ratio", live.get("ev_positive_ratio"))
             push("window_outcomes", live.get("window_outcomes"))
+            push("survival_5ms", live.get("survival_5ms"))
             push("survival_10ms", live.get("survival_10ms"))
+            push("survival_25ms", live.get("survival_25ms"))
+            push("survival_probe_5ms", live.get("survival_probe_5ms"))
+            push("survival_probe_10ms", live.get("survival_probe_10ms"))
+            push("survival_probe_25ms", live.get("survival_probe_25ms"))
+            push("survival_probe_5ms_n", live.get("survival_probe_5ms_n"))
+            push("survival_probe_10ms_n", live.get("survival_probe_10ms_n"))
+            push("survival_probe_25ms_n", live.get("survival_probe_25ms_n"))
             push("fillability_10ms", live.get("fillability_10ms"))
             push("book_top_lag_p50_ms", live.get("book_top_lag_p50_ms"))
             push("book_top_lag_p90_ms", live.get("book_top_lag_p90_ms"))
@@ -106,6 +122,7 @@ def collect_engine_series(base_url: str, seconds: int, poll_interval: float) -> 
             "window_outcomes": (last_live or {}).get("window_outcomes"),
             "book_top_lag_by_symbol_p50_ms": (last_live or {}).get("book_top_lag_by_symbol_p50_ms"),
             "survival_10ms_by_symbol": (last_live or {}).get("survival_10ms_by_symbol"),
+            "survival_probe_10ms_by_symbol": (last_live or {}).get("survival_probe_10ms_by_symbol"),
         },
     }
 

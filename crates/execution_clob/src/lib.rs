@@ -5,9 +5,7 @@ use std::time::Instant;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use chrono::Utc;
-use core_types::{
-    new_id, ExecutionVenue, OrderAck, OrderAckV2, OrderIntentV2, QuoteIntent,
-};
+use core_types::{new_id, ExecutionVenue, OrderAck, OrderAckV2, OrderIntentV2, QuoteIntent};
 use parking_lot::RwLock;
 use reqwest::Client;
 

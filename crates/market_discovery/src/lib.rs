@@ -305,7 +305,10 @@ mod tests {
             classify_market_type("BITCOIN UP OR DOWN - 15 MINUTES"),
             "updown"
         );
-        assert_eq!(classify_timeframe("BITCOIN UP OR DOWN - 5 MINUTES"), Some("5m"));
+        assert_eq!(
+            classify_timeframe("BITCOIN UP OR DOWN - 5 MINUTES"),
+            Some("5m")
+        );
         assert_eq!(
             classify_timeframe("ETHEREUM UP OR DOWN - 15 MINUTES"),
             Some("15m")

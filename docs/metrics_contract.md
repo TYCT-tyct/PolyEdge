@@ -48,6 +48,30 @@ This file is the single source of truth for live gate/report metrics.
 - `decision_compute_p99_ms`: compute stage duration.
 - `source_latency_p99_ms`: source event timestamp to local receive delay.
 - `local_backlog_p99_ms`: local queue/backlog-induced delay.
+- `book_top_lag_*_ms`: `max(0, book.recv_ts_local_ns - tick_fast.recv_ts_local_ns) / 1e6`.
+  - Interpretation: positive means **our fast ref tick arrived earlier than the Polymarket book update**.
+  - This is the *potential* latency-arb window (does not guarantee fill).
+
+## Competition / Arb Window Metrics
+
+- `survival_*` and `fillability_*` are derived from executed Shadow outcomes (i.e. only exist when
+  the engine is actually placing orders that get accepted).
+- `survival_probe_*` is the **orderless** competitiveness probe (used to answer: "am I faster than
+  the market makers, and by how much?"), independent of acks.
+
+### Survival Probe (orderless)
+
+At T0, observe a crossable top-of-book price (`probe_px`) for the chosen side, then at `+Δ ms`
+check whether it is still crossable:
+
+- buy: `probe_px >= book.ask_*`
+- sell: `probe_px <= book.bid_*`
+
+Metrics:
+
+- `survival_probe_5ms`, `survival_probe_10ms`, `survival_probe_25ms`: ratios in `[0,1]`.
+- `survival_probe_5ms_n`, `survival_probe_10ms_n`, `survival_probe_25ms_n`: sample counts.
+- `survival_probe_10ms_by_symbol`: per-symbol survival probe ratios at `+10ms`.
 
 ## Hard Gates
 

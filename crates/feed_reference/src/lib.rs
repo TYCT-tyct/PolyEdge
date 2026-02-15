@@ -124,7 +124,11 @@ async fn run_binance_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> R
                 break;
             }
             Err(err) => {
-                tracing::warn!(?err, endpoint, "connect binance ws failed; trying next endpoint");
+                tracing::warn!(
+                    ?err,
+                    endpoint,
+                    "connect binance ws failed; trying next endpoint"
+                );
                 last_err = Some(anyhow::Error::new(err));
             }
         }

@@ -61,7 +61,10 @@ pub fn quote_block_ratio(quote_attempted: u64, quote_blocked: u64) -> f64 {
 }
 
 pub fn policy_block_ratio(quote_attempted: u64, policy_blocked: u64) -> f64 {
-    ratio_u64(policy_blocked, quote_attempted.saturating_add(policy_blocked))
+    ratio_u64(
+        policy_blocked,
+        quote_attempted.saturating_add(policy_blocked),
+    )
 }
 
 pub fn value_to_f64(v: &serde_json::Value) -> Option<f64> {

@@ -18,13 +18,22 @@ pub(super) fn compute_gate_fail_reasons(
         ));
     }
     if live.net_edge_p50_bps <= 0.0 {
-        failed.push(format!("net_edge_p50_bps {:.4} <= 0", live.net_edge_p50_bps));
+        failed.push(format!(
+            "net_edge_p50_bps {:.4} <= 0",
+            live.net_edge_p50_bps
+        ));
     }
     if live.net_edge_p10_bps < -1.0 {
-        failed.push(format!("net_edge_p10_bps {:.4} < -1", live.net_edge_p10_bps));
+        failed.push(format!(
+            "net_edge_p10_bps {:.4} < -1",
+            live.net_edge_p10_bps
+        ));
     }
     if live.quote_block_ratio >= 0.10 {
-        failed.push(format!("quote_block_ratio {:.4} >= 0.10", live.quote_block_ratio));
+        failed.push(format!(
+            "quote_block_ratio {:.4} >= 0.10",
+            live.quote_block_ratio
+        ));
     }
     if live.policy_block_ratio >= 0.10 {
         failed.push(format!(
@@ -39,7 +48,10 @@ pub(super) fn compute_gate_fail_reasons(
         ));
     }
     if live.data_valid_ratio < 0.999 {
-        failed.push(format!("data_valid_ratio {:.5} < 0.99900", live.data_valid_ratio));
+        failed.push(format!(
+            "data_valid_ratio {:.5} < 0.99900",
+            live.data_valid_ratio
+        ));
     }
     if live.seq_gap_rate > 0.001 {
         failed.push(format!("seq_gap_rate {:.5} > 0.00100", live.seq_gap_rate));
@@ -69,10 +81,16 @@ pub(super) fn compute_gate_fail_reasons(
         ));
     }
     if live.book_freshness_ms >= 1_500 {
-        failed.push(format!("book_freshness_ms {} >= 1500", live.book_freshness_ms));
+        failed.push(format!(
+            "book_freshness_ms {} >= 1500",
+            live.book_freshness_ms
+        ));
     }
     if live.ref_freshness_ms >= 1_000 {
-        failed.push(format!("ref_freshness_ms {} >= 1000", live.ref_freshness_ms));
+        failed.push(format!(
+            "ref_freshness_ms {} >= 1000",
+            live.ref_freshness_ms
+        ));
     }
     if live.net_markout_10s_usdc_p50 <= 0.0 {
         failed.push(format!(
