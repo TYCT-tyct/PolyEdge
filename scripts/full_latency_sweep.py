@@ -115,8 +115,13 @@ def main() -> int:
     symbols = [s.strip().upper() for s in str(args.symbols).split(",") if s.strip()]
 
     started_ms = int(time.time() * 1000)
-    engine = collect_engine_series(args.base_url, seconds, poll_interval)
-    ws = asyncio.run(collect_ws_all(seconds, symbols))
+    async def run_all() -> tuple[Dict[str, Any], Dict[str, Any]]:
+        engine_task = asyncio.to_thread(collect_engine_series, args.base_url, seconds, poll_interval)
+        ws_task = collect_ws_all(seconds, symbols)
+        engine_res, ws_res = await asyncio.gather(engine_task, ws_task)
+        return engine_res, ws_res
+
+    engine, ws = asyncio.run(run_all())
 
     payload: Dict[str, Any] = {
         "meta": {
@@ -141,4 +146,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
