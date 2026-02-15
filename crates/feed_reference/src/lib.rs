@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -71,6 +72,23 @@ impl RefPriceWsFeed for MultiSourceRefFeed {
                 sleep_with_jitter(backoff).await;
             }
         });
+
+        let enable_chainlink_anchor = std::env::var("POLYEDGE_ENABLE_CHAINLINK_ANCHOR")
+            .ok()
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+        if enable_chainlink_anchor {
+            let anchor_symbols = symbols.clone();
+            let tx_anchor = tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    if let Err(err) = run_chainlink_rtds_stream(&anchor_symbols, &tx_anchor).await {
+                        tracing::warn!(?err, "chainlink rtds stream failed; reconnecting");
+                    }
+                    sleep_with_jitter(backoff).await;
+                }
+            });
+        }
 
         drop(tx);
 
@@ -350,6 +368,130 @@ async fn run_coinbase_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> 
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+struct RtdsEnvelope {
+    #[serde(default)]
+    topic: Option<String>,
+    #[serde(default)]
+    timestamp: Option<i64>,
+    #[serde(default)]
+    payload: Option<RtdsPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RtdsPayload {
+    #[serde(default)]
+    symbol: Option<String>,
+    #[serde(default)]
+    timestamp: Option<i64>,
+    #[serde(default)]
+    value: Option<f64>,
+}
+
+fn chainlink_to_internal_symbol(symbol: &str) -> Option<String> {
+    let sym = symbol.trim().to_ascii_uppercase();
+    let base = sym
+        .split(|c: char| c == '/' || c == '-' || c == '_' || c.is_whitespace())
+        .next()?;
+    if base.is_empty() {
+        return None;
+    }
+    Some(format!("{base}USDT"))
+}
+
+async fn run_chainlink_rtds_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> Result<()> {
+    let allowed = symbols
+        .iter()
+        .map(|s| s.trim().to_ascii_uppercase())
+        .filter(|s| !s.is_empty())
+        .collect::<HashSet<_>>();
+    if allowed.is_empty() {
+        anyhow::bail!("chainlink rtds requires non-empty symbols");
+    }
+
+    let endpoint = std::env::var("POLYEDGE_RTDS_WS")
+        .unwrap_or_else(|_| "wss://ws-live-data.polymarket.com".to_string());
+    let (mut ws, _) = connect_async(&endpoint)
+        .await
+        .with_context(|| format!("connect polymarket rtds ws: {endpoint}"))?;
+
+    let sub = serde_json::json!({
+        "action": "subscribe",
+        "subscriptions": [
+            {"topic": "crypto_prices_chainlink", "type": "*", "filters": ""}
+        ]
+    });
+    ws.send(Message::Text(sub.to_string().into()))
+        .await
+        .context("send chainlink rtds subscribe")?;
+
+    let mut ping = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            _ = ping.tick() => {
+                // RTDS docs recommend sending a ping periodically.
+                let _ = ws.send(Message::Ping(Vec::new().into())).await;
+            }
+            msg = ws.next() => {
+                let Some(msg) = msg else { break; };
+                let msg = msg.context("chainlink rtds read")?;
+                let text = match msg {
+                    Message::Text(t) => t.to_string(),
+                    Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
+                    Message::Ping(v) => {
+                        let _ = ws.send(Message::Pong(v)).await;
+                        continue;
+                    }
+                    Message::Pong(_) => continue,
+                    Message::Close(_) => break,
+                    Message::Frame(_) => continue,
+                };
+
+                let Ok(env) = serde_json::from_str::<RtdsEnvelope>(&text) else {
+                    continue;
+                };
+                if env.topic.as_deref() != Some("crypto_prices_chainlink") {
+                    continue;
+                }
+                let payload = env.payload.unwrap_or(RtdsPayload {
+                    symbol: None,
+                    timestamp: None,
+                    value: None,
+                });
+                let Some(raw_symbol) = payload.symbol.as_deref() else {
+                    continue;
+                };
+                let Some(symbol) = chainlink_to_internal_symbol(raw_symbol) else {
+                    continue;
+                };
+                if !allowed.contains(symbol.as_str()) {
+                    continue;
+                }
+                let Some(price) = payload.value else {
+                    continue;
+                };
+                let event_ts = payload.timestamp.or(env.timestamp).unwrap_or_else(now_ms);
+
+                let tick = RefTick {
+                    source: "chainlink_rtds".to_string(),
+                    symbol,
+                    event_ts_ms: event_ts,
+                    recv_ts_ms: now_ms(),
+                    event_ts_exchange_ms: event_ts,
+                    recv_ts_local_ns: now_ns(),
+                    price,
+                };
+
+                if tx.send(tick).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn parse_rfc3339_ms(value: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(value)
         .ok()
@@ -475,5 +617,17 @@ mod tests {
     fn parse_time_works() {
         let ts = parse_rfc3339_ms("2026-02-13T12:34:56.789Z").expect("parse");
         assert!(ts > 0);
+    }
+
+    #[test]
+    fn chainlink_symbol_conversion() {
+        assert_eq!(
+            chainlink_to_internal_symbol("btc/usd").as_deref(),
+            Some("BTCUSDT")
+        );
+        assert_eq!(
+            chainlink_to_internal_symbol("eth-usd").as_deref(),
+            Some("ETHUSDT")
+        );
     }
 }

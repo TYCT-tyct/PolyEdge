@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import time
 from pathlib import Path
 from typing import Any, Dict, List
@@ -180,10 +181,17 @@ def main() -> None:
 
     print("\n=== WS FEED LATENCY (RECV - SOURCE TS) ===")
     ws = asyncio.run(run_ws_latency(args.seconds, args.symbol))
-    print_stat_block("polymarket_ws", ws["pm_lag_ms"], "ms")
+    print_stat_block("rtds_crypto_prices", ws["pm_lag_ms"], "ms")
+    print_stat_block("rtds_chainlink", ws["chainlink_lag_ms"], "ms")
     print_stat_block("binance_ws", ws["bin_lag_ms"], "ms")
     if has_delta(ws):
         print(f"delta_pm_minus_bin_p50={ws['delta_pm_minus_bin_p50_ms']:.3f}ms")
+    delta_chainlink = ws.get("delta_chainlink_minus_bin_p50_ms", float("nan"))
+    if not math.isnan(delta_chainlink):
+        print(f"delta_chainlink_minus_bin_p50={delta_chainlink:.3f}ms")
+    delta_pm_minus_chainlink = ws.get("delta_pm_minus_chainlink_p50_ms", float("nan"))
+    if not math.isnan(delta_pm_minus_chainlink):
+        print(f"delta_pm_minus_chainlink_p50={delta_pm_minus_chainlink:.3f}ms")
 
     payload = {
         "meta": {

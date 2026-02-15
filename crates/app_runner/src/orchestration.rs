@@ -66,6 +66,7 @@ pub(super) fn spawn_data_reconcile_task(
             if reconcile_fail {
                 stats.set_observe_only(true);
                 *paused.write().await = true;
+                stats.set_paused(true);
                 let _ = bus.publish(EngineEvent::Control(ControlCommand::Pause));
             }
 

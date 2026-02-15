@@ -427,6 +427,7 @@ dependencies = [
  "chrono",
  "core_types",
  "futures",
+ "market_discovery",
  "rand",
  "reqwest",
  "serde",

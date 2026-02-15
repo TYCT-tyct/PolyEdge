@@ -10,6 +10,7 @@ async-trait.workspace = true
 chrono.workspace = true
 core_types = { path = "../core_types" }
 futures.workspace = true
+market_discovery = { path = "../market_discovery" }
 reqwest.workspace = true
 rand.workspace = true
 serde.workspace = true

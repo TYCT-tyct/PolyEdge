@@ -8,6 +8,7 @@ use core_types::{
     OrderbookStateDigest, PolymarketBookWsFeed,
 };
 use futures::{SinkExt, StreamExt};
+use market_discovery::{DiscoveryConfig, MarketDiscovery};
 use rand::Rng;
 use reqwest::Client;
 use serde::Deserialize;
@@ -33,10 +34,11 @@ impl Default for PolymarketEndpoints {
 
 #[derive(Debug, Clone)]
 pub struct PolymarketFeed {
-    http: Client,
     pub endpoints: PolymarketEndpoints,
     reconnect_backoff: Duration,
     symbols: Vec<String>,
+    market_types: Vec<String>,
+    timeframes: Vec<String>,
 }
 
 impl PolymarketFeed {
@@ -45,13 +47,36 @@ impl PolymarketFeed {
     }
 
     pub fn new_with_symbols(_poll_interval: Duration, symbols: Vec<String>) -> Self {
+        Self::new_with_universe(
+            _poll_interval,
+            symbols,
+            vec!["updown".to_string()],
+            vec!["5m".to_string(), "15m".to_string(), "1h".to_string(), "1d".to_string()],
+        )
+    }
+
+    pub fn new_with_universe(
+        _poll_interval: Duration,
+        symbols: Vec<String>,
+        market_types: Vec<String>,
+        timeframes: Vec<String>,
+    ) -> Self {
         Self {
-            http: Client::new(),
             endpoints: PolymarketEndpoints::default(),
             reconnect_backoff: Duration::from_secs(1),
             symbols: symbols
                 .into_iter()
                 .map(|s| s.trim().to_ascii_uppercase())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            market_types: market_types
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            timeframes: timeframes
+                .into_iter()
+                .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
         }
@@ -67,89 +92,33 @@ impl PolymarketFeed {
     }
 
     async fn discover_target_markets(&self) -> Result<HashMap<String, MarketState>> {
-        let mut out = HashMap::<String, MarketState>::new();
-        let aliases: [(&str, [&str; 2]); 15] = [
-            ("BTCUSDT", ["bitcoin", "btc"]),
-            ("ETHUSDT", ["ethereum", "eth"]),
-            ("SOLUSDT", ["solana", "sol"]),
-            ("XRPUSDT", ["ripple", "xrp"]),
-            ("BNBUSDT", ["binance", "bnb"]),
-            ("DOGEUSDT", ["dogecoin", "doge"]),
-            ("ADAUSDT", ["cardano", "ada"]),
-            ("AVAXUSDT", ["avalanche", "avax"]),
-            ("LINKUSDT", ["chainlink", "link"]),
-            ("MATICUSDT", ["polygon", "matic"]),
-            ("LTCUSDT", ["litecoin", "ltc"]),
-            ("DOTUSDT", ["polkadot", "dot"]),
-            ("TRXUSDT", ["tron", "trx"]),
-            ("TONUSDT", ["toncoin", "ton"]),
-            ("NEARUSDT", ["near", "near"]),
-        ];
-        let allowed_symbols: HashSet<String> = if self.symbols.is_empty() {
-            aliases
-                .iter()
-                .map(|(symbol, _)| (*symbol).to_string())
-                .collect()
-        } else {
-            self.symbols.iter().cloned().collect()
-        };
+        let discovery = MarketDiscovery::new(DiscoveryConfig {
+            symbols: self.symbols.clone(),
+            market_types: self.market_types.clone(),
+            timeframes: self.timeframes.clone(),
+            endpoint: self.endpoints.gamma_markets.clone(),
+        });
+        let markets = discovery.discover().await?;
 
-        let markets: Vec<GammaMarket> = self
-            .http
-            .get(&self.endpoints.gamma_markets)
-            .query(&[
-                ("closed", "false"),
-                ("archived", "false"),
-                ("active", "true"),
-                ("limit", "1000"),
-                ("order", "volume"),
-                ("ascending", "false"),
-            ])
-            .send()
-            .await
-            .context("gamma request")?
-            .error_for_status()
-            .context("gamma status")?
-            .json()
-            .await
-            .context("gamma json")?;
+        let mut out = HashMap::<String, MarketState>::new();
+        let ts_ms = chrono::Utc::now().timestamp_millis();
 
         for market in markets {
-            if !market.active || market.closed || !market.accepting_orders {
-                continue;
-            }
-            let Some((yes, no)) = parse_token_pair(market.clob_token_ids.as_deref()) else {
+            let (Some(yes), Some(no)) = (market.token_id_yes, market.token_id_no) else {
                 continue;
             };
-            let text = format!(
-                "{} {}",
-                market.question.to_ascii_lowercase(),
-                market.slug.clone().unwrap_or_default().to_ascii_lowercase()
-            );
-
-            let matched_symbol = aliases
-                .iter()
-                .filter(|(symbol, _)| allowed_symbols.contains(*symbol))
-                .find(|(_, keys)| text.contains(keys[0]) || text.contains(keys[1]))
-                .map(|(s, _)| (*s).to_string());
-            let Some(_symbol) = matched_symbol else {
-                continue;
-            };
-
-            if out.contains_key(&market.id) {
+            if out.contains_key(&market.market_id) {
                 continue;
             }
-
-            let bid_yes = market.best_bid.unwrap_or(0.0);
-            let ask_yes = market.best_ask.unwrap_or(1.0);
+            let bid_yes = market.best_bid.unwrap_or(0.0).clamp(0.0, 1.0);
+            let ask_yes = market.best_ask.unwrap_or(1.0).clamp(0.0, 1.0);
             let bid_no = (1.0 - ask_yes).max(0.0);
             let ask_no = (1.0 - bid_yes).min(1.0);
 
-            let ts_ms = chrono::Utc::now().timestamp_millis();
             out.insert(
-                market.id.clone(),
+                market.market_id.clone(),
                 MarketState {
-                    market_id: market.id,
+                    market_id: market.market_id,
                     yes_token: yes,
                     no_token: no,
                     yes: AssetTop {
@@ -283,12 +252,13 @@ impl PolymarketBookWsFeed for PolymarketFeed {
         }
 
         let endpoint = self.endpoints.clob_ws_market.clone();
+        let gamma_endpoint = self.endpoints.gamma_markets.clone();
         let backoff = self.reconnect_backoff;
 
         let (tx, rx) = mpsc::channel::<BookUpdate>(16_384);
         tokio::spawn(async move {
             loop {
-                if let Err(err) = run_book_update_loop(&endpoint, &token_ids, &tx).await {
+                if let Err(err) = run_book_update_loop(&endpoint, &gamma_endpoint, &token_ids, &tx).await {
                     tracing::warn!(?err, "book update ws loop failed; reconnecting");
                 }
                 sleep_with_jitter(backoff).await;
@@ -302,9 +272,12 @@ impl PolymarketBookWsFeed for PolymarketFeed {
 
 async fn run_book_update_loop(
     endpoint: &str,
+    gamma_endpoint: &str,
     token_ids: &[String],
     tx: &mpsc::Sender<BookUpdate>,
 ) -> Result<()> {
+    let token_market_map = fetch_token_market_map(gamma_endpoint, token_ids).await?;
+
     let (mut ws, _) = connect_async(endpoint)
         .await
         .with_context(|| format!("connect polymarket ws: {endpoint}"))?;
@@ -336,13 +309,19 @@ async fn run_book_update_loop(
         };
 
         for event in payload.into_events() {
-            if let Some(snapshot) = parse_snapshot(&event) {
+            if let Some(mut snapshot) = parse_snapshot(&event) {
+                if let Some(market_id) = token_market_map.get(&snapshot.asset_id) {
+                    snapshot.market_id = market_id.clone();
+                }
                 if tx.send(BookUpdate::Snapshot(snapshot)).await.is_err() {
                     return Ok(());
                 }
             }
 
-            for delta in parse_deltas(&event) {
+            for mut delta in parse_deltas(&event) {
+                if let Some(market_id) = token_market_map.get(&delta.asset_id) {
+                    delta.market_id = market_id.clone();
+                }
                 let digest = OrderbookStateDigest {
                     market_id: delta.market_id.clone(),
                     asset_id: delta.asset_id.clone(),
@@ -375,6 +354,91 @@ fn build_asset_to_market_map(
         out.insert(state.no_token.clone(), (market_id.clone(), false));
     }
     out
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GammaMarketTokens {
+    id: String,
+    #[serde(default)]
+    clob_token_ids: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    closed: bool,
+    #[serde(default)]
+    accepting_orders: bool,
+}
+
+async fn fetch_token_market_map(
+    gamma_endpoint: &str,
+    token_ids: &[String],
+) -> Result<HashMap<String, String>> {
+    let mut wanted = HashSet::<String>::new();
+    for t in token_ids {
+        let t = t.trim();
+        if !t.is_empty() {
+            wanted.insert(t.to_string());
+        }
+    }
+    if wanted.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let http = Client::new();
+    let mut out = HashMap::<String, String>::new();
+
+    let limit: i64 = 1000;
+    for offset in [0_i64, 1000, 2000, 3000] {
+        if wanted.is_empty() {
+            break;
+        }
+        let limit_s = limit.to_string();
+        let offset_s = offset.to_string();
+        let markets: Vec<GammaMarketTokens> = http
+            .get(gamma_endpoint)
+            .query(&[
+                ("closed", "false"),
+                ("archived", "false"),
+                ("active", "true"),
+                ("limit", limit_s.as_str()),
+                ("offset", offset_s.as_str()),
+                ("order", "volume"),
+                ("ascending", "false"),
+            ])
+            .send()
+            .await
+            .context("gamma request")?
+            .error_for_status()
+            .context("gamma status")?
+            .json()
+            .await
+            .context("gamma json")?;
+
+        if markets.is_empty() {
+            break;
+        }
+
+        for market in markets {
+            if !market.active || market.closed || !market.accepting_orders {
+                continue;
+            }
+            let Some((yes, no)) = parse_token_pair(market.clob_token_ids.as_deref()) else {
+                continue;
+            };
+            if wanted.remove(&yes) {
+                out.insert(yes, market.id.clone());
+            }
+            if wanted.remove(&no) {
+                out.insert(no, market.id.clone());
+            }
+            if wanted.is_empty() {
+                break;
+            }
+        }
+    }
+
+    Ok(out)
 }
 
 fn parse_token_pair(input: Option<&str>) -> Option<(String, String)> {
@@ -681,27 +745,6 @@ struct AssetUpdate {
     best_ask: Option<f64>,
     ts_exchange_ms: i64,
     recv_ts_local_ns: i64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GammaMarket {
-    id: String,
-    question: String,
-    #[serde(default)]
-    slug: Option<String>,
-    #[serde(default)]
-    active: bool,
-    #[serde(default)]
-    closed: bool,
-    #[serde(default)]
-    accepting_orders: bool,
-    #[serde(default)]
-    best_bid: Option<f64>,
-    #[serde(default)]
-    best_ask: Option<f64>,
-    #[serde(default)]
-    clob_token_ids: Option<String>,
 }
 
 pub fn verify_probability(price: f64) -> Result<f64> {

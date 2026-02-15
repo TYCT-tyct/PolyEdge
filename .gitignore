@@ -2,6 +2,12 @@
 /target/
 **/*.rs.bk
 
+# Runtime outputs
+/tmp/
+/datasets/
+/crates/**/datasets/
+/crates/**/tmp/
+
 # Python
 __pycache__/
 *.py[cod]

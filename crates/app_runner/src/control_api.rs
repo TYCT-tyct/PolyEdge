@@ -50,6 +50,7 @@ async fn pnl(State(state): State<AppState>) -> Json<core_types::PnLSnapshot> {
 
 async fn pause(State(state): State<AppState>) -> impl IntoResponse {
     *state.paused.write().await = true;
+    state.shadow_stats.set_paused(true);
     let _ = state
         .bus
         .publish(EngineEvent::Control(ControlCommand::Pause));
@@ -58,6 +59,7 @@ async fn pause(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn resume(State(state): State<AppState>) -> impl IntoResponse {
     *state.paused.write().await = false;
+    state.shadow_stats.set_paused(false);
     let _ = state
         .bus
         .publish(EngineEvent::Control(ControlCommand::Resume));

@@ -48,8 +48,20 @@ pub fn freshness_ms(now_ms: i64, last_ms: i64) -> i64 {
     (now_ms - last_ms).max(0)
 }
 
-pub fn estimate_uptime_pct(_elapsed: std::time::Duration) -> f64 {
-    100.0
+pub fn ratio_u64(num: u64, denom: u64) -> f64 {
+    if denom == 0 {
+        0.0
+    } else {
+        (num as f64 / denom as f64).clamp(0.0, 1.0)
+    }
+}
+
+pub fn quote_block_ratio(quote_attempted: u64, quote_blocked: u64) -> f64 {
+    ratio_u64(quote_blocked, quote_attempted.saturating_add(quote_blocked))
+}
+
+pub fn policy_block_ratio(quote_attempted: u64, policy_blocked: u64) -> f64 {
+    ratio_u64(policy_blocked, quote_attempted.saturating_add(policy_blocked))
 }
 
 pub fn value_to_f64(v: &serde_json::Value) -> Option<f64> {

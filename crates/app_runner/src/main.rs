@@ -44,8 +44,8 @@ mod engine_core;
 mod gate_eval;
 mod orchestration;
 use stats_utils::{
-    estimate_uptime_pct, freshness_ms, now_ns, percentile, push_capped, robust_filter_iqr,
-    value_to_f64,
+    freshness_ms, now_ns, percentile, policy_block_ratio, push_capped, quote_block_ratio,
+    robust_filter_iqr, value_to_f64,
 };
 use engine_core::{
     classify_execution_error_reason, classify_execution_style, edge_for_side,
@@ -611,6 +611,9 @@ struct ShadowStats {
     ts_inversion: AtomicU64,
     stale_tick_dropped: AtomicU64,
     observe_only: AtomicBool,
+    paused: AtomicBool,
+    paused_since_ms: AtomicU64,
+    paused_total_ms: AtomicU64,
 }
 
 impl ShadowStats {
@@ -661,6 +664,9 @@ impl ShadowStats {
             ts_inversion: AtomicU64::new(0),
             stale_tick_dropped: AtomicU64::new(0),
             observe_only: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+            paused_since_ms: AtomicU64::new(0),
+            paused_total_ms: AtomicU64::new(0),
         }
     }
 
@@ -707,6 +713,9 @@ impl ShadowStats {
         self.ts_inversion.store(0, Ordering::Relaxed);
         self.stale_tick_dropped.store(0, Ordering::Relaxed);
         self.observe_only.store(false, Ordering::Relaxed);
+        self.paused.store(false, Ordering::Relaxed);
+        self.paused_since_ms.store(0, Ordering::Relaxed);
+        self.paused_total_ms.store(0, Ordering::Relaxed);
         window_id
     }
 
@@ -910,6 +919,45 @@ impl ShadowStats {
     fn set_observe_only(&self, v: bool) {
         self.observe_only.store(v, Ordering::Relaxed);
     }
+
+    fn set_paused(&self, v: bool) {
+        let now_ms = Utc::now().timestamp_millis().max(0) as u64;
+        let was = self.paused.swap(v, Ordering::Relaxed);
+        if was == v {
+            return;
+        }
+        if v {
+            self.paused_since_ms.store(now_ms, Ordering::Relaxed);
+            return;
+        }
+        let since = self.paused_since_ms.swap(0, Ordering::Relaxed);
+        if since > 0 {
+            self.paused_total_ms
+                .fetch_add(now_ms.saturating_sub(since), Ordering::Relaxed);
+        }
+    }
+
+    fn uptime_pct(&self, elapsed: Duration) -> f64 {
+        let elapsed_ms = elapsed.as_millis() as u64;
+        if elapsed_ms == 0 {
+            return 100.0;
+        }
+        let now_ms = Utc::now().timestamp_millis().max(0) as u64;
+        let base_paused = self.paused_total_ms.load(Ordering::Relaxed);
+        let paused_extra = if self.paused.load(Ordering::Relaxed) {
+            let since = self.paused_since_ms.load(Ordering::Relaxed);
+            if since > 0 {
+                now_ms.saturating_sub(since)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let paused_ms = base_paused.saturating_add(paused_extra).min(elapsed_ms);
+        let uptime_ms = elapsed_ms.saturating_sub(paused_ms);
+        ((uptime_ms as f64) * 100.0 / elapsed_ms as f64).clamp(0.0, 100.0)
+    }
 }
 
 impl ShadowStats {
@@ -1004,19 +1052,11 @@ impl ShadowStats {
         } else {
             executed_count as f64 / eligible_count as f64
         };
-        let block_ratio = if attempted == 0 {
-            0.0
-        } else {
-            blocked as f64 / attempted as f64
-        };
-        let policy_block_ratio = if attempted + policy_blocked == 0 {
-            0.0
-        } else {
-            policy_blocked as f64 / (attempted + policy_blocked) as f64
-        };
+        let quote_block_ratio = quote_block_ratio(attempted, blocked);
+        let policy_ratio = policy_block_ratio(attempted, policy_blocked);
 
         let elapsed = self.started_at.read().await.elapsed();
-        let uptime_pct = estimate_uptime_pct(elapsed);
+        let uptime_pct = self.uptime_pct(elapsed);
         let tick_to_ack_p99 = percentile(&tick_to_ack_ms, 0.99).unwrap_or(0.0);
         let scorecard = build_market_scorecard(&shots, &outcomes);
         let ref_ticks_total = self.ref_ticks_total.load(Ordering::Relaxed);
@@ -1135,8 +1175,8 @@ impl ShadowStats {
             ev_net_usdc_p50,
             ev_net_usdc_p10,
             ev_positive_ratio,
-            quote_block_ratio: block_ratio,
-            policy_block_ratio,
+            quote_block_ratio,
+            policy_block_ratio: policy_ratio,
             queue_depth_p99: percentile(&queue_depth, 0.99).unwrap_or(0.0),
             event_backlog_p99: percentile(&event_backlog, 0.99).unwrap_or(0.0),
             tick_to_decision_p50_ms: latency.tick_to_decision_p50_ms,
@@ -1383,6 +1423,8 @@ async fn async_main() -> Result<()> {
         bus.clone(),
         shared.shadow_stats.clone(),
         (*universe_symbols).clone(),
+        (*universe_market_types).clone(),
+        (*universe_timeframes).clone(),
     );
     spawn_strategy_engine(
         bus.clone(),
@@ -1481,10 +1523,21 @@ fn spawn_reference_feed(
     });
 }
 
-fn spawn_market_feed(bus: RingBus<EngineEvent>, stats: Arc<ShadowStats>, symbols: Vec<String>) {
+fn spawn_market_feed(
+    bus: RingBus<EngineEvent>,
+    stats: Arc<ShadowStats>,
+    symbols: Vec<String>,
+    market_types: Vec<String>,
+    timeframes: Vec<String>,
+) {
     const TS_INVERSION_TOLERANCE_MS: i64 = 250;
     tokio::spawn(async move {
-        let feed = PolymarketFeed::new_with_symbols(Duration::from_millis(50), symbols);
+        let feed = PolymarketFeed::new_with_universe(
+            Duration::from_millis(50),
+            symbols,
+            market_types,
+            timeframes,
+        );
         let Ok(mut stream) = feed.stream_books().await else {
             tracing::error!("market feed failed to start");
             return;
@@ -1549,7 +1602,10 @@ fn spawn_strategy_engine(
 ) {
     tokio::spawn(async move {
         let fair = BasisMrFairValue::new(shared.fair_value_cfg.clone());
-        let mut latest_ticks: HashMap<String, RefTick> = HashMap::new();
+        // Separate fast reference ticks (exchange WS) from anchor ticks (Chainlink RTDS).
+        // Fast ticks drive stale filtering + latency measurement, while anchor ticks drive fair value.
+        let mut latest_fast_ticks: HashMap<String, RefTick> = HashMap::new();
+        let mut latest_anchor_ticks: HashMap<String, RefTick> = HashMap::new();
         let mut market_inventory: HashMap<String, InventoryState> = HashMap::new();
         let mut market_rate_budget: HashMap<String, TokenBucket> = HashMap::new();
         let mut untracked_issue_cooldown: HashMap<String, Instant> = HashMap::new();
@@ -1578,7 +1634,7 @@ fn spawn_strategy_engine(
                 EngineEvent::RefTick(tick) => {
                     let parse_us = dispatch_start.elapsed().as_secs_f64() * 1_000_000.0;
                     shared.shadow_stats.push_parse_us(parse_us).await;
-                    insert_latest_tick(&mut latest_ticks, tick);
+                    insert_latest_ref_tick(&mut latest_fast_ticks, &mut latest_anchor_ticks, tick);
                 }
                 EngineEvent::BookTop(mut book) => {
                     let parse_us = dispatch_start.elapsed().as_secs_f64() * 1_000_000.0;
@@ -1595,7 +1651,11 @@ fn spawn_strategy_engine(
                                 coalesced += 1;
                             }
                             Ok(EngineEvent::RefTick(next_tick)) => {
-                                insert_latest_tick(&mut latest_ticks, next_tick);
+                                insert_latest_ref_tick(
+                                    &mut latest_fast_ticks,
+                                    &mut latest_anchor_ticks,
+                                    next_tick,
+                                );
                                 coalesced += 1;
                             }
                             Ok(_) => {
@@ -1682,17 +1742,31 @@ fn spawn_strategy_engine(
                         }
                         continue;
                     };
-                    let tick = latest_ticks
-                        .get(&symbol)
-                        .cloned()
-                        .or_else(|| latest_ticks.values().max_by_key(|t| t.recv_ts_ms).cloned());
-                    let Some(tick) = tick else {
+                    let tick_fast = pick_latest_tick(&latest_fast_ticks, &symbol);
+                    let Some(tick_fast) = tick_fast else {
                         shared.shadow_stats.record_issue("tick_missing").await;
                         continue;
                     };
+                    let tick_anchor = pick_latest_tick(&latest_anchor_ticks, &symbol);
+                    let now_ms = Utc::now().timestamp_millis();
+                    let eval_tick = match tick_anchor {
+                        Some(anchor) => {
+                            let age_ms = now_ms - ref_event_ts_ms(anchor);
+                            if age_ms <= 5_000 {
+                                anchor
+                            } else {
+                                shared.shadow_stats.record_issue("anchor_stale").await;
+                                tick_fast
+                            }
+                        }
+                        None => {
+                            shared.shadow_stats.record_issue("anchor_missing").await;
+                            tick_fast
+                        }
+                    };
                     shared.shadow_stats.mark_seen();
 
-                    let latency_sample = estimate_feed_latency(&tick, &book);
+                    let latency_sample = estimate_feed_latency(tick_fast, &book);
                     let feed_in_ms = latency_sample.feed_in_ms;
                     let stale_tick_filter_ms = shared.strategy_cfg.read().await.stale_tick_filter_ms;
                     if feed_in_ms > stale_tick_filter_ms {
@@ -1719,7 +1793,7 @@ fn spawn_strategy_engine(
                     metrics::histogram!("latency.local_backlog_ms")
                         .record(latency_sample.local_backlog_ms);
                     let signal_start = Instant::now();
-                    let signal = fair.evaluate(&tick, &book);
+                    let signal = fair.evaluate(eval_tick, &book);
                     if signal.edge_bps_bid > 0.0 || signal.edge_bps_ask > 0.0 {
                         shared.shadow_stats.mark_candidate();
                     }
@@ -2280,9 +2354,11 @@ fn spawn_strategy_engine(
                 }
                 EngineEvent::Control(ControlCommand::Pause) => {
                     *paused.write().await = true;
+                    shared.shadow_stats.set_paused(true);
                 }
                 EngineEvent::Control(ControlCommand::Resume) => {
                     *paused.write().await = false;
+                    shared.shadow_stats.set_paused(false);
                 }
                 EngineEvent::Control(ControlCommand::Flatten) => {
                     if let Err(err) = execution.flatten_all().await {
@@ -2985,6 +3061,10 @@ fn ref_source_rank(source: &str) -> u8 {
     }
 }
 
+fn is_anchor_ref_source(source: &str) -> bool {
+    source == "chainlink_rtds"
+}
+
 fn ref_event_ts_ms(tick: &RefTick) -> i64 {
     tick.event_ts_exchange_ms.max(tick.event_ts_ms)
 }
@@ -3004,6 +3084,18 @@ fn should_replace_ref_tick(current: &RefTick, next: &RefTick) -> bool {
     ref_source_rank(next.source.as_str()) >= ref_source_rank(current.source.as_str())
 }
 
+fn should_replace_anchor_tick(current: &RefTick, next: &RefTick) -> bool {
+    let current_event = ref_event_ts_ms(current);
+    let next_event = ref_event_ts_ms(next);
+    if next_event + 50 < current_event {
+        return false;
+    }
+    if next_event > current_event + 1 {
+        return true;
+    }
+    next.recv_ts_local_ns > current.recv_ts_local_ns + 1_000_000
+}
+
 fn insert_latest_tick(latest_ticks: &mut HashMap<String, RefTick>, tick: RefTick) {
     match latest_ticks.get(tick.symbol.as_str()) {
         Some(current) => {
@@ -3015,6 +3107,40 @@ fn insert_latest_tick(latest_ticks: &mut HashMap<String, RefTick>, tick: RefTick
             latest_ticks.insert(tick.symbol.clone(), tick);
         }
     }
+}
+
+fn insert_latest_anchor_tick(latest_ticks: &mut HashMap<String, RefTick>, tick: RefTick) {
+    match latest_ticks.get(tick.symbol.as_str()) {
+        Some(current) => {
+            if should_replace_anchor_tick(current, &tick) {
+                latest_ticks.insert(tick.symbol.clone(), tick);
+            }
+        }
+        None => {
+            latest_ticks.insert(tick.symbol.clone(), tick);
+        }
+    }
+}
+
+fn insert_latest_ref_tick(
+    latest_fast_ticks: &mut HashMap<String, RefTick>,
+    latest_anchor_ticks: &mut HashMap<String, RefTick>,
+    tick: RefTick,
+) {
+    if is_anchor_ref_source(tick.source.as_str()) {
+        insert_latest_anchor_tick(latest_anchor_ticks, tick);
+    } else {
+        insert_latest_tick(latest_fast_ticks, tick);
+    }
+}
+
+fn pick_latest_tick<'a>(
+    latest_ticks: &'a HashMap<String, RefTick>,
+    symbol: &str,
+) -> Option<&'a RefTick> {
+    latest_ticks
+        .get(symbol)
+        .or_else(|| latest_ticks.values().max_by_key(|t| t.recv_ts_ms))
 }
 
 async fn get_fee_rate_bps_cached(shared: &EngineShared, market_id: &str) -> f64 {
@@ -4030,12 +4156,21 @@ fn current_jsonl_queue_depth() -> u64 {
     JSONL_QUEUE_DEPTH.load(Ordering::Relaxed)
 }
 
+fn append_jsonl_sync(path: &Path, line: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
 fn append_jsonl(path: &Path, value: &serde_json::Value) {
     let line = value.to_string();
     if let Some(tx) = JSONL_WRITER.get() {
         let req = JsonlWriteReq {
             path: path.to_path_buf(),
-            line: line.clone(),
+            line,
         };
         match tx.try_send(req) {
             Ok(_) => {
@@ -4044,28 +4179,27 @@ fn append_jsonl(path: &Path, value: &serde_json::Value) {
                     .store(cap.saturating_sub(tx.capacity()) as u64, Ordering::Relaxed);
                 return;
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            Err(tokio::sync::mpsc::error::TrySendError::Full(req)) => {
                 metrics::counter!("io.jsonl.queue_full").increment(1);
                 if JSONL_DROP_ON_FULL.load(Ordering::Relaxed) {
                     metrics::counter!("io.jsonl.dropped").increment(1);
                     return;
                 }
+                append_jsonl_sync(&req.path, &req.line);
+                return;
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(req)) => {
                 metrics::counter!("io.jsonl.queue_closed").increment(1);
                 if JSONL_DROP_ON_FULL.load(Ordering::Relaxed) {
                     metrics::counter!("io.jsonl.dropped").increment(1);
                     return;
                 }
+                append_jsonl_sync(&req.path, &req.line);
+                return;
             }
         }
     }
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{line}");
-    }
+    append_jsonl_sync(path, &line);
 }
 
 fn persist_live_report_files(live: &ShadowLiveReport) {
@@ -4698,6 +4832,33 @@ mod tests {
         assert!(should_observe_only_symbol("SOLUSDT", &cfg, &tox, 260.0, 0.01));
         assert!(should_observe_only_symbol("SOLUSDT", &cfg, &tox, 120.0, 0.03));
         assert!(!should_observe_only_symbol("BTCUSDT", &cfg, &tox, 260.0, 0.03));
+    }
+
+    #[test]
+    fn quote_block_ratio_matches_contract_and_is_bounded() {
+        assert_eq!(quote_block_ratio(0, 0), 0.0);
+        assert_eq!(quote_block_ratio(10, 0), 0.0);
+        assert_eq!(quote_block_ratio(0, 10), 1.0);
+
+        let r = quote_block_ratio(10, 2);
+        assert!(r > 0.0 && r < 1.0);
+    }
+
+    #[test]
+    fn policy_block_ratio_matches_contract_and_is_bounded() {
+        assert_eq!(policy_block_ratio(0, 0), 0.0);
+        assert_eq!(policy_block_ratio(10, 0), 0.0);
+        assert_eq!(policy_block_ratio(0, 10), 1.0);
+
+        let r = policy_block_ratio(10, 2);
+        assert!(r > 0.0 && r < 1.0);
+    }
+
+    #[test]
+    fn uptime_pct_is_bounded() {
+        let stats = ShadowStats::new();
+        let u = stats.uptime_pct(Duration::from_secs(1));
+        assert!((0.0..=100.0).contains(&u));
     }
 
     #[test]
