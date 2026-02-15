@@ -172,10 +172,17 @@ impl PolymarketFeed {
 
         let asset_map = build_asset_to_market_map(&markets);
         let assets = asset_map.keys().cloned().collect::<Vec<_>>();
+        tracing::info!(
+            market_count = markets.len(),
+            asset_count = assets.len(),
+            endpoint = %self.endpoints.clob_ws_market,
+            "polymarket market ws subscribing"
+        );
 
         let (mut ws, _) = connect_async(&self.endpoints.clob_ws_market)
             .await
             .context("connect polymarket market ws")?;
+        tracing::info!(endpoint = %self.endpoints.clob_ws_market, "polymarket market ws connected");
 
         let sub = serde_json::json!({
             "type": "market",
@@ -184,14 +191,19 @@ impl PolymarketFeed {
         ws.send(Message::Text(sub.to_string().into()))
             .await
             .context("send polymarket subscribe")?;
+        tracing::info!("polymarket market ws subscribed");
 
         let mut ping = tokio::time::interval(Duration::from_secs(15));
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut parse_failures = 0_u64;
+        let mut no_update_msgs = 0_u64;
+        let mut seen_msgs = 0_u64;
 
         loop {
             tokio::select! {
                 _ = ping.tick() => {
-                    ws.send(Message::Ping(Vec::new().into()))
+                    // The Polymarket WS docs recommend an application-level "PING".
+                    ws.send(Message::Text("PING".to_string().into()))
                         .await
                         .context("send polymarket ping")?;
                 }
@@ -209,13 +221,53 @@ impl PolymarketFeed {
                         Message::Close(_) => break,
                         Message::Frame(_) => continue,
                     };
-
-                    let Ok(payload) = serde_json::from_str::<WsEnvelope>(&text) else {
+                    if text == "PONG" {
                         continue;
+                    }
+                    seen_msgs = seen_msgs.saturating_add(1);
+                    if seen_msgs <= 2 {
+                        let preview = text
+                            .chars()
+                            .take(240)
+                            .collect::<String>()
+                            .replace('\n', "\\n");
+                        tracing::info!(preview = %preview, "polymarket market ws first messages");
+                    }
+
+                    let payload = match serde_json::from_str::<WsEnvelope>(&text) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            parse_failures = parse_failures.saturating_add(1);
+                            if parse_failures <= 5 {
+                                let preview = text
+                                    .chars()
+                                    .take(240)
+                                    .collect::<String>()
+                                    .replace('\n', "\\n");
+                                tracing::warn!(
+                                    ?err,
+                                    failures = parse_failures,
+                                    preview = %preview,
+                                    "polymarket market ws json parse failed"
+                                );
+                            }
+                            continue;
+                        }
                     };
 
                     for event in payload.into_events() {
-                        for update in parse_asset_updates(&event) {
+                        let updates = parse_asset_updates(&event);
+                        if updates.is_empty() {
+                            no_update_msgs = no_update_msgs.saturating_add(1);
+                            if no_update_msgs <= 3 {
+                                tracing::info!(
+                                    kind = event.kind.as_deref().unwrap_or(""),
+                                    event_type = event.event_type.as_deref().unwrap_or(""),
+                                    "polymarket market ws parsed message without updates"
+                                );
+                            }
+                        }
+                        for update in updates {
                             let Some((market_id, is_yes)) = asset_map.get(&update.asset_id).cloned() else {
                                 continue;
                             };
@@ -305,11 +357,12 @@ async fn run_book_update_loop(
 
     let mut ping = tokio::time::interval(Duration::from_secs(15));
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut parse_failures = 0_u64;
 
     loop {
         tokio::select! {
             _ = ping.tick() => {
-                ws.send(Message::Ping(Vec::new().into()))
+                ws.send(Message::Text("PING".to_string().into()))
                     .await
                     .context("send polymarket book ping")?;
             }
@@ -327,9 +380,29 @@ async fn run_book_update_loop(
                     Message::Close(_) => break,
                     Message::Frame(_) => continue,
                 };
-
-                let Ok(payload) = serde_json::from_str::<WsEnvelope>(&text) else {
+                if text == "PONG" {
                     continue;
+                }
+
+                let payload = match serde_json::from_str::<WsEnvelope>(&text) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        parse_failures = parse_failures.saturating_add(1);
+                        if parse_failures <= 5 {
+                            let preview = text
+                                .chars()
+                                .take(240)
+                                .collect::<String>()
+                                .replace('\n', "\\n");
+                            tracing::warn!(
+                                ?err,
+                                failures = parse_failures,
+                                preview = %preview,
+                                "polymarket book ws json parse failed"
+                            );
+                        }
+                        continue;
+                    }
                 };
 
                 for event in payload.into_events() {
