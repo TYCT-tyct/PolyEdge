@@ -73,74 +73,92 @@ impl MarketDiscovery {
     }
 
     pub async fn discover(&self) -> Result<Vec<MarketDescriptor>> {
-        let markets: Vec<GammaMarket> = self
-            .http
-            .get(&self.cfg.endpoint)
-            .query(&[
-                ("closed", "false"),
-                ("archived", "false"),
-                ("active", "true"),
-                ("limit", "1000"),
-                ("order", "volume"),
-                ("ascending", "false"),
-            ])
-            .send()
-            .await
-            .context("discovery request")?
-            .error_for_status()
-            .context("discovery status")?
-            .json()
-            .await
-            .context("discovery json")?;
-
         let mut out = Vec::new();
-        for market in markets {
-            if !market.active || market.closed || !market.accepting_orders {
-                continue;
+        let mut seen = std::collections::HashSet::<String>::new();
+
+        // Gamma is ordered by volume and paginated by offset; crypto up/down markets can fall
+        // outside the top 1k depending on the global market mix. Scan a few pages deterministically.
+        let limit: i64 = 1000;
+        for offset in [0_i64, 1000, 2000, 3000] {
+            let limit_s = limit.to_string();
+            let offset_s = offset.to_string();
+            let markets: Vec<GammaMarket> = self
+                .http
+                .get(&self.cfg.endpoint)
+                .query(&[
+                    ("closed", "false"),
+                    ("archived", "false"),
+                    ("active", "true"),
+                    ("limit", limit_s.as_str()),
+                    ("offset", offset_s.as_str()),
+                    ("order", "volume"),
+                    ("ascending", "false"),
+                ])
+                .send()
+                .await
+                .context("discovery request")?
+                .error_for_status()
+                .context("discovery status")?
+                .json()
+                .await
+                .context("discovery json")?;
+
+            if markets.is_empty() {
+                break;
             }
-            let text = format!(
-                "{} {}",
-                market.question.to_ascii_uppercase(),
-                market.slug.clone().unwrap_or_default().to_ascii_uppercase()
-            );
-            let market_type = classify_market_type(&text);
-            if !self.cfg.market_types.is_empty()
-                && !self
-                    .cfg
-                    .market_types
-                    .iter()
-                    .any(|t| t.eq_ignore_ascii_case(market_type))
-            {
-                continue;
-            }
-            if !self.cfg.timeframes.is_empty() {
-                let Some(timeframe) = classify_timeframe(&text) else {
+
+            for market in markets {
+                if !market.active || market.closed || !market.accepting_orders {
                     continue;
-                };
-                if !self
-                    .cfg
-                    .timeframes
-                    .iter()
-                    .any(|t| t.eq_ignore_ascii_case(timeframe))
+                }
+                if !seen.insert(market.id.clone()) {
+                    continue;
+                }
+
+                let text = format!(
+                    "{} {}",
+                    market.question.to_ascii_uppercase(),
+                    market.slug.clone().unwrap_or_default().to_ascii_uppercase()
+                );
+                let market_type = classify_market_type(&text);
+                if !self.cfg.market_types.is_empty()
+                    && !self
+                        .cfg
+                        .market_types
+                        .iter()
+                        .any(|t| t.eq_ignore_ascii_case(market_type))
                 {
                     continue;
                 }
-            }
-            let Some(symbol) = detect_symbol(&text, &self.cfg.symbols) else {
-                continue;
-            };
+                if !self.cfg.timeframes.is_empty() {
+                    let Some(timeframe) = classify_timeframe(&text) else {
+                        continue;
+                    };
+                    if !self
+                        .cfg
+                        .timeframes
+                        .iter()
+                        .any(|t| t.eq_ignore_ascii_case(timeframe))
+                    {
+                        continue;
+                    }
+                }
+                let Some(symbol) = detect_symbol(&text, &self.cfg.symbols) else {
+                    continue;
+                };
 
-            out.push(MarketDescriptor {
-                market_id: market.id,
-                question: market.question,
-                symbol,
-                token_id_yes: parse_token_pair(market.clob_token_ids.as_deref()).map(|x| x.0),
-                token_id_no: parse_token_pair(market.clob_token_ids.as_deref()).map(|x| x.1),
-                event_slug: market.event_slug,
-                end_date: market.end_date,
-                best_bid: market.best_bid,
-                best_ask: market.best_ask,
-            });
+                out.push(MarketDescriptor {
+                    market_id: market.id,
+                    question: market.question,
+                    symbol,
+                    token_id_yes: parse_token_pair(market.clob_token_ids.as_deref()).map(|x| x.0),
+                    token_id_no: parse_token_pair(market.clob_token_ids.as_deref()).map(|x| x.1),
+                    event_slug: market.event_slug,
+                    end_date: market.end_date,
+                    best_bid: market.best_bid,
+                    best_ask: market.best_ask,
+                });
+            }
         }
 
         Ok(out)
