@@ -738,6 +738,10 @@ impl ShadowStats {
         push_capped(&mut outcomes, outcome, Self::SHADOW_CAP);
     }
 
+    async fn window_outcomes_len(&self) -> usize {
+        self.outcomes.read().await.len()
+    }
+
     async fn push_tick_to_decision_ms(&self, ms: f64) {
         let mut v = self.tick_to_decision_ms.write().await;
         push_capped(&mut v, ms, Self::SAMPLE_CAP);
@@ -1540,6 +1544,7 @@ fn spawn_strategy_engine(
         let mut latest_ticks: HashMap<String, RefTick> = HashMap::new();
         let mut market_inventory: HashMap<String, InventoryState> = HashMap::new();
         let mut market_rate_budget: HashMap<String, TokenBucket> = HashMap::new();
+        let mut untracked_issue_cooldown: HashMap<String, Instant> = HashMap::new();
         let mut global_rate_budget = TokenBucket::new(
             shared.rate_limit_rps,
             (shared.rate_limit_rps * 2.0).max(1.0),
@@ -1653,7 +1658,15 @@ fn spawn_strategy_engine(
                             }
                             shared.shadow_stats.record_issue("symbol_missing").await;
                         } else {
-                            shared.shadow_stats.record_issue("market_untracked").await;
+                            let now = Instant::now();
+                            let should_record = untracked_issue_cooldown
+                                .get(&book.market_id)
+                                .map(|last| last.elapsed() >= Duration::from_secs(60))
+                                .unwrap_or(true);
+                            if should_record {
+                                shared.shadow_stats.record_issue("market_untracked").await;
+                                untracked_issue_cooldown.insert(book.market_id.clone(), now);
+                            }
                         }
                         if last_symbol_retry_refresh.elapsed() >= Duration::from_secs(15) {
                             refresh_market_symbol_map(&shared).await;
@@ -1828,6 +1841,7 @@ fn spawn_strategy_engine(
                         )
                     };
                     let spread_yes = (book.ask_yes - book.bid_yes).max(0.0);
+                    let window_outcomes = shared.shadow_stats.window_outcomes_len().await;
                     let effective_min_edge_bps = adaptive_min_edge_bps(
                         cfg.min_edge_bps,
                         tox_decision.tox_score,
@@ -1835,12 +1849,21 @@ fn spawn_strategy_engine(
                         no_quote_rate,
                         markout_10s_p50,
                         markout_10s_p25,
+                        window_outcomes,
+                        ShadowStats::GATE_MIN_OUTCOMES,
                     );
                     let effective_max_spread = adaptive_max_spread(
                         cfg.max_spread,
                         tox_decision.tox_score,
                         markout_samples,
                     );
+                    if should_observe_only_symbol(&symbol, &cfg, &tox_decision, feed_in_ms, spread_yes) {
+                        shared
+                            .shadow_stats
+                            .mark_blocked_with_reason("symbol_quality_guard")
+                            .await;
+                        continue;
+                    }
                     let queue_fill_proxy =
                         estimate_queue_fill_proxy(tox_decision.tox_score, spread_yes, feed_in_ms);
 
@@ -2027,12 +2050,31 @@ fn spawn_strategy_engine(
                         }
 
                         let mut force_taker = false;
-                        if should_force_taker(&cfg, &tox_decision, edge_net, signal.confidence) {
+                        if should_force_taker(
+                            &cfg,
+                            &tox_decision,
+                            edge_net,
+                            signal.confidence,
+                            markout_samples,
+                            no_quote_rate,
+                            window_outcomes,
+                            ShadowStats::GATE_MIN_OUTCOMES,
+                            &symbol,
+                        ) {
                             let aggressive_price = aggressive_price_for_side(&book, &intent.side);
                             let passive_price = intent.price.max(1e-6);
                             let price_move_bps =
                                 ((aggressive_price - intent.price).abs() / passive_price) * 10_000.0;
-                            if price_move_bps <= cfg.taker_max_slippage_bps.max(0.0) {
+                            let taker_slippage_budget = adaptive_taker_slippage_bps(
+                                cfg.taker_max_slippage_bps,
+                                &cfg.market_tier_profile,
+                                &symbol,
+                                markout_samples,
+                                no_quote_rate,
+                                window_outcomes,
+                                ShadowStats::GATE_MIN_OUTCOMES,
+                            );
+                            if price_move_bps <= taker_slippage_budget {
                                 intent.price = aggressive_price;
                                 intent.ttl_ms = intent.ttl_ms.min(150);
                                 force_taker = true;
@@ -2584,7 +2626,20 @@ fn adaptive_min_edge_bps(
     no_quote_rate: f64,
     markout_10s_p50: f64,
     markout_10s_p25: f64,
+    window_outcomes: usize,
+    gate_min_outcomes: usize,
 ) -> f64 {
+    if window_outcomes < gate_min_outcomes {
+        let progress = (window_outcomes as f64 / gate_min_outcomes.max(1) as f64).clamp(0.0, 1.0);
+        let warmup_floor = (base_min_edge_bps * 0.15).max(0.5);
+        let warmup_target = (base_min_edge_bps * 0.50).max(warmup_floor);
+        let mut warmup_edge = warmup_floor + (warmup_target - warmup_floor) * progress;
+        if no_quote_rate > 0.85 {
+            warmup_edge *= 0.80;
+        }
+        return warmup_edge.clamp(0.25, base_min_edge_bps.max(0.25));
+    }
+
     if markout_samples < 20 {
         return (base_min_edge_bps * 0.5).max(1.0);
     }
@@ -2613,28 +2668,99 @@ fn should_force_taker(
     tox: &ToxicDecision,
     edge_net_bps: f64,
     confidence: f64,
+    markout_samples: usize,
+    no_quote_rate: f64,
+    window_outcomes: usize,
+    gate_min_outcomes: usize,
+    symbol: &str,
 ) -> bool {
-    if edge_net_bps < cfg.taker_trigger_bps.max(0.0) {
+    let profile = cfg.market_tier_profile.to_ascii_lowercase();
+    let aggressive_profile = profile.contains("taker")
+        || profile.contains("aggressive")
+        || profile.contains("latency");
+
+    let warmup_factor = if window_outcomes < gate_min_outcomes {
+        let progress = (window_outcomes as f64 / gate_min_outcomes.max(1) as f64).clamp(0.0, 1.0);
+        // Lower trigger during warmup so the funnel can collect enough comparable samples.
+        (0.70 + 0.30 * progress).clamp(0.60, 1.0)
+    } else {
+        1.0
+    };
+    let no_quote_factor = if no_quote_rate > 0.90 { 0.85 } else { 1.0 };
+    let mut trigger_bps = cfg.taker_trigger_bps.max(0.0) * warmup_factor * no_quote_factor;
+    if symbol.eq_ignore_ascii_case("SOLUSDT")
+        && (profile.contains("sol_guard") || !aggressive_profile)
+    {
+        trigger_bps *= 1.25;
+    }
+
+    if edge_net_bps < trigger_bps {
         return false;
     }
     if matches!(tox.regime, ToxicRegime::Danger) {
         return false;
     }
 
-    let profile = cfg.market_tier_profile.to_ascii_lowercase();
-    let aggressive_profile = profile.contains("taker")
-        || profile.contains("aggressive")
-        || profile.contains("latency");
-
     if matches!(tox.regime, ToxicRegime::Caution) && !aggressive_profile {
         return false;
     }
 
-    if confidence < 0.55 && !aggressive_profile {
+    let min_conf = if markout_samples < 20 || window_outcomes < gate_min_outcomes {
+        0.45
+    } else {
+        0.55
+    };
+    if confidence < min_conf && !aggressive_profile {
         return false;
     }
 
     true
+}
+
+fn adaptive_taker_slippage_bps(
+    base_slippage_bps: f64,
+    market_tier_profile: &str,
+    symbol: &str,
+    markout_samples: usize,
+    no_quote_rate: f64,
+    window_outcomes: usize,
+    gate_min_outcomes: usize,
+) -> f64 {
+    let mut out = base_slippage_bps.max(1.0);
+    let profile = market_tier_profile.to_ascii_lowercase();
+    let aggressive = profile.contains("aggressive") || profile.contains("latency");
+
+    if window_outcomes < gate_min_outcomes || markout_samples < 20 {
+        out *= if no_quote_rate > 0.85 { 1.40 } else { 1.20 };
+    }
+    if aggressive {
+        out *= 1.10;
+    }
+    if symbol.eq_ignore_ascii_case("SOLUSDT")
+        && (profile.contains("sol_guard") || !aggressive)
+    {
+        out *= 0.80;
+    }
+
+    out.clamp(5.0, 60.0)
+}
+
+fn should_observe_only_symbol(
+    symbol: &str,
+    cfg: &MakerConfig,
+    tox: &ToxicDecision,
+    feed_in_ms: f64,
+    spread_yes: f64,
+) -> bool {
+    if !symbol.eq_ignore_ascii_case("SOLUSDT") {
+        return false;
+    }
+    let profile = cfg.market_tier_profile.to_ascii_lowercase();
+    if !(profile.contains("sol_guard") || profile.contains("balanced")) {
+        return false;
+    }
+
+    matches!(tox.regime, ToxicRegime::Danger) || feed_in_ms > 250.0 || spread_yes > 0.020
 }
 
 fn estimate_queue_fill_proxy(tox_score: f64, spread_yes: f64, feed_in_ms: f64) -> f64 {
@@ -4481,17 +4607,50 @@ mod tests {
             reason_codes: vec![],
             ts_ns: 1,
         };
-        assert!(should_force_taker(&cfg, &safe, 12.0, 0.8));
-        assert!(!should_force_taker(&cfg, &safe, 8.0, 0.8));
-        assert!(!should_force_taker(&cfg, &safe, 12.0, 0.4));
+        assert!(should_force_taker(&cfg, &safe, 12.0, 0.8, 30, 0.1, 40, 30, "BTCUSDT"));
+        assert!(!should_force_taker(
+            &cfg, &safe, 8.0, 0.8, 30, 0.1, 40, 30, "BTCUSDT"
+        ));
+        assert!(!should_force_taker(
+            &cfg, &safe, 12.0, 0.4, 30, 0.1, 40, 30, "BTCUSDT"
+        ));
 
         let caution = ToxicDecision {
             regime: ToxicRegime::Caution,
             ..safe.clone()
         };
-        assert!(!should_force_taker(&cfg, &caution, 12.0, 0.8));
+        assert!(!should_force_taker(
+            &cfg, &caution, 12.0, 0.8, 30, 0.1, 40, 30, "BTCUSDT"
+        ));
         cfg.market_tier_profile = "latency_aggressive".to_string();
-        assert!(should_force_taker(&cfg, &caution, 12.0, 0.8));
+        assert!(should_force_taker(
+            &cfg, &caution, 12.0, 0.8, 30, 0.1, 40, 30, "BTCUSDT"
+        ));
+    }
+
+    #[test]
+    fn adaptive_min_edge_bps_warmup_relaxes_threshold() {
+        let relaxed = adaptive_min_edge_bps(5.0, 0.3, 0, 0.95, 0.0, 0.0, 0, 30);
+        assert!(relaxed <= 1.0);
+        let progressed = adaptive_min_edge_bps(5.0, 0.3, 0, 0.20, 0.0, 0.0, 25, 30);
+        assert!(progressed >= relaxed);
+    }
+
+    #[test]
+    fn sol_guard_observe_only_for_high_latency_or_spread() {
+        let mut cfg = MakerConfig::default();
+        cfg.market_tier_profile = "balanced_sol_guard".to_string();
+        let tox = ToxicDecision {
+            market_id: "m".to_string(),
+            symbol: "SOLUSDT".to_string(),
+            tox_score: 0.2,
+            regime: ToxicRegime::Safe,
+            reason_codes: vec![],
+            ts_ns: 1,
+        };
+        assert!(should_observe_only_symbol("SOLUSDT", &cfg, &tox, 260.0, 0.01));
+        assert!(should_observe_only_symbol("SOLUSDT", &cfg, &tox, 120.0, 0.03));
+        assert!(!should_observe_only_symbol("BTCUSDT", &cfg, &tox, 260.0, 0.03));
     }
 
     #[test]

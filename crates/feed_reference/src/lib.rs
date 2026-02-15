@@ -95,15 +95,26 @@ async fn run_binance_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> R
         .map(|s| format!("{}@trade", s.to_lowercase()))
         .collect::<Vec<_>>()
         .join("/");
-    let ws_base = std::env::var("POLYEDGE_BINANCE_WS_BASE")
-        .ok()
-        .filter(|v| v.starts_with("ws://") || v.starts_with("wss://"))
-        .unwrap_or_else(|| "wss://stream.binance.com:9443".to_string());
-    let endpoint = format!("{}/stream?streams={streams}", ws_base.trim_end_matches('/'));
+    let endpoint_candidates = binance_ws_endpoints(&streams);
+    let mut last_err: Option<anyhow::Error> = None;
+    let mut ws = None;
 
-    let (mut ws, _) = connect_async(&endpoint)
-        .await
-        .with_context(|| format!("connect binance ws: {endpoint}"))?;
+    for endpoint in endpoint_candidates {
+        match connect_async(&endpoint).await {
+            Ok((socket, _)) => {
+                ws = Some(socket);
+                break;
+            }
+            Err(err) => {
+                tracing::warn!(?err, endpoint, "connect binance ws failed; trying next endpoint");
+                last_err = Some(anyhow::Error::new(err));
+            }
+        }
+    }
+    let mut ws = ws.ok_or_else(|| {
+        last_err
+            .unwrap_or_else(|| anyhow::anyhow!("connect binance ws failed: no endpoint available"))
+    })?;
 
     while let Some(msg) = ws.next().await {
         let msg = msg.context("binance ws read")?;
@@ -143,6 +154,35 @@ async fn run_binance_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> R
     }
 
     Ok(())
+}
+
+fn binance_ws_endpoints(streams: &str) -> Vec<String> {
+    if let Ok(raw) = std::env::var("POLYEDGE_BINANCE_WS_BASES") {
+        let endpoints = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|v| v.starts_with("ws://") || v.starts_with("wss://"))
+            .map(|base| format!("{}/stream?streams={streams}", base.trim_end_matches('/')))
+            .collect::<Vec<_>>();
+        if !endpoints.is_empty() {
+            return endpoints;
+        }
+    }
+
+    if let Ok(base) = std::env::var("POLYEDGE_BINANCE_WS_BASE") {
+        if base.starts_with("ws://") || base.starts_with("wss://") {
+            return vec![format!(
+                "{}/stream?streams={streams}",
+                base.trim_end_matches('/')
+            )];
+        }
+    }
+
+    vec![
+        format!("wss://stream.binance.com/stream?streams={streams}"),
+        format!("wss://stream.binance.com:9443/stream?streams={streams}"),
+        format!("wss://data-stream.binance.vision/stream?streams={streams}"),
+    ]
 }
 
 async fn run_bybit_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> Result<()> {
