@@ -1818,9 +1818,12 @@ fn spawn_strategy_engine(
                     let eval_tick = tick_fast;
                     shared.shadow_stats.mark_seen();
 
-                    let book_top_lag_ms = if tick_fast.recv_ts_local_ns > 0 && book.recv_ts_local_ns > 0 {
-                        ((tick_fast.recv_ts_local_ns - book.recv_ts_local_ns).max(0) as f64)
-                            / 1_000_000.0
+                    // Positive value means: our fast reference tick arrived earlier than the
+                    // Polymarket book update (i.e. the exploitable lag window).
+                    let book_top_lag_ms =
+                        if tick_fast.recv_ts_local_ns > 0 && book.recv_ts_local_ns > 0 {
+                            ((book.recv_ts_local_ns - tick_fast.recv_ts_local_ns).max(0) as f64)
+                                / 1_000_000.0
                     } else {
                         0.0
                     };
