@@ -532,6 +532,12 @@ struct LatencyBreakdown {
     ref_decode_p50_ms: f64,
     ref_decode_p90_ms: f64,
     ref_decode_p99_ms: f64,
+    /// `book_top_lag_ms` distribution *for the same primary-delay executed shots* that have a
+    /// measured `ack_only_ms` (i.e. same sample set as capturable_window).
+    book_top_lag_at_ack_p50_ms: f64,
+    book_top_lag_at_ack_p90_ms: f64,
+    book_top_lag_at_ack_p99_ms: f64,
+    book_top_lag_at_ack_n: u64,
     capturable_window_p50_ms: f64,
     capturable_window_p75_ms: f64,
     capturable_window_p90_ms: f64,
@@ -1387,6 +1393,16 @@ impl ShadowStats {
             survival_probe_10ms_by_symbol.insert(sym, c.ratio(10));
         }
 
+        let shots_primary_at_ack = shots_primary
+            .iter()
+            .copied()
+            .filter(|s| s.ack_only_ms > 0.0)
+            .collect::<Vec<_>>();
+        let book_top_lag_at_ack_ms = shots_primary_at_ack
+            .iter()
+            .map(|s| s.book_top_lag_ms)
+            .collect::<Vec<_>>();
+
         let latency = LatencyBreakdown {
             feed_in_p50_ms: percentile(&feed_in_ms, 0.50).unwrap_or(0.0),
             feed_in_p90_ms: percentile(&feed_in_ms, 0.90).unwrap_or(0.0),
@@ -1433,6 +1449,10 @@ impl ShadowStats {
             ref_decode_p50_ms: percentile(&ref_decode_ms, 0.50).unwrap_or(0.0),
             ref_decode_p90_ms: percentile(&ref_decode_ms, 0.90).unwrap_or(0.0),
             ref_decode_p99_ms: percentile(&ref_decode_ms, 0.99).unwrap_or(0.0),
+            book_top_lag_at_ack_p50_ms: percentile(&book_top_lag_at_ack_ms, 0.50).unwrap_or(0.0),
+            book_top_lag_at_ack_p90_ms: percentile(&book_top_lag_at_ack_ms, 0.90).unwrap_or(0.0),
+            book_top_lag_at_ack_p99_ms: percentile(&book_top_lag_at_ack_ms, 0.99).unwrap_or(0.0),
+            book_top_lag_at_ack_n: book_top_lag_at_ack_ms.len() as u64,
             capturable_window_p50_ms: percentile(&capturable_window_ms, 0.50).unwrap_or(0.0),
             capturable_window_p75_ms: percentile(&capturable_window_ms, 0.75).unwrap_or(0.0),
             capturable_window_p90_ms: percentile(&capturable_window_ms, 0.90).unwrap_or(0.0),
@@ -2560,6 +2580,8 @@ fn spawn_strategy_engine(
                             &mut global_rate_budget,
                             &predator_cfg,
                             &symbol,
+                            tick_fast.recv_ts_ms,
+                            tick_fast.recv_ts_local_ns,
                             now_ms,
                         )
                         .await;
@@ -2630,6 +2652,8 @@ fn spawn_strategy_engine(
                                 &mut global_rate_budget,
                                 &predator_cfg,
                                 &symbol,
+                                tick_fast.recv_ts_ms,
+                                tick_fast.recv_ts_local_ns,
                                 now_ms,
                             )
                             .await;
@@ -2860,12 +2884,10 @@ fn spawn_strategy_engine(
                                     .await;
                                 if ack_only_ms > 0.0 {
                                     shared.shadow_stats.push_ack_only_ms(ack_only_ms).await;
-                                }
-                                shared
-                                    .shadow_stats
-                                    .push_tick_to_ack_ms(tick_to_ack_ms)
-                                    .await;
-                                if capturable_window_ms != 0.0 {
+                                    shared
+                                        .shadow_stats
+                                        .push_tick_to_ack_ms(tick_to_ack_ms)
+                                        .await;
                                     shared
                                         .shadow_stats
                                         .push_capturable_window_ms(capturable_window_ms)
@@ -2879,10 +2901,8 @@ fn spawn_strategy_engine(
                                     .record(latency_sample.local_backlog_ms);
                                 if ack_only_ms > 0.0 {
                                     metrics::histogram!("latency.ack_only_ms").record(ack_only_ms);
-                                }
-                                metrics::histogram!("latency.tick_to_ack_ms")
-                                    .record(tick_to_ack_ms);
-                                if capturable_window_ms != 0.0 {
+                                    metrics::histogram!("latency.tick_to_ack_ms")
+                                        .record(tick_to_ack_ms);
                                     metrics::histogram!("latency.capturable_window_ms")
                                         .record(capturable_window_ms);
                                 }
@@ -2993,6 +3013,8 @@ async fn run_predator_c_for_symbol(
     global_rate_budget: &mut TokenBucket,
     predator_cfg: &PredatorCConfig,
     symbol: &str,
+    tick_fast_recv_ts_ms: i64,
+    tick_fast_recv_ts_local_ns: i64,
     now_ms: i64,
 ) -> PredatorExecResult {
     shared.shadow_stats.set_predator_enabled(predator_cfg.enabled);
@@ -3211,6 +3233,8 @@ async fn run_predator_c_for_symbol(
             predator_cfg,
             &direction_signal,
             &opp,
+            tick_fast_recv_ts_ms,
+            tick_fast_recv_ts_local_ns,
             now_ms,
         )
         .await;
@@ -3232,6 +3256,8 @@ async fn predator_execute_opportunity(
     predator_cfg: &PredatorCConfig,
     _direction_signal: &DirectionSignal,
     opp: &TimeframeOpp,
+    tick_fast_recv_ts_ms: i64,
+    tick_fast_recv_ts_local_ns: i64,
     now_ms: i64,
 ) -> PredatorExecResult {
     let mut intent = QuoteIntent {
@@ -3251,6 +3277,19 @@ async fn predator_execute_opportunity(
             .mark_predator_taker_skipped("book_missing")
             .await;
         return PredatorExecResult::default();
+    };
+
+    // Same interpretation as the maker path: positive means our fast ref tick arrived earlier
+    // than the Polymarket book update. For Predator, the ref tick is per-symbol while the book
+    // is per-market, so this is still a useful (if approximate) window estimate.
+    let tick_age_ms = freshness_ms(now_ms, tick_fast_recv_ts_ms);
+    let book_top_lag_ms = if tick_age_ms <= 1_500
+        && tick_fast_recv_ts_local_ns > 0
+        && book.recv_ts_local_ns > 0
+    {
+        ((book.recv_ts_local_ns - tick_fast_recv_ts_local_ns).max(0) as f64) / 1_000_000.0
+    } else {
+        0.0
     };
 
     let proposed_notional_usdc = (intent.price.max(0.0) * intent.size.max(0.0)).max(0.0);
@@ -3375,13 +3414,25 @@ async fn predator_execute_opportunity(
                 0.0
             };
             let tick_to_ack_ms = order_build_ms + ack_only_ms;
+            let capturable_window_ms = if ack_only_ms > 0.0 {
+                book_top_lag_ms - tick_to_ack_ms
+            } else {
+                0.0
+            };
             if ack_only_ms > 0.0 {
                 shared.shadow_stats.push_ack_only_ms(ack_only_ms).await;
+                shared
+                    .shadow_stats
+                    .push_tick_to_ack_ms(tick_to_ack_ms)
+                    .await;
+                shared
+                    .shadow_stats
+                    .push_capturable_window_ms(capturable_window_ms)
+                    .await;
+                metrics::histogram!("latency.ack_only_ms").record(ack_only_ms);
+                metrics::histogram!("latency.tick_to_ack_ms").record(tick_to_ack_ms);
+                metrics::histogram!("latency.capturable_window_ms").record(capturable_window_ms);
             }
-            shared
-                .shadow_stats
-                .push_tick_to_ack_ms(tick_to_ack_ms)
-                .await;
 
             let ack = OrderAck {
                 order_id: ack_v2.order_id,
@@ -3399,10 +3450,10 @@ async fn predator_execute_opportunity(
                     symbol: opp.symbol.clone(),
                     side: intent.side.clone(),
                     execution_style: ExecutionStyle::Taker,
-                    book_top_lag_ms: 0.0,
+                    book_top_lag_ms,
                     ack_only_ms,
                     tick_to_ack_ms,
-                    capturable_window_ms: 0.0,
+                    capturable_window_ms,
                     survival_probe_price: aggressive_price_for_side(&book, &intent.side),
                     intended_price: intent.price,
                     size: intent.size,

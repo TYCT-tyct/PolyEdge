@@ -48,6 +48,10 @@ def main() -> int:
         ("book_top_lag_p50_ms", ["book_top_lag_p50_ms"]),
         ("book_top_lag_p90_ms", ["book_top_lag_p90_ms"]),
         ("book_top_lag_p99_ms", ["book_top_lag_p99_ms"]),
+        ("book_top_lag_at_ack_p50_ms", ["latency", "book_top_lag_at_ack_p50_ms"]),
+        ("book_top_lag_at_ack_p90_ms", ["latency", "book_top_lag_at_ack_p90_ms"]),
+        ("book_top_lag_at_ack_p99_ms", ["latency", "book_top_lag_at_ack_p99_ms"]),
+        ("book_top_lag_at_ack_n", ["latency", "book_top_lag_at_ack_n"]),
         ("capturable_window_p50_ms", ["latency", "capturable_window_p50_ms"]),
         ("capturable_window_p75_ms", ["latency", "capturable_window_p75_ms"]),
         ("capturable_window_p90_ms", ["latency", "capturable_window_p90_ms"]),
@@ -59,6 +63,15 @@ def main() -> int:
     for name, path in fields:
         v = _get(d, path)
         print(f"{name}={v}")
+
+    # Sanity check: capturable should match (book_top_lag_at_ack - tick_to_ack) on the same sample set.
+    try:
+        lag_at_ack_p50 = float(_get(d, ["latency", "book_top_lag_at_ack_p50_ms"]) or 0.0)
+        tta_p50 = float(_get(d, ["latency", "tick_to_ack_p50_ms"]) or 0.0)
+        capt_est = lag_at_ack_p50 - tta_p50
+        print(f"capturable_est_p50_ms={capt_est}")
+    except Exception:
+        pass
 
     br = d.get("blocked_reason_counts", {})
     if isinstance(br, dict):
@@ -75,4 +88,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

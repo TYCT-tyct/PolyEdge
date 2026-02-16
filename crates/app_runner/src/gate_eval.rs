@@ -11,6 +11,18 @@ pub(super) fn compute_gate_fail_reasons(
             live.window_outcomes, min_outcomes
         ));
     }
+    if live.latency.ack_only_n < min_outcomes as u64 {
+        failed.push(format!(
+            "ack_only_unmeasured_or_insufficient_samples {} < {}",
+            live.latency.ack_only_n, min_outcomes
+        ));
+    }
+    if live.latency.capturable_window_n < min_outcomes as u64 {
+        failed.push(format!(
+            "capturable_window_unmeasured_or_insufficient_samples {} < {}",
+            live.latency.capturable_window_n, min_outcomes
+        ));
+    }
     if live.fillability_10ms < 0.60 {
         failed.push(format!(
             "fillability_10ms {:.4} < 0.6000",
