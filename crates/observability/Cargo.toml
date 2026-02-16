@@ -9,3 +9,4 @@ metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tracing-appender.workspace = true

@@ -1697,7 +1697,7 @@ fn main() -> Result<()> {
 }
 
 async fn async_main() -> Result<()> {
-    init_tracing("app_runner");
+    let _guard = init_tracing("app_runner");
     let prometheus = init_metrics();
     ensure_dataset_dirs();
 
