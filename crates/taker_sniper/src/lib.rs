@@ -92,7 +92,8 @@ impl TakerSniper {
         if self.cfg.cooldown_ms_per_market > 0 {
             if let Some(last) = self.last_fire_ms_by_market.get(market_id) {
                 let age = now_ms.saturating_sub(*last);
-                if age >= 0 && (age as u64) < self.cfg.cooldown_ms_per_market {
+                // saturating_sub already ensures age >= 0
+                if (age as u64) < self.cfg.cooldown_ms_per_market {
                     return skip("cooldown_active");
                 }
             }

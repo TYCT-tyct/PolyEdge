@@ -59,7 +59,12 @@ impl SettlementCompounder {
         &self.cfg
     }
 
-    pub fn set_cfg(&mut self, cfg: CompounderConfig) {
+    pub fn set_cfg(&mut self, mut cfg: CompounderConfig) {
+        // Validate and clamp config values to valid ranges
+        cfg.compound_ratio = cfg.compound_ratio.clamp(0.0, 1.0);
+        cfg.position_fraction = cfg.position_fraction.clamp(0.0, 1.0);
+        cfg.min_quote_size = cfg.min_quote_size.max(0.0);
+        cfg.daily_loss_cap_usdc = cfg.daily_loss_cap_usdc.max(0.0);
         self.cfg = cfg;
         if self.initial_usdc <= 0.0 {
             self.initial_usdc = self.cfg.initial_capital_usdc.max(0.0);

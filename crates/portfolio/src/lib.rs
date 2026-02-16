@@ -37,18 +37,22 @@ impl PortfolioBook {
                 pos.yes += fill.size;
             }
             OrderSide::SellYes => {
+                // Use min to prevent negative position: only close up to existing position
                 let closed = fill.size.min(pos.yes);
                 *self.realized.write() += (fill.price - pos.avg_yes) * closed - fill.fee;
-                pos.yes -= fill.size;
+                // Only reduce by actual closed amount, not full fill size
+                pos.yes = (pos.yes - closed).max(0.0);
             }
             OrderSide::BuyNo => {
                 pos.avg_no = weighted_avg(pos.avg_no, pos.no, fill.price, fill.size);
                 pos.no += fill.size;
             }
             OrderSide::SellNo => {
+                // Use min to prevent negative position: only close up to existing position
                 let closed = fill.size.min(pos.no);
                 *self.realized.write() += (fill.price - pos.avg_no) * closed - fill.fee;
-                pos.no -= fill.size;
+                // Only reduce by actual closed amount, not full fill size
+                pos.no = (pos.no - closed).max(0.0);
             }
         }
     }
@@ -57,9 +61,25 @@ impl PortfolioBook {
         self.positions.read().clone()
     }
 
-    pub fn snapshot(&self) -> PnLSnapshot {
+    /// Calculate unrealized PnL based on current market prices
+    /// If no prices provided, unrealized is treated as 0
+    pub fn snapshot_with_prices(&self, prices: &HashMap<String, f64>) -> PnLSnapshot {
         let realized = *self.realized.read();
-        let unrealized = 0.0;
+
+        // Calculate unrealized PnL using current market prices
+        let positions = self.positions.read();
+        let mut unrealized = 0.0;
+        for (market_id, pos) in positions.iter() {
+            if let Some(&current_price) = prices.get(market_id) {
+                // Unrealized = (current_price - avg_price) * position_size
+                // For yes position: (current - avg_yes) * yes
+                // For no position: (current - (1-avg_no)) * no = (avg_no - (1-current)) * no
+                unrealized += (current_price - pos.avg_yes).max(0.0) * pos.yes;
+                unrealized += ((1.0 - pos.avg_no) - (1.0 - current_price)).max(0.0) * pos.no;
+            }
+        }
+        drop(positions);
+
         let equity = realized + unrealized;
 
         let mut peak = self.equity_peak.write();
@@ -79,6 +99,11 @@ impl PortfolioBook {
             max_drawdown_pct: drawdown,
             daily_pnl: equity,
         }
+    }
+
+    /// Legacy snapshot without price info (unrealized = 0)
+    pub fn snapshot(&self) -> PnLSnapshot {
+        self.snapshot_with_prices(&HashMap::new())
     }
 }
 

@@ -1,26 +1,35 @@
 # Rust
-/target/
+/target
 **/*.rs.bk
-
-# Runtime outputs
-/tmp/
-/datasets/
-/crates/**/datasets/
-/crates/**/tmp/
+Cargo.lock
 
 # Python
 __pycache__/
 *.py[cod]
-*.pyo
-.pytest_cache/
-.mypy_cache/
+*.so
+venv/
+.venv/
+env/
+.env
 
-# OS / editors
-.DS_Store
-Thumbs.db
-.idea/
-.vscode/
+# Datasets & Temp
+datasets/
+crates/replay_engine/datasets/
+tmp/
+*.log
+*.tar.gz
 
-# local sync artifacts (never commit)
-codex_changes.patch
-codex_sync.tgz
+# IDEs
+.idea
+.vscode
+*.iml
+
+# Deployment Artifacts
+setup_remote.sh
+deploy.tar.gz
+settings.local.json
+optimized.env.example
+debug_*.json
+scripts/deploy_optimize.sh
+scripts/network_optimize.sh
+scripts/latency_probe/live_latency.py

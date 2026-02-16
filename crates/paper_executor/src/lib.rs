@@ -32,15 +32,14 @@ impl ShadowExecutor {
 
     pub fn on_book(&self, book: &BookTop) -> Vec<FillEvent> {
         let mut fills = Vec::new();
-        let mut to_remove = Vec::new();
 
-        {
-            let orders = self.orders.read();
-            for (id, order) in orders.iter() {
-                if order.intent.market_id != book.market_id {
-                    continue;
-                }
-
+        // Use write lock for entire operation to prevent race condition
+        // between read (matching) and write (removing filled orders)
+        let mut orders = self.orders.write();
+        let to_remove: Vec<String> = orders
+            .iter()
+            .filter(|(_, order)| order.intent.market_id == book.market_id)
+            .filter_map(|(id, order)| {
                 let maybe_fill_price = match order.intent.side {
                     OrderSide::BuyYes if order.intent.price >= book.ask_yes => Some(book.ask_yes),
                     OrderSide::SellYes if order.intent.price <= book.bid_yes => Some(book.bid_yes),
@@ -48,8 +47,7 @@ impl ShadowExecutor {
                     OrderSide::SellNo if order.intent.price <= book.bid_no => Some(book.bid_no),
                     _ => None,
                 };
-
-                if let Some(px) = maybe_fill_price {
+                maybe_fill_price.map(|px| {
                     fills.push(FillEvent {
                         order_id: id.clone(),
                         market_id: order.intent.market_id.clone(),
@@ -59,16 +57,14 @@ impl ShadowExecutor {
                         fee: 0.0,
                         ts_ms: Utc::now().timestamp_millis(),
                     });
-                    to_remove.push(id.clone());
-                }
-            }
-        }
+                    id.clone()
+                })
+            })
+            .collect();
 
-        if !to_remove.is_empty() {
-            let mut orders = self.orders.write();
-            for id in to_remove {
-                orders.remove(&id);
-            }
+        // Remove filled orders within same write lock
+        for id in to_remove {
+            orders.remove(&id);
         }
 
         fills

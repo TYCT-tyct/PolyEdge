@@ -48,6 +48,8 @@ struct SymbolWindow {
 pub struct DirectionDetector {
     windows: HashMap<String, SymbolWindow>,
     cfg: DirectionConfig,
+    /// Tick counter for lazy pruning - only prune every N ticks
+    tick_counter: usize,
 }
 
 impl DirectionDetector {
@@ -55,6 +57,7 @@ impl DirectionDetector {
         Self {
             windows: HashMap::new(),
             cfg,
+            tick_counter: 0,
         }
     }
 
@@ -71,17 +74,22 @@ impl DirectionDetector {
         let w = self
             .windows
             .entry(tick.symbol.clone())
-            .or_insert_with(SymbolWindow::default);
+            .or_default();
 
         w.ticks.push_back((tick.recv_ts_ms, tick.price));
         w.latest_by_source
             .insert(tick.source.clone(), tick.price);
 
-        let cutoff = tick
-            .recv_ts_ms
-            .saturating_sub((self.cfg.window_max_sec as i64).saturating_mul(1_000));
-        while matches!(w.ticks.front(), Some((ts, _)) if *ts < cutoff) {
-            w.ticks.pop_front();
+        // Lazy pruning: only prune every 100 ticks to reduce CPU overhead
+        self.tick_counter += 1;
+        if self.tick_counter >= 100 {
+            self.tick_counter = 0;
+            let cutoff = tick
+                .recv_ts_ms
+                .saturating_sub((self.cfg.window_max_sec as i64).saturating_mul(1_000));
+            while matches!(w.ticks.front(), Some((ts, _)) if *ts < cutoff) {
+                w.ticks.pop_front();
+            }
         }
     }
 
@@ -133,7 +141,7 @@ impl DirectionDetector {
             magnitude_pct,
             confidence,
             recommended_tf,
-            ts_ns: (now_ms.max(0) as i64) * 1_000_000,
+            ts_ns: now_ms.max(0) * 1_000_000,
         })
     }
 }
@@ -171,12 +179,15 @@ fn compute_confidence(
         return 0.0;
     }
     let mut consistent = 0usize;
+    // Use a small threshold for Neutral instead of exact equality
+    // Floating-point exact equality is nearly impossible, so we use 0.1% threshold
+    const NEUTRAL_THRESHOLD: f64 = 0.001;
     for px in latest_by_source.values() {
         let ret = (*px - anchor_short) / anchor_short;
         let ok = match direction {
             Direction::Up => ret > 0.0,
             Direction::Down => ret < 0.0,
-            Direction::Neutral => ret.abs() <= 0.0,
+            Direction::Neutral => ret.abs() <= NEUTRAL_THRESHOLD,
         };
         if ok {
             consistent += 1;

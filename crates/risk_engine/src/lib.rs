@@ -47,27 +47,35 @@ impl DefaultRiskManager {
 
 impl RiskManager for DefaultRiskManager {
     fn evaluate(&self, ctx: &RiskContext) -> RiskDecision {
-        let limits = self
-            .limits
-            .read()
-            .map(|g| g.clone())
-            .unwrap_or_else(|_| RiskLimits::default());
+        let limits = match self.limits.read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => {
+                // Lock poisoned - fail closed for safety
+                return RiskDecision {
+                    allow: false,
+                    reason: "risk_lock_poisoned".to_string(),
+                    capped_size: 0.0,
+                };
+            }
+        };
 
         let now_ms = ctx.now_ms;
 
         // Cooldown gate (e.g. after a loss streak trigger).
-        if let Ok(st) = self.state.lock() {
-            if now_ms > 0 && now_ms < st.cooldown_until_ms {
-                return RiskDecision {
-                    allow: false,
-                    reason: "cooldown".to_string(),
-                    capped_size: 0.0,
-                };
-            }
+        let cooldown_active = self.state.lock()
+            .map(|st| now_ms > 0 && now_ms < st.cooldown_until_ms)
+            .unwrap_or(false); // Fail closed if lock fails
+
+        if cooldown_active {
+            return RiskDecision {
+                allow: false,
+                reason: "cooldown".to_string(),
+                capped_size: 0.0,
+            };
         }
 
-        // Hard drawdown stop.
-        if ctx.drawdown_pct >= limits.max_drawdown_pct {
+        // Hard drawdown stop - use abs to handle negative drawdown values
+        if ctx.drawdown_pct.abs() >= limits.max_drawdown_pct {
             return RiskDecision {
                 allow: false,
                 reason: "drawdown_stop".to_string(),
@@ -79,8 +87,9 @@ impl RiskManager for DefaultRiskManager {
         if ctx.loss_streak >= limits.max_loss_streak && limits.max_loss_streak > 0 {
             if let Ok(mut st) = self.state.lock() {
                 if now_ms > 0 {
-                    st.cooldown_until_ms =
-                        st.cooldown_until_ms.max(now_ms + (limits.cooldown_sec as i64) * 1_000);
+                    // Use saturating_add to prevent overflow
+                    st.cooldown_until_ms = st.cooldown_until_ms
+                        .saturating_add((limits.cooldown_sec as i64).saturating_mul(1_000));
                 }
             }
             return RiskDecision {
@@ -102,12 +111,17 @@ impl RiskManager for DefaultRiskManager {
         // Notional caps. RiskContext carries precomputed notional in USDC.
         let proposed_notional = ctx.proposed_notional_usdc.max(0.0);
 
-        if ctx.market_notional + proposed_notional > limits.max_market_notional {
-            let remaining = (limits.max_market_notional - ctx.market_notional).max(0.0);
+        // Normalize existing notional to handle potential negative values
+        let market_notional = ctx.market_notional.max(0.0);
+        let asset_notional = ctx.asset_notional.max(0.0);
+
+        if market_notional + proposed_notional > limits.max_market_notional {
+            let remaining = (limits.max_market_notional - market_notional).max(0.0);
             let capped_size = if proposed_notional <= 0.0 {
                 0.0
             } else {
                 // Scale down size proportionally; caller uses it as a cap.
+                // Use epsilon to prevent division by zero
                 (ctx.proposed_size * (remaining / proposed_notional)).max(0.0)
             };
             return RiskDecision {
@@ -117,8 +131,8 @@ impl RiskManager for DefaultRiskManager {
             };
         }
 
-        if ctx.asset_notional + proposed_notional > limits.max_asset_notional {
-            let remaining = (limits.max_asset_notional - ctx.asset_notional).max(0.0);
+        if asset_notional + proposed_notional > limits.max_asset_notional {
+            let remaining = (limits.max_asset_notional - asset_notional).max(0.0);
             let capped_size = if proposed_notional <= 0.0 {
                 0.0
             } else {

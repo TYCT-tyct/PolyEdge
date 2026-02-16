@@ -23,7 +23,9 @@ impl Default for MonotonicClock {
 impl MonotonicClock {
     pub fn now_ns(&self) -> i64 {
         let elapsed = self.boot.elapsed().as_nanos() as i64;
-        elapsed + self.offset_ns.load(Ordering::Relaxed)
+        // Use SeqCst to ensure proper memory ordering for time synchronization
+        // This guarantees that writes to offset_ns are visible to subsequent reads
+        elapsed + self.offset_ns.load(Ordering::SeqCst)
     }
 
     pub fn now_ms(&self) -> i64 {
@@ -35,11 +37,12 @@ impl MonotonicClock {
     }
 
     pub fn apply_offset_ns(&self, offset_ns: i64) {
-        self.offset_ns.store(offset_ns, Ordering::Relaxed);
+        // Use SeqCst to ensure the offset is properly visible to all threads
+        self.offset_ns.store(offset_ns, Ordering::SeqCst);
     }
 
     pub fn offset_ns(&self) -> i64 {
-        self.offset_ns.load(Ordering::Relaxed)
+        self.offset_ns.load(Ordering::SeqCst)
     }
 }
 
