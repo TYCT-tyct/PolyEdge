@@ -1969,75 +1969,120 @@ fn spawn_market_feed(
 ) {
     const TS_INVERSION_TOLERANCE_MS: i64 = 250;
     const TS_BACKJUMP_RESET_MS: i64 = 5_000;
+    const BOOK_IDLE_TIMEOUT_MS: u64 = 1_000;
+    const RECONNECT_BASE_MS: u64 = 250;
+    const RECONNECT_MAX_MS: u64 = 10_000;
     tokio::spawn(async move {
-        let feed = PolymarketFeed::new_with_universe(
-            Duration::from_millis(50),
-            symbols,
-            market_types,
-            timeframes,
-        );
-        let Ok(mut stream) = feed.stream_books().await else {
-            tracing::error!("market feed failed to start");
-            return;
-        };
-        let mut ingest_seq: u64 = 0;
-        let mut last_source_ts_by_market: HashMap<String, i64> = HashMap::new();
+        let mut reconnects: u64 = 0;
+        loop {
+            let feed = PolymarketFeed::new_with_universe(
+                Duration::from_millis(50),
+                symbols.clone(),
+                market_types.clone(),
+                timeframes.clone(),
+            );
+            let Ok(mut stream) = feed.stream_books().await else {
+                reconnects = reconnects.saturating_add(1);
+                let backoff_ms =
+                    (RECONNECT_BASE_MS.saturating_mul(reconnects.min(40))).min(RECONNECT_MAX_MS);
+                tracing::warn!(
+                    reconnects,
+                    backoff_ms,
+                    "market feed failed to start; reconnecting"
+                );
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                continue;
+            };
+            if reconnects > 0 {
+                tracing::info!(reconnects, "market feed reconnected");
+            }
+            reconnects = 0;
 
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(book) => {
-                    ingest_seq = ingest_seq.saturating_add(1);
-                    let source_ts = book.ts_ms;
-                    let source_seq = source_ts.max(0) as u64;
-                    let valid = !book.market_id.is_empty()
-                        && book.bid_yes.is_finite()
-                        && book.ask_yes.is_finite()
-                        && book.bid_no.is_finite()
-                        && book.ask_no.is_finite()
-                        && source_seq > 0;
-                    stats.mark_data_validity(valid);
-                    if let Some(prev) = last_source_ts_by_market.get(&book.market_id).copied() {
-                        if source_ts + TS_INVERSION_TOLERANCE_MS < prev {
-                            let back_jump_ms = prev.saturating_sub(source_ts);
-                            if back_jump_ms > TS_BACKJUMP_RESET_MS {
-                                stats.record_issue("book_ts_backjump_reset").await;
-                            } else {
-                                stats.mark_ts_inversion();
+            let mut ingest_seq: u64 = 0;
+            let mut last_source_ts_by_market: HashMap<String, i64> = HashMap::new();
+
+            loop {
+                let next = tokio::time::timeout(
+                    Duration::from_millis(BOOK_IDLE_TIMEOUT_MS),
+                    stream.next(),
+                )
+                .await;
+                let item = match next {
+                    Ok(v) => v,
+                    Err(_) => {
+                        tracing::warn!(
+                            timeout_ms = BOOK_IDLE_TIMEOUT_MS,
+                            "market feed idle timeout; reconnecting"
+                        );
+                        break;
+                    }
+                };
+
+                let Some(item) = item else {
+                    tracing::warn!("market feed stream ended; reconnecting");
+                    break;
+                };
+
+                match item {
+                    Ok(book) => {
+                        ingest_seq = ingest_seq.saturating_add(1);
+                        let source_ts = book.ts_ms;
+                        let source_seq = source_ts.max(0) as u64;
+                        let valid = !book.market_id.is_empty()
+                            && book.bid_yes.is_finite()
+                            && book.ask_yes.is_finite()
+                            && book.bid_no.is_finite()
+                            && book.ask_no.is_finite()
+                            && source_seq > 0;
+                        stats.mark_data_validity(valid);
+                        if let Some(prev) = last_source_ts_by_market.get(&book.market_id).copied() {
+                            if source_ts + TS_INVERSION_TOLERANCE_MS < prev {
+                                let back_jump_ms = prev.saturating_sub(source_ts);
+                                if back_jump_ms > TS_BACKJUMP_RESET_MS {
+                                    stats.record_issue("book_ts_backjump_reset").await;
+                                } else {
+                                    stats.mark_ts_inversion();
+                                }
                             }
                         }
+                        last_source_ts_by_market.insert(book.market_id.clone(), source_ts);
+                        // IMPORTANT: book freshness must be based on *local* receive time, not the
+                        // exchange/server-provided ts_ms (which can be skewed/backjump).
+                        let book_tick_ms = if book.recv_ts_local_ns > 0 {
+                            (book.recv_ts_local_ns / 1_000_000).max(0)
+                        } else {
+                            Utc::now().timestamp_millis()
+                        };
+                        stats.mark_book_tick(book_tick_ms);
+                        let book_json =
+                            serde_json::to_string(&book).unwrap_or_else(|_| "{}".to_string());
+                        let hash = sha256_hex(&book_json);
+                        let line = format!(
+                            "{{\"ts_ms\":{},\"source_seq\":{},\"ingest_seq\":{},\"valid\":{},\"sha256\":\"{}\",\"book\":{}}}",
+                            Utc::now().timestamp_millis(),
+                            source_seq,
+                            ingest_seq,
+                            valid,
+                            hash,
+                            book_json
+                        );
+                        append_jsonl_line(&dataset_path("raw", "book_tops.jsonl"), line);
+                        if !valid {
+                            stats.record_issue("invalid_book_top").await;
+                            continue;
+                        }
+                        let _ = bus.publish(EngineEvent::BookTop(book));
                     }
-                    last_source_ts_by_market.insert(book.market_id.clone(), source_ts);
-                    // IMPORTANT: book freshness must be based on *local* receive time, not the
-                    // exchange/server-provided ts_ms (which can be skewed/backjump).
-                    let book_tick_ms = if book.recv_ts_local_ns > 0 {
-                        (book.recv_ts_local_ns / 1_000_000).max(0)
-                    } else {
-                        Utc::now().timestamp_millis()
-                    };
-                    stats.mark_book_tick(book_tick_ms);
-                    let book_json =
-                        serde_json::to_string(&book).unwrap_or_else(|_| "{}".to_string());
-                    let hash = sha256_hex(&book_json);
-                    let line = format!(
-                        "{{\"ts_ms\":{},\"source_seq\":{},\"ingest_seq\":{},\"valid\":{},\"sha256\":\"{}\",\"book\":{}}}",
-                        Utc::now().timestamp_millis(),
-                        source_seq,
-                        ingest_seq,
-                        valid,
-                        hash,
-                        book_json
-                    );
-                    append_jsonl_line(&dataset_path("raw", "book_tops.jsonl"), line);
-                    if !valid {
-                        stats.record_issue("invalid_book_top").await;
-                        continue;
+                    Err(err) => {
+                        tracing::warn!(?err, "market feed event error");
                     }
-                    let _ = bus.publish(EngineEvent::BookTop(book));
-                }
-                Err(err) => {
-                    tracing::warn!(?err, "market feed event error");
                 }
             }
+
+            reconnects = reconnects.saturating_add(1);
+            let backoff_ms =
+                (RECONNECT_BASE_MS.saturating_mul(reconnects.min(40))).min(RECONNECT_MAX_MS);
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
         }
     });
 }
