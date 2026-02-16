@@ -30,8 +30,10 @@ ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 # Polymarket CLOB enforces probability bounds for order prices.
 # Using a strict clamp here makes the gateway resilient to small slippage widening and
 # prevents avoidable "price out of range" rejects during canaries / micro-live.
-MIN_PRICE = 0.01
-MAX_PRICE = 0.99
+#
+# Note: CLOB books commonly show prices as low as 0.001 and as high as 0.999.
+MIN_PRICE = 0.001
+MAX_PRICE = 0.999
 
 
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
