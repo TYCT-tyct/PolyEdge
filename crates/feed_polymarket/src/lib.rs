@@ -13,9 +13,20 @@ use rand::Rng;
 use reqwest::Client;
 use serde::Deserialize;
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+
+/// WebSocket connection timeout
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// WebSocket read timeout - prevents hanging on stale connections
+const WS_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Validates that a price value is finite and within valid range [0, 1]
+fn validate_price(price: f64) -> bool {
+    price.is_finite() && (0.0..=1.0).contains(&price)
+}
 
 #[derive(Debug, Clone)]
 pub struct PolymarketEndpoints {
@@ -184,9 +195,13 @@ impl PolymarketFeed {
             "polymarket market ws subscribing"
         );
 
-        let (mut ws, _) = connect_async(&self.endpoints.clob_ws_market)
-            .await
-            .context("connect polymarket market ws")?;
+        let (mut ws, _) = timeout(
+            WS_CONNECT_TIMEOUT,
+            connect_async(&self.endpoints.clob_ws_market)
+        )
+        .await
+        .context("connect polymarket market ws timeout")?
+        .context("connect polymarket market ws")?;
         tracing::info!(endpoint = %self.endpoints.clob_ws_market, "polymarket market ws connected");
 
         let sub = serde_json::json!({
@@ -229,9 +244,22 @@ impl PolymarketFeed {
                         .await
                         .context("send polymarket ping")?;
                 }
-                msg = ws.next() => {
-                    let Some(msg) = msg else { break };
-                    let msg = msg.context("polymarket ws read")?;
+                msg = timeout(WS_READ_TIMEOUT, ws.next()) => {
+                    let msg = match msg {
+                        Ok(m) => m,
+                        Err(_) => {
+                            tracing::warn!("polymarket ws read timeout, reconnecting");
+                            break;
+                        }
+                    };
+                    let msg = match msg {
+                        Some(Ok(m)) => m,
+                        None => break, // Stream ended
+                        Some(Err(e)) => {
+                            tracing::warn!(error = %e, "polymarket ws read error");
+                            break;
+                        }
+                    };
                     let text = match msg {
                         Message::Text(t) => t.to_string(),
                         Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
@@ -302,11 +330,20 @@ impl PolymarketFeed {
                             } else {
                                 &mut state.no
                             };
+                            // Validate price data before assignment
                             if let Some(v) = update.best_bid {
-                                target.bid = v;
+                                if validate_price(v) {
+                                    target.bid = v;
+                                } else {
+                                    tracing::warn!(price = v, "invalid bid price, skipping");
+                                }
                             }
                             if let Some(v) = update.best_ask {
-                                target.ask = v;
+                                if validate_price(v) {
+                                    target.ask = v;
+                                } else {
+                                    tracing::warn!(price = v, "invalid ask price, skipping");
+                                }
                             }
                             target.ts_exchange_ms = update.ts_exchange_ms;
                             target.recv_ts_local_ns = update.recv_ts_local_ns;
@@ -367,9 +404,13 @@ async fn run_book_update_loop(
 ) -> Result<()> {
     let token_market_map = fetch_token_market_map(gamma_endpoint, token_ids).await?;
 
-    let (mut ws, _) = connect_async(endpoint)
-        .await
-        .with_context(|| format!("connect polymarket ws: {endpoint}"))?;
+    let (mut ws, _) = timeout(
+        WS_CONNECT_TIMEOUT,
+        connect_async(endpoint)
+    )
+    .await
+    .with_context(|| format!("connect polymarket ws timeout: {endpoint}"))?
+    .with_context(|| format!("connect polymarket ws: {endpoint}"))?;
 
     let sub = serde_json::json!({
         "type": "market",
@@ -390,9 +431,22 @@ async fn run_book_update_loop(
                     .await
                     .context("send polymarket book ping")?;
             }
-            msg = ws.next() => {
-                let Some(msg) = msg else { break };
-                let msg = msg.context("polymarket book ws read")?;
+            msg = timeout(WS_READ_TIMEOUT, ws.next()) => {
+                let msg = match msg {
+                    Ok(m) => m,
+                    Err(_) => {
+                        tracing::warn!("polymarket book ws read timeout, reconnecting");
+                        break;
+                    }
+                };
+                let msg = match msg {
+                    Some(Ok(m)) => m,
+                    None => break,
+                    Some(Err(e)) => {
+                        tracing::warn!(error = %e, "polymarket book ws read error");
+                        break;
+                    }
+                };
                 let text = match msg {
                     Message::Text(t) => t.to_string(),
                     Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
@@ -434,7 +488,16 @@ async fn run_book_update_loop(
                         if let Some(market_id) = token_market_map.get(&snapshot.asset_id) {
                             snapshot.market_id = market_id.clone();
                         }
-                        if tx.send(BookUpdate::Snapshot(snapshot)).await.is_err() {
+                        // Validate snapshot price levels
+                        let mut valid_snapshot = true;
+                        for level in snapshot.bids.iter().chain(snapshot.asks.iter()) {
+                            if !validate_price(level.price) {
+                                tracing::warn!(price = level.price, "invalid snapshot price level");
+                                valid_snapshot = false;
+                                break;
+                            }
+                        }
+                        if valid_snapshot && tx.send(BookUpdate::Snapshot(snapshot)).await.is_err() {
                             return Ok(());
                         }
                     }
@@ -442,6 +505,13 @@ async fn run_book_update_loop(
                     for mut delta in parse_deltas(&event) {
                         if let Some(market_id) = token_market_map.get(&delta.asset_id) {
                             delta.market_id = market_id.clone();
+                        }
+                        // Validate delta prices
+                        let valid_bid = delta.best_bid.map(validate_price).unwrap_or(true);
+                        let valid_ask = delta.best_ask.map(validate_price).unwrap_or(true);
+                        if !valid_bid || !valid_ask {
+                            tracing::warn!("invalid delta prices, skipping");
+                            continue;
                         }
                         let digest = OrderbookStateDigest {
                             market_id: delta.market_id.clone(),
@@ -710,8 +780,12 @@ fn top_level_price(value: Option<&Vec<WsLevel>>) -> Option<f64> {
     value?.first()?.price
 }
 
+/// Fast timestamp using SystemTime (more efficient than chrono::Utc::now())
 fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 async fn sleep_with_jitter(base: Duration) {
@@ -721,9 +795,10 @@ async fn sleep_with_jitter(base: Duration) {
 }
 
 fn now_ns() -> i64 {
-    chrono::Utc::now()
-        .timestamp_nanos_opt()
-        .unwrap_or_else(|| now_ms() * 1_000_000)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or_else(|_| now_ms() * 1_000_000)
 }
 
 #[derive(Debug, Deserialize)]

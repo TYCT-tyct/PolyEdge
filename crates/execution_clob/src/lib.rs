@@ -17,14 +17,30 @@ pub enum ExecutionMode {
     Live,
 }
 
-#[derive(Clone)]
 pub struct ClobExecution {
     mode: ExecutionMode,
     http: Client,
     clob_endpoint: String,
     open_orders: Arc<RwLock<HashMap<String, PaperOpenOrder>>>,
+    last_prune: std::sync::Mutex<Instant>,
     ack_probe: Option<Arc<AckProbe>>,
 }
+
+impl Clone for ClobExecution {
+    fn clone(&self) -> Self {
+        Self {
+            mode: self.mode,
+            http: self.http.clone(),
+            clob_endpoint: self.clob_endpoint.clone(),
+            open_orders: self.open_orders.clone(),
+            last_prune: std::sync::Mutex::new(Instant::now()),
+            ack_probe: self.ack_probe.clone(),
+        }
+    }
+}
+
+/// Minimum interval between order pruning to reduce lock contention
+const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 struct AckProbe {
@@ -116,6 +132,7 @@ impl ClobExecution {
             http,
             clob_endpoint,
             open_orders: Arc::new(RwLock::new(HashMap::new())),
+            last_prune: std::sync::Mutex::new(Instant::now()),
             ack_probe,
         }
     }
@@ -156,13 +173,29 @@ impl ClobExecution {
         }
     }
 
+    /// Prune expired orders with lazy cleanup (only every 60 seconds)
+    /// This reduces lock contention from O(n) per call to O(n) per minute
     fn prune_expired_orders(&self) {
-        let mut orders = self.open_orders.write();
-        let now = Instant::now();
-        orders.retain(|_, o| {
-            let ttl = std::time::Duration::from_millis(o.intent.ttl_ms.max(1));
-            now.duration_since(o.created_at) < ttl
-        });
+        // Check if enough time has passed since last prune
+        let should_prune = {
+            let mut last = self.last_prune.lock().unwrap();
+            let now = Instant::now();
+            if now.duration_since(*last) >= PRUNE_INTERVAL {
+                *last = now;
+                true
+            } else {
+                false
+            }
+        };
+
+        if should_prune {
+            let mut orders = self.open_orders.write();
+            let now = Instant::now();
+            orders.retain(|_, o| {
+                let ttl = Duration::from_millis(o.intent.ttl_ms.max(1));
+                now.duration_since(o.created_at) < ttl
+            });
+        }
     }
 }
 
@@ -221,6 +254,19 @@ impl ExecutionVenue for ClobExecution {
                 })
             }
             ExecutionMode::Live => {
+                // Validate price is finite and within valid range before sending
+                if !intent.price.is_finite() || intent.price <= 0.0 || intent.price >= 1.0 {
+                    return Ok(OrderAckV2 {
+                        order_id: new_id(),
+                        market_id: intent.market_id,
+                        accepted: false,
+                        accepted_size: 0.0,
+                        reject_code: Some("invalid_price".to_string()),
+                        exchange_latency_ms: 0.0,
+                        ts_ms: Utc::now().timestamp_millis(),
+                    });
+                }
+
                 let payload = serde_json::json!({
                     "market_id": intent.market_id,
                     "token_id": intent.token_id,
@@ -237,75 +283,105 @@ impl ExecutionVenue for ClobExecution {
                     "hold_to_resolution": intent.hold_to_resolution,
                 });
 
-                let res = self
-                    .http
-                    .post(format!("{}/orders", self.clob_endpoint))
-                    .json(&payload)
-                    .send()
-                    .await?;
-                let status = res.status();
-                let exchange_latency_ms = started.elapsed().as_secs_f64() * 1_000.0;
+                // Simple retry logic - retry immediately on network errors
+                const MAX_RETRIES: u32 = 3;
+                for attempt in 0..MAX_RETRIES {
+                    let res = match self
+                        .http
+                        .post(format!("{}/orders", self.clob_endpoint))
+                        .json(&payload)
+                        .send()
+                        .await
+                    {
+                        Ok(res) => res,
+                        Err(e) => {
+                            if attempt < MAX_RETRIES - 1 {
+                                continue; // Retry immediately
+                            }
+                            // All retries exhausted
+                            return Ok(OrderAckV2 {
+                                order_id: new_id(),
+                                market_id: intent.market_id,
+                                accepted: false,
+                                accepted_size: 0.0,
+                                reject_code: Some(format!("network_error: {}", e)),
+                                exchange_latency_ms: started.elapsed().as_secs_f64() * 1_000.0,
+                                ts_ms: Utc::now().timestamp_millis(),
+                            });
+                        }
+                    };
 
-                if !status.is_success() {
+                    let status = res.status();
+                    // Process response (read text first so we can still return a useful reject_code
+                    // even when the server returns non-JSON bodies).
+                    let raw = res.text().await.unwrap_or_default();
+                    let payload_value =
+                        serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_else(|_| {
+                            serde_json::json!({
+                                "raw": raw,
+                            })
+                        });
+                    let order_id = payload_value
+                        .get("order_id")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| payload_value.get("id").and_then(|v| v.as_str()))
+                        .or_else(|| payload_value.get("orderID").and_then(|v| v.as_str()))
+                        .map(ToString::to_string)
+                        .unwrap_or_else(new_id);
+                    let accepted_size = payload_value
+                        .get("accepted_size")
+                        .and_then(|v| v.as_f64())
+                        .or_else(|| payload_value.get("size").and_then(|v| v.as_f64()))
+                        .unwrap_or_else(|| if status.is_success() { intent.size } else { 0.0 });
+                    let mut accepted = payload_value
+                        .get("accepted")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(status.is_success());
+                    let mut reject_code = payload_value
+                        .get("reject_code")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| payload_value.get("reason").and_then(|v| v.as_str()))
+                        .or_else(|| payload_value.get("error").and_then(|v| v.as_str()))
+                        .map(ToString::to_string);
+
+                    // Force "not accepted" on HTTP errors even if the payload is missing/odd.
+                    if !status.is_success() {
+                        accepted = false;
+                        if reject_code.is_none() {
+                            reject_code = Some(format!("http_{}", status.as_u16()));
+                        }
+                    }
+
+                    if accepted_size <= 0.0 {
+                        accepted = false;
+                    }
+
+                    // Only retry on server errors (5xx)
+                    if status.is_server_error() && attempt < MAX_RETRIES - 1 {
+                        continue;
+                    }
+
+                    let exchange_latency_ms = started.elapsed().as_secs_f64() * 1_000.0;
                     return Ok(OrderAckV2 {
-                        order_id: new_id(),
+                        order_id,
                         market_id: intent.market_id,
-                        accepted: false,
-                        accepted_size: 0.0,
-                        reject_code: Some(format!("http_{}", status.as_u16())),
+                        accepted,
+                        accepted_size,
+                        reject_code,
                         exchange_latency_ms,
                         ts_ms: Utc::now().timestamp_millis(),
                     });
                 }
-
-                let payload_value = res
-                    .json::<serde_json::Value>()
-                    .await
-                    .unwrap_or_else(|_| serde_json::json!({}));
-                let order_id = payload_value
-                    .get("order_id")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| payload_value.get("id").and_then(|v| v.as_str()))
-                    .or_else(|| payload_value.get("orderID").and_then(|v| v.as_str()))
-                    .map(ToString::to_string)
-                    .unwrap_or_else(new_id);
-                let accepted_size = payload_value
-                    .get("accepted_size")
-                    .and_then(|v| v.as_f64())
-                    .or_else(|| payload_value.get("size").and_then(|v| v.as_f64()))
-                    .unwrap_or(intent.size);
-                let mut accepted = payload_value
-                    .get("accepted")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-                let mut reject_code = payload_value
-                    .get("reject_code")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| payload_value.get("reason").and_then(|v| v.as_str()))
-                    .or_else(|| payload_value.get("error").and_then(|v| v.as_str()))
-                    .map(ToString::to_string);
-
-                if accepted_size <= 0.0 {
-                    accepted = false;
-                    reject_code.get_or_insert_with(|| "zero_fill".to_string());
-                }
-                if accepted && matches!(intent.tif, core_types::OrderTimeInForce::Fok) {
-                    let missing = intent.size - accepted_size;
-                    if missing > 1e-9 {
-                        accepted = false;
-                        reject_code.get_or_insert_with(|| "fok_partial_fill".to_string());
-                    }
-                }
-
-                Ok(OrderAckV2 {
-                    order_id,
+                // All retries exhausted
+                return Ok(OrderAckV2 {
+                    order_id: new_id(),
                     market_id: intent.market_id,
-                    accepted,
-                    accepted_size: accepted_size.max(0.0),
-                    reject_code,
-                    exchange_latency_ms,
+                    accepted: false,
+                    accepted_size: 0.0,
+                    reject_code: Some("network_error_after_retry".to_string()),
+                    exchange_latency_ms: started.elapsed().as_secs_f64() * 1_000.0,
                     ts_ms: Utc::now().timestamp_millis(),
-                })
+                });
             }
         }
     }

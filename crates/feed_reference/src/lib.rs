@@ -8,9 +8,20 @@ use rand::Rng;
 use reqwest::Client;
 use serde::Deserialize;
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+
+/// WebSocket connection timeout
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// WebSocket read timeout - prevents hanging on stale connections
+const WS_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Validates that a price value is finite and positive
+fn validate_price(price: f64) -> bool {
+    price.is_finite() && price > 0.0
+}
 
 #[derive(Debug, Clone)]
 pub struct MultiSourceRefFeed {
@@ -119,18 +130,22 @@ async fn run_binance_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> R
     let mut ws = None;
 
     for endpoint in endpoint_candidates {
-        match connect_async(&endpoint).await {
-            Ok((socket, _)) => {
+        match timeout(WS_CONNECT_TIMEOUT, connect_async(&endpoint)).await {
+            Ok(Ok((socket, _))) => {
                 ws = Some(socket);
                 break;
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 tracing::warn!(
                     ?err,
                     endpoint,
                     "connect binance ws failed; trying next endpoint"
                 );
                 last_err = Some(anyhow::Error::new(err));
+            }
+            Err(_) => {
+                tracing::warn!(endpoint = %endpoint, "connect binance ws timeout; trying next endpoint");
+                last_err = Some(anyhow::anyhow!("connection timeout"));
             }
         }
     }
@@ -139,45 +154,64 @@ async fn run_binance_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> R
             .unwrap_or_else(|| anyhow::anyhow!("connect binance ws failed: no endpoint available"))
     })?;
 
-    while let Some(msg) = ws.next().await {
-        let msg = msg.context("binance ws read")?;
-        // Capture local receive timestamp as close as possible to socket delivery.
-        let recv_ns = now_ns();
-        let recv_ms = recv_ns / 1_000_000;
-        let text = match msg {
-            Message::Text(t) => t.to_string(),
-            Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
-            Message::Ping(v) => {
-                let _ = ws.send(Message::Pong(v)).await;
-                continue;
+    loop {
+        match timeout(WS_READ_TIMEOUT, ws.next()).await {
+            Ok(Some(Ok(msg))) => {
+                // Capture local receive timestamp as close as possible to socket delivery.
+                let recv_ns = now_ns();
+                let recv_ms = recv_ns / 1_000_000;
+                let text = match msg {
+                    Message::Text(t) => t.to_string(),
+                    Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
+                    Message::Ping(v) => {
+                        let _ = ws.send(Message::Pong(v)).await;
+                        continue;
+                    }
+                    Message::Pong(_) => continue,
+                    Message::Close(_) => break,
+                    Message::Frame(_) => continue,
+                };
+
+                let Ok(payload) = serde_json::from_str::<BinanceWsMessage>(&text) else {
+                    continue;
+                };
+                let trade = payload.into_trade();
+                let symbol = trade.symbol;
+                let price = trade.price;
+
+                // Validate price before creating tick
+                if !validate_price(price) {
+                    tracing::warn!(price = price, "invalid binance price, skipping");
+                    continue;
+                }
+
+                let event_ts = trade.event_ts.unwrap_or_else(now_ms);
+                let ingest_ns = now_ns();
+
+                let tick = RefTick {
+                    source: "binance_ws".to_string(),
+                    symbol,
+                    event_ts_ms: event_ts,
+                    recv_ts_ms: recv_ms,
+                    event_ts_exchange_ms: event_ts,
+                    recv_ts_local_ns: recv_ns,
+                    ingest_ts_local_ns: ingest_ns,
+                    price,
+                };
+
+                if tx.send(tick).await.is_err() {
+                    break;
+                }
             }
-            Message::Pong(_) => continue,
-            Message::Close(_) => break,
-            Message::Frame(_) => continue,
-        };
-
-        let Ok(payload) = serde_json::from_str::<BinanceWsMessage>(&text) else {
-            continue;
-        };
-        let trade = payload.into_trade();
-        let symbol = trade.symbol;
-        let price = trade.price;
-        let event_ts = trade.event_ts.unwrap_or_else(now_ms);
-        let ingest_ns = now_ns();
-
-        let tick = RefTick {
-            source: "binance_ws".to_string(),
-            symbol,
-            event_ts_ms: event_ts,
-            recv_ts_ms: recv_ms,
-            event_ts_exchange_ms: event_ts,
-            recv_ts_local_ns: recv_ns,
-            ingest_ts_local_ns: ingest_ns,
-            price,
-        };
-
-        if tx.send(tick).await.is_err() {
-            break;
+            Ok(None) => break, // Stream ended
+            Ok(Some(Err(e))) => {
+                tracing::warn!(error = %e, "binance ws read error");
+                break;
+            }
+            Err(_) => {
+                tracing::warn!("binance ws read timeout, reconnecting");
+                break;
+            }
         }
     }
 
@@ -351,6 +385,12 @@ async fn run_bybit_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> Res
             continue;
         };
 
+        // Validate price before creating tick
+        if !validate_price(price) {
+            tracing::warn!(price = price, "invalid bybit price, skipping");
+            continue;
+        }
+
         let tick = RefTick {
             source: "bybit_ws".to_string(),
             symbol,
@@ -436,6 +476,12 @@ async fn run_coinbase_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> 
         let Some(price) = price else {
             continue;
         };
+
+        // Validate price before creating tick
+        if !validate_price(price) {
+            tracing::warn!(price = price, "invalid coinbase price, skipping");
+            continue;
+        }
 
         let tick = RefTick {
             source: "coinbase_ws".to_string(),
@@ -684,14 +730,19 @@ fn from_coinbase_pair(product_id: &str) -> Option<String> {
     Some(format!("{base}USDT"))
 }
 
+/// Fast timestamp using SystemTime (more efficient than chrono::Utc::now())
 fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn now_ns() -> i64 {
-    chrono::Utc::now()
-        .timestamp_nanos_opt()
-        .unwrap_or_else(|| now_ms() * 1_000_000)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or_else(|_| now_ms() * 1_000_000)
 }
 
 #[cfg(test)]
