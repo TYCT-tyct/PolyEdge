@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use anyhow::{bail, Result};
@@ -21,6 +22,14 @@ pub struct ClobExecution {
     http: Client,
     clob_endpoint: String,
     open_orders: Arc<RwLock<HashMap<String, PaperOpenOrder>>>,
+    ack_probe: Option<Arc<AckProbe>>,
+}
+
+#[derive(Debug)]
+struct AckProbe {
+    url: String,
+    every: u64,
+    counter: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -43,11 +52,27 @@ impl ClobExecution {
             .timeout(timeout)
             .build()
             .unwrap_or_else(|_| Client::new());
+        let ack_probe = std::env::var("POLYEDGE_ACK_ONLY_PROBE_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|url| {
+                let every = std::env::var("POLYEDGE_ACK_ONLY_PROBE_EVERY")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(20)
+                    .max(1);
+                Arc::new(AckProbe {
+                    url,
+                    every,
+                    counter: AtomicU64::new(0),
+                })
+            });
         Self {
             mode,
             http,
             clob_endpoint,
             open_orders: Arc::new(RwLock::new(HashMap::new())),
+            ack_probe,
         }
     }
 
@@ -121,13 +146,25 @@ impl ExecutionVenue for ClobExecution {
                         created_at: Instant::now(),
                     },
                 );
+                // In paper mode, there is no real exchange RTT. Optionally probe a configured URL
+                // at a low sampling rate to estimate ack_only_ms without placing orders.
+                let mut exchange_latency_ms = 0.0;
+                if let Some(probe) = &self.ack_probe {
+                    let n = probe.counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                    if n % probe.every == 0 {
+                        let t0 = Instant::now();
+                        let _ = self.http.get(&probe.url).send().await;
+                        exchange_latency_ms = t0.elapsed().as_secs_f64() * 1_000.0;
+                    }
+                }
                 Ok(OrderAckV2 {
                     order_id,
                     market_id: intent.market_id,
                     accepted: true,
                     accepted_size: intent.size,
                     reject_code: None,
-                    exchange_latency_ms: started.elapsed().as_secs_f64() * 1_000.0,
+                    // Note: default is 0.0 unless probing is enabled.
+                    exchange_latency_ms,
                     ts_ms: Utc::now().timestamp_millis(),
                 })
             }

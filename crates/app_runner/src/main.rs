@@ -2834,18 +2834,18 @@ fn spawn_strategy_engine(
                                     .await;
                                 }
                                 let is_live = execution.is_live();
-                                let ack_only_ms = if is_live {
-                                    if ack_v2.exchange_latency_ms > 0.0 {
-                                        ack_v2.exchange_latency_ms
-                                    } else {
-                                        place_start.elapsed().as_secs_f64() * 1_000.0
-                                    }
+                                let ack_measured = ack_v2.exchange_latency_ms > 0.0;
+                                let ack_only_ms = if ack_measured {
+                                    ack_v2.exchange_latency_ms
+                                } else if is_live {
+                                    // Live should always return exchange_latency_ms, but keep a fallback.
+                                    place_start.elapsed().as_secs_f64() * 1_000.0
                                 } else {
                                     0.0
                                 };
                                 let tick_to_ack_ms =
                                     tick_to_decision_ms + order_build_ms + ack_only_ms;
-                                let capturable_window_ms = if is_live {
+                                let capturable_window_ms = if ack_only_ms > 0.0 {
                                     book_top_lag_ms - tick_to_ack_ms
                                 } else {
                                     0.0
@@ -2858,14 +2858,14 @@ fn spawn_strategy_engine(
                                     .shadow_stats
                                     .push_tick_to_decision_ms(tick_to_decision_ms)
                                     .await;
-                                if is_live && ack_only_ms > 0.0 {
+                                if ack_only_ms > 0.0 {
                                     shared.shadow_stats.push_ack_only_ms(ack_only_ms).await;
                                 }
                                 shared
                                     .shadow_stats
                                     .push_tick_to_ack_ms(tick_to_ack_ms)
                                     .await;
-                                if is_live {
+                                if capturable_window_ms != 0.0 {
                                     shared
                                         .shadow_stats
                                         .push_capturable_window_ms(capturable_window_ms)
@@ -2877,12 +2877,12 @@ fn spawn_strategy_engine(
                                     .record(decision_compute_ms);
                                 metrics::histogram!("latency.decision_queue_wait_ms")
                                     .record(latency_sample.local_backlog_ms);
-                                if is_live {
+                                if ack_only_ms > 0.0 {
                                     metrics::histogram!("latency.ack_only_ms").record(ack_only_ms);
                                 }
                                 metrics::histogram!("latency.tick_to_ack_ms")
                                     .record(tick_to_ack_ms);
-                                if is_live {
+                                if capturable_window_ms != 0.0 {
                                     metrics::histogram!("latency.capturable_window_ms")
                                         .record(capturable_window_ms);
                                 }
@@ -3366,17 +3366,16 @@ async fn predator_execute_opportunity(
             out.executed = out.executed.saturating_add(1);
 
             let is_live = execution.is_live();
-            let ack_only_ms = if is_live {
-                if ack_v2.exchange_latency_ms > 0.0 {
-                    ack_v2.exchange_latency_ms
-                } else {
-                    place_start.elapsed().as_secs_f64() * 1_000.0
-                }
+            let ack_measured = ack_v2.exchange_latency_ms > 0.0;
+            let ack_only_ms = if ack_measured {
+                ack_v2.exchange_latency_ms
+            } else if is_live {
+                place_start.elapsed().as_secs_f64() * 1_000.0
             } else {
                 0.0
             };
             let tick_to_ack_ms = order_build_ms + ack_only_ms;
-            if is_live && ack_only_ms > 0.0 {
+            if ack_only_ms > 0.0 {
                 shared.shadow_stats.push_ack_only_ms(ack_only_ms).await;
             }
             shared
