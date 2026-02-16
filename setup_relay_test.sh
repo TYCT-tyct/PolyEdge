@@ -1,54 +1,57 @@
 #!/bin/bash
 set -e
 
-# Hardcoded Values for Reliability
-TOKYO_IP="172.31.44.26"
-KEY="/home/ubuntu/.ssh/dongjing.pem"
+# PolyEdge Relay Setup Script
+# Usage: ./setup_relay_test.sh [sender|receiver] [target_ip]
 
-echo ">>> Preparing Tokyo Installer..."
-cat > install_tokyo.sh << EOF
-#!/bin/bash
-set -e
-sudo apt-get update -qq
-sudo apt-get install -y dante-server -qq
+ROLE=$1
+TARGET_IP=${2:-"10.0.3.123"} # Default to Ireland Private IP
+SYMBOL=${3:-"btcusdt"}
 
-# Find Interface
-IFACE=\$(ip route get 8.8.8.8 | awk '{print \$5}')
-echo ">>> Detected Interface: \$IFACE"
+echo "🚀 PolyEdge Setup: Role=$ROLE, Target=$TARGET_IP"
 
-# Config Dante
-echo ">>> Configuring Dante..."
-echo "logoutput: /dev/null" | sudo tee /etc/danted.conf
-echo "internal: 172.31.44.26 port = 1080" | sudo tee -a /etc/danted.conf
-echo "external: \$IFACE" | sudo tee -a /etc/danted.conf
-echo "socksmethod: none" | sudo tee -a /etc/danted.conf
-echo "clientmethod: none" | sudo tee -a /etc/danted.conf
-echo "user.privileged: root" | sudo tee -a /etc/danted.conf
-echo "user.unprivileged: nobody" | sudo tee -a /etc/danted.conf
-echo "client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 log: error }" | sudo tee -a /etc/danted.conf
-echo "socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 log: error }" | sudo tee -a /etc/danted.conf
+# 1. Update Codebase
+if [ -d "PolyEdge" ]; then
+    echo "📂 Updating PolyEdge..."
+    cd PolyEdge
+    git fetch origin
+    git checkout codex/fullchain-20260216
+    git pull origin codex/fullchain-20260216
+else
+    echo "📂 Cloning PolyEdge..."
+    git clone https://github.com/TYCT-tyct/PolyEdge.git
+    cd PolyEdge
+    git checkout codex/fullchain-20260216
+fi
 
-# Kernel Tuning
-echo ">>> Tuning Tokyo Kernel..."
-echo "net.core.default_qdisc=fq" | sudo tee /etc/sysctl.d/99-bbr.conf
-echo "net.ipv4.tcp_congestion_control=bbr" | sudo tee -a /etc/sysctl.d/99-bbr.conf
-sudo sysctl -p /etc/sysctl.d/99-bbr.conf
+# 2. Build Rust Binaries
+source "$HOME/.cargo/env" || true
+echo "🛠️ Building Release Binaries..."
 
-echo ">>> Restarting Dante..."
-sudo systemctl restart danted
-# sleep 2
-# sudo systemctl is-active danted
-EOF
+if [ "$ROLE" == "sender" ]; then
+    cargo build --release --bin feeder_tokyo
+    echo "✅ Sender Built."
 
-echo ">>> Uploading Installer to Tokyo..."
-scp -o StrictHostKeyChecking=no -i /home/ubuntu/.ssh/dongjing.pem install_tokyo.sh ubuntu@172.31.44.26:~/
+    echo "🏃 Starting Feeder (Tokyo)..."
+    export TARGET="${TARGET_IP}:6666"
+    export SYMBOL="$SYMBOL"
+    pkill -f feeder_tokyo || true
+    nohup ./target/release/feeder_tokyo > feeder.log 2>&1 &
+    echo "🔥 Sender running! PID: $!"
+    echo "See logs: tail -f PolyEdge/feeder.log"
 
-echo ">>> Running Installer on Tokyo..."
-ssh -o StrictHostKeyChecking=no -i /home/ubuntu/.ssh/dongjing.pem ubuntu@172.31.44.26 "chmod +x install_tokyo.sh && sudo ./install_tokyo.sh"
+elif [ "$ROLE" == "receiver" ]; then
+    cargo build --release --bin bench_feed
+    echo "✅ Receiver Built."
 
-echo ">>> Updating Benchmark Target to 172.31.44.26..."
-sed -i 's/PROXY_HOST = .*/PROXY_HOST = "172.31.44.26"/' /home/ubuntu/benchmark.py
+    echo "🎧 Starting Receiver (Ireland)..."
+    pkill -f bench_feed || true
+    nohup ./target/release/bench_feed > latency_report.csv 2>&1 &
+    echo "🔥 Receiver running! PID: $!"
+    echo "See logs: tail -f PolyEdge/latency_report.csv"
 
-echo ">>> Running Benchmark (Phase 2: SOCKS5 over Peering)..."
-source /home/ubuntu/PolyEdge/venv/bin/activate
-python3 -u /home/ubuntu/benchmark.py
+else
+    echo "❌ Unknown Role. Use 'sender' or 'receiver'."
+    exit 1
+fi
+
