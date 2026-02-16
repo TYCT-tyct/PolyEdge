@@ -3283,7 +3283,7 @@ async fn predator_execute_opportunity(
         side: opp.side.clone(),
         price: opp.entry_price,
         size: opp.size,
-        ttl_ms: 150,
+        ttl_ms: maker_cfg.ttl_ms,
     };
 
     shared.shadow_stats.mark_attempted();
@@ -5428,22 +5428,26 @@ fn load_predator_c_config() -> PredatorCConfig {
 }
 
 fn load_risk_limits_config() -> RiskLimits {
-    let path = Path::new("configs/risk.toml");
+    let path = Path::new("configs/strategy.toml");
     let Ok(raw) = fs::read_to_string(path) else {
-        let mut defaults = RiskLimits::default();
-        defaults.max_drawdown_pct = 0.015;
-        return defaults;
+        println!("Warn: strategy.toml not found for risk config, using defaults");
+        return RiskLimits::default();
     };
+
     let mut cfg = RiskLimits::default();
-    cfg.max_drawdown_pct = 0.015;
-    let mut in_max = false;
+    // Set safer defaults than the hardcoded 1.5% if parsing fails
+    cfg.max_drawdown_pct = 0.20;
+    cfg.max_asset_notional = 50.0;
+    cfg.max_market_notional = 10.0;
+
+    let mut section = "";
     for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         if line.starts_with('[') && line.ends_with(']') {
-            in_max = line == "[max]";
+            section = line;
             continue;
         }
         let Some((k, v)) = line.split_once('=') else {
@@ -5451,48 +5455,31 @@ fn load_risk_limits_config() -> RiskLimits {
         };
         let key = k.trim();
         let val = v.trim().trim_matches('"');
-        if in_max {
-            match key {
-                "market_notional" => {
-                    if let Ok(parsed) = val.parse::<f64>() {
-                        cfg.max_market_notional = parsed.max(0.0);
+
+        match section {
+            "[risk_controls.exposure_limits]" => {
+                match key {
+                    "max_total_exposure_usdc" => {
+                        if let Ok(p) = val.parse::<f64>() { cfg.max_asset_notional = p.max(0.0); }
                     }
-                }
-                "asset_notional" => {
-                    if let Ok(parsed) = val.parse::<f64>() {
-                        cfg.max_asset_notional = parsed.max(0.0);
+                    "max_per_market_exposure_usdc" => {
+                        if let Ok(p) = val.parse::<f64>() { cfg.max_market_notional = p.max(0.0); }
                     }
-                }
-                "open_orders" => {
-                    if let Ok(parsed) = val.parse::<usize>() {
-                        cfg.max_open_orders = parsed.max(1);
+                    "max_concurrent_positions" => {
+                        if let Ok(p) = val.parse::<usize>() { cfg.max_open_orders = p.max(1); }
                     }
+                    _ => {}
                 }
-                "max_loss_streak" => {
-                    if let Ok(parsed) = val.parse::<u32>() {
-                        cfg.max_loss_streak = parsed.max(1);
-                    }
-                }
-                "cooldown_sec" => {
-                    if let Ok(parsed) = val.parse::<u64>() {
-                        cfg.cooldown_sec = parsed.max(1);
-                    }
-                }
-                _ => {}
             }
-        }
-        if key == "drawdown_stop_pct" {
-            if let Ok(parsed) = val.parse::<f64>() {
-                cfg.max_drawdown_pct = parsed.clamp(0.001, 1.0);
+            "[risk_controls.kill_switch]" => {
+                match key {
+                    "max_drawdown_pct" => {
+                        if let Ok(p) = val.parse::<f64>() { cfg.max_drawdown_pct = p.clamp(0.001, 1.0); }
+                    }
+                    _ => {}
+                }
             }
-        } else if key == "max_loss_streak" {
-            if let Ok(parsed) = val.parse::<u32>() {
-                cfg.max_loss_streak = parsed.max(1);
-            }
-        } else if key == "cooldown_sec" {
-            if let Ok(parsed) = val.parse::<u64>() {
-                cfg.cooldown_sec = parsed.max(1);
-            }
+            _ => {}
         }
     }
     cfg
