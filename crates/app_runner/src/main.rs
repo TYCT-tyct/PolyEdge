@@ -523,6 +523,9 @@ struct LatencyBreakdown {
     source_latency_p50_ms: f64,
     source_latency_p90_ms: f64,
     source_latency_p99_ms: f64,
+    book_latency_p50_ms: f64,
+    book_latency_p90_ms: f64,
+    book_latency_p99_ms: f64,
     local_backlog_p50_ms: f64,
     local_backlog_p90_ms: f64,
     local_backlog_p99_ms: f64,
@@ -761,6 +764,7 @@ struct ShadowSamples {
     tick_to_ack_ms: Vec<f64>,
     feed_in_ms: Vec<f64>,
     source_latency_ms: Vec<f64>,
+    book_latency_ms: Vec<f64>,
     local_backlog_ms: Vec<f64>,
     book_top_lag_ms: Vec<f64>,
     signal_us: Vec<f64>,
@@ -944,10 +948,17 @@ impl ShadowStats {
         push_capped(&mut s.io_queue_depth, io_queue_depth, Self::SAMPLE_CAP);
     }
 
-    async fn push_latency_sample(&self, feed_in_ms: f64, source_latency_ms: f64, local_backlog_ms: f64) {
+    async fn push_latency_sample(
+        &self,
+        feed_in_ms: f64,
+        source_latency_ms: f64,
+        book_latency_ms: f64,
+        local_backlog_ms: f64,
+    ) {
         let mut s = self.samples.write().await;
         push_capped(&mut s.feed_in_ms, feed_in_ms, Self::SAMPLE_CAP);
         push_capped(&mut s.source_latency_ms, source_latency_ms, Self::SAMPLE_CAP);
+        push_capped(&mut s.book_latency_ms, book_latency_ms, Self::SAMPLE_CAP);
         push_capped(&mut s.local_backlog_ms, local_backlog_ms, Self::SAMPLE_CAP);
         // Contract: decision_queue_wait is the queue/backlog time we spent waiting locally.
         push_capped(&mut s.decision_queue_wait_ms, local_backlog_ms, Self::SAMPLE_CAP);
@@ -1189,6 +1200,7 @@ impl ShadowStats {
             tick_to_ack_ms,
             feed_in_ms,
             source_latency_ms,
+            book_latency_ms,
             local_backlog_ms,
             book_top_lag_ms,
             signal_us,
@@ -1386,6 +1398,9 @@ impl ShadowStats {
             source_latency_p50_ms: percentile(&source_latency_ms, 0.50).unwrap_or(0.0),
             source_latency_p90_ms: percentile(&source_latency_ms, 0.90).unwrap_or(0.0),
             source_latency_p99_ms: percentile(&source_latency_ms, 0.99).unwrap_or(0.0),
+            book_latency_p50_ms: percentile(&book_latency_ms, 0.50).unwrap_or(0.0),
+            book_latency_p90_ms: percentile(&book_latency_ms, 0.90).unwrap_or(0.0),
+            book_latency_p99_ms: percentile(&book_latency_ms, 0.99).unwrap_or(0.0),
             local_backlog_p50_ms: percentile(&local_backlog_ms, 0.50).unwrap_or(0.0),
             local_backlog_p90_ms: percentile(&local_backlog_ms, 0.90).unwrap_or(0.0),
             local_backlog_p99_ms: percentile(&local_backlog_ms, 0.99).unwrap_or(0.0),
@@ -2166,12 +2181,14 @@ fn spawn_strategy_engine(
                         .push_latency_sample(
                             feed_in_ms,
                             latency_sample.source_latency_ms,
+                            latency_sample.book_latency_ms,
                             latency_sample.local_backlog_ms,
                         )
                         .await;
                     metrics::histogram!("latency.feed_in_ms").record(feed_in_ms);
                     metrics::histogram!("latency.source_latency_ms")
                         .record(latency_sample.source_latency_ms);
+                    metrics::histogram!("latency.book_latency_ms").record(latency_sample.book_latency_ms);
                     metrics::histogram!("latency.local_backlog_ms")
                         .record(latency_sample.local_backlog_ms);
                     let signal_start = Instant::now();
@@ -4067,6 +4084,7 @@ fn sigmoid(x: f64) -> f64 {
 struct FeedLatencySample {
     feed_in_ms: f64,
     source_latency_ms: f64,
+    book_latency_ms: f64,
     local_backlog_ms: f64,
 }
 
@@ -4115,7 +4133,9 @@ fn estimate_feed_latency(tick: &RefTick, book: &BookTop) -> FeedLatencySample {
         now_ms
     };
     let book_ingest_ms = (book_recv_ms - book.ts_ms).max(0) as f64;
-    let source_latency_ms = tick_ingest_ms.max(book_ingest_ms);
+    // IMPORTANT: `source_latency_ms` is the external *reference* (CEX) tick latency proxy.
+    // Do not mix in Polymarket book timestamps here; track book latency separately.
+    let source_latency_ms = tick_ingest_ms;
 
     let latest_recv_ns = if book.recv_ts_local_ns > 0 {
         tick.recv_ts_local_ns.max(book.recv_ts_local_ns)
@@ -4132,6 +4152,7 @@ fn estimate_feed_latency(tick: &RefTick, book: &BookTop) -> FeedLatencySample {
     FeedLatencySample {
         feed_in_ms,
         source_latency_ms,
+        book_latency_ms: book_ingest_ms,
         local_backlog_ms,
     }
 }
@@ -4147,15 +4168,36 @@ fn ref_event_ts_ms(tick: &RefTick) -> i64 {
 fn should_replace_ref_tick(current: &RefTick, next: &RefTick) -> bool {
     let current_event = ref_event_ts_ms(current);
     let next_event = ref_event_ts_ms(next);
-    if next_event + 50 < current_event {
+    // Guard: ignore ticks whose event timestamp is wildly in the future vs our local receive time.
+    // (This can happen under clock skew or malformed payloads and would break latency ranking.)
+    if next_event > next.recv_ts_ms + 5_000 {
         return false;
     }
-    if next_event > current_event + 1 {
+    // Goal: "fastest observable tick" for latency-sensitive triggers.
+    // Event timestamps across sources are not perfectly comparable, so we bias towards lower
+    // `recv_ts_ms - event_ts_ms` latency (i.e. faster wire path), with a small guard against
+    // extreme back-jumps in event time.
+    let current_latency_ms = (current.recv_ts_ms - current_event).max(0) as f64;
+    let next_latency_ms = (next.recv_ts_ms - next_event).max(0) as f64;
+
+    const EVENT_BACKJUMP_TOL_MS: i64 = 250;
+    const LATENCY_DOMINATE_MS: f64 = 20.0;
+    const LATENCY_TIE_EPS_MS: f64 = 5.0;
+
+    if next_event + EVENT_BACKJUMP_TOL_MS < current_event {
+        // Allow a big latency improvement to override moderate event-time skew.
+        return next_latency_ms + LATENCY_DOMINATE_MS < current_latency_ms;
+    }
+
+    if next_latency_ms + LATENCY_TIE_EPS_MS < current_latency_ms {
         return true;
     }
-    // If the event timestamps are effectively equal, keep the first-arriving tick for speed.
-    // (The later-arriving copy is usually strictly worse for latency-arb triggers.)
-    false
+    if current_latency_ms + LATENCY_TIE_EPS_MS < next_latency_ms {
+        return false;
+    }
+
+    // Within ~5ms latency tie: prefer the newer event time, otherwise keep first-arriving tick.
+    next_event > current_event + 1
 }
 
 fn should_replace_anchor_tick(current: &RefTick, next: &RefTick) -> bool {

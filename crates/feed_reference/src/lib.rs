@@ -140,6 +140,9 @@ async fn run_binance_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> R
 
     while let Some(msg) = ws.next().await {
         let msg = msg.context("binance ws read")?;
+        // Capture local receive timestamp as close as possible to socket delivery.
+        let recv_ns = now_ns();
+        let recv_ms = recv_ns / 1_000_000;
         let text = match msg {
             Message::Text(t) => t.to_string(),
             Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
@@ -164,9 +167,9 @@ async fn run_binance_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> R
             source: "binance_ws".to_string(),
             symbol,
             event_ts_ms: event_ts,
-            recv_ts_ms: now_ms(),
+            recv_ts_ms: recv_ms,
             event_ts_exchange_ms: event_ts,
-            recv_ts_local_ns: now_ns(),
+            recv_ts_local_ns: recv_ns,
             price,
         };
 
@@ -229,6 +232,8 @@ async fn run_bybit_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> Res
 
     while let Some(msg) = ws.next().await {
         let msg = msg.context("bybit ws read")?;
+        let recv_ns = now_ns();
+        let recv_ms = recv_ns / 1_000_000;
         let text = match msg {
             Message::Text(t) => t.to_string(),
             Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
@@ -276,9 +281,9 @@ async fn run_bybit_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> Res
             source: "bybit_ws".to_string(),
             symbol,
             event_ts_ms: event_ts,
-            recv_ts_ms: now_ms(),
+            recv_ts_ms: recv_ms,
             event_ts_exchange_ms: event_ts,
-            recv_ts_local_ns: now_ns(),
+            recv_ts_local_ns: recv_ns,
             price,
         };
 
@@ -319,6 +324,8 @@ async fn run_coinbase_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> 
 
     while let Some(msg) = ws.next().await {
         let msg = msg.context("coinbase ws read")?;
+        let recv_ns = now_ns();
+        let recv_ms = recv_ns / 1_000_000;
         let text = match msg {
             Message::Text(t) => t.to_string(),
             Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
@@ -358,9 +365,9 @@ async fn run_coinbase_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> 
             source: "coinbase_ws".to_string(),
             symbol,
             event_ts_ms: event_ts,
-            recv_ts_ms: now_ms(),
+            recv_ts_ms: recv_ms,
             event_ts_exchange_ms: event_ts,
-            recv_ts_local_ns: now_ns(),
+            recv_ts_local_ns: recv_ns,
             price,
         };
 
@@ -436,13 +443,15 @@ async fn run_chainlink_rtds_stream(symbols: &[String], tx: &mpsc::Sender<RefTick
                 // RTDS docs recommend sending a ping periodically.
                 let _ = ws.send(Message::Ping(Vec::new().into())).await;
             }
-            msg = ws.next() => {
-                let Some(msg) = msg else { break; };
-                let msg = msg.context("chainlink rtds read")?;
-                let text = match msg {
-                    Message::Text(t) => t.to_string(),
-                    Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
-                    Message::Ping(v) => {
+             msg = ws.next() => {
+                 let Some(msg) = msg else { break; };
+                 let msg = msg.context("chainlink rtds read")?;
+                 let recv_ns = now_ns();
+                 let recv_ms = recv_ns / 1_000_000;
+                 let text = match msg {
+                     Message::Text(t) => t.to_string(),
+                     Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
+                     Message::Ping(v) => {
                         let _ = ws.send(Message::Pong(v)).await;
                         continue;
                     }
@@ -476,15 +485,15 @@ async fn run_chainlink_rtds_stream(symbols: &[String], tx: &mpsc::Sender<RefTick
                 };
                 let event_ts = payload.timestamp.or(env.timestamp).unwrap_or_else(now_ms);
 
-                let tick = RefTick {
-                    source: "chainlink_rtds".to_string(),
-                    symbol,
-                    event_ts_ms: event_ts,
-                    recv_ts_ms: now_ms(),
-                    event_ts_exchange_ms: event_ts,
-                    recv_ts_local_ns: now_ns(),
-                    price,
-                };
+                 let tick = RefTick {
+                     source: "chainlink_rtds".to_string(),
+                     symbol,
+                     event_ts_ms: event_ts,
+                     recv_ts_ms: recv_ms,
+                     event_ts_exchange_ms: event_ts,
+                     recv_ts_local_ns: recv_ns,
+                     price,
+                 };
 
                 if tx.send(tick).await.is_err() {
                     break;
