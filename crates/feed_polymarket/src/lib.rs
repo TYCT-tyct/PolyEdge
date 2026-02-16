@@ -200,12 +200,29 @@ impl PolymarketFeed {
 
         let mut ping = tokio::time::interval(Duration::from_secs(15));
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Many Polymarket markets (especially 5m/15m contracts) expire quickly. If the WS
+        // connection stays up, we would otherwise keep subscribing to stale/closed assets and
+        // stop seeing updates. Force a periodic re-discovery + resubscribe.
+        let refresh_every = std::env::var("POLYEDGE_MARKET_REFRESH_SEC")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(120));
+        let refresh_deadline = tokio::time::sleep(refresh_every);
+        tokio::pin!(refresh_deadline);
         let mut parse_failures = 0_u64;
         let mut no_update_msgs = 0_u64;
         let mut seen_msgs = 0_u64;
 
         loop {
             tokio::select! {
+                _ = &mut refresh_deadline => {
+                    tracing::info!(
+                        refresh_sec = refresh_every.as_secs(),
+                        "polymarket market ws refresh triggered; resubscribing"
+                    );
+                    break;
+                }
                 _ = ping.tick() => {
                     // The Polymarket WS docs recommend an application-level "PING".
                     ws.send(Message::Text("PING".to_string().into()))

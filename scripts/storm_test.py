@@ -82,12 +82,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--heartbeat-sec", type=float, default=30.0)
     p.add_argument("--run-id", default=f"storm-{int(time.time())}")
     p.add_argument("--out-root", default="datasets/reports")
+    # When enabled, write artifacts under datasets/reports/<day>/runs/<run_id>/ to avoid overwriting
+    # day-level legacy files (storm_test_summary.json / storm_test_trace.jsonl).
+    p.add_argument("--use-run-dir", action="store_true")
     p.add_argument("--fail-fast-threshold", type=int, default=20)
+    # Default is safe: do NOT leave the engine paused after a test. Enable only when
+    # explicitly testing pause/resume semantics.
+    p.add_argument("--churn-pause-resume", action="store_true")
     p.add_argument("--once", action="store_true")
     return p.parse_args()
 
 
-def maybe_control_churn(session: requests.Session, base_url: str, timeout_sec: float) -> List[ProbeResult]:
+def maybe_control_churn(
+    session: requests.Session, base_url: str, timeout_sec: float, churn_pause_resume: bool
+) -> List[ProbeResult]:
     jitter = random.uniform(-2.5, 2.5)
     maker_payload = {
         "min_edge_bps": max(1.0, 6.0 + jitter),
@@ -115,9 +123,14 @@ def maybe_control_churn(session: requests.Session, base_url: str, timeout_sec: f
         ("POST", f"{base_url}/control/reload_taker", maker_payload),
         ("POST", f"{base_url}/control/reload_allocator", alloc_payload),
         ("POST", f"{base_url}/control/reload_risk", risk_payload),
-        ("POST", f"{base_url}/control/pause", {}),
-        ("POST", f"{base_url}/control/resume", {}),
     ]
+    if churn_pause_resume:
+        ops.extend(
+            [
+                ("POST", f"{base_url}/control/pause", {}),
+                ("POST", f"{base_url}/control/resume", {}),
+            ]
+        )
     out: List[ProbeResult] = []
     for method, url, payload in ops:
         out.append(request_json(session, method, url, timeout_sec, payload))
@@ -138,7 +151,10 @@ def main() -> int:
     next_control = started + max(1.0, args.control_interval_sec)
 
     day = utc_day()
-    out_dir = Path(args.out_root) / day
+    if args.use_run_dir:
+        out_dir = Path(args.out_root) / day / "runs" / str(args.run_id)
+    else:
+        out_dir = Path(args.out_root) / day
     summary_path = out_dir / "storm_test_summary.json"
     trace_path = out_dir / "storm_test_trace.jsonl"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -148,81 +164,89 @@ def main() -> int:
     consecutive_failures = 0
     samples: List[ProbeResult] = []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
-        if args.once:
-            probe = request_json(session, "GET", f"{args.base_url}/report/shadow/live", args.timeout_sec)
-            samples.append(probe)
-        else:
-            while True:
-                now = time.monotonic()
-                if now >= deadline:
-                    break
-                if now >= hard_deadline:
-                    break
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
+            if args.once:
+                probe = request_json(session, "GET", f"{args.base_url}/report/shadow/live", args.timeout_sec)
+                samples.append(probe)
+            else:
+                while True:
+                    now = time.monotonic()
+                    if now >= deadline:
+                        break
+                    if now >= hard_deadline:
+                        break
 
-                burst = max(1, args.burst_rps)
-                futures = [
-                    pool.submit(
-                        request_json,
-                        session,
-                        "GET",
-                        f"{args.base_url}/report/shadow/live",
-                        args.timeout_sec,
-                        None,
-                    )
-                    for _ in range(burst)
-                ]
-                for f in futures:
-                    r = f.result()
-                    samples.append(r)
-                    if not r.ok:
-                        errors += 1
-                        consecutive_failures += 1
-                    else:
-                        consecutive_failures = 0
-                    with trace_path.open("a", encoding="utf-8") as fp:
-                        fp.write(
-                            json.dumps(
-                                {
-                                    "ts_ms": now_ms(),
-                                    "ok": r.ok,
-                                    "latency_ms": round(r.latency_ms, 3),
-                                    "status": r.status,
-                                    "endpoint": r.endpoint,
-                                    "error": r.error,
-                                },
-                                ensure_ascii=True,
-                                separators=(",", ":"),
-                            )
-                            + "\n"
+                    burst = max(1, args.burst_rps)
+                    futures = [
+                        pool.submit(
+                            request_json,
+                            session,
+                            "GET",
+                            f"{args.base_url}/report/shadow/live",
+                            args.timeout_sec,
+                            None,
                         )
-
-                if now >= next_control:
-                    for ctrl in maybe_control_churn(session, args.base_url, args.timeout_sec):
-                        samples.append(ctrl)
-                        if not ctrl.ok:
+                        for _ in range(burst)
+                    ]
+                    for f in futures:
+                        r = f.result()
+                        samples.append(r)
+                        if not r.ok:
                             errors += 1
                             consecutive_failures += 1
-                    next_control = now + max(1.0, args.control_interval_sec)
+                        else:
+                            consecutive_failures = 0
+                        with trace_path.open("a", encoding="utf-8") as fp:
+                            fp.write(
+                                json.dumps(
+                                    {
+                                        "ts_ms": now_ms(),
+                                        "ok": r.ok,
+                                        "latency_ms": round(r.latency_ms, 3),
+                                        "status": r.status,
+                                        "endpoint": r.endpoint,
+                                        "error": r.error,
+                                    },
+                                    ensure_ascii=True,
+                                    separators=(",", ":"),
+                                )
+                                + "\n"
+                            )
 
-                if consecutive_failures >= max(1, args.fail_fast_threshold):
-                    break
-                if errors >= max(1, args.max_errors):
-                    break
-                if now >= heartbeat_at:
-                    elapsed = int(now - started)
-                    print(
-                        f"[heartbeat] elapsed={elapsed}s samples={len(samples)} errors={errors} "
-                        f"consecutive_failures={consecutive_failures}"
-                    )
-                    heartbeat_at = now + max(1.0, args.heartbeat_sec)
-                time.sleep(1.0)
+                    if now >= next_control:
+                        for ctrl in maybe_control_churn(
+                            session, args.base_url, args.timeout_sec, args.churn_pause_resume
+                        ):
+                            samples.append(ctrl)
+                            if not ctrl.ok:
+                                errors += 1
+                                consecutive_failures += 1
+                        next_control = now + max(1.0, args.control_interval_sec)
+
+                    if consecutive_failures >= max(1, args.fail_fast_threshold):
+                        break
+                    if errors >= max(1, args.max_errors):
+                        break
+                    if now >= heartbeat_at:
+                        elapsed = int(now - started)
+                        print(
+                            f"[heartbeat] elapsed={elapsed}s samples={len(samples)} errors={errors} "
+                            f"consecutive_failures={consecutive_failures}"
+                        )
+                        heartbeat_at = now + max(1.0, args.heartbeat_sec)
+                    time.sleep(1.0)
+    finally:
+        # Safety: never leave the engine paused after a stress run.
+        _ = request_json(session, "POST", f"{args.base_url}/control/resume", 2.0, {})
 
     lat_ok = [s.latency_ms for s in samples if s.ok]
     lat_fail = [s.latency_ms for s in samples if not s.ok]
     summary: Dict[str, Any] = {
         "ts_ms": now_ms(),
         "run_id": args.run_id,
+        "use_run_dir": bool(args.use_run_dir),
+        "out_dir": str(out_dir),
         "base_url": args.base_url,
         "duration_sec": int(time.monotonic() - started),
         "sample_count": len(samples),

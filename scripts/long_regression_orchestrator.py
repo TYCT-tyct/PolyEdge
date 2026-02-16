@@ -116,9 +116,8 @@ def gate_pass(live: Dict[str, Any], min_outcomes: int) -> bool:
     )
 
 
-def run_param_regression(args: argparse.Namespace, cycle: int, budget_sec: int) -> None:
+def run_param_regression(args: argparse.Namespace, trial_run_id: str, budget_sec: int) -> None:
     script_path = Path(__file__).resolve().parent / "param_regression.py"
-    trial_run_id = f"{args.run_id}-c{cycle:02d}"
     cmd = [
         sys.executable,
         str(script_path),
@@ -148,8 +147,8 @@ def run_param_regression(args: argparse.Namespace, cycle: int, budget_sec: int) 
     subprocess.run(cmd, check=True)
 
 
-def read_best_trial(day_dir: Path) -> Dict[str, Any] | None:
-    summary_json = day_dir / "regression_summary.json"
+def read_best_trial(day_dir: Path, trial_run_id: str) -> Dict[str, Any] | None:
+    summary_json = day_dir / "runs" / trial_run_id / "regression_summary.json"
     if not summary_json.exists():
         return None
     data = json.loads(summary_json.read_text(encoding="utf-8"))
@@ -292,8 +291,9 @@ def main() -> int:
         budget_remaining = 0
         if args.max_runtime_sec > 0:
             budget_remaining = max(1, int(args.max_runtime_sec - (time.monotonic() - started)))
-        run_param_regression(args, cycle, budget_remaining)
-        trial = read_best_trial(day_dir)
+        trial_run_id = f"{args.run_id}-c{cycle:02d}"
+        run_param_regression(args, trial_run_id, budget_remaining)
+        trial = read_best_trial(day_dir, trial_run_id)
         if trial is None:
             raise RuntimeError("No best trial found after param_regression")
 

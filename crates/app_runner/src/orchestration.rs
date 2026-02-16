@@ -4,7 +4,7 @@ pub(super) fn spawn_periodic_report_persistor(
     stats: Arc<ShadowStats>,
     tox_state: Arc<RwLock<HashMap<String, MarketToxicState>>>,
     execution: Arc<ClobExecution>,
-    toxicity_cfg: Arc<RwLock<ToxicityConfig>>,
+    toxicity_cfg: Arc<RwLock<Arc<ToxicityConfig>>>,
 ) {
     tokio::spawn(async move {
         let mut last_final = Instant::now() - Duration::from_secs(600);
@@ -40,6 +40,15 @@ pub(super) fn spawn_data_reconcile_task(
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(600));
+        // The raw JSONL files are bucketed by date, while `ShadowStats` counters are reset on
+        // `/control/reset_shadow` (window reset). Comparing absolute totals would therefore
+        // generate false "gap" alarms after any reset. Track deltas between intervals and
+        // automatically re-baseline on resets/rotations.
+        let mut last_window_id: u64 = 0;
+        let mut last_ref_lines: i64 = 0;
+        let mut last_book_lines: i64 = 0;
+        let mut last_ref_expected: i64 = 0;
+        let mut last_book_expected: i64 = 0;
         loop {
             interval.tick().await;
             let live = stats.build_live_report().await;
@@ -47,21 +56,41 @@ pub(super) fn spawn_data_reconcile_task(
             let book_lines = count_jsonl_lines(&dataset_path("raw", "book_tops.jsonl"));
             let ref_expected = live.ref_ticks_total as i64;
             let book_expected = live.book_ticks_total as i64;
-            let ref_gap_ratio = if ref_expected <= 0 {
-                0.0
+            let baseline_reset = last_window_id == 0
+                || live.window_id != last_window_id
+                || ref_lines < last_ref_lines
+                || book_lines < last_book_lines
+                || ref_expected < last_ref_expected
+                || book_expected < last_book_expected;
+
+            let (ref_gap_ratio, book_gap_ratio) = if baseline_reset {
+                (0.0, 0.0)
             } else {
-                ((ref_lines - ref_expected).abs() as f64) / (ref_expected as f64)
+                let ref_lines_delta = ref_lines - last_ref_lines;
+                let book_lines_delta = book_lines - last_book_lines;
+                let ref_expected_delta = ref_expected - last_ref_expected;
+                let book_expected_delta = book_expected - last_book_expected;
+                let ref_gap = if ref_expected_delta <= 0 {
+                    0.0
+                } else {
+                    ((ref_lines_delta - ref_expected_delta).abs() as f64)
+                        / (ref_expected_delta as f64)
+                };
+                let book_gap = if book_expected_delta <= 0 {
+                    0.0
+                } else {
+                    ((book_lines_delta - book_expected_delta).abs() as f64)
+                        / (book_expected_delta as f64)
+                };
+                (ref_gap, book_gap)
             };
-            let book_gap_ratio = if book_expected <= 0 {
-                0.0
-            } else {
-                ((book_lines - book_expected).abs() as f64) / (book_expected as f64)
-            };
-            let reconcile_fail = ref_gap_ratio > 0.05
-                || book_gap_ratio > 0.05
-                || live.data_valid_ratio < 0.999
-                || live.seq_gap_rate > 0.001
-                || live.ts_inversion_rate > 0.0005;
+
+            let reconcile_fail = !baseline_reset
+                && (ref_gap_ratio > 0.05
+                    || book_gap_ratio > 0.05
+                    || live.data_valid_ratio < 0.999
+                    || live.seq_gap_rate > 0.001
+                    || live.ts_inversion_rate > 0.0005);
 
             if reconcile_fail {
                 stats.set_observe_only(true);
@@ -86,9 +115,16 @@ pub(super) fn spawn_data_reconcile_task(
                     "ref_gap_ratio": ref_gap_ratio,
                     "book_gap_ratio": book_gap_ratio,
                     "reconcile_fail": reconcile_fail,
+                    "baseline_reset": baseline_reset,
                     "observe_only": stats.observe_only()
                 }),
             );
+
+            last_window_id = live.window_id;
+            last_ref_lines = ref_lines;
+            last_book_lines = book_lines;
+            last_ref_expected = ref_expected;
+            last_book_expected = book_expected;
         }
     });
 }

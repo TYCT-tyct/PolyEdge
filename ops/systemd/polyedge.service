@@ -8,6 +8,9 @@ Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/PolyEdge
 Environment=RUST_LOG=info
+# Optional feed toggles (defaults are enabled in code). We disable Chainlink anchor input on
+# servers by default to avoid slow ticks impacting data validity and latency tails.
+Environment=POLYEDGE_ENABLE_CHAINLINK_ANCHOR=false
 # Run the built binary directly (faster restarts, avoids cargo spawning/port races).
 ExecStart=/home/ubuntu/PolyEdge/target/release/app_runner
 Restart=always

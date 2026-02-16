@@ -1,0 +1,30 @@
+[Unit]
+Description=PolyEdge CLOB gateway (py-clob-client)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/PolyEdge/ops/clob_gateway
+Environment=PYTHONUNBUFFERED=1
+# Secrets must live outside the repo. Example file:
+#   /etc/polyedge/clob_gateway.env
+# containing:
+#   CLOB_HOST=https://clob.polymarket.com
+#   CLOB_CHAIN_ID=137
+#   CLOB_PRIVATE_KEY=...
+#   CLOB_API_KEY=...
+#   CLOB_API_SECRET=...
+#   CLOB_API_PASSPHRASE=...
+EnvironmentFile=-/etc/polyedge/clob_gateway.env
+ExecStart=/usr/bin/python3 -m uvicorn app:app --host 127.0.0.1 --port 9001 --workers 1
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+StandardOutput=append:/var/log/polyedge/clob_gateway.log
+StandardError=append:/var/log/polyedge/clob_gateway.err.log
+
+[Install]
+WantedBy=multi-user.target
+

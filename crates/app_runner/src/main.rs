@@ -15,12 +15,14 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use core_types::{
-    new_id, BookTop, ControlCommand, EdgeAttribution, EngineEvent, EnginePnLBreakdown,
-    ExecutionStyle, ExecutionVenue, FairValueModel, InventoryState, MarketFeed, MarketHealth,
-    OrderAck, OrderIntentV2, OrderSide, OrderTimeInForce, QuoteEval, QuoteIntent, QuotePolicy,
-    RefPriceFeed, RefTick, RiskContext, RiskManager, ShadowOutcome, ShadowShot, ToxicDecision,
-    ToxicFeatures, ToxicRegime,
+    new_id, BookTop, CapitalUpdate, ControlCommand, Direction, DirectionSignal, EdgeAttribution,
+    EngineEvent, EnginePnLBreakdown, ExecutionStyle, ExecutionVenue, FairValueModel, InventoryState,
+    MarketFeed, MarketHealth, OrderAck, OrderIntentV2, OrderSide, OrderTimeInForce, QuoteEval,
+    QuoteIntent, QuotePolicy, RefPriceFeed, RefTick, RiskContext, RiskManager, ShadowOutcome,
+    ShadowShot, Signal, TimeframeClass, TimeframeOpp, ToxicDecision, ToxicFeatures, ToxicRegime,
 };
+use dashmap::DashMap;
+use direction_detector::{DirectionConfig, DirectionDetector};
 use execution_clob::{ClobExecution, ExecutionMode};
 use fair_value::{BasisMrConfig, BasisMrFairValue};
 use feed_polymarket::PolymarketFeed;
@@ -34,8 +36,11 @@ use portfolio::PortfolioBook;
 use reqwest::Client;
 use risk_engine::{DefaultRiskManager, RiskLimits};
 use serde::{Deserialize, Serialize};
+use settlement_compounder::{CompounderConfig, SettlementCompounder};
 use sha2::{Digest, Sha256};
 use strategy_maker::{MakerConfig, MakerQuotePolicy};
+use taker_sniper::{TakerAction, TakerSniper, TakerSniperConfig};
+use timeframe_router::{RouterConfig, TimeframeRouter};
 use tokio::sync::{mpsc, RwLock};
 
 mod control_api;
@@ -48,8 +53,8 @@ use engine_core::{
     is_quote_reject_reason, normalize_reject_code,
 };
 use stats_utils::{
-    freshness_ms, now_ns, percentile, percentile_deque, policy_block_ratio, push_capped,
-    quote_block_ratio, robust_filter_iqr, value_to_f64,
+    freshness_ms, now_ns, percentile, policy_block_ratio, push_capped,
+    percentile_deque_capped, quote_block_ratio, robust_filter_iqr, value_to_f64,
 };
 
 #[derive(Clone)]
@@ -60,14 +65,15 @@ struct AppState {
     execution: Arc<ClobExecution>,
     _shadow: Arc<ShadowExecutor>,
     prometheus: metrics_exporter_prometheus::PrometheusHandle,
-    strategy_cfg: Arc<RwLock<MakerConfig>>,
+    strategy_cfg: Arc<RwLock<Arc<MakerConfig>>>,
     fair_value_cfg: Arc<StdRwLock<BasisMrConfig>>,
-    toxicity_cfg: Arc<RwLock<ToxicityConfig>>,
+    toxicity_cfg: Arc<RwLock<Arc<ToxicityConfig>>>,
     allocator_cfg: Arc<RwLock<AllocatorConfig>>,
     risk_limits: Arc<StdRwLock<RiskLimits>>,
     tox_state: Arc<RwLock<HashMap<String, MarketToxicState>>>,
     shadow_stats: Arc<ShadowStats>,
     perf_profile: Arc<RwLock<PerfProfile>>,
+    shared: Arc<EngineShared>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,20 +90,66 @@ struct ScoringState {
     fetched_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct SignalCacheEntry {
+    signal: Signal,
+    ts_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum PredatorCPriority {
+    MakerFirst,
+    TakerFirst,
+    TakerOnly,
+}
+
+impl Default for PredatorCPriority {
+    fn default() -> Self {
+        Self::TakerFirst
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct PredatorCConfig {
+    enabled: bool,
+    priority: PredatorCPriority,
+    direction_detector: DirectionConfig,
+    taker_sniper: TakerSniperConfig,
+    router: RouterConfig,
+    compounder: CompounderConfig,
+}
+
+impl Default for PredatorCConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            priority: PredatorCPriority::TakerFirst,
+            direction_detector: DirectionConfig::default(),
+            taker_sniper: TakerSniperConfig::default(),
+            router: RouterConfig::default(),
+            compounder: CompounderConfig::default(),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct EngineShared {
     latest_books: Arc<RwLock<HashMap<String, BookTop>>>,
+    latest_signals: Arc<DashMap<String, SignalCacheEntry>>,
     market_to_symbol: Arc<RwLock<HashMap<String, String>>>,
     token_to_symbol: Arc<RwLock<HashMap<String, String>>>,
+    market_to_timeframe: Arc<RwLock<HashMap<String, TimeframeClass>>>,
+    symbol_to_markets: Arc<RwLock<HashMap<String, Vec<String>>>>,
     fee_cache: Arc<RwLock<HashMap<String, FeeRateEntry>>>,
     fee_refresh_inflight: Arc<RwLock<HashMap<String, Instant>>>,
     scoring_cache: Arc<RwLock<HashMap<String, ScoringState>>>,
     scoring_refresh_inflight: Arc<RwLock<HashMap<String, Instant>>>,
     http: Client,
     clob_endpoint: String,
-    strategy_cfg: Arc<RwLock<MakerConfig>>,
+    strategy_cfg: Arc<RwLock<Arc<MakerConfig>>>,
     fair_value_cfg: Arc<StdRwLock<BasisMrConfig>>,
-    toxicity_cfg: Arc<RwLock<ToxicityConfig>>,
+    toxicity_cfg: Arc<RwLock<Arc<ToxicityConfig>>>,
     risk_manager: Arc<DefaultRiskManager>,
     universe_symbols: Arc<Vec<String>>,
     universe_market_types: Arc<Vec<String>>,
@@ -106,6 +158,12 @@ struct EngineShared {
     scoring_rebate_factor: f64,
     tox_state: Arc<RwLock<HashMap<String, MarketToxicState>>>,
     shadow_stats: Arc<ShadowStats>,
+    predator_cfg: Arc<RwLock<PredatorCConfig>>,
+    predator_direction_detector: Arc<RwLock<DirectionDetector>>,
+    predator_latest_direction: Arc<RwLock<HashMap<String, DirectionSignal>>>,
+    predator_taker_sniper: Arc<RwLock<TakerSniper>>,
+    predator_router: Arc<RwLock<TimeframeRouter>>,
+    predator_compounder: Arc<RwLock<SettlementCompounder>>,
 }
 
 #[derive(Serialize)]
@@ -240,6 +298,8 @@ struct ExecutionConfig {
     rate_limit_rps: f64,
     http_timeout_ms: u64,
     clob_endpoint: String,
+    #[serde(default)]
+    order_endpoint: Option<String>,
 }
 
 impl Default for ExecutionConfig {
@@ -249,6 +309,7 @@ impl Default for ExecutionConfig {
             rate_limit_rps: 15.0,
             http_timeout_ms: 3000,
             clob_endpoint: "https://clob.polymarket.com".to_string(),
+            order_endpoint: None,
         }
     }
 }
@@ -334,6 +395,7 @@ struct MarketToxicState {
     symbol_missing: u64,
     last_tox_score: f64,
     last_regime: ToxicRegime,
+    market_score: f64,
     cooldown_until_ms: i64,
 }
 
@@ -349,6 +411,7 @@ impl Default for MarketToxicState {
             symbol_missing: 0,
             last_tox_score: 0.0,
             last_regime: ToxicRegime::Safe,
+            market_score: 80.0,
             cooldown_until_ms: 0,
         }
     }
@@ -545,6 +608,17 @@ struct ShadowLiveReport {
     blocked_reason_counts: HashMap<String, u64>,
     latency: LatencyBreakdown,
     market_scorecard: Vec<MarketScoreRow>,
+    predator_c_enabled: bool,
+    direction_signals_up: u64,
+    direction_signals_down: u64,
+    direction_signals_neutral: u64,
+    taker_sniper_fired: u64,
+    taker_sniper_skipped: u64,
+    taker_sniper_skip_reasons_top: Vec<(String, u64)>,
+    router_locked_by_tf_usdc: HashMap<String, f64>,
+    capital_available_usdc: f64,
+    capital_base_quote_size: f64,
+    capital_halt: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -652,26 +726,10 @@ struct ShadowStats {
     last_book_tick_ms: AtomicI64,
     shots: RwLock<Vec<ShadowShot>>,
     outcomes: RwLock<Vec<ShadowOutcome>>,
-    decision_queue_wait_ms: RwLock<Vec<f64>>,
-    decision_compute_ms: RwLock<Vec<f64>>,
-    tick_to_decision_ms: RwLock<Vec<f64>>,
-    ack_only_ms: RwLock<Vec<f64>>,
-    tick_to_ack_ms: RwLock<Vec<f64>>,
-    feed_in_ms: RwLock<Vec<f64>>,
-    source_latency_ms: RwLock<Vec<f64>>,
-    local_backlog_ms: RwLock<Vec<f64>>,
-    book_top_lag_ms: RwLock<Vec<f64>>,
+    samples: RwLock<ShadowSamples>,
     book_top_lag_by_symbol_ms: RwLock<HashMap<String, Vec<f64>>>,
     survival_probe_overall: RwLock<SurvivalProbeCounters>,
     survival_probe_by_symbol: RwLock<HashMap<String, SurvivalProbeCounters>>,
-    signal_us: RwLock<Vec<f64>>,
-    quote_us: RwLock<Vec<f64>>,
-    risk_us: RwLock<Vec<f64>>,
-    shadow_fill_ms: RwLock<Vec<f64>>,
-    queue_depth: RwLock<Vec<f64>>,
-    event_backlog: RwLock<Vec<f64>>,
-    parse_us: RwLock<Vec<f64>>,
-    io_queue_depth: RwLock<Vec<f64>>,
     data_total: AtomicU64,
     data_invalid: AtomicU64,
     seq_gap: AtomicU64,
@@ -682,6 +740,37 @@ struct ShadowStats {
     paused: AtomicBool,
     paused_since_ms: AtomicU64,
     paused_total_ms: AtomicU64,
+    predator_c_enabled: AtomicBool,
+    predator_dir_up: AtomicU64,
+    predator_dir_down: AtomicU64,
+    predator_dir_neutral: AtomicU64,
+    predator_taker_fired: AtomicU64,
+    predator_taker_skipped: AtomicU64,
+    predator_taker_skip_reasons: RwLock<HashMap<String, u64>>,
+    predator_router_locked_by_tf_usdc: RwLock<HashMap<String, f64>>,
+    predator_capital: RwLock<CapitalUpdate>,
+    predator_capital_halt: AtomicBool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ShadowSamples {
+    decision_queue_wait_ms: Vec<f64>,
+    decision_compute_ms: Vec<f64>,
+    tick_to_decision_ms: Vec<f64>,
+    ack_only_ms: Vec<f64>,
+    tick_to_ack_ms: Vec<f64>,
+    feed_in_ms: Vec<f64>,
+    source_latency_ms: Vec<f64>,
+    local_backlog_ms: Vec<f64>,
+    book_top_lag_ms: Vec<f64>,
+    signal_us: Vec<f64>,
+    quote_us: Vec<f64>,
+    risk_us: Vec<f64>,
+    shadow_fill_ms: Vec<f64>,
+    queue_depth: Vec<f64>,
+    event_backlog: Vec<f64>,
+    parse_us: Vec<f64>,
+    io_queue_depth: Vec<f64>,
 }
 
 impl ShadowStats {
@@ -710,26 +799,10 @@ impl ShadowStats {
             last_book_tick_ms: AtomicI64::new(0),
             shots: RwLock::new(Vec::new()),
             outcomes: RwLock::new(Vec::new()),
-            decision_queue_wait_ms: RwLock::new(Vec::new()),
-            decision_compute_ms: RwLock::new(Vec::new()),
-            tick_to_decision_ms: RwLock::new(Vec::new()),
-            ack_only_ms: RwLock::new(Vec::new()),
-            tick_to_ack_ms: RwLock::new(Vec::new()),
-            feed_in_ms: RwLock::new(Vec::new()),
-            source_latency_ms: RwLock::new(Vec::new()),
-            local_backlog_ms: RwLock::new(Vec::new()),
-            book_top_lag_ms: RwLock::new(Vec::new()),
+            samples: RwLock::new(ShadowSamples::default()),
             book_top_lag_by_symbol_ms: RwLock::new(HashMap::new()),
             survival_probe_overall: RwLock::new(SurvivalProbeCounters::default()),
             survival_probe_by_symbol: RwLock::new(HashMap::new()),
-            signal_us: RwLock::new(Vec::new()),
-            quote_us: RwLock::new(Vec::new()),
-            risk_us: RwLock::new(Vec::new()),
-            shadow_fill_ms: RwLock::new(Vec::new()),
-            queue_depth: RwLock::new(Vec::new()),
-            event_backlog: RwLock::new(Vec::new()),
-            parse_us: RwLock::new(Vec::new()),
-            io_queue_depth: RwLock::new(Vec::new()),
             data_total: AtomicU64::new(0),
             data_invalid: AtomicU64::new(0),
             seq_gap: AtomicU64::new(0),
@@ -740,6 +813,20 @@ impl ShadowStats {
             paused: AtomicBool::new(false),
             paused_since_ms: AtomicU64::new(0),
             paused_total_ms: AtomicU64::new(0),
+            predator_c_enabled: AtomicBool::new(false),
+            predator_dir_up: AtomicU64::new(0),
+            predator_dir_down: AtomicU64::new(0),
+            predator_dir_neutral: AtomicU64::new(0),
+            predator_taker_fired: AtomicU64::new(0),
+            predator_taker_skipped: AtomicU64::new(0),
+            predator_taker_skip_reasons: RwLock::new(HashMap::new()),
+            predator_router_locked_by_tf_usdc: RwLock::new(HashMap::new()),
+            predator_capital: RwLock::new(CapitalUpdate {
+                available_usdc: 0.0,
+                base_quote_size: 0.0,
+                ts_ms: 0,
+            }),
+            predator_capital_halt: AtomicBool::new(false),
         }
     }
 
@@ -764,26 +851,10 @@ impl ShadowStats {
         self.blocked_reasons.write().await.clear();
         self.shots.write().await.clear();
         self.outcomes.write().await.clear();
-        self.decision_queue_wait_ms.write().await.clear();
-        self.decision_compute_ms.write().await.clear();
-        self.tick_to_decision_ms.write().await.clear();
-        self.ack_only_ms.write().await.clear();
-        self.tick_to_ack_ms.write().await.clear();
-        self.feed_in_ms.write().await.clear();
-        self.source_latency_ms.write().await.clear();
-        self.local_backlog_ms.write().await.clear();
-        self.book_top_lag_ms.write().await.clear();
+        *self.samples.write().await = ShadowSamples::default();
         self.book_top_lag_by_symbol_ms.write().await.clear();
         *self.survival_probe_overall.write().await = SurvivalProbeCounters::default();
         self.survival_probe_by_symbol.write().await.clear();
-        self.signal_us.write().await.clear();
-        self.quote_us.write().await.clear();
-        self.risk_us.write().await.clear();
-        self.shadow_fill_ms.write().await.clear();
-        self.queue_depth.write().await.clear();
-        self.event_backlog.write().await.clear();
-        self.parse_us.write().await.clear();
-        self.io_queue_depth.write().await.clear();
         self.data_total.store(0, Ordering::Relaxed);
         self.data_invalid.store(0, Ordering::Relaxed);
         self.seq_gap.store(0, Ordering::Relaxed);
@@ -794,6 +865,20 @@ impl ShadowStats {
         self.paused.store(false, Ordering::Relaxed);
         self.paused_since_ms.store(0, Ordering::Relaxed);
         self.paused_total_ms.store(0, Ordering::Relaxed);
+        self.predator_c_enabled.store(false, Ordering::Relaxed);
+        self.predator_dir_up.store(0, Ordering::Relaxed);
+        self.predator_dir_down.store(0, Ordering::Relaxed);
+        self.predator_dir_neutral.store(0, Ordering::Relaxed);
+        self.predator_taker_fired.store(0, Ordering::Relaxed);
+        self.predator_taker_skipped.store(0, Ordering::Relaxed);
+        self.predator_taker_skip_reasons.write().await.clear();
+        self.predator_router_locked_by_tf_usdc.write().await.clear();
+        *self.predator_capital.write().await = CapitalUpdate {
+            available_usdc: 0.0,
+            base_quote_size: 0.0,
+            ts_ms: 0,
+        };
+        self.predator_capital_halt.store(false, Ordering::Relaxed);
         window_id
     }
 
@@ -848,49 +933,46 @@ impl ShadowStats {
     }
 
     async fn push_tick_to_decision_ms(&self, ms: f64) {
-        let mut v = self.tick_to_decision_ms.write().await;
-        push_capped(&mut v, ms, Self::SAMPLE_CAP);
+        let mut s = self.samples.write().await;
+        push_capped(&mut s.tick_to_decision_ms, ms, Self::SAMPLE_CAP);
     }
 
-    async fn push_decision_queue_wait_ms(&self, ms: f64) {
-        let mut v = self.decision_queue_wait_ms.write().await;
-        push_capped(&mut v, ms, Self::SAMPLE_CAP);
+    async fn push_depth_sample(&self, event_backlog: f64, queue_depth: f64, io_queue_depth: f64) {
+        let mut s = self.samples.write().await;
+        push_capped(&mut s.event_backlog, event_backlog, Self::SAMPLE_CAP);
+        push_capped(&mut s.queue_depth, queue_depth, Self::SAMPLE_CAP);
+        push_capped(&mut s.io_queue_depth, io_queue_depth, Self::SAMPLE_CAP);
+    }
+
+    async fn push_latency_sample(&self, feed_in_ms: f64, source_latency_ms: f64, local_backlog_ms: f64) {
+        let mut s = self.samples.write().await;
+        push_capped(&mut s.feed_in_ms, feed_in_ms, Self::SAMPLE_CAP);
+        push_capped(&mut s.source_latency_ms, source_latency_ms, Self::SAMPLE_CAP);
+        push_capped(&mut s.local_backlog_ms, local_backlog_ms, Self::SAMPLE_CAP);
+        // Contract: decision_queue_wait is the queue/backlog time we spent waiting locally.
+        push_capped(&mut s.decision_queue_wait_ms, local_backlog_ms, Self::SAMPLE_CAP);
     }
 
     async fn push_decision_compute_ms(&self, ms: f64) {
-        let mut v = self.decision_compute_ms.write().await;
-        push_capped(&mut v, ms, Self::SAMPLE_CAP);
+        let mut s = self.samples.write().await;
+        push_capped(&mut s.decision_compute_ms, ms, Self::SAMPLE_CAP);
     }
 
     async fn push_ack_only_ms(&self, ms: f64) {
-        let mut v = self.ack_only_ms.write().await;
-        push_capped(&mut v, ms, Self::SAMPLE_CAP);
+        let mut s = self.samples.write().await;
+        push_capped(&mut s.ack_only_ms, ms, Self::SAMPLE_CAP);
     }
 
     async fn push_tick_to_ack_ms(&self, ms: f64) {
-        let mut v = self.tick_to_ack_ms.write().await;
-        push_capped(&mut v, ms, Self::SAMPLE_CAP);
-    }
-
-    async fn push_feed_in_ms(&self, ms: f64) {
-        let mut v = self.feed_in_ms.write().await;
-        push_capped(&mut v, ms, Self::SAMPLE_CAP);
-    }
-
-    async fn push_source_latency_ms(&self, ms: f64) {
-        let mut v = self.source_latency_ms.write().await;
-        push_capped(&mut v, ms, Self::SAMPLE_CAP);
-    }
-
-    async fn push_local_backlog_ms(&self, ms: f64) {
-        let mut v = self.local_backlog_ms.write().await;
-        push_capped(&mut v, ms, Self::SAMPLE_CAP);
+        let mut s = self.samples.write().await;
+        push_capped(&mut s.tick_to_ack_ms, ms, Self::SAMPLE_CAP);
     }
 
     async fn push_book_top_lag_ms(&self, symbol: &str, ms: f64) {
-        let mut v = self.book_top_lag_ms.write().await;
-        push_capped(&mut v, ms, Self::SAMPLE_CAP);
-        drop(v);
+        {
+            let mut s = self.samples.write().await;
+            push_capped(&mut s.book_top_lag_ms, ms, Self::SAMPLE_CAP);
+        }
 
         let mut by_symbol = self.book_top_lag_by_symbol_ms.write().await;
         let entry = by_symbol.entry(symbol.to_string()).or_default();
@@ -908,43 +990,28 @@ impl ShadowStats {
     }
 
     async fn push_signal_us(&self, us: f64) {
-        let mut v = self.signal_us.write().await;
-        push_capped(&mut v, us, Self::SAMPLE_CAP);
+        let mut s = self.samples.write().await;
+        push_capped(&mut s.signal_us, us, Self::SAMPLE_CAP);
     }
 
     async fn push_quote_us(&self, us: f64) {
-        let mut v = self.quote_us.write().await;
-        push_capped(&mut v, us, Self::SAMPLE_CAP);
+        let mut s = self.samples.write().await;
+        push_capped(&mut s.quote_us, us, Self::SAMPLE_CAP);
     }
 
     async fn push_risk_us(&self, us: f64) {
-        let mut v = self.risk_us.write().await;
-        push_capped(&mut v, us, Self::SAMPLE_CAP);
+        let mut s = self.samples.write().await;
+        push_capped(&mut s.risk_us, us, Self::SAMPLE_CAP);
     }
 
     async fn push_shadow_fill_ms(&self, ms: f64) {
-        let mut v = self.shadow_fill_ms.write().await;
-        push_capped(&mut v, ms, Self::SAMPLE_CAP);
-    }
-
-    async fn push_queue_depth(&self, depth: f64) {
-        let mut v = self.queue_depth.write().await;
-        push_capped(&mut v, depth, Self::SAMPLE_CAP);
-    }
-
-    async fn push_event_backlog(&self, depth: f64) {
-        let mut v = self.event_backlog.write().await;
-        push_capped(&mut v, depth, Self::SAMPLE_CAP);
+        let mut s = self.samples.write().await;
+        push_capped(&mut s.shadow_fill_ms, ms, Self::SAMPLE_CAP);
     }
 
     async fn push_parse_us(&self, us: f64) {
-        let mut v = self.parse_us.write().await;
-        push_capped(&mut v, us, Self::SAMPLE_CAP);
-    }
-
-    async fn push_io_queue_depth(&self, depth: f64) {
-        let mut v = self.io_queue_depth.write().await;
-        push_capped(&mut v, depth, Self::SAMPLE_CAP);
+        let mut s = self.samples.write().await;
+        push_capped(&mut s.parse_us, us, Self::SAMPLE_CAP);
     }
 
     fn mark_attempted(&self) {
@@ -1049,6 +1116,43 @@ impl ShadowStats {
         }
     }
 
+    fn set_predator_enabled(&self, v: bool) {
+        self.predator_c_enabled.store(v, Ordering::Relaxed);
+    }
+
+    fn mark_predator_direction(&self, dir: &Direction) {
+        match dir {
+            Direction::Up => {
+                self.predator_dir_up.fetch_add(1, Ordering::Relaxed);
+            }
+            Direction::Down => {
+                self.predator_dir_down.fetch_add(1, Ordering::Relaxed);
+            }
+            Direction::Neutral => {
+                self.predator_dir_neutral.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn mark_predator_taker_fired(&self) {
+        self.predator_taker_fired.fetch_add(1, Ordering::Relaxed);
+    }
+
+    async fn mark_predator_taker_skipped(&self, reason: &str) {
+        self.predator_taker_skipped.fetch_add(1, Ordering::Relaxed);
+        let mut reasons = self.predator_taker_skip_reasons.write().await;
+        *reasons.entry(reason.to_string()).or_insert(0) += 1;
+    }
+
+    async fn set_predator_router_locked_by_tf_usdc(&self, locked: HashMap<String, f64>) {
+        *self.predator_router_locked_by_tf_usdc.write().await = locked;
+    }
+
+    async fn set_predator_capital(&self, update: CapitalUpdate, halt: bool) {
+        *self.predator_capital.write().await = update;
+        self.predator_capital_halt.store(halt, Ordering::Relaxed);
+    }
+
     fn uptime_pct(&self, elapsed: Duration) -> f64 {
         let elapsed_ms = elapsed.as_millis() as u64;
         if elapsed_ms == 0 {
@@ -1077,24 +1181,26 @@ impl ShadowStats {
         const PRIMARY_DELAY_MS: u64 = 10;
         let shots = self.shots.read().await.clone();
         let outcomes = self.outcomes.read().await.clone();
-        let decision_queue_wait_ms = self.decision_queue_wait_ms.read().await.clone();
-        let decision_compute_ms = self.decision_compute_ms.read().await.clone();
-        let tick_to_decision_ms = self.tick_to_decision_ms.read().await.clone();
-        let ack_only_ms = self.ack_only_ms.read().await.clone();
-        let tick_to_ack_ms = self.tick_to_ack_ms.read().await.clone();
-        let feed_in_ms = self.feed_in_ms.read().await.clone();
-        let source_latency_ms = self.source_latency_ms.read().await.clone();
-        let local_backlog_ms = self.local_backlog_ms.read().await.clone();
-        let book_top_lag_ms = self.book_top_lag_ms.read().await.clone();
+        let ShadowSamples {
+            decision_queue_wait_ms,
+            decision_compute_ms,
+            tick_to_decision_ms,
+            ack_only_ms,
+            tick_to_ack_ms,
+            feed_in_ms,
+            source_latency_ms,
+            local_backlog_ms,
+            book_top_lag_ms,
+            signal_us,
+            quote_us,
+            risk_us,
+            shadow_fill_ms,
+            queue_depth,
+            event_backlog,
+            parse_us,
+            io_queue_depth,
+        } = self.samples.read().await.clone();
         let book_top_lag_by_symbol_ms = self.book_top_lag_by_symbol_ms.read().await.clone();
-        let signal_us = self.signal_us.read().await.clone();
-        let quote_us = self.quote_us.read().await.clone();
-        let risk_us = self.risk_us.read().await.clone();
-        let shadow_fill_ms = self.shadow_fill_ms.read().await.clone();
-        let queue_depth = self.queue_depth.read().await.clone();
-        let event_backlog = self.event_backlog.read().await.clone();
-        let parse_us = self.parse_us.read().await.clone();
-        let io_queue_depth = self.io_queue_depth.read().await.clone();
         let blocked_reason_counts = self.blocked_reasons.read().await.clone();
         let survival_probe_overall = *self.survival_probe_overall.read().await;
         let survival_probe_by_symbol = self.survival_probe_by_symbol.read().await.clone();
@@ -1285,6 +1391,20 @@ impl ShadowStats {
             local_backlog_p99_ms: percentile(&local_backlog_ms, 0.99).unwrap_or(0.0),
         };
 
+        let predator_c_enabled = self.predator_c_enabled.load(Ordering::Relaxed);
+        let direction_signals_up = self.predator_dir_up.load(Ordering::Relaxed);
+        let direction_signals_down = self.predator_dir_down.load(Ordering::Relaxed);
+        let direction_signals_neutral = self.predator_dir_neutral.load(Ordering::Relaxed);
+        let taker_sniper_fired = self.predator_taker_fired.load(Ordering::Relaxed);
+        let taker_sniper_skipped = self.predator_taker_skipped.load(Ordering::Relaxed);
+        let skip_reasons = self.predator_taker_skip_reasons.read().await.clone();
+        let mut skip_top = skip_reasons.into_iter().collect::<Vec<_>>();
+        skip_top.sort_by(|a, b| b.1.cmp(&a.1));
+        skip_top.truncate(10);
+        let router_locked_by_tf_usdc = self.predator_router_locked_by_tf_usdc.read().await.clone();
+        let capital = self.predator_capital.read().await.clone();
+        let capital_halt = self.predator_capital_halt.load(Ordering::Relaxed);
+
         let mut live = ShadowLiveReport {
             window_id: self.window_id.load(Ordering::Relaxed),
             window_shots: shots.len(),
@@ -1361,6 +1481,17 @@ impl ShadowStats {
             blocked_reason_counts,
             latency,
             market_scorecard: scorecard,
+            predator_c_enabled,
+            direction_signals_up,
+            direction_signals_down,
+            direction_signals_neutral,
+            taker_sniper_fired,
+            taker_sniper_skipped,
+            taker_sniper_skip_reasons_top: skip_top,
+            router_locked_by_tf_usdc,
+            capital_available_usdc: capital.available_usdc,
+            capital_base_quote_size: capital.base_quote_size,
+            capital_halt,
         };
         live.gate_fail_reasons =
             gate_eval::compute_gate_fail_reasons(&live, Self::GATE_MIN_OUTCOMES);
@@ -1497,20 +1628,32 @@ async fn async_main() -> Result<()> {
     let universe_cfg = load_universe_config();
     let bus = RingBus::new(16_384);
     let portfolio = Arc::new(PortfolioBook::default());
-    let exec_mode = if execution_cfg.mode.eq_ignore_ascii_case("live") {
+    let live_armed = std::env::var("POLYEDGE_LIVE_ARMED")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
+    let exec_mode = if execution_cfg.mode.eq_ignore_ascii_case("live") && live_armed {
         ExecutionMode::Live
     } else {
+        if execution_cfg.mode.eq_ignore_ascii_case("live") && !live_armed {
+            tracing::warn!(
+                "execution.mode=live but POLYEDGE_LIVE_ARMED is not true; forcing paper mode"
+            );
+        }
         ExecutionMode::Paper
     };
+    let order_endpoint = execution_cfg
+        .order_endpoint
+        .clone()
+        .unwrap_or_else(|| execution_cfg.clob_endpoint.clone());
     let execution = Arc::new(ClobExecution::new_with_timeout(
         exec_mode,
-        execution_cfg.clob_endpoint.clone(),
+        order_endpoint,
         Duration::from_millis(execution_cfg.http_timeout_ms),
     ));
     let shadow = Arc::new(ShadowExecutor::default());
-    let strategy_cfg = Arc::new(RwLock::new(load_strategy_config()));
+    let strategy_cfg = Arc::new(RwLock::new(Arc::new(load_strategy_config())));
     let fair_value_cfg = Arc::new(StdRwLock::new(load_fair_value_config()));
-    let toxicity_cfg = Arc::new(RwLock::new(ToxicityConfig::default()));
+    let toxicity_cfg = Arc::new(RwLock::new(Arc::new(ToxicityConfig::default())));
     let risk_limits = Arc::new(StdRwLock::new(load_risk_limits_config()));
     let perf_profile = Arc::new(RwLock::new(load_perf_profile_config()));
     let allocator_cfg = {
@@ -1531,23 +1674,6 @@ async fn async_main() -> Result<()> {
     let universe_timeframes = Arc::new(universe_cfg.timeframes.clone());
     init_jsonl_writer(perf_profile.clone()).await;
 
-    let state = AppState {
-        paused: paused.clone(),
-        bus: bus.clone(),
-        portfolio: portfolio.clone(),
-        execution: execution.clone(),
-        _shadow: shadow.clone(),
-        prometheus,
-        strategy_cfg: strategy_cfg.clone(),
-        fair_value_cfg: fair_value_cfg.clone(),
-        toxicity_cfg: toxicity_cfg.clone(),
-        allocator_cfg: allocator_cfg.clone(),
-        risk_limits: risk_limits.clone(),
-        tox_state: tox_state.clone(),
-        shadow_stats: shadow_stats.clone(),
-        perf_profile: perf_profile.clone(),
-    };
-
     let scoring_rebate_factor = std::env::var("POLYEDGE_SCORING_REBATE_FACTOR")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
@@ -1556,10 +1682,26 @@ async fn async_main() -> Result<()> {
         .clamp(0.0, 1.0);
 
     let risk_manager = Arc::new(DefaultRiskManager::new(risk_limits.clone()));
+    let predator_cfg = Arc::new(RwLock::new(load_predator_c_config()));
+    let predator_cfg0 = predator_cfg.read().await.clone();
+    let predator_direction_detector = Arc::new(RwLock::new(DirectionDetector::new(
+        predator_cfg0.direction_detector.clone(),
+    )));
+    let predator_latest_direction = Arc::new(RwLock::new(HashMap::new()));
+    let predator_taker_sniper = Arc::new(RwLock::new(TakerSniper::new(
+        predator_cfg0.taker_sniper.clone(),
+    )));
+    let predator_router = Arc::new(RwLock::new(TimeframeRouter::new(predator_cfg0.router.clone())));
+    let predator_compounder = Arc::new(RwLock::new(SettlementCompounder::new(
+        predator_cfg0.compounder.clone(),
+    )));
     let shared = Arc::new(EngineShared {
         latest_books: Arc::new(RwLock::new(HashMap::new())),
+        latest_signals: Arc::new(DashMap::new()),
         market_to_symbol: Arc::new(RwLock::new(HashMap::new())),
         token_to_symbol: Arc::new(RwLock::new(HashMap::new())),
+        market_to_timeframe: Arc::new(RwLock::new(HashMap::new())),
+        symbol_to_markets: Arc::new(RwLock::new(HashMap::new())),
         fee_cache: Arc::new(RwLock::new(HashMap::new())),
         fee_refresh_inflight: Arc::new(RwLock::new(HashMap::new())),
         scoring_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -1577,7 +1719,31 @@ async fn async_main() -> Result<()> {
         scoring_rebate_factor,
         tox_state,
         shadow_stats,
+        predator_cfg: predator_cfg.clone(),
+        predator_direction_detector,
+        predator_latest_direction,
+        predator_taker_sniper,
+        predator_router,
+        predator_compounder,
     });
+
+    let state = AppState {
+        paused: paused.clone(),
+        bus: bus.clone(),
+        portfolio: portfolio.clone(),
+        execution: execution.clone(),
+        _shadow: shadow.clone(),
+        prometheus,
+        strategy_cfg: shared.strategy_cfg.clone(),
+        fair_value_cfg: shared.fair_value_cfg.clone(),
+        toxicity_cfg: shared.toxicity_cfg.clone(),
+        allocator_cfg: allocator_cfg.clone(),
+        risk_limits: risk_limits.clone(),
+        tox_state: shared.tox_state.clone(),
+        shadow_stats: shared.shadow_stats.clone(),
+        perf_profile: perf_profile.clone(),
+        shared: shared.clone(),
+    };
 
     spawn_reference_feed(
         bus.clone(),
@@ -1625,6 +1791,7 @@ fn install_rustls_provider() {
 
 fn spawn_reference_feed(bus: RingBus<EngineEvent>, stats: Arc<ShadowStats>, symbols: Vec<String>) {
     const TS_INVERSION_TOLERANCE_MS: i64 = 250;
+    const TS_BACKJUMP_RESET_MS: i64 = 5_000;
     tokio::spawn(async move {
         let feed = MultiSourceRefFeed::new(Duration::from_millis(50));
         if symbols.is_empty() {
@@ -1656,7 +1823,12 @@ fn spawn_reference_feed(bus: RingBus<EngineEvent>, stats: Arc<ShadowStats>, symb
                     let stream_key = format!("{}:{}", tick.source, tick.symbol);
                     if let Some(prev) = last_source_ts_by_stream.get(&stream_key).copied() {
                         if source_ts + TS_INVERSION_TOLERANCE_MS < prev {
-                            stats.mark_ts_inversion();
+                            let back_jump_ms = prev.saturating_sub(source_ts);
+                            if back_jump_ms > TS_BACKJUMP_RESET_MS {
+                                stats.record_issue("ref_ts_backjump_reset").await;
+                            } else {
+                                stats.mark_ts_inversion();
+                            }
                         }
                     }
                     last_source_ts_by_stream.insert(stream_key, source_ts);
@@ -1698,6 +1870,7 @@ fn spawn_market_feed(
     timeframes: Vec<String>,
 ) {
     const TS_INVERSION_TOLERANCE_MS: i64 = 250;
+    const TS_BACKJUMP_RESET_MS: i64 = 5_000;
     tokio::spawn(async move {
         let feed = PolymarketFeed::new_with_universe(
             Duration::from_millis(50),
@@ -1727,7 +1900,12 @@ fn spawn_market_feed(
                     stats.mark_data_validity(valid);
                     if let Some(prev) = last_source_ts_by_market.get(&book.market_id).copied() {
                         if source_ts + TS_INVERSION_TOLERANCE_MS < prev {
-                            stats.mark_ts_inversion();
+                            let back_jump_ms = prev.saturating_sub(source_ts);
+                            if back_jump_ms > TS_BACKJUMP_RESET_MS {
+                                stats.record_issue("book_ts_backjump_reset").await;
+                            } else {
+                                stats.mark_ts_inversion();
+                            }
                         }
                     }
                     last_source_ts_by_market.insert(book.market_id.clone(), source_ts);
@@ -1803,6 +1981,13 @@ fn spawn_strategy_engine(
                 EngineEvent::RefTick(tick) => {
                     let parse_us = dispatch_start.elapsed().as_secs_f64() * 1_000_000.0;
                     shared.shadow_stats.push_parse_us(parse_us).await;
+                    if !is_anchor_ref_source(tick.source.as_str()) {
+                        shared
+                            .predator_direction_detector
+                            .write()
+                            .await
+                            .on_tick(&tick);
+                    }
                     insert_latest_ref_tick(&mut latest_fast_ticks, &mut latest_anchor_ticks, tick);
                 }
                 EngineEvent::BookTop(mut book) => {
@@ -1820,6 +2005,13 @@ fn spawn_strategy_engine(
                                 coalesced += 1;
                             }
                             Ok(EngineEvent::RefTick(next_tick)) => {
+                                if !is_anchor_ref_source(next_tick.source.as_str()) {
+                                    shared
+                                        .predator_direction_detector
+                                        .write()
+                                        .await
+                                        .on_tick(&next_tick);
+                                }
                                 insert_latest_ref_tick(
                                     &mut latest_fast_ticks,
                                     &mut latest_anchor_ticks,
@@ -1845,13 +2037,14 @@ fn spawn_strategy_engine(
                     }
 
                     let backlog_depth = rx.len() as f64;
-                    shared.shadow_stats.push_event_backlog(backlog_depth).await;
                     metrics::histogram!("runtime.event_backlog_depth").record(backlog_depth);
                     let queue_depth = execution.open_orders_count() as f64;
-                    shared.shadow_stats.push_queue_depth(queue_depth).await;
                     metrics::histogram!("runtime.open_order_depth").record(queue_depth);
                     let io_depth = current_jsonl_queue_depth() as f64;
-                    shared.shadow_stats.push_io_queue_depth(io_depth).await;
+                    shared
+                        .shadow_stats
+                        .push_depth_sample(backlog_depth, queue_depth, io_depth)
+                        .await;
                     metrics::histogram!("runtime.jsonl_queue_depth").record(io_depth);
                     shared
                         .latest_books
@@ -1968,18 +2161,13 @@ fn spawn_strategy_engine(
                         shared.shadow_stats.record_issue("stale_tick_dropped").await;
                         continue;
                     }
-                    shared.shadow_stats.push_feed_in_ms(feed_in_ms).await;
                     shared
                         .shadow_stats
-                        .push_source_latency_ms(latency_sample.source_latency_ms)
-                        .await;
-                    shared
-                        .shadow_stats
-                        .push_local_backlog_ms(latency_sample.local_backlog_ms)
-                        .await;
-                    shared
-                        .shadow_stats
-                        .push_decision_queue_wait_ms(latency_sample.local_backlog_ms)
+                        .push_latency_sample(
+                            feed_in_ms,
+                            latency_sample.source_latency_ms,
+                            latency_sample.local_backlog_ms,
+                        )
                         .await;
                     metrics::histogram!("latency.feed_in_ms").record(feed_in_ms);
                     metrics::histogram!("latency.source_latency_ms")
@@ -1995,6 +2183,13 @@ fn spawn_strategy_engine(
                     shared.shadow_stats.push_signal_us(signal_us).await;
                     metrics::histogram!("latency.signal_us").record(signal_us);
                     let _ = bus.publish(EngineEvent::Signal(signal.clone()));
+                    shared.latest_signals.insert(
+                        book.market_id.clone(),
+                        SignalCacheEntry {
+                            signal: signal.clone(),
+                            ts_ms: Utc::now().timestamp_millis(),
+                        },
+                    );
                     if should_sample_book_lag && book_top_lag_ms >= 5.0 {
                         // "Orderless" survival probe: measure whether an observed top-of-book
                         // price survives for +Δ ms, independent of order placement.
@@ -2042,97 +2237,126 @@ fn spawn_strategy_engine(
                         markout_10s_p25,
                         active_by_rank,
                     ) = {
-                        let mut states = shared.tox_state.write().await;
+                        // Step A: snapshot (read-lock) the state needed for computation.
                         let (
-                            features,
-                            decision,
-                            score,
-                            pending_exposure,
-                            no_quote_rate,
-                            symbol_missing_rate,
-                            markout_samples,
+                            attempted0,
+                            no_quote0,
+                            symbol_missing0,
+                            cooldown_until_ms0,
+                            markout_samples0,
+                            markout_1s_p50,
+                            markout_5s_p50,
                             markout_10s_p50,
                             markout_10s_p25,
                         ) = {
+                            let states = shared.tox_state.read().await;
+                            if let Some(st) = states.get(&book.market_id) {
+                                let samples = st
+                                    .markout_1s
+                                    .len()
+                                    .max(st.markout_5s.len())
+                                    .max(st.markout_10s.len());
+                                (
+                                    st.attempted,
+                                    st.no_quote,
+                                    st.symbol_missing,
+                                    st.cooldown_until_ms,
+                                    samples,
+                                    percentile_deque_capped(&st.markout_1s, 0.50, 1024)
+                                        .unwrap_or(0.0),
+                                    percentile_deque_capped(&st.markout_5s, 0.50, 1024)
+                                        .unwrap_or(0.0),
+                                    percentile_deque_capped(&st.markout_10s, 0.50, 2048)
+                                        .unwrap_or(0.0),
+                                    percentile_deque_capped(&st.markout_10s, 0.25, 2048)
+                                        .unwrap_or(0.0),
+                                )
+                            } else {
+                                (0, 0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0)
+                            }
+                        };
+
+                        // Step B: compute without holding a write lock.
+                        let attempted1 = attempted0.saturating_add(1).max(1);
+                        let tox_features = build_toxic_features(
+                            &book,
+                            &symbol,
+                            feed_in_ms,
+                            signal.fair_yes,
+                            attempted1,
+                            no_quote0,
+                            markout_1s_p50,
+                            markout_5s_p50,
+                            markout_10s_p50,
+                        );
+                        let mut tox_decision = evaluate_toxicity(&tox_features, &tox_cfg);
+                        let score_scale = (tox_cfg.k_spread / 1.5).clamp(0.25, 4.0);
+                        tox_decision.tox_score = (tox_decision.tox_score * score_scale).clamp(0.0, 1.0);
+                        tox_decision.regime = if tox_decision.tox_score >= tox_cfg.caution_threshold {
+                            ToxicRegime::Danger
+                        } else if tox_decision.tox_score >= tox_cfg.safe_threshold {
+                            ToxicRegime::Caution
+                        } else {
+                            ToxicRegime::Safe
+                        };
+
+                        let now_ms = Utc::now().timestamp_millis();
+                        let mut cooldown_until_ms1 = cooldown_until_ms0;
+                        if now_ms < cooldown_until_ms0 {
+                            tox_decision.regime = ToxicRegime::Danger;
+                            tox_decision.reason_codes.push("cooldown_active".to_string());
+                        }
+                        // Note: cooldown is based on the pre-warmup regime, matching the old behavior.
+                        if matches!(tox_decision.regime, ToxicRegime::Danger) {
+                            let cool = cooldown_secs_for_score(tox_decision.tox_score, &tox_cfg);
+                            cooldown_until_ms1 =
+                                cooldown_until_ms1.max(now_ms + (cool as i64) * 1_000);
+                        }
+                        let markout_samples = markout_samples0;
+                        if markout_samples < 20 {
+                            tox_decision.tox_score =
+                                tox_decision.tox_score.min(tox_cfg.safe_threshold * 0.8);
+                            tox_decision.regime = ToxicRegime::Safe;
+                            tox_decision
+                                .reason_codes
+                                .push("warmup_samples_lt_20".to_string());
+                        }
+
+                        let market_score = compute_market_score_from_snapshot(
+                            attempted1,
+                            no_quote0,
+                            symbol_missing0,
+                            tox_decision.tox_score,
+                            markout_samples,
+                            markout_10s_p50,
+                        );
+                        let no_quote_rate = (no_quote0 as f64 / attempted1 as f64).clamp(0.0, 1.0);
+                        let symbol_missing_rate =
+                            (symbol_missing0 as f64 / attempted1 as f64).clamp(0.0, 1.0);
+
+                        // Step C: short write-back only.
+                        {
+                            let mut states = shared.tox_state.write().await;
                             let st = states.entry(book.market_id.clone()).or_default();
                             st.attempted = st.attempted.saturating_add(1);
                             st.symbol = symbol.clone();
+                            st.last_tox_score = tox_decision.tox_score;
+                            st.last_regime = tox_decision.regime.clone();
+                            st.cooldown_until_ms = st.cooldown_until_ms.max(cooldown_until_ms1);
+                            st.market_score = market_score;
+                        }
 
-                            let features = build_toxic_features(
-                                &book,
-                                &symbol,
-                                feed_in_ms,
-                                signal.fair_yes,
-                                st,
-                            );
-                            let mut decision = evaluate_toxicity(&features, &tox_cfg);
-                            let score_scale = (tox_cfg.k_spread / 1.5).clamp(0.25, 4.0);
-                            decision.tox_score = (decision.tox_score * score_scale).clamp(0.0, 1.0);
-                            decision.regime = if decision.tox_score >= tox_cfg.caution_threshold {
-                                ToxicRegime::Danger
-                            } else if decision.tox_score >= tox_cfg.safe_threshold {
-                                ToxicRegime::Caution
-                            } else {
-                                ToxicRegime::Safe
-                            };
-                            let now_ms = Utc::now().timestamp_millis();
-
-                            if now_ms < st.cooldown_until_ms {
-                                decision.regime = ToxicRegime::Danger;
-                                decision.reason_codes.push("cooldown_active".to_string());
-                            }
-                            if matches!(decision.regime, ToxicRegime::Danger) {
-                                let cool = cooldown_secs_for_score(decision.tox_score, &tox_cfg);
-                                st.cooldown_until_ms =
-                                    st.cooldown_until_ms.max(now_ms + (cool as i64) * 1_000);
-                            }
-                            let markout_samples = st
-                                .markout_1s
-                                .len()
-                                .max(st.markout_5s.len())
-                                .max(st.markout_10s.len());
-                            if markout_samples < 20 {
-                                decision.tox_score =
-                                    decision.tox_score.min(tox_cfg.safe_threshold * 0.8);
-                                decision.regime = ToxicRegime::Safe;
-                                decision
-                                    .reason_codes
-                                    .push("warmup_samples_lt_20".to_string());
-                            }
-                            st.last_tox_score = decision.tox_score;
-                            st.last_regime = decision.regime.clone();
-                            let score =
-                                compute_market_score(st, decision.tox_score, markout_samples);
-                            let markout_10s_p50 =
-                                percentile_deque(&st.markout_10s, 0.50).unwrap_or(0.0);
-                            let markout_10s_p25 =
-                                percentile_deque(&st.markout_10s, 0.25).unwrap_or(0.0);
-                            let pending_exposure = pending_market_exposure;
-                            let attempted = st.attempted.max(1);
-                            let no_quote_rate = st.no_quote as f64 / attempted as f64;
-                            let symbol_missing_rate = st.symbol_missing as f64 / attempted as f64;
-                            (
-                                features,
-                                decision,
-                                score,
-                                pending_exposure,
-                                no_quote_rate,
-                                symbol_missing_rate,
-                                markout_samples,
-                                markout_10s_p50,
-                                markout_10s_p25,
-                            )
+                        // Step D: rank decision (read-lock, uses updated market_score).
+                        let active_by_rank = {
+                            let states = shared.tox_state.read().await;
+                            is_market_in_top_n(&states, &book.market_id, tox_cfg.active_top_n_markets)
                         };
-                        let active_by_rank = is_market_in_top_n(
-                            &states,
-                            &book.market_id,
-                            tox_cfg.active_top_n_markets,
-                        );
+
                         (
-                            features,
-                            decision,
-                            score,
-                            pending_exposure,
+                            tox_features,
+                            tox_decision,
+                            market_score,
+                            pending_market_exposure,
                             no_quote_rate,
                             symbol_missing_rate,
                             markout_samples,
@@ -2257,7 +2481,38 @@ fn spawn_strategy_engine(
                         continue;
                     }
 
-                    let mut effective_cfg = cfg.clone();
+                    let predator_cfg = shared.predator_cfg.read().await.clone();
+                    if predator_cfg.enabled
+                        && matches!(
+                            predator_cfg.priority,
+                            PredatorCPriority::TakerFirst | PredatorCPriority::TakerOnly
+                        )
+                    {
+                        let now_ms = Utc::now().timestamp_millis();
+                        let res = run_predator_c_for_symbol(
+                            &shared,
+                            &bus,
+                            &portfolio,
+                            &execution,
+                            &shadow,
+                            &mut market_rate_budget,
+                            &mut global_rate_budget,
+                            &predator_cfg,
+                            &symbol,
+                            now_ms,
+                        )
+                        .await;
+                        if matches!(predator_cfg.priority, PredatorCPriority::TakerOnly) {
+                            continue;
+                        }
+                        if matches!(predator_cfg.priority, PredatorCPriority::TakerFirst)
+                            && res.attempted > 0
+                        {
+                            continue;
+                        }
+                    }
+
+                    let mut effective_cfg = (*cfg).clone();
                     effective_cfg.min_edge_bps = effective_min_edge_bps;
                     let policy = MakerQuotePolicy::new(effective_cfg);
                     let mut intents =
@@ -2299,6 +2554,24 @@ fn spawn_strategy_engine(
                                 .shadow_stats
                                 .mark_blocked_with_reason("no_quote_policy")
                                 .await;
+                        }
+                        if predator_cfg.enabled
+                            && matches!(predator_cfg.priority, PredatorCPriority::MakerFirst)
+                        {
+                            let now_ms = Utc::now().timestamp_millis();
+                            let _ = run_predator_c_for_symbol(
+                                &shared,
+                                &bus,
+                                &portfolio,
+                                &execution,
+                                &shadow,
+                                &mut market_rate_budget,
+                                &mut global_rate_budget,
+                                &predator_cfg,
+                                &symbol,
+                                now_ms,
+                            )
+                            .await;
                         }
                         continue;
                     }
@@ -2412,7 +2685,9 @@ fn spawn_strategy_engine(
                                     .shadow_stats
                                     .mark_blocked_with_reason("taker_slippage_budget")
                                     .await;
-                                continue;
+                                // If the market moved too far for a safe taker cross, keep the
+                                // passive maker quote instead of dropping the opportunity.
+                                force_taker = false;
                             }
                         }
                         let per_market_rps = (shared.rate_limit_rps / 8.0).max(0.5);
@@ -2451,8 +2726,13 @@ fn spawn_strategy_engine(
                             ExecutionStyle::Maker => OrderTimeInForce::PostOnly,
                             ExecutionStyle::Taker | ExecutionStyle::Arb => OrderTimeInForce::Fak,
                         };
+                        let token_id = match intent.side {
+                            OrderSide::BuyYes | OrderSide::SellYes => book.token_id_yes.clone(),
+                            OrderSide::BuyNo | OrderSide::SellNo => book.token_id_no.clone(),
+                        };
                         let v2_intent = OrderIntentV2 {
                             market_id: intent.market_id.clone(),
+                            token_id: Some(token_id),
                             side: intent.side.clone(),
                             price: intent.price,
                             size: intent.size,
@@ -2462,6 +2742,7 @@ fn spawn_strategy_engine(
                             max_slippage_bps: cfg.taker_max_slippage_bps,
                             fee_rate_bps: fee_bps,
                             expected_edge_net_bps: edge_net,
+                            client_order_id: Some(new_id()),
                             hold_to_resolution: false,
                         };
                         match execution.place_order_v2(v2_intent).await {
@@ -2602,6 +2883,460 @@ fn spawn_strategy_engine(
     });
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct PredatorExecResult {
+    attempted: u64,
+    executed: u64,
+}
+
+async fn run_predator_c_for_symbol(
+    shared: &Arc<EngineShared>,
+    bus: &RingBus<EngineEvent>,
+    portfolio: &Arc<PortfolioBook>,
+    execution: &Arc<ClobExecution>,
+    shadow: &Arc<ShadowExecutor>,
+    market_rate_budget: &mut HashMap<String, TokenBucket>,
+    global_rate_budget: &mut TokenBucket,
+    predator_cfg: &PredatorCConfig,
+    symbol: &str,
+    now_ms: i64,
+) -> PredatorExecResult {
+    shared.shadow_stats.set_predator_enabled(predator_cfg.enabled);
+    if !predator_cfg.enabled {
+        return PredatorExecResult::default();
+    }
+
+    let direction_signal = {
+        let det = shared.predator_direction_detector.read().await;
+        det.evaluate(symbol, now_ms)
+    };
+    let Some(direction_signal) = direction_signal else {
+        shared
+            .shadow_stats
+            .mark_predator_taker_skipped("no_direction_signal")
+            .await;
+        return PredatorExecResult::default();
+    };
+
+    shared.shadow_stats.mark_predator_direction(&direction_signal.direction);
+    {
+        let mut map = shared.predator_latest_direction.write().await;
+        map.insert(symbol.to_string(), direction_signal.clone());
+    }
+    let _ = bus.publish(EngineEvent::DirectionSignal(direction_signal.clone()));
+
+    if matches!(direction_signal.direction, Direction::Neutral) {
+        shared
+            .shadow_stats
+            .mark_predator_taker_skipped("neutral_direction")
+            .await;
+        return PredatorExecResult::default();
+    }
+
+    let market_ids = shared
+        .symbol_to_markets
+        .read()
+        .await
+        .get(symbol)
+        .cloned()
+        .unwrap_or_default();
+    if market_ids.is_empty() {
+        shared
+            .shadow_stats
+            .mark_predator_taker_skipped("no_symbol_markets")
+            .await;
+        return PredatorExecResult::default();
+    }
+
+    let maker_cfg = shared.strategy_cfg.read().await.clone();
+
+    let (quote_notional_usdc, total_capital_usdc) = if predator_cfg.compounder.enabled {
+        let c = shared.predator_compounder.read().await;
+        (c.recommended_quote_notional_usdc(), c.available())
+    } else {
+        (0.0, predator_cfg.compounder.initial_capital_usdc.max(0.0))
+    };
+
+    let side = match direction_signal.direction {
+        Direction::Up => OrderSide::BuyYes,
+        Direction::Down => OrderSide::BuyNo,
+        Direction::Neutral => OrderSide::BuyYes,
+    };
+
+    // Build candidate opportunities using cached fair values per market (do NOT call fair.evaluate
+    // here; the fair model is stateful per symbol and would be advanced multiple times).
+    #[derive(Debug, Clone)]
+    struct PredatorCandIn {
+        market_id: String,
+        timeframe: TimeframeClass,
+        entry_price: f64,
+        spread: f64,
+        fee_bps: f64,
+        edge_gross_bps: f64,
+        edge_net_bps: f64,
+        size: f64,
+    }
+
+    let market_ids = market_ids.into_iter().take(32).collect::<Vec<_>>();
+    let tf_by_market = {
+        let map = shared.market_to_timeframe.read().await;
+        market_ids
+            .iter()
+            .filter_map(|id| map.get(id).cloned().map(|tf| (id.clone(), tf)))
+            .collect::<HashMap<String, TimeframeClass>>()
+    };
+    let book_by_market = {
+        let map = shared.latest_books.read().await;
+        market_ids
+            .iter()
+            .filter_map(|id| map.get(id).cloned().map(|b| (id.clone(), b)))
+            .collect::<HashMap<String, BookTop>>()
+    };
+
+    let mut cand_inputs = Vec::<PredatorCandIn>::new();
+    for market_id in market_ids {
+        let Some(timeframe) = tf_by_market.get(&market_id).cloned() else {
+            continue;
+        };
+        let Some(book) = book_by_market.get(&market_id).cloned() else {
+            continue;
+        };
+        let sig_entry = shared
+            .latest_signals
+            .get(&market_id)
+            .map(|v| v.value().clone());
+        let Some(sig_entry) = sig_entry else {
+            continue;
+        };
+        if now_ms.saturating_sub(sig_entry.ts_ms) > 5_000 {
+            continue;
+        }
+
+        let entry_price = aggressive_price_for_side(&book, &side);
+        let spread = spread_for_side(&book, &side);
+        let fee_bps = get_fee_rate_bps_cached(shared, &market_id).await;
+        let rebate_est_bps = get_rebate_bps_cached(shared, &market_id, fee_bps).await;
+        let edge_gross_bps =
+            edge_gross_bps_for_side(sig_entry.signal.fair_yes, &side, entry_price);
+        let edge_net_bps = edge_gross_bps - fee_bps + rebate_est_bps;
+        let size = if predator_cfg.compounder.enabled {
+            (quote_notional_usdc / entry_price.max(1e-6)).max(0.01)
+        } else {
+            maker_cfg.base_quote_size.max(0.01)
+        };
+
+        cand_inputs.push(PredatorCandIn {
+            market_id,
+            timeframe,
+            entry_price,
+            spread,
+            fee_bps,
+            edge_gross_bps,
+            edge_net_bps,
+            size,
+        });
+    }
+
+    let mut candidates: Vec<TimeframeOpp> = Vec::new();
+    let mut skip_reasons: Vec<String> = Vec::new();
+    {
+        let mut sniper = shared.predator_taker_sniper.write().await;
+        for cin in cand_inputs {
+            let decision = sniper.evaluate(
+                &cin.market_id,
+                symbol,
+                cin.timeframe.clone(),
+                &direction_signal,
+                cin.entry_price,
+                cin.spread,
+                cin.fee_bps,
+                cin.edge_gross_bps,
+                cin.edge_net_bps,
+                cin.size,
+                now_ms,
+            );
+            match decision.action {
+                TakerAction::Fire => {
+                    if let Some(opp) = decision.opportunity {
+                        candidates.push(opp);
+                    }
+                }
+                TakerAction::Skip => {
+                    skip_reasons.push(decision.reason);
+                }
+            }
+        }
+    }
+    for reason in skip_reasons {
+        shared
+            .shadow_stats
+            .mark_predator_taker_skipped(reason.as_str())
+            .await;
+    }
+
+    if candidates.is_empty() {
+        return PredatorExecResult::default();
+    }
+
+    // Router selects + locks.
+    let mut locked_opps: Vec<TimeframeOpp> = Vec::new();
+    let mut locked_by_tf_usdc: HashMap<String, f64> = HashMap::new();
+    {
+        let mut router = shared.predator_router.write().await;
+        let selected = router.route(candidates, total_capital_usdc.max(0.0), now_ms);
+        for opp in selected {
+            if router.lock(&opp, now_ms) {
+                locked_opps.push(opp);
+            }
+        }
+        for (tf, v) in router.locked_by_tf_usdc(now_ms) {
+            locked_by_tf_usdc.insert(tf.to_string(), v);
+        }
+    }
+    shared
+        .shadow_stats
+        .set_predator_router_locked_by_tf_usdc(locked_by_tf_usdc)
+        .await;
+
+    if locked_opps.is_empty() {
+        return PredatorExecResult::default();
+    }
+
+    let mut out = PredatorExecResult::default();
+    for opp in locked_opps {
+        shared.shadow_stats.mark_predator_taker_fired();
+        let res = predator_execute_opportunity(
+            shared,
+            bus,
+            portfolio,
+            execution,
+            shadow,
+            market_rate_budget,
+            global_rate_budget,
+            &maker_cfg,
+            predator_cfg,
+            &direction_signal,
+            &opp,
+            now_ms,
+        )
+        .await;
+        out.attempted = out.attempted.saturating_add(res.attempted);
+        out.executed = out.executed.saturating_add(res.executed);
+    }
+    out
+}
+
+async fn predator_execute_opportunity(
+    shared: &Arc<EngineShared>,
+    bus: &RingBus<EngineEvent>,
+    portfolio: &Arc<PortfolioBook>,
+    execution: &Arc<ClobExecution>,
+    shadow: &Arc<ShadowExecutor>,
+    market_rate_budget: &mut HashMap<String, TokenBucket>,
+    global_rate_budget: &mut TokenBucket,
+    maker_cfg: &MakerConfig,
+    predator_cfg: &PredatorCConfig,
+    _direction_signal: &DirectionSignal,
+    opp: &TimeframeOpp,
+    now_ms: i64,
+) -> PredatorExecResult {
+    let mut intent = QuoteIntent {
+        market_id: opp.market_id.clone(),
+        side: opp.side.clone(),
+        price: opp.entry_price,
+        size: opp.size,
+        ttl_ms: 150,
+    };
+
+    shared.shadow_stats.mark_attempted();
+
+    let book = shared.latest_books.read().await.get(&intent.market_id).cloned();
+    let Some(book) = book else {
+        shared
+            .shadow_stats
+            .mark_predator_taker_skipped("book_missing")
+            .await;
+        return PredatorExecResult::default();
+    };
+
+    let proposed_notional_usdc = (intent.price.max(0.0) * intent.size.max(0.0)).max(0.0);
+    let inventory = inventory_for_market(portfolio, &intent.market_id);
+    let pending_market_exposure = execution.open_order_notional_for_market(&intent.market_id);
+    let pending_total_exposure = execution.open_order_notional_total();
+    let drawdown = portfolio.snapshot().max_drawdown_pct;
+    let ctx = RiskContext {
+        market_id: intent.market_id.clone(),
+        symbol: opp.symbol.clone(),
+        order_count: execution.open_orders_count(),
+        proposed_size: intent.size,
+        proposed_notional_usdc,
+        market_notional: inventory.exposure_notional + pending_market_exposure,
+        asset_notional: inventory.exposure_notional + pending_total_exposure,
+        drawdown_pct: drawdown,
+        loss_streak: shared.shadow_stats.loss_streak(),
+        now_ms,
+    };
+    let decision = shared.risk_manager.evaluate(&ctx);
+    if !decision.allow {
+        shared
+            .shadow_stats
+            .mark_blocked_with_reason(&format!("risk:{}", decision.reason))
+            .await;
+        return PredatorExecResult::default();
+    }
+    if decision.capped_size <= 0.0 {
+        shared
+            .shadow_stats
+            .mark_blocked_with_reason("risk_capped_zero")
+            .await;
+        return PredatorExecResult::default();
+    }
+    intent.size = intent.size.min(decision.capped_size);
+
+    let intended_notional_usdc = (intent.price.max(0.0) * intent.size.max(0.0)).max(0.0);
+    if intended_notional_usdc < maker_cfg.min_eval_notional_usdc {
+        shared
+            .shadow_stats
+            .mark_blocked_with_reason("tiny_notional")
+            .await;
+        return PredatorExecResult::default();
+    }
+
+    let edge_net_usdc = (opp.edge_net_bps / 10_000.0) * intended_notional_usdc;
+    if edge_net_usdc < maker_cfg.min_expected_edge_usdc {
+        shared
+            .shadow_stats
+            .mark_blocked_with_reason("edge_notional_too_small")
+            .await;
+        return PredatorExecResult::default();
+    }
+
+    let per_market_rps = (shared.rate_limit_rps / 8.0).max(0.5);
+    let market_bucket = market_rate_budget
+        .entry(intent.market_id.clone())
+        .or_insert_with(|| TokenBucket::new(per_market_rps, (per_market_rps * 2.0).max(1.0)));
+    if !global_rate_budget.try_take(1.0) {
+        shared
+            .shadow_stats
+            .mark_blocked_with_reason("rate_budget_global")
+            .await;
+        return PredatorExecResult::default();
+    }
+    if !market_bucket.try_take(1.0) {
+        shared
+            .shadow_stats
+            .mark_blocked_with_reason("rate_budget_market")
+            .await;
+        return PredatorExecResult::default();
+    }
+
+    shared.shadow_stats.mark_eligible();
+    let place_start = Instant::now();
+    let token_id = match intent.side {
+        OrderSide::BuyYes | OrderSide::SellYes => book.token_id_yes.clone(),
+        OrderSide::BuyNo | OrderSide::SellNo => book.token_id_no.clone(),
+    };
+    let v2_intent = OrderIntentV2 {
+        market_id: intent.market_id.clone(),
+        token_id: Some(token_id),
+        side: intent.side.clone(),
+        price: intent.price,
+        size: intent.size,
+        ttl_ms: intent.ttl_ms,
+        style: ExecutionStyle::Taker,
+        tif: OrderTimeInForce::Fak,
+        max_slippage_bps: maker_cfg.taker_max_slippage_bps,
+        fee_rate_bps: opp.fee_bps,
+        expected_edge_net_bps: opp.edge_net_bps,
+        client_order_id: Some(new_id()),
+        hold_to_resolution: false,
+    };
+
+    let mut out = PredatorExecResult::default();
+    out.attempted = out.attempted.saturating_add(1);
+
+    match execution.place_order_v2(v2_intent).await {
+        Ok(ack_v2) if ack_v2.accepted => {
+            let accepted_size = ack_v2.accepted_size.max(0.0).min(intent.size);
+            if accepted_size <= 0.0 {
+                shared
+                    .shadow_stats
+                    .mark_blocked_with_reason("exchange_reject_zero_size")
+                    .await;
+                return out;
+            }
+            intent.size = accepted_size;
+            shared.shadow_stats.mark_executed();
+            out.executed = out.executed.saturating_add(1);
+
+            let ack_only_ms = if ack_v2.exchange_latency_ms > 0.0 {
+                ack_v2.exchange_latency_ms
+            } else {
+                place_start.elapsed().as_secs_f64() * 1_000.0
+            };
+            shared.shadow_stats.push_ack_only_ms(ack_only_ms).await;
+            shared
+                .shadow_stats
+                .push_tick_to_ack_ms(ack_only_ms)
+                .await;
+
+            let ack = OrderAck {
+                order_id: ack_v2.order_id,
+                market_id: ack_v2.market_id,
+                accepted: true,
+                ts_ms: ack_v2.ts_ms,
+            };
+            let _ = bus.publish(EngineEvent::OrderAck(ack.clone()));
+            shadow.register_order(&ack, intent.clone());
+
+            for delay_ms in [5_u64, 10_u64, 25_u64] {
+                let shot = ShadowShot {
+                    shot_id: new_id(),
+                    market_id: intent.market_id.clone(),
+                    symbol: opp.symbol.clone(),
+                    side: intent.side.clone(),
+                    execution_style: ExecutionStyle::Taker,
+                    survival_probe_price: aggressive_price_for_side(&book, &intent.side),
+                    intended_price: intent.price,
+                    size: intent.size,
+                    edge_gross_bps: opp.edge_gross_bps,
+                    edge_net_bps: opp.edge_net_bps,
+                    fee_paid_bps: opp.fee_bps,
+                    rebate_est_bps: 0.0,
+                    delay_ms,
+                    t0_ns: now_ns(),
+                    min_edge_bps: predator_cfg.taker_sniper.min_edge_net_bps,
+                    tox_score: 0.0,
+                    ttl_ms: intent.ttl_ms,
+                };
+                shared.shadow_stats.push_shot(shot.clone()).await;
+                let _ = bus.publish(EngineEvent::ShadowShot(shot.clone()));
+                spawn_shadow_outcome_task(shared.clone(), bus.clone(), shot);
+            }
+        }
+        Ok(ack_v2) => {
+            let reject_code = ack_v2
+                .reject_code
+                .as_deref()
+                .map(normalize_reject_code)
+                .unwrap_or_else(|| "unknown".to_string());
+            shared
+                .shadow_stats
+                .mark_blocked_with_reason(&format!("exchange_reject_{reject_code}"))
+                .await;
+            metrics::counter!("execution.place_rejected").increment(1);
+        }
+        Err(err) => {
+            let reason = classify_execution_error_reason(&err);
+            shared.shadow_stats.mark_blocked_with_reason(reason).await;
+            tracing::warn!(?err, "predator place_order failed");
+            metrics::counter!("execution.place_error").increment(1);
+        }
+    }
+
+    out
+}
+
 fn spawn_shadow_outcome_task(
     shared: Arc<EngineShared>,
     bus: RingBus<EngineEvent>,
@@ -2715,6 +3450,32 @@ fn spawn_shadow_outcome_task(
         shared.shadow_stats.push_outcome(outcome.clone()).await;
         update_toxic_state_from_outcome(&shared, &outcome).await;
         if shot.delay_ms == 10 {
+            if let Some(pnl_usdc) = outcome.net_markout_10s_usdc {
+                let compounder_enabled = shared.predator_cfg.read().await.compounder.enabled;
+                if compounder_enabled {
+                    let (update, halt) = {
+                        let mut c = shared.predator_compounder.write().await;
+                        let update = c.on_markout(pnl_usdc);
+                        (update, c.halted())
+                    };
+                    shared
+                        .shadow_stats
+                        .set_predator_capital(update.clone(), halt)
+                        .await;
+                    let _ = bus.publish(EngineEvent::CapitalUpdate(update));
+
+                    if halt {
+                        let live_armed = std::env::var("POLYEDGE_LIVE_ARMED")
+                            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+                            .unwrap_or(false);
+                        if live_armed {
+                            shared.shadow_stats.record_issue("capital_halt").await;
+                            let _ = bus.publish(EngineEvent::Control(ControlCommand::Pause));
+                            let _ = bus.publish(EngineEvent::Control(ControlCommand::Flatten));
+                        }
+                    }
+                }
+            }
             let eval = QuoteEval {
                 market_id: shot.market_id.clone(),
                 symbol: shot.symbol.clone(),
@@ -2772,14 +3533,31 @@ async fn refresh_market_symbol_map(shared: &EngineShared) {
         Ok(markets) => {
             let mut market_map = HashMap::new();
             let mut token_map = HashMap::new();
+            let mut timeframe_map = HashMap::new();
+            let mut symbol_to_markets = HashMap::<String, Vec<String>>::new();
             for m in markets {
                 market_map.insert(m.market_id.clone(), m.symbol.clone());
+                symbol_to_markets
+                    .entry(m.symbol.clone())
+                    .or_default()
+                    .push(m.market_id.clone());
+                if let Some(tf) = m
+                    .timeframe
+                    .as_deref()
+                    .and_then(parse_timeframe_class)
+                {
+                    timeframe_map.insert(m.market_id.clone(), tf);
+                }
                 if let Some(t) = m.token_id_yes {
                     token_map.insert(t, m.symbol.clone());
                 }
                 if let Some(t) = m.token_id_no {
                     token_map.insert(t, m.symbol.clone());
                 }
+            }
+            for v in symbol_to_markets.values_mut() {
+                v.sort();
+                v.dedup();
             }
             {
                 let mut map = shared.market_to_symbol.write().await;
@@ -2789,10 +3567,28 @@ async fn refresh_market_symbol_map(shared: &EngineShared) {
                 let mut map = shared.token_to_symbol.write().await;
                 *map = token_map;
             }
+            {
+                let mut map = shared.market_to_timeframe.write().await;
+                *map = timeframe_map;
+            }
+            {
+                let mut map = shared.symbol_to_markets.write().await;
+                *map = symbol_to_markets;
+            }
         }
         Err(err) => {
             tracing::warn!(?err, "market discovery refresh failed");
         }
+    }
+}
+
+fn parse_timeframe_class(tf: &str) -> Option<TimeframeClass> {
+    match tf.trim().to_ascii_lowercase().as_str() {
+        "5m" | "tf5m" => Some(TimeframeClass::Tf5m),
+        "15m" | "tf15m" => Some(TimeframeClass::Tf15m),
+        "1h" | "tf1h" => Some(TimeframeClass::Tf1h),
+        "1d" | "tf1d" => Some(TimeframeClass::Tf1d),
+        _ => None,
     }
 }
 
@@ -2849,7 +3645,11 @@ fn build_toxic_features(
     symbol: &str,
     stale_ms: f64,
     fair_yes: f64,
-    state: &MarketToxicState,
+    attempted: u64,
+    no_quote: u64,
+    markout_1s_p50: f64,
+    markout_5s_p50: f64,
+    markout_10s_p50: f64,
 ) -> ToxicFeatures {
     let mid_yes = ((book.bid_yes + book.ask_yes) * 0.5).max(0.0001);
     let spread_bps = ((book.ask_yes - book.bid_yes).max(0.0) / mid_yes) * 10_000.0;
@@ -2860,15 +3660,15 @@ fn build_toxic_features(
     } else {
         ((book.bid_yes + book.ask_no) - (book.ask_yes + book.bid_no)) / imbalance_den
     };
-    let attempted = state.attempted.max(1);
-    let cancel_burst = (state.no_quote as f64 / attempted as f64).clamp(0.0, 1.0);
+    let attempted = attempted.max(1);
+    let cancel_burst = (no_quote as f64 / attempted as f64).clamp(0.0, 1.0);
 
     ToxicFeatures {
         market_id: book.market_id.clone(),
         symbol: symbol.to_string(),
-        markout_1s: percentile_deque(&state.markout_1s, 0.50).unwrap_or(0.0),
-        markout_5s: percentile_deque(&state.markout_5s, 0.50).unwrap_or(0.0),
-        markout_10s: percentile_deque(&state.markout_10s, 0.50).unwrap_or(0.0),
+        markout_1s: markout_1s_p50,
+        markout_5s: markout_5s_p50,
+        markout_10s: markout_10s_p50,
         spread_bps,
         microprice_drift,
         stale_ms,
@@ -2974,12 +3774,34 @@ fn compute_market_score(state: &MarketToxicState, tox_score: f64, markout_sample
     let attempted = state.attempted.max(1);
     let no_quote_rate = state.no_quote as f64 / attempted as f64;
     let symbol_missing_rate = state.symbol_missing as f64 / attempted as f64;
-    let markout_10s = percentile_deque(&state.markout_10s, 0.50).unwrap_or(0.0);
+    let markout_10s = percentile_deque_capped(&state.markout_10s, 0.50, 2048).unwrap_or(0.0);
     if markout_samples < 20 {
         let warmup_score = 80.0 - no_quote_rate * 6.0 - symbol_missing_rate * 6.0;
         return warmup_score.clamp(45.0, 100.0);
     }
     let score = 70.0 + (markout_10s * 1.5).clamp(-30.0, 30.0)
+        - no_quote_rate * 25.0
+        - symbol_missing_rate * 30.0
+        - tox_score * 20.0;
+    score.clamp(0.0, 100.0)
+}
+
+fn compute_market_score_from_snapshot(
+    attempted: u64,
+    no_quote: u64,
+    symbol_missing: u64,
+    tox_score: f64,
+    markout_samples: usize,
+    markout_10s_p50: f64,
+) -> f64 {
+    let attempted = attempted.max(1);
+    let no_quote_rate = no_quote as f64 / attempted as f64;
+    let symbol_missing_rate = symbol_missing as f64 / attempted as f64;
+    if markout_samples < 20 {
+        let warmup_score = 80.0 - no_quote_rate * 6.0 - symbol_missing_rate * 6.0;
+        return warmup_score.clamp(45.0, 100.0);
+    }
+    let score = 70.0 + (markout_10s_p50 * 1.5).clamp(-30.0, 30.0)
         - no_quote_rate * 25.0
         - symbol_missing_rate * 30.0
         - tox_score * 20.0;
@@ -3161,17 +3983,7 @@ fn is_market_in_top_n(
     }
     let mut ranked = states
         .iter()
-        .map(|(id, st)| {
-            let samples = st
-                .markout_1s
-                .len()
-                .max(st.markout_5s.len())
-                .max(st.markout_10s.len());
-            (
-                id.clone(),
-                compute_market_score(st, st.last_tox_score, samples),
-            )
-        })
+        .map(|(id, st)| (id.clone(), st.market_score))
         .collect::<Vec<_>>();
     if ranked.is_empty() {
         return true;
@@ -3227,6 +4039,12 @@ async fn update_toxic_state_from_outcome(shared: &EngineShared, outcome: &Shadow
     if let Some(v) = outcome.net_markout_10s_bps.or(outcome.pnl_10s_bps) {
         push_rolling(&mut st.markout_10s, v, 2048);
     }
+    let samples = st
+        .markout_1s
+        .len()
+        .max(st.markout_5s.len())
+        .max(st.markout_10s.len());
+    st.market_score = compute_market_score(st, st.last_tox_score, samples);
 }
 
 fn push_rolling(dst: &mut VecDeque<f64>, value: f64, cap: usize) {
@@ -3765,12 +4583,39 @@ fn aggressive_price_for_side(book: &BookTop, side: &OrderSide) -> f64 {
     }
 }
 
+fn spread_for_side(book: &BookTop, side: &OrderSide) -> f64 {
+    match side {
+        OrderSide::BuyYes | OrderSide::SellYes => (book.ask_yes - book.bid_yes).max(0.0),
+        OrderSide::BuyNo | OrderSide::SellNo => (book.ask_no - book.bid_no).max(0.0),
+    }
+}
+
+fn fair_for_side(fair_yes: f64, side: &OrderSide) -> f64 {
+    match side {
+        OrderSide::BuyYes | OrderSide::SellYes => fair_yes,
+        OrderSide::BuyNo | OrderSide::SellNo => (1.0 - fair_yes).clamp(0.001, 0.999),
+    }
+}
+
+fn edge_gross_bps_for_side(fair_yes: f64, side: &OrderSide, entry_price: f64) -> f64 {
+    let fair = fair_for_side(fair_yes, side);
+    let px = entry_price.max(1e-6);
+    match side {
+        OrderSide::BuyYes | OrderSide::BuyNo => ((fair - px) / px) * 10_000.0,
+        OrderSide::SellYes | OrderSide::SellNo => ((px - fair) / px) * 10_000.0,
+    }
+}
+
 fn edge_for_intent(fair_yes: f64, intent: &QuoteIntent) -> f64 {
     let px = intent.price.max(1e-6);
+    let fair = match intent.side {
+        OrderSide::BuyYes | OrderSide::SellYes => fair_yes,
+        OrderSide::BuyNo | OrderSide::SellNo => (1.0 - fair_yes).clamp(0.001, 0.999),
+    };
     match intent.side {
         // Expected edge vs. intended entry price in bps of entry.
-        OrderSide::BuyYes | OrderSide::BuyNo => ((fair_yes - px) / px) * 10_000.0,
-        OrderSide::SellYes | OrderSide::SellNo => ((px - fair_yes) / px) * 10_000.0,
+        OrderSide::BuyYes | OrderSide::BuyNo => ((fair - px) / px) * 10_000.0,
+        OrderSide::SellYes | OrderSide::SellNo => ((px - fair) / px) * 10_000.0,
     }
 }
 
@@ -3778,7 +4623,7 @@ async fn build_toxicity_live_report(
     tox_state: Arc<RwLock<HashMap<String, MarketToxicState>>>,
     shadow_stats: Arc<ShadowStats>,
     execution: Arc<ClobExecution>,
-    toxicity_cfg: Arc<RwLock<ToxicityConfig>>,
+    toxicity_cfg: Arc<RwLock<Arc<ToxicityConfig>>>,
 ) -> ToxicityLiveReport {
     let cfg = toxicity_cfg.read().await.clone();
     let states = tox_state.read().await.clone();
@@ -3810,13 +4655,17 @@ async fn build_toxicity_live_report(
         let attempted = st.attempted.max(1);
         let no_quote_rate = st.no_quote as f64 / attempted as f64;
         let symbol_missing_rate = st.symbol_missing as f64 / attempted as f64;
-        let markout_10s_bps = percentile_deque(&st.markout_10s, 0.50).unwrap_or(0.0);
+        let markout_10s_bps = percentile_deque_capped(&st.markout_10s, 0.50, 2048).unwrap_or(0.0);
         let markout_samples = st
             .markout_1s
             .len()
             .max(st.markout_5s.len())
             .max(st.markout_10s.len());
-        let market_score = compute_market_score(&st, st.last_tox_score, markout_samples);
+        let market_score = if st.market_score > 0.0 {
+            st.market_score
+        } else {
+            compute_market_score(&st, st.last_tox_score, markout_samples)
+        };
         let pending_exposure = execution.open_order_notional_for_market(&market_id);
 
         tox_sum += st.last_tox_score;
@@ -4137,6 +4986,231 @@ fn load_strategy_config() -> MakerConfig {
     cfg
 }
 
+fn load_predator_c_config() -> PredatorCConfig {
+    let path = Path::new("configs/strategy.toml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return PredatorCConfig::default();
+    };
+
+    let mut cfg = PredatorCConfig::default();
+
+    let mut in_root = false;
+    let mut in_dir = false;
+    let mut in_sniper = false;
+    let mut in_router = false;
+    let mut in_compounder = false;
+
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_root = line == "[predator_c]";
+            in_dir = line == "[predator_c.direction_detector]";
+            in_sniper = line == "[predator_c.taker_sniper]";
+            in_router = line == "[predator_c.router]";
+            in_compounder = line == "[predator_c.compounder]";
+            continue;
+        }
+        if !(in_root || in_dir || in_sniper || in_router || in_compounder) {
+            continue;
+        }
+
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim().trim_matches('"');
+
+        if in_root {
+            match key {
+                "enabled" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.enabled = parsed;
+                    }
+                }
+                "priority" => {
+                    let norm = val.trim().to_ascii_lowercase();
+                    cfg.priority = match norm.as_str() {
+                        "maker_first" => PredatorCPriority::MakerFirst,
+                        "taker_first" => PredatorCPriority::TakerFirst,
+                        "taker_only" => PredatorCPriority::TakerOnly,
+                        _ => cfg.priority.clone(),
+                    };
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if in_dir {
+            match key {
+                "window_max_sec" => {
+                    if let Ok(parsed) = val.parse::<u64>() {
+                        cfg.direction_detector.window_max_sec = parsed.max(10);
+                    }
+                }
+                "threshold_5m_pct" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.direction_detector.threshold_5m_pct = parsed.max(0.0);
+                    }
+                }
+                "threshold_15m_pct" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.direction_detector.threshold_15m_pct = parsed.max(0.0);
+                    }
+                }
+                "threshold_1h_pct" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.direction_detector.threshold_1h_pct = parsed.max(0.0);
+                    }
+                }
+                "threshold_1d_pct" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.direction_detector.threshold_1d_pct = parsed.max(0.0);
+                    }
+                }
+                "lookback_short_sec" => {
+                    if let Ok(parsed) = val.parse::<u64>() {
+                        cfg.direction_detector.lookback_short_sec = parsed.max(1);
+                    }
+                }
+                "lookback_long_sec" => {
+                    if let Ok(parsed) = val.parse::<u64>() {
+                        cfg.direction_detector.lookback_long_sec = parsed.max(1);
+                    }
+                }
+                "min_sources_for_high_confidence" => {
+                    if let Ok(parsed) = val.parse::<usize>() {
+                        cfg.direction_detector.min_sources_for_high_confidence = parsed.max(1);
+                    }
+                }
+                "min_ticks_for_signal" => {
+                    if let Ok(parsed) = val.parse::<usize>() {
+                        cfg.direction_detector.min_ticks_for_signal = parsed.max(1);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if in_sniper {
+            match key {
+                "min_direction_confidence" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.taker_sniper.min_direction_confidence = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "min_edge_net_bps" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.taker_sniper.min_edge_net_bps = parsed.max(0.0);
+                    }
+                }
+                "max_spread" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.taker_sniper.max_spread = parsed.max(0.0001);
+                    }
+                }
+                "cooldown_ms_per_market" => {
+                    if let Ok(parsed) = val.parse::<u64>() {
+                        cfg.taker_sniper.cooldown_ms_per_market = parsed;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if in_router {
+            match key {
+                "max_locked_pct_5m" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.router.max_locked_pct_5m = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "max_locked_pct_15m" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.router.max_locked_pct_15m = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "max_locked_pct_1h" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.router.max_locked_pct_1h = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "max_locked_pct_1d" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.router.max_locked_pct_1d = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "max_concurrent_positions" => {
+                    if let Ok(parsed) = val.parse::<usize>() {
+                        cfg.router.max_concurrent_positions = parsed.max(1);
+                    }
+                }
+                "liquidity_reserve_pct" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.router.liquidity_reserve_pct = parsed.clamp(0.0, 0.95);
+                    }
+                }
+                "max_order_notional_usdc" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.router.max_order_notional_usdc = parsed.max(0.0);
+                    }
+                }
+                "max_total_notional_usdc" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.router.max_total_notional_usdc = parsed.max(0.0);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if in_compounder {
+            match key {
+                "enabled" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.compounder.enabled = parsed;
+                    }
+                }
+                "initial_capital_usdc" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.compounder.initial_capital_usdc = parsed.max(0.0);
+                    }
+                }
+                "compound_ratio" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.compounder.compound_ratio = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "position_fraction" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.compounder.position_fraction = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "min_quote_size" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.compounder.min_quote_size = parsed.max(0.0);
+                    }
+                }
+                "daily_loss_cap_usdc" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.compounder.daily_loss_cap_usdc = parsed.max(0.0);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+    }
+
+    cfg
+}
+
 fn load_risk_limits_config() -> RiskLimits {
     let path = Path::new("configs/risk.toml");
     let Ok(raw) = fs::read_to_string(path) else {
@@ -4245,6 +5319,14 @@ fn load_execution_config() -> ExecutionConfig {
                 }
             }
             "clob_endpoint" => cfg.clob_endpoint = val.to_string(),
+            "order_endpoint" => {
+                let v = val.to_string();
+                if v.is_empty() {
+                    cfg.order_endpoint = None;
+                } else {
+                    cfg.order_endpoint = Some(v);
+                }
+            }
             _ => {}
         }
     }

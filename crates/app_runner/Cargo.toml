@@ -8,7 +8,9 @@ license.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 chrono.workspace = true
+dashmap.workspace = true
 core_types = { path = "../core_types" }
+direction_detector = { path = "../direction_detector" }
 execution_clob = { path = "../execution_clob" }
 fair_value = { path = "../fair_value" }
 feed_polymarket = { path = "../feed_polymarket" }
@@ -26,7 +28,10 @@ risk_engine = { path = "../risk_engine" }
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+settlement_compounder = { path = "../settlement_compounder" }
 sha2.workspace = true
 strategy_maker = { path = "../strategy_maker" }
+taker_sniper = { path = "../taker_sniper" }
+timeframe_router = { path = "../timeframe_router" }
 tokio.workspace = true
 tracing.workspace = true

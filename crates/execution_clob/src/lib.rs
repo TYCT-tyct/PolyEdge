@@ -134,12 +134,14 @@ impl ExecutionVenue for ClobExecution {
             ExecutionMode::Live => {
                 let payload = serde_json::json!({
                     "market_id": intent.market_id,
+                    "token_id": intent.token_id,
                     "side": intent.side.to_string(),
                     "price": intent.price,
                     "size": intent.size,
                     "ttl_ms": intent.ttl_ms,
                     "style": intent.style.to_string(),
                     "tif": intent.tif.to_string(),
+                    "client_order_id": intent.client_order_id,
                     "max_slippage_bps": intent.max_slippage_bps,
                     "fee_rate_bps": intent.fee_rate_bps,
                     "expected_edge_net_bps": intent.expected_edge_net_bps,
@@ -241,6 +243,16 @@ impl ExecutionVenue for ClobExecution {
 
     async fn flatten_all(&self) -> Result<()> {
         self.open_orders.write().clear();
-        Ok(())
+        match self.mode {
+            ExecutionMode::Paper => Ok(()),
+            ExecutionMode::Live => {
+                let base = self.clob_endpoint.trim_end_matches('/');
+                let res = self.http.post(format!("{base}/flatten")).send().await?;
+                if !res.status().is_success() {
+                    bail!("flatten failed with status {}", res.status());
+                }
+                Ok(())
+            }
+        }
     }
 }

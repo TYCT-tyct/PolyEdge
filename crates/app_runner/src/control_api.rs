@@ -9,6 +9,9 @@ pub(super) fn build_router(state: AppState) -> Router {
         .route("/report/shadow/live", get(report_shadow_live))
         .route("/report/shadow/final", get(report_shadow_final))
         .route("/report/pnl/by_engine", get(report_pnl_by_engine))
+        .route("/report/direction", get(report_direction))
+        .route("/report/router", get(report_router))
+        .route("/report/capital", get(report_capital))
         .route("/report/toxicity/live", get(report_toxicity_live))
         .route("/report/toxicity/final", get(report_toxicity_final))
         .route("/control/pause", post(pause))
@@ -20,6 +23,7 @@ pub(super) fn build_router(state: AppState) -> Router {
         .route("/control/reload_allocator", post(reload_allocator))
         .route("/control/reload_toxicity", post(reload_toxicity))
         .route("/control/reload_risk", post(reload_risk))
+        .route("/control/reload_predator_c", post(reload_predator_c))
         .route("/control/reload_perf_profile", post(reload_perf_profile))
         .with_state(state)
 }
@@ -85,52 +89,180 @@ async fn flatten(State(state): State<AppState>) -> impl IntoResponse {
 async fn reset_shadow(State(state): State<AppState>) -> impl IntoResponse {
     let window_id = state.shadow_stats.reset().await;
     state.tox_state.write().await.clear();
+    {
+        let mut router = state.shared.predator_router.write().await;
+        *router = TimeframeRouter::new(router.cfg().clone());
+    }
+    {
+        let mut sniper = state.shared.predator_taker_sniper.write().await;
+        *sniper = TakerSniper::new(sniper.cfg().clone());
+    }
+    {
+        let cfg = state.shared.predator_cfg.read().await.clone();
+        let mut compounder = state.shared.predator_compounder.write().await;
+        *compounder = SettlementCompounder::new(cfg.compounder);
+    }
     Json(serde_json::json!({"ok": true, "shadow_reset": true, "window_id": window_id}))
+}
+
+#[derive(Debug, Deserialize)]
+struct PredatorCReloadReq {
+    enabled: Option<bool>,
+    priority: Option<PredatorCPriority>,
+    direction_detector: Option<DirectionConfig>,
+    taker_sniper: Option<TakerSniperConfig>,
+    router: Option<RouterConfig>,
+    compounder: Option<CompounderConfig>,
+}
+
+#[derive(Debug, Serialize)]
+struct PredatorCReloadResp {
+    predator_c: PredatorCConfig,
+}
+
+async fn reload_predator_c(
+    State(state): State<AppState>,
+    Json(req): Json<PredatorCReloadReq>,
+) -> Json<PredatorCReloadResp> {
+    let mut cfg = state.shared.predator_cfg.write().await;
+    if let Some(v) = req.enabled {
+        cfg.enabled = v;
+    }
+    if let Some(v) = req.priority {
+        cfg.priority = v;
+    }
+    if let Some(v) = req.direction_detector {
+        cfg.direction_detector = v;
+    }
+    if let Some(v) = req.taker_sniper {
+        cfg.taker_sniper = v;
+    }
+    if let Some(v) = req.router {
+        cfg.router = v;
+    }
+    if let Some(v) = req.compounder {
+        cfg.compounder = v;
+    }
+    let snapshot = cfg.clone();
+    drop(cfg);
+
+    state.shadow_stats.set_predator_enabled(snapshot.enabled);
+    {
+        let mut det = state.shared.predator_direction_detector.write().await;
+        det.set_cfg(snapshot.direction_detector.clone());
+    }
+    {
+        let mut sniper = state.shared.predator_taker_sniper.write().await;
+        sniper.set_cfg(snapshot.taker_sniper.clone());
+    }
+    {
+        let mut router = state.shared.predator_router.write().await;
+        router.set_cfg(snapshot.router.clone());
+    }
+    {
+        let mut compounder = state.shared.predator_compounder.write().await;
+        compounder.set_cfg(snapshot.compounder.clone());
+    }
+
+    append_jsonl(
+        &dataset_path("reports", "predator_c_reload.jsonl"),
+        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "predator_c": snapshot}),
+    );
+
+    Json(PredatorCReloadResp { predator_c: snapshot })
+}
+
+async fn report_direction(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let now = Utc::now().timestamp_millis();
+    let latest = state
+        .shared
+        .predator_latest_direction
+        .read()
+        .await
+        .clone();
+    Json(serde_json::json!({"ts_ms": now, "latest": latest}))
+}
+
+async fn report_router(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let now = Utc::now().timestamp_millis();
+    let mut router = state.shared.predator_router.write().await;
+    let locks = router.snapshot_locks(now);
+    let locked_by_tf = router.locked_by_tf_usdc(now);
+    let mut locked_by_tf_usdc = HashMap::<String, f64>::new();
+    for (tf, v) in locked_by_tf {
+        locked_by_tf_usdc.insert(tf.to_string(), v);
+    }
+    Json(serde_json::json!({
+        "ts_ms": now,
+        "locks": locks,
+        "locked_by_tf_usdc": locked_by_tf_usdc,
+        "active_positions": router.active_positions(now),
+        "locked_total_usdc": router.locked_total_usdc(now)
+    }))
+}
+
+async fn report_capital(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let now = Utc::now().timestamp_millis();
+    let compounder = state.shared.predator_compounder.read().await;
+    let cfg = compounder.cfg().clone();
+    Json(serde_json::json!({
+        "ts_ms": now,
+        "cfg": cfg,
+        "available_usdc": compounder.available(),
+        "total_pnl_usdc": compounder.total_pnl(),
+        "daily_pnl_usdc": compounder.daily_pnl(),
+        "halted": compounder.halted(),
+        "win_rate": compounder.win_rate(),
+        "recommended_quote_notional_usdc": compounder.recommended_quote_notional_usdc(),
+    }))
 }
 
 async fn reload_strategy(
     State(state): State<AppState>,
     Json(req): Json<StrategyReloadReq>,
 ) -> Json<StrategyReloadResp> {
-    let mut cfg = state.strategy_cfg.write().await;
+    let cur = state.strategy_cfg.read().await.clone();
+    let mut next = (*cur).clone();
     if let Some(v) = req.min_edge_bps {
-        cfg.min_edge_bps = v.max(0.0);
+        next.min_edge_bps = v.max(0.0);
     }
     if let Some(v) = req.ttl_ms {
-        cfg.ttl_ms = v.max(50);
+        next.ttl_ms = v.max(50);
     }
     if let Some(v) = req.inventory_skew {
-        cfg.inventory_skew = v.clamp(0.0, 1.0);
+        next.inventory_skew = v.clamp(0.0, 1.0);
     }
     if let Some(v) = req.base_quote_size {
-        cfg.base_quote_size = v.max(0.01);
+        next.base_quote_size = v.max(0.01);
     }
     if let Some(v) = req.max_spread {
-        cfg.max_spread = v.max(0.0001);
+        next.max_spread = v.max(0.0001);
     }
     if let Some(v) = req.taker_trigger_bps {
-        cfg.taker_trigger_bps = v.max(0.0);
+        next.taker_trigger_bps = v.max(0.0);
     }
     if let Some(v) = req.taker_max_slippage_bps {
-        cfg.taker_max_slippage_bps = v.max(0.0);
+        next.taker_max_slippage_bps = v.max(0.0);
     }
     if let Some(v) = req.stale_tick_filter_ms {
-        cfg.stale_tick_filter_ms = v.clamp(50.0, 5_000.0);
+        next.stale_tick_filter_ms = v.clamp(50.0, 5_000.0);
     }
     if let Some(v) = req.market_tier_profile {
-        cfg.market_tier_profile = v;
+        next.market_tier_profile = v;
     }
     if let Some(v) = req.capital_fraction_kelly {
-        cfg.capital_fraction_kelly = v.clamp(0.01, 1.0);
+        next.capital_fraction_kelly = v.clamp(0.01, 1.0);
     }
     if let Some(v) = req.variance_penalty_lambda {
-        cfg.variance_penalty_lambda = v.clamp(0.0, 5.0);
+        next.variance_penalty_lambda = v.clamp(0.0, 5.0);
     }
     if let Some(v) = req.min_eval_notional_usdc {
-        cfg.min_eval_notional_usdc = v.max(0.0);
+        next.min_eval_notional_usdc = v.max(0.0);
     }
     if let Some(v) = req.min_expected_edge_usdc {
-        cfg.min_expected_edge_usdc = v.max(0.0);
+        next.min_expected_edge_usdc = v.max(0.0);
     }
     let mut fair_cfg = state
         .fair_value_cfg
@@ -149,8 +281,8 @@ async fn reload_strategy(
     if let Ok(mut guard) = state.fair_value_cfg.write() {
         *guard = fair_cfg.clone();
     }
-    let maker_cfg = cfg.clone();
-    drop(cfg);
+    *state.strategy_cfg.write().await = std::sync::Arc::new(next.clone());
+    let maker_cfg = next;
     append_jsonl(
         &dataset_path("reports", "strategy_reload.jsonl"),
         &serde_json::json!({
@@ -169,24 +301,26 @@ async fn reload_taker(
     State(state): State<AppState>,
     Json(req): Json<TakerReloadReq>,
 ) -> Json<TakerReloadResp> {
-    let mut cfg = state.strategy_cfg.write().await;
+    let cur = state.strategy_cfg.read().await.clone();
+    let mut next = (*cur).clone();
     if let Some(v) = req.trigger_bps {
-        cfg.taker_trigger_bps = v.max(0.0);
+        next.taker_trigger_bps = v.max(0.0);
     }
     if let Some(v) = req.max_slippage_bps {
-        cfg.taker_max_slippage_bps = v.max(0.0);
+        next.taker_max_slippage_bps = v.max(0.0);
     }
     if let Some(v) = req.stale_tick_filter_ms {
-        cfg.stale_tick_filter_ms = v.clamp(50.0, 5_000.0);
+        next.stale_tick_filter_ms = v.clamp(50.0, 5_000.0);
     }
     if let Some(v) = req.market_tier_profile {
-        cfg.market_tier_profile = v;
+        next.market_tier_profile = v;
     }
+    *state.strategy_cfg.write().await = std::sync::Arc::new(next.clone());
     let resp = TakerReloadResp {
-        trigger_bps: cfg.taker_trigger_bps,
-        max_slippage_bps: cfg.taker_max_slippage_bps,
-        stale_tick_filter_ms: cfg.stale_tick_filter_ms,
-        market_tier_profile: cfg.market_tier_profile.clone(),
+        trigger_bps: next.taker_trigger_bps,
+        max_slippage_bps: next.taker_max_slippage_bps,
+        stale_tick_filter_ms: next.stale_tick_filter_ms,
+        market_tier_profile: next.market_tier_profile.clone(),
     };
     append_jsonl(
         &dataset_path("reports", "taker_reload.jsonl"),
@@ -228,13 +362,17 @@ async fn reload_allocator(
     }
 
     {
-        let mut strategy = state.strategy_cfg.write().await;
-        strategy.capital_fraction_kelly = allocator.capital_fraction_kelly;
-        strategy.variance_penalty_lambda = allocator.variance_penalty_lambda;
+        let cur = state.strategy_cfg.read().await.clone();
+        let mut next = (*cur).clone();
+        next.capital_fraction_kelly = allocator.capital_fraction_kelly;
+        next.variance_penalty_lambda = allocator.variance_penalty_lambda;
+        *state.strategy_cfg.write().await = std::sync::Arc::new(next);
     }
     {
-        let mut tox = state.toxicity_cfg.write().await;
-        tox.active_top_n_markets = allocator.active_top_n_markets;
+        let cur = state.toxicity_cfg.read().await.clone();
+        let mut next = (*cur).clone();
+        next.active_top_n_markets = allocator.active_top_n_markets;
+        *state.toxicity_cfg.write().await = std::sync::Arc::new(next);
     }
 
     let resp = AllocatorReloadResp {
@@ -285,68 +423,70 @@ async fn reload_toxicity(
     State(state): State<AppState>,
     Json(req): Json<ToxicityReloadReq>,
 ) -> Json<ToxicityConfig> {
-    let mut cfg = state.toxicity_cfg.write().await;
+    let cur = state.toxicity_cfg.read().await.clone();
+    let mut next = (*cur).clone();
     if let Some(v) = req.safe_threshold {
-        cfg.safe_threshold = v.clamp(0.0, 1.0);
+        next.safe_threshold = v.clamp(0.0, 1.0);
     }
     if let Some(v) = req.caution_threshold {
-        cfg.caution_threshold = v.clamp(0.0, 1.0);
+        next.caution_threshold = v.clamp(0.0, 1.0);
     }
     if let Some(v) = req.cooldown_min_sec {
-        cfg.cooldown_min_sec = v.max(1);
+        next.cooldown_min_sec = v.max(1);
     }
     if let Some(v) = req.cooldown_max_sec {
-        cfg.cooldown_max_sec = v.max(cfg.cooldown_min_sec);
+        next.cooldown_max_sec = v.max(next.cooldown_min_sec);
     }
     if let Some(v) = req.min_market_score {
-        cfg.min_market_score = v.clamp(0.0, 100.0);
+        next.min_market_score = v.clamp(0.0, 100.0);
     }
     if let Some(v) = req.active_top_n_markets {
-        cfg.active_top_n_markets = v;
+        next.active_top_n_markets = v;
     }
     if let Some(v) = req.markout_1s_caution_bps {
-        cfg.markout_1s_caution_bps = v;
+        next.markout_1s_caution_bps = v;
     }
     if let Some(v) = req.markout_5s_caution_bps {
-        cfg.markout_5s_caution_bps = v;
+        next.markout_5s_caution_bps = v;
     }
     if let Some(v) = req.markout_10s_caution_bps {
-        cfg.markout_10s_caution_bps = v;
+        next.markout_10s_caution_bps = v;
     }
     if let Some(v) = req.markout_1s_danger_bps {
-        cfg.markout_1s_danger_bps = v;
+        next.markout_1s_danger_bps = v;
     }
     if let Some(v) = req.markout_5s_danger_bps {
-        cfg.markout_5s_danger_bps = v;
+        next.markout_5s_danger_bps = v;
     }
     if let Some(v) = req.markout_10s_danger_bps {
-        cfg.markout_10s_danger_bps = v;
+        next.markout_10s_danger_bps = v;
     }
-    if cfg.safe_threshold > cfg.caution_threshold {
-        let safe = cfg.safe_threshold;
-        cfg.safe_threshold = cfg.caution_threshold;
-        cfg.caution_threshold = safe;
+    if next.safe_threshold > next.caution_threshold {
+        let safe = next.safe_threshold;
+        next.safe_threshold = next.caution_threshold;
+        next.caution_threshold = safe;
     }
-    if cfg.markout_1s_caution_bps < cfg.markout_1s_danger_bps {
-        let v = cfg.markout_1s_caution_bps;
-        cfg.markout_1s_caution_bps = cfg.markout_1s_danger_bps;
-        cfg.markout_1s_danger_bps = v;
+    if next.markout_1s_caution_bps < next.markout_1s_danger_bps {
+        let v = next.markout_1s_caution_bps;
+        next.markout_1s_caution_bps = next.markout_1s_danger_bps;
+        next.markout_1s_danger_bps = v;
     }
-    if cfg.markout_5s_caution_bps < cfg.markout_5s_danger_bps {
-        let v = cfg.markout_5s_caution_bps;
-        cfg.markout_5s_caution_bps = cfg.markout_5s_danger_bps;
-        cfg.markout_5s_danger_bps = v;
+    if next.markout_5s_caution_bps < next.markout_5s_danger_bps {
+        let v = next.markout_5s_caution_bps;
+        next.markout_5s_caution_bps = next.markout_5s_danger_bps;
+        next.markout_5s_danger_bps = v;
     }
-    if cfg.markout_10s_caution_bps < cfg.markout_10s_danger_bps {
-        let v = cfg.markout_10s_caution_bps;
-        cfg.markout_10s_caution_bps = cfg.markout_10s_danger_bps;
-        cfg.markout_10s_danger_bps = v;
+    if next.markout_10s_caution_bps < next.markout_10s_danger_bps {
+        let v = next.markout_10s_caution_bps;
+        next.markout_10s_caution_bps = next.markout_10s_danger_bps;
+        next.markout_10s_danger_bps = v;
     }
+    *state.toxicity_cfg.write().await = std::sync::Arc::new(next.clone());
     append_jsonl(
         &dataset_path("reports", "toxicity_reload.jsonl"),
-        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "config": *cfg}),
+        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "config": next}),
     );
-    Json(cfg.clone())
+    Json(next)
 }
 
 async fn reload_perf_profile(

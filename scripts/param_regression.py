@@ -44,16 +44,27 @@ def parse_int_grid(raw: str) -> List[int]:
 
 PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "quick": {
-        "window_sec": 120,
+        # 5-hour sprint default: fewer trials, longer per-trial window, bounded runtime.
+        "window_sec": 300,
         "poll_interval_sec": 3.0,
-        "eval_window_sec": 120,
-        "max_trials": 2,
-        "max_runtime_sec": 480,
+        "eval_window_sec": 300,
+        "max_trials": 6,
+        "max_runtime_sec": 3600,
         "heartbeat_sec": 15.0,
-        "fail_fast_threshold": 1,
-        "min_outcomes": 10,
-        "min_edge_grid": "4.5,5.0",
-        "ttl_grid": "350,400",
+        # Don't stop after the first failure; we want at least a few parameter probes in quick mode.
+        "fail_fast_threshold": 3,
+        "min_outcomes": 30,
+        "min_edge_grid": "0.5,1.0,2.0",
+        "ttl_grid": "250,400,700",
+        "max_spread_grid": "0.03,0.05,0.08",
+        "base_quote_size_grid": "2,5",
+        "min_eval_notional_usdc_grid": "0.01,0.05",
+        "min_expected_edge_usdc_grid": "0.0002",
+        "taker_trigger_grid": "3,4,6",
+        "taker_max_slippage_grid": "20,30",
+        "stale_tick_filter_ms": 2000,
+        "market_tier_profile": "balanced_sol_guard",
+        "active_top_n_markets": 12,
         "basis_k_grid": "0.8",
         "basis_z_grid": "3.0",
         "safe_threshold_grid": "0.35",
@@ -70,8 +81,17 @@ PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "heartbeat_sec": 30.0,
         "fail_fast_threshold": 0,
         "min_outcomes": 30,
-        "min_edge_grid": "5,7,9",
+        "min_edge_grid": "0.5,1.0,2.0,3.0",
         "ttl_grid": "250,400,700",
+        "max_spread_grid": "0.03,0.05,0.08",
+        "base_quote_size_grid": "2,5",
+        "min_eval_notional_usdc_grid": "0.01,0.05",
+        "min_expected_edge_usdc_grid": "0.0002",
+        "taker_trigger_grid": "3,4,6",
+        "taker_max_slippage_grid": "20,30",
+        "stale_tick_filter_ms": 2000,
+        "market_tier_profile": "balanced_sol_guard",
+        "active_top_n_markets": 12,
         "basis_k_grid": "0.70,0.85,1.00",
         "basis_z_grid": "2.0,3.0",
         "safe_threshold_grid": "0.35",
@@ -88,8 +108,17 @@ PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "heartbeat_sec": 30.0,
         "fail_fast_threshold": 0,
         "min_outcomes": 50,
-        "min_edge_grid": "4.5,5,6,7,9",
+        "min_edge_grid": "0.5,1.0,2.0,3.0,4.0",
         "ttl_grid": "250,350,500,700",
+        "max_spread_grid": "0.03,0.05,0.08",
+        "base_quote_size_grid": "2,5,8",
+        "min_eval_notional_usdc_grid": "0.01,0.05,0.10",
+        "min_expected_edge_usdc_grid": "0.0002,0.001",
+        "taker_trigger_grid": "3,4,6,8",
+        "taker_max_slippage_grid": "15,20,30",
+        "stale_tick_filter_ms": 2000,
+        "market_tier_profile": "balanced_sol_guard",
+        "active_top_n_markets": 12,
         "basis_k_grid": "0.70,0.80,0.90,1.00",
         "basis_z_grid": "2.0,2.5,3.0",
         "safe_threshold_grid": "0.30,0.35",
@@ -123,6 +152,15 @@ class TrialResult:
     trial_index: int
     min_edge_bps: float
     ttl_ms: int
+    max_spread: float
+    base_quote_size: float
+    min_eval_notional_usdc: float
+    min_expected_edge_usdc: float
+    taker_trigger_bps: float
+    taker_max_slippage_bps: float
+    stale_tick_filter_ms: float
+    market_tier_profile: str
+    active_top_n_markets: int
     basis_k_revert: float
     basis_z_cap: float
     safe_threshold: float
@@ -150,6 +188,7 @@ class TrialResult:
     data_valid_ratio: float
     net_edge_p50_bps: float
     gate_fail_reasons: List[str]
+    blocked_reason_top: str
 
     def gate_pass(self) -> bool:
         return (
@@ -194,16 +233,45 @@ def score_trial(row: TrialResult) -> float:
     return score
 
 
-def fetch_json(session: requests.Session, url: str, timeout: float = 5.0) -> Dict[str, Any]:
-    resp = session.get(url, timeout=timeout)
-    resp.raise_for_status()
-    return resp.json()
+def fetch_json(
+    session: requests.Session,
+    url: str,
+    timeout: float = 15.0,
+    retries: int = 3,
+    backoff_sec: float = 0.5,
+) -> Dict[str, Any]:
+    last_exc: Exception | None = None
+    for attempt in range(max(1, retries)):
+        try:
+            resp = session.get(url, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            last_exc = exc
+            time.sleep(backoff_sec * float(attempt + 1))
+    assert last_exc is not None
+    raise last_exc
 
 
-def post_json(session: requests.Session, url: str, payload: Dict[str, Any], timeout: float = 5.0) -> Dict[str, Any]:
-    resp = session.post(url, json=payload, timeout=timeout)
-    resp.raise_for_status()
-    return resp.json()
+def post_json(
+    session: requests.Session,
+    url: str,
+    payload: Dict[str, Any],
+    timeout: float = 10.0,
+    retries: int = 3,
+    backoff_sec: float = 0.5,
+) -> Dict[str, Any]:
+    last_exc: Exception | None = None
+    for attempt in range(max(1, retries)):
+        try:
+            resp = session.post(url, json=payload, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            last_exc = exc
+            time.sleep(backoff_sec * float(attempt + 1))
+    assert last_exc is not None
+    raise last_exc
 
 
 def post_json_optional(
@@ -230,6 +298,15 @@ def run_trial(
     poll_interval_sec: float,
     min_edge_bps: float,
     ttl_ms: int,
+    max_spread: float,
+    base_quote_size: float,
+    min_eval_notional_usdc: float,
+    min_expected_edge_usdc: float,
+    taker_trigger_bps: float,
+    taker_max_slippage_bps: float,
+    stale_tick_filter_ms: float,
+    market_tier_profile: str,
+    active_top_n_markets: int,
     basis_k_revert: float,
     basis_z_cap: float,
     safe_threshold: float,
@@ -237,6 +314,8 @@ def run_trial(
     warmup_sec: int,
 ) -> TrialResult:
     base = base_url.rstrip("/")
+    # Ensure the runtime isn't stuck paused from a previous test cycle.
+    post_json_optional(session, f"{base}/control/resume", {})
     reset_resp = post_json(session, f"{base}/control/reset_shadow", {})
     reset_window_id = int(reset_resp.get("window_id", 0) or 0)
     post_json(
@@ -245,6 +324,10 @@ def run_trial(
         {
             "min_edge_bps": min_edge_bps,
             "ttl_ms": ttl_ms,
+            "max_spread": max_spread,
+            "base_quote_size": base_quote_size,
+            "min_eval_notional_usdc": min_eval_notional_usdc,
+            "min_expected_edge_usdc": min_expected_edge_usdc,
             "basis_k_revert": basis_k_revert,
             "basis_z_cap": basis_z_cap,
         },
@@ -253,10 +336,10 @@ def run_trial(
         session,
         f"{base}/control/reload_taker",
         {
-            "trigger_bps": max(1.0, min_edge_bps),
-            "max_slippage_bps": 25.0,
-            "stale_tick_filter_ms": 450.0,
-            "market_tier_profile": "balanced",
+            "trigger_bps": taker_trigger_bps,
+            "max_slippage_bps": taker_max_slippage_bps,
+            "stale_tick_filter_ms": stale_tick_filter_ms,
+            "market_tier_profile": market_tier_profile,
         },
     )
     post_json_optional(
@@ -265,7 +348,7 @@ def run_trial(
         {
             "capital_fraction_kelly": 0.35,
             "variance_penalty_lambda": 0.25,
-            "active_top_n_markets": 8,
+            "active_top_n_markets": active_top_n_markets,
             "taker_weight": 0.7,
             "maker_weight": 0.2,
             "arb_weight": 0.1,
@@ -304,10 +387,12 @@ def run_trial(
     gate_fail_reasons: List[str] = []
     observed_window_id = reset_window_id
     next_heartbeat = time.time() + max(1.0, heartbeat_sec)
+    last_live: Dict[str, Any] | None = None
 
     deadline = time.time() + min(window_sec, eval_window_sec)
     while time.time() < deadline:
         live = fetch_json(session, f"{base}/report/shadow/live")
+        last_live = live
         observed_window_id = int(live.get("window_id", observed_window_id) or observed_window_id)
         fillability.append(float(live.get("fillability_10ms", 0.0)))
         pnl10_raw.append(float(live.get("pnl_10s_p50_bps_raw", live.get("pnl_10s_p50_bps", 0.0))))
@@ -341,11 +426,27 @@ def run_trial(
             next_heartbeat = time.time() + max(1.0, heartbeat_sec)
         time.sleep(max(1.0, poll_interval_sec))
 
+    blocked_top = ""
+    if isinstance(last_live, dict):
+        br = last_live.get("blocked_reason_counts")
+        if isinstance(br, dict) and br:
+            top_items = sorted(br.items(), key=lambda kv: float(kv[1]), reverse=True)[:8]
+            blocked_top = ";".join(f"{k}:{int(v)}" for k, v in top_items)
+
     return TrialResult(
         run_id=run_id,
         trial_index=trial_index,
         min_edge_bps=min_edge_bps,
         ttl_ms=ttl_ms,
+        max_spread=max_spread,
+        base_quote_size=base_quote_size,
+        min_eval_notional_usdc=min_eval_notional_usdc,
+        min_expected_edge_usdc=min_expected_edge_usdc,
+        taker_trigger_bps=taker_trigger_bps,
+        taker_max_slippage_bps=taker_max_slippage_bps,
+        stale_tick_filter_ms=stale_tick_filter_ms,
+        market_tier_profile=market_tier_profile,
+        active_top_n_markets=active_top_n_markets,
         basis_k_revert=basis_k_revert,
         basis_z_cap=basis_z_cap,
         safe_threshold=safe_threshold,
@@ -376,6 +477,7 @@ def run_trial(
         data_valid_ratio=percentile(data_valid_ratio, 0.50),
         net_edge_p50_bps=percentile(net_edge, 0.50),
         gate_fail_reasons=gate_fail_reasons,
+        blocked_reason_top=blocked_top,
     )
 
 
@@ -387,6 +489,15 @@ def write_ablation_csv(path: Path, rows: Iterable[TrialResult]) -> None:
             [
                 "min_edge_bps",
                 "ttl_ms",
+                "max_spread",
+                "base_quote_size",
+                "min_eval_notional_usdc",
+                "min_expected_edge_usdc",
+                "taker_trigger_bps",
+                "taker_max_slippage_bps",
+                "stale_tick_filter_ms",
+                "market_tier_profile",
+                "active_top_n_markets",
                 "basis_k_revert",
                 "basis_z_cap",
                 "safe_threshold",
@@ -416,6 +527,7 @@ def write_ablation_csv(path: Path, rows: Iterable[TrialResult]) -> None:
                 "data_valid_ratio",
                 "net_edge_p50_bps",
                 "gate_pass",
+                "blocked_reason_top",
             ]
         )
         for row in rows:
@@ -423,6 +535,15 @@ def write_ablation_csv(path: Path, rows: Iterable[TrialResult]) -> None:
                 [
                     row.min_edge_bps,
                     row.ttl_ms,
+                    row.max_spread,
+                    row.base_quote_size,
+                    row.min_eval_notional_usdc,
+                    row.min_expected_edge_usdc,
+                    row.taker_trigger_bps,
+                    row.taker_max_slippage_bps,
+                    row.stale_tick_filter_ms,
+                    row.market_tier_profile,
+                    row.active_top_n_markets,
                     row.basis_k_revert,
                     row.basis_z_cap,
                     row.safe_threshold,
@@ -452,6 +573,7 @@ def write_ablation_csv(path: Path, rows: Iterable[TrialResult]) -> None:
                     f"{row.data_valid_ratio:.6f}",
                     f"{row.net_edge_p50_bps:.6f}",
                     row.gate_pass(),
+                    row.blocked_reason_top,
                 ]
             )
 
@@ -469,7 +591,10 @@ def write_summary_md(path: Path, rows: List[TrialResult]) -> None:
         lines.append(f"- best_gate_pass: {best.gate_pass()}")
         lines.append(f"- best_gate_ready: {best.gate_ready}")
         lines.append(
-            f"- best_params: edge={best.min_edge_bps}, ttl={best.ttl_ms}, "
+            f"- best_params: edge={best.min_edge_bps}, ttl={best.ttl_ms}, base_quote={best.base_quote_size}, "
+            f"min_eval_notional={best.min_eval_notional_usdc}, "
+            f"taker_trigger={best.taker_trigger_bps}, taker_slip={best.taker_max_slippage_bps}, "
+            f"stale_ms={best.stale_tick_filter_ms}, tier={best.market_tier_profile}, topn={best.active_top_n_markets}, "
             f"k={best.basis_k_revert}, z={best.basis_z_cap}, "
             f"safe={best.safe_threshold}, caution={best.caution_threshold}"
         )
@@ -478,7 +603,10 @@ def write_summary_md(path: Path, rows: List[TrialResult]) -> None:
     lines.append("## Top Trials")
     for i, row in enumerate(top, start=1):
         lines.append(
-                f"- #{i} edge={row.min_edge_bps}, ttl={row.ttl_ms}, "
+                f"- #{i} edge={row.min_edge_bps}, ttl={row.ttl_ms}, base_quote={row.base_quote_size}, "
+                f"min_eval_notional={row.min_eval_notional_usdc}, "
+                f"taker_trigger={row.taker_trigger_bps}, taker_slip={row.taker_max_slippage_bps}, "
+                f"stale_ms={row.stale_tick_filter_ms}, tier={row.market_tier_profile}, topn={row.active_top_n_markets}, "
                 f"k={row.basis_k_revert}, z={row.basis_z_cap}, "
                 f"pnl10_raw_p50={row.pnl_10s_p50_bps_raw:.3f}, "
                 f"pnl10_robust_p50={row.pnl_10s_p50_bps_robust:.3f}, "
@@ -490,6 +618,8 @@ def write_summary_md(path: Path, rows: List[TrialResult]) -> None:
                 f"ready={row.gate_ready}, "
                 f"tick_to_ack_p99={row.tick_to_ack_p99_ms:.3f}, gate={row.gate_pass()}"
             )
+        if row.blocked_reason_top:
+            lines.append(f"  blocked_top: {row.blocked_reason_top}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -556,6 +686,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-outcomes", type=int, default=None)
     p.add_argument("--min-edge-grid", default=None)
     p.add_argument("--ttl-grid", default=None)
+    p.add_argument("--max-spread-grid", default=None)
+    p.add_argument("--base-quote-size-grid", default=None)
+    p.add_argument("--min-eval-notional-usdc-grid", default=None)
+    p.add_argument("--min-expected-edge-usdc-grid", default=None)
+    p.add_argument("--taker-trigger-grid", default=None)
+    p.add_argument("--taker-max-slippage-grid", default=None)
+    p.add_argument("--stale-tick-filter-ms", type=float, default=None)
+    p.add_argument("--market-tier-profile", default=None)
+    p.add_argument("--active-top-n-markets", type=int, default=None)
     p.add_argument("--basis-k-grid", default=None)
     p.add_argument("--basis-z-grid", default=None)
     p.add_argument("--safe-threshold-grid", default=None)
@@ -573,18 +712,120 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = apply_profile_defaults(parse_args())
     day_dir = Path(args.out_root) / utc_day()
+    run_dir = day_dir / "runs" / str(args.run_id)
+    run_dir.mkdir(parents=True, exist_ok=True)
     session = requests.Session()
     started = time.monotonic()
 
     edge_grid = parse_float_grid(args.min_edge_grid)
     ttl_grid = parse_int_grid(args.ttl_grid)
+    max_spread_grid = parse_float_grid(args.max_spread_grid)
+    base_quote_grid = parse_float_grid(args.base_quote_size_grid)
+    min_eval_grid = parse_float_grid(args.min_eval_notional_usdc_grid)
+    min_edge_usdc_grid = parse_float_grid(args.min_expected_edge_usdc_grid)
+    taker_trigger_grid = parse_float_grid(args.taker_trigger_grid)
+    taker_slip_grid = parse_float_grid(args.taker_max_slippage_grid)
     k_grid = parse_float_grid(args.basis_k_grid)
     z_grid = parse_float_grid(args.basis_z_grid)
     safe_grid = parse_float_grid(args.safe_threshold_grid)
     caution_grid = parse_float_grid(args.caution_threshold_grid)
 
-    combos = list(itertools.product(edge_grid, ttl_grid, k_grid, z_grid, safe_grid, caution_grid))
-    combos = combos[: max(1, args.max_trials)]
+    # For small max_trials, prefer a deterministic OFAT-style set instead of a huge cartesian product.
+    def pick_default(seq: List[Any], prefer_last: bool = False) -> Any:
+        if not seq:
+            raise ValueError("empty grid")
+        return seq[-1] if prefer_last else seq[0]
+
+    base = {
+        "edge": edge_grid[min(1, len(edge_grid) - 1)] if edge_grid else 1.0,
+        "ttl": ttl_grid[min(1, len(ttl_grid) - 1)] if ttl_grid else 400,
+        "max_spread": pick_default(max_spread_grid, prefer_last=True) if max_spread_grid else 0.03,
+        "base_quote": pick_default(base_quote_grid, prefer_last=True),
+        "min_eval": pick_default(min_eval_grid, prefer_last=False),
+        "min_edge_usdc": pick_default(min_edge_usdc_grid, prefer_last=False),
+        "taker_trigger": taker_trigger_grid[min(1, len(taker_trigger_grid) - 1)]
+        if taker_trigger_grid
+        else 4.0,
+        "taker_slip": pick_default(taker_slip_grid, prefer_last=True),
+        "k": pick_default(k_grid, prefer_last=False),
+        "z": pick_default(z_grid, prefer_last=False),
+        "safe": pick_default(safe_grid, prefer_last=False),
+        "caution": pick_default(caution_grid, prefer_last=False),
+    }
+
+    combos: List[tuple[Any, ...]] = []
+    combos.append(
+        (
+            base["edge"],
+            base["ttl"],
+            base["max_spread"],
+            base["base_quote"],
+            base["min_eval"],
+            base["min_edge_usdc"],
+            base["taker_trigger"],
+            base["taker_slip"],
+            base["k"],
+            base["z"],
+            base["safe"],
+            base["caution"],
+        )
+    )
+
+    def add_variants(key: str, grid: List[Any]) -> None:
+        for v in grid:
+            if len(combos) >= max(1, args.max_trials):
+                return
+            if v == base[key]:
+                continue
+            spec = dict(base)
+            spec[key] = v
+            combos.append(
+                (
+                    spec["edge"],
+                    spec["ttl"],
+                    spec["max_spread"],
+                    spec["base_quote"],
+                    spec["min_eval"],
+                    spec["min_edge_usdc"],
+                    spec["taker_trigger"],
+                    spec["taker_slip"],
+                    spec["k"],
+                    spec["z"],
+                    spec["safe"],
+                    spec["caution"],
+                )
+            )
+
+    add_variants("edge", edge_grid)
+    add_variants("ttl", ttl_grid)
+    add_variants("max_spread", max_spread_grid)
+    add_variants("base_quote", base_quote_grid)
+    add_variants("min_eval", min_eval_grid)
+    add_variants("taker_trigger", taker_trigger_grid)
+    add_variants("taker_slip", taker_slip_grid)
+
+    # If still short, fall back to cartesian product, deterministic order.
+    if len(combos) < max(1, args.max_trials):
+        prod = itertools.product(
+            edge_grid,
+            ttl_grid,
+            max_spread_grid,
+            base_quote_grid,
+            min_eval_grid,
+            min_edge_usdc_grid,
+            taker_trigger_grid,
+            taker_slip_grid,
+            k_grid,
+            z_grid,
+            safe_grid,
+            caution_grid,
+        )
+        for row in prod:
+            if len(combos) >= max(1, args.max_trials):
+                break
+            if row in combos:
+                continue
+            combos.append(row)
 
     per_trial_sec = max(1, int(args.warmup_sec + min(args.window_sec, args.eval_window_sec)))
     estimated_full_sec = per_trial_sec * len(combos)
@@ -604,12 +845,29 @@ def main() -> int:
 
     rows: List[TrialResult] = []
     consecutive_failures = 0
-    for idx, (edge, ttl, k, z, safe, caution) in enumerate(combos, start=1):
+    for idx, combo in enumerate(combos, start=1):
         if args.max_runtime_sec > 0 and (time.monotonic() - started) >= args.max_runtime_sec:
             print("[stop] max-runtime-sec reached; ending regression loop")
             break
+        (
+            edge,
+            ttl,
+            max_spread,
+            base_quote_size,
+            min_eval_notional_usdc,
+            min_expected_edge_usdc,
+            taker_trigger_bps,
+            taker_max_slippage_bps,
+            k,
+            z,
+            safe,
+            caution,
+        ) = combo  # type: ignore[misc]
         print(
             f"[trial {idx}/{len(combos)}] edge={edge} ttl={ttl} "
+            f"max_spread={max_spread} "
+            f"base_quote={base_quote_size} min_eval={min_eval_notional_usdc} min_edge_usdc={min_expected_edge_usdc} "
+            f"taker_trigger={taker_trigger_bps} taker_slip={taker_max_slippage_bps} "
             f"k={k} z={z} safe={safe} caution={caution}"
         )
         row = run_trial(
@@ -624,6 +882,15 @@ def main() -> int:
             poll_interval_sec=args.poll_interval_sec,
             min_edge_bps=edge,
             ttl_ms=ttl,
+            max_spread=max_spread,
+            base_quote_size=base_quote_size,
+            min_eval_notional_usdc=min_eval_notional_usdc,
+            min_expected_edge_usdc=min_expected_edge_usdc,
+            taker_trigger_bps=taker_trigger_bps,
+            taker_max_slippage_bps=taker_max_slippage_bps,
+            stale_tick_filter_ms=float(args.stale_tick_filter_ms),
+            market_tier_profile=str(args.market_tier_profile),
+            active_top_n_markets=int(args.active_top_n_markets),
             basis_k_revert=k,
             basis_z_cap=z,
             safe_threshold=safe,
@@ -654,14 +921,14 @@ def main() -> int:
         reverse=True,
     )
 
-    ablation_path = day_dir / "ablation_toxicity.csv"
-    summary_path = day_dir / "regression_summary.md"
-    fixlist_path = day_dir / "next_fixlist.md"
+    ablation_path = run_dir / "ablation_toxicity.csv"
+    summary_path = run_dir / "regression_summary.md"
+    fixlist_path = run_dir / "next_fixlist.md"
     write_ablation_csv(ablation_path, rows)
     write_summary_md(summary_path, rows)
     write_fixlist(fixlist_path, rows[0] if rows else None)
 
-    out_json = day_dir / "regression_summary.json"
+    out_json = run_dir / "regression_summary.json"
     best = rows[0] if rows else None
     out_json.write_text(
         json.dumps(
@@ -677,6 +944,14 @@ def main() -> int:
                     {
                         "min_edge_bps": best.min_edge_bps,
                         "ttl_ms": best.ttl_ms,
+                        "base_quote_size": best.base_quote_size,
+                        "min_eval_notional_usdc": best.min_eval_notional_usdc,
+                        "min_expected_edge_usdc": best.min_expected_edge_usdc,
+                        "taker_trigger_bps": best.taker_trigger_bps,
+                        "taker_max_slippage_bps": best.taker_max_slippage_bps,
+                        "stale_tick_filter_ms": best.stale_tick_filter_ms,
+                        "market_tier_profile": best.market_tier_profile,
+                        "active_top_n_markets": best.active_top_n_markets,
                         "basis_k_revert": best.basis_k_revert,
                         "basis_z_cap": best.basis_z_cap,
                         "safe_threshold": best.safe_threshold,

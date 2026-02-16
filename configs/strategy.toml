@@ -1,12 +1,12 @@
 [maker]
-base_quote_size = 2.0
-min_edge_bps = 4.0
+base_quote_size = 5.0
+min_edge_bps = 1.0
 inventory_skew = 0.15
-max_spread = 0.03
-ttl_ms = 400
+max_spread = 0.08
+ttl_ms = 250
 
 [taker]
-trigger_bps = 7.0
+trigger_bps = 4.0
 max_slippage_bps = 30.0
 stale_tick_filter_ms = 2000
 market_tier_profile = "balanced_sol_guard"
@@ -14,7 +14,7 @@ market_tier_profile = "balanced_sol_guard"
 [online_calibration]
 capital_fraction_kelly = 0.35
 variance_penalty_lambda = 0.25
-min_eval_notional_usdc = 0.05
+min_eval_notional_usdc = 0.01
 min_expected_edge_usdc = 0.0002
 
 [fair_value.basis_mr]
@@ -33,3 +33,48 @@ enabled = true
 outlier_method = "iqr"
 iqr_k = 1.5
 min_samples = 5
+
+# ===== Predator C+ (MVP) =====
+# Edge-confirmed: Direction only decides YES/NO side; EV thresholds are still enforced.
+
+[predator_c]
+enabled = false
+# "maker_first" | "taker_first" | "taker_only"
+priority = "taker_first"
+
+[predator_c.direction_detector]
+window_max_sec = 120
+threshold_5m_pct = 0.05
+threshold_15m_pct = 0.10
+threshold_1h_pct = 0.20
+threshold_1d_pct = 0.50
+lookback_short_sec = 15
+lookback_long_sec = 60
+min_sources_for_high_confidence = 2
+min_ticks_for_signal = 5
+
+[predator_c.taker_sniper]
+min_direction_confidence = 0.70
+min_edge_net_bps = 10.0
+max_spread = 0.08
+cooldown_ms_per_market = 800
+
+[predator_c.router]
+max_locked_pct_5m = 0.30
+max_locked_pct_15m = 0.40
+max_locked_pct_1h = 0.50
+max_locked_pct_1d = 0.30
+max_concurrent_positions = 8
+liquidity_reserve_pct = 0.20
+# Micro-live hard caps (keep permissive in paper/shadow; override when armed)
+max_order_notional_usdc = 1000000.0
+max_total_notional_usdc = 1000000.0
+
+[predator_c.compounder]
+enabled = false
+initial_capital_usdc = 100.0
+compound_ratio = 1.0
+position_fraction = 0.15
+min_quote_size = 1.0
+# For micro-live: loss <= -1U triggers pause+flatten (enforced only when live-armed).
+daily_loss_cap_usdc = 1.0

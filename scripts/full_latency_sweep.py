@@ -140,6 +140,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--poll-interval", type=float, default=None)
     p.add_argument("--symbols", default=",".join(SYMBOL_TO_NAME.keys()))
     p.add_argument("--out-root", default="datasets/reports")
+    # Optional: write artifacts under datasets/reports/<day>/runs/<run_id>/ for easier A/B comparison.
+    # When omitted, preserves the legacy location under datasets/reports/<day>/.
+    p.add_argument("--run-id", default=None)
+    p.add_argument("--skip-ws", action="store_true", help="skip CEX websocket latency probe (engine metrics only)")
     return p.parse_args()
 
 
@@ -153,6 +157,9 @@ def main() -> int:
     started_ms = int(time.time() * 1000)
     async def run_all() -> tuple[Dict[str, Any], Dict[str, Any]]:
         engine_task = asyncio.to_thread(collect_engine_series, args.base_url, seconds, poll_interval)
+        if args.skip_ws:
+            engine_res = await engine_task
+            return engine_res, {}
         ws_task = collect_ws_all(seconds, symbols)
         engine_res, ws_res = await asyncio.gather(engine_task, ws_task)
         return engine_res, ws_res
@@ -167,12 +174,17 @@ def main() -> int:
             "poll_interval": poll_interval,
             "symbols": symbols,
             "ts_ms": started_ms,
+            "run_id": args.run_id,
+            "skip_ws": bool(args.skip_ws),
         },
         "engine": engine,
         "ws": ws,
     }
 
-    out_dir = Path(args.out_root) / utc_day()
+    if args.run_id:
+        out_dir = Path(args.out_root) / utc_day() / "runs" / str(args.run_id)
+    else:
+        out_dir = Path(args.out_root) / utc_day()
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"full_latency_sweep_{started_ms}.json"
     out_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")

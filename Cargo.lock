@@ -46,6 +46,8 @@ dependencies = [
  "axum",
  "chrono",
  "core_types",
+ "dashmap",
+ "direction_detector",
  "execution_clob",
  "fair_value",
  "feed_polymarket",
@@ -63,8 +65,11 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "settlement_compounder",
  "sha2",
  "strategy_maker",
+ "taker_sniper",
+ "timeframe_router",
  "tokio",
  "tracing",
 ]
@@ -333,6 +338,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashmap"
+version = "6.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5041cc499144891f3790297212f32a74fb938e5136a14943f338ef9e0ae276cf"
+dependencies = [
+ "cfg-if",
+ "crossbeam-utils",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
+]
+
+[[package]]
 name = "data-encoding"
 version = "2.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -346,6 +365,14 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+]
+
+[[package]]
+name = "direction_detector"
+version = "0.1.0"
+dependencies = [
+ "core_types",
+ "serde",
 ]
 
 [[package]]
@@ -664,6 +691,12 @@ dependencies = [
  "tokio-util",
  "tracing",
 ]
+
+[[package]]
+name = "hashbrown"
+version = "0.14.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
 
 [[package]]
 name = "hashbrown"
@@ -1815,6 +1848,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "settlement_compounder"
+version = "0.1.0"
+dependencies = [
+ "core_types",
+ "serde",
+]
+
+[[package]]
 name = "sha1"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1962,6 +2003,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "taker_sniper"
+version = "0.1.0"
+dependencies = [
+ "core_types",
+ "serde",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2021,6 +2070,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "timeframe_router"
+version = "0.1.0"
+dependencies = [
+ "core_types",
+ "serde",
 ]
 
 [[package]]

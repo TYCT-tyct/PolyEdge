@@ -56,7 +56,15 @@ Invoke-Remote $buildCmd
 
 Write-Host "[5/7] Restart runtime"
 $restartTemplate = @'
-cd __REPO_DIR__ || exit 1; pkill -x app_runner >/dev/null 2>&1 || true; nohup env RUST_LOG=info ./target/release/app_runner >/tmp/polyedge_app.log 2>&1 & true
+set -e
+cd __REPO_DIR__ || exit 1
+if command -v systemctl >/dev/null 2>&1 && systemctl --quiet is-enabled polyedge.service 2>/dev/null; then
+  sudo systemctl daemon-reload || true
+  sudo systemctl restart polyedge.service
+else
+  pkill -x app_runner >/dev/null 2>&1 || true
+  nohup env RUST_LOG=info POLYEDGE_ENABLE_CHAINLINK_ANCHOR=false ./target/release/app_runner >/tmp/polyedge_app.log 2>&1 & true
+fi
 '@
 $restartCmd = $restartTemplate.Replace("__REPO_DIR__", $RepoDir)
 Invoke-Remote $restartCmd

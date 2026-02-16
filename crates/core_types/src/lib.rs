@@ -99,6 +99,72 @@ pub struct Signal {
     pub confidence: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum TimeframeClass {
+    Tf5m,
+    Tf15m,
+    Tf1h,
+    Tf1d,
+}
+
+impl fmt::Display for TimeframeClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Tf5m => "5m",
+            Self::Tf15m => "15m",
+            Self::Tf1h => "1h",
+            Self::Tf1d => "1d",
+        };
+        f.write_str(value)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum Direction {
+    Up,
+    Down,
+    Neutral,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DirectionSignal {
+    pub symbol: String,
+    pub direction: Direction,
+    /// Price move magnitude in percentage points, e.g. 0.35 means +0.35%.
+    pub magnitude_pct: f64,
+    /// Confidence in [0,1], derived from multi-source consistency.
+    pub confidence: f64,
+    pub recommended_tf: TimeframeClass,
+    pub ts_ns: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CapitalUpdate {
+    pub available_usdc: f64,
+    /// "Base quote size" used by Predator C+ sizing logic. Interpreted as USDC notional.
+    pub base_quote_size: f64,
+    pub ts_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TimeframeOpp {
+    pub timeframe: TimeframeClass,
+    pub market_id: String,
+    pub symbol: String,
+    pub direction: Direction,
+    pub side: OrderSide,
+    pub entry_price: f64,
+    pub size: f64,
+    pub edge_gross_bps: f64,
+    pub edge_net_bps: f64,
+    pub edge_net_usdc: f64,
+    pub fee_bps: f64,
+    pub lock_minutes: f64,
+    pub density: f64,
+    pub confidence: f64,
+    pub ts_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum OrderSide {
     BuyYes,
@@ -188,6 +254,8 @@ pub struct OrderAck {
 pub struct OrderIntentV2 {
     pub market_id: String,
     pub side: OrderSide,
+    #[serde(default)]
+    pub token_id: Option<String>,
     pub price: f64,
     pub size: f64,
     pub ttl_ms: u64,
@@ -195,6 +263,8 @@ pub struct OrderIntentV2 {
     pub style: ExecutionStyle,
     #[serde(default = "default_order_tif")]
     pub tif: OrderTimeInForce,
+    #[serde(default)]
+    pub client_order_id: Option<String>,
     #[serde(default)]
     pub max_slippage_bps: f64,
     #[serde(default)]
@@ -210,11 +280,13 @@ impl From<QuoteIntent> for OrderIntentV2 {
         Self {
             market_id: value.market_id,
             side: value.side,
+            token_id: None,
             price: value.price,
             size: value.size,
             ttl_ms: value.ttl_ms,
             style: ExecutionStyle::Maker,
             tif: OrderTimeInForce::PostOnly,
+            client_order_id: None,
             max_slippage_bps: 0.0,
             fee_rate_bps: 0.0,
             expected_edge_net_bps: 0.0,
@@ -498,6 +570,7 @@ pub enum EngineEvent {
     BookDelta(BookDelta),
     BookDigest(OrderbookStateDigest),
     Signal(Signal),
+    DirectionSignal(DirectionSignal),
     ToxicFeatures(ToxicFeatures),
     ToxicDecision(ToxicDecision),
     QuoteIntent(QuoteIntent),
@@ -506,6 +579,7 @@ pub enum EngineEvent {
     Fill(FillEvent),
     ShadowShot(ShadowShot),
     ShadowOutcome(ShadowOutcome),
+    CapitalUpdate(CapitalUpdate),
     Pnl(PnLSnapshot),
     Control(ControlCommand),
 }
