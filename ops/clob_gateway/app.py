@@ -27,6 +27,12 @@ from py_clob_client.order_builder.constants import BUY, SELL
 
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
+# Polymarket CLOB enforces probability bounds for order prices.
+# Using a strict clamp here makes the gateway resilient to small slippage widening and
+# prevents avoidable "price out of range" rejects during canaries / micro-live.
+MIN_PRICE = 0.01
+MAX_PRICE = 0.99
+
 
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
     v = os.environ.get(name)
@@ -219,7 +225,7 @@ def post_order(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
     except Exception:
         return respond(False, reject_code="invalid_price_or_size")
 
-    if not (0.0 < price < 1.0):
+    if not (MIN_PRICE <= price <= MAX_PRICE):
         return respond(False, reject_code="price_out_of_range")
     if not (size > 0.0):
         return respond(False, reject_code="size_non_positive")
@@ -239,9 +245,9 @@ def post_order(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
     if max_slippage_bps > 0:
         slip = max_slippage_bps / 10_000.0
         if side == BUY:
-            price = _clamp(price * (1.0 + slip), 0.0001, 0.9999)
+            price = _clamp(price * (1.0 + slip), MIN_PRICE, MAX_PRICE)
         else:
-            price = _clamp(price * (1.0 - slip), 0.0001, 0.9999)
+            price = _clamp(price * (1.0 - slip), MIN_PRICE, MAX_PRICE)
 
     try:
         fee_rate_bps = float(payload.get("fee_rate_bps") or 0.0)
