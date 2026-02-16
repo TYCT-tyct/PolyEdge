@@ -500,6 +500,19 @@ pub struct ShadowShot {
     pub side: OrderSide,
     #[serde(default = "default_execution_style")]
     pub execution_style: ExecutionStyle,
+    /// Positive means: our fast reference tick arrived earlier than the Polymarket book update.
+    /// See docs/metrics_contract.md for the contract definition.
+    #[serde(default)]
+    pub book_top_lag_ms: f64,
+    /// Execution venue request/ack duration only (real in live mode).
+    #[serde(default)]
+    pub ack_only_ms: f64,
+    /// End-to-end decision+execution latency (see app_runner for definition).
+    #[serde(default)]
+    pub tick_to_ack_ms: f64,
+    /// `book_top_lag_ms - tick_to_ack_ms`; positive means we likely had time to capture.
+    #[serde(default)]
+    pub capturable_window_ms: f64,
     #[serde(default)]
     pub survival_probe_price: f64,
     pub intended_price: f64,

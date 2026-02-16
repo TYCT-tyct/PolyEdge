@@ -532,6 +532,18 @@ struct LatencyBreakdown {
     ref_decode_p50_ms: f64,
     ref_decode_p90_ms: f64,
     ref_decode_p99_ms: f64,
+    capturable_window_p50_ms: f64,
+    capturable_window_p75_ms: f64,
+    capturable_window_p90_ms: f64,
+    capturable_window_p99_ms: f64,
+    /// Ratio of samples where capturable_window_ms > 0.0.
+    profitable_window_ratio: f64,
+    /// Number of capturable window samples included in the distribution.
+    capturable_window_n: u64,
+    /// Number of ack_only_ms samples (only meaningful in live execution).
+    ack_only_n: u64,
+    /// Number of tick_to_ack_ms samples.
+    tick_to_ack_n: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -765,6 +777,7 @@ struct ShadowSamples {
     tick_to_decision_ms: Vec<f64>,
     ack_only_ms: Vec<f64>,
     tick_to_ack_ms: Vec<f64>,
+    capturable_window_ms: Vec<f64>,
     feed_in_ms: Vec<f64>,
     source_latency_ms: Vec<f64>,
     book_latency_ms: Vec<f64>,
@@ -983,6 +996,11 @@ impl ShadowStats {
     async fn push_tick_to_ack_ms(&self, ms: f64) {
         let mut s = self.samples.write().await;
         push_capped(&mut s.tick_to_ack_ms, ms, Self::SAMPLE_CAP);
+    }
+
+    async fn push_capturable_window_ms(&self, ms: f64) {
+        let mut s = self.samples.write().await;
+        push_capped(&mut s.capturable_window_ms, ms, Self::SAMPLE_CAP);
     }
 
     async fn push_book_top_lag_ms(&self, symbol: &str, ms: f64) {
@@ -1204,6 +1222,7 @@ impl ShadowStats {
             tick_to_decision_ms,
             ack_only_ms,
             tick_to_ack_ms,
+            capturable_window_ms,
             feed_in_ms,
             source_latency_ms,
             book_latency_ms,
@@ -1414,6 +1433,19 @@ impl ShadowStats {
             ref_decode_p50_ms: percentile(&ref_decode_ms, 0.50).unwrap_or(0.0),
             ref_decode_p90_ms: percentile(&ref_decode_ms, 0.90).unwrap_or(0.0),
             ref_decode_p99_ms: percentile(&ref_decode_ms, 0.99).unwrap_or(0.0),
+            capturable_window_p50_ms: percentile(&capturable_window_ms, 0.50).unwrap_or(0.0),
+            capturable_window_p75_ms: percentile(&capturable_window_ms, 0.75).unwrap_or(0.0),
+            capturable_window_p90_ms: percentile(&capturable_window_ms, 0.90).unwrap_or(0.0),
+            capturable_window_p99_ms: percentile(&capturable_window_ms, 0.99).unwrap_or(0.0),
+            profitable_window_ratio: if capturable_window_ms.is_empty() {
+                0.0
+            } else {
+                capturable_window_ms.iter().filter(|v| **v > 0.0).count() as f64
+                    / capturable_window_ms.len() as f64
+            },
+            capturable_window_n: capturable_window_ms.len() as u64,
+            ack_only_n: ack_only_ms.len() as u64,
+            tick_to_ack_n: tick_to_ack_ms.len() as u64,
         };
 
         let predator_c_enabled = self.predator_c_enabled.load(Ordering::Relaxed);
@@ -2745,7 +2777,8 @@ fn spawn_strategy_engine(
                             intent_decision_start.elapsed().as_secs_f64() * 1_000.0;
                         let tick_to_decision_ms =
                             latency_sample.local_backlog_ms + decision_compute_ms;
-                        let place_start = Instant::now();
+                        // Measure order-build cost separately from execution RTT.
+                        let order_build_start = Instant::now();
                         let execution_style = if force_taker {
                             ExecutionStyle::Taker
                         } else {
@@ -2774,6 +2807,9 @@ fn spawn_strategy_engine(
                             client_order_id: Some(new_id()),
                             hold_to_resolution: false,
                         };
+                        let order_build_ms = order_build_start.elapsed().as_secs_f64() * 1_000.0;
+                        // Start measuring ack-only RTT right before the await.
+                        let place_start = Instant::now();
                         match execution.place_order_v2(v2_intent).await {
                             Ok(ack_v2) if ack_v2.accepted => {
                                 let accepted_size = ack_v2.accepted_size.max(0.0).min(intent.size);
@@ -2797,12 +2833,23 @@ fn spawn_strategy_engine(
                                     )
                                     .await;
                                 }
-                                let ack_only_ms = if ack_v2.exchange_latency_ms > 0.0 {
-                                    ack_v2.exchange_latency_ms
+                                let is_live = execution.is_live();
+                                let ack_only_ms = if is_live {
+                                    if ack_v2.exchange_latency_ms > 0.0 {
+                                        ack_v2.exchange_latency_ms
+                                    } else {
+                                        place_start.elapsed().as_secs_f64() * 1_000.0
+                                    }
                                 } else {
-                                    place_start.elapsed().as_secs_f64() * 1_000.0
+                                    0.0
                                 };
-                                let tick_to_ack_ms = tick_to_decision_ms + ack_only_ms;
+                                let tick_to_ack_ms =
+                                    tick_to_decision_ms + order_build_ms + ack_only_ms;
+                                let capturable_window_ms = if is_live {
+                                    book_top_lag_ms - tick_to_ack_ms
+                                } else {
+                                    0.0
+                                };
                                 shared
                                     .shadow_stats
                                     .push_decision_compute_ms(decision_compute_ms)
@@ -2811,20 +2858,34 @@ fn spawn_strategy_engine(
                                     .shadow_stats
                                     .push_tick_to_decision_ms(tick_to_decision_ms)
                                     .await;
-                                shared.shadow_stats.push_ack_only_ms(ack_only_ms).await;
+                                if is_live && ack_only_ms > 0.0 {
+                                    shared.shadow_stats.push_ack_only_ms(ack_only_ms).await;
+                                }
                                 shared
                                     .shadow_stats
                                     .push_tick_to_ack_ms(tick_to_ack_ms)
                                     .await;
+                                if is_live {
+                                    shared
+                                        .shadow_stats
+                                        .push_capturable_window_ms(capturable_window_ms)
+                                        .await;
+                                }
                                 metrics::histogram!("latency.tick_to_decision_ms")
                                     .record(tick_to_decision_ms);
                                 metrics::histogram!("latency.decision_compute_ms")
                                     .record(decision_compute_ms);
                                 metrics::histogram!("latency.decision_queue_wait_ms")
                                     .record(latency_sample.local_backlog_ms);
-                                metrics::histogram!("latency.ack_only_ms").record(ack_only_ms);
+                                if is_live {
+                                    metrics::histogram!("latency.ack_only_ms").record(ack_only_ms);
+                                }
                                 metrics::histogram!("latency.tick_to_ack_ms")
                                     .record(tick_to_ack_ms);
+                                if is_live {
+                                    metrics::histogram!("latency.capturable_window_ms")
+                                        .record(capturable_window_ms);
+                                }
 
                                 let ack = OrderAck {
                                     order_id: ack_v2.order_id,
@@ -2842,6 +2903,10 @@ fn spawn_strategy_engine(
                                         symbol: symbol.clone(),
                                         side: intent.side.clone(),
                                         execution_style: execution_style.clone(),
+                                        book_top_lag_ms,
+                                        ack_only_ms,
+                                        tick_to_ack_ms,
+                                        capturable_window_ms,
                                         // Use taker top-of-book only for "opportunity survival" probing.
                                         // Keep intended_price as maker entry for markout/PnL attribution.
                                         survival_probe_price: aggressive_price_for_side(
@@ -3260,7 +3325,7 @@ async fn predator_execute_opportunity(
     }
 
     shared.shadow_stats.mark_eligible();
-    let place_start = Instant::now();
+    let order_build_start = Instant::now();
     let token_id = match intent.side {
         OrderSide::BuyYes | OrderSide::SellYes => book.token_id_yes.clone(),
         OrderSide::BuyNo | OrderSide::SellNo => book.token_id_no.clone(),
@@ -3280,6 +3345,8 @@ async fn predator_execute_opportunity(
         client_order_id: Some(new_id()),
         hold_to_resolution: false,
     };
+    let order_build_ms = order_build_start.elapsed().as_secs_f64() * 1_000.0;
+    let place_start = Instant::now();
 
     let mut out = PredatorExecResult::default();
     out.attempted = out.attempted.saturating_add(1);
@@ -3298,15 +3365,23 @@ async fn predator_execute_opportunity(
             shared.shadow_stats.mark_executed();
             out.executed = out.executed.saturating_add(1);
 
-            let ack_only_ms = if ack_v2.exchange_latency_ms > 0.0 {
-                ack_v2.exchange_latency_ms
+            let is_live = execution.is_live();
+            let ack_only_ms = if is_live {
+                if ack_v2.exchange_latency_ms > 0.0 {
+                    ack_v2.exchange_latency_ms
+                } else {
+                    place_start.elapsed().as_secs_f64() * 1_000.0
+                }
             } else {
-                place_start.elapsed().as_secs_f64() * 1_000.0
+                0.0
             };
-            shared.shadow_stats.push_ack_only_ms(ack_only_ms).await;
+            let tick_to_ack_ms = order_build_ms + ack_only_ms;
+            if is_live && ack_only_ms > 0.0 {
+                shared.shadow_stats.push_ack_only_ms(ack_only_ms).await;
+            }
             shared
                 .shadow_stats
-                .push_tick_to_ack_ms(ack_only_ms)
+                .push_tick_to_ack_ms(tick_to_ack_ms)
                 .await;
 
             let ack = OrderAck {
@@ -3325,6 +3400,10 @@ async fn predator_execute_opportunity(
                     symbol: opp.symbol.clone(),
                     side: intent.side.clone(),
                     execution_style: ExecutionStyle::Taker,
+                    book_top_lag_ms: 0.0,
+                    ack_only_ms,
+                    tick_to_ack_ms,
+                    capturable_window_ms: 0.0,
                     survival_probe_price: aggressive_price_for_side(&book, &intent.side),
                     intended_price: intent.price,
                     size: intent.size,
