@@ -20,4 +20,7 @@ __pycache__/
 Thumbs.db
 .idea/
 .vscode/
-\ncodex_changes.patch\ncodex_sync.tgz\n
+
+# local sync artifacts (never commit)
+codex_changes.patch
+codex_sync.tgz
