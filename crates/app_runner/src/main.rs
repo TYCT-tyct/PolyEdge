@@ -2007,7 +2007,14 @@ fn spawn_market_feed(
                         }
                     }
                     last_source_ts_by_market.insert(book.market_id.clone(), source_ts);
-                    stats.mark_book_tick(book.ts_ms);
+                    // IMPORTANT: book freshness must be based on *local* receive time, not the
+                    // exchange/server-provided ts_ms (which can be skewed/backjump).
+                    let book_tick_ms = if book.recv_ts_local_ns > 0 {
+                        (book.recv_ts_local_ns / 1_000_000).max(0)
+                    } else {
+                        Utc::now().timestamp_millis()
+                    };
+                    stats.mark_book_tick(book_tick_ms);
                     let book_json =
                         serde_json::to_string(&book).unwrap_or_else(|_| "{}".to_string());
                     let hash = sha256_hex(&book_json);
@@ -2229,6 +2236,7 @@ fn spawn_strategy_engine(
                     // Guardrail: if the tick is already old, this is not a meaningful "lag window"
                     // measurement and would inflate p50/p99. We only sample when the tick is fresh.
                     let tick_age_ms = freshness_ms(Utc::now().timestamp_millis(), tick_fast.recv_ts_ms);
+                    let stale_ms = tick_age_ms.max(0) as f64;
                     let book_top_lag_ms = if tick_age_ms <= 1_500
                         && tick_fast.recv_ts_local_ns > 0
                         && book.recv_ts_local_ns > 0
@@ -2254,7 +2262,9 @@ fn spawn_strategy_engine(
                     let feed_in_ms = latency_sample.feed_in_ms;
                     let stale_tick_filter_ms =
                         shared.strategy_cfg.read().await.stale_tick_filter_ms;
-                    if feed_in_ms > stale_tick_filter_ms {
+                    // Stale tick filtering must be based on *local* staleness/age, not exchange
+                    // event timestamps (which can be skewed across venues).
+                    if stale_ms > stale_tick_filter_ms {
                         shared.shadow_stats.mark_stale_tick_dropped();
                         shared.shadow_stats.record_issue("stale_tick_dropped").await;
                         continue;
@@ -2383,7 +2393,7 @@ fn spawn_strategy_engine(
                         let tox_features = build_toxic_features(
                             &book,
                             &symbol,
-                            feed_in_ms,
+                            stale_ms,
                             signal.fair_yes,
                             attempted1,
                             no_quote0,
@@ -2488,7 +2498,7 @@ fn spawn_strategy_engine(
                         &symbol,
                         &cfg,
                         &tox_decision,
-                        feed_in_ms,
+                        stale_ms,
                         spread_yes,
                         book_top_lag_ms,
                     ) {
@@ -2499,7 +2509,7 @@ fn spawn_strategy_engine(
                         continue;
                     }
                     let queue_fill_proxy =
-                        estimate_queue_fill_proxy(tox_decision.tox_score, spread_yes, feed_in_ms);
+                        estimate_queue_fill_proxy(tox_decision.tox_score, spread_yes, stale_ms);
 
                     if spread_yes > effective_max_spread {
                         {
@@ -4114,7 +4124,7 @@ fn should_observe_only_symbol(
     symbol: &str,
     cfg: &MakerConfig,
     tox: &ToxicDecision,
-    feed_in_ms: f64,
+    stale_ms: f64,
     spread_yes: f64,
     book_top_lag_ms: f64,
 ) -> bool {
@@ -4130,13 +4140,13 @@ fn should_observe_only_symbol(
     // This avoids letting one slow/volatile venue degrade the overall engine quality.
     book_top_lag_ms > 130.0
         || matches!(tox.regime, ToxicRegime::Danger)
-        || feed_in_ms > 250.0
+        || stale_ms > 250.0
         || spread_yes > 0.020
 }
 
-fn estimate_queue_fill_proxy(tox_score: f64, spread_yes: f64, feed_in_ms: f64) -> f64 {
+fn estimate_queue_fill_proxy(tox_score: f64, spread_yes: f64, stale_ms: f64) -> f64 {
     let spread_pen = (spread_yes / 0.03).clamp(0.0, 1.0);
-    let latency_pen = (feed_in_ms / 800.0).clamp(0.0, 1.0);
+    let latency_pen = (stale_ms / 800.0).clamp(0.0, 1.0);
     (1.0 - (tox_score * 0.45 + spread_pen * 0.35 + latency_pen * 0.20)).clamp(0.0, 1.0)
 }
 
@@ -4316,7 +4326,10 @@ fn estimate_feed_latency(tick: &RefTick, book: &BookTop) -> FeedLatencySample {
         (now_ms - tick.recv_ts_ms.max(book.ts_ms)).max(0) as f64
     };
 
-    let feed_in_ms = source_latency_ms + local_backlog_ms;
+    // IMPORTANT: `feed_in_ms` is the *local* recv->ingest latency (decode + enqueue), intended
+    // to be <5ms and independent of exchange clock skew. Use source_latency_ms/local_backlog_ms
+    // separately for "how old is this data?" debugging/guardrails.
+    let feed_in_ms = ref_decode_ms;
     FeedLatencySample {
         feed_in_ms,
         source_latency_ms,
@@ -6350,7 +6363,7 @@ mod tests {
             recv_ts_ms: now_ms - 200,
             event_ts_exchange_ms: now_ms - 300,
             recv_ts_local_ns: now - 200_000_000,
-            ingest_ts_local_ns: now - 200_000_000,
+            ingest_ts_local_ns: now - 198_000_000,
             price: 70_000.0,
         };
         let book = BookTop {
@@ -6370,10 +6383,9 @@ mod tests {
         assert!(sample.source_latency_ms <= 110.0);
         assert!(sample.local_backlog_ms >= 10.0);
         assert!(sample.local_backlog_ms <= 40.0);
-        assert!(sample.feed_in_ms >= sample.source_latency_ms);
-        assert!(
-            (sample.feed_in_ms - (sample.source_latency_ms + sample.local_backlog_ms)).abs() < 3.0
-        );
+        assert!(sample.feed_in_ms >= 1.0);
+        assert!(sample.feed_in_ms <= 4.0);
+        assert!((sample.feed_in_ms - sample.ref_decode_ms).abs() < 0.0001);
     }
 
     #[test]
