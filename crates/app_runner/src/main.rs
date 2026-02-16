@@ -1223,8 +1223,6 @@ impl ShadowStats {
 impl ShadowStats {
     async fn build_live_report(&self) -> ShadowLiveReport {
         const PRIMARY_DELAY_MS: u64 = 10;
-        let shots = self.shots.read().await.clone();
-        let outcomes = self.outcomes.read().await.clone();
         let ShadowSamples {
             decision_queue_wait_ms,
             decision_compute_ms,
@@ -1251,13 +1249,20 @@ impl ShadowStats {
         let blocked_reason_counts = self.blocked_reasons.read().await.clone();
         let survival_probe_overall = *self.survival_probe_overall.read().await;
         let survival_probe_by_symbol = self.survival_probe_by_symbol.read().await.clone();
+        let elapsed = self.started_at.read().await.elapsed();
+        let uptime_pct = self.uptime_pct(elapsed);
 
-        let fillability_5 = fillability_ratio(&outcomes, 5);
-        let fillability_10 = fillability_ratio(&outcomes, 10);
-        let fillability_25 = fillability_ratio(&outcomes, 25);
-        let survival_5 = survival_ratio(&outcomes, 5);
-        let survival_10 = survival_ratio(&outcomes, 10);
-        let survival_25 = survival_ratio(&outcomes, 25);
+        // Avoid cloning large shot/outcome vectors per request. Under stress polling this can
+        // cause massive allocation churn and even OOM kills (esp. when market_scorecard is large).
+        let shots_guard = self.shots.read().await;
+        let outcomes_guard = self.outcomes.read().await;
+
+        let fillability_5 = fillability_ratio(&outcomes_guard, 5);
+        let fillability_10 = fillability_ratio(&outcomes_guard, 10);
+        let fillability_25 = fillability_ratio(&outcomes_guard, 25);
+        let survival_5 = survival_ratio(&outcomes_guard, 5);
+        let survival_10 = survival_ratio(&outcomes_guard, 10);
+        let survival_25 = survival_ratio(&outcomes_guard, 25);
         let survival_probe_5 = survival_probe_overall.ratio(5);
         let survival_probe_10 = survival_probe_overall.ratio(10);
         let survival_probe_25 = survival_probe_overall.ratio(25);
@@ -1265,11 +1270,11 @@ impl ShadowStats {
         let survival_probe_10_n = survival_probe_overall.n(10);
         let survival_probe_25_n = survival_probe_overall.n(25);
 
-        let shots_primary = shots
+        let shots_primary = shots_guard
             .iter()
             .filter(|s| s.delay_ms == PRIMARY_DELAY_MS)
             .collect::<Vec<_>>();
-        let outcomes_primary = outcomes
+        let outcomes_primary = outcomes_guard
             .iter()
             .filter(|o| o.delay_ms == PRIMARY_DELAY_MS)
             .collect::<Vec<_>>();
@@ -1333,10 +1338,8 @@ impl ShadowStats {
         let quote_block_ratio = quote_block_ratio(attempted, blocked);
         let policy_ratio = policy_block_ratio(attempted, policy_blocked);
 
-        let elapsed = self.started_at.read().await.elapsed();
-        let uptime_pct = self.uptime_pct(elapsed);
         let tick_to_ack_p99 = percentile(&tick_to_ack_ms, 0.99).unwrap_or(0.0);
-        let scorecard = build_market_scorecard(&shots, &outcomes);
+        let scorecard = build_market_scorecard(&shots_guard, &outcomes_guard);
         let ref_ticks_total = self.ref_ticks_total.load(Ordering::Relaxed);
         let book_ticks_total = self.book_ticks_total.load(Ordering::Relaxed);
         let now_ms = Utc::now().timestamp_millis();
@@ -1471,6 +1474,13 @@ impl ShadowStats {
             tick_to_ack_n: tick_to_ack_ms.len() as u64,
         };
 
+        let total_shots = shots_guard.len();
+        let total_outcomes = outcomes_guard.len();
+
+        // IMPORTANT: drop large read-guards before awaiting on other locks below.
+        drop(shots_guard);
+        drop(outcomes_guard);
+
         let predator_c_enabled = self.predator_c_enabled.load(Ordering::Relaxed);
         let direction_signals_up = self.predator_dir_up.load(Ordering::Relaxed);
         let direction_signals_down = self.predator_dir_down.load(Ordering::Relaxed);
@@ -1487,15 +1497,15 @@ impl ShadowStats {
 
         let mut live = ShadowLiveReport {
             window_id: self.window_id.load(Ordering::Relaxed),
-            window_shots: shots.len(),
-            window_outcomes: outcomes.len(),
-            gate_ready: outcomes.len() >= Self::GATE_MIN_OUTCOMES,
+            window_shots: total_shots,
+            window_outcomes: total_outcomes,
+            gate_ready: total_outcomes >= Self::GATE_MIN_OUTCOMES,
             gate_fail_reasons: Vec::new(),
             observe_only: self.observe_only(),
             started_at_ms: self.started_at_ms.load(Ordering::Relaxed),
             elapsed_sec: elapsed.as_secs(),
-            total_shots: shots.len(),
-            total_outcomes: outcomes.len(),
+            total_shots,
+            total_outcomes,
             data_valid_ratio,
             seq_gap_rate,
             ts_inversion_rate,
@@ -5841,7 +5851,24 @@ fn append_jsonl(path: &Path, value: &serde_json::Value) {
     append_jsonl_line(path, value.to_string());
 }
 
+static LAST_LIVE_REPORT_PERSIST_MS: AtomicI64 = AtomicI64::new(0);
+
 fn persist_live_report_files(live: &ShadowLiveReport) {
+    // Throttle file persistence. /report/shadow/live can be polled at high frequency (storm tests)
+    // and pretty-json serialization + fs::write per request is unnecessary and can destabilize the
+    // process under load.
+    let now_ms = Utc::now().timestamp_millis();
+    let last_ms = LAST_LIVE_REPORT_PERSIST_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last_ms) < 1_000 {
+        return;
+    }
+    if LAST_LIVE_REPORT_PERSIST_MS
+        .compare_exchange(last_ms, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+
     let reports_dir = dataset_dir("reports");
     let _ = fs::create_dir_all(&reports_dir);
 
@@ -6236,88 +6263,123 @@ fn persist_toxicity_report_files(report: &ToxicityLiveReport) {
 }
 
 fn fillability_ratio(outcomes: &[ShadowOutcome], delay_ms: u64) -> f64 {
-    let scoped = outcomes
-        .iter()
-        .filter(|o| o.delay_ms == delay_ms)
-        .collect::<Vec<_>>();
-    if scoped.is_empty() {
-        return 0.0;
+    let mut total = 0_u64;
+    let mut filled = 0_u64;
+    for o in outcomes {
+        if o.delay_ms != delay_ms {
+            continue;
+        }
+        total = total.saturating_add(1);
+        if o.fillable {
+            filled = filled.saturating_add(1);
+        }
     }
-    let filled = scoped.iter().filter(|o| o.fillable).count();
-    filled as f64 / scoped.len() as f64
+    if total == 0 {
+        0.0
+    } else {
+        filled as f64 / total as f64
+    }
 }
 
 fn survival_ratio(outcomes: &[ShadowOutcome], delay_ms: u64) -> f64 {
-    let scoped = outcomes
-        .iter()
-        .filter(|o| o.delay_ms == delay_ms)
-        .collect::<Vec<_>>();
-    if scoped.is_empty() {
-        return 0.0;
+    let mut total = 0_u64;
+    let mut survived = 0_u64;
+    for o in outcomes {
+        if o.delay_ms != delay_ms {
+            continue;
+        }
+        total = total.saturating_add(1);
+        if o.survived {
+            survived = survived.saturating_add(1);
+        }
     }
-    let survived = scoped.iter().filter(|o| o.survived).count();
-    survived as f64 / scoped.len() as f64
+    if total == 0 {
+        0.0
+    } else {
+        survived as f64 / total as f64
+    }
 }
 
 fn build_market_scorecard(shots: &[ShadowShot], outcomes: &[ShadowOutcome]) -> Vec<MarketScoreRow> {
     const PRIMARY_DELAY_MS: u64 = 10;
-    let mut keys: HashMap<(String, String), ()> = HashMap::new();
-    for shot in shots {
-        keys.insert((shot.market_id.clone(), shot.symbol.clone()), ());
+    const MAX_ROWS: usize = 200;
+
+    #[derive(Default)]
+    struct Agg {
+        market_id: String,
+        symbol: String,
+        shots_primary: usize,
+        outcomes_primary: usize,
+        filled_10ms: u64,
+        total_10ms: u64,
+        net_edges: Vec<f64>,
+        pnl_10s: Vec<f64>,
+        net_markout_10s_usdc: Vec<f64>,
+        roi_notional_10s_bps: Vec<f64>,
     }
-    for outcome in outcomes {
-        keys.insert((outcome.market_id.clone(), outcome.symbol.clone()), ());
+
+    // Single-pass aggregation to avoid O(N^2) cloning/filtering. This keeps /report/shadow/live
+    // stable under stress polling.
+    let mut by_key: HashMap<(String, String), Agg> = HashMap::new();
+
+    for s in shots {
+        if s.delay_ms != PRIMARY_DELAY_MS {
+            continue;
+        }
+        let key = (s.market_id.clone(), s.symbol.clone());
+        let entry = by_key.entry(key).or_insert_with(|| Agg {
+            market_id: s.market_id.clone(),
+            symbol: s.symbol.clone(),
+            ..Agg::default()
+        });
+        entry.shots_primary = entry.shots_primary.saturating_add(1);
+        entry.net_edges.push(s.edge_net_bps);
     }
 
-    let mut rows = Vec::new();
-    for (market_id, symbol) in keys.into_keys() {
-        let market_shots = shots
-            .iter()
-            .filter(|s| s.market_id == market_id && s.symbol == symbol)
-            .cloned()
-            .collect::<Vec<_>>();
-        let market_outcomes = outcomes
-            .iter()
-            .filter(|o| o.market_id == market_id && o.symbol == symbol)
-            .cloned()
-            .collect::<Vec<_>>();
-        let market_shots_primary = market_shots
-            .iter()
-            .filter(|s| s.delay_ms == PRIMARY_DELAY_MS)
-            .collect::<Vec<_>>();
-        let market_outcomes_primary = market_outcomes
-            .iter()
-            .filter(|o| o.delay_ms == PRIMARY_DELAY_MS)
-            .collect::<Vec<_>>();
+    for o in outcomes {
+        if o.delay_ms != PRIMARY_DELAY_MS {
+            continue;
+        }
+        let key = (o.market_id.clone(), o.symbol.clone());
+        let entry = by_key.entry(key).or_insert_with(|| Agg {
+            market_id: o.market_id.clone(),
+            symbol: o.symbol.clone(),
+            ..Agg::default()
+        });
+        entry.outcomes_primary = entry.outcomes_primary.saturating_add(1);
+        entry.total_10ms = entry.total_10ms.saturating_add(1);
+        if o.fillable {
+            entry.filled_10ms = entry.filled_10ms.saturating_add(1);
+        }
+        if let Some(v) = o.net_markout_10s_bps.or(o.pnl_10s_bps) {
+            entry.pnl_10s.push(v);
+        }
+        if let Some(v) = o.net_markout_10s_usdc {
+            entry.net_markout_10s_usdc.push(v);
+        }
+        if let Some(v) = o.roi_notional_10s_bps {
+            entry.roi_notional_10s_bps.push(v);
+        }
+    }
 
-        let net_edges = market_shots_primary
-            .iter()
-            .map(|s| s.edge_net_bps)
-            .collect::<Vec<_>>();
-        let pnl_10s = market_outcomes_primary
-            .iter()
-            .filter_map(|o| o.net_markout_10s_bps.or(o.pnl_10s_bps))
-            .collect::<Vec<_>>();
-        let net_markout_10s_usdc = market_outcomes_primary
-            .iter()
-            .filter_map(|o| o.net_markout_10s_usdc)
-            .collect::<Vec<_>>();
-        let roi_notional_10s_bps = market_outcomes_primary
-            .iter()
-            .filter_map(|o| o.roi_notional_10s_bps)
-            .collect::<Vec<_>>();
-
+    let mut rows = Vec::with_capacity(by_key.len());
+    for (_, agg) in by_key {
+        let fillability_10ms = if agg.total_10ms == 0 {
+            0.0
+        } else {
+            agg.filled_10ms as f64 / agg.total_10ms as f64
+        };
         rows.push(MarketScoreRow {
-            market_id,
-            symbol,
-            shots: market_shots_primary.len(),
-            outcomes: market_outcomes_primary.len(),
-            fillability_10ms: fillability_ratio(&market_outcomes, 10),
-            net_edge_p50_bps: percentile(&net_edges, 0.50).unwrap_or(0.0),
-            net_edge_p10_bps: percentile(&net_edges, 0.10).unwrap_or(0.0),
-            pnl_10s_p50_bps: percentile(&pnl_10s, 0.50).unwrap_or(0.0),
-            net_markout_10s_usdc_p50: percentile(&net_markout_10s_usdc, 0.50).unwrap_or(0.0),
-            roi_notional_10s_bps_p50: percentile(&roi_notional_10s_bps, 0.50).unwrap_or(0.0),
+            market_id: agg.market_id,
+            symbol: agg.symbol,
+            shots: agg.shots_primary,
+            outcomes: agg.outcomes_primary,
+            fillability_10ms,
+            net_edge_p50_bps: percentile(&agg.net_edges, 0.50).unwrap_or(0.0),
+            net_edge_p10_bps: percentile(&agg.net_edges, 0.10).unwrap_or(0.0),
+            pnl_10s_p50_bps: percentile(&agg.pnl_10s, 0.50).unwrap_or(0.0),
+            net_markout_10s_usdc_p50: percentile(&agg.net_markout_10s_usdc, 0.50).unwrap_or(0.0),
+            roi_notional_10s_bps_p50: percentile(&agg.roi_notional_10s_bps, 0.50).unwrap_or(0.0),
         });
     }
 
@@ -6325,6 +6387,7 @@ fn build_market_scorecard(shots: &[ShadowShot], outcomes: &[ShadowOutcome]) -> V
         b.net_markout_10s_usdc_p50
             .total_cmp(&a.net_markout_10s_usdc_p50)
     });
+    rows.truncate(MAX_ROWS);
     rows
 }
 
