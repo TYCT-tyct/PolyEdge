@@ -1,0 +1,8 @@
+[package]
+name = "poly_wire"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+bincode = { workspace = true }

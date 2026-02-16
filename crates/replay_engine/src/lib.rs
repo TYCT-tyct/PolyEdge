@@ -99,6 +99,7 @@ mod tests {
                     symbol: "BTCUSDT".to_string(),
                     event_ts_ms: 1,
                     recv_ts_ms: 1,
+                        source_seq: 0,
                     event_ts_exchange_ms: 1,
                     recv_ts_local_ns: 1_000_000,
                     ingest_ts_local_ns: 1_000_000,

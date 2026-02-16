@@ -87,6 +87,9 @@ The workspace contains 21 crates in `crates/`:
 **Data Feeds:**
 - `feed_polymarket` - Polymarket WebSocket feed for orders/books
 - `feed_reference` - External reference price feeds
+- `feed_udp` - Low-latency UDP receiver for Binance BookTicker
+- `feeder_tokyo` - UDP sender service (Binance -> UDP)
+- `poly_wire` - Binary protocol definitions for UDP feed
 
 **Strategy Layer:**
 - `strategy_maker` - Maker quote generation with inventory skew

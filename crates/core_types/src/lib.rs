@@ -15,6 +15,8 @@ pub struct RefTick {
     pub event_ts_ms: i64,
     pub recv_ts_ms: i64,
     #[serde(default)]
+    pub source_seq: u64,
+    #[serde(default)]
     pub event_ts_exchange_ms: i64,
     #[serde(default)]
     pub recv_ts_local_ns: i64,
@@ -715,6 +717,7 @@ mod tests {
             symbol: "BTCUSDT".to_string(),
             event_ts_ms: 1,
             recv_ts_ms: 2,
+            source_seq: 0,
             event_ts_exchange_ms: 1,
             recv_ts_local_ns: 2,
             ingest_ts_local_ns: 2,

@@ -1,0 +1,17 @@
+[package]
+name = "feeder_tokyo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true, features = ["full"] }
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+url = { workspace = true }
+anyhow = { workspace = true }
+poly_wire = { path = "../poly_wire" }
+rustls = { workspace = true }
+socket2 = "0.6.2"

@@ -210,6 +210,7 @@ mod tests {
             symbol: symbol.to_string(),
             event_ts_ms: recv_ts_ms,
             recv_ts_ms,
+            source_seq: 0,
             event_ts_exchange_ms: recv_ts_ms,
             recv_ts_local_ns: recv_ts_ms * 1_000_000,
             ingest_ts_local_ns: recv_ts_ms * 1_000_000,

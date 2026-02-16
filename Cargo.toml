@@ -20,6 +20,9 @@ members = [
   "crates/paper_executor",
   "crates/observability",
   "crates/app_runner",
+  "crates/poly_wire",
+  "crates/feeder_tokyo",
+  "crates/feed_udp",
 ]
 
 [workspace.package]
@@ -41,18 +44,21 @@ metrics-exporter-prometheus = "0.16"
 parking_lot = "0.12"
 rand = "0.9"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
-rustls = { version = "0.23", features = ["aws_lc_rs"] }
+rustls = { version = "0.23", features = ["ring"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
+bincode = "1"
+tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+url = "2"
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 tracing-appender = "0.2"
-url = "2"
+
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [profile.release]

@@ -1901,18 +1901,25 @@ fn spawn_reference_feed(bus: RingBus<EngineEvent>, stats: Arc<ShadowStats>, symb
     const TS_INVERSION_TOLERANCE_MS: i64 = 250;
     const TS_BACKJUMP_RESET_MS: i64 = 5_000;
     tokio::spawn(async move {
-        let feed = MultiSourceRefFeed::new(Duration::from_millis(50));
-        if symbols.is_empty() {
-            tracing::warn!("reference feed symbols empty; using fallback BTCUSDT");
-        }
-        let symbols = if symbols.is_empty() {
-            vec!["BTCUSDT".to_string()]
+        let udp_enabled = std::env::var("ENABLE_UDP_FEED")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false);
+
+        let mut stream = if udp_enabled {
+            tracing::info!("Using UDP Binance Feed (Port 6666)");
+            let feed = feed_udp::UdpBinanceFeed::new(6666);
+            feed.stream_ticks(symbols).await.expect("Failed to start UDP stream")
         } else {
-            symbols
-        };
-        let Ok(mut stream) = feed.stream_ticks(symbols).await else {
-            tracing::error!("reference feed failed to start");
-            return;
+            let feed = MultiSourceRefFeed::new(Duration::from_millis(50));
+            if symbols.is_empty() {
+                tracing::warn!("reference feed symbols empty; using fallback BTCUSDT");
+            }
+            let symbols = if symbols.is_empty() {
+                vec!["BTCUSDT".to_string()]
+            } else {
+                symbols
+            };
+            feed.stream_ticks(symbols).await.expect("reference feed failed to start")
         };
         let mut ingest_seq: u64 = 0;
         let mut last_source_ts_by_stream: HashMap<String, i64> = HashMap::new();
