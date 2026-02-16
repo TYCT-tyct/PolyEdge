@@ -69,6 +69,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gateway-url", default="http://127.0.0.1:9001")
     p.add_argument("--clob-host", default="https://clob.polymarket.com")
     p.add_argument("--token-id", required=True, help="Polymarket asset_id / token_id (YES or NO token)")
+    p.add_argument(
+        "--price",
+        type=float,
+        default=None,
+        help="Optional fixed price to skip fetching orderbook. Useful when token has no /book or access is restricted.",
+    )
     p.add_argument("--market-id", default="canary")
     p.add_argument("--side", default="buy_yes", choices=["buy_yes", "buy_no", "sell_yes", "sell_no"])
     p.add_argument("--notional-usdc", type=float, default=0.5)
@@ -89,15 +95,23 @@ def main() -> int:
     session = requests.Session()
     health = session.get(f"{args.gateway_url.rstrip('/')}/health", timeout=args.timeout_sec).json()
 
-    best_bid, best_ask = fetch_book_top(args.clob_host, args.token_id, args.timeout_sec)
-    if args.side.startswith("buy"):
-        ref_px = best_ask
-        if ref_px <= 0:
-            raise RuntimeError("no asks in book; cannot form crossable buy")
+    best_bid = 0.0
+    best_ask = 0.0
+    if args.price is not None:
+        ref_px = float(args.price)
     else:
-        ref_px = best_bid
-        if ref_px <= 0:
-            raise RuntimeError("no bids in book; cannot form crossable sell")
+        best_bid, best_ask = fetch_book_top(args.clob_host, args.token_id, args.timeout_sec)
+        if args.side.startswith("buy"):
+            ref_px = best_ask
+            if ref_px <= 0:
+                raise RuntimeError("no asks in book; cannot form crossable buy (pass --price to skip book fetch)")
+        else:
+            ref_px = best_bid
+            if ref_px <= 0:
+                raise RuntimeError("no bids in book; cannot form crossable sell (pass --price to skip book fetch)")
+
+    if not (0.0 < ref_px < 1.0):
+        raise RuntimeError(f"invalid ref_px={ref_px} (must be in (0,1))")
 
     notional = max(0.0, float(args.notional_usdc))
     if notional <= 0.0:
@@ -163,7 +177,7 @@ def main() -> int:
         "clob_host": args.clob_host,
         "token_id": args.token_id,
         "side": args.side,
-        "book_top": {"best_bid": best_bid, "best_ask": best_ask, "ref_px": ref_px},
+        "book_top": {"best_bid": best_bid, "best_ask": best_ask, "ref_px": ref_px, "used_fixed_price": (args.price is not None)},
         "notional_usdc": notional,
         "size": size,
         "attempts": int(args.attempts),
@@ -179,4 +193,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
