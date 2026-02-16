@@ -74,6 +74,9 @@ impl ClobExecution {
                     .unwrap_or(30)
                     .max(5),
             )))
+            .tcp_nodelay(true)
+            // Force HTTP/2 without negotiation (Polymarket CLOB supports it)
+            .http2_prior_knowledge()
             // If the peer supports it (ALPN), this can cut head-of-line blocking.
             .http2_keep_alive_interval(Some(Duration::from_secs(
                 std::env::var("POLYEDGE_HTTP2_KEEPALIVE_INTERVAL_SEC")

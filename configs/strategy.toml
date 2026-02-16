@@ -38,7 +38,7 @@ min_samples = 5
 # Edge-confirmed: Direction only decides YES/NO side; EV thresholds are still enforced.
 
 [predator_c]
-enabled = false
+enabled = true
 # "maker_first" | "taker_first" | "taker_only"
 priority = "taker_first"
 
