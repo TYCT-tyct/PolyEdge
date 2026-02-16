@@ -35,3 +35,4 @@ taker_sniper = { path = "../taker_sniper" }
 timeframe_router = { path = "../timeframe_router" }
 tokio.workspace = true
 tracing.workspace = true
+mimalloc = "0.1"

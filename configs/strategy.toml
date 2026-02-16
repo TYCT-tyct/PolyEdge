@@ -1,5 +1,5 @@
 [maker]
-base_quote_size = 5.0
+base_quote_size = 1.0
 min_edge_bps = 1.0
 inventory_skew = 0.15
 max_spread = 0.08
@@ -92,9 +92,9 @@ min_liquidity_usdc = 50.0             # Skip if best bid/ask < $50
 
 [risk_controls.exposure_limits]
 # Position size caps
-max_total_exposure_usdc = 50.0        # Total across all positions
-max_per_market_exposure_usdc = 5.0    # Per market ID
-max_per_symbol_exposure_usdc = 10.0   # Per underlying symbol
+max_total_exposure_usdc = 2.0        # Total across all positions
+max_per_market_exposure_usdc = 2.0    # Per market ID
+max_per_symbol_exposure_usdc = 2.0   # Per underlying symbol
 max_concurrent_positions = 8          # Already in predator_c.router
 
 [risk_controls.kill_switch]

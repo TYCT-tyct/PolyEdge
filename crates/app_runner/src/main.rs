@@ -43,6 +43,9 @@ use taker_sniper::{TakerAction, TakerSniper, TakerSniperConfig};
 use timeframe_router::{RouterConfig, TimeframeRouter};
 use tokio::sync::{mpsc, RwLock};
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod control_api;
 mod engine_core;
 mod gate_eval;
