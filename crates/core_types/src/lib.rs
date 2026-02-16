@@ -18,6 +18,10 @@ pub struct RefTick {
     pub event_ts_exchange_ms: i64,
     #[serde(default)]
     pub recv_ts_local_ns: i64,
+    /// Local timestamp taken after decoding/parsing and right before enqueueing/publishing.
+    /// This enables measuring pure local decode/ingest latency independent of exchange clocks.
+    #[serde(default)]
+    pub ingest_ts_local_ns: i64,
     pub price: f64,
 }
 
@@ -700,6 +704,7 @@ mod tests {
             recv_ts_ms: 2,
             event_ts_exchange_ms: 1,
             recv_ts_local_ns: 2,
+            ingest_ts_local_ns: 2,
             price: 50000.0,
         });
 

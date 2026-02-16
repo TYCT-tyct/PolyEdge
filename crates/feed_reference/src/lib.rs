@@ -162,6 +162,7 @@ async fn run_binance_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> R
         let symbol = trade.symbol;
         let price = trade.price;
         let event_ts = trade.event_ts.unwrap_or_else(now_ms);
+        let ingest_ns = now_ns();
 
         let tick = RefTick {
             source: "binance_ws".to_string(),
@@ -170,6 +171,7 @@ async fn run_binance_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> R
             recv_ts_ms: recv_ms,
             event_ts_exchange_ms: event_ts,
             recv_ts_local_ns: recv_ns,
+            ingest_ts_local_ns: ingest_ns,
             price,
         };
 
@@ -272,6 +274,7 @@ async fn run_bybit_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> Res
             .ts
             .or_else(|| payload.data.as_ref().and_then(|d| d.ts))
             .unwrap_or_else(now_ms);
+        let ingest_ns = now_ns();
 
         let (Some(symbol), Some(price)) = (symbol, price) else {
             continue;
@@ -284,6 +287,7 @@ async fn run_bybit_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> Res
             recv_ts_ms: recv_ms,
             event_ts_exchange_ms: event_ts,
             recv_ts_local_ns: recv_ns,
+            ingest_ts_local_ns: ingest_ns,
             price,
         };
 
@@ -356,6 +360,7 @@ async fn run_coinbase_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> 
             .as_deref()
             .and_then(parse_rfc3339_ms)
             .unwrap_or_else(now_ms);
+        let ingest_ns = now_ns();
 
         let Some(price) = price else {
             continue;
@@ -368,6 +373,7 @@ async fn run_coinbase_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> 
             recv_ts_ms: recv_ms,
             event_ts_exchange_ms: event_ts,
             recv_ts_local_ns: recv_ns,
+            ingest_ts_local_ns: ingest_ns,
             price,
         };
 
@@ -484,16 +490,18 @@ async fn run_chainlink_rtds_stream(symbols: &[String], tx: &mpsc::Sender<RefTick
                     continue;
                 };
                 let event_ts = payload.timestamp.or(env.timestamp).unwrap_or_else(now_ms);
+                let ingest_ns = now_ns();
 
-                 let tick = RefTick {
-                     source: "chainlink_rtds".to_string(),
-                     symbol,
-                     event_ts_ms: event_ts,
-                     recv_ts_ms: recv_ms,
-                     event_ts_exchange_ms: event_ts,
-                     recv_ts_local_ns: recv_ns,
-                     price,
-                 };
+                let tick = RefTick {
+                    source: "chainlink_rtds".to_string(),
+                    symbol,
+                    event_ts_ms: event_ts,
+                    recv_ts_ms: recv_ms,
+                    event_ts_exchange_ms: event_ts,
+                    recv_ts_local_ns: recv_ns,
+                    ingest_ts_local_ns: ingest_ns,
+                    price,
+                };
 
                 if tx.send(tick).await.is_err() {
                     break;

@@ -101,6 +101,7 @@ mod tests {
                     recv_ts_ms: 1,
                     event_ts_exchange_ms: 1,
                     recv_ts_local_ns: 1_000_000,
+                    ingest_ts_local_ns: 1_000_000,
                     price: 1.0,
                 }),
             })

@@ -529,6 +529,9 @@ struct LatencyBreakdown {
     local_backlog_p50_ms: f64,
     local_backlog_p90_ms: f64,
     local_backlog_p99_ms: f64,
+    ref_decode_p50_ms: f64,
+    ref_decode_p90_ms: f64,
+    ref_decode_p99_ms: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -766,6 +769,7 @@ struct ShadowSamples {
     source_latency_ms: Vec<f64>,
     book_latency_ms: Vec<f64>,
     local_backlog_ms: Vec<f64>,
+    ref_decode_ms: Vec<f64>,
     book_top_lag_ms: Vec<f64>,
     signal_us: Vec<f64>,
     quote_us: Vec<f64>,
@@ -954,12 +958,14 @@ impl ShadowStats {
         source_latency_ms: f64,
         book_latency_ms: f64,
         local_backlog_ms: f64,
+        ref_decode_ms: f64,
     ) {
         let mut s = self.samples.write().await;
         push_capped(&mut s.feed_in_ms, feed_in_ms, Self::SAMPLE_CAP);
         push_capped(&mut s.source_latency_ms, source_latency_ms, Self::SAMPLE_CAP);
         push_capped(&mut s.book_latency_ms, book_latency_ms, Self::SAMPLE_CAP);
         push_capped(&mut s.local_backlog_ms, local_backlog_ms, Self::SAMPLE_CAP);
+        push_capped(&mut s.ref_decode_ms, ref_decode_ms, Self::SAMPLE_CAP);
         // Contract: decision_queue_wait is the queue/backlog time we spent waiting locally.
         push_capped(&mut s.decision_queue_wait_ms, local_backlog_ms, Self::SAMPLE_CAP);
     }
@@ -1202,6 +1208,7 @@ impl ShadowStats {
             source_latency_ms,
             book_latency_ms,
             local_backlog_ms,
+            ref_decode_ms,
             book_top_lag_ms,
             signal_us,
             quote_us,
@@ -1404,6 +1411,9 @@ impl ShadowStats {
             local_backlog_p50_ms: percentile(&local_backlog_ms, 0.50).unwrap_or(0.0),
             local_backlog_p90_ms: percentile(&local_backlog_ms, 0.90).unwrap_or(0.0),
             local_backlog_p99_ms: percentile(&local_backlog_ms, 0.99).unwrap_or(0.0),
+            ref_decode_p50_ms: percentile(&ref_decode_ms, 0.50).unwrap_or(0.0),
+            ref_decode_p90_ms: percentile(&ref_decode_ms, 0.90).unwrap_or(0.0),
+            ref_decode_p99_ms: percentile(&ref_decode_ms, 0.99).unwrap_or(0.0),
         };
 
         let predator_c_enabled = self.predator_c_enabled.load(Ordering::Relaxed);
@@ -2183,6 +2193,7 @@ fn spawn_strategy_engine(
                             latency_sample.source_latency_ms,
                             latency_sample.book_latency_ms,
                             latency_sample.local_backlog_ms,
+                            latency_sample.ref_decode_ms,
                         )
                         .await;
                     metrics::histogram!("latency.feed_in_ms").record(feed_in_ms);
@@ -2191,6 +2202,7 @@ fn spawn_strategy_engine(
                     metrics::histogram!("latency.book_latency_ms").record(latency_sample.book_latency_ms);
                     metrics::histogram!("latency.local_backlog_ms")
                         .record(latency_sample.local_backlog_ms);
+                    metrics::histogram!("latency.ref_decode_ms").record(latency_sample.ref_decode_ms);
                     let signal_start = Instant::now();
                     let signal = fair.evaluate(eval_tick, &book);
                     if signal.edge_bps_bid > 0.0 || signal.edge_bps_ask > 0.0 {
@@ -4086,6 +4098,7 @@ struct FeedLatencySample {
     source_latency_ms: f64,
     book_latency_ms: f64,
     local_backlog_ms: f64,
+    ref_decode_ms: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -4136,6 +4149,11 @@ fn estimate_feed_latency(tick: &RefTick, book: &BookTop) -> FeedLatencySample {
     // IMPORTANT: `source_latency_ms` is the external *reference* (CEX) tick latency proxy.
     // Do not mix in Polymarket book timestamps here; track book latency separately.
     let source_latency_ms = tick_ingest_ms;
+    let ref_decode_ms = if tick.recv_ts_local_ns > 0 && tick.ingest_ts_local_ns > 0 {
+        ((tick.ingest_ts_local_ns - tick.recv_ts_local_ns).max(0) as f64) / 1_000_000.0
+    } else {
+        0.0
+    };
 
     let latest_recv_ns = if book.recv_ts_local_ns > 0 {
         tick.recv_ts_local_ns.max(book.recv_ts_local_ns)
@@ -4154,6 +4172,7 @@ fn estimate_feed_latency(tick: &RefTick, book: &BookTop) -> FeedLatencySample {
         source_latency_ms,
         book_latency_ms: book_ingest_ms,
         local_backlog_ms,
+        ref_decode_ms,
     }
 }
 
@@ -6186,6 +6205,7 @@ mod tests {
             recv_ts_ms: now_ms - 200,
             event_ts_exchange_ms: now_ms - 300,
             recv_ts_local_ns: now - 200_000_000,
+            ingest_ts_local_ns: now - 200_000_000,
             price: 70_000.0,
         };
         let book = BookTop {

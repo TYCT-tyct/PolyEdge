@@ -139,6 +139,7 @@ mod tests {
             recv_ts_ms: ts,
             event_ts_exchange_ms: ts,
             recv_ts_local_ns: ts * 1_000_000,
+            ingest_ts_local_ns: ts * 1_000_000,
             price: px,
         }
     }
