@@ -227,6 +227,13 @@ async fn pick_best_ws_endpoint(endpoints: Vec<String>) -> Vec<String> {
     }
 
     results.sort_by(|a, b| a.1.total_cmp(&b.1));
+    for (ep, ms) in results.iter().take(8) {
+        tracing::info!(
+            endpoint = ep.as_str(),
+            handshake_ms = *ms,
+            "ws endpoint probe result"
+        );
+    }
     let best = results[0].0.clone();
     tracing::info!(
         endpoint = best.as_str(),
