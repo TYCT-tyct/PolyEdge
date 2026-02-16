@@ -1979,7 +1979,9 @@ fn spawn_market_feed(
 ) {
     const TS_INVERSION_TOLERANCE_MS: i64 = 250;
     const TS_BACKJUMP_RESET_MS: i64 = 5_000;
-    const BOOK_IDLE_TIMEOUT_MS: u64 = 1_000;
+    // If we see *no* market messages for this long, treat the WS stream as stuck and reconnect.
+    // Keep this comfortably above "normal quiet" to avoid hammering gamma discovery on reconnection.
+    const BOOK_IDLE_TIMEOUT_MS: u64 = 5_000;
     const RECONNECT_BASE_MS: u64 = 250;
     const RECONNECT_MAX_MS: u64 = 10_000;
     tokio::spawn(async move {
@@ -2003,13 +2005,12 @@ fn spawn_market_feed(
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                 continue;
             };
-            if reconnects > 0 {
-                tracing::info!(reconnects, "market feed reconnected");
-            }
-            reconnects = 0;
-
             let mut ingest_seq: u64 = 0;
             let mut last_source_ts_by_market: HashMap<String, i64> = HashMap::new();
+            // Only reset reconnect backoff once we observe actual book traffic (not just a successful
+            // handshake). This avoids a reconnect storm when discovery/WS is returning 200 but no
+            // updates are delivered.
+            let mut saw_any_book = false;
 
             loop {
                 let next = tokio::time::timeout(
@@ -2022,6 +2023,8 @@ fn spawn_market_feed(
                     Err(_) => {
                         tracing::warn!(
                             timeout_ms = BOOK_IDLE_TIMEOUT_MS,
+                            saw_any_book,
+                            reconnects,
                             "market feed idle timeout; reconnecting"
                         );
                         break;
@@ -2035,6 +2038,13 @@ fn spawn_market_feed(
 
                 match item {
                     Ok(book) => {
+                        if !saw_any_book {
+                            saw_any_book = true;
+                            if reconnects > 0 {
+                                tracing::info!(reconnects, "market feed reconnected");
+                            }
+                            reconnects = 0;
+                        }
                         ingest_seq = ingest_seq.saturating_add(1);
                         let source_ts = book.ts_ms;
                         let source_seq = source_ts.max(0) as u64;
