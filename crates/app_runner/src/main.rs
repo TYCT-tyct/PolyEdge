@@ -5712,10 +5712,29 @@ fn sha256_hex(input: &str) -> String {
 }
 
 fn count_jsonl_lines(path: &Path) -> i64 {
-    let Ok(raw) = fs::read_to_string(path) else {
+    // NOTE: do not use fs::read_to_string() here. Raw JSONL files can reach multiple GB and
+    // would OOM the process. This is a best-effort counter used for diagnostics only.
+    use std::io::Read as _;
+
+    let Ok(mut file) = std::fs::File::open(path) else {
         return 0;
     };
-    raw.lines().filter(|l| !l.trim().is_empty()).count() as i64
+    let mut buf = [0_u8; 64 * 1024];
+    let mut lines: i64 = 0;
+    loop {
+        let Ok(n) = file.read(&mut buf) else {
+            break;
+        };
+        if n == 0 {
+            break;
+        }
+        for &b in &buf[..n] {
+            if b == b'\n' {
+                lines = lines.saturating_add(1);
+            }
+        }
+    }
+    lines
 }
 
 #[derive(Debug)]

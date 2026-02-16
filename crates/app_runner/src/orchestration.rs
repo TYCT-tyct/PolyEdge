@@ -1,5 +1,74 @@
 use super::*;
 
+use std::io::{Read, Seek};
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Default)]
+struct JsonlTailCounter {
+    /// Current file path being tracked (bucketed by date).
+    path: PathBuf,
+    /// Byte offset we have already scanned up to.
+    offset: u64,
+    /// Cumulative line count observed since the current baseline/rotation.
+    lines: i64,
+}
+
+impl JsonlTailCounter {
+    fn tick(mut self, path: PathBuf) -> Self {
+        // If the date rolled over (or path otherwise changed), reset baseline.
+        if self.path != path {
+            self.path = path;
+            self.offset = 0;
+            self.lines = 0;
+        }
+
+        let Ok(meta) = fs::metadata(&self.path) else {
+            return self;
+        };
+        let len = meta.len();
+
+        // Baseline: do not scan historical data on startup. We only care about deltas while the
+        // current process is running to detect drops/gaps in the JSONL writer.
+        if self.offset == 0 {
+            self.offset = len;
+            return self;
+        }
+
+        // Handle truncation/rotation.
+        if len < self.offset {
+            self.offset = len;
+            self.lines = 0;
+            return self;
+        }
+
+        let Ok(mut file) = std::fs::File::open(&self.path) else {
+            return self;
+        };
+        if file.seek(std::io::SeekFrom::Start(self.offset)).is_err() {
+            return self;
+        }
+
+        let mut buf = [0_u8; 64 * 1024];
+        let mut added: i64 = 0;
+        loop {
+            let Ok(n) = file.read(&mut buf) else {
+                break;
+            };
+            if n == 0 {
+                break;
+            }
+            for &b in &buf[..n] {
+                if b == b'\n' {
+                    added = added.saturating_add(1);
+                }
+            }
+        }
+        self.lines = self.lines.saturating_add(added);
+        self.offset = len;
+        self
+    }
+}
+
 pub(super) fn spawn_periodic_report_persistor(
     stats: Arc<ShadowStats>,
     tox_state: Arc<RwLock<HashMap<String, MarketToxicState>>>,
@@ -49,11 +118,33 @@ pub(super) fn spawn_data_reconcile_task(
         let mut last_book_lines: i64 = 0;
         let mut last_ref_expected: i64 = 0;
         let mut last_book_expected: i64 = 0;
+        let mut ref_tail = JsonlTailCounter::default();
+        let mut book_tail = JsonlTailCounter::default();
         loop {
             interval.tick().await;
             let live = stats.build_live_report().await;
-            let ref_lines = count_jsonl_lines(&dataset_path("raw", "ref_ticks.jsonl"));
-            let book_lines = count_jsonl_lines(&dataset_path("raw", "book_tops.jsonl"));
+            let ref_path = dataset_path("raw", "ref_ticks.jsonl");
+            let book_path = dataset_path("raw", "book_tops.jsonl");
+            // Counting lines in multi-GB JSONL files must never allocate the whole file.
+            // We do a tail-based, incremental newline count in a blocking thread.
+            let (next_ref_tail, next_book_tail) = {
+                // We avoid moving the live state into the blocking closure so we can keep the
+                // current values on failure (panic/cancel).
+                let ref_state = ref_tail.clone();
+                let book_state = book_tail.clone();
+                match tokio::task::spawn_blocking(move || {
+                    (ref_state.tick(ref_path), book_state.tick(book_path))
+                })
+                .await
+                {
+                    Ok(v) => v,
+                    Err(_) => (ref_tail.clone(), book_tail.clone()),
+                }
+            };
+            ref_tail = next_ref_tail;
+            book_tail = next_book_tail;
+            let ref_lines = ref_tail.lines;
+            let book_lines = book_tail.lines;
             let ref_expected = live.ref_ticks_total as i64;
             let book_expected = live.book_ticks_total as i64;
             let baseline_reset = last_window_id == 0
