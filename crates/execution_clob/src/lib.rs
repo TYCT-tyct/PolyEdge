@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::{bail, Result};
@@ -49,7 +50,46 @@ impl ClobExecution {
         timeout: std::time::Duration,
     ) -> Self {
         let http = Client::builder()
+            // Keep the request budget bounded (engine must never hang on IO).
             .timeout(timeout)
+            // Connection pooling + keepalive to reduce RTT tail spikes.
+            .pool_max_idle_per_host(
+                std::env::var("POLYEDGE_HTTP_POOL_IDLE_PER_HOST")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(16)
+                    .max(1),
+            )
+            .pool_idle_timeout(Some(Duration::from_secs(
+                std::env::var("POLYEDGE_HTTP_POOL_IDLE_TIMEOUT_SEC")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(90)
+                    .max(5),
+            )))
+            .tcp_keepalive(Some(Duration::from_secs(
+                std::env::var("POLYEDGE_HTTP_TCP_KEEPALIVE_SEC")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(30)
+                    .max(5),
+            )))
+            // If the peer supports it (ALPN), this can cut head-of-line blocking.
+            .http2_keep_alive_interval(Some(Duration::from_secs(
+                std::env::var("POLYEDGE_HTTP2_KEEPALIVE_INTERVAL_SEC")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(30)
+                    .max(5),
+            )))
+            .http2_keep_alive_timeout(Duration::from_secs(
+                std::env::var("POLYEDGE_HTTP2_KEEPALIVE_TIMEOUT_SEC")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(10)
+                    .max(1),
+            ))
+            .http2_keep_alive_while_idle(true)
             .build()
             .unwrap_or_else(|_| Client::new());
         let ack_probe = std::env::var("POLYEDGE_ACK_ONLY_PROBE_URL")
@@ -67,6 +107,7 @@ impl ClobExecution {
                     counter: AtomicU64::new(0),
                 })
             });
+
         Self {
             mode,
             http,
@@ -102,6 +143,14 @@ impl ClobExecution {
             .values()
             .map(|o| o.intent.size * o.intent.price.abs())
             .sum()
+    }
+
+    /// Best-effort warmup for the internal HTTP client pool. Intended to run on startup so the
+    /// first order/ack path doesn't pay DNS+TLS handshake cost.
+    pub async fn prewarm_urls(&self, urls: &[String]) {
+        for url in urls {
+            let _ = self.http.get(url).send().await;
+        }
     }
 
     fn prune_expired_orders(&self) {

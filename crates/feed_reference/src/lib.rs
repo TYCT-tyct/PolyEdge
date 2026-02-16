@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use core_types::{DynStream, RefPriceFeed, RefPriceWsFeed, RefTick};
@@ -114,6 +114,7 @@ async fn run_binance_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> R
         .collect::<Vec<_>>()
         .join("/");
     let endpoint_candidates = binance_ws_endpoints(&streams);
+    let endpoint_candidates = pick_best_ws_endpoint(endpoint_candidates).await;
     let mut last_err: Option<anyhow::Error> = None;
     let mut ws = None;
 
@@ -183,6 +184,68 @@ async fn run_binance_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> R
     Ok(())
 }
 
+async fn pick_best_ws_endpoint(endpoints: Vec<String>) -> Vec<String> {
+    if endpoints.len() <= 1 {
+        return endpoints;
+    }
+
+    // Probe all candidates concurrently at startup and prefer the fastest handshake.
+    // This matters because some Binance hosts/ports resolve to different regions and DNS can
+    // change over time; we want a deterministic "fastest-first" order.
+    let timeout = Duration::from_secs(
+        std::env::var("POLYEDGE_WS_PROBE_TIMEOUT_SEC")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(3)
+            .max(1),
+    );
+
+    let mut join_set = tokio::task::JoinSet::new();
+    for ep in endpoints.iter().cloned() {
+        join_set.spawn(async move {
+            let started = Instant::now();
+            let ok = tokio::time::timeout(timeout, connect_async(&ep)).await;
+            match ok {
+                Ok(Ok((ws, _resp))) => {
+                    drop(ws);
+                    Some((ep, started.elapsed().as_secs_f64() * 1_000.0))
+                }
+                _ => None,
+            }
+        });
+    }
+
+    let mut results: Vec<(String, f64)> = Vec::new();
+    while let Some(res) = join_set.join_next().await {
+        if let Ok(Some(v)) = res {
+            results.push(v);
+        }
+    }
+
+    if results.is_empty() {
+        return endpoints;
+    }
+
+    results.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let best = results[0].0.clone();
+    tracing::info!(
+        endpoint = best.as_str(),
+        handshake_ms = results[0].1,
+        candidates = endpoints.len(),
+        "selected best ws endpoint by handshake latency"
+    );
+
+    // Return endpoints reordered: best first, then the rest in original order.
+    let mut out = Vec::with_capacity(endpoints.len());
+    out.push(best.clone());
+    for ep in endpoints {
+        if ep != best {
+            out.push(ep);
+        }
+    }
+    out
+}
+
 fn binance_ws_endpoints(streams: &str) -> Vec<String> {
     if let Ok(raw) = std::env::var("POLYEDGE_BINANCE_WS_BASES") {
         let endpoints = raw
@@ -206,9 +269,10 @@ fn binance_ws_endpoints(streams: &str) -> Vec<String> {
     }
 
     vec![
-        format!("wss://stream.binance.com/stream?streams={streams}"),
         format!("wss://stream.binance.com:9443/stream?streams={streams}"),
         format!("wss://data-stream.binance.vision/stream?streams={streams}"),
+        // Keep the default host as a fallback, but do not prefer it.
+        format!("wss://stream.binance.com/stream?streams={streams}"),
     ]
 }
 

@@ -1727,6 +1727,24 @@ async fn async_main() -> Result<()> {
         order_endpoint,
         Duration::from_millis(execution_cfg.http_timeout_ms),
     ));
+
+    // Optional: prewarm the execution HTTP client pool to reduce first-ack latency spikes.
+    // Uses the *same* reqwest client inside the execution layer (unlike ad-hoc curl probes).
+    if let Ok(raw) = std::env::var("POLYEDGE_HTTP_PREWARM_URLS") {
+        let urls = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>();
+        if !urls.is_empty() {
+            tracing::info!(count = urls.len(), "prewarming execution http pool");
+            let exec = execution.clone();
+            tokio::spawn(async move {
+                exec.prewarm_urls(&urls).await;
+            });
+        }
+    }
     let shadow = Arc::new(ShadowExecutor::default());
     let strategy_cfg = Arc::new(RwLock::new(Arc::new(load_strategy_config())));
     let fair_value_cfg = Arc::new(StdRwLock::new(load_fair_value_config()));
