@@ -78,3 +78,28 @@ position_fraction = 0.15
 min_quote_size = 1.0
 # For micro-live: loss <= -1U triggers pause+flatten (enforced only when live-armed).
 daily_loss_cap_usdc = 1.0
+
+# ===== Risk Controls (P2) =====
+
+[risk_controls]
+enabled = true
+
+[risk_controls.market_quality]
+# Filter out low-quality markets
+max_spread_bps = 150                  # Skip if spread > 1.5%
+min_survival_rate = 0.80              # Skip if market survival < 80%
+min_liquidity_usdc = 50.0             # Skip if best bid/ask < $50
+
+[risk_controls.exposure_limits]
+# Position size caps
+max_total_exposure_usdc = 50.0        # Total across all positions
+max_per_market_exposure_usdc = 5.0    # Per market ID
+max_per_symbol_exposure_usdc = 10.0   # Per underlying symbol
+max_concurrent_positions = 8          # Already in predator_c.router
+
+[risk_controls.kill_switch]
+# Automatic pause conditions
+max_daily_loss_usdc = 5.0             # Pause if daily loss > $5
+max_drawdown_pct = 0.20               # Pause if drawdown > 20%
+max_latency_p99_ms = 100.0            # Pause if p99 latency > 100ms
+min_execution_success_rate = 0.50     # Pause if success rate < 50%

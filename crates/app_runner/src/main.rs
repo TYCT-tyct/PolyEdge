@@ -4339,6 +4339,14 @@ fn should_replace_ref_tick(current: &RefTick, next: &RefTick) -> bool {
     if next_event > next.recv_ts_ms + 5_000 {
         return false;
     }
+
+    // Priority 1: Chainlink RTDS has <5ms latency, always prefer when timestamps are recent
+    if next.source == "chainlink_rtds" && next_event + 50 >= current_event {
+        return true;
+    }
+    if current.source == "chainlink_rtds" && current_event + 50 >= next_event {
+        return false;
+    }
     // Goal: "fastest observable tick" for latency-sensitive triggers.
     // Event timestamps across sources are not perfectly comparable, so we bias towards lower
     // `recv_ts_ms - event_ts_ms` latency (i.e. faster wire path), with a small guard against
