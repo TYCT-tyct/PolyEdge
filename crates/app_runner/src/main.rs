@@ -1021,6 +1021,17 @@ impl ShadowStats {
         window_id
     }
 
+    #[inline]
+    fn is_current_window_ts_ns(&self, ts_ns: i64) -> bool {
+        let started_at_ms = self.started_at_ms.load(Ordering::Relaxed);
+        if started_at_ms <= 0 {
+            return true;
+        }
+        let ts_ms = ts_ns / 1_000_000;
+        // 1ms tolerance for clock granularity and ordering jitter around reset.
+        ts_ms.saturating_add(1) >= started_at_ms
+    }
+
     async fn push_shot(&self, shot: ShadowShot) {
         let ingest_seq = next_normalized_ingest_seq();
         let source_seq = shot.t0_ns.max(0) as u64;
@@ -2503,6 +2514,18 @@ fn spawn_strategy_engine(
                         shared.shadow_stats.record_issue("tick_missing").await;
                         continue;
                     };
+                    let fusion_mode = {
+                        let fusion = shared.fusion_cfg.read().await;
+                        fusion.mode.clone()
+                    };
+                    if !fast_tick_allowed_in_fusion_mode(tick_fast.source.as_str(), &fusion_mode)
+                    {
+                        shared
+                            .shadow_stats
+                            .record_issue("tick_source_mode_mismatch")
+                            .await;
+                        continue;
+                    }
                     let tick_anchor = pick_latest_tick(&latest_anchor_ticks, &symbol);
                     if let Some(anchor) = tick_anchor {
                         let now_ms = Utc::now().timestamp_millis();
@@ -3865,6 +3888,10 @@ fn spawn_shadow_outcome_task(
 ) {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(shot.delay_ms)).await;
+        if !shared.shadow_stats.is_current_window_ts_ns(shot.t0_ns) {
+            metrics::counter!("shadow.outcome_window_mismatch").increment(1);
+            return;
+        }
 
         let book = shared
             .latest_books
@@ -3968,6 +3995,10 @@ fn spawn_shadow_outcome_task(
             attribution,
             ts_ns: now_ns(),
         };
+        if !shared.shadow_stats.is_current_window_ts_ns(outcome.ts_ns) {
+            metrics::counter!("shadow.outcome_window_mismatch").increment(1);
+            return;
+        }
         shared.shadow_stats.push_outcome(outcome.clone()).await;
         if shot.delay_ms == 10 {
             let exit_cfg = shared.exit_cfg.read().await.clone();
@@ -4764,6 +4795,16 @@ fn estimate_feed_latency(tick: &RefTick, book: &BookTop) -> FeedLatencySample {
 
 fn is_anchor_ref_source(source: &str) -> bool {
     source == "chainlink_rtds"
+}
+
+#[inline]
+fn fast_tick_allowed_in_fusion_mode(source: &str, mode: &str) -> bool {
+    match mode {
+        "udp_only" => source == "binance_udp",
+        "direct_only" => source != "binance_udp" && !is_anchor_ref_source(source),
+        // active_active and unknown future modes: allow all fast sources.
+        _ => true,
+    }
 }
 
 fn ref_event_ts_ms(tick: &RefTick) -> i64 {
