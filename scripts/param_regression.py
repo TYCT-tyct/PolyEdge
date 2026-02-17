@@ -71,6 +71,10 @@ PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "caution_threshold_grid": "0.65",
         "warmup_sec": 5,
         "max_estimated_sec": 900,
+        "walkforward_windows": 2,
+        "walkforward_cooldown_sec": 2.0,
+        "selection_mode": "robust",
+        "top_k_consensus": 3,
     },
     "standard": {
         "window_sec": 300,
@@ -98,6 +102,10 @@ PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "caution_threshold_grid": "0.65",
         "warmup_sec": 15,
         "max_estimated_sec": 0,
+        "walkforward_windows": 2,
+        "walkforward_cooldown_sec": 3.0,
+        "selection_mode": "robust",
+        "top_k_consensus": 3,
     },
     "deep": {
         "window_sec": 600,
@@ -125,6 +133,10 @@ PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "caution_threshold_grid": "0.60,0.65",
         "warmup_sec": 20,
         "max_estimated_sec": 0,
+        "walkforward_windows": 3,
+        "walkforward_cooldown_sec": 5.0,
+        "selection_mode": "robust",
+        "top_k_consensus": 5,
     },
 }
 
@@ -189,6 +201,9 @@ class TrialResult:
     net_edge_p50_bps: float
     gate_fail_reasons: List[str]
     blocked_reason_top: str
+    walkforward_windows: int = 1
+    stability_penalty: float = 0.0
+    consistency_score: float = 1.0
 
     def gate_pass(self) -> bool:
         return (
@@ -211,6 +226,7 @@ class TrialResult:
 
 def score_trial(row: TrialResult) -> float:
     """Single-score ranking used for best trial selection in reports."""
+    objective = objective_ev_net_penalty(row)
     score = 0.0
     if row.gate_ready:
         score += 200.0
@@ -223,14 +239,218 @@ def score_trial(row: TrialResult) -> float:
     score += row.pnl_10s_p50_bps_robust * 0.2
     score += row.fillability_10ms * 100.0
     score += row.net_edge_p50_bps * 0.1
+    score += row.consistency_score * 80.0
     score -= row.quote_block_ratio * 300.0
     score -= row.policy_block_ratio * 120.0
     score -= row.tick_to_ack_p99_ms * 0.2
     score -= row.feed_in_p99_ms * 0.05
     score -= row.decision_compute_p99_ms * 20.0
+    score -= row.stability_penalty
     score -= max(0.0, 0.999 - row.data_valid_ratio) * 10_000.0
     score -= max(0.0, 0.60 - row.executed_over_eligible) * 500.0
+    score += objective * 120.0
     return score
+
+
+def objective_penalty(row: TrialResult) -> float:
+    penalty = 0.0
+    penalty += max(0.0, row.tick_to_ack_p99_ms - 450.0) * 0.00002
+    penalty += max(0.0, row.decision_compute_p99_ms - 2.0) * 0.05
+    penalty += max(0.0, row.feed_in_p99_ms - 800.0) * 0.000005
+    penalty += max(0.0, row.quote_block_ratio - 0.10) * 0.20
+    penalty += max(0.0, row.policy_block_ratio - 0.10) * 0.20
+    penalty += max(0.0, 0.60 - row.executed_over_eligible) * 0.50
+    penalty += max(0.0, 0.999 - row.data_valid_ratio) * 80.0
+    penalty += row.stability_penalty * 0.01
+    if not row.gate_pass():
+        penalty += 0.20
+    return penalty
+
+
+def objective_ev_net_penalty(row: TrialResult) -> float:
+    return row.ev_net_usdc_p50 - objective_penalty(row)
+
+
+def aggregate_walkforward_results(
+    run_id: str,
+    trial_index: int,
+    windows: List[TrialResult],
+    selection_mode: str,
+) -> TrialResult:
+    if not windows:
+        raise ValueError("walkforward windows must not be empty")
+
+    mode = selection_mode.strip().lower()
+    if mode not in {"score", "robust"}:
+        mode = "robust"
+
+    def as_list(field: str) -> List[float]:
+        return [float(getattr(w, field)) for w in windows]
+
+    def aggregate_good(field: str) -> float:
+        values = as_list(field)
+        q = 0.50 if mode == "score" else 0.25
+        return percentile(values, q)
+
+    def aggregate_bad(field: str) -> float:
+        values = as_list(field)
+        q = 0.50 if mode == "score" else 0.75
+        return percentile(values, q)
+
+    def span(values: List[float]) -> float:
+        return max(values) - min(values) if values else 0.0
+
+    basis = windows[0]
+    gate_ready_vals = [1.0 if w.gate_ready else 0.0 for w in windows]
+    ev_vals = as_list("ev_net_usdc_p50")
+    markout_vals = as_list("net_markout_10s_usdc_p50")
+    ack_vals = as_list("tick_to_ack_p99_ms")
+    block_vals = as_list("quote_block_ratio")
+    exec_vals = as_list("executed_over_eligible")
+    data_valid_vals = as_list("data_valid_ratio")
+    unique_reasons = sorted({r for w in windows for r in w.gate_fail_reasons})
+    blocked_by_row = sorted(
+        windows,
+        key=lambda w: (
+            w.quote_block_ratio + w.policy_block_ratio,
+            w.tick_to_ack_p99_ms,
+            -w.ev_net_usdc_p50,
+        ),
+        reverse=True,
+    )
+
+    stability_penalty = (
+        span(ev_vals) * 60.0
+        + span(markout_vals) * 80.0
+        + span(ack_vals) * 0.15
+        + span(block_vals) * 320.0
+        + max(0.0, 0.999 - min(data_valid_vals)) * 30_000.0
+        + max(0.0, 0.60 - min(exec_vals)) * 800.0
+    )
+    consistency_score = 1.0 / (1.0 + (stability_penalty / 200.0))
+
+    if mode == "robust":
+        gate_ready = all(w.gate_ready for w in windows)
+    else:
+        gate_ready = bool(percentile(gate_ready_vals, 0.50) >= 1.0)
+
+    return TrialResult(
+        run_id=run_id,
+        trial_index=trial_index,
+        min_edge_bps=basis.min_edge_bps,
+        ttl_ms=basis.ttl_ms,
+        max_spread=basis.max_spread,
+        base_quote_size=basis.base_quote_size,
+        min_eval_notional_usdc=basis.min_eval_notional_usdc,
+        min_expected_edge_usdc=basis.min_expected_edge_usdc,
+        taker_trigger_bps=basis.taker_trigger_bps,
+        taker_max_slippage_bps=basis.taker_max_slippage_bps,
+        stale_tick_filter_ms=basis.stale_tick_filter_ms,
+        market_tier_profile=basis.market_tier_profile,
+        active_top_n_markets=basis.active_top_n_markets,
+        basis_k_revert=basis.basis_k_revert,
+        basis_z_cap=basis.basis_z_cap,
+        safe_threshold=basis.safe_threshold,
+        caution_threshold=basis.caution_threshold,
+        window_id=windows[-1].window_id,
+        gate_ready=gate_ready,
+        samples=sum(w.samples for w in windows),
+        fillability_10ms=aggregate_good("fillability_10ms"),
+        pnl_10s_p50_bps_raw=aggregate_good("pnl_10s_p50_bps_raw"),
+        pnl_10s_p50_bps_robust=aggregate_good("pnl_10s_p50_bps_robust"),
+        pnl_10s_p25_bps_robust=min(as_list("pnl_10s_p25_bps_robust")),
+        ev_net_usdc_p50=aggregate_good("ev_net_usdc_p50"),
+        ev_net_usdc_p10=min(as_list("ev_net_usdc_p10")),
+        ev_positive_ratio=aggregate_good("ev_positive_ratio"),
+        net_markout_10s_usdc_p50=aggregate_good("net_markout_10s_usdc_p50"),
+        roi_notional_10s_bps_p50=aggregate_good("roi_notional_10s_bps_p50"),
+        eligible_count=int(aggregate_good("eligible_count")),
+        executed_count=int(aggregate_good("executed_count")),
+        executed_over_eligible=aggregate_good("executed_over_eligible"),
+        quote_block_ratio=aggregate_bad("quote_block_ratio"),
+        policy_block_ratio=aggregate_bad("policy_block_ratio"),
+        tick_to_ack_p99_ms=aggregate_bad("tick_to_ack_p99_ms"),
+        decision_compute_p99_ms=aggregate_bad("decision_compute_p99_ms"),
+        feed_in_p99_ms=aggregate_bad("feed_in_p99_ms"),
+        data_valid_ratio=aggregate_good("data_valid_ratio"),
+        net_edge_p50_bps=aggregate_good("net_edge_p50_bps"),
+        gate_fail_reasons=unique_reasons,
+        blocked_reason_top=blocked_by_row[0].blocked_reason_top if blocked_by_row else "",
+        walkforward_windows=len(windows),
+        stability_penalty=stability_penalty,
+        consistency_score=consistency_score,
+    )
+
+
+def build_consensus_params(rows: List[TrialResult], top_k: int) -> Dict[str, Any]:
+    if not rows:
+        return {}
+
+    preferred = [row for row in rows if row.gate_pass()]
+    if not preferred:
+        preferred = [row for row in rows if row.gate_ready]
+    if not preferred:
+        preferred = rows
+    chosen = preferred[: max(1, top_k)]
+
+    def median(values: List[float]) -> float:
+        return percentile(values, 0.50)
+
+    def medf(field: str) -> float:
+        return median([float(getattr(row, field)) for row in chosen])
+
+    def medi(field: str) -> int:
+        return int(round(medf(field)))
+
+    first = chosen[0]
+    return {
+        "source_trial_indices": [row.trial_index for row in chosen],
+        "selection_count": len(chosen),
+        "reload_strategy": {
+            "min_edge_bps": medf("min_edge_bps"),
+            "ttl_ms": medi("ttl_ms"),
+            "max_spread": medf("max_spread"),
+            "base_quote_size": medf("base_quote_size"),
+            "min_eval_notional_usdc": medf("min_eval_notional_usdc"),
+            "min_expected_edge_usdc": medf("min_expected_edge_usdc"),
+            "basis_k_revert": medf("basis_k_revert"),
+            "basis_z_cap": medf("basis_z_cap"),
+        },
+        "reload_taker": {
+            "trigger_bps": medf("taker_trigger_bps"),
+            "max_slippage_bps": medf("taker_max_slippage_bps"),
+            "stale_tick_filter_ms": medf("stale_tick_filter_ms"),
+            "market_tier_profile": first.market_tier_profile,
+        },
+        "reload_allocator": {
+            "capital_fraction_kelly": 0.35,
+            "variance_penalty_lambda": 0.25,
+            "active_top_n_markets": medi("active_top_n_markets"),
+            "taker_weight": 0.7,
+            "maker_weight": 0.2,
+            "arb_weight": 0.1,
+        },
+        "reload_toxicity": {
+            "safe_threshold": medf("safe_threshold"),
+            "caution_threshold": medf("caution_threshold"),
+        },
+    }
+
+
+def write_auto_tuned_thresholds(
+    path: Path,
+    rows: List[TrialResult],
+    top_k: int,
+) -> Dict[str, Any]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "optimizer": "top-k-consensus",
+        "top_k": max(1, top_k),
+        "consensus": build_consensus_params(rows, top_k),
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+    return payload
 
 
 def fetch_json(
@@ -526,6 +746,12 @@ def write_ablation_csv(path: Path, rows: Iterable[TrialResult]) -> None:
                 "feed_in_p99_ms",
                 "data_valid_ratio",
                 "net_edge_p50_bps",
+                "walkforward_windows",
+                "consistency_score",
+                "stability_penalty",
+                "objective_penalty",
+                "objective_ev_net_penalty",
+                "score",
                 "gate_pass",
                 "blocked_reason_top",
             ]
@@ -572,6 +798,12 @@ def write_ablation_csv(path: Path, rows: Iterable[TrialResult]) -> None:
                     f"{row.feed_in_p99_ms:.6f}",
                     f"{row.data_valid_ratio:.6f}",
                     f"{row.net_edge_p50_bps:.6f}",
+                    row.walkforward_windows,
+                    f"{row.consistency_score:.6f}",
+                    f"{row.stability_penalty:.6f}",
+                    f"{objective_penalty(row):.6f}",
+                    f"{objective_ev_net_penalty(row):.6f}",
+                    f"{score_trial(row):.6f}",
                     row.gate_pass(),
                     row.blocked_reason_top,
                 ]
@@ -588,8 +820,12 @@ def write_summary_md(path: Path, rows: List[TrialResult]) -> None:
     if rows:
         best = rows[0]
         lines.append(f"- best_score: {score_trial(best):.3f}")
+        lines.append(f"- best_objective_ev_net_penalty: {objective_ev_net_penalty(best):.6f}")
         lines.append(f"- best_gate_pass: {best.gate_pass()}")
         lines.append(f"- best_gate_ready: {best.gate_ready}")
+        lines.append(f"- best_walkforward_windows: {best.walkforward_windows}")
+        lines.append(f"- best_consistency_score: {best.consistency_score:.3f}")
+        lines.append(f"- best_stability_penalty: {best.stability_penalty:.3f}")
         lines.append(
             f"- best_params: edge={best.min_edge_bps}, ttl={best.ttl_ms}, base_quote={best.base_quote_size}, "
             f"min_eval_notional={best.min_eval_notional_usdc}, "
@@ -616,7 +852,11 @@ def write_summary_md(path: Path, rows: List[TrialResult]) -> None:
                 f"fill10={row.fillability_10ms:.3f}, block={row.quote_block_ratio:.3f}, "
                 f"exec_over_eligible={row.executed_over_eligible:.3f}, "
                 f"ready={row.gate_ready}, "
-                f"tick_to_ack_p99={row.tick_to_ack_p99_ms:.3f}, gate={row.gate_pass()}"
+                f"tick_to_ack_p99={row.tick_to_ack_p99_ms:.3f}, "
+                f"wf={row.walkforward_windows}, "
+                f"consistency={row.consistency_score:.3f}, "
+                f"objective={objective_ev_net_penalty(row):.6f}, "
+                f"score={score_trial(row):.2f}, gate={row.gate_pass()}"
             )
         if row.blocked_reason_top:
             lines.append(f"  blocked_top: {row.blocked_reason_top}")
@@ -700,6 +940,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--safe-threshold-grid", default=None)
     p.add_argument("--caution-threshold-grid", default=None)
     p.add_argument("--warmup-sec", type=int, default=None)
+    p.add_argument(
+        "--selection-mode",
+        choices=["score", "robust"],
+        default=None,
+        help="score=median ranking, robust=conservative walk-forward aggregation",
+    )
+    p.add_argument("--walkforward-windows", type=int, default=None)
+    p.add_argument("--walkforward-cooldown-sec", type=float, default=None)
+    p.add_argument(
+        "--top-k-consensus",
+        type=int,
+        default=None,
+        help="Use top-K ranked trials to build consensus auto-tuned thresholds",
+    )
     p.add_argument(
         "--max-estimated-sec",
         type=int,
@@ -827,7 +1081,15 @@ def main() -> int:
                 continue
             combos.append(row)
 
-    per_trial_sec = max(1, int(args.warmup_sec + min(args.window_sec, args.eval_window_sec)))
+    single_window_sec = max(1, int(args.warmup_sec + min(args.window_sec, args.eval_window_sec)))
+    per_trial_sec = max(
+        1,
+        int(
+            single_window_sec * max(1, int(args.walkforward_windows))
+            + max(0.0, float(args.walkforward_cooldown_sec))
+            * max(0, int(args.walkforward_windows) - 1)
+        ),
+    )
     estimated_full_sec = per_trial_sec * len(combos)
     if args.max_estimated_sec and args.max_estimated_sec > 0 and estimated_full_sec > args.max_estimated_sec:
         allowed_trials = max(1, int(args.max_estimated_sec // per_trial_sec))
@@ -840,7 +1102,8 @@ def main() -> int:
             estimated_full_sec = per_trial_sec * len(combos)
     print(
         f"[profile] {args.profile} trials={len(combos)} per_trial~{per_trial_sec}s "
-        f"estimated~{estimated_full_sec}s max_runtime={args.max_runtime_sec}s"
+        f"estimated~{estimated_full_sec}s max_runtime={args.max_runtime_sec}s "
+        f"mode={args.selection_mode} wf_windows={args.walkforward_windows}"
     )
 
     rows: List[TrialResult] = []
@@ -870,32 +1133,53 @@ def main() -> int:
             f"taker_trigger={taker_trigger_bps} taker_slip={taker_max_slippage_bps} "
             f"k={k} z={z} safe={safe} caution={caution}"
         )
-        row = run_trial(
-            session=session,
-            base_url=args.base_url,
+        window_rows: List[TrialResult] = []
+        for wf_idx in range(max(1, int(args.walkforward_windows))):
+            if args.max_runtime_sec > 0 and (time.monotonic() - started) >= args.max_runtime_sec:
+                print("[stop] max-runtime-sec reached while running walk-forward windows")
+                break
+            print(
+                f"[trial {idx}/{len(combos)} window {wf_idx + 1}/{max(1, int(args.walkforward_windows))}] "
+                f"running..."
+            )
+            row_window = run_trial(
+                session=session,
+                base_url=args.base_url,
+                run_id=args.run_id,
+                trial_index=idx,
+                min_outcomes=args.min_outcomes,
+                eval_window_sec=args.eval_window_sec,
+                heartbeat_sec=args.heartbeat_sec,
+                window_sec=args.window_sec,
+                poll_interval_sec=args.poll_interval_sec,
+                min_edge_bps=edge,
+                ttl_ms=ttl,
+                max_spread=max_spread,
+                base_quote_size=base_quote_size,
+                min_eval_notional_usdc=min_eval_notional_usdc,
+                min_expected_edge_usdc=min_expected_edge_usdc,
+                taker_trigger_bps=taker_trigger_bps,
+                taker_max_slippage_bps=taker_max_slippage_bps,
+                stale_tick_filter_ms=float(args.stale_tick_filter_ms),
+                market_tier_profile=str(args.market_tier_profile),
+                active_top_n_markets=int(args.active_top_n_markets),
+                basis_k_revert=k,
+                basis_z_cap=z,
+                safe_threshold=safe,
+                caution_threshold=caution,
+                warmup_sec=args.warmup_sec,
+            )
+            window_rows.append(row_window)
+            if wf_idx + 1 < max(1, int(args.walkforward_windows)):
+                time.sleep(max(0.0, float(args.walkforward_cooldown_sec)))
+
+        if not window_rows:
+            break
+        row = aggregate_walkforward_results(
             run_id=args.run_id,
             trial_index=idx,
-            min_outcomes=args.min_outcomes,
-            eval_window_sec=args.eval_window_sec,
-            heartbeat_sec=args.heartbeat_sec,
-            window_sec=args.window_sec,
-            poll_interval_sec=args.poll_interval_sec,
-            min_edge_bps=edge,
-            ttl_ms=ttl,
-            max_spread=max_spread,
-            base_quote_size=base_quote_size,
-            min_eval_notional_usdc=min_eval_notional_usdc,
-            min_expected_edge_usdc=min_expected_edge_usdc,
-            taker_trigger_bps=taker_trigger_bps,
-            taker_max_slippage_bps=taker_max_slippage_bps,
-            stale_tick_filter_ms=float(args.stale_tick_filter_ms),
-            market_tier_profile=str(args.market_tier_profile),
-            active_top_n_markets=int(args.active_top_n_markets),
-            basis_k_revert=k,
-            basis_z_cap=z,
-            safe_threshold=safe,
-            caution_threshold=caution,
-            warmup_sec=args.warmup_sec,
+            windows=window_rows,
+            selection_mode=str(args.selection_mode),
         )
         rows.append(row)
         consecutive_failures = 0 if row.gate_pass() else consecutive_failures + 1
@@ -905,21 +1189,7 @@ def main() -> int:
             )
             break
 
-    rows.sort(
-        key=lambda r: (
-            r.gate_pass(),
-            r.gate_ready,
-            r.ev_net_usdc_p50,
-            r.ev_positive_ratio,
-            r.executed_over_eligible,
-            r.net_markout_10s_usdc_p50,
-            r.roi_notional_10s_bps_p50,
-            r.fillability_10ms,
-            -r.quote_block_ratio,
-            -r.tick_to_ack_p99_ms,
-        ),
-        reverse=True,
-    )
+    rows.sort(key=score_trial, reverse=True)
 
     ablation_path = run_dir / "ablation_toxicity.csv"
     summary_path = run_dir / "regression_summary.md"
@@ -927,6 +1197,8 @@ def main() -> int:
     write_ablation_csv(ablation_path, rows)
     write_summary_md(summary_path, rows)
     write_fixlist(fixlist_path, rows[0] if rows else None)
+    auto_tuned_path = run_dir / "auto_tuned_thresholds.json"
+    auto_tuned = write_auto_tuned_thresholds(auto_tuned_path, rows, int(args.top_k_consensus))
 
     out_json = run_dir / "regression_summary.json"
     best = rows[0] if rows else None
@@ -937,7 +1209,10 @@ def main() -> int:
                 "run_id": args.run_id,
                 "min_outcomes": args.min_outcomes,
                 "eval_window_sec": args.eval_window_sec,
+                "selection_mode": args.selection_mode,
+                "walkforward_windows": args.walkforward_windows,
                 "best_score": score_trial(best) if best else None,
+                "best_objective_ev_net_penalty": objective_ev_net_penalty(best) if best else None,
                 "best_pass": best.gate_pass() if best else None,
                 "best_gate_ready": best.gate_ready if best else None,
                 "best_params": (
@@ -957,11 +1232,25 @@ def main() -> int:
                         "safe_threshold": best.safe_threshold,
                         "caution_threshold": best.caution_threshold,
                         "policy_block_ratio": best.policy_block_ratio,
+                        "walkforward_windows": best.walkforward_windows,
+                        "consistency_score": best.consistency_score,
+                        "stability_penalty": best.stability_penalty,
+                        "objective_penalty": objective_penalty(best),
+                        "objective_ev_net_penalty": objective_ev_net_penalty(best),
                     }
                     if best
                     else None
                 ),
-                "trials": [row.__dict__ | {"gate_pass": row.gate_pass()} for row in rows],
+                "auto_tuned_thresholds": auto_tuned,
+                "trials": [
+                    row.__dict__
+                    | {
+                        "gate_pass": row.gate_pass(),
+                        "objective_penalty": objective_penalty(row),
+                        "objective_ev_net_penalty": objective_ev_net_penalty(row),
+                    }
+                    for row in rows
+                ],
             },
             ensure_ascii=True,
             indent=2,
@@ -971,6 +1260,7 @@ def main() -> int:
     print(f"wrote={ablation_path}")
     print(f"wrote={summary_path}")
     print(f"wrote={fixlist_path}")
+    print(f"wrote={auto_tuned_path}")
     print(f"wrote={out_json}")
     return 0
 
