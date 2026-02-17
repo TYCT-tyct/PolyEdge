@@ -151,6 +151,9 @@ struct EngineShared {
     http: Client,
     clob_endpoint: String,
     strategy_cfg: Arc<RwLock<Arc<MakerConfig>>>,
+    fusion_cfg: Arc<RwLock<FusionConfig>>,
+    edge_model_cfg: Arc<RwLock<EdgeModelConfig>>,
+    exit_cfg: Arc<RwLock<ExitConfig>>,
     fair_value_cfg: Arc<StdRwLock<BasisMrConfig>>,
     toxicity_cfg: Arc<RwLock<Arc<ToxicityConfig>>>,
     risk_manager: Arc<DefaultRiskManager>,
@@ -193,6 +196,34 @@ struct StrategyReloadReq {
     variance_penalty_lambda: Option<f64>,
     min_eval_notional_usdc: Option<f64>,
     min_expected_edge_usdc: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FusionReloadReq {
+    enable_udp: Option<bool>,
+    mode: Option<String>,
+    udp_port: Option<u16>,
+    dedupe_window_ms: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EdgeModelReloadReq {
+    model: Option<String>,
+    gate_mode: Option<String>,
+    version: Option<String>,
+    base_gate_bps: Option<f64>,
+    congestion_penalty_bps: Option<f64>,
+    latency_penalty_bps: Option<f64>,
+    fail_cost_bps: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExitReloadReq {
+    enabled: Option<bool>,
+    time_stop_ms: Option<u64>,
+    edge_decay_bps: Option<f64>,
+    adverse_move_bps: Option<f64>,
+    flatten_on_trigger: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -293,6 +324,71 @@ struct PerfProfileReloadReq {
     io_queue_capacity: Option<usize>,
     json_mode: Option<String>,
     io_drop_on_full: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FusionConfig {
+    enable_udp: bool,
+    mode: String,
+    udp_port: u16,
+    dedupe_window_ms: i64,
+}
+
+impl Default for FusionConfig {
+    fn default() -> Self {
+        Self {
+            enable_udp: true,
+            mode: "active_active".to_string(),
+            udp_port: 6666,
+            dedupe_window_ms: 30,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EdgeModelConfig {
+    model: String,
+    gate_mode: String,
+    version: String,
+    base_gate_bps: f64,
+    congestion_penalty_bps: f64,
+    latency_penalty_bps: f64,
+    fail_cost_bps: f64,
+}
+
+impl Default for EdgeModelConfig {
+    fn default() -> Self {
+        Self {
+            model: "ev_net".to_string(),
+            gate_mode: "dynamic".to_string(),
+            version: "v2-ev-net".to_string(),
+            base_gate_bps: 0.0,
+            congestion_penalty_bps: 2.0,
+            latency_penalty_bps: 2.0,
+            fail_cost_bps: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExitConfig {
+    enabled: bool,
+    time_stop_ms: u64,
+    edge_decay_bps: f64,
+    adverse_move_bps: f64,
+    flatten_on_trigger: bool,
+}
+
+impl Default for ExitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            time_stop_ms: 2_000,
+            edge_decay_bps: -2.0,
+            adverse_move_bps: -8.0,
+            flatten_on_trigger: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -617,6 +713,7 @@ struct ShadowLiveReport {
     decision_compute_p99_ms: f64,
     source_latency_p99_ms: f64,
     local_backlog_p99_ms: f64,
+    lag_half_life_ms: f64,
     ack_only_p50_ms: f64,
     ack_only_p90_ms: f64,
     ack_only_p99_ms: f64,
@@ -633,6 +730,9 @@ struct ShadowLiveReport {
     survival_10ms_by_symbol: HashMap<String, f64>,
     survival_probe_10ms_by_symbol: HashMap<String, f64>,
     blocked_reason_counts: HashMap<String, u64>,
+    source_mix_ratio: HashMap<String, f64>,
+    exit_reason_top: Vec<(String, u64)>,
+    edge_model_version: String,
     latency: LatencyBreakdown,
     market_scorecard: Vec<MarketScoreRow>,
     predator_c_enabled: bool,
@@ -747,8 +847,11 @@ struct ShadowStats {
     executed_count: AtomicU64,
     filled_count: AtomicU64,
     blocked_reasons: RwLock<HashMap<String, u64>>,
+    exit_reasons: RwLock<HashMap<String, u64>>,
     ref_ticks_total: AtomicU64,
     book_ticks_total: AtomicU64,
+    ref_source_counts: RwLock<HashMap<String, u64>>,
+    ref_dedupe_dropped: AtomicU64,
     last_ref_tick_ms: AtomicI64,
     last_book_tick_ms: AtomicI64,
     shots: RwLock<Vec<ShadowShot>>,
@@ -823,8 +926,11 @@ impl ShadowStats {
             executed_count: AtomicU64::new(0),
             filled_count: AtomicU64::new(0),
             blocked_reasons: RwLock::new(HashMap::new()),
+            exit_reasons: RwLock::new(HashMap::new()),
             ref_ticks_total: AtomicU64::new(0),
             book_ticks_total: AtomicU64::new(0),
+            ref_source_counts: RwLock::new(HashMap::new()),
+            ref_dedupe_dropped: AtomicU64::new(0),
             last_ref_tick_ms: AtomicI64::new(0),
             last_book_tick_ms: AtomicI64::new(0),
             shots: RwLock::new(Vec::new()),
@@ -876,9 +982,12 @@ impl ShadowStats {
         self.filled_count.store(0, Ordering::Relaxed);
         self.ref_ticks_total.store(0, Ordering::Relaxed);
         self.book_ticks_total.store(0, Ordering::Relaxed);
+        self.ref_dedupe_dropped.store(0, Ordering::Relaxed);
         self.last_ref_tick_ms.store(0, Ordering::Relaxed);
         self.last_book_tick_ms.store(0, Ordering::Relaxed);
         self.blocked_reasons.write().await.clear();
+        self.exit_reasons.write().await.clear();
+        self.ref_source_counts.write().await.clear();
         self.shots.write().await.clear();
         self.outcomes.write().await.clear();
         *self.samples.write().await = ShadowSamples::default();
@@ -1110,9 +1219,15 @@ impl ShadowStats {
         *reasons.entry(reason.to_string()).or_insert(0) += 1;
     }
 
-    fn mark_ref_tick(&self, ts_ms: i64) {
+    async fn mark_ref_tick(&self, source: &str, ts_ms: i64) {
         self.ref_ticks_total.fetch_add(1, Ordering::Relaxed);
         self.last_ref_tick_ms.store(ts_ms, Ordering::Relaxed);
+        let mut counts = self.ref_source_counts.write().await;
+        *counts.entry(source.to_string()).or_insert(0) += 1;
+    }
+
+    fn mark_ref_dedupe_dropped(&self) {
+        self.ref_dedupe_dropped.fetch_add(1, Ordering::Relaxed);
     }
 
     fn mark_book_tick(&self, ts_ms: i64) {
@@ -1133,6 +1248,11 @@ impl ShadowStats {
 
     fn mark_stale_tick_dropped(&self) {
         self.stale_tick_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    async fn record_exit_reason(&self, reason: &str) {
+        let mut reasons = self.exit_reasons.write().await;
+        *reasons.entry(reason.to_string()).or_insert(0) += 1;
     }
 
     fn observe_only(&self) -> bool {
@@ -1246,7 +1366,9 @@ impl ShadowStats {
             io_queue_depth,
         } = self.samples.read().await.clone();
         let book_top_lag_by_symbol_ms = self.book_top_lag_by_symbol_ms.read().await.clone();
-        let blocked_reason_counts = self.blocked_reasons.read().await.clone();
+        let mut blocked_reason_counts = self.blocked_reasons.read().await.clone();
+        let source_counts = self.ref_source_counts.read().await.clone();
+        let exit_reason_counts = self.exit_reasons.read().await.clone();
         let survival_probe_overall = *self.survival_probe_overall.read().await;
         let survival_probe_by_symbol = self.survival_probe_by_symbol.read().await.clone();
         let elapsed = self.started_at.read().await.elapsed();
@@ -1372,6 +1494,28 @@ impl ShadowStats {
         } else {
             stale_tick_dropped as f64 / data_total as f64
         };
+        let dedupe_dropped = self.ref_dedupe_dropped.load(Ordering::Relaxed);
+        if dedupe_dropped > 0 {
+            blocked_reason_counts.insert("ref_dedupe_dropped".to_string(), dedupe_dropped);
+        }
+        let mut source_mix_ratio = HashMap::new();
+        if ref_ticks_total > 0 {
+            for (source, cnt) in &source_counts {
+                source_mix_ratio.insert(source.clone(), (*cnt as f64 / ref_ticks_total as f64).clamp(0.0, 1.0));
+            }
+        }
+        let mut exit_reason_top = exit_reason_counts.into_iter().collect::<Vec<_>>();
+        exit_reason_top.sort_by(|a, b| b.1.cmp(&a.1));
+        exit_reason_top.truncate(8);
+        let lag_half_life_ms = percentile(
+            &book_top_lag_ms
+                .iter()
+                .copied()
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .collect::<Vec<_>>(),
+            0.50,
+        )
+        .unwrap_or(0.0);
 
         let book_top_lag_p50_ms = percentile(&book_top_lag_ms, 0.50).unwrap_or(0.0);
         let book_top_lag_p90_ms = percentile(&book_top_lag_ms, 0.90).unwrap_or(0.0);
@@ -1553,6 +1697,7 @@ impl ShadowStats {
             decision_compute_p99_ms: latency.decision_compute_p99_ms,
             source_latency_p99_ms: latency.source_latency_p99_ms,
             local_backlog_p99_ms: latency.local_backlog_p99_ms,
+            lag_half_life_ms,
             ack_only_p50_ms: latency.ack_only_p50_ms,
             ack_only_p90_ms: latency.ack_only_p90_ms,
             ack_only_p99_ms: latency.ack_only_p99_ms,
@@ -1569,6 +1714,9 @@ impl ShadowStats {
             survival_10ms_by_symbol,
             survival_probe_10ms_by_symbol,
             blocked_reason_counts,
+            source_mix_ratio,
+            exit_reason_top,
+            edge_model_version: "unknown".to_string(),
             latency,
             market_scorecard: scorecard,
             predator_c_enabled,
@@ -1760,6 +1908,9 @@ async fn async_main() -> Result<()> {
     }
     let shadow = Arc::new(ShadowExecutor::default());
     let strategy_cfg = Arc::new(RwLock::new(Arc::new(load_strategy_config())));
+    let fusion_cfg = Arc::new(RwLock::new(load_fusion_config()));
+    let edge_model_cfg = Arc::new(RwLock::new(load_edge_model_config()));
+    let exit_cfg = Arc::new(RwLock::new(load_exit_config()));
     let fair_value_cfg = Arc::new(StdRwLock::new(load_fair_value_config()));
     let toxicity_cfg = Arc::new(RwLock::new(Arc::new(ToxicityConfig::default())));
     let risk_limits = Arc::new(StdRwLock::new(load_risk_limits_config()));
@@ -1817,6 +1968,9 @@ async fn async_main() -> Result<()> {
         http: Client::new(),
         clob_endpoint: execution_cfg.clob_endpoint.clone(),
         strategy_cfg,
+        fusion_cfg: fusion_cfg.clone(),
+        edge_model_cfg: edge_model_cfg.clone(),
+        exit_cfg: exit_cfg.clone(),
         fair_value_cfg,
         toxicity_cfg,
         risk_manager,
@@ -1857,6 +2011,7 @@ async fn async_main() -> Result<()> {
         bus.clone(),
         shared.shadow_stats.clone(),
         (*universe_symbols).clone(),
+        shared.fusion_cfg.clone(),
     );
     spawn_market_feed(
         bus.clone(),
@@ -1897,36 +2052,86 @@ fn install_rustls_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
-fn spawn_reference_feed(bus: RingBus<EngineEvent>, stats: Arc<ShadowStats>, symbols: Vec<String>) {
+fn spawn_reference_feed(
+    bus: RingBus<EngineEvent>,
+    stats: Arc<ShadowStats>,
+    symbols: Vec<String>,
+    fusion_cfg: Arc<RwLock<FusionConfig>>,
+) {
+    #[derive(Clone, Copy)]
+    enum RefLane {
+        Direct,
+        Udp,
+    }
     const TS_INVERSION_TOLERANCE_MS: i64 = 250;
     const TS_BACKJUMP_RESET_MS: i64 = 5_000;
     tokio::spawn(async move {
-        let udp_enabled = std::env::var("ENABLE_UDP_FEED")
-            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-            .unwrap_or(false);
-
-        let mut stream = if udp_enabled {
-            tracing::info!("Using UDP Binance Feed (Port 6666)");
-            let feed = feed_udp::UdpBinanceFeed::new(6666);
-            feed.stream_ticks(symbols).await.expect("Failed to start UDP stream")
+        let symbols = if symbols.is_empty() {
+            vec!["BTCUSDT".to_string()]
         } else {
-            let feed = MultiSourceRefFeed::new(Duration::from_millis(50));
-            if symbols.is_empty() {
-                tracing::warn!("reference feed symbols empty; using fallback BTCUSDT");
-            }
-            let symbols = if symbols.is_empty() {
-                vec!["BTCUSDT".to_string()]
-            } else {
-                symbols
-            };
-            feed.stream_ticks(symbols).await.expect("reference feed failed to start")
+            symbols
         };
+        let (tx, mut rx) = mpsc::channel::<(RefLane, Result<RefTick>)>(32_768);
+
+        let tx_direct = tx.clone();
+        let symbols_direct = symbols.clone();
+        tokio::spawn(async move {
+            loop {
+                let feed = MultiSourceRefFeed::new(Duration::from_millis(50));
+                match feed.stream_ticks(symbols_direct.clone()).await {
+                    Ok(mut stream) => {
+                        while let Some(item) = stream.next().await {
+                            if tx_direct.send((RefLane::Direct, item)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(err) => tracing::warn!(?err, "direct reference feed failed to start"),
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        });
+
+        let tx_udp = tx.clone();
+        let symbols_udp = symbols.clone();
+        let fusion_cfg_udp = fusion_cfg.clone();
+        tokio::spawn(async move {
+            loop {
+                let cfg = fusion_cfg_udp.read().await.clone();
+                if !cfg.enable_udp || cfg.mode == "direct_only" {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+                let feed = feed_udp::UdpBinanceFeed::new(cfg.udp_port);
+                match feed.stream_ticks(symbols_udp.clone()).await {
+                    Ok(mut stream) => {
+                        while let Some(item) = stream.next().await {
+                            if tx_udp.send((RefLane::Udp, item)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(err) => tracing::warn!(?err, "udp reference feed failed to start"),
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        });
+        drop(tx);
+
         let mut ingest_seq: u64 = 0;
         let mut last_source_ts_by_stream: HashMap<String, i64> = HashMap::new();
+        let mut last_published_by_symbol: HashMap<String, (i64, f64)> = HashMap::new();
 
-        while let Some(item) = stream.next().await {
+        while let Some((lane, item)) = rx.recv().await {
             match item {
                 Ok(tick) => {
+                    let fusion = fusion_cfg.read().await.clone();
+                    if fusion.mode == "udp_only" && !matches!(lane, RefLane::Udp) {
+                        continue;
+                    }
+                    if fusion.mode == "direct_only" && !matches!(lane, RefLane::Direct) {
+                        continue;
+                    }
                     ingest_seq = ingest_seq.saturating_add(1);
                     let source_ts = tick.event_ts_exchange_ms.max(tick.event_ts_ms);
                     let source_seq = source_ts.max(0) as u64;
@@ -1947,7 +2152,16 @@ fn spawn_reference_feed(bus: RingBus<EngineEvent>, stats: Arc<ShadowStats>, symb
                         }
                     }
                     last_source_ts_by_stream.insert(stream_key, source_ts);
-                    stats.mark_ref_tick(tick.recv_ts_ms);
+                    if let Some((prev_ts, prev_px)) = last_published_by_symbol.get(&tick.symbol) {
+                        if (source_ts - *prev_ts).abs() <= fusion.dedupe_window_ms
+                            && (tick.price - *prev_px).abs() <= f64::EPSILON
+                        {
+                            stats.mark_ref_dedupe_dropped();
+                            continue;
+                        }
+                    }
+                    last_published_by_symbol.insert(tick.symbol.clone(), (source_ts, tick.price));
+                    stats.mark_ref_tick(tick.source.as_str(), tick.recv_ts_ms).await;
                     // Hot-path logging: avoid dynamic JSON trees + extra stringify passes.
                     // Build a single JSONL line and hand it to the async writer.
                     let tick_json =
@@ -2551,7 +2765,7 @@ fn spawn_strategy_engine(
                     };
                     let spread_yes = (book.ask_yes - book.bid_yes).max(0.0);
                     let window_outcomes = shared.shadow_stats.window_outcomes_len().await;
-                    let effective_min_edge_bps = adaptive_min_edge_bps(
+                    let base_min_edge_bps = adaptive_min_edge_bps(
                         cfg.min_edge_bps,
                         tox_decision.tox_score,
                         markout_samples,
@@ -2561,6 +2775,15 @@ fn spawn_strategy_engine(
                         window_outcomes,
                         ShadowStats::GATE_MIN_OUTCOMES,
                     );
+                    let edge_model_cfg = shared.edge_model_cfg.read().await.clone();
+                    let effective_min_edge_bps = base_min_edge_bps
+                        + edge_gate_bps(
+                            &edge_model_cfg,
+                            tox_decision.tox_score,
+                            latency_sample.local_backlog_ms,
+                            latency_sample.source_latency_ms,
+                            no_quote_rate,
+                        );
                     let effective_max_spread = adaptive_max_spread(
                         cfg.max_spread,
                         tox_decision.tox_score,
@@ -2812,7 +3035,8 @@ fn spawn_strategy_engine(
                         let edge_gross = edge_for_intent(signal.fair_yes, &intent);
                         let rebate_est_bps =
                             get_rebate_bps_cached(&shared, &book.market_id, fee_bps).await;
-                        let edge_net = edge_gross - fee_bps + rebate_est_bps;
+                        let edge_net =
+                            edge_gross - fee_bps + rebate_est_bps - edge_model_cfg.fail_cost_bps;
                         if edge_net < effective_min_edge_bps {
                             shared
                                 .shadow_stats
@@ -3168,6 +3392,25 @@ async fn run_predator_c_for_symbol(
     }
 
     let maker_cfg = shared.strategy_cfg.read().await.clone();
+    let edge_model_cfg = shared.edge_model_cfg.read().await.clone();
+    let tf_weights = HashMap::from([
+        (
+            TimeframeClass::Tf5m,
+            timeframe_weight(shared, &TimeframeClass::Tf5m).await,
+        ),
+        (
+            TimeframeClass::Tf15m,
+            timeframe_weight(shared, &TimeframeClass::Tf15m).await,
+        ),
+        (
+            TimeframeClass::Tf1h,
+            timeframe_weight(shared, &TimeframeClass::Tf1h).await,
+        ),
+        (
+            TimeframeClass::Tf1d,
+            timeframe_weight(shared, &TimeframeClass::Tf1d).await,
+        ),
+    ]);
 
     let (quote_notional_usdc, total_capital_usdc) = if predator_cfg.compounder.enabled {
         let c = shared.predator_compounder.read().await;
@@ -3237,12 +3480,17 @@ async fn run_predator_c_for_symbol(
         let rebate_est_bps = get_rebate_bps_cached(shared, &market_id, fee_bps).await;
         let edge_gross_bps =
             edge_gross_bps_for_side(sig_entry.signal.fair_yes, &side, entry_price);
-        let edge_net_bps = edge_gross_bps - fee_bps + rebate_est_bps;
-        let size = if predator_cfg.compounder.enabled {
+        let edge_net_bps = edge_gross_bps - fee_bps + rebate_est_bps - edge_model_cfg.fail_cost_bps;
+        let base_size = if predator_cfg.compounder.enabled {
             (quote_notional_usdc / entry_price.max(1e-6)).max(0.01)
         } else {
             maker_cfg.base_quote_size.max(0.01)
         };
+        let tf_weight = tf_weights.get(&timeframe).copied().unwrap_or(1.0).clamp(0.0, 1.0);
+        if tf_weight <= 0.0 {
+            continue;
+        }
+        let size = (base_size * tf_weight).max(0.01);
 
         cand_inputs.push(PredatorCandIn {
             market_id,
@@ -3439,6 +3687,21 @@ async fn predator_execute_opportunity(
     }
 
     let edge_net_usdc = (opp.edge_net_bps / 10_000.0) * intended_notional_usdc;
+    let edge_model_cfg = shared.edge_model_cfg.read().await.clone();
+    let dynamic_gate_bps = edge_gate_bps(
+        &edge_model_cfg,
+        0.0,
+        tick_age_ms as f64,
+        book_top_lag_ms,
+        0.0,
+    );
+    if opp.edge_net_bps < maker_cfg.min_edge_bps + dynamic_gate_bps {
+        shared
+            .shadow_stats
+            .mark_blocked_with_reason("edge_below_dynamic_gate")
+            .await;
+        return PredatorExecResult::default();
+    }
     if edge_net_usdc < maker_cfg.min_expected_edge_usdc {
         shared
             .shadow_stats
@@ -3709,6 +3972,28 @@ fn spawn_shadow_outcome_task(
             ts_ns: now_ns(),
         };
         shared.shadow_stats.push_outcome(outcome.clone()).await;
+        if shot.delay_ms == 10 {
+            let exit_cfg = shared.exit_cfg.read().await.clone();
+            if exit_cfg.enabled {
+                let elapsed_ms = ((now_ns() - shot.t0_ns).max(0) as f64) / 1_000_000.0;
+                let net_10s = outcome.net_markout_10s_bps.unwrap_or(0.0);
+                let exit_reason = if net_10s <= exit_cfg.adverse_move_bps {
+                    Some("adverse_move")
+                } else if net_10s <= exit_cfg.edge_decay_bps {
+                    Some("edge_decay")
+                } else if elapsed_ms > exit_cfg.time_stop_ms as f64 {
+                    Some("time_stop")
+                } else {
+                    None
+                };
+                if let Some(reason) = exit_reason {
+                    shared.shadow_stats.record_exit_reason(reason).await;
+                    if exit_cfg.flatten_on_trigger {
+                        let _ = bus.publish(EngineEvent::Control(ControlCommand::Flatten));
+                    }
+                }
+            }
+        }
         update_toxic_state_from_outcome(&shared, &outcome).await;
         if shot.delay_ms == 10 {
             if let Some(pnl_usdc) = outcome.net_markout_10s_usdc {
@@ -4106,11 +4391,80 @@ fn adaptive_min_edge_bps(
     out.clamp(1.0, base_min_edge_bps * 2.5)
 }
 
+fn edge_gate_bps(
+    cfg: &EdgeModelConfig,
+    tox_score: f64,
+    local_backlog_ms: f64,
+    source_latency_ms: f64,
+    no_quote_rate: f64,
+) -> f64 {
+    if !cfg.gate_mode.eq_ignore_ascii_case("dynamic") {
+        return cfg.base_gate_bps.max(0.0);
+    }
+    let congestion = cfg.congestion_penalty_bps * no_quote_rate.clamp(0.0, 1.0);
+    let latency = cfg.latency_penalty_bps
+        * ((local_backlog_ms / 100.0).clamp(0.0, 1.0)
+            + (source_latency_ms / 800.0).clamp(0.0, 1.0));
+    let tox = cfg.fail_cost_bps * tox_score.clamp(0.0, 1.0);
+    (cfg.base_gate_bps + congestion + latency + tox).max(0.0)
+}
+
 fn adaptive_max_spread(base_max_spread: f64, tox_score: f64, markout_samples: usize) -> f64 {
     if markout_samples < 20 {
         return (base_max_spread * 1.2).clamp(0.003, 0.08);
     }
     (base_max_spread * (1.0 - tox_score * 0.35)).clamp(0.002, base_max_spread)
+}
+
+async fn timeframe_weight(shared: &Arc<EngineShared>, timeframe: &TimeframeClass) -> f64 {
+    let baseline = match timeframe {
+        TimeframeClass::Tf5m | TimeframeClass::Tf15m => 1.0,
+        TimeframeClass::Tf1h => 0.35,
+        TimeframeClass::Tf1d => 0.20,
+    };
+    if matches!(timeframe, TimeframeClass::Tf5m | TimeframeClass::Tf15m) {
+        return baseline;
+    }
+
+    let outcomes = shared.shadow_stats.outcomes.read().await;
+    if outcomes.is_empty() {
+        return baseline;
+    }
+    let market_tf = shared.market_to_timeframe.read().await;
+    let mut markouts = Vec::new();
+    for o in outcomes.iter().rev() {
+        if o.delay_ms != 10 || !o.fillable {
+            continue;
+        }
+        let Some(tf) = market_tf.get(&o.market_id) else {
+            continue;
+        };
+        if tf != timeframe {
+            continue;
+        }
+        if let Some(v) = o.net_markout_10s_bps {
+            markouts.push(v);
+        }
+        if markouts.len() >= 200 {
+            break;
+        }
+    }
+
+    if markouts.len() < 30 {
+        return baseline;
+    }
+    let p50 = percentile(&markouts, 0.50).unwrap_or(0.0);
+    if p50 <= -8.0 {
+        0.05
+    } else if p50 <= -2.0 {
+        0.12
+    } else if p50 <= 0.0 {
+        0.20
+    } else if p50 <= 3.0 {
+        baseline
+    } else {
+        (baseline * 1.4).clamp(0.0, 1.0)
+    }
 }
 
 fn should_force_taker(
@@ -5290,6 +5644,169 @@ fn load_strategy_config() -> MakerConfig {
     cfg
 }
 
+fn load_fusion_config() -> FusionConfig {
+    let path = Path::new("configs/strategy.toml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return FusionConfig::default();
+    };
+    let mut cfg = FusionConfig::default();
+    let mut in_section = false;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_section = line == "[fusion]";
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim().trim_matches('"');
+        match key {
+            "enable_udp" => {
+                if let Ok(parsed) = val.parse::<bool>() {
+                    cfg.enable_udp = parsed;
+                }
+            }
+            "mode" => {
+                let norm = val.to_ascii_lowercase();
+                cfg.mode = match norm.as_str() {
+                    "active_active" | "direct_only" | "udp_only" => norm,
+                    _ => cfg.mode,
+                };
+            }
+            "udp_port" => {
+                if let Ok(parsed) = val.parse::<u16>() {
+                    cfg.udp_port = parsed.max(1);
+                }
+            }
+            "dedupe_window_ms" => {
+                if let Ok(parsed) = val.parse::<i64>() {
+                    cfg.dedupe_window_ms = parsed.clamp(0, 2_000);
+                }
+            }
+            _ => {}
+        }
+    }
+    cfg
+}
+
+fn load_edge_model_config() -> EdgeModelConfig {
+    let path = Path::new("configs/strategy.toml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return EdgeModelConfig::default();
+    };
+    let mut cfg = EdgeModelConfig::default();
+    let mut in_section = false;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_section = line == "[edge_model]";
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim().trim_matches('"');
+        match key {
+            "model" => cfg.model = val.to_string(),
+            "gate_mode" => cfg.gate_mode = val.to_string(),
+            "version" => cfg.version = val.to_string(),
+            "base_gate_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.base_gate_bps = parsed.max(0.0);
+                }
+            }
+            "congestion_penalty_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.congestion_penalty_bps = parsed.max(0.0);
+                }
+            }
+            "latency_penalty_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.latency_penalty_bps = parsed.max(0.0);
+                }
+            }
+            "fail_cost_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.fail_cost_bps = parsed.max(0.0);
+                }
+            }
+            _ => {}
+        }
+    }
+    cfg
+}
+
+fn load_exit_config() -> ExitConfig {
+    let path = Path::new("configs/strategy.toml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return ExitConfig::default();
+    };
+    let mut cfg = ExitConfig::default();
+    let mut in_section = false;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_section = line == "[exit]";
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim().trim_matches('"');
+        match key {
+            "enabled" => {
+                if let Ok(parsed) = val.parse::<bool>() {
+                    cfg.enabled = parsed;
+                }
+            }
+            "time_stop_ms" => {
+                if let Ok(parsed) = val.parse::<u64>() {
+                    cfg.time_stop_ms = parsed.clamp(50, 60_000);
+                }
+            }
+            "edge_decay_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.edge_decay_bps = parsed;
+                }
+            }
+            "adverse_move_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.adverse_move_bps = parsed;
+                }
+            }
+            "flatten_on_trigger" => {
+                if let Ok(parsed) = val.parse::<bool>() {
+                    cfg.flatten_on_trigger = parsed;
+                }
+            }
+            _ => {}
+        }
+    }
+    cfg
+}
+
 fn load_predator_c_config() -> PredatorCConfig {
     let path = Path::new("configs/strategy.toml");
     let Ok(raw) = fs::read_to_string(path) else {
@@ -5726,32 +6243,6 @@ fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     format!("{:x}", hasher.finalize())
-}
-
-fn count_jsonl_lines(path: &Path) -> i64 {
-    // NOTE: do not use fs::read_to_string() here. Raw JSONL files can reach multiple GB and
-    // would OOM the process. This is a best-effort counter used for diagnostics only.
-    use std::io::Read as _;
-
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return 0;
-    };
-    let mut buf = [0_u8; 64 * 1024];
-    let mut lines: i64 = 0;
-    loop {
-        let Ok(n) = file.read(&mut buf) else {
-            break;
-        };
-        if n == 0 {
-            break;
-        }
-        for &b in &buf[..n] {
-            if b == b'\n' {
-                lines = lines.saturating_add(1);
-            }
-        }
-    }
-    lines
 }
 
 #[derive(Debug)]
@@ -6503,6 +6994,7 @@ mod tests {
         let tick = RefTick {
             source: "binance_ws".to_string(),
             symbol: "BTCUSDT".to_string(),
+            source_seq: now_ms as u64,
             event_ts_ms: now_ms - 300,
             recv_ts_ms: now_ms - 200,
             event_ts_exchange_ms: now_ms - 300,

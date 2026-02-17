@@ -24,6 +24,9 @@ pub(super) fn build_router(state: AppState) -> Router {
         .route("/control/reload_toxicity", post(reload_toxicity))
         .route("/control/reload_risk", post(reload_risk))
         .route("/control/reload_predator_c", post(reload_predator_c))
+        .route("/control/reload_fusion", post(reload_fusion))
+        .route("/control/reload_edge_model", post(reload_edge_model))
+        .route("/control/reload_exit", post(reload_exit))
         .route("/control/reload_perf_profile", post(reload_perf_profile))
         .with_state(state)
 }
@@ -170,6 +173,96 @@ async fn reload_predator_c(
     );
 
     Json(PredatorCReloadResp { predator_c: snapshot })
+}
+
+async fn reload_fusion(
+    State(state): State<AppState>,
+    Json(req): Json<FusionReloadReq>,
+) -> Json<FusionConfig> {
+    let mut cfg = state.shared.fusion_cfg.write().await;
+    if let Some(v) = req.enable_udp {
+        cfg.enable_udp = v;
+    }
+    if let Some(v) = req.mode {
+        let norm = v.to_ascii_lowercase();
+        if matches!(norm.as_str(), "active_active" | "direct_only" | "udp_only") {
+            cfg.mode = norm;
+        }
+    }
+    if let Some(v) = req.udp_port {
+        cfg.udp_port = v.max(1);
+    }
+    if let Some(v) = req.dedupe_window_ms {
+        cfg.dedupe_window_ms = v.clamp(0, 2_000);
+    }
+    let snapshot = cfg.clone();
+    append_jsonl(
+        &dataset_path("reports", "fusion_reload.jsonl"),
+        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "fusion": snapshot}),
+    );
+    Json(snapshot)
+}
+
+async fn reload_edge_model(
+    State(state): State<AppState>,
+    Json(req): Json<EdgeModelReloadReq>,
+) -> Json<EdgeModelConfig> {
+    let mut cfg = state.shared.edge_model_cfg.write().await;
+    if let Some(v) = req.model {
+        cfg.model = v;
+    }
+    if let Some(v) = req.gate_mode {
+        cfg.gate_mode = v;
+    }
+    if let Some(v) = req.version {
+        cfg.version = v;
+    }
+    if let Some(v) = req.base_gate_bps {
+        cfg.base_gate_bps = v.max(0.0);
+    }
+    if let Some(v) = req.congestion_penalty_bps {
+        cfg.congestion_penalty_bps = v.max(0.0);
+    }
+    if let Some(v) = req.latency_penalty_bps {
+        cfg.latency_penalty_bps = v.max(0.0);
+    }
+    if let Some(v) = req.fail_cost_bps {
+        cfg.fail_cost_bps = v.max(0.0);
+    }
+    let snapshot = cfg.clone();
+    append_jsonl(
+        &dataset_path("reports", "edge_model_reload.jsonl"),
+        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "edge_model": snapshot}),
+    );
+    Json(snapshot)
+}
+
+async fn reload_exit(
+    State(state): State<AppState>,
+    Json(req): Json<ExitReloadReq>,
+) -> Json<ExitConfig> {
+    let mut cfg = state.shared.exit_cfg.write().await;
+    if let Some(v) = req.enabled {
+        cfg.enabled = v;
+    }
+    if let Some(v) = req.time_stop_ms {
+        cfg.time_stop_ms = v.clamp(50, 60_000);
+    }
+    if let Some(v) = req.edge_decay_bps {
+        cfg.edge_decay_bps = v;
+    }
+    if let Some(v) = req.adverse_move_bps {
+        cfg.adverse_move_bps = v;
+    }
+    if let Some(v) = req.flatten_on_trigger {
+        cfg.flatten_on_trigger = v;
+    }
+    let snapshot = cfg.clone();
+    append_jsonl(
+        &dataset_path("reports", "exit_reload.jsonl"),
+        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "exit": snapshot}),
+    );
+    Json(snapshot)
 }
 
 async fn report_direction(
@@ -518,13 +611,15 @@ async fn reload_perf_profile(
 }
 
 async fn report_shadow_live(State(state): State<AppState>) -> Json<ShadowLiveReport> {
-    let live = state.shadow_stats.build_live_report().await;
+    let mut live = state.shadow_stats.build_live_report().await;
+    live.edge_model_version = state.shared.edge_model_cfg.read().await.version.clone();
     persist_live_report_files(&live);
     Json(live)
 }
 
 async fn report_shadow_final(State(state): State<AppState>) -> Json<ShadowFinalReport> {
-    let final_report = state.shadow_stats.build_final_report().await;
+    let mut final_report = state.shadow_stats.build_final_report().await;
+    final_report.live.edge_model_version = state.shared.edge_model_cfg.read().await.version.clone();
     persist_final_report_files(&final_report);
     Json(final_report)
 }

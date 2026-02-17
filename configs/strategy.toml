@@ -79,6 +79,28 @@ min_quote_size = 1.0
 # For micro-live: loss <= -1U triggers pause+flatten (enforced only when live-armed).
 daily_loss_cap_usdc = 1.0
 
+[fusion]
+enable_udp = true
+mode = "active_active"
+udp_port = 6666
+dedupe_window_ms = 30
+
+[edge_model]
+model = "ev_net"
+gate_mode = "dynamic"
+version = "v2-ev-net"
+base_gate_bps = 0.5
+congestion_penalty_bps = 2.0
+latency_penalty_bps = 2.0
+fail_cost_bps = 1.0
+
+[exit]
+enabled = true
+time_stop_ms = 2000
+edge_decay_bps = -2.0
+adverse_move_bps = -8.0
+flatten_on_trigger = true
+
 # ===== Risk Controls (P2) =====
 
 [risk_controls]
