@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -17,6 +18,7 @@ use tokio_tungstenite::tungstenite::Message;
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// WebSocket read timeout - prevents hanging on stale connections
 const WS_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const REF_TICK_QUEUE_DEFAULT: usize = 16_384;
 
 /// Validates that a price value is finite and positive
 fn validate_price(price: f64) -> bool {
@@ -48,7 +50,12 @@ impl RefPriceFeed for MultiSourceRefFeed {
 #[async_trait::async_trait]
 impl RefPriceWsFeed for MultiSourceRefFeed {
     async fn stream_ticks_ws(&self, symbols: Vec<String>) -> Result<DynStream<RefTick>> {
-        let (tx, rx) = mpsc::channel::<RefTick>(16_384);
+        let queue_cap = std::env::var("POLYEDGE_REF_TICK_QUEUE_CAP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(REF_TICK_QUEUE_DEFAULT)
+            .clamp(1_024, 65_536);
+        let (tx, rx) = mpsc::channel::<RefTick>(queue_cap);
 
         let binance_symbols = symbols.clone();
         let tx_binance = tx.clone();
@@ -112,6 +119,32 @@ async fn sleep_with_jitter(base: Duration) {
     let base_ms = base.as_millis() as u64;
     let jitter_ms = rand::rng().random_range(0..=300);
     tokio::time::sleep(Duration::from_millis(base_ms.saturating_add(jitter_ms))).await;
+}
+
+enum TickDispatch {
+    Sent,
+    Dropped,
+    Closed,
+}
+
+fn dispatch_ref_tick(tx: &mpsc::Sender<RefTick>, tick: RefTick, source: &'static str) -> TickDispatch {
+    static DROP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    match tx.try_send(tick) {
+        Ok(()) => TickDispatch::Sent,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            let dropped = DROP_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped.is_multiple_of(1024) {
+                tracing::warn!(
+                    source,
+                    dropped,
+                    "ref tick queue full, dropping stale ticks"
+                );
+            }
+            TickDispatch::Dropped
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => TickDispatch::Closed,
+    }
 }
 
 async fn run_binance_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> Result<()> {
@@ -200,8 +233,9 @@ async fn run_binance_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> R
                     price,
                 };
 
-                if tx.send(tick).await.is_err() {
-                    break;
+                match dispatch_ref_tick(tx, tick, "binance_ws") {
+                    TickDispatch::Sent | TickDispatch::Dropped => {}
+                    TickDispatch::Closed => break,
                 }
             }
             Ok(None) => break, // Stream ended
@@ -404,8 +438,9 @@ async fn run_bybit_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> Res
             price,
         };
 
-        if tx.send(tick).await.is_err() {
-            break;
+        match dispatch_ref_tick(tx, tick, "bybit_ws") {
+            TickDispatch::Sent | TickDispatch::Dropped => {}
+            TickDispatch::Closed => break,
         }
     }
 
@@ -497,8 +532,9 @@ async fn run_coinbase_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> 
             price,
         };
 
-        if tx.send(tick).await.is_err() {
-            break;
+        match dispatch_ref_tick(tx, tick, "coinbase_ws") {
+            TickDispatch::Sent | TickDispatch::Dropped => {}
+            TickDispatch::Closed => break,
         }
     }
 
@@ -624,8 +660,9 @@ async fn run_chainlink_rtds_stream(symbols: &[String], tx: &mpsc::Sender<RefTick
                     price,
                 };
 
-                if tx.send(tick).await.is_err() {
-                    break;
+                match dispatch_ref_tick(tx, tick, "chainlink_rtds") {
+                    TickDispatch::Sent | TickDispatch::Dropped => {}
+                    TickDispatch::Closed => break,
                 }
             }
         }

@@ -2135,8 +2135,12 @@ fn spawn_reference_feed(
         let ref_merge_queue_cap = std::env::var("POLYEDGE_REF_MERGE_QUEUE_CAP")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(65_536)
-            .clamp(8_192, 262_144);
+            .unwrap_or(16_384)
+            .clamp(2_048, 262_144);
+        let ref_merge_drop_on_full = std::env::var("POLYEDGE_REF_MERGE_DROP_ON_FULL")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+            .unwrap_or(true);
         let (tx, mut rx) = mpsc::channel::<(RefLane, Result<RefTick>)>(ref_merge_queue_cap);
 
         let tx_direct = tx.clone();
@@ -2147,7 +2151,16 @@ fn spawn_reference_feed(
                 match feed.stream_ticks(symbols_direct.clone()).await {
                     Ok(mut stream) => {
                         while let Some(item) = stream.next().await {
-                            if tx_direct.send((RefLane::Direct, item)).await.is_err() {
+                            let lane_item = (RefLane::Direct, item);
+                            if ref_merge_drop_on_full {
+                                match tx_direct.try_send(lane_item) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        metrics::counter!("fusion.ref_merge_drop").increment(1);
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => return,
+                                }
+                            } else if tx_direct.send(lane_item).await.is_err() {
                                 return;
                             }
                         }
@@ -2172,7 +2185,16 @@ fn spawn_reference_feed(
                 match feed.stream_ticks(symbols_udp.clone()).await {
                     Ok(mut stream) => {
                         while let Some(item) = stream.next().await {
-                            if tx_udp.send((RefLane::Udp, item)).await.is_err() {
+                            let lane_item = (RefLane::Udp, item);
+                            if ref_merge_drop_on_full {
+                                match tx_udp.try_send(lane_item) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        metrics::counter!("fusion.ref_merge_drop").increment(1);
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => return,
+                                }
+                            } else if tx_udp.send(lane_item).await.is_err() {
                                 return;
                             }
                         }
@@ -2449,13 +2471,19 @@ fn spawn_strategy_engine(
         let strategy_max_coalesce = std::env::var("POLYEDGE_STRATEGY_MAX_COALESCE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(1_024)
-            .clamp(128, 8_192);
+            .unwrap_or(2_048)
+            .clamp(256, 16_384);
         let strategy_coalesce_min = std::env::var("POLYEDGE_STRATEGY_MIN_COALESCE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(128)
-            .clamp(32, 2_048);
+            .unwrap_or(256)
+            .clamp(64, 4_096);
+        let strategy_drop_stale_book_ms = std::env::var("POLYEDGE_STRATEGY_DROP_STALE_BOOK_MS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(800.0)
+            .clamp(50.0, 5_000.0);
+        let mut stale_book_drops: u64 = 0;
         refresh_market_symbol_map(&shared).await;
 
         loop {
@@ -2542,6 +2570,20 @@ fn spawn_strategy_engine(
                     }
                     if coalesced > 0 {
                         metrics::counter!("runtime.coalesced_events").increment(coalesced);
+                    }
+                    if book.recv_ts_local_ns > 0 {
+                        let book_age_ms =
+                            ((now_ns() - book.recv_ts_local_ns).max(0) as f64) / 1_000_000.0;
+                        if book_age_ms > strategy_drop_stale_book_ms {
+                            stale_book_drops = stale_book_drops.saturating_add(1);
+                            metrics::counter!("strategy.stale_book_dropped").increment(1);
+                            metrics::histogram!("latency.stale_book_drop_age_ms")
+                                .record(book_age_ms);
+                            if stale_book_drops.is_multiple_of(128) {
+                                shared.shadow_stats.record_issue("stale_book_dropped").await;
+                            }
+                            continue;
+                        }
                     }
 
                     let backlog_depth = rx.len() as f64;
