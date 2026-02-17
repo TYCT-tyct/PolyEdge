@@ -37,7 +37,7 @@ use market_discovery::{DiscoveryConfig, MarketDiscovery};
 use observability::{init_metrics, init_tracing};
 use paper_executor::ShadowExecutor;
 use portfolio::PortfolioBook;
-use probability_engine::ProbabilityEngine;
+use probability_engine::{ProbabilityEngine, ProbabilityEngineConfig};
 use reqwest::Client;
 use risk_engine::{DefaultRiskManager, RiskLimits};
 use serde::{Deserialize, Serialize};
@@ -126,6 +126,7 @@ struct PredatorCConfig {
     enabled: bool,
     priority: PredatorCPriority,
     direction_detector: DirectionConfig,
+    probability_engine: ProbabilityEngineConfig,
     taker_sniper: TakerSniperConfig,
     router: RouterConfig,
     compounder: CompounderConfig,
@@ -137,6 +138,7 @@ impl Default for PredatorCConfig {
             enabled: false,
             priority: PredatorCPriority::TakerFirst,
             direction_detector: DirectionConfig::default(),
+            probability_engine: ProbabilityEngineConfig::default(),
             taker_sniper: TakerSniperConfig::default(),
             router: RouterConfig::default(),
             compounder: CompounderConfig::default(),
@@ -231,6 +233,13 @@ struct EdgeModelReloadReq {
     congestion_penalty_bps: Option<f64>,
     latency_penalty_bps: Option<f64>,
     fail_cost_bps: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbabilityReloadReq {
+    momentum_gain: Option<f64>,
+    lag_penalty_per_ms: Option<f64>,
+    confidence_floor: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -803,6 +812,11 @@ struct ShadowLiveReport {
     source_latency_p99_ms: f64,
     local_backlog_p99_ms: f64,
     lag_half_life_ms: f64,
+    probability_total: u64,
+    settlement_source_degraded_ratio: f64,
+    settle_fast_delta_p50_bps: f64,
+    settle_fast_delta_p90_bps: f64,
+    probability_confidence_p50: f64,
     ack_only_p50_ms: f64,
     ack_only_p90_ms: f64,
     ack_only_p99_ms: f64,
@@ -969,6 +983,8 @@ struct ShadowStats {
     predator_router_locked_by_tf_usdc: RwLock<HashMap<String, f64>>,
     predator_capital: RwLock<CapitalUpdate>,
     predator_capital_halt: AtomicBool,
+    probability_total: AtomicU64,
+    probability_degraded: AtomicU64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -993,6 +1009,8 @@ struct ShadowSamples {
     event_backlog: Vec<f64>,
     parse_us: Vec<f64>,
     io_queue_depth: Vec<f64>,
+    settle_fast_delta_bps: Vec<f64>,
+    probability_confidence: Vec<f64>,
 }
 
 impl ShadowStats {
@@ -1052,6 +1070,8 @@ impl ShadowStats {
                 ts_ms: 0,
             }),
             predator_capital_halt: AtomicBool::new(false),
+            probability_total: AtomicU64::new(0),
+            probability_degraded: AtomicU64::new(0),
         }
     }
 
@@ -1107,6 +1127,8 @@ impl ShadowStats {
             ts_ms: 0,
         };
         self.predator_capital_halt.store(false, Ordering::Relaxed);
+        self.probability_total.store(0, Ordering::Relaxed);
+        self.probability_degraded.store(0, Ordering::Relaxed);
         window_id
     }
 
@@ -1265,6 +1287,21 @@ impl ShadowStats {
     async fn push_parse_us(&self, us: f64) {
         let mut s = self.samples.write().await;
         push_capped(&mut s.parse_us, us, Self::SAMPLE_CAP);
+    }
+
+    async fn push_probability_sample(&self, estimate: &ProbabilityEstimate) {
+        self.probability_total.fetch_add(1, Ordering::Relaxed);
+        if estimate.settlement_source_degraded {
+            self.probability_degraded.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut s = self.samples.write().await;
+        let delta_bps = ((estimate.p_settle - estimate.p_fast).abs() * 10_000.0).clamp(0.0, 10_000.0);
+        push_capped(&mut s.settle_fast_delta_bps, delta_bps, Self::SAMPLE_CAP);
+        push_capped(
+            &mut s.probability_confidence,
+            estimate.confidence.clamp(0.0, 1.0),
+            Self::SAMPLE_CAP,
+        );
     }
 
     fn mark_attempted(&self) {
@@ -1464,6 +1501,8 @@ impl ShadowStats {
             event_backlog,
             parse_us,
             io_queue_depth,
+            settle_fast_delta_bps,
+            probability_confidence,
         } = self.samples.read().await.clone();
         let book_top_lag_by_symbol_ms = self.book_top_lag_by_symbol_ms.read().await.clone();
         let mut blocked_reason_counts = self.blocked_reasons.read().await.clone();
@@ -1595,6 +1634,16 @@ impl ShadowStats {
             stale_tick_dropped as f64 / data_total as f64
         };
         let dedupe_dropped = self.ref_dedupe_dropped.load(Ordering::Relaxed);
+        let probability_total = self.probability_total.load(Ordering::Relaxed);
+        let probability_degraded = self.probability_degraded.load(Ordering::Relaxed);
+        let settlement_source_degraded_ratio = if probability_total == 0 {
+            0.0
+        } else {
+            probability_degraded as f64 / probability_total as f64
+        };
+        let settle_fast_delta_p50_bps = percentile(&settle_fast_delta_bps, 0.50).unwrap_or(0.0);
+        let settle_fast_delta_p90_bps = percentile(&settle_fast_delta_bps, 0.90).unwrap_or(0.0);
+        let probability_confidence_p50 = percentile(&probability_confidence, 0.50).unwrap_or(0.0);
         if dedupe_dropped > 0 {
             blocked_reason_counts.insert("ref_dedupe_dropped".to_string(), dedupe_dropped);
         }
@@ -1803,6 +1852,11 @@ impl ShadowStats {
             source_latency_p99_ms: latency.source_latency_p99_ms,
             local_backlog_p99_ms: latency.local_backlog_p99_ms,
             lag_half_life_ms,
+            probability_total,
+            settlement_source_degraded_ratio,
+            settle_fast_delta_p50_bps,
+            settle_fast_delta_p90_bps,
+            probability_confidence_p50,
             ack_only_p50_ms: latency.ack_only_p50_ms,
             ack_only_p90_ms: latency.ack_only_p90_ms,
             ack_only_p99_ms: latency.ack_only_p99_ms,
@@ -2063,7 +2117,9 @@ async fn async_main() -> Result<()> {
     )));
     let predator_latest_direction = Arc::new(RwLock::new(HashMap::new()));
     let predator_latest_probability = Arc::new(RwLock::new(HashMap::new()));
-    let predator_probability_engine = Arc::new(RwLock::new(ProbabilityEngine::default()));
+    let predator_probability_engine = Arc::new(RwLock::new(ProbabilityEngine::new(
+        predator_cfg0.probability_engine.clone(),
+    )));
     let predator_taker_sniper = Arc::new(RwLock::new(TakerSniper::new(
         predator_cfg0.taker_sniper.clone(),
     )));
@@ -2508,8 +2564,24 @@ async fn settlement_prob_yes_for_symbol(
     shared: &Arc<EngineShared>,
     symbol: &str,
     p_fast_yes: f64,
+    now_ms: i64,
 ) -> Option<f64> {
-    let settle_price = shared.settlement_prices.read().await.get(symbol).copied()?;
+    let settle_price = {
+        let anchor = shared
+            .latest_anchor_ticks
+            .get(symbol)
+            .map(|tick| tick.value().clone())
+            .filter(|tick| {
+                is_anchor_ref_source(tick.source.as_str())
+                    && now_ms.saturating_sub(ref_event_ts_ms(tick)) <= 5_000
+            })
+            .map(|tick| tick.price);
+        if let Some(v) = anchor {
+            Some(v)
+        } else {
+            shared.settlement_prices.read().await.get(symbol).copied()
+        }
+    }?;
     if settle_price <= 0.0 {
         return None;
     }
@@ -2517,13 +2589,21 @@ async fn settlement_prob_yes_for_symbol(
     if fast_price <= 0.0 {
         return None;
     }
+    Some(blend_settlement_probability(
+        p_fast_yes,
+        fast_price,
+        settle_price,
+    ))
+}
 
+#[inline]
+fn blend_settlement_probability(p_fast_yes: f64, fast_price: f64, settle_price: f64) -> f64 {
     // When fast and settlement feeds diverge, pull probability toward 0.5.
     // This keeps execution conservative until settlement alignment recovers.
     let gap = ((fast_price - settle_price) / settle_price).abs().clamp(0.0, 0.03);
     let settle_blend = (gap * 20.0).clamp(0.0, 0.25);
     let p = (p_fast_yes.clamp(0.0, 1.0) * (1.0 - settle_blend)) + (0.5 * settle_blend);
-    Some(p.clamp(0.0, 1.0))
+    p.clamp(0.0, 1.0)
 }
 
 fn spawn_market_feed(
@@ -3983,7 +4063,7 @@ async fn run_predator_c_for_symbol(
                 0.0
             };
         let settlement_prob_yes =
-            settlement_prob_yes_for_symbol(shared, symbol, sig_entry.signal.fair_yes).await;
+            settlement_prob_yes_for_symbol(shared, symbol, sig_entry.signal.fair_yes, now_ms).await;
         let probability = {
             let engine = shared.predator_probability_engine.read().await;
             engine.estimate(
@@ -3998,6 +4078,10 @@ async fn run_predator_c_for_symbol(
             let mut map = shared.predator_latest_probability.write().await;
             map.insert(market_id.clone(), probability.clone());
         }
+        shared
+            .shadow_stats
+            .push_probability_sample(&probability)
+            .await;
         let edge_gross_bps = edge_gross_bps_for_side(probability.p_settle, &side, entry_price);
         let edge_net_bps = edge_gross_bps - fee_bps + rebate_est_bps - edge_model_cfg.fail_cost_bps;
         let base_size = if predator_cfg.compounder.enabled {
@@ -6679,6 +6763,7 @@ fn load_predator_c_config() -> PredatorCConfig {
 
     let mut in_root = false;
     let mut in_dir = false;
+    let mut in_prob = false;
     let mut in_sniper = false;
     let mut in_gatling = false;
     let mut in_router = false;
@@ -6692,13 +6777,14 @@ fn load_predator_c_config() -> PredatorCConfig {
         if line.starts_with('[') && line.ends_with(']') {
             in_root = line == "[predator_c]";
             in_dir = line == "[predator_c.direction_detector]";
+            in_prob = line == "[predator_c.probability_engine]";
             in_sniper = line == "[predator_c.taker_sniper]";
             in_gatling = line == "[predator_c.gatling]";
             in_router = line == "[predator_c.router]";
             in_compounder = line == "[predator_c.compounder]";
             continue;
         }
-        if !(in_root || in_dir || in_sniper || in_gatling || in_router || in_compounder) {
+        if !(in_root || in_dir || in_prob || in_sniper || in_gatling || in_router || in_compounder) {
             continue;
         }
 
@@ -6794,6 +6880,28 @@ fn load_predator_c_config() -> PredatorCConfig {
                 "momentum_spike_multiplier" => {
                     if let Ok(parsed) = val.parse::<f64>() {
                         cfg.direction_detector.momentum_spike_multiplier = parsed.max(1.0);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if in_prob {
+            match key {
+                "momentum_gain" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.probability_engine.momentum_gain = parsed.clamp(0.0, 20.0);
+                    }
+                }
+                "lag_penalty_per_ms" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.probability_engine.lag_penalty_per_ms = parsed.clamp(0.0, 0.1);
+                    }
+                }
+                "confidence_floor" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.probability_engine.confidence_floor = parsed.clamp(0.0, 1.0);
                     }
                 }
                 _ => {}
@@ -8198,5 +8306,20 @@ timeframes = ["5m", "15m", "1h", "1d"]
         let raw = "foo = 1\nassets = []\n";
         assert!(parse_toml_array_for_key(raw, "missing").is_none());
         assert!(parse_toml_array_for_key(raw, "assets").is_none());
+    }
+
+    #[test]
+    fn blend_settlement_probability_moves_toward_half_when_gap_widens() {
+        let p_small_gap = blend_settlement_probability(0.80, 100.0, 99.9);
+        let p_large_gap = blend_settlement_probability(0.80, 100.0, 97.5);
+        assert!(p_small_gap > 0.70);
+        assert!(p_large_gap < p_small_gap);
+        assert!(p_large_gap > 0.50);
+    }
+
+    #[test]
+    fn blend_settlement_probability_is_stable_when_prices_match() {
+        let p = blend_settlement_probability(0.63, 100.0, 100.0);
+        assert!((p - 0.63).abs() < 1e-9);
     }
 }

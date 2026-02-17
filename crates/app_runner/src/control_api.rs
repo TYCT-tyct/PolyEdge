@@ -26,6 +26,7 @@ pub(super) fn build_router(state: AppState) -> Router {
         .route("/control/reload_predator_c", post(reload_predator_c))
         .route("/control/reload_fusion", post(reload_fusion))
         .route("/control/reload_edge_model", post(reload_edge_model))
+        .route("/control/reload_probability", post(reload_probability))
         .route("/control/reload_exit", post(reload_exit))
         .route("/control/reload_perf_profile", post(reload_perf_profile))
         .with_state(state)
@@ -235,6 +236,30 @@ async fn reload_edge_model(
         &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "edge_model": snapshot}),
     );
     Json(snapshot)
+}
+
+async fn reload_probability(
+    State(state): State<AppState>,
+    Json(req): Json<ProbabilityReloadReq>,
+) -> Json<ProbabilityEngineConfig> {
+    let mut engine = state.shared.predator_probability_engine.write().await;
+    let mut cfg = engine.cfg().clone();
+    if let Some(v) = req.momentum_gain {
+        cfg.momentum_gain = v.clamp(0.0, 20.0);
+    }
+    if let Some(v) = req.lag_penalty_per_ms {
+        cfg.lag_penalty_per_ms = v.clamp(0.0, 0.1);
+    }
+    if let Some(v) = req.confidence_floor {
+        cfg.confidence_floor = v.clamp(0.0, 1.0);
+    }
+    engine.set_cfg(cfg.clone());
+    drop(engine);
+    append_jsonl(
+        &dataset_path("reports", "probability_reload.jsonl"),
+        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "probability": cfg}),
+    );
+    Json(cfg)
 }
 
 async fn reload_exit(
