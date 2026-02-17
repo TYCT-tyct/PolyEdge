@@ -108,7 +108,8 @@ impl TakerSniper {
         if spread > self.cfg.max_spread {
             return skip("spread_too_wide");
         }
-        let dynamic_min_edge = dynamic_fee_gate_min_edge_bps(entry_price);
+        let dynamic_min_edge =
+            dynamic_fee_gate_min_edge_bps(entry_price, direction_signal.confidence);
         let min_edge_required = self.cfg.min_edge_net_bps.max(dynamic_min_edge);
         if edge_net_bps < min_edge_required {
             return skip("fee_gate_too_expensive");
@@ -228,19 +229,22 @@ fn direction_to_side(dir: &Direction) -> core_types::OrderSide {
 }
 
 #[inline]
-fn dynamic_fee_gate_min_edge_bps(entry_price: f64) -> f64 {
+fn dynamic_fee_gate_min_edge_bps(entry_price: f64, confidence: f64) -> f64 {
     let p = entry_price.clamp(0.0, 1.0);
-    if p >= 0.92 || p <= 0.08 {
-        30.0
+    let base_gate = if p >= 0.92 || p <= 0.08 {
+        20.0
     } else if p >= 0.85 || p <= 0.15 {
-        80.0
+        35.0
     } else if p >= 0.75 || p <= 0.25 {
-        200.0
+        60.0
     } else if p >= 0.60 || p <= 0.40 {
-        400.0
+        90.0
     } else {
-        800.0
-    }
+        120.0
+    };
+    let confidence_relax = (1.0 - (confidence.clamp(0.0, 1.0) - 0.5).max(0.0) * 0.4)
+        .clamp(0.75, 1.0);
+    base_gate * confidence_relax
 }
 
 #[cfg(test)]
@@ -389,7 +393,7 @@ mod tests {
             0.01,
             2.0,
             60.0,
-            300.0,
+            95.0,
             10.0,
             1_000_000,
         );
@@ -418,6 +422,44 @@ mod tests {
             1_000_000,
         );
         assert!(matches!(d.action, TakerAction::Fire));
+    }
+
+    #[test]
+    fn dynamic_fee_gate_relaxes_with_higher_confidence() {
+        let mut sniper = TakerSniper::new(TakerSniperConfig {
+            min_edge_net_bps: 10.0,
+            ..TakerSniperConfig::default()
+        });
+        let low = up_signal(0.55);
+        let high = up_signal(0.95);
+        let d_low = sniper.evaluate(
+            "m1",
+            "BTCUSDT",
+            TimeframeClass::Tf15m,
+            &low,
+            0.50,
+            0.01,
+            2.0,
+            60.0,
+            95.0,
+            10.0,
+            1_000_000,
+        );
+        assert!(matches!(d_low.action, TakerAction::Skip));
+        let d_high = sniper.evaluate(
+            "m2",
+            "BTCUSDT",
+            TimeframeClass::Tf15m,
+            &high,
+            0.50,
+            0.01,
+            2.0,
+            60.0,
+            105.0,
+            10.0,
+            1_000_000,
+        );
+        assert!(matches!(d_high.action, TakerAction::Fire));
     }
 
     #[test]
