@@ -171,6 +171,9 @@ mod tests {
             magnitude_pct: 0.20,
             confidence,
             recommended_tf: TimeframeClass::Tf15m,
+            velocity_bps_per_sec: 7.5,
+            acceleration: 0.8,
+            tick_consistency: 3,
             ts_ns: 1,
         }
     }
@@ -285,4 +288,3 @@ mod tests {
         assert_eq!(d2.reason, "cooldown_active");
     }
 }
-

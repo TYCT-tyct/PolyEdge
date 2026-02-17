@@ -6353,6 +6353,26 @@ fn load_predator_c_config() -> PredatorCConfig {
                         cfg.direction_detector.min_ticks_for_signal = parsed.max(1);
                     }
                 }
+                "min_consecutive_ticks" => {
+                    if let Ok(parsed) = val.parse::<u8>() {
+                        cfg.direction_detector.min_consecutive_ticks = parsed.max(1);
+                    }
+                }
+                "min_velocity_bps_per_sec" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.direction_detector.min_velocity_bps_per_sec = parsed.max(0.0);
+                    }
+                }
+                "min_acceleration" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.direction_detector.min_acceleration = parsed.max(0.0);
+                    }
+                }
+                "momentum_spike_multiplier" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.direction_detector.momentum_spike_multiplier = parsed.max(1.0);
+                    }
+                }
                 _ => {}
             }
             continue;

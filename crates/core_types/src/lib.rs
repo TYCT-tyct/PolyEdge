@@ -141,6 +141,15 @@ pub struct DirectionSignal {
     /// Confidence in [0,1], derived from multi-source consistency.
     pub confidence: f64,
     pub recommended_tf: TimeframeClass,
+    /// First derivative of price move in bps/s.
+    #[serde(default)]
+    pub velocity_bps_per_sec: f64,
+    /// Second derivative in (bps/s)/s.
+    #[serde(default)]
+    pub acceleration: f64,
+    /// Count of consecutive same-direction ticks used by the triple-confirm gate.
+    #[serde(default)]
+    pub tick_consistency: u8,
     pub ts_ns: i64,
 }
 

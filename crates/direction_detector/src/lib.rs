@@ -19,6 +19,14 @@ pub struct DirectionConfig {
     pub min_sources_for_high_confidence: usize,
     /// Cold-start guard.
     pub min_ticks_for_signal: usize,
+    /// Triple-confirm gate: minimum consecutive same-direction ticks.
+    pub min_consecutive_ticks: u8,
+    /// Triple-confirm gate: minimum absolute velocity in bps/s.
+    pub min_velocity_bps_per_sec: f64,
+    /// Triple-confirm gate: minimum directional acceleration.
+    pub min_acceleration: f64,
+    /// If abs(velocity) is above this multiple of min_velocity, treat as momentum spike.
+    pub momentum_spike_multiplier: f64,
 }
 
 impl Default for DirectionConfig {
@@ -33,6 +41,10 @@ impl Default for DirectionConfig {
             lookback_long_sec: 60,
             min_sources_for_high_confidence: 2,
             min_ticks_for_signal: 5,
+            min_consecutive_ticks: 2,
+            min_velocity_bps_per_sec: 5.0,
+            min_acceleration: 0.0,
+            momentum_spike_multiplier: 1.8,
         }
     }
 }
@@ -117,11 +129,32 @@ impl DirectionDetector {
         let ret_short = (latest - anchor_short) / anchor_short;
         let ret_long = (latest - anchor_long) / anchor_long;
         let magnitude_pct = (ret_short * 0.7 + ret_long * 0.3) * 100.0;
+        let (velocity_bps_per_sec, acceleration, tick_consistency) =
+            kinematics_from_ticks(&w.ticks);
 
-        let direction = if magnitude_pct > self.cfg.threshold_15m_pct {
+        let raw_direction = if magnitude_pct > self.cfg.threshold_15m_pct {
             Direction::Up
         } else if magnitude_pct < -self.cfg.threshold_15m_pct {
             Direction::Down
+        } else {
+            Direction::Neutral
+        };
+        let direction_sign = match raw_direction {
+            Direction::Up => 1.0,
+            Direction::Down => -1.0,
+            Direction::Neutral => 0.0,
+        };
+        let velocity_abs = velocity_bps_per_sec.abs();
+        let directional_acceleration = acceleration * direction_sign;
+        let momentum_spike = velocity_abs
+            >= self.cfg.min_velocity_bps_per_sec.max(0.0)
+                * self.cfg.momentum_spike_multiplier.max(1.0);
+        let triple_confirm = !matches!(raw_direction, Direction::Neutral)
+            && tick_consistency >= self.cfg.min_consecutive_ticks.max(1)
+            && velocity_abs >= self.cfg.min_velocity_bps_per_sec.max(0.0)
+            && (directional_acceleration >= self.cfg.min_acceleration || momentum_spike);
+        let direction = if triple_confirm {
+            raw_direction
         } else {
             Direction::Neutral
         };
@@ -141,9 +174,79 @@ impl DirectionDetector {
             magnitude_pct,
             confidence,
             recommended_tf,
+            velocity_bps_per_sec,
+            acceleration,
+            tick_consistency,
             ts_ns: now_ms.max(0) * 1_000_000,
         })
     }
+}
+
+fn kinematics_from_ticks(ticks: &VecDeque<(i64, f64)>) -> (f64, f64, u8) {
+    if ticks.len() < 3 {
+        return (0.0, 0.0, 0);
+    }
+    let mut it = ticks.iter().rev();
+    let (t2, p2) = *it.next().unwrap_or(&(0, 0.0));
+    let (t1, p1) = *it.next().unwrap_or(&(0, 0.0));
+    let (t0, p0) = *it.next().unwrap_or(&(0, 0.0));
+    let v2 = velocity_bps_per_sec(t1, p1, t2, p2);
+    let v1 = velocity_bps_per_sec(t0, p0, t1, p1);
+    let dt_s = ((t2 - t1).max(1) as f64) / 1_000.0;
+    let acceleration = (v2 - v1) / dt_s.max(1e-6);
+    let consistency = consecutive_direction_count(ticks);
+    (v2, acceleration, consistency)
+}
+
+fn velocity_bps_per_sec(t0_ms: i64, p0: f64, t1_ms: i64, p1: f64) -> f64 {
+    if p0 <= 0.0 || p1 <= 0.0 {
+        return 0.0;
+    }
+    let dt_ms = (t1_ms - t0_ms).max(1) as f64;
+    let dt_s = dt_ms / 1_000.0;
+    let ret = (p1 - p0) / p0;
+    let v = (ret * 10_000.0) / dt_s.max(1e-6);
+    if v.is_finite() {
+        v
+    } else {
+        0.0
+    }
+}
+
+fn consecutive_direction_count(ticks: &VecDeque<(i64, f64)>) -> u8 {
+    if ticks.len() < 2 {
+        return 0;
+    }
+    let mut count: u8 = 0;
+    let mut prev_sign: i8 = 0;
+    for win in ticks.iter().rev().zip(ticks.iter().rev().skip(1)) {
+        let ((_, p_new), (_, p_old)) = win;
+        if *p_old <= 0.0 {
+            break;
+        }
+        let delta = p_new - p_old;
+        let sign = if delta > 0.0 {
+            1
+        } else if delta < 0.0 {
+            -1
+        } else {
+            0
+        };
+        if sign == 0 {
+            break;
+        }
+        if prev_sign == 0 {
+            prev_sign = sign;
+            count = count.saturating_add(1);
+            continue;
+        }
+        if sign == prev_sign {
+            count = count.saturating_add(1);
+        } else {
+            break;
+        }
+    }
+    count
 }
 
 fn find_anchor_price(ticks: &VecDeque<(i64, f64)>, target_ms: i64) -> Option<f64> {
@@ -236,6 +339,8 @@ mod tests {
         let mut det = DirectionDetector::new(DirectionConfig {
             min_ticks_for_signal: 3,
             threshold_15m_pct: 0.10,
+            min_consecutive_ticks: 1,
+            min_velocity_bps_per_sec: 0.0,
             ..DirectionConfig::default()
         });
         let now = 1_000_000i64;
@@ -245,6 +350,7 @@ mod tests {
         let sig = det.evaluate("BTCUSDT", now).unwrap();
         assert_eq!(sig.direction, Direction::Up);
         assert!(sig.magnitude_pct > 0.10);
+        assert!(sig.velocity_bps_per_sec > 0.0);
     }
 
     #[test]
@@ -261,6 +367,8 @@ mod tests {
         let mut det = DirectionDetector::new(DirectionConfig {
             min_ticks_for_signal: 3,
             min_sources_for_high_confidence: 2,
+            min_consecutive_ticks: 1,
+            min_velocity_bps_per_sec: 0.0,
             ..DirectionConfig::default()
         });
         let now = 1_000_000i64;
@@ -271,5 +379,42 @@ mod tests {
         let sig = det.evaluate("BTCUSDT", now).unwrap();
         assert_eq!(sig.direction, Direction::Up);
         assert!(sig.confidence >= 0.85);
+    }
+
+    #[test]
+    fn triple_confirm_blocks_single_tick_fakeout() {
+        let mut det = DirectionDetector::new(DirectionConfig {
+            min_ticks_for_signal: 3,
+            threshold_15m_pct: 0.10,
+            min_consecutive_ticks: 2,
+            min_velocity_bps_per_sec: 1.0,
+            ..DirectionConfig::default()
+        });
+        let now = 1_000_000i64;
+        det.on_tick(&tick("binance", "BTCUSDT", now - 60_000, 100.0));
+        det.on_tick(&tick("binance", "BTCUSDT", now - 15_000, 100.0));
+        det.on_tick(&tick("binance", "BTCUSDT", now - 1_000, 100.2));
+        det.on_tick(&tick("binance", "BTCUSDT", now, 100.1));
+        let sig = det.evaluate("BTCUSDT", now).unwrap();
+        assert_eq!(sig.direction, Direction::Neutral);
+    }
+
+    #[test]
+    fn triple_confirm_passes_consistent_move() {
+        let mut det = DirectionDetector::new(DirectionConfig {
+            min_ticks_for_signal: 4,
+            threshold_15m_pct: 0.05,
+            min_consecutive_ticks: 2,
+            min_velocity_bps_per_sec: 1.0,
+            ..DirectionConfig::default()
+        });
+        let now = 1_000_000i64;
+        det.on_tick(&tick("binance", "BTCUSDT", now - 60_000, 100.0));
+        det.on_tick(&tick("binance", "BTCUSDT", now - 2_000, 100.05));
+        det.on_tick(&tick("binance", "BTCUSDT", now - 1_000, 100.10));
+        det.on_tick(&tick("binance", "BTCUSDT", now, 100.20));
+        let sig = det.evaluate("BTCUSDT", now).unwrap();
+        assert_eq!(sig.direction, Direction::Up);
+        assert!(sig.tick_consistency >= 2);
     }
 }
