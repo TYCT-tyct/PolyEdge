@@ -2502,6 +2502,9 @@ fn spawn_strategy_engine(
                 latest_fast_ticks.retain(|_, tick| {
                     fast_tick_allowed_in_fusion_mode(tick.source.as_str(), &current_fusion_mode)
                 });
+                shared.latest_fast_ticks.retain(|_, tick| {
+                    fast_tick_allowed_in_fusion_mode(tick.source.as_str(), &current_fusion_mode)
+                });
                 last_fusion_mode = current_fusion_mode.clone();
                 shared
                     .shadow_stats
@@ -2657,7 +2660,17 @@ fn spawn_strategy_engine(
                     let tick_fast_owned = shared
                         .latest_fast_ticks
                         .get(symbol.as_str())
-                        .map(|entry| entry.value().clone());
+                        .map(|entry| entry.value().clone())
+                        .and_then(|tick| {
+                            if fast_tick_allowed_in_fusion_mode(
+                                tick.source.as_str(),
+                                &current_fusion_mode,
+                            ) {
+                                Some(tick)
+                            } else {
+                                None
+                            }
+                        });
                     let tick_fast = tick_fast_owned
                         .as_ref()
                         .or_else(|| pick_latest_tick(&latest_fast_ticks, &symbol));
