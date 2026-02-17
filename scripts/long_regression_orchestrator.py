@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import atexit
 import argparse
 import json
 import math
@@ -628,6 +629,7 @@ def main() -> int:
     started = time.monotonic()
     next_heartbeat = started + max(1.0, args.heartbeat_sec)
     session = requests.Session()
+    atexit.register(session.close)
     out_root = Path(args.out_root)
     out_root.mkdir(parents=True, exist_ok=True)
 

@@ -8,7 +8,7 @@ use anyhow::{bail, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use core_types::{new_id, ExecutionVenue, OrderAck, OrderAckV2, OrderIntentV2, QuoteIntent};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use reqwest::Client;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,7 +22,7 @@ pub struct ClobExecution {
     http: Client,
     clob_endpoint: String,
     open_orders: Arc<RwLock<HashMap<String, PaperOpenOrder>>>,
-    last_prune: std::sync::Mutex<Instant>,
+    last_prune: Mutex<Instant>,
     ack_probe: Option<Arc<AckProbe>>,
 }
 
@@ -33,7 +33,7 @@ impl Clone for ClobExecution {
             http: self.http.clone(),
             clob_endpoint: self.clob_endpoint.clone(),
             open_orders: self.open_orders.clone(),
-            last_prune: std::sync::Mutex::new(Instant::now()),
+            last_prune: Mutex::new(Instant::now()),
             ack_probe: self.ack_probe.clone(),
         }
     }
@@ -132,7 +132,7 @@ impl ClobExecution {
             http,
             clob_endpoint,
             open_orders: Arc::new(RwLock::new(HashMap::new())),
-            last_prune: std::sync::Mutex::new(Instant::now()),
+            last_prune: Mutex::new(Instant::now()),
             ack_probe,
         }
     }
@@ -178,7 +178,7 @@ impl ClobExecution {
     fn prune_expired_orders(&self) {
         // Check if enough time has passed since last prune
         let should_prune = {
-            let mut last = self.last_prune.lock().unwrap();
+            let mut last = self.last_prune.lock();
             let now = Instant::now();
             if now.duration_since(*last) >= PRUNE_INTERVAL {
                 *last = now;

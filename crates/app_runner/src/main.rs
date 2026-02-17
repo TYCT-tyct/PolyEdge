@@ -1,8 +1,10 @@
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
@@ -27,7 +29,7 @@ use execution_clob::{ClobExecution, ExecutionMode};
 use fair_value::{BasisMrConfig, BasisMrFairValue};
 use feed_polymarket::PolymarketFeed;
 use feed_reference::MultiSourceRefFeed;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use infra_bus::RingBus;
 use market_discovery::{DiscoveryConfig, MarketDiscovery};
 use observability::{init_metrics, init_tracing};
@@ -1912,7 +1914,7 @@ async fn async_main() -> Result<()> {
         if !urls.is_empty() {
             tracing::info!(count = urls.len(), "prewarming execution http pool");
             let exec = execution.clone();
-            tokio::spawn(async move {
+            spawn_detached("execution_http_prewarm", false, async move {
                 exec.prewarm_urls(&urls).await;
             });
         }
@@ -2063,6 +2065,32 @@ fn install_rustls_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
+fn spawn_detached<F>(task_name: &'static str, report_normal_exit: bool, fut: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        match AssertUnwindSafe(fut).catch_unwind().await {
+            Ok(()) => {
+                if report_normal_exit {
+                    tracing::warn!(task = task_name, "detached task exited");
+                }
+            }
+            Err(payload) => {
+                let panic_msg = if let Some(msg) = payload.downcast_ref::<&str>() {
+                    (*msg).to_string()
+                } else if let Some(msg) = payload.downcast_ref::<String>() {
+                    msg.clone()
+                } else {
+                    "unknown panic payload".to_string()
+                };
+                tracing::error!(task = task_name, panic = %panic_msg, "detached task panicked");
+                metrics::counter!("runtime.detached_task_panic").increment(1);
+            }
+        }
+    });
+}
+
 fn spawn_reference_feed(
     bus: RingBus<EngineEvent>,
     stats: Arc<ShadowStats>,
@@ -2076,7 +2104,7 @@ fn spawn_reference_feed(
     }
     const TS_INVERSION_TOLERANCE_MS: i64 = 250;
     const TS_BACKJUMP_RESET_MS: i64 = 5_000;
-    tokio::spawn(async move {
+    spawn_detached("reference_feed_orchestrator", true, async move {
         let symbols = if symbols.is_empty() {
             vec!["BTCUSDT".to_string()]
         } else {
@@ -2086,7 +2114,7 @@ fn spawn_reference_feed(
 
         let tx_direct = tx.clone();
         let symbols_direct = symbols.clone();
-        tokio::spawn(async move {
+        spawn_detached("reference_feed_direct_lane", true, async move {
             loop {
                 let feed = MultiSourceRefFeed::new(Duration::from_millis(50));
                 match feed.stream_ticks(symbols_direct.clone()).await {
@@ -2106,7 +2134,7 @@ fn spawn_reference_feed(
         let tx_udp = tx.clone();
         let symbols_udp = symbols.clone();
         let fusion_cfg_udp = fusion_cfg.clone();
-        tokio::spawn(async move {
+        spawn_detached("reference_feed_udp_lane", true, async move {
             loop {
                 let cfg = fusion_cfg_udp.read().await.clone();
                 if !cfg.enable_udp || cfg.mode == "direct_only" {
@@ -2219,7 +2247,7 @@ fn spawn_market_feed(
     const BOOK_IDLE_TIMEOUT_MS: u64 = 20_000;
     const RECONNECT_BASE_MS: u64 = 250;
     const RECONNECT_MAX_MS: u64 = 10_000;
-    tokio::spawn(async move {
+    spawn_detached("market_feed_orchestrator", true, async move {
         let mut reconnects: u64 = 0;
         loop {
             let feed = PolymarketFeed::new_with_universe(
@@ -2350,7 +2378,7 @@ fn spawn_strategy_engine(
     paused: Arc<RwLock<bool>>,
     shared: Arc<EngineShared>,
 ) {
-    tokio::spawn(async move {
+    spawn_detached("strategy_engine", true, async move {
         let fair = BasisMrFairValue::new(shared.fair_value_cfg.clone());
         // Separate fast reference ticks (exchange WS) from anchor ticks (Chainlink RTDS).
         // Fast ticks drive stale filtering + fair value evaluation; anchor ticks are tracked for
@@ -3915,7 +3943,7 @@ fn spawn_shadow_outcome_task(
     bus: RingBus<EngineEvent>,
     shot: ShadowShot,
 ) {
-    tokio::spawn(async move {
+    spawn_detached("shadow_outcome", false, async move {
         tokio::time::sleep(Duration::from_millis(shot.delay_ms)).await;
         if !shared.shadow_stats.is_current_window_ts_ns(shot.t0_ns) {
             metrics::counter!("shadow.outcome_window_mismatch").increment(1);
@@ -4111,7 +4139,7 @@ fn spawn_survival_probe_task(
     probe_px: f64,
     delay_ms: u64,
 ) {
-    tokio::spawn(async move {
+    spawn_detached("survival_probe", false, async move {
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         let book = shared.latest_books.read().await.get(&market_id).cloned();
         let survived = match book {
@@ -5005,7 +5033,7 @@ async fn maybe_spawn_fee_refresh(
     let clob_endpoint = shared.clob_endpoint.clone();
     let fee_cache = shared.fee_cache.clone();
     let inflight = shared.fee_refresh_inflight.clone();
-    tokio::spawn(async move {
+    spawn_detached("fee_refresh", false, async move {
         if let Some(fee_bps) = fetch_fee_rate_bps(&http, &clob_endpoint, &market).await {
             fee_cache.write().await.insert(
                 market.clone(),
@@ -5055,7 +5083,7 @@ async fn maybe_spawn_scoring_refresh(
     let scoring_cache = shared.scoring_cache.clone();
     let inflight = shared.scoring_refresh_inflight.clone();
     let rebate_factor = shared.scoring_rebate_factor;
-    tokio::spawn(async move {
+    spawn_detached("scoring_refresh", false, async move {
         if let Some((scoring_ok, raw)) = fetch_order_scoring(&http, &clob_endpoint, &order).await {
             let mut cache = scoring_cache.write().await;
             let mut entry = cache.get(&market).cloned().unwrap_or(ScoringState {
@@ -6337,7 +6365,7 @@ async fn init_jsonl_writer(perf_profile: Arc<RwLock<PerfProfile>>) {
     if JSONL_WRITER.set(tx.clone()).is_err() {
         return;
     }
-    tokio::spawn(async move {
+    spawn_detached("jsonl_writer", true, async move {
         let mut batch = Vec::<JsonlWriteReq>::new();
         let mut ticker = tokio::time::interval(Duration::from_millis(200));
         loop {

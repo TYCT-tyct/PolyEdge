@@ -9,6 +9,7 @@ Writes:
 
 from __future__ import annotations
 
+import atexit
 import argparse
 import json
 import time
@@ -93,6 +94,7 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     session = requests.Session()
+    atexit.register(session.close)
     health = session.get(f"{args.gateway_url.rstrip('/')}/health", timeout=args.timeout_sec).json()
 
     best_bid = 0.0

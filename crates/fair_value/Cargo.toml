@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 core_types = { path = "../core_types" }
 serde.workspace = true
+parking_lot.workspace = true

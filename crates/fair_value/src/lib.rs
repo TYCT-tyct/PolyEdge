@@ -1,7 +1,8 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 use core_types::{BookTop, FairValueModel, RefTick, Signal};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,7 +79,7 @@ impl FairValueModel for BasisMrFairValue {
         // across all markets (e.g. daily, 15m) for that asset. This prevents warmup reset on rollover.
         let key = tick.symbol.clone();
 
-        let mut map = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.state.lock();
         let st = map.entry(key).or_default();
 
         let ret = if st.last_ref_px > 0.0 {

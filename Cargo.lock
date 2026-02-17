@@ -469,6 +469,7 @@ name = "fair_value"
 version = "0.1.0"
 dependencies = [
  "core_types",
+ "parking_lot",
  "serde",
 ]
 

@@ -7,6 +7,7 @@ under datasets/reports/<day>/, suitable for comparing runs over time.
 
 from __future__ import annotations
 
+import atexit
 import argparse
 import asyncio
 import json
@@ -69,6 +70,7 @@ def utc_day(ts: float | None = None) -> str:
 
 def collect_engine_series(base_url: str, seconds: int, poll_interval: float) -> Dict[str, Any]:
     session = requests.Session()
+    atexit.register(session.close)
     deadline = time.time() + max(1, seconds)
     samples = 0
     failures = 0

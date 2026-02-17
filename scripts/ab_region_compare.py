@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import atexit
 import argparse
 import json
 import os
@@ -57,6 +58,7 @@ def collect(
     fail_fast_threshold: int,
 ) -> RegionStats:
     session = requests.Session()
+    atexit.register(session.close)
     deadline = time.time() + max(1, seconds)
     tick_ack: List[float] = []
     tick_decision: List[float] = []

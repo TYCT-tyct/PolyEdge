@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import atexit
 import argparse
 import asyncio
 import json
@@ -26,6 +27,7 @@ PROFILE_DEFAULTS: Dict[str, Dict[str, float]] = {
 
 def collect_engine_metrics(base_url: str, seconds: int, poll_interval: float) -> Dict[str, Any]:
     session = requests.Session()
+    atexit.register(session.close)
     deadline = time.time() + max(1, seconds)
     samples = 0
     failures = 0

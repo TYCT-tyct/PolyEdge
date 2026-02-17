@@ -3,6 +3,7 @@ from __future__ import annotations
 # NOTE: This module is kept for legacy REST comparison only.
 # The primary benchmark path is scripts/e2e_latency_test.py in ws-first mode.
 
+import atexit
 import json
 import time
 import uuid
@@ -281,6 +282,7 @@ def simulate_execution(intents: List[Dict[str, Any]]) -> List[str]:
 
 def run_rest_pipeline(iterations: int, symbol: str) -> Dict[str, Any]:
     session = requests.Session()
+    atexit.register(session.close)
     market = discover_market(session, symbol)
     samples: List[StageSample] = []
     failures = 0

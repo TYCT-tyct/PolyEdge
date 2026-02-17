@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import atexit
 import argparse
 import json
 import os
@@ -278,6 +279,7 @@ def main() -> int:
     modes = ["direct_only", "udp_only", "active_active"]
 
     session = requests.Session()
+    atexit.register(session.close)
     payload: Dict[str, Any] = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "run_id": args.run_id,

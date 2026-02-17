@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import atexit
 import argparse
 import csv
 import itertools
@@ -969,6 +970,7 @@ def main() -> int:
     run_dir = day_dir / "runs" / str(args.run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     session = requests.Session()
+    atexit.register(session.close)
     started = time.monotonic()
 
     edge_grid = parse_float_grid(args.min_edge_grid)

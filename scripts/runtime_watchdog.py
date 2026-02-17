@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import atexit
 import argparse
 import json
 import sys
@@ -294,6 +295,7 @@ def run_once(session: requests.Session, args: argparse.Namespace) -> int:
 def main() -> int:
     args = parse_args()
     session = requests.Session()
+    atexit.register(session.close)
 
     if args.once:
         return run_once(session, args)

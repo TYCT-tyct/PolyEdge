@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import atexit
 import argparse
 import concurrent.futures
 import json
@@ -160,6 +161,7 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     session = requests.Session()
+    atexit.register(session.close)
     errors = 0
     consecutive_failures = 0
     samples: List[ProbeResult] = []

@@ -9,6 +9,7 @@ Artifacts are written under:
 
 from __future__ import annotations
 
+import atexit
 import argparse
 import json
 import time
@@ -396,6 +397,7 @@ def main() -> int:
     day = utc_day()
     root = Path(args.out_root) / day / "runs" / args.run_id
     session = requests.Session()
+    atexit.register(session.close)
 
     try:
         if args.mode == "baseline":
