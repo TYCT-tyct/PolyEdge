@@ -24,6 +24,10 @@ struct Route {
 struct SenderTuning {
     redundancy: u8,
     sndbuf_bytes: Option<usize>,
+    adaptive_redundancy: bool,
+    adaptive_redundancy_high: u8,
+    adaptive_err_threshold_per_sec: u64,
+    adaptive_cooldown_sec: u64,
 }
 
 fn main() -> Result<()> {
@@ -100,9 +104,92 @@ fn load_sender_tuning() -> SenderTuning {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0);
+    let adaptive_redundancy = std::env::var("POLYEDGE_UDP_REDUNDANCY_ADAPTIVE")
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+        .unwrap_or(false);
+    let adaptive_redundancy_high = std::env::var("POLYEDGE_UDP_REDUNDANCY_ADAPTIVE_HIGH")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(2)
+        .min(8);
+    let adaptive_err_threshold_per_sec = std::env::var("POLYEDGE_UDP_REDUNDANCY_ERR_THRESHOLD_PER_SEC")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(2)
+        .max(1);
+    let adaptive_cooldown_sec = std::env::var("POLYEDGE_UDP_REDUNDANCY_COOLDOWN_SEC")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(10)
+        .max(1);
     SenderTuning {
         redundancy,
         sndbuf_bytes,
+        adaptive_redundancy,
+        adaptive_redundancy_high,
+        adaptive_err_threshold_per_sec,
+        adaptive_cooldown_sec,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RedundancyController {
+    base: u8,
+    high: u8,
+    enabled: bool,
+    err_threshold_per_sec: u64,
+    cooldown_sec: u64,
+    current: u8,
+    last_error_window: std::time::Instant,
+    last_error_total: u64,
+    last_error_event: std::time::Instant,
+}
+
+impl RedundancyController {
+    fn new(tuning: SenderTuning) -> Self {
+        let base = tuning.redundancy.max(1);
+        let high = tuning.adaptive_redundancy_high.max(base);
+        let now = std::time::Instant::now();
+        Self {
+            base,
+            high,
+            enabled: tuning.adaptive_redundancy,
+            err_threshold_per_sec: tuning.adaptive_err_threshold_per_sec.max(1),
+            cooldown_sec: tuning.adaptive_cooldown_sec.max(1),
+            current: base,
+            last_error_window: now,
+            last_error_total: 0,
+            last_error_event: now,
+        }
+    }
+
+    fn current(&self) -> u8 {
+        self.current
+    }
+
+    fn on_progress(&mut self, total_errors: u64) {
+        if !self.enabled {
+            self.current = self.base;
+            return;
+        }
+        let now = std::time::Instant::now();
+        let elapsed = now.saturating_duration_since(self.last_error_window);
+        if elapsed >= Duration::from_secs(1) {
+            let err_delta = total_errors.saturating_sub(self.last_error_total);
+            if err_delta >= self.err_threshold_per_sec {
+                self.current = self.high;
+                self.last_error_event = now;
+            } else if self.current > self.base
+                && now.saturating_duration_since(self.last_error_event)
+                    >= Duration::from_secs(self.cooldown_sec)
+            {
+                self.current = self.current.saturating_sub(1).max(self.base);
+            }
+            self.last_error_total = total_errors;
+            self.last_error_window = now;
+        }
     }
 }
 
@@ -206,6 +293,7 @@ async fn run_route(route: &Route, tuning: SenderTuning) -> Result<()> {
     let mut dropped_would_block: u64 = 0;
     let mut dropped_conn_refused: u64 = 0;
     let mut dropped_other: u64 = 0;
+    let mut redundancy_ctl = RedundancyController::new(tuning);
     let mut last_log = std::time::Instant::now();
 
     loop {
@@ -231,7 +319,7 @@ async fn run_route(route: &Route, tuning: SenderTuning) -> Result<()> {
                 encode_book_top24(&packet, &mut packet_buf).context("encode 24-byte packet")?;
                 frames = frames.saturating_add(1);
 
-                for _ in 0..tuning.redundancy {
+                for _ in 0..redundancy_ctl.current() {
                     match socket.send_to(&packet_buf, target_addr) {
                         Ok(_) => packets_ok = packets_ok.saturating_add(1),
                         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -245,15 +333,21 @@ async fn run_route(route: &Route, tuning: SenderTuning) -> Result<()> {
                 }
             }
 
+            let total_errors = dropped_would_block
+                .saturating_add(dropped_conn_refused)
+                .saturating_add(dropped_other);
+            redundancy_ctl.on_progress(total_errors);
+
             if last_log.elapsed().as_secs() >= 5 {
                 eprintln!(
-                    "sender: symbol={} frames={} packets_ok={} dropped_would_block={} dropped_conn_refused={} dropped_other={}",
+                    "sender: symbol={} frames={} packets_ok={} dropped_would_block={} dropped_conn_refused={} dropped_other={} redundancy={}",
                     route.symbol,
                     frames,
                     packets_ok,
                     dropped_would_block,
                     dropped_conn_refused,
-                    dropped_other
+                    dropped_other,
+                    redundancy_ctl.current()
                 );
                 last_log = std::time::Instant::now();
             }
@@ -398,5 +492,22 @@ mod tests {
         let map = parse_symbol_core_map("btcusdt:2,ethusdt:3");
         assert_eq!(map.get("btcusdt"), Some(&2usize));
         assert_eq!(map.get("ethusdt"), Some(&3usize));
+    }
+
+    #[test]
+    fn adaptive_redundancy_escalates_on_error_spike() {
+        let tuning = SenderTuning {
+            redundancy: 1,
+            sndbuf_bytes: None,
+            adaptive_redundancy: true,
+            adaptive_redundancy_high: 2,
+            adaptive_err_threshold_per_sec: 1,
+            adaptive_cooldown_sec: 1,
+        };
+        let mut ctl = RedundancyController::new(tuning);
+        assert_eq!(ctl.current(), 1);
+        std::thread::sleep(Duration::from_millis(1100));
+        ctl.on_progress(2);
+        assert_eq!(ctl.current(), 2);
     }
 }

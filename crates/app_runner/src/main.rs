@@ -139,6 +139,8 @@ impl Default for PredatorCConfig {
 struct EngineShared {
     latest_books: Arc<RwLock<HashMap<String, BookTop>>>,
     latest_signals: Arc<DashMap<String, SignalCacheEntry>>,
+    latest_fast_ticks: Arc<DashMap<String, RefTick>>,
+    latest_anchor_ticks: Arc<DashMap<String, RefTick>>,
     market_to_symbol: Arc<RwLock<HashMap<String, String>>>,
     token_to_symbol: Arc<RwLock<HashMap<String, String>>>,
     market_to_timeframe: Arc<RwLock<HashMap<String, TimeframeClass>>>,
@@ -1984,6 +1986,8 @@ async fn async_main() -> Result<()> {
     let shared = Arc::new(EngineShared {
         latest_books: Arc::new(RwLock::new(HashMap::new())),
         latest_signals: Arc::new(DashMap::new()),
+        latest_fast_ticks: Arc::new(DashMap::new()),
+        latest_anchor_ticks: Arc::new(DashMap::new()),
         market_to_symbol: Arc::new(RwLock::new(HashMap::new())),
         token_to_symbol: Arc::new(RwLock::new(HashMap::new())),
         market_to_timeframe: Arc::new(RwLock::new(HashMap::new())),
@@ -2039,6 +2043,7 @@ async fn async_main() -> Result<()> {
         shared.shadow_stats.clone(),
         (*universe_symbols).clone(),
         shared.fusion_cfg.clone(),
+        shared.clone(),
     );
     spawn_market_feed(
         bus.clone(),
@@ -2110,6 +2115,7 @@ fn spawn_reference_feed(
     stats: Arc<ShadowStats>,
     symbols: Vec<String>,
     fusion_cfg: Arc<RwLock<FusionConfig>>,
+    shared: Arc<EngineShared>,
 ) {
     #[derive(Clone, Copy)]
     enum RefLane {
@@ -2179,6 +2185,10 @@ fn spawn_reference_feed(
         let mut ingest_seq: u64 = 0;
         let mut last_source_ts_by_stream: HashMap<String, i64> = HashMap::new();
         let mut last_published_by_symbol: HashMap<String, (i64, f64)> = HashMap::new();
+        let ref_tick_bus_enabled = std::env::var("POLYEDGE_REF_TICK_BUS_ENABLED")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+            .unwrap_or(false);
 
         while let Some((lane, item)) = rx.recv().await {
             match item {
@@ -2240,7 +2250,24 @@ fn spawn_reference_feed(
                         stats.record_issue("invalid_ref_tick").await;
                         continue;
                     }
-                    let _ = bus.publish(EngineEvent::RefTick(tick));
+
+                    if is_anchor {
+                        let _ = upsert_latest_tick_slot(
+                            &shared.latest_anchor_ticks,
+                            tick.clone(),
+                            should_replace_anchor_tick,
+                        );
+                    } else if let Some(delta_ns) = upsert_latest_tick_slot(
+                        &shared.latest_fast_ticks,
+                        tick.clone(),
+                        should_replace_ref_tick,
+                    ) {
+                        metrics::histogram!("fusion.arrive_delta_ns").record(delta_ns as f64);
+                    }
+
+                    if ref_tick_bus_enabled {
+                        let _ = bus.publish(EngineEvent::RefTick(tick));
+                    }
                 }
                 Err(err) => {
                     tracing::warn!(?err, "reference feed event error");
@@ -2404,6 +2431,7 @@ fn spawn_strategy_engine(
         // auditing/diagnostics so the trigger stays latency-sensitive.
         let mut latest_fast_ticks: HashMap<String, RefTick> = HashMap::new();
         let mut latest_anchor_ticks: HashMap<String, RefTick> = HashMap::new();
+        let mut last_direction_tick_event_ms: HashMap<String, i64> = HashMap::new();
         let mut market_inventory: HashMap<String, InventoryState> = HashMap::new();
         let mut market_rate_budget: HashMap<String, TokenBucket> = HashMap::new();
         let mut untracked_issue_cooldown: HashMap<String, Instant> = HashMap::new();
@@ -2455,13 +2483,6 @@ fn spawn_strategy_engine(
                 EngineEvent::RefTick(tick) => {
                     let parse_us = dispatch_start.elapsed().as_secs_f64() * 1_000_000.0;
                     shared.shadow_stats.push_parse_us(parse_us).await;
-                    if !is_anchor_ref_source(tick.source.as_str()) {
-                        shared
-                            .predator_direction_detector
-                            .write()
-                            .await
-                            .on_tick(&tick);
-                    }
                     if !is_anchor_ref_source(tick.source.as_str())
                         && !fast_tick_allowed_in_fusion_mode(
                             tick.source.as_str(),
@@ -2480,7 +2501,6 @@ fn spawn_strategy_engine(
                     let mut coalesced = 0_u64;
                     let dynamic_cap = rx.len().saturating_add(64).min(strategy_max_coalesce);
                     let max_coalesced = dynamic_cap.max(strategy_coalesce_min);
-                    let mut coalesced_direction_ticks: HashMap<String, RefTick> = HashMap::new();
                     while coalesced < max_coalesced as u64 {
                         match rx.try_recv() {
                             Ok(EngineEvent::BookTop(next_book)) => {
@@ -2497,16 +2517,6 @@ fn spawn_strategy_engine(
                                 {
                                     coalesced += 1;
                                     continue;
-                                }
-                                if !next_is_anchor {
-                                    let key = next_tick.symbol.clone();
-                                    let replace = coalesced_direction_ticks
-                                        .get(&key)
-                                        .map(|cur| should_replace_ref_tick(cur, &next_tick))
-                                        .unwrap_or(true);
-                                    if replace {
-                                        coalesced_direction_ticks.insert(key, next_tick.clone());
-                                    }
                                 }
                                 insert_latest_ref_tick(
                                     &mut latest_fast_ticks,
@@ -2526,12 +2536,6 @@ fn spawn_strategy_engine(
                                 break;
                             }
                             Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
-                        }
-                    }
-                    if !coalesced_direction_ticks.is_empty() {
-                        let mut detector = shared.predator_direction_detector.write().await;
-                        for tick in coalesced_direction_ticks.values() {
-                            detector.on_tick(tick);
                         }
                     }
                     if coalesced > 0 {
@@ -2606,7 +2610,13 @@ fn spawn_strategy_engine(
                         }
                         continue;
                     };
-                    let tick_fast = pick_latest_tick(&latest_fast_ticks, &symbol);
+                    let tick_fast_owned = shared
+                        .latest_fast_ticks
+                        .get(symbol.as_str())
+                        .map(|entry| entry.value().clone());
+                    let tick_fast = tick_fast_owned
+                        .as_ref()
+                        .or_else(|| pick_latest_tick(&latest_fast_ticks, &symbol));
                     let Some(tick_fast) = tick_fast else {
                         shared.shadow_stats.record_issue("tick_missing").await;
                         continue;
@@ -2623,7 +2633,13 @@ fn spawn_strategy_engine(
                             .await;
                         continue;
                     }
-                    let tick_anchor = pick_latest_tick(&latest_anchor_ticks, &symbol);
+                    let tick_anchor_owned = shared
+                        .latest_anchor_ticks
+                        .get(symbol.as_str())
+                        .map(|entry| entry.value().clone());
+                    let tick_anchor = tick_anchor_owned
+                        .as_ref()
+                        .or_else(|| pick_latest_tick(&latest_anchor_ticks, &symbol));
                     if let Some(anchor) = tick_anchor {
                         let now_ms = Utc::now().timestamp_millis();
                         let age_ms = now_ms - ref_event_ts_ms(anchor);
@@ -2637,6 +2653,21 @@ fn spawn_strategy_engine(
                     // reference tick. The Chainlink anchor is tracked for correctness auditing and
                     // can be used for future calibration, but should not slow down the trigger.
                     let eval_tick = tick_fast;
+                    if !is_anchor_ref_source(eval_tick.source.as_str()) {
+                        let event_ms = ref_event_ts_ms(eval_tick);
+                        let should_update_direction = last_direction_tick_event_ms
+                            .get(symbol.as_str())
+                            .map(|prev| event_ms > *prev)
+                            .unwrap_or(true);
+                        if should_update_direction {
+                            shared
+                                .predator_direction_detector
+                                .write()
+                                .await
+                                .on_tick(eval_tick);
+                            last_direction_tick_event_ms.insert(symbol.clone(), event_ms);
+                        }
+                    }
                     shared.shadow_stats.mark_seen();
 
                     // Positive value means: our fast reference tick arrived earlier than the
@@ -4917,6 +4948,17 @@ fn should_replace_ref_tick(current: &RefTick, next: &RefTick) -> bool {
         return false;
     }
 
+    let staleness_budget_us = fusion_staleness_budget_us();
+    if next.recv_ts_local_ns > 0
+        && current.recv_ts_local_ns > 0
+        && next.recv_ts_local_ns > current.recv_ts_local_ns
+    {
+        let arrival_delta_us = (next.recv_ts_local_ns - current.recv_ts_local_ns) / 1_000;
+        if arrival_delta_us > staleness_budget_us && next_event <= current_event + 1 {
+            return false;
+        }
+    }
+
     // Priority 1: Chainlink RTDS has <5ms latency, always prefer when timestamps are recent
     if next.source == "chainlink_rtds" && next_event + 50 >= current_event {
         return true;
@@ -4949,6 +4991,17 @@ fn should_replace_ref_tick(current: &RefTick, next: &RefTick) -> bool {
 
     // Within ~5ms latency tie: prefer the newer event time, otherwise keep first-arriving tick.
     next_event > current_event + 1
+}
+
+fn fusion_staleness_budget_us() -> i64 {
+    static BUDGET_US: OnceLock<i64> = OnceLock::new();
+    *BUDGET_US.get_or_init(|| {
+        std::env::var("POLYEDGE_FUSION_STALENESS_BUDGET_US")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(600)
+            .clamp(50, 5_000)
+    })
 }
 
 fn should_replace_anchor_tick(current: &RefTick, next: &RefTick) -> bool {
@@ -4985,6 +5038,36 @@ fn insert_latest_anchor_tick(latest_ticks: &mut HashMap<String, RefTick>, tick: 
         }
         None => {
             latest_ticks.insert(tick.symbol.clone(), tick);
+        }
+    }
+}
+
+fn upsert_latest_tick_slot(
+    latest_ticks: &DashMap<String, RefTick>,
+    tick: RefTick,
+    should_replace: fn(&RefTick, &RefTick) -> bool,
+) -> Option<i64> {
+    use dashmap::mapref::entry::Entry;
+    match latest_ticks.entry(tick.symbol.clone()) {
+        Entry::Occupied(mut entry) => {
+            let current = entry.get();
+            if !should_replace(current, &tick) {
+                return None;
+            }
+            let delta_ns = if current.source != tick.source
+                && current.recv_ts_local_ns > 0
+                && tick.recv_ts_local_ns > 0
+            {
+                Some((tick.recv_ts_local_ns - current.recv_ts_local_ns).unsigned_abs() as i64)
+            } else {
+                None
+            };
+            entry.insert(tick);
+            delta_ns
+        }
+        Entry::Vacant(entry) => {
+            entry.insert(tick);
+            None
         }
     }
 }
@@ -7154,6 +7237,54 @@ mod tests {
         assert!(sample.feed_in_ms >= 1.0);
         assert!(sample.feed_in_ms <= 4.0);
         assert!((sample.feed_in_ms - sample.ref_decode_ms).abs() < 0.0001);
+    }
+
+    #[test]
+    fn should_replace_ref_tick_respects_staleness_budget_for_same_event() {
+        let current = RefTick {
+            source: "binance_ws".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            source_seq: 10,
+            event_ts_ms: 1_000,
+            recv_ts_ms: 1_010,
+            event_ts_exchange_ms: 1_000,
+            recv_ts_local_ns: 1_000_000_000,
+            ingest_ts_local_ns: 1_000_100_000,
+            price: 100.0,
+        };
+        let mut next = current.clone();
+        next.source = "binance_udp".to_string();
+        next.recv_ts_local_ns = current.recv_ts_local_ns + 2_000_000;
+        next.recv_ts_ms = current.recv_ts_ms + 2;
+
+        assert!(!should_replace_ref_tick(&current, &next));
+    }
+
+    #[test]
+    fn upsert_latest_tick_slot_reports_source_switch_delta() {
+        let ticks = DashMap::<String, RefTick>::new();
+        let first = RefTick {
+            source: "binance_ws".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            source_seq: 1,
+            event_ts_ms: 1_000,
+            recv_ts_ms: 1_010,
+            event_ts_exchange_ms: 1_000,
+            recv_ts_local_ns: 1_000_000_000,
+            ingest_ts_local_ns: 1_000_050_000,
+            price: 100.0,
+        };
+        let mut second = first.clone();
+        second.source = "binance_udp".to_string();
+        second.event_ts_exchange_ms += 2;
+        second.recv_ts_ms += 1;
+        second.recv_ts_local_ns += 400_000;
+        second.price = 100.2;
+
+        let first_delta = upsert_latest_tick_slot(&ticks, first, should_replace_ref_tick);
+        assert!(first_delta.is_none());
+        let second_delta = upsert_latest_tick_slot(&ticks, second, should_replace_ref_tick);
+        assert_eq!(second_delta, Some(400_000));
     }
 
     #[test]

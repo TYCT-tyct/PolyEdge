@@ -19,6 +19,7 @@ struct UdpRecvTuning {
     rcvbuf_bytes: Option<usize>,
     busy_poll_us: Option<u32>,
     user_spin: bool,
+    drop_on_full: bool,
 }
 
 impl UdpRecvTuning {
@@ -35,10 +36,15 @@ impl UdpRecvTuning {
             .ok()
             .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
             .unwrap_or(false);
+        let drop_on_full = std::env::var("POLYEDGE_UDP_DROP_ON_FULL")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+            .unwrap_or(true);
         Self {
             rcvbuf_bytes,
             busy_poll_us,
             user_spin,
+            drop_on_full,
         }
     }
 }
@@ -52,7 +58,12 @@ impl UdpBinanceFeed {
 #[async_trait]
 impl RefPriceFeed for UdpBinanceFeed {
     async fn stream_ticks(&self, symbols: Vec<String>) -> Result<DynStream<RefTick>> {
-        let (tx, rx) = mpsc::channel::<Result<RefTick>>(16_384);
+        let rx_queue_cap = std::env::var("POLYEDGE_UDP_RX_QUEUE_CAP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4_096)
+            .clamp(512, 65_536);
+        let (tx, rx) = mpsc::channel::<Result<RefTick>>(rx_queue_cap);
         let normalized_symbols = normalize_symbols(&symbols);
         let bindings = udp_bindings(self.port, &normalized_symbols);
         let tuning = UdpRecvTuning::from_env();
@@ -118,7 +129,15 @@ fn spawn_recv_loop(
                         continue;
                     }
                     Err(err) => {
-                        if tx.blocking_send(Err(err.into())).is_err() {
+                        let send_err = if tuning.drop_on_full {
+                            match tx.try_send(Err(err.into())) {
+                                Ok(_) | Err(mpsc::error::TrySendError::Full(_)) => false,
+                                Err(mpsc::error::TrySendError::Closed(_)) => true,
+                            }
+                        } else {
+                            tx.blocking_send(Err(err.into())).is_err()
+                        };
+                        if send_err {
                             break;
                         }
                         continue;
@@ -131,7 +150,15 @@ fn spawn_recv_loop(
                 let packet = match decode_book_top24(&buf) {
                     Ok(pkt) => pkt,
                     Err(err) => {
-                        if tx.blocking_send(Err(err.into())).is_err() {
+                        let send_err = if tuning.drop_on_full {
+                            match tx.try_send(Err(err.into())) {
+                                Ok(_) | Err(mpsc::error::TrySendError::Full(_)) => false,
+                                Err(mpsc::error::TrySendError::Closed(_)) => true,
+                            }
+                        } else {
+                            tx.blocking_send(Err(err.into())).is_err()
+                        };
+                        if send_err {
                             break;
                         }
                         continue;
@@ -157,7 +184,15 @@ fn spawn_recv_loop(
                     price: mid,
                 };
 
-                if tx.blocking_send(Ok(tick)).is_err() {
+                let send_err = if tuning.drop_on_full {
+                    match tx.try_send(Ok(tick)) {
+                        Ok(_) | Err(mpsc::error::TrySendError::Full(_)) => false,
+                        Err(mpsc::error::TrySendError::Closed(_)) => true,
+                    }
+                } else {
+                    tx.blocking_send(Ok(tick)).is_err()
+                };
+                if send_err {
                     break;
                 }
             }
