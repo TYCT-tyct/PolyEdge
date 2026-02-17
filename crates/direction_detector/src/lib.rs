@@ -144,13 +144,29 @@ impl DirectionDetector {
         let (velocity_bps_per_sec, acceleration, tick_consistency) =
             kinematics_from_ticks(&w.ticks);
 
-        let raw_direction = if magnitude_pct > self.cfg.threshold_15m_pct {
+        let mut raw_direction = if magnitude_pct > self.cfg.threshold_15m_pct {
             Direction::Up
         } else if magnitude_pct < -self.cfg.threshold_15m_pct {
             Direction::Down
         } else {
             Direction::Neutral
         };
+        let velocity_direction = if velocity_bps_per_sec > 0.0 {
+            Direction::Up
+        } else if velocity_bps_per_sec < 0.0 {
+            Direction::Down
+        } else {
+            Direction::Neutral
+        };
+        let velocity_spike_only = matches!(raw_direction, Direction::Neutral)
+            && !matches!(velocity_direction, Direction::Neutral)
+            && tick_consistency >= self.cfg.min_consecutive_ticks.max(1)
+            && velocity_bps_per_sec.abs()
+                >= self.cfg.min_velocity_bps_per_sec.max(0.0)
+                    * self.cfg.momentum_spike_multiplier.max(1.0);
+        if velocity_spike_only {
+            raw_direction = velocity_direction;
+        }
         let direction_sign = match raw_direction {
             Direction::Up => 1.0,
             Direction::Down => -1.0,
@@ -557,5 +573,26 @@ mod tests {
         det.on_tick(&tick("chainlink_rtds", "BTCUSDT", now, 100.21));
         let sig = det.evaluate("BTCUSDT", now).unwrap();
         assert_eq!(sig.direction, Direction::Up);
+    }
+
+    #[test]
+    fn velocity_spike_overrides_magnitude_neutral() {
+        let mut det = DirectionDetector::new(DirectionConfig {
+            min_ticks_for_signal: 4,
+            threshold_15m_pct: 0.10,
+            min_consecutive_ticks: 2,
+            min_velocity_bps_per_sec: 5.0,
+            momentum_spike_multiplier: 1.8,
+            require_secondary_confirmation: false,
+            ..DirectionConfig::default()
+        });
+        let now = 1_000_000i64;
+        det.on_tick(&tick("binance_ws", "BTCUSDT", now - 60_000, 100.0));
+        det.on_tick(&tick("binance_ws", "BTCUSDT", now - 1_000, 100.00));
+        det.on_tick(&tick("binance_ws", "BTCUSDT", now - 800, 100.04));
+        det.on_tick(&tick("binance_ws", "BTCUSDT", now - 600, 100.08));
+        let sig = det.evaluate("BTCUSDT", now).unwrap();
+        assert_eq!(sig.direction, Direction::Up);
+        assert!(sig.magnitude_pct < 0.10);
     }
 }
