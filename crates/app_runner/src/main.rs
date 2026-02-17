@@ -2126,10 +2126,11 @@ fn spawn_reference_feed(
             match item {
                 Ok(tick) => {
                     let fusion = fusion_cfg.read().await.clone();
-                    if fusion.mode == "udp_only" && !matches!(lane, RefLane::Udp) {
+                    let is_anchor = is_anchor_ref_source(tick.source.as_str());
+                    if fusion.mode == "udp_only" && !matches!(lane, RefLane::Udp) && !is_anchor {
                         continue;
                     }
-                    if fusion.mode == "direct_only" && !matches!(lane, RefLane::Direct) {
+                    if fusion.mode == "direct_only" && !matches!(lane, RefLane::Direct) && !is_anchor {
                         continue;
                     }
                     ingest_seq = ingest_seq.saturating_add(1);
