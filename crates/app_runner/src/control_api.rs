@@ -27,6 +27,7 @@ pub(super) fn build_router(state: AppState) -> Router {
         .route("/control/reload_fusion", post(reload_fusion))
         .route("/control/reload_edge_model", post(reload_edge_model))
         .route("/control/reload_probability", post(reload_probability))
+        .route("/control/reload_source_health", post(reload_source_health))
         .route("/control/reload_exit", post(reload_exit))
         .route("/control/reload_perf_profile", post(reload_perf_profile))
         .with_state(state)
@@ -260,6 +261,34 @@ async fn reload_probability(
         &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "probability": cfg}),
     );
     Json(cfg)
+}
+
+async fn reload_source_health(
+    State(state): State<AppState>,
+    Json(req): Json<SourceHealthReloadReq>,
+) -> Json<SourceHealthConfig> {
+    let mut cfg = state.shared.source_health_cfg.write().await;
+    if let Some(v) = req.min_samples {
+        cfg.min_samples = v.max(1);
+    }
+    if let Some(v) = req.gap_window_ms {
+        cfg.gap_window_ms = v.clamp(50, 60_000);
+    }
+    if let Some(v) = req.jitter_limit_ms {
+        cfg.jitter_limit_ms = v.clamp(0.1, 2_000.0);
+    }
+    if let Some(v) = req.deviation_limit_bps {
+        cfg.deviation_limit_bps = v.clamp(0.1, 10_000.0);
+    }
+    if let Some(v) = req.min_score_for_trading {
+        cfg.min_score_for_trading = v.clamp(0.0, 1.0);
+    }
+    let snapshot = cfg.clone();
+    append_jsonl(
+        &dataset_path("reports", "source_health_reload.jsonl"),
+        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "source_health": snapshot}),
+    );
+    Json(snapshot)
 }
 
 async fn reload_exit(
@@ -658,6 +687,12 @@ async fn reload_perf_profile(
 async fn report_shadow_live(State(state): State<AppState>) -> Json<ShadowLiveReport> {
     let mut live = state.shadow_stats.build_live_report().await;
     live.edge_model_version = state.shared.edge_model_cfg.read().await.version.clone();
+    {
+        let map = state.shared.source_health_latest.read().await;
+        let mut rows = map.values().cloned().collect::<Vec<_>>();
+        rows.sort_by(|a, b| b.score.total_cmp(&a.score));
+        live.source_health = rows;
+    }
     persist_live_report_files(&live);
     Json(live)
 }
@@ -665,6 +700,12 @@ async fn report_shadow_live(State(state): State<AppState>) -> Json<ShadowLiveRep
 async fn report_shadow_final(State(state): State<AppState>) -> Json<ShadowFinalReport> {
     let mut final_report = state.shadow_stats.build_final_report().await;
     final_report.live.edge_model_version = state.shared.edge_model_cfg.read().await.version.clone();
+    {
+        let map = state.shared.source_health_latest.read().await;
+        let mut rows = map.values().cloned().collect::<Vec<_>>();
+        rows.sort_by(|a, b| b.score.total_cmp(&a.score));
+        final_report.live.source_health = rows;
+    }
     persist_final_report_files(&final_report);
     Json(final_report)
 }

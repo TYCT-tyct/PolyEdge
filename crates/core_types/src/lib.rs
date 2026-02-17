@@ -172,6 +172,21 @@ pub struct ProbabilityEstimate {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SourceHealth {
+    pub source: String,
+    pub latency_ms: f64,
+    pub jitter_ms: f64,
+    pub out_of_order_rate: f64,
+    pub gap_rate: f64,
+    pub price_deviation_bps: f64,
+    pub score: f64,
+    #[serde(default)]
+    pub sample_count: u64,
+    #[serde(default)]
+    pub ts_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TimeframeOpp {
     pub timeframe: TimeframeClass,
     pub market_id: String,

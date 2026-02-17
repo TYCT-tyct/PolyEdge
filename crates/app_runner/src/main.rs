@@ -21,6 +21,7 @@ use core_types::{
     EngineEvent, EnginePnLBreakdown, ExecutionStyle, ExecutionVenue, FairValueModel, InventoryState,
     MarketFeed, MarketHealth, OrderAck, OrderIntentV2, OrderSide, OrderTimeInForce,
     ProbabilityEstimate, QuoteEval, QuoteIntent, QuotePolicy, RefPriceFeed, RefTick, RiskContext,
+    SourceHealth,
     RiskManager, ShadowOutcome, ShadowShot, Signal, TimeframeClass, TimeframeOpp, ToxicDecision,
     ToxicFeatures, ToxicRegime,
 };
@@ -164,6 +165,8 @@ struct EngineShared {
     clob_endpoint: String,
     strategy_cfg: Arc<RwLock<Arc<MakerConfig>>>,
     settlement_cfg: Arc<RwLock<SettlementConfig>>,
+    source_health_cfg: Arc<RwLock<SourceHealthConfig>>,
+    source_health_latest: Arc<RwLock<HashMap<String, SourceHealth>>>,
     settlement_prices: Arc<RwLock<HashMap<String, f64>>>,
     fusion_cfg: Arc<RwLock<FusionConfig>>,
     edge_model_cfg: Arc<RwLock<EdgeModelConfig>>,
@@ -240,6 +243,15 @@ struct ProbabilityReloadReq {
     momentum_gain: Option<f64>,
     lag_penalty_per_ms: Option<f64>,
     confidence_floor: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceHealthReloadReq {
+    min_samples: Option<u64>,
+    gap_window_ms: Option<i64>,
+    jitter_limit_ms: Option<f64>,
+    deviation_limit_bps: Option<f64>,
+    min_score_for_trading: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -459,6 +471,27 @@ impl Default for SettlementConfig {
                 "SOLUSDT".to_string(),
                 "XRPUSDT".to_string(),
             ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SourceHealthConfig {
+    min_samples: u64,
+    gap_window_ms: i64,
+    jitter_limit_ms: f64,
+    deviation_limit_bps: f64,
+    min_score_for_trading: f64,
+}
+
+impl Default for SourceHealthConfig {
+    fn default() -> Self {
+        Self {
+            min_samples: 64,
+            gap_window_ms: 2_000,
+            jitter_limit_ms: 12.0,
+            deviation_limit_bps: 30.0,
+            min_score_for_trading: 0.45,
         }
     }
 }
@@ -834,6 +867,7 @@ struct ShadowLiveReport {
     survival_probe_10ms_by_symbol: HashMap<String, f64>,
     blocked_reason_counts: HashMap<String, u64>,
     source_mix_ratio: HashMap<String, f64>,
+    source_health: Vec<SourceHealth>,
     exit_reason_top: Vec<(String, u64)>,
     edge_model_version: String,
     latency: LatencyBreakdown,
@@ -1874,6 +1908,7 @@ impl ShadowStats {
             survival_probe_10ms_by_symbol,
             blocked_reason_counts,
             source_mix_ratio,
+            source_health: Vec::new(),
             exit_reason_top,
             edge_model_version: "unknown".to_string(),
             latency,
@@ -2077,6 +2112,7 @@ async fn async_main() -> Result<()> {
     let strategy_cfg = Arc::new(RwLock::new(Arc::new(load_strategy_config())));
     let settlement_cfg = Arc::new(RwLock::new(load_settlement_config()));
     let fusion_cfg = Arc::new(RwLock::new(load_fusion_config()));
+    let source_health_cfg = Arc::new(RwLock::new(load_source_health_config()));
     let edge_model_cfg = Arc::new(RwLock::new(load_edge_model_config()));
     let exit_cfg = Arc::new(RwLock::new(load_exit_config()));
     let exit_cfg0 = exit_cfg.read().await.clone();
@@ -2147,6 +2183,8 @@ async fn async_main() -> Result<()> {
         clob_endpoint: execution_cfg.clob_endpoint.clone(),
         strategy_cfg,
         settlement_cfg: settlement_cfg.clone(),
+        source_health_cfg: source_health_cfg.clone(),
+        source_health_latest: Arc::new(RwLock::new(HashMap::new())),
         settlement_prices: Arc::new(RwLock::new(HashMap::new())),
         fusion_cfg: fusion_cfg.clone(),
         edge_model_cfg: edge_model_cfg.clone(),
@@ -2388,6 +2426,10 @@ fn spawn_reference_feed(
         let mut ingest_seq: u64 = 0;
         let mut last_source_ts_by_stream: HashMap<String, i64> = HashMap::new();
         let mut last_published_by_symbol: HashMap<String, (i64, f64)> = HashMap::new();
+        let mut source_runtime: HashMap<String, SourceRuntimeStats> = HashMap::new();
+        let mut latest_price_by_symbol_source: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        let mut source_health_cfg = shared.source_health_cfg.read().await.clone();
+        let mut source_health_cfg_refresh_at = Instant::now();
         let ref_tick_bus_enabled = std::env::var("POLYEDGE_REF_TICK_BUS_ENABLED")
             .ok()
             .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
@@ -2434,6 +2476,63 @@ fn spawn_reference_feed(
                     }
                     last_published_by_symbol.insert(tick.symbol.clone(), (source_ts, tick.price));
                     stats.mark_ref_tick(tick.source.as_str(), tick.recv_ts_ms).await;
+                    if source_health_cfg_refresh_at.elapsed() >= Duration::from_millis(500) {
+                        source_health_cfg = shared.source_health_cfg.read().await.clone();
+                        source_health_cfg_refresh_at = Instant::now();
+                    }
+                    let source_key = tick.source.clone();
+                    let symbol_key = tick.symbol.clone();
+                    let recv_ts_ms = tick.recv_ts_ms;
+                    let latency_ms = recv_ts_ms.saturating_sub(source_ts).max(0) as f64;
+                    let runtime = source_runtime.entry(source_key.clone()).or_default();
+                    runtime.sample_count = runtime.sample_count.saturating_add(1);
+                    runtime.latency_sum_ms += latency_ms;
+                    runtime.latency_sq_sum_ms += latency_ms * latency_ms;
+                    if runtime.last_event_ts_ms > 0
+                        && source_ts + TS_INVERSION_TOLERANCE_MS < runtime.last_event_ts_ms
+                    {
+                        runtime.out_of_order_count = runtime.out_of_order_count.saturating_add(1);
+                    }
+                    if runtime.last_recv_ts_ms > 0
+                        && recv_ts_ms.saturating_sub(runtime.last_recv_ts_ms)
+                            > source_health_cfg.gap_window_ms
+                    {
+                        runtime.gap_count = runtime.gap_count.saturating_add(1);
+                    }
+                    runtime.last_event_ts_ms = source_ts;
+                    runtime.last_recv_ts_ms = recv_ts_ms;
+
+                    {
+                        let per_symbol = latest_price_by_symbol_source
+                            .entry(symbol_key)
+                            .or_default();
+                        per_symbol.insert(source_key.clone(), tick.price);
+                        if per_symbol.len() >= 2 {
+                            let values = per_symbol.values().copied().collect::<Vec<_>>();
+                            if let Some(median) = median_price(&values) {
+                                if median.is_finite() && median > 0.0 {
+                                    let dev_bps =
+                                        ((tick.price - median).abs() / median * 10_000.0).clamp(0.0, 10_000.0);
+                                    if runtime.sample_count <= 1 {
+                                        runtime.deviation_ema_bps = dev_bps;
+                                    } else {
+                                        runtime.deviation_ema_bps =
+                                            (runtime.deviation_ema_bps * 0.90) + (dev_bps * 0.10);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let source_health = build_source_health_snapshot(
+                        source_key.as_str(),
+                        runtime,
+                        &source_health_cfg,
+                        Utc::now().timestamp_millis(),
+                    );
+                    if runtime.sample_count % 8 == 0 {
+                        let mut map = shared.source_health_latest.write().await;
+                        map.insert(source_key, source_health);
+                    }
                     // Hot-path logging: avoid dynamic JSON trees + extra stringify passes.
                     // Build a single JSONL line and hand it to the async writer.
                     let tick_json =
@@ -2604,6 +2703,71 @@ fn blend_settlement_probability(p_fast_yes: f64, fast_price: f64, settle_price: 
     let settle_blend = (gap * 20.0).clamp(0.0, 0.25);
     let p = (p_fast_yes.clamp(0.0, 1.0) * (1.0 - settle_blend)) + (0.5 * settle_blend);
     p.clamp(0.0, 1.0)
+}
+
+#[derive(Debug, Default, Clone)]
+struct SourceRuntimeStats {
+    sample_count: u64,
+    latency_sum_ms: f64,
+    latency_sq_sum_ms: f64,
+    out_of_order_count: u64,
+    gap_count: u64,
+    last_event_ts_ms: i64,
+    last_recv_ts_ms: i64,
+    deviation_ema_bps: f64,
+}
+
+fn median_price(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let mid = sorted.len() / 2;
+    Some(if sorted.len() % 2 == 0 {
+        (sorted[mid - 1] + sorted[mid]) * 0.5
+    } else {
+        sorted[mid]
+    })
+}
+
+fn build_source_health_snapshot(
+    source: &str,
+    stats: &SourceRuntimeStats,
+    cfg: &SourceHealthConfig,
+    now_ms: i64,
+) -> SourceHealth {
+    let n = stats.sample_count.max(1) as f64;
+    let latency_ms = (stats.latency_sum_ms / n).max(0.0);
+    let variance = (stats.latency_sq_sum_ms / n) - (latency_ms * latency_ms);
+    let jitter_ms = variance.max(0.0).sqrt();
+    let out_of_order_rate = (stats.out_of_order_count as f64 / n).clamp(0.0, 1.0);
+    let gap_rate = (stats.gap_count as f64 / n).clamp(0.0, 1.0);
+    let price_deviation_bps = stats.deviation_ema_bps.max(0.0);
+
+    let jitter_penalty = (jitter_ms / cfg.jitter_limit_ms.max(1e-6)).clamp(0.0, 2.0);
+    let deviation_penalty = (price_deviation_bps / cfg.deviation_limit_bps.max(1e-6)).clamp(0.0, 2.0);
+    let out_of_order_penalty = (out_of_order_rate / 0.02).clamp(0.0, 2.0);
+    let gap_penalty = (gap_rate / 0.02).clamp(0.0, 2.0);
+    let coverage = (stats.sample_count as f64 / cfg.min_samples.max(1) as f64).clamp(0.0, 1.0);
+    let raw_score = 1.0
+        - (0.35 * jitter_penalty)
+        - (0.30 * deviation_penalty)
+        - (0.20 * out_of_order_penalty)
+        - (0.15 * gap_penalty);
+    let score = (raw_score.clamp(0.0, 1.0) * (0.25 + 0.75 * coverage)).clamp(0.0, 1.0);
+
+    SourceHealth {
+        source: source.to_string(),
+        latency_ms,
+        jitter_ms,
+        out_of_order_rate,
+        gap_rate,
+        price_deviation_bps,
+        score,
+        sample_count: stats.sample_count,
+        ts_ms: now_ms,
+    }
 }
 
 fn spawn_market_feed(
@@ -3925,6 +4089,28 @@ async fn run_predator_c_for_symbol(
     shared.shadow_stats.set_predator_enabled(predator_cfg.enabled);
     if !predator_cfg.enabled {
         return PredatorExecResult::default();
+    }
+    let source_health_cfg = shared.source_health_cfg.read().await.clone();
+    let primary_fast_source = shared
+        .latest_fast_ticks
+        .get(symbol)
+        .map(|tick| tick.source.clone());
+    if let Some(source) = primary_fast_source {
+        let health = {
+            let map = shared.source_health_latest.read().await;
+            map.get(&source).cloned()
+        };
+        if let Some(health) = health {
+            if health.sample_count >= source_health_cfg.min_samples
+                && health.score < source_health_cfg.min_score_for_trading
+            {
+                shared
+                    .shadow_stats
+                    .mark_predator_taker_skipped("source_health_low")
+                    .await;
+                return PredatorExecResult::default();
+            }
+        }
     }
 
     let direction_signal = {
@@ -6608,6 +6794,62 @@ fn load_fusion_config() -> FusionConfig {
     cfg
 }
 
+fn load_source_health_config() -> SourceHealthConfig {
+    let path = Path::new("configs/strategy.toml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return SourceHealthConfig::default();
+    };
+    let mut cfg = SourceHealthConfig::default();
+    let mut in_section = false;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_section = line == "[source_health]";
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim().trim_matches('"');
+        match key {
+            "min_samples" => {
+                if let Ok(parsed) = val.parse::<u64>() {
+                    cfg.min_samples = parsed.max(1);
+                }
+            }
+            "gap_window_ms" => {
+                if let Ok(parsed) = val.parse::<i64>() {
+                    cfg.gap_window_ms = parsed.clamp(50, 60_000);
+                }
+            }
+            "jitter_limit_ms" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.jitter_limit_ms = parsed.clamp(0.1, 2_000.0);
+                }
+            }
+            "deviation_limit_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.deviation_limit_bps = parsed.clamp(0.1, 10_000.0);
+                }
+            }
+            "min_score_for_trading" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.min_score_for_trading = parsed.clamp(0.0, 1.0);
+                }
+            }
+            _ => {}
+        }
+    }
+    cfg
+}
+
 fn load_edge_model_config() -> EdgeModelConfig {
     let path = Path::new("configs/strategy.toml");
     let Ok(raw) = fs::read_to_string(path) else {
@@ -8321,5 +8563,44 @@ timeframes = ["5m", "15m", "1h", "1d"]
     fn blend_settlement_probability_is_stable_when_prices_match() {
         let p = blend_settlement_probability(0.63, 100.0, 100.0);
         assert!((p - 0.63).abs() < 1e-9);
+    }
+
+    #[test]
+    fn source_health_snapshot_penalizes_bad_stream() {
+        let cfg = SourceHealthConfig::default();
+        let stats = SourceRuntimeStats {
+            sample_count: 256,
+            latency_sum_ms: 256.0 * 24.0,
+            latency_sq_sum_ms: 256.0 * (24.0f64.powi(2) + 18.0f64.powi(2)),
+            out_of_order_count: 12,
+            gap_count: 16,
+            last_event_ts_ms: 1_000,
+            last_recv_ts_ms: 1_010,
+            deviation_ema_bps: 80.0,
+        };
+        let row = build_source_health_snapshot("binance", &stats, &cfg, 1_700_000_000_000);
+        assert!(row.score < 0.45);
+        assert!(row.gap_rate > 0.01);
+        assert!(row.out_of_order_rate > 0.01);
+        assert!(row.jitter_ms > cfg.jitter_limit_ms);
+    }
+
+    #[test]
+    fn source_health_snapshot_stays_high_for_clean_stream() {
+        let cfg = SourceHealthConfig::default();
+        let stats = SourceRuntimeStats {
+            sample_count: 512,
+            latency_sum_ms: 512.0 * 4.0,
+            latency_sq_sum_ms: 512.0 * (4.0f64.powi(2) + 0.8f64.powi(2)),
+            out_of_order_count: 0,
+            gap_count: 0,
+            last_event_ts_ms: 1_000,
+            last_recv_ts_ms: 1_004,
+            deviation_ema_bps: 3.0,
+        };
+        let row = build_source_health_snapshot("coinbase", &stats, &cfg, 1_700_000_000_000);
+        assert!(row.score > 0.75);
+        assert!(row.jitter_ms < cfg.jitter_limit_ms);
+        assert!(row.price_deviation_bps < cfg.deviation_limit_bps);
     }
 }

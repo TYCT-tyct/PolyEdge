@@ -113,6 +113,13 @@ mode = "active_active"
 udp_port = 6666
 dedupe_window_ms = 30
 
+[source_health]
+min_samples = 64
+gap_window_ms = 2000
+jitter_limit_ms = 12.0
+deviation_limit_bps = 30.0
+min_score_for_trading = 0.45
+
 [edge_model]
 model = "ev_net"
 gate_mode = "dynamic"
