@@ -37,6 +37,9 @@ from dataclasses import dataclass, asdict
 from typing import List, Optional
 import numpy as np
 
+PROBE_FMT = "!QQ"
+PROBE_SIZE = struct.calcsize(PROBE_FMT)
+
 
 # ============================================================
 # 数据结构
@@ -122,7 +125,7 @@ async def test_latency_udp(target: str, port: int, duration_sec: int = 30,
                 send_ts = time.perf_counter_ns()
 
                 # 打包: 序列号 + 发送时间
-                payload = struct.pack('!IQ', seq, send_ts)
+                payload = struct.pack(PROBE_FMT, seq, send_ts)
                 sock.sendto(payload, (target, port))
 
                 # 等待响应 (简单 echo)
@@ -130,8 +133,8 @@ async def test_latency_udp(target: str, port: int, duration_sec: int = 30,
                     resp, _ = sock.recvfrom(1024)
                     recv_ts = time.perf_counter_ns()
 
-                    if len(resp) >= 16:
-                        resp_seq, resp_ts = struct.unpack('!IQ', resp[:16])
+                    if len(resp) >= PROBE_SIZE:
+                        resp_seq, resp_ts = struct.unpack(PROBE_FMT, resp[:PROBE_SIZE])
                         if resp_seq == seq:
                             # RTT = recv - send (纳秒)
                             rtt_ns = recv_ts - send_ts
@@ -192,7 +195,7 @@ async def test_throughput_udp(target: str, port: int, duration_sec: int = 10,
     sock.settimeout(1)
 
     # 构造固定大小数据包
-    payload = struct.pack('!IQ', 0, 0) + b'X' * (msg_size - 16)
+    payload = struct.pack(PROBE_FMT, 0, 0) + b'X' * (msg_size - PROBE_SIZE)
 
     total_bytes = 0
     total_msgs = 0
@@ -206,7 +209,7 @@ async def test_throughput_udp(target: str, port: int, duration_sec: int = 10,
             try:
                 seq = total_msgs + 1
                 send_ts = time.perf_counter_ns()
-                packet = struct.pack('!IQ', seq, send_ts) + payload[:msg_size-16]
+                packet = struct.pack(PROBE_FMT, seq, send_ts) + payload[:msg_size-PROBE_SIZE]
 
                 sock.sendto(packet, (target, port))
                 total_bytes += len(packet)
@@ -270,7 +273,7 @@ async def test_packet_loss_udp(target: str, port: int, duration_sec: int = 30,
                 sent += 1
                 send_ts = time.perf_counter_ns()
 
-                payload = struct.pack('!IQ', sent, send_ts)
+                payload = struct.pack(PROBE_FMT, sent, send_ts)
                 sock.sendto(payload, (target, port))
 
                 # 尝试接收响应
@@ -278,8 +281,8 @@ async def test_packet_loss_udp(target: str, port: int, duration_sec: int = 30,
                     resp, _ = sock.recvfrom(1024)
                     recv_ts = time.perf_counter_ns()
 
-                    if len(resp) >= 16:
-                        seq, _ = struct.unpack('!IQ', resp[:16])
+                    if len(resp) >= PROBE_SIZE:
+                        seq, _ = struct.unpack(PROBE_FMT, resp[:PROBE_SIZE])
                         received += 1
                         rtt = (recv_ts - send_ts) / 1e6
                         rtts.append(rtt)
@@ -553,7 +556,27 @@ async def main():
                 print("="*60)
                 print(f"   VPC 平均延迟:   {vpc_result.avg_ms:.2f} ms")
                 print(f"   公网平均延迟:   {direct_result.avg_ms:.2f} ms")
-                print(f"   速度提升:       {direct_result.avg_ms / vpc_result.avg_ms:.1f}x")
+                comparison = {
+                    "vpc_avg_ms": vpc_result.avg_ms,
+                    "vpc_samples": vpc_result.samples,
+                    "direct_avg_ms": direct_result.avg_ms,
+                    "direct_samples": direct_result.samples,
+                    "speedup_x": None,
+                    "comparable": False,
+                    "reason": None,
+                }
+                if vpc_result.samples <= 0 or vpc_result.avg_ms <= 0:
+                    comparison["reason"] = "vpc_latency_invalid_or_empty"
+                    print("   速度提升:       N/A (VPC 样本无效或为空)")
+                elif direct_result.samples <= 0 or direct_result.avg_ms <= 0:
+                    comparison["reason"] = "direct_latency_invalid_or_empty"
+                    print("   速度提升:       N/A (公网样本无效或为空)")
+                else:
+                    speedup_x = direct_result.avg_ms / vpc_result.avg_ms
+                    comparison["speedup_x"] = speedup_x
+                    comparison["comparable"] = True
+                    print(f"   速度提升:       {speedup_x:.1f}x")
+                results["compare"] = comparison
 
     # 保存结果
     if args.output:

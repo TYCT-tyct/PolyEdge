@@ -165,6 +165,7 @@ def summarize_windows(results: List[WindowResult], min_outcomes: int) -> Dict[st
                 "idx": r.idx,
                 "window_id": r.window_id,
                 "window_outcomes": int(live.get("window_outcomes") or 0),
+                "timed_out": bool(live.get("_timed_out", False)),
                 "gate_ready": bool(live.get("gate_ready")),
                 "gate_fail_reasons": live.get("gate_fail_reasons") or [],
                 "ev_net_usdc_p50": float(live.get("ev_net_usdc_p50") or 0.0),
@@ -195,6 +196,7 @@ def summarize_windows(results: List[WindowResult], min_outcomes: int) -> Dict[st
 
     all_have_samples = all(int(row["window_outcomes"]) >= min_outcomes for row in rows)
     all_gate_ok = all_have_samples and all((row.get("gate_fail_reasons") or []) == [] for row in rows)
+    timed_out_count = sum(1 for row in rows if bool(row.get("timed_out")))
 
     return {
         "ts_ms": now_ms(),
@@ -212,6 +214,7 @@ def summarize_windows(results: List[WindowResult], min_outcomes: int) -> Dict[st
             "feed_in_p99_ms": avg("feed_in_p99_ms"),
         },
         "pass": bool(all_gate_ok),
+        "timed_out_windows": timed_out_count,
         "notes": [],
     }
 
@@ -222,6 +225,7 @@ def render_md(mode_name: str, summary: Dict[str, Any]) -> str:
     lines.append(f"# Three-Window Summary ({mode_name})")
     lines.append("")
     lines.append(f"- pass: `{summary.get('pass')}`")
+    lines.append(f"- timed_out_windows: `{int(summary.get('timed_out_windows') or 0)}`")
     lines.append("")
     lines.append("## Averages")
     lines.append("")
@@ -248,14 +252,15 @@ def render_md(mode_name: str, summary: Dict[str, Any]) -> str:
     lines.append("")
     lines.append("## Windows")
     lines.append("")
-    lines.append("| idx | window_id | outcomes | gate_ready | ev_p50 | roi_p50_bps | exec/eligible | quote_block | policy_block |")
-    lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    lines.append("| idx | window_id | outcomes | timed_out | gate_ready | ev_p50 | roi_p50_bps | exec/eligible | quote_block | policy_block |")
+    lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for row in summary.get("windows") or []:
         lines.append(
-            "| {idx} | {window_id} | {out} | {gate_ready} | {ev:.6g} | {roi:.6g} | {eoe:.4f} | {qbr:.4f} | {pbr:.4f} |".format(
+            "| {idx} | {window_id} | {out} | {timed_out} | {gate_ready} | {ev:.6g} | {roi:.6g} | {eoe:.4f} | {qbr:.4f} | {pbr:.4f} |".format(
                 idx=int(row.get("idx") or 0),
                 window_id=int(row.get("window_id") or 0),
                 out=int(row.get("window_outcomes") or 0),
+                timed_out=bool(row.get("timed_out")),
                 gate_ready=bool(row.get("gate_ready")),
                 ev=float(row.get("ev_net_usdc_p50") or 0.0),
                 roi=float(row.get("roi_notional_10s_bps_p50") or 0.0),
@@ -286,6 +291,7 @@ def run_one_mode(
     window_timeout_sec: int,
     poll_interval: float,
     out_dir: Path,
+    continue_on_timeout: bool,
 ) -> Dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -317,9 +323,15 @@ def run_one_mode(
 
             fixlist = compute_fixlist(live)
             write_text(out_dir / "next_fixlist.md", "\n".join(f"- {x}" for x in fixlist) + "\n")
-            raise RuntimeError(
-                f"window {i} timed out: outcomes={outcomes} < min_outcomes={min_outcomes}"
-            )
+            if not continue_on_timeout:
+                raise RuntimeError(
+                    f"window {i} timed out: outcomes={outcomes} < min_outcomes={min_outcomes}"
+                )
+            live = dict(live)
+            live["_timed_out"] = True
+            live["_min_outcomes"] = min_outcomes
+            results.append(WindowResult(idx=i, window_id=window_id, live=live, pnl_by_engine=pnl_by_engine))
+            continue
 
         pnl_by_engine = request_json(
             session, "GET", f"{base_url.rstrip('/')}/report/pnl/by_engine", timeout_sec
@@ -373,6 +385,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--window-timeout-sec", type=int, default=20 * 60)
     p.add_argument("--poll-interval", type=float, default=2.0)
     p.add_argument("--timeout-sec", type=float, default=5.0)
+    p.add_argument("--continue-on-timeout", action="store_true")
     p.add_argument("--run-id", default=f"threew-{int(time.time())}")
     p.add_argument("--out-root", default="datasets/reports")
     return p.parse_args()
@@ -399,6 +412,7 @@ def main() -> int:
                 window_timeout_sec=args.window_timeout_sec,
                 poll_interval=args.poll_interval,
                 out_dir=out_dir,
+                continue_on_timeout=args.continue_on_timeout,
             )
             print(f"wrote_dir={out_dir}")
             return 0
@@ -417,6 +431,7 @@ def main() -> int:
                 window_timeout_sec=args.window_timeout_sec,
                 poll_interval=args.poll_interval,
                 out_dir=out_dir,
+                continue_on_timeout=args.continue_on_timeout,
             )
             print(f"wrote_dir={out_dir}")
             return 0
@@ -436,6 +451,7 @@ def main() -> int:
             window_timeout_sec=args.window_timeout_sec,
             poll_interval=args.poll_interval,
             out_dir=baseline_dir,
+            continue_on_timeout=args.continue_on_timeout,
         )
         pred = run_one_mode(
             "predator_c",
@@ -449,6 +465,7 @@ def main() -> int:
             window_timeout_sec=args.window_timeout_sec,
             poll_interval=args.poll_interval,
             out_dir=predator_dir,
+            continue_on_timeout=args.continue_on_timeout,
         )
         compare_md = render_compare_md(base, pred)
         write_text(root / "three_window_compare.md", compare_md)
@@ -463,4 +480,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
