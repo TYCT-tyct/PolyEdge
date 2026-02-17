@@ -2202,7 +2202,9 @@ fn spawn_market_feed(
     const TS_BACKJUMP_RESET_MS: i64 = 5_000;
     // If we see *no* market messages for this long, treat the WS stream as stuck and reconnect.
     // Keep this comfortably above "normal quiet" to avoid hammering gamma discovery on reconnection.
-    const BOOK_IDLE_TIMEOUT_MS: u64 = 5_000;
+    // 5s is too aggressive for quiet windows and creates reconnect churn.
+    // Keep stale protection, but allow a calmer idle window to reduce needless reconnects.
+    const BOOK_IDLE_TIMEOUT_MS: u64 = 20_000;
     const RECONNECT_BASE_MS: u64 = 250;
     const RECONNECT_MAX_MS: u64 = 10_000;
     tokio::spawn(async move {
