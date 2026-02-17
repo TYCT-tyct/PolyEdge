@@ -29,7 +29,7 @@ pub struct DirectionConfig {
     pub momentum_spike_multiplier: f64,
     /// Enable source vote gate: Binance confirmation is mandatory.
     pub enable_source_vote_gate: bool,
-    /// Require one non-Binance secondary source confirmation when such source is available.
+    /// Require Chainlink secondary source confirmation when available.
     pub require_secondary_confirmation: bool,
     /// Ignore source snapshots older than this window when voting.
     pub source_vote_max_age_ms: i64,
@@ -246,7 +246,7 @@ fn source_vote(
         };
         if is_binance_source(source) {
             out.binance_confirms |= confirms;
-        } else if is_secondary_source(source) {
+        } else if is_chainlink_source(source) {
             out.secondary_available = true;
             out.secondary_confirms |= confirms;
         }
@@ -258,9 +258,8 @@ fn is_binance_source(source: &str) -> bool {
     source.to_ascii_lowercase().contains("binance")
 }
 
-fn is_secondary_source(source: &str) -> bool {
-    let s = source.to_ascii_lowercase();
-    s.contains("coinbase") || s.contains("bybit") || s.contains("chainlink")
+fn is_chainlink_source(source: &str) -> bool {
+    source.to_ascii_lowercase().contains("chainlink")
 }
 
 fn kinematics_from_ticks(ticks: &VecDeque<(i64, f64)>) -> (f64, f64, u8) {
@@ -457,9 +456,9 @@ mod tests {
         });
         let now = 1_000_000i64;
         det.on_tick(&tick("binance", "BTCUSDT", now - 60_000, 100.0));
-        det.on_tick(&tick("coinbase", "BTCUSDT", now - 15_000, 100.0));
+        det.on_tick(&tick("chainlink_rtds", "BTCUSDT", now - 15_000, 100.0));
         det.on_tick(&tick("binance", "BTCUSDT", now, 100.2));
-        det.on_tick(&tick("coinbase", "BTCUSDT", now, 100.21));
+        det.on_tick(&tick("chainlink_rtds", "BTCUSDT", now, 100.21));
         let sig = det.evaluate("BTCUSDT", now).unwrap();
         assert_eq!(sig.direction, Direction::Up);
         assert!(sig.confidence >= 0.85);
@@ -515,9 +514,9 @@ mod tests {
         });
         let now = 1_000_000i64;
         det.on_tick(&tick("binance_ws", "BTCUSDT", now - 60_000, 100.0));
-        det.on_tick(&tick("coinbase_ws", "BTCUSDT", now - 60_000, 100.0));
+        det.on_tick(&tick("chainlink_rtds", "BTCUSDT", now - 60_000, 100.0));
         det.on_tick(&tick("binance_ws", "BTCUSDT", now - 1_000, 99.9));
-        det.on_tick(&tick("coinbase_ws", "BTCUSDT", now, 100.2));
+        det.on_tick(&tick("chainlink_rtds", "BTCUSDT", now, 100.2));
         let sig = det.evaluate("BTCUSDT", now).unwrap();
         assert_eq!(sig.direction, Direction::Neutral);
     }
@@ -534,9 +533,9 @@ mod tests {
         });
         let now = 1_000_000i64;
         det.on_tick(&tick("binance_ws", "BTCUSDT", now - 60_000, 100.0));
-        det.on_tick(&tick("coinbase_ws", "BTCUSDT", now - 60_000, 100.0));
+        det.on_tick(&tick("chainlink_rtds", "BTCUSDT", now - 60_000, 100.0));
         det.on_tick(&tick("binance_ws", "BTCUSDT", now - 1_000, 100.2));
-        det.on_tick(&tick("coinbase_ws", "BTCUSDT", now, 100.21));
+        det.on_tick(&tick("chainlink_rtds", "BTCUSDT", now, 100.21));
         let sig = det.evaluate("BTCUSDT", now).unwrap();
         assert_eq!(sig.direction, Direction::Up);
     }

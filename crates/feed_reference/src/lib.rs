@@ -25,6 +25,13 @@ fn validate_price(price: f64) -> bool {
     price.is_finite() && price > 0.0
 }
 
+fn env_flag(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(default)
+}
+
 #[derive(Debug, Clone)]
 pub struct MultiSourceRefFeed {
     _http: Client,
@@ -60,41 +67,44 @@ impl RefPriceWsFeed for MultiSourceRefFeed {
         let binance_symbols = symbols.clone();
         let tx_binance = tx.clone();
         let backoff = self.reconnect_backoff;
-        tokio::spawn(async move {
-            loop {
-                if let Err(err) = run_binance_stream(&binance_symbols, &tx_binance).await {
-                    tracing::warn!(?err, "binance ws stream failed; reconnecting");
+        if env_flag("POLYEDGE_ENABLE_BINANCE_WS", true) {
+            tokio::spawn(async move {
+                loop {
+                    if let Err(err) = run_binance_stream(&binance_symbols, &tx_binance).await {
+                        tracing::warn!(?err, "binance ws stream failed; reconnecting");
+                    }
+                    sleep_with_jitter(backoff).await;
                 }
-                sleep_with_jitter(backoff).await;
-            }
-        });
+            });
+        }
 
-        let bybit_symbols = symbols.clone();
-        let tx_bybit = tx.clone();
-        tokio::spawn(async move {
-            loop {
-                if let Err(err) = run_bybit_stream(&bybit_symbols, &tx_bybit).await {
-                    tracing::warn!(?err, "bybit ws stream failed; reconnecting");
+        if env_flag("POLYEDGE_ENABLE_BYBIT_WS", false) {
+            let bybit_symbols = symbols.clone();
+            let tx_bybit = tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    if let Err(err) = run_bybit_stream(&bybit_symbols, &tx_bybit).await {
+                        tracing::warn!(?err, "bybit ws stream failed; reconnecting");
+                    }
+                    sleep_with_jitter(backoff).await;
                 }
-                sleep_with_jitter(backoff).await;
-            }
-        });
+            });
+        }
 
-        let coinbase_symbols = symbols.clone();
-        let tx_coinbase = tx.clone();
-        tokio::spawn(async move {
-            loop {
-                if let Err(err) = run_coinbase_stream(&coinbase_symbols, &tx_coinbase).await {
-                    tracing::warn!(?err, "coinbase ws stream failed; reconnecting");
+        if env_flag("POLYEDGE_ENABLE_COINBASE_WS", false) {
+            let coinbase_symbols = symbols.clone();
+            let tx_coinbase = tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    if let Err(err) = run_coinbase_stream(&coinbase_symbols, &tx_coinbase).await {
+                        tracing::warn!(?err, "coinbase ws stream failed; reconnecting");
+                    }
+                    sleep_with_jitter(backoff).await;
                 }
-                sleep_with_jitter(backoff).await;
-            }
-        });
+            });
+        }
 
-        let enable_chainlink_anchor = std::env::var("POLYEDGE_ENABLE_CHAINLINK_ANCHOR")
-            .ok()
-            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(true);
+        let enable_chainlink_anchor = env_flag("POLYEDGE_ENABLE_CHAINLINK_ANCHOR", true);
         if enable_chainlink_anchor {
             let anchor_symbols = symbols.clone();
             let tx_anchor = tx.clone();

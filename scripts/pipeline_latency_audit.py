@@ -257,7 +257,7 @@ def write_markdown(out_md: Path, payload: Dict[str, Any]) -> None:
     lines.append("")
     lines.append("```mermaid")
     lines.append("flowchart LR")
-    lines.append("    A[Binance/Coinbase ticks] --> B[Tokyo Sender parse + 24-byte pack]")
+    lines.append("    A[Binance/Chainlink ticks] --> B[Tokyo Sender parse + 24-byte pack]")
     lines.append("    B --> C[AWS Backbone UDP]")
     lines.append("    C --> D[Ireland app_runner UDP ingest]")
     lines.append("    A --> E[Ireland direct WS ingest]")
