@@ -82,6 +82,12 @@ struct AppState {
 }
 
 #[derive(Debug, Clone)]
+enum StrategyIngress {
+    RefTick(RefTick),
+    BookTop(BookTop),
+}
+
+#[derive(Debug, Clone)]
 struct FeeRateEntry {
     fee_bps: f64,
     fetched_at: Instant,
@@ -2021,6 +2027,13 @@ async fn async_main() -> Result<()> {
         predator_router,
         predator_compounder,
     });
+    let strategy_input_queue_cap = std::env::var("POLYEDGE_STRATEGY_INPUT_QUEUE_CAP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8_192)
+        .clamp(512, 131_072);
+    let (strategy_ingress_tx, strategy_ingress_rx) =
+        mpsc::channel::<StrategyIngress>(strategy_input_queue_cap);
 
     let state = AppState {
         paused: paused.clone(),
@@ -2046,6 +2059,7 @@ async fn async_main() -> Result<()> {
         (*universe_symbols).clone(),
         shared.fusion_cfg.clone(),
         shared.clone(),
+        strategy_ingress_tx.clone(),
     );
     spawn_market_feed(
         bus.clone(),
@@ -2053,6 +2067,7 @@ async fn async_main() -> Result<()> {
         (*universe_symbols).clone(),
         (*universe_market_types).clone(),
         (*universe_timeframes).clone(),
+        strategy_ingress_tx,
     );
     spawn_strategy_engine(
         bus.clone(),
@@ -2061,6 +2076,7 @@ async fn async_main() -> Result<()> {
         shadow,
         paused.clone(),
         shared.clone(),
+        strategy_ingress_rx,
     );
     orchestration::spawn_periodic_report_persistor(
         shared.shadow_stats.clone(),
@@ -2084,6 +2100,13 @@ async fn async_main() -> Result<()> {
 
 fn install_rustls_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
+#[inline]
+fn publish_if_telemetry_subscribers(bus: &RingBus<EngineEvent>, event: EngineEvent) {
+    if bus.receiver_count() > 1 {
+        let _ = bus.publish(event);
+    }
 }
 
 fn spawn_detached<F>(task_name: &'static str, report_normal_exit: bool, fut: F)
@@ -2118,6 +2141,7 @@ fn spawn_reference_feed(
     symbols: Vec<String>,
     fusion_cfg: Arc<RwLock<FusionConfig>>,
     shared: Arc<EngineShared>,
+    strategy_tx: mpsc::Sender<StrategyIngress>,
 ) {
     #[derive(Clone, Copy)]
     enum RefLane {
@@ -2141,6 +2165,11 @@ fn spawn_reference_feed(
             .ok()
             .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
             .unwrap_or(true);
+        let strategy_ingress_drop_on_full =
+            std::env::var("POLYEDGE_STRATEGY_INGRESS_DROP_ON_FULL")
+                .ok()
+                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+                .unwrap_or(true);
         let (tx, mut rx) = mpsc::channel::<(RefLane, Result<RefTick>)>(ref_merge_queue_cap);
 
         let tx_direct = tx.clone();
@@ -2289,8 +2318,21 @@ fn spawn_reference_feed(
                         metrics::histogram!("fusion.arrive_delta_ns").record(delta_ns as f64);
                     }
 
+                    let ingress = StrategyIngress::RefTick(tick.clone());
+                    if strategy_ingress_drop_on_full {
+                        match strategy_tx.try_send(ingress) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                metrics::counter!("strategy.ingress_ref_drop").increment(1);
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        }
+                    } else if strategy_tx.send(ingress).await.is_err() {
+                        break;
+                    }
+
                     if ref_tick_bus_enabled {
-                        let _ = bus.publish(EngineEvent::RefTick(tick));
+                        publish_if_telemetry_subscribers(&bus, EngineEvent::RefTick(tick));
                     }
                 }
                 Err(err) => {
@@ -2307,6 +2349,7 @@ fn spawn_market_feed(
     symbols: Vec<String>,
     market_types: Vec<String>,
     timeframes: Vec<String>,
+    strategy_tx: mpsc::Sender<StrategyIngress>,
 ) {
     const TS_INVERSION_TOLERANCE_MS: i64 = 250;
     const TS_BACKJUMP_RESET_MS: i64 = 5_000;
@@ -2318,6 +2361,11 @@ fn spawn_market_feed(
     const RECONNECT_BASE_MS: u64 = 250;
     const RECONNECT_MAX_MS: u64 = 10_000;
     spawn_detached("market_feed_orchestrator", true, async move {
+        let strategy_ingress_drop_on_full =
+            std::env::var("POLYEDGE_STRATEGY_INGRESS_DROP_ON_FULL")
+                .ok()
+                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+                .unwrap_or(true);
         let mut reconnects: u64 = 0;
         loop {
             let feed = PolymarketFeed::new_with_universe(
@@ -2424,7 +2472,21 @@ fn spawn_market_feed(
                             stats.record_issue("invalid_book_top").await;
                             continue;
                         }
-                        let _ = bus.publish(EngineEvent::BookTop(book));
+
+                        let ingress = StrategyIngress::BookTop(book.clone());
+                        if strategy_ingress_drop_on_full {
+                            match strategy_tx.try_send(ingress) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    metrics::counter!("strategy.ingress_book_drop").increment(1);
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => break,
+                            }
+                        } else if strategy_tx.send(ingress).await.is_err() {
+                            break;
+                        }
+
+                        publish_if_telemetry_subscribers(&bus, EngineEvent::BookTop(book));
                     }
                     Err(err) => {
                         tracing::warn!(?err, "market feed event error");
@@ -2447,6 +2509,7 @@ fn spawn_strategy_engine(
     shadow: Arc<ShadowExecutor>,
     paused: Arc<RwLock<bool>>,
     shared: Arc<EngineShared>,
+    mut ingress_rx: mpsc::Receiver<StrategyIngress>,
 ) {
     spawn_detached("strategy_engine", true, async move {
         let fair = BasisMrFairValue::new(shared.fair_value_cfg.clone());
@@ -2464,7 +2527,7 @@ fn spawn_strategy_engine(
             shared.rate_limit_rps,
             (shared.rate_limit_rps * 2.0).max(1.0),
         );
-        let mut rx = bus.subscribe();
+        let mut control_rx = bus.subscribe();
         let mut last_discovery_refresh = Instant::now() - Duration::from_secs(3600);
         let mut last_symbol_retry_refresh = Instant::now() - Duration::from_secs(3600);
         let mut last_fusion_mode = shared.fusion_cfg.read().await.mode.clone();
@@ -2492,10 +2555,36 @@ fn spawn_strategy_engine(
                 last_discovery_refresh = Instant::now();
             }
 
-            let recv = rx.recv().await;
-            let Ok(event) = recv else {
-                continue;
+            let ingress_event = tokio::select! {
+                ctrl = control_rx.recv() => {
+                    match ctrl {
+                        Ok(EngineEvent::Control(ControlCommand::Pause)) => {
+                            *paused.write().await = true;
+                            shared.shadow_stats.set_paused(true);
+                        }
+                        Ok(EngineEvent::Control(ControlCommand::Resume)) => {
+                            *paused.write().await = false;
+                            shared.shadow_stats.set_paused(false);
+                        }
+                        Ok(EngineEvent::Control(ControlCommand::Flatten)) => {
+                            if let Err(err) = execution.flatten_all().await {
+                                tracing::warn!(?err, "flatten from control event failed");
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => {}
+                    }
+                    continue;
+                }
+                maybe_ingress = ingress_rx.recv() => {
+                    let Some(event) = maybe_ingress else {
+                        shared.shadow_stats.record_issue("strategy_ingress_closed").await;
+                        break;
+                    };
+                    event
+                }
             };
+
             let dispatch_start = Instant::now();
             let current_fusion_mode = shared.fusion_cfg.read().await.mode.clone();
             if current_fusion_mode != last_fusion_mode {
@@ -2512,8 +2601,8 @@ fn spawn_strategy_engine(
                     .await;
             }
 
-            match event {
-                EngineEvent::RefTick(tick) => {
+            match ingress_event {
+                StrategyIngress::RefTick(tick) => {
                     let parse_us = dispatch_start.elapsed().as_secs_f64() * 1_000_000.0;
                     shared.shadow_stats.push_parse_us(parse_us).await;
                     if !is_anchor_ref_source(tick.source.as_str())
@@ -2526,21 +2615,24 @@ fn spawn_strategy_engine(
                     }
                     insert_latest_ref_tick(&mut latest_fast_ticks, &mut latest_anchor_ticks, tick);
                 }
-                EngineEvent::BookTop(mut book) => {
+                StrategyIngress::BookTop(mut book) => {
                     let parse_us = dispatch_start.elapsed().as_secs_f64() * 1_000_000.0;
                     shared.shadow_stats.push_parse_us(parse_us).await;
                     // Coalesce bursty queue traffic to the freshest observable state.
                     // This trims local backlog and avoids spending cycles on superseded snapshots.
                     let mut coalesced = 0_u64;
-                    let dynamic_cap = rx.len().saturating_add(64).min(strategy_max_coalesce);
+                    let dynamic_cap = ingress_rx
+                        .len()
+                        .saturating_add(64)
+                        .min(strategy_max_coalesce);
                     let max_coalesced = dynamic_cap.max(strategy_coalesce_min);
                     while coalesced < max_coalesced as u64 {
-                        match rx.try_recv() {
-                            Ok(EngineEvent::BookTop(next_book)) => {
+                        match ingress_rx.try_recv() {
+                            Ok(StrategyIngress::BookTop(next_book)) => {
                                 book = next_book;
                                 coalesced += 1;
                             }
-                            Ok(EngineEvent::RefTick(next_tick)) => {
+                            Ok(StrategyIngress::RefTick(next_tick)) => {
                                 let next_is_anchor = is_anchor_ref_source(next_tick.source.as_str());
                                 if !next_is_anchor
                                     && !fast_tick_allowed_in_fusion_mode(
@@ -2558,17 +2650,11 @@ fn spawn_strategy_engine(
                                 );
                                 coalesced += 1;
                             }
-                            Ok(_) => {
-                                // This subscriber doesn't consume other event kinds.
-                                // Drain them here to keep queue pressure bounded.
-                                coalesced += 1;
-                            }
-                            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
-                            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
-                                shared.shadow_stats.record_issue("bus_lagged").await;
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                shared.shadow_stats.record_issue("strategy_ingress_disconnected").await;
                                 break;
                             }
-                            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
                         }
                     }
                     if coalesced > 0 {
@@ -2589,7 +2675,7 @@ fn spawn_strategy_engine(
                         }
                     }
 
-                    let backlog_depth = rx.len() as f64;
+                    let backlog_depth = ingress_rx.len() as f64;
                     metrics::histogram!("runtime.event_backlog_depth").record(backlog_depth);
                     let queue_depth = execution.open_orders_count() as f64;
                     metrics::histogram!("runtime.open_order_depth").record(queue_depth);
@@ -2609,7 +2695,10 @@ fn spawn_strategy_engine(
                     shared.shadow_stats.mark_filled(fills.len() as u64);
                     for fill in fills {
                         portfolio.apply_fill(&fill);
-                        let _ = bus.publish(EngineEvent::Fill(fill.clone()));
+                        publish_if_telemetry_subscribers(
+                            &bus,
+                            EngineEvent::Fill(fill.clone()),
+                        );
                         let ingest_seq = next_normalized_ingest_seq();
                         append_jsonl(
                             &dataset_path("normalized", "fills.jsonl"),
@@ -2791,7 +2880,7 @@ fn spawn_strategy_engine(
                     let signal_us = signal_start.elapsed().as_secs_f64() * 1_000_000.0;
                     shared.shadow_stats.push_signal_us(signal_us).await;
                     metrics::histogram!("latency.signal_us").record(signal_us);
-                    let _ = bus.publish(EngineEvent::Signal(signal.clone()));
+                    publish_if_telemetry_subscribers(&bus, EngineEvent::Signal(signal.clone()));
                     shared.latest_signals.insert(
                         book.market_id.clone(),
                         SignalCacheEntry {
@@ -3042,8 +3131,14 @@ fn spawn_strategy_engine(
                         continue;
                     }
 
-                    let _ = bus.publish(EngineEvent::ToxicFeatures(tox_features.clone()));
-                    let _ = bus.publish(EngineEvent::ToxicDecision(tox_decision.clone()));
+                    publish_if_telemetry_subscribers(
+                        &bus,
+                        EngineEvent::ToxicFeatures(tox_features.clone()),
+                    );
+                    publish_if_telemetry_subscribers(
+                        &bus,
+                        EngineEvent::ToxicDecision(tox_decision.clone()),
+                    );
                     let ingest_seq_features = next_normalized_ingest_seq();
                     append_jsonl(
                         &dataset_path("normalized", "tox_features.jsonl"),
@@ -3467,7 +3562,10 @@ fn spawn_strategy_engine(
                                     accepted: true,
                                     ts_ms: ack_v2.ts_ms,
                                 };
-                                let _ = bus.publish(EngineEvent::OrderAck(ack.clone()));
+                                publish_if_telemetry_subscribers(
+                                    &bus,
+                                    EngineEvent::OrderAck(ack.clone()),
+                                );
                                 shadow.register_order(&ack, intent.clone());
 
                                 for delay_ms in [5_u64, 10_u64, 25_u64] {
@@ -3500,7 +3598,10 @@ fn spawn_strategy_engine(
                                         ttl_ms: intent.ttl_ms,
                                     };
                                     shared.shadow_stats.push_shot(shot.clone()).await;
-                                    let _ = bus.publish(EngineEvent::ShadowShot(shot.clone()));
+                                    publish_if_telemetry_subscribers(
+                                        &bus,
+                                        EngineEvent::ShadowShot(shot.clone()),
+                                    );
                                     spawn_shadow_outcome_task(shared.clone(), bus.clone(), shot);
                                 }
                             }
@@ -3532,20 +3633,6 @@ fn spawn_strategy_engine(
                         inventory_for_market(&portfolio, &book.market_id),
                     );
                 }
-                EngineEvent::Control(ControlCommand::Pause) => {
-                    *paused.write().await = true;
-                    shared.shadow_stats.set_paused(true);
-                }
-                EngineEvent::Control(ControlCommand::Resume) => {
-                    *paused.write().await = false;
-                    shared.shadow_stats.set_paused(false);
-                }
-                EngineEvent::Control(ControlCommand::Flatten) => {
-                    if let Err(err) = execution.flatten_all().await {
-                        tracing::warn!(?err, "flatten from control event failed");
-                    }
-                }
-                _ => {}
             }
         }
     });
@@ -3593,7 +3680,7 @@ async fn run_predator_c_for_symbol(
         let mut map = shared.predator_latest_direction.write().await;
         map.insert(symbol.to_string(), direction_signal.clone());
     }
-    let _ = bus.publish(EngineEvent::DirectionSignal(direction_signal.clone()));
+    publish_if_telemetry_subscribers(bus, EngineEvent::DirectionSignal(direction_signal.clone()));
 
     if matches!(direction_signal.direction, Direction::Neutral) {
         shared
@@ -4050,7 +4137,7 @@ async fn predator_execute_opportunity(
                 accepted: true,
                 ts_ms: ack_v2.ts_ms,
             };
-            let _ = bus.publish(EngineEvent::OrderAck(ack.clone()));
+            publish_if_telemetry_subscribers(bus, EngineEvent::OrderAck(ack.clone()));
             shadow.register_order(&ack, intent.clone());
 
             for delay_ms in [5_u64, 10_u64, 25_u64] {
@@ -4078,7 +4165,7 @@ async fn predator_execute_opportunity(
                     ttl_ms: intent.ttl_ms,
                 };
                 shared.shadow_stats.push_shot(shot.clone()).await;
-                let _ = bus.publish(EngineEvent::ShadowShot(shot.clone()));
+                publish_if_telemetry_subscribers(bus, EngineEvent::ShadowShot(shot.clone()));
                 spawn_shadow_outcome_task(shared.clone(), bus.clone(), shot);
             }
         }
@@ -4260,7 +4347,7 @@ fn spawn_shadow_outcome_task(
                         .shadow_stats
                         .set_predator_capital(update.clone(), halt)
                         .await;
-                    let _ = bus.publish(EngineEvent::CapitalUpdate(update));
+                    publish_if_telemetry_subscribers(&bus, EngineEvent::CapitalUpdate(update));
 
                     if halt {
                         let live_armed = std::env::var("POLYEDGE_LIVE_ARMED")
@@ -4292,9 +4379,9 @@ fn spawn_shadow_outcome_task(
                     "eval": eval
                 }),
             );
-            let _ = bus.publish(EngineEvent::QuoteEval(eval));
+            publish_if_telemetry_subscribers(&bus, EngineEvent::QuoteEval(eval));
         }
-        let _ = bus.publish(EngineEvent::ShadowOutcome(outcome));
+        publish_if_telemetry_subscribers(&bus, EngineEvent::ShadowOutcome(outcome));
     });
 }
 
