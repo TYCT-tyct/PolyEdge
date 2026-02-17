@@ -83,8 +83,10 @@ impl TakerSniper {
         if spread > self.cfg.max_spread {
             return skip("spread_too_wide");
         }
-        if edge_net_bps < self.cfg.min_edge_net_bps {
-            return skip("edge_below_threshold");
+        let dynamic_min_edge = dynamic_fee_gate_min_edge_bps(entry_price);
+        let min_edge_required = self.cfg.min_edge_net_bps.max(dynamic_min_edge);
+        if edge_net_bps < min_edge_required {
+            return skip("fee_gate_too_expensive");
         }
         if size <= 0.0 {
             return skip("size_zero");
@@ -159,6 +161,22 @@ fn direction_to_side(dir: &Direction) -> core_types::OrderSide {
     }
 }
 
+#[inline]
+fn dynamic_fee_gate_min_edge_bps(entry_price: f64) -> f64 {
+    let p = entry_price.clamp(0.0, 1.0);
+    if p >= 0.92 || p <= 0.08 {
+        30.0
+    } else if p >= 0.85 || p <= 0.15 {
+        80.0
+    } else if p >= 0.75 || p <= 0.25 {
+        200.0
+    } else if p >= 0.60 || p <= 0.40 {
+        400.0
+    } else {
+        800.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,11 +210,11 @@ mod tests {
             "BTCUSDT",
             TimeframeClass::Tf15m,
             &sig,
-            0.52,
+            0.95,
             0.01,
             2.0,
             30.0,
-            28.0,
+            32.0,
             10.0,
             1_000_000,
         );
@@ -217,7 +235,7 @@ mod tests {
             0.01,
             2.0,
             30.0,
-            28.0,
+            32.0,
             10.0,
             1_000_000,
         );
@@ -246,7 +264,7 @@ mod tests {
             1_000_000,
         );
         assert!(matches!(d.action, TakerAction::Skip));
-        assert_eq!(d.reason, "edge_below_threshold");
+        assert_eq!(d.reason, "fee_gate_too_expensive");
     }
 
     #[test]
@@ -262,11 +280,11 @@ mod tests {
             "BTCUSDT",
             TimeframeClass::Tf15m,
             &sig,
-            0.52,
+            0.95,
             0.01,
             2.0,
             30.0,
-            28.0,
+            32.0,
             10.0,
             1_000_000,
         );
@@ -276,15 +294,62 @@ mod tests {
             "BTCUSDT",
             TimeframeClass::Tf15m,
             &sig,
-            0.52,
+            0.95,
             0.01,
             2.0,
             30.0,
-            28.0,
+            32.0,
             10.0,
             1_000_500,
         );
         assert!(matches!(d2.action, TakerAction::Skip));
         assert_eq!(d2.reason, "cooldown_active");
+    }
+
+    #[test]
+    fn dynamic_fee_gate_blocks_mid_price_without_large_edge() {
+        let mut sniper = TakerSniper::new(TakerSniperConfig {
+            min_edge_net_bps: 10.0,
+            ..TakerSniperConfig::default()
+        });
+        let sig = up_signal(0.9);
+        let d = sniper.evaluate(
+            "m1",
+            "BTCUSDT",
+            TimeframeClass::Tf15m,
+            &sig,
+            0.50,
+            0.01,
+            2.0,
+            60.0,
+            300.0,
+            10.0,
+            1_000_000,
+        );
+        assert!(matches!(d.action, TakerAction::Skip));
+        assert_eq!(d.reason, "fee_gate_too_expensive");
+    }
+
+    #[test]
+    fn dynamic_fee_gate_allows_extreme_price_with_small_edge() {
+        let mut sniper = TakerSniper::new(TakerSniperConfig {
+            min_edge_net_bps: 10.0,
+            ..TakerSniperConfig::default()
+        });
+        let sig = up_signal(0.9);
+        let d = sniper.evaluate(
+            "m1",
+            "BTCUSDT",
+            TimeframeClass::Tf15m,
+            &sig,
+            0.95,
+            0.01,
+            2.0,
+            60.0,
+            40.0,
+            10.0,
+            1_000_000,
+        );
+        assert!(matches!(d.action, TakerAction::Fire));
     }
 }
