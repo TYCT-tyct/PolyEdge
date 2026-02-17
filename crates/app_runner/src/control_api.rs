@@ -29,6 +29,8 @@ pub(super) fn build_router(state: AppState) -> Router {
         .route("/control/reload_probability", post(reload_probability))
         .route("/control/reload_source_health", post(reload_source_health))
         .route("/control/reload_exit", post(reload_exit))
+        .route("/control/reload_exit_manager", post(reload_exit))
+        .route("/control/reload_regime", post(reload_regime))
         .route("/control/reload_perf_profile", post(reload_perf_profile))
         .with_state(state)
 }
@@ -183,6 +185,23 @@ async fn reload_predator_c(
     );
 
     Json(PredatorCReloadResp { predator_c: snapshot })
+}
+
+async fn reload_regime(
+    State(state): State<AppState>,
+    Json(regime): Json<PredatorRegimeConfig>,
+) -> Json<PredatorRegimeConfig> {
+    let mut cfg = state.shared.predator_cfg.write().await;
+    cfg.regime = regime.clone();
+    let snapshot = cfg.regime.clone();
+    drop(cfg);
+
+    append_jsonl(
+        &dataset_path("reports", "regime_reload.jsonl"),
+        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "regime": snapshot}),
+    );
+
+    Json(regime)
 }
 
 async fn reload_fusion(
