@@ -78,32 +78,6 @@ impl RefPriceWsFeed for MultiSourceRefFeed {
             });
         }
 
-        if env_flag("POLYEDGE_ENABLE_BYBIT_WS", false) {
-            let bybit_symbols = symbols.clone();
-            let tx_bybit = tx.clone();
-            tokio::spawn(async move {
-                loop {
-                    if let Err(err) = run_bybit_stream(&bybit_symbols, &tx_bybit).await {
-                        tracing::warn!(?err, "bybit ws stream failed; reconnecting");
-                    }
-                    sleep_with_jitter(backoff).await;
-                }
-            });
-        }
-
-        if env_flag("POLYEDGE_ENABLE_COINBASE_WS", false) {
-            let coinbase_symbols = symbols.clone();
-            let tx_coinbase = tx.clone();
-            tokio::spawn(async move {
-                loop {
-                    if let Err(err) = run_coinbase_stream(&coinbase_symbols, &tx_coinbase).await {
-                        tracing::warn!(?err, "coinbase ws stream failed; reconnecting");
-                    }
-                    sleep_with_jitter(backoff).await;
-                }
-            });
-        }
-
         let enable_chainlink_anchor = env_flag("POLYEDGE_ENABLE_CHAINLINK_ANCHOR", true);
         if enable_chainlink_anchor {
             let anchor_symbols = symbols.clone();
@@ -362,195 +336,6 @@ fn binance_ws_endpoints(streams: &str) -> Vec<String> {
     ]
 }
 
-async fn run_bybit_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> Result<()> {
-    if symbols.is_empty() {
-        anyhow::bail!("bybit symbols list is empty");
-    }
-
-    let endpoint = "wss://stream.bybit.com/v5/public/spot";
-    let (mut ws, _) = connect_async(endpoint).await.context("connect bybit ws")?;
-
-    let args = symbols
-        .iter()
-        .map(|s| format!("tickers.{s}"))
-        .collect::<Vec<_>>();
-    let sub = serde_json::json!({
-        "op": "subscribe",
-        "args": args,
-    });
-    ws.send(Message::Text(sub.to_string().into()))
-        .await
-        .context("send bybit subscribe")?;
-
-    while let Some(msg) = ws.next().await {
-        let msg = msg.context("bybit ws read")?;
-        let recv_ns = now_ns();
-        let recv_ms = recv_ns / 1_000_000;
-        let text = match msg {
-            Message::Text(t) => t.to_string(),
-            Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
-            Message::Ping(v) => {
-                let _ = ws.send(Message::Pong(v)).await;
-                continue;
-            }
-            Message::Pong(_) => continue,
-            Message::Close(_) => break,
-            Message::Frame(_) => continue,
-        };
-
-        let Ok(payload) = serde_json::from_str::<BybitWsMessage>(&text) else {
-            continue;
-        };
-        if payload.success.is_some() {
-            continue;
-        }
-        let topic = payload.topic.as_deref().unwrap_or_default();
-        if !topic.starts_with("tickers.") {
-            continue;
-        }
-
-        let symbol = payload
-            .data
-            .as_ref()
-            .and_then(|d| d.symbol.clone())
-            .or_else(|| topic.split('.').nth(1).map(ToOwned::to_owned));
-        let price = payload
-            .data
-            .as_ref()
-            .and_then(|d| d.last_price.as_deref())
-            .or_else(|| payload.data.as_ref().and_then(|d| d.mark_price.as_deref()))
-            .and_then(parse_f64_str);
-        let event_ts = payload
-            .ts
-            .or_else(|| payload.data.as_ref().and_then(|d| d.ts))
-            .unwrap_or_else(now_ms);
-        let ingest_ns = now_ns();
-
-        let (Some(symbol), Some(price)) = (symbol, price) else {
-            continue;
-        };
-
-        // Validate price before creating tick
-        if !validate_price(price) {
-            tracing::warn!(price = price, "invalid bybit price, skipping");
-            continue;
-        }
-
-        let tick = RefTick {
-            source: "bybit_ws".to_string(),
-            symbol,
-            event_ts_ms: event_ts,
-            recv_ts_ms: recv_ms,
-            source_seq: event_ts.max(0) as u64,
-            event_ts_exchange_ms: event_ts,
-            recv_ts_local_ns: recv_ns,
-            ingest_ts_local_ns: ingest_ns,
-            price,
-        };
-
-        match dispatch_ref_tick(tx, tick, "bybit_ws") {
-            TickDispatch::Sent | TickDispatch::Dropped => {}
-            TickDispatch::Closed => break,
-        }
-    }
-
-    Ok(())
-}
-
-async fn run_coinbase_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> Result<()> {
-    if symbols.is_empty() {
-        anyhow::bail!("coinbase symbols list is empty");
-    }
-
-    let products = symbols
-        .iter()
-        .filter_map(|s| to_coinbase_pair(s))
-        .collect::<Vec<_>>();
-    if products.is_empty() {
-        anyhow::bail!("coinbase has no supported symbols");
-    }
-
-    let endpoint = "wss://ws-feed.exchange.coinbase.com";
-    let (mut ws, _) = connect_async(endpoint)
-        .await
-        .context("connect coinbase ws")?;
-
-    let sub = serde_json::json!({
-        "type": "subscribe",
-        "product_ids": products,
-        "channels": ["ticker"],
-    });
-    ws.send(Message::Text(sub.to_string().into()))
-        .await
-        .context("send coinbase subscribe")?;
-
-    while let Some(msg) = ws.next().await {
-        let msg = msg.context("coinbase ws read")?;
-        let recv_ns = now_ns();
-        let recv_ms = recv_ns / 1_000_000;
-        let text = match msg {
-            Message::Text(t) => t.to_string(),
-            Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
-            Message::Ping(v) => {
-                let _ = ws.send(Message::Pong(v)).await;
-                continue;
-            }
-            Message::Pong(_) => continue,
-            Message::Close(_) => break,
-            Message::Frame(_) => continue,
-        };
-
-        let Ok(payload) = serde_json::from_str::<CoinbaseWsMessage>(&text) else {
-            continue;
-        };
-        let msg_type = payload.kind.as_deref().unwrap_or_default();
-        if msg_type != "ticker" {
-            continue;
-        }
-        let product_id = payload.product_id.as_deref().unwrap_or_default();
-        let Some(symbol) = from_coinbase_pair(product_id) else {
-            continue;
-        };
-
-        let price = payload.price.as_deref().and_then(parse_f64_str);
-        let event_ts = payload
-            .time
-            .as_deref()
-            .and_then(parse_rfc3339_ms)
-            .unwrap_or_else(now_ms);
-        let ingest_ns = now_ns();
-
-        let Some(price) = price else {
-            continue;
-        };
-
-        // Validate price before creating tick
-        if !validate_price(price) {
-            tracing::warn!(price = price, "invalid coinbase price, skipping");
-            continue;
-        }
-
-        let tick = RefTick {
-            source: "coinbase_ws".to_string(),
-            symbol,
-            event_ts_ms: event_ts,
-            recv_ts_ms: recv_ms,
-            source_seq: event_ts.max(0) as u64,
-            event_ts_exchange_ms: event_ts,
-            recv_ts_local_ns: recv_ns,
-            ingest_ts_local_ns: ingest_ns,
-            price,
-        };
-
-        match dispatch_ref_tick(tx, tick, "coinbase_ws") {
-            TickDispatch::Sent | TickDispatch::Dropped => {}
-            TickDispatch::Closed => break,
-        }
-    }
-
-    Ok(())
-}
-
 #[derive(Debug, Deserialize)]
 struct RtdsEnvelope {
     #[serde(default)]
@@ -681,16 +466,6 @@ async fn run_chainlink_rtds_stream(symbols: &[String], tx: &mpsc::Sender<RefTick
     Ok(())
 }
 
-fn parse_rfc3339_ms(value: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|dt| dt.timestamp_millis())
-}
-
-fn parse_f64_str(value: &str) -> Option<f64> {
-    value.parse::<f64>().ok()
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum BinanceWsMessage {
@@ -717,42 +492,6 @@ struct BinanceTrade {
     event_ts: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
-struct BybitWsMessage {
-    #[serde(default)]
-    success: Option<bool>,
-    #[serde(default)]
-    topic: Option<String>,
-    #[serde(default)]
-    ts: Option<i64>,
-    #[serde(default)]
-    data: Option<BybitTickData>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BybitTickData {
-    #[serde(default)]
-    symbol: Option<String>,
-    #[serde(rename = "lastPrice", default)]
-    last_price: Option<String>,
-    #[serde(rename = "markPrice", default)]
-    mark_price: Option<String>,
-    #[serde(default)]
-    ts: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CoinbaseWsMessage {
-    #[serde(rename = "type", default)]
-    kind: Option<String>,
-    #[serde(default)]
-    product_id: Option<String>,
-    #[serde(default)]
-    price: Option<String>,
-    #[serde(default)]
-    time: Option<String>,
-}
-
 fn de_f64_from_str<'de, D>(deserializer: D) -> Result<f64, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -769,16 +508,6 @@ where
             .parse::<f64>()
             .map_err(|e| serde::de::Error::custom(format!("invalid f64 string: {e}"))),
     }
-}
-
-fn to_coinbase_pair(symbol: &str) -> Option<String> {
-    let base = symbol.strip_suffix("USDT")?;
-    Some(format!("{base}-USD"))
-}
-
-fn from_coinbase_pair(product_id: &str) -> Option<String> {
-    let base = product_id.strip_suffix("-USD")?;
-    Some(format!("{base}USDT"))
 }
 
 /// Fast timestamp using SystemTime (more efficient than chrono::Utc::now())
@@ -799,19 +528,6 @@ fn now_ns() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn coinbase_pair_conversion() {
-        assert_eq!(to_coinbase_pair("BTCUSDT").as_deref(), Some("BTC-USD"));
-        assert_eq!(to_coinbase_pair("FOO"), None);
-        assert_eq!(from_coinbase_pair("ETH-USD").as_deref(), Some("ETHUSDT"));
-    }
-
-    #[test]
-    fn parse_time_works() {
-        let ts = parse_rfc3339_ms("2026-02-13T12:34:56.789Z").expect("parse");
-        assert!(ts > 0);
-    }
 
     #[test]
     fn chainlink_symbol_conversion() {
