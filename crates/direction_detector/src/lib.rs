@@ -27,6 +27,12 @@ pub struct DirectionConfig {
     pub min_acceleration: f64,
     /// If abs(velocity) is above this multiple of min_velocity, treat as momentum spike.
     pub momentum_spike_multiplier: f64,
+    /// Enable source vote gate: Binance confirmation is mandatory.
+    pub enable_source_vote_gate: bool,
+    /// Require one non-Binance secondary source confirmation when such source is available.
+    pub require_secondary_confirmation: bool,
+    /// Ignore source snapshots older than this window when voting.
+    pub source_vote_max_age_ms: i64,
 }
 
 impl Default for DirectionConfig {
@@ -45,6 +51,9 @@ impl Default for DirectionConfig {
             min_velocity_bps_per_sec: 5.0,
             min_acceleration: 0.0,
             momentum_spike_multiplier: 1.8,
+            enable_source_vote_gate: true,
+            require_secondary_confirmation: true,
+            source_vote_max_age_ms: 2_000,
         }
     }
 }
@@ -54,6 +63,7 @@ struct SymbolWindow {
     // (recv_ts_ms, price)
     ticks: VecDeque<(i64, f64)>,
     latest_by_source: HashMap<String, f64>,
+    latest_ts_by_source: HashMap<String, i64>,
 }
 
 #[derive(Debug)]
@@ -91,6 +101,8 @@ impl DirectionDetector {
         w.ticks.push_back((tick.recv_ts_ms, tick.price));
         w.latest_by_source
             .insert(tick.source.clone(), tick.price);
+        w.latest_ts_by_source
+            .insert(tick.source.clone(), tick.recv_ts_ms);
 
         // Lazy pruning: only prune every 100 ticks to reduce CPU overhead
         self.tick_counter += 1;
@@ -153,7 +165,24 @@ impl DirectionDetector {
             && tick_consistency >= self.cfg.min_consecutive_ticks.max(1)
             && velocity_abs >= self.cfg.min_velocity_bps_per_sec.max(0.0)
             && (directional_acceleration >= self.cfg.min_acceleration || momentum_spike);
-        let direction = if triple_confirm {
+        let vote = source_vote(
+            &w.latest_by_source,
+            &w.latest_ts_by_source,
+            anchor_short,
+            &raw_direction,
+            now_ms,
+            self.cfg.source_vote_max_age_ms,
+        );
+        let vote_passed = if !self.cfg.enable_source_vote_gate {
+            true
+        } else if matches!(raw_direction, Direction::Neutral) {
+            true
+        } else if self.cfg.require_secondary_confirmation {
+            vote.binance_confirms && (!vote.secondary_available || vote.secondary_confirms)
+        } else {
+            vote.binance_confirms
+        };
+        let direction = if triple_confirm && vote_passed {
             raw_direction
         } else {
             Direction::Neutral
@@ -180,6 +209,58 @@ impl DirectionDetector {
             ts_ns: now_ms.max(0) * 1_000_000,
         })
     }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct SourceVote {
+    binance_confirms: bool,
+    secondary_available: bool,
+    secondary_confirms: bool,
+}
+
+fn source_vote(
+    latest_by_source: &HashMap<String, f64>,
+    latest_ts_by_source: &HashMap<String, i64>,
+    anchor_short: f64,
+    direction: &Direction,
+    now_ms: i64,
+    max_age_ms: i64,
+) -> SourceVote {
+    if anchor_short <= 0.0 || matches!(direction, Direction::Neutral) {
+        return SourceVote::default();
+    }
+    let mut out = SourceVote::default();
+    let max_age_ms = max_age_ms.max(50);
+    for (source, px) in latest_by_source {
+        let Some(ts_ms) = latest_ts_by_source.get(source).copied() else {
+            continue;
+        };
+        if now_ms.saturating_sub(ts_ms) > max_age_ms {
+            continue;
+        }
+        let ret = (*px - anchor_short) / anchor_short;
+        let confirms = match direction {
+            Direction::Up => ret > 0.0,
+            Direction::Down => ret < 0.0,
+            Direction::Neutral => false,
+        };
+        if is_binance_source(source) {
+            out.binance_confirms |= confirms;
+        } else if is_secondary_source(source) {
+            out.secondary_available = true;
+            out.secondary_confirms |= confirms;
+        }
+    }
+    out
+}
+
+fn is_binance_source(source: &str) -> bool {
+    source.to_ascii_lowercase().contains("binance")
+}
+
+fn is_secondary_source(source: &str) -> bool {
+    let s = source.to_ascii_lowercase();
+    s.contains("coinbase") || s.contains("bybit")
 }
 
 fn kinematics_from_ticks(ticks: &VecDeque<(i64, f64)>) -> (f64, f64, u8) {
@@ -325,6 +406,7 @@ mod tests {
     fn no_signal_when_cold_start() {
         let mut det = DirectionDetector::new(DirectionConfig {
             min_ticks_for_signal: 5,
+            require_secondary_confirmation: false,
             ..DirectionConfig::default()
         });
         let now = 1_000_000i64;
@@ -341,6 +423,7 @@ mod tests {
             threshold_15m_pct: 0.10,
             min_consecutive_ticks: 1,
             min_velocity_bps_per_sec: 0.0,
+            require_secondary_confirmation: false,
             ..DirectionConfig::default()
         });
         let now = 1_000_000i64;
@@ -369,6 +452,7 @@ mod tests {
             min_sources_for_high_confidence: 2,
             min_consecutive_ticks: 1,
             min_velocity_bps_per_sec: 0.0,
+            require_secondary_confirmation: true,
             ..DirectionConfig::default()
         });
         let now = 1_000_000i64;
@@ -388,6 +472,7 @@ mod tests {
             threshold_15m_pct: 0.10,
             min_consecutive_ticks: 2,
             min_velocity_bps_per_sec: 1.0,
+            require_secondary_confirmation: false,
             ..DirectionConfig::default()
         });
         let now = 1_000_000i64;
@@ -406,6 +491,7 @@ mod tests {
             threshold_15m_pct: 0.05,
             min_consecutive_ticks: 2,
             min_velocity_bps_per_sec: 1.0,
+            require_secondary_confirmation: false,
             ..DirectionConfig::default()
         });
         let now = 1_000_000i64;
@@ -416,5 +502,42 @@ mod tests {
         let sig = det.evaluate("BTCUSDT", now).unwrap();
         assert_eq!(sig.direction, Direction::Up);
         assert!(sig.tick_consistency >= 2);
+    }
+
+    #[test]
+    fn source_vote_blocks_when_binance_unconfirmed() {
+        let mut det = DirectionDetector::new(DirectionConfig {
+            min_ticks_for_signal: 3,
+            min_consecutive_ticks: 1,
+            min_velocity_bps_per_sec: 0.0,
+            require_secondary_confirmation: true,
+            ..DirectionConfig::default()
+        });
+        let now = 1_000_000i64;
+        det.on_tick(&tick("binance_ws", "BTCUSDT", now - 60_000, 100.0));
+        det.on_tick(&tick("coinbase_ws", "BTCUSDT", now - 60_000, 100.0));
+        det.on_tick(&tick("binance_ws", "BTCUSDT", now - 1_000, 99.9));
+        det.on_tick(&tick("coinbase_ws", "BTCUSDT", now, 100.2));
+        let sig = det.evaluate("BTCUSDT", now).unwrap();
+        assert_eq!(sig.direction, Direction::Neutral);
+    }
+
+    #[test]
+    fn source_vote_passes_with_binance_plus_secondary() {
+        let mut det = DirectionDetector::new(DirectionConfig {
+            min_ticks_for_signal: 3,
+            threshold_15m_pct: 0.10,
+            min_consecutive_ticks: 1,
+            min_velocity_bps_per_sec: 0.0,
+            require_secondary_confirmation: true,
+            ..DirectionConfig::default()
+        });
+        let now = 1_000_000i64;
+        det.on_tick(&tick("binance_ws", "BTCUSDT", now - 60_000, 100.0));
+        det.on_tick(&tick("coinbase_ws", "BTCUSDT", now - 60_000, 100.0));
+        det.on_tick(&tick("binance_ws", "BTCUSDT", now - 1_000, 100.2));
+        det.on_tick(&tick("coinbase_ws", "BTCUSDT", now, 100.21));
+        let sig = det.evaluate("BTCUSDT", now).unwrap();
+        assert_eq!(sig.direction, Direction::Up);
     }
 }

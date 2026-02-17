@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExitManagerConfig {
+    pub t300ms_reversal_bps: f64,
     pub t3_take_ratio: f64,
     pub t15_min_unrealized_usdc: f64,
     pub t60_true_prob_floor: f64,
@@ -16,6 +17,7 @@ pub struct ExitManagerConfig {
 impl Default for ExitManagerConfig {
     fn default() -> Self {
         Self {
+            t300ms_reversal_bps: -2.0,
             t3_take_ratio: 0.60,
             t15_min_unrealized_usdc: 0.0,
             t60_true_prob_floor: 0.70,
@@ -49,6 +51,7 @@ pub struct MarketEvalInput {
 #[serde(rename_all = "snake_case")]
 pub enum ExitReason {
     StopLoss,
+    Reversal300ms,
     TakeProfit3s,
     TakeProfit15s,
     ProbGuard60s,
@@ -126,6 +129,13 @@ impl ExitManager {
             return Some(ExitReason::StopLoss);
         }
 
+        if (300..3_000).contains(&elapsed_ms) && position.entry_notional_usdc > 0.0 {
+            let pnl_bps = (input.unrealized_pnl_usdc / position.entry_notional_usdc) * 10_000.0;
+            if pnl_bps <= self.cfg.t300ms_reversal_bps {
+                return Some(ExitReason::Reversal300ms);
+            }
+        }
+
         if elapsed_ms >= 3_000 {
             let t3_target = position.entry_edge_usdc.max(0.0) * self.cfg.t3_take_ratio;
             if input.unrealized_pnl_usdc > t3_target {
@@ -201,6 +211,25 @@ mod tests {
         assert!(matches!(
             action.map(|a| a.reason),
             Some(ExitReason::TakeProfit3s)
+        ));
+    }
+
+    #[test]
+    fn reversal_300ms_triggers_before_t3() {
+        let mut manager = ExitManager::new(ExitManagerConfig::default());
+        manager.register(sample_position(1_000));
+        let action = manager.evaluate_market(
+            "m1",
+            MarketEvalInput {
+                now_ms: 1_400,
+                unrealized_pnl_usdc: -0.02, // -4 bps on 50 notional
+                true_prob: 0.9,
+                time_to_expiry_ms: 500_000,
+            },
+        );
+        assert!(matches!(
+            action.map(|a| a.reason),
+            Some(ExitReason::Reversal300ms)
         ));
     }
 

@@ -56,6 +56,9 @@ min_consecutive_ticks = 2
 min_velocity_bps_per_sec = 5.0
 min_acceleration = 0.0
 momentum_spike_multiplier = 1.8
+enable_source_vote_gate = true
+require_secondary_confirmation = true
+source_vote_max_age_ms = 2000
 
 [predator_c.probability_engine]
 momentum_gain = 2.0
@@ -78,6 +81,7 @@ stop_on_reject = true
 
 [predator_c.exit]
 enabled = true
+t300ms_reversal_bps = -2.0
 t3_take_ratio = 0.60
 t15_min_unrealized_usdc = 0.0
 t60_true_prob_floor = 0.70
@@ -131,6 +135,7 @@ fail_cost_bps = 1.0
 
 [exit]
 enabled = true
+t300ms_reversal_bps = -2.0
 time_stop_ms = 300000
 edge_decay_bps = -2.0
 adverse_move_bps = -8.0

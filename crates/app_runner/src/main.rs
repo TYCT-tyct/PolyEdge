@@ -257,6 +257,7 @@ struct SourceHealthReloadReq {
 #[derive(Debug, Deserialize)]
 struct ExitReloadReq {
     enabled: Option<bool>,
+    t300ms_reversal_bps: Option<f64>,
     time_stop_ms: Option<u64>,
     edge_decay_bps: Option<f64>,
     adverse_move_bps: Option<f64>,
@@ -417,6 +418,7 @@ impl Default for EdgeModelConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExitConfig {
     enabled: bool,
+    t300ms_reversal_bps: f64,
     time_stop_ms: u64,
     edge_decay_bps: f64,
     adverse_move_bps: f64,
@@ -434,6 +436,7 @@ impl Default for ExitConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            t300ms_reversal_bps: -2.0,
             time_stop_ms: 300_000,
             edge_decay_bps: -2.0,
             adverse_move_bps: -8.0,
@@ -498,6 +501,7 @@ impl Default for SourceHealthConfig {
 
 fn to_exit_manager_config(cfg: &ExitConfig) -> ExitManagerConfig {
     ExitManagerConfig {
+        t300ms_reversal_bps: cfg.t300ms_reversal_bps,
         t3_take_ratio: cfg.t3_take_ratio.clamp(0.0, 5.0),
         t15_min_unrealized_usdc: cfg.t15_min_unrealized_usdc,
         t60_true_prob_floor: cfg.t60_true_prob_floor.clamp(0.0, 1.0),
@@ -511,6 +515,7 @@ fn to_exit_manager_config(cfg: &ExitConfig) -> ExitManagerConfig {
 fn exit_reason_label(reason: ExitReason) -> &'static str {
     match reason {
         ExitReason::StopLoss => "stop_loss",
+        ExitReason::Reversal300ms => "t_plus_300ms_reversal",
         ExitReason::TakeProfit3s => "t_plus_3s",
         ExitReason::TakeProfit15s => "t_plus_15s",
         ExitReason::ProbGuard60s => "t_plus_60s_prob_guard",
@@ -6934,6 +6939,11 @@ fn load_exit_config() -> ExitConfig {
                     cfg.enabled = parsed;
                 }
             }
+            "t300ms_reversal_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.t300ms_reversal_bps = parsed;
+                }
+            }
             "time_stop_ms" => {
                 if let Ok(parsed) = val.parse::<u64>() {
                     cfg.time_stop_ms = parsed.clamp(50, 600_000);
@@ -7122,6 +7132,21 @@ fn load_predator_c_config() -> PredatorCConfig {
                 "momentum_spike_multiplier" => {
                     if let Ok(parsed) = val.parse::<f64>() {
                         cfg.direction_detector.momentum_spike_multiplier = parsed.max(1.0);
+                    }
+                }
+                "enable_source_vote_gate" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.direction_detector.enable_source_vote_gate = parsed;
+                    }
+                }
+                "require_secondary_confirmation" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.direction_detector.require_secondary_confirmation = parsed;
+                    }
+                }
+                "source_vote_max_age_ms" => {
+                    if let Ok(parsed) = val.parse::<i64>() {
+                        cfg.direction_detector.source_vote_max_age_ms = parsed.clamp(50, 60_000);
                     }
                 }
                 _ => {}
