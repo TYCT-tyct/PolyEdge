@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use poly_wire::{decode_book_top24, now_micros, WIRE_BOOK_TOP24_SIZE};
 use std::net::UdpSocket;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 
 fn main() -> Result<()> {
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:6666".to_string());
@@ -9,9 +11,23 @@ fn main() -> Result<()> {
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(1);
+    let pin_core = std::env::var("PIN_CORE").ok().and_then(|v| v.parse::<usize>().ok());
+    let busy_poll_us = std::env::var("BUSY_POLL_US")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| *v > 0);
+    let rcvbuf_bytes = std::env::var("RCVBUF_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0);
+
+    if let Some(core_id) = pin_core {
+        pin_current_thread(core_id)?;
+    }
 
     let socket = UdpSocket::bind(&bind_addr)
         .with_context(|| format!("bind receiver UDP socket at {bind_addr}"))?;
+    apply_udp_socket_tuning(&socket, rcvbuf_bytes, busy_poll_us)?;
     socket
         .set_nonblocking(true)
         .context("set receiver UDP socket nonblocking")?;
@@ -47,7 +63,7 @@ fn main() -> Result<()> {
                 last_packet_ts = packet.ts_micros;
 
                 recv_ok = recv_ok.saturating_add(1);
-                if recv_ok % print_every == 0 {
+                if recv_ok.is_multiple_of(print_every) {
                     let now = now_micros();
                     let latency_us = now.saturating_sub(packet.ts_micros);
                     println!(
@@ -68,4 +84,78 @@ fn main() -> Result<()> {
             Err(err) => return Err(err).context("udp recv_from failed"),
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn apply_udp_socket_tuning(
+    socket: &UdpSocket,
+    rcvbuf_bytes: Option<usize>,
+    busy_poll_us: Option<u32>,
+) -> Result<()> {
+    if let Some(bytes) = rcvbuf_bytes {
+        let value: libc::c_int = bytes.try_into().unwrap_or(libc::c_int::MAX);
+        let rc = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&value as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            anyhow::bail!("set SO_RCVBUF failed: {}", std::io::Error::last_os_error());
+        }
+    }
+    if let Some(us) = busy_poll_us {
+        let value: libc::c_int = us.try_into().unwrap_or(libc::c_int::MAX);
+        let rc = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_BUSY_POLL,
+                (&value as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            anyhow::bail!("set SO_BUSY_POLL failed: {}", std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_udp_socket_tuning(
+    _socket: &UdpSocket,
+    _rcvbuf_bytes: Option<usize>,
+    _busy_poll_us: Option<u32>,
+) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn pin_current_thread(core_id: usize) -> Result<()> {
+    let mut cpuset: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::CPU_ZERO(&mut cpuset);
+        libc::CPU_SET(core_id, &mut cpuset);
+        let rc = libc::pthread_setaffinity_np(
+            libc::pthread_self(),
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &cpuset,
+        );
+        if rc != 0 {
+            anyhow::bail!(
+                "pthread_setaffinity_np(core={core_id}) failed: {}",
+                std::io::Error::from_raw_os_error(rc)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_current_thread(_core_id: usize) -> Result<()> {
+    Ok(())
 }

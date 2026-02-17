@@ -19,8 +19,14 @@ net.core.rmem_max=26214400
 net.core.rmem_default=26214400
 net.core.wmem_max=26214400
 net.core.wmem_default=26214400
+net.core.netdev_max_backlog=250000
+net.core.busy_read=50
+net.core.busy_poll=50
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
+net.ipv4.udp_mem=262144 524288 1048576
+net.ipv4.udp_rmem_min=16384
+net.ipv4.udp_wmem_min=16384
 EOF
 
 sysctl --system >/dev/null

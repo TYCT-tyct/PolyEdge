@@ -10,3 +10,4 @@ futures = { workspace = true }
 anyhow = { workspace = true }
 poly_wire = { path = "../poly_wire" }
 rustls = { workspace = true }
+libc = "0.2"

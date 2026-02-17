@@ -142,6 +142,8 @@ def summary_from_samples(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
     quote_block = col("quote_block_ratio")
     policy_block = col("policy_block_ratio")
     executed_over_eligible = col("executed_over_eligible")
+    eligible_count = col("eligible_count")
+    executed_count = col("executed_count")
     fillability = col("fillability_10ms")
     ev_net = col("ev_net_usdc_p50")
     ev_positive_ratio = col("ev_positive_ratio")
@@ -156,14 +158,33 @@ def summary_from_samples(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     source_mix: Dict[str, float] = {}
     exit_reason_top: Dict[str, int] = {}
-    gate_ready_series: List[float] = []
+    gate_ready_series_reported: List[float] = []
+    gate_ready_series_effective: List[float] = []
+    gate_ready_mismatch_count = 0
     for row in samples:
-        gate_ready_series.append(1.0 if bool(row.get("gate_ready", False)) else 0.0)
-        for k, v in (row.get("source_mix_ratio") or {}).items():
+        reported = bool(row.get("gate_ready", False))
+        eligible = float(row.get("eligible_count", 0.0) or 0.0)
+        executed = float(row.get("executed_count", 0.0) or 0.0)
+        effective = reported or eligible > 0.0 or executed > 0.0
+        gate_ready_series_reported.append(1.0 if reported else 0.0)
+        gate_ready_series_effective.append(1.0 if effective else 0.0)
+        if executed > 0.0 and not reported:
+            gate_ready_mismatch_count += 1
+
+        source_mix_row = row.get("source_mix_ratio") or row.get("source_mix_ratio_peak") or {}
+        for k, v in source_mix_row.items():
             source_mix[k] = max(source_mix.get(k, 0.0), float(v))
-        for item in row.get("exit_reason_top") or []:
-            if isinstance(item, list) and len(item) == 2:
-                exit_reason_top[str(item[0])] = int(item[1])
+        exit_reason_row = row.get("exit_reason_top") or {}
+        if isinstance(exit_reason_row, dict):
+            for k, v in exit_reason_row.items():
+                try:
+                    exit_reason_top[str(k)] = int(v)
+                except Exception:
+                    continue
+        elif isinstance(exit_reason_row, list):
+            for item in exit_reason_row:
+                if isinstance(item, list) and len(item) == 2:
+                    exit_reason_top[str(item[0])] = int(item[1])
 
     return {
         "samples": len(samples),
@@ -172,6 +193,8 @@ def summary_from_samples(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
         "decision_compute_p99_ms": {"p50": p(decision_compute, 0.50), "p90": p(decision_compute, 0.90), "p99": p(decision_compute, 0.99)},
         "quote_block_ratio": {"p50": p(quote_block, 0.50), "p90": p(quote_block, 0.90)},
         "policy_block_ratio": {"p50": p(policy_block, 0.50), "p90": p(policy_block, 0.90)},
+        "eligible_count": {"p50": p(eligible_count, 0.50), "p90": p(eligible_count, 0.90)},
+        "executed_count": {"p50": p(executed_count, 0.50), "p90": p(executed_count, 0.90)},
         "executed_over_eligible": {"p50": p(executed_over_eligible, 0.50)},
         "fillability_10ms": {"p50": p(fillability, 0.50)},
         "ev_net_usdc_p50": {"p50": p(ev_net, 0.50), "p90": p(ev_net, 0.90)},
@@ -184,7 +207,10 @@ def summary_from_samples(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
         "feed_in_p99_ms": {"p50": p(feed_in_p99, 0.50), "p90": p(feed_in_p99, 0.90)},
         "decision_queue_wait_p99_ms": {"p50": p(queue_wait_p99, 0.50), "p90": p(queue_wait_p99, 0.90)},
         "latency_decision_compute_p99_ms": {"p50": p(compute_p99, 0.50), "p90": p(compute_p99, 0.90)},
-        "gate_ready_ratio": p(gate_ready_series, 0.50),
+        "gate_ready_ratio": p(gate_ready_series_effective, 0.50),
+        "gate_ready_ratio_reported": p(gate_ready_series_reported, 0.50),
+        "gate_ready_ratio_effective": p(gate_ready_series_effective, 0.50),
+        "gate_ready_mismatch_count": gate_ready_mismatch_count,
         "source_mix_ratio_peak": source_mix,
         "exit_reason_top_last": dict(sorted(exit_reason_top.items(), key=lambda kv: kv[1], reverse=True)[:8]),
         "tick_to_ack_stddev": statistics.pstdev(tick_to_ack) if len(tick_to_ack) > 1 else 0.0,
@@ -212,7 +238,7 @@ def write_markdown(out_md: Path, payload: Dict[str, Any]) -> None:
     lines.append("")
     lines.append("## Mode Summary")
     lines.append("")
-    lines.append("| mode | tick_to_ack_p99 p50 (ms) | tick_to_decision_p99 p50 (ms) | feed_in_p99 p50 (ms) | decision_compute_p99 p50 (ms) | data_valid p50 | gate_ready_ratio |")
+    lines.append("| mode | tick_to_ack_p99 p50 (ms) | tick_to_decision_p99 p50 (ms) | feed_in_p99 p50 (ms) | decision_compute_p99 p50 (ms) | data_valid p50 | gate_ready_effective |")
     lines.append("|---|---:|---:|---:|---:|---:|---:|")
     for mode in payload["modes"]:
         s = payload["modes"][mode]["summary"]
@@ -220,7 +246,7 @@ def write_markdown(out_md: Path, payload: Dict[str, Any]) -> None:
             "| "
             + f"{mode} | {s['tick_to_ack_p99_ms']['p50']:.3f} | {s['tick_to_decision_p99_ms']['p50']:.3f} | "
             + f"{s['feed_in_p99_ms']['p50']:.3f} | {s['decision_compute_p99_ms']['p50']:.3f} | "
-            + f"{s['data_valid_ratio']['p50']:.5f} | {s['gate_ready_ratio']:.3f} |"
+            + f"{s['data_valid_ratio']['p50']:.5f} | {s['gate_ready_ratio_effective']:.3f} |"
         )
     lines.append("")
     lines.append("## End-to-End Flow")
@@ -259,8 +285,14 @@ def write_markdown(out_md: Path, payload: Dict[str, Any]) -> None:
         lines.append(f"- lag_half_life_ms p50/p90: {s['lag_half_life_ms']['p50']:.3f}/{s['lag_half_life_ms']['p90']:.3f}")
         lines.append(f"- quote_block_ratio p50/p90: {s['quote_block_ratio']['p50']:.4f}/{s['quote_block_ratio']['p90']:.4f}")
         lines.append(f"- policy_block_ratio p50/p90: {s['policy_block_ratio']['p50']:.4f}/{s['policy_block_ratio']['p90']:.4f}")
+        lines.append(f"- eligible_count p50/p90: {s['eligible_count']['p50']:.3f}/{s['eligible_count']['p90']:.3f}")
+        lines.append(f"- executed_count p50/p90: {s['executed_count']['p50']:.3f}/{s['executed_count']['p90']:.3f}")
         lines.append(f"- data_valid_ratio p10/p50: {s['data_valid_ratio']['p10']:.5f}/{s['data_valid_ratio']['p50']:.5f}")
         lines.append(f"- executed_over_eligible p50: {s['executed_over_eligible']['p50']:.4f}")
+        lines.append(
+            f"- gate_ready_ratio reported/effective: {s['gate_ready_ratio_reported']:.3f}/{s['gate_ready_ratio_effective']:.3f}"
+        )
+        lines.append(f"- gate_ready_mismatch_count: {s['gate_ready_mismatch_count']}")
         lines.append(f"- ev_net_usdc_p50 p50/p90: {s['ev_net_usdc_p50']['p50']:.6f}/{s['ev_net_usdc_p50']['p90']:.6f}")
         lines.append(f"- source_mix_ratio_peak: {json.dumps(s['source_mix_ratio_peak'], ensure_ascii=True)}")
         lines.append(f"- exit_reason_top_last: {json.dumps(s['exit_reason_top_last'], ensure_ascii=True)}")

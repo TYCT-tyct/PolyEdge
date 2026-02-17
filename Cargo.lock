@@ -527,6 +527,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "core_types",
+ "libc",
  "poly_wire",
  "tokio",
  "tokio-stream",
@@ -538,6 +539,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures",
+ "libc",
  "poly_wire",
  "rustls",
  "tokio",

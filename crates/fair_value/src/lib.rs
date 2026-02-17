@@ -68,11 +68,10 @@ impl Default for BasisMrFairValue {
 
 impl FairValueModel for BasisMrFairValue {
     fn evaluate(&self, tick: &RefTick, book: &BookTop) -> Signal {
-        let cfg = self
-            .cfg
-            .read()
-            .map(|g| g.clone())
-            .unwrap_or_else(|_| BasisMrConfig::default());
+        let cfg = match self.cfg.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
         let mid_yes = ((book.bid_yes + book.ask_yes) * 0.5).clamp(0.001, 0.999);
         let spread = (book.ask_yes - book.bid_yes).max(0.0001);
         // Fix DESIGN-2: Key by symbol only (e.g. "BTCUSDT") to share specific fair value state

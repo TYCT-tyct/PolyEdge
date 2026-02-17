@@ -70,9 +70,11 @@ deploy_tokyo() {
     # 创建启动脚本
     cat > /tmp/feeder_tokyo.sh << 'EOF'
 #!/bin/bash
-export TARGET="10.0.3.123:6666"
-export SYMBOL="btcusdt"
-export SEND_BUFFER="16777216"
+export SYMBOL_TARGETS="btcusdt=10.0.3.123:6666,ethusdt=10.0.3.123:6667,solusdt=10.0.3.123:6668,xrpusdt=10.0.3.123:6669"
+export BIND_BASE_PORT="9999"
+export POLYEDGE_UDP_REDUNDANCY="2"
+export POLYEDGE_UDP_SNDBUF_BYTES="16777216"
+export POLYEDGE_SENDER_PIN_CORES="btcusdt:0,ethusdt:0,solusdt:1,xrpusdt:1"
 
 cd /opt/PolyEdge
 ./target/release/sender >> /var/log/feeder_tokyo.log 2>&1
@@ -81,7 +83,7 @@ EOF
     chmod +x /tmp/feeder_tokyo.sh
 
     log_success "东京服务器部署完成"
-    log_info "启动命令: export TARGET=10.0.3.123:6666 && cargo run -p feeder_tokyo --bin sender --release"
+    log_info "启动命令: export SYMBOL_TARGETS='btcusdt=10.0.3.123:6666,ethusdt=10.0.3.123:6667,solusdt=10.0.3.123:6668,xrpusdt=10.0.3.123:6669' && export POLYEDGE_UDP_REDUNDANCY=2 && cargo run -p feeder_tokyo --bin sender --release"
 }
 
 # 部署爱尔兰服务器
@@ -104,6 +106,10 @@ deploy_ireland() {
 export POLYEDGE_BINANCE_RELAY=true
 export POLYEDGE_BINANCE_RELAY_HOST=127.0.0.1
 export POLYEDGE_BINANCE_RELAY_PORT=6666
+export POLYEDGE_UDP_SYMBOL_PORTS="BTCUSDT:6666,ETHUSDT:6667,SOLUSDT:6668,XRPUSDT:6669"
+export POLYEDGE_UDP_RCVBUF_BYTES=26214400
+export POLYEDGE_UDP_BUSY_POLL_US=50
+export POLYEDGE_UDP_PIN_CORES="6666:1,6667:2,6668:2,6669:3"
 EOF
 
     log_info "环境配置已保存到 /tmp/polyedge.env"
@@ -171,6 +177,10 @@ Type=simple
 User=$user
 WorkingDirectory=/opt/PolyEdge
 Environment=TARGET=10.0.3.123:6666
+Environment=SYMBOL_TARGETS=btcusdt=10.0.3.123:6666,ethusdt=10.0.3.123:6667,solusdt=10.0.3.123:6668,xrpusdt=10.0.3.123:6669
+Environment=POLYEDGE_UDP_REDUNDANCY=2
+Environment=POLYEDGE_UDP_SNDBUF_BYTES=16777216
+Environment=POLYEDGE_SENDER_PIN_CORES=btcusdt:0,ethusdt:0,solusdt:1,xrpusdt:1
 ExecStart=/opt/PolyEdge/target/release/sender
 Restart=always
 RestartSec=5

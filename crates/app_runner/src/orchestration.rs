@@ -75,7 +75,7 @@ pub(super) fn spawn_periodic_report_persistor(
     execution: Arc<ClobExecution>,
     toxicity_cfg: Arc<RwLock<Arc<ToxicityConfig>>>,
 ) {
-    tokio::spawn(async move {
+    spawn_detached("periodic_report_persistor", false, async move {
         let mut last_final = Instant::now() - Duration::from_secs(600);
         loop {
             let live = stats.build_live_report().await;
@@ -107,7 +107,7 @@ pub(super) fn spawn_data_reconcile_task(
     paused: Arc<RwLock<bool>>,
     stats: Arc<ShadowStats>,
 ) {
-    tokio::spawn(async move {
+    spawn_detached("data_reconcile_task", false, async move {
         let mut interval = tokio::time::interval(Duration::from_secs(600));
         // The raw JSONL files are bucketed by date, while `ShadowStats` counters are reset on
         // `/control/reset_shadow` (window reset). Comparing absolute totals would therefore

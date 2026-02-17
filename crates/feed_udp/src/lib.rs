@@ -3,13 +3,44 @@ use async_trait::async_trait;
 use core_types::{DynStream, RefPriceFeed, RefTick};
 use poly_wire::{decode_book_top24, WIRE_BOOK_TOP24_SIZE};
 use std::collections::HashMap;
-use std::net::SocketAddr;
-use tokio::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 pub struct UdpBinanceFeed {
     port: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct UdpRecvTuning {
+    rcvbuf_bytes: Option<usize>,
+    busy_poll_us: Option<u32>,
+    user_spin: bool,
+}
+
+impl UdpRecvTuning {
+    fn from_env() -> Self {
+        let rcvbuf_bytes = std::env::var("POLYEDGE_UDP_RCVBUF_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0);
+        let busy_poll_us = std::env::var("POLYEDGE_UDP_BUSY_POLL_US")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v > 0);
+        let user_spin = std::env::var("POLYEDGE_UDP_USER_SPIN")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+            .unwrap_or(false);
+        Self {
+            rcvbuf_bytes,
+            busy_poll_us,
+            user_spin,
+        }
+    }
 }
 
 impl UdpBinanceFeed {
@@ -24,6 +55,9 @@ impl RefPriceFeed for UdpBinanceFeed {
         let (tx, rx) = mpsc::channel::<Result<RefTick>>(16_384);
         let normalized_symbols = normalize_symbols(&symbols);
         let bindings = udp_bindings(self.port, &normalized_symbols);
+        let tuning = UdpRecvTuning::from_env();
+        let core_map = parse_port_core_map(&std::env::var("POLYEDGE_UDP_PIN_CORES").unwrap_or_default());
+
         if bindings.is_empty() {
             let symbol = normalized_symbols
                 .first()
@@ -32,17 +66,19 @@ impl RefPriceFeed for UdpBinanceFeed {
             let addr: SocketAddr = format!("0.0.0.0:{}", self.port)
                 .parse()
                 .context("parse udp bind addr")?;
-            let socket = UdpSocket::bind(addr).await.context("bind udp feed socket")?;
-            spawn_recv_loop(socket, symbol, tx.clone());
+            let socket = StdUdpSocket::bind(addr).context("bind udp feed socket")?;
+            let core_id = core_map.get(&self.port).copied();
+            spawn_recv_loop(socket, symbol, tx.clone(), tuning, core_id)?;
         } else {
             for (symbol, port) in bindings {
                 let addr: SocketAddr = format!("0.0.0.0:{port}")
                     .parse()
                     .context("parse udp bind addr")?;
-                let socket = UdpSocket::bind(addr).await.with_context(|| {
+                let socket = StdUdpSocket::bind(addr).with_context(|| {
                     format!("bind udp feed socket for symbol={symbol} port={port}")
                 })?;
-                spawn_recv_loop(socket, symbol, tx.clone());
+                let core_id = core_map.get(&port).copied();
+                spawn_recv_loop(socket, symbol, tx.clone(), tuning, core_id)?;
             }
         }
         drop(tx);
@@ -51,53 +87,150 @@ impl RefPriceFeed for UdpBinanceFeed {
     }
 }
 
-fn spawn_recv_loop(socket: UdpSocket, symbol: String, tx: mpsc::Sender<Result<RefTick>>) {
-    tokio::spawn(async move {
-        let mut buf = [0u8; WIRE_BOOK_TOP24_SIZE];
-        loop {
-            let recv = socket.recv_from(&mut buf).await;
-            let (amt, _) = match recv {
-                Ok(v) => v,
-                Err(err) => {
-                    let _ = tx.send(Err(err.into())).await;
+fn spawn_recv_loop(
+    socket: StdUdpSocket,
+    symbol: String,
+    tx: mpsc::Sender<Result<RefTick>>,
+    tuning: UdpRecvTuning,
+    core_id: Option<usize>,
+) -> Result<()> {
+    socket
+        .set_nonblocking(tuning.user_spin)
+        .context("configure udp nonblocking")?;
+    apply_udp_recv_socket_tuning(&socket, tuning)?;
+
+    std::thread::Builder::new()
+        .name(format!("udp-recv-{symbol}"))
+        .spawn(move || {
+            if let Some(core) = core_id {
+                if let Err(err) = pin_current_thread(core) {
+                    let _ = tx.blocking_send(Err(err));
+                }
+            }
+
+            let mut buf = [0u8; WIRE_BOOK_TOP24_SIZE];
+            loop {
+                let recv = socket.recv_from(&mut buf);
+                let (amt, _src) = match recv {
+                    Ok(v) => v,
+                    Err(err) if tuning.user_spin && err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                    Err(err) => {
+                        if tx.blocking_send(Err(err.into())).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                if amt != WIRE_BOOK_TOP24_SIZE {
                     continue;
                 }
-            };
-            if amt != WIRE_BOOK_TOP24_SIZE {
-                continue;
-            }
-            let packet = match decode_book_top24(&buf) {
-                Ok(pkt) => pkt,
-                Err(err) => {
-                    let _ = tx.send(Err(err.into())).await;
+
+                let packet = match decode_book_top24(&buf) {
+                    Ok(pkt) => pkt,
+                    Err(err) => {
+                        if tx.blocking_send(Err(err.into())).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+
+                let recv_ns = now_ns();
+                let event_ms = (packet.ts_micros / 1_000) as i64;
+                let mid = (packet.bid + packet.ask) * 0.5;
+                if !mid.is_finite() || mid <= 0.0 {
                     continue;
                 }
-            };
 
-            let recv_ns = now_ns();
-            let event_ms = (packet.ts_micros / 1_000) as i64;
-            let mid = (packet.bid + packet.ask) * 0.5;
-            if !mid.is_finite() || mid <= 0.0 {
-                continue;
+                let tick = RefTick {
+                    source: "binance_udp".to_string(),
+                    symbol: symbol.clone(),
+                    event_ts_ms: event_ms,
+                    recv_ts_ms: recv_ns / 1_000_000,
+                    source_seq: stable_udp_seq(packet.ts_micros, packet.bid, packet.ask),
+                    event_ts_exchange_ms: event_ms,
+                    recv_ts_local_ns: recv_ns,
+                    ingest_ts_local_ns: now_ns(),
+                    price: mid,
+                };
+
+                if tx.blocking_send(Ok(tick)).is_err() {
+                    break;
+                }
             }
+        })
+        .context("spawn udp receiver thread")?;
 
-            let tick = RefTick {
-                source: "binance_udp".to_string(),
-                symbol: symbol.clone(),
-                event_ts_ms: event_ms,
-                recv_ts_ms: recv_ns / 1_000_000,
-                source_seq: stable_udp_seq(packet.ts_micros, packet.bid, packet.ask),
-                event_ts_exchange_ms: event_ms,
-                recv_ts_local_ns: recv_ns,
-                ingest_ts_local_ns: now_ns(),
-                price: mid,
-            };
+    Ok(())
+}
 
-            if tx.send(Ok(tick)).await.is_err() {
-                break;
-            }
+#[cfg(target_os = "linux")]
+fn apply_udp_recv_socket_tuning(socket: &StdUdpSocket, tuning: UdpRecvTuning) -> Result<()> {
+    if let Some(bytes) = tuning.rcvbuf_bytes {
+        let value: libc::c_int = bytes.try_into().unwrap_or(libc::c_int::MAX);
+        let rc = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&value as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            anyhow::bail!("set SO_RCVBUF={} failed: {}", bytes, err);
         }
-    });
+    }
+    if let Some(us) = tuning.busy_poll_us {
+        let value: libc::c_int = us.try_into().unwrap_or(libc::c_int::MAX);
+        let rc = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_BUSY_POLL,
+                (&value as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            anyhow::bail!("set SO_BUSY_POLL={} failed: {}", us, err);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_udp_recv_socket_tuning(_socket: &StdUdpSocket, _tuning: UdpRecvTuning) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn pin_current_thread(core_id: usize) -> Result<()> {
+    let mut cpuset: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::CPU_ZERO(&mut cpuset);
+        libc::CPU_SET(core_id, &mut cpuset);
+        let rc = libc::pthread_setaffinity_np(
+            libc::pthread_self(),
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &cpuset,
+        );
+        if rc != 0 {
+            let err = std::io::Error::from_raw_os_error(rc);
+            anyhow::bail!("pthread_setaffinity_np(core={core_id}) failed: {err}");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_current_thread(_core_id: usize) -> Result<()> {
+    Ok(())
 }
 
 fn normalize_symbols(symbols: &[String]) -> Vec<String> {
@@ -165,6 +298,26 @@ fn parse_symbol_port_map(raw: &str) -> HashMap<String, u16> {
     out
 }
 
+fn parse_port_core_map(raw: &str) -> HashMap<u16, usize> {
+    let mut out = HashMap::<u16, usize>::new();
+    for item in raw.split(',') {
+        let token = item.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let mut pair = token.split(':');
+        let port = pair.next().unwrap_or_default().trim();
+        let core = pair.next().unwrap_or_default().trim();
+        if port.is_empty() || core.is_empty() || pair.next().is_some() {
+            continue;
+        }
+        if let (Ok(port_id), Ok(core_id)) = (port.parse::<u16>(), core.parse::<usize>()) {
+            out.insert(port_id, core_id);
+        }
+    }
+    out
+}
+
 #[inline]
 fn now_ns() -> i64 {
     std::time::SystemTime::now()
@@ -224,5 +377,12 @@ mod tests {
                 ("SOLUSDT".to_string(), 6668),
             ]
         );
+    }
+
+    #[test]
+    fn parse_port_core_map_accepts_pairs() {
+        let map = parse_port_core_map("6666:2,6667:3");
+        assert_eq!(map.get(&6666), Some(&2usize));
+        assert_eq!(map.get(&6667), Some(&3usize));
     }
 }
