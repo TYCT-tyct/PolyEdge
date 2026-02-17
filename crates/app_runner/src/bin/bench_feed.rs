@@ -129,11 +129,7 @@ async fn main() -> Result<()> {
                         entry.1 = Some(recv_ts);
 
                         // Check match inside lock, but do NOT do I/O
-                        let match_found = if let Some(ws_ts) = entry.0 {
-                            Some(ws_ts)
-                        } else {
-                            None
-                        };
+                        let match_found = entry.0;
 
                         if let Some(ws_ts) = match_found {
                              map.remove(&event_ts_ms);
@@ -175,11 +171,7 @@ async fn main() -> Result<()> {
                     let entry = map.entry(ticker.event_time_ms).or_insert((None, None));
                     entry.0 = Some(recv_ts);
 
-                    let match_found = if let Some(udp_ts) = entry.1 {
-                        Some(udp_ts)
-                    } else {
-                        None
-                    };
+                    let match_found = entry.1;
 
                     if let Some(udp_ts) = match_found {
                         map.remove(&ticker.event_time_ms);

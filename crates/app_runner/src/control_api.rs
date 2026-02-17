@@ -555,24 +555,16 @@ async fn reload_toxicity(
         next.markout_10s_danger_bps = v;
     }
     if next.safe_threshold > next.caution_threshold {
-        let safe = next.safe_threshold;
-        next.safe_threshold = next.caution_threshold;
-        next.caution_threshold = safe;
+        std::mem::swap(&mut next.safe_threshold, &mut next.caution_threshold);
     }
     if next.markout_1s_caution_bps < next.markout_1s_danger_bps {
-        let v = next.markout_1s_caution_bps;
-        next.markout_1s_caution_bps = next.markout_1s_danger_bps;
-        next.markout_1s_danger_bps = v;
+        std::mem::swap(&mut next.markout_1s_caution_bps, &mut next.markout_1s_danger_bps);
     }
     if next.markout_5s_caution_bps < next.markout_5s_danger_bps {
-        let v = next.markout_5s_caution_bps;
-        next.markout_5s_caution_bps = next.markout_5s_danger_bps;
-        next.markout_5s_danger_bps = v;
+        std::mem::swap(&mut next.markout_5s_caution_bps, &mut next.markout_5s_danger_bps);
     }
     if next.markout_10s_caution_bps < next.markout_10s_danger_bps {
-        let v = next.markout_10s_caution_bps;
-        next.markout_10s_caution_bps = next.markout_10s_danger_bps;
-        next.markout_10s_danger_bps = v;
+        std::mem::swap(&mut next.markout_10s_caution_bps, &mut next.markout_10s_danger_bps);
     }
     *state.toxicity_cfg.write().await = std::sync::Arc::new(next.clone());
     append_jsonl(

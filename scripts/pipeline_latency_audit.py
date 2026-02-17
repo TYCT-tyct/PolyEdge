@@ -158,14 +158,17 @@ def summary_from_samples(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     source_mix: Dict[str, float] = {}
     exit_reason_top: Dict[str, int] = {}
+    gate_ready_series_strict: List[float] = []
     gate_ready_series_reported: List[float] = []
     gate_ready_series_effective: List[float] = []
     gate_ready_mismatch_count = 0
     for row in samples:
-        reported = bool(row.get("gate_ready", False))
+        strict = bool(row.get("gate_ready_strict", row.get("gate_ready", False)))
+        reported = bool(row.get("gate_ready_effective", strict))
         eligible = float(row.get("eligible_count", 0.0) or 0.0)
         executed = float(row.get("executed_count", 0.0) or 0.0)
         effective = reported or eligible > 0.0 or executed > 0.0
+        gate_ready_series_strict.append(1.0 if strict else 0.0)
         gate_ready_series_reported.append(1.0 if reported else 0.0)
         gate_ready_series_effective.append(1.0 if effective else 0.0)
         if executed > 0.0 and not reported:
@@ -208,6 +211,7 @@ def summary_from_samples(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
         "decision_queue_wait_p99_ms": {"p50": p(queue_wait_p99, 0.50), "p90": p(queue_wait_p99, 0.90)},
         "latency_decision_compute_p99_ms": {"p50": p(compute_p99, 0.50), "p90": p(compute_p99, 0.90)},
         "gate_ready_ratio": p(gate_ready_series_effective, 0.50),
+        "gate_ready_ratio_strict": p(gate_ready_series_strict, 0.50),
         "gate_ready_ratio_reported": p(gate_ready_series_reported, 0.50),
         "gate_ready_ratio_effective": p(gate_ready_series_effective, 0.50),
         "gate_ready_mismatch_count": gate_ready_mismatch_count,
@@ -290,7 +294,7 @@ def write_markdown(out_md: Path, payload: Dict[str, Any]) -> None:
         lines.append(f"- data_valid_ratio p10/p50: {s['data_valid_ratio']['p10']:.5f}/{s['data_valid_ratio']['p50']:.5f}")
         lines.append(f"- executed_over_eligible p50: {s['executed_over_eligible']['p50']:.4f}")
         lines.append(
-            f"- gate_ready_ratio reported/effective: {s['gate_ready_ratio_reported']:.3f}/{s['gate_ready_ratio_effective']:.3f}"
+            f"- gate_ready_ratio strict/reported/effective: {s['gate_ready_ratio_strict']:.3f}/{s['gate_ready_ratio_reported']:.3f}/{s['gate_ready_ratio_effective']:.3f}"
         )
         lines.append(f"- gate_ready_mismatch_count: {s['gate_ready_mismatch_count']}")
         lines.append(f"- ev_net_usdc_p50 p50/p90: {s['ev_net_usdc_p50']['p50']:.6f}/{s['ev_net_usdc_p50']['p90']:.6f}")

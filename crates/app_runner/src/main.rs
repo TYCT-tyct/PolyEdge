@@ -103,17 +103,14 @@ struct SignalCacheEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 enum PredatorCPriority {
     MakerFirst,
+    #[default]
     TakerFirst,
     TakerOnly,
 }
 
-impl Default for PredatorCPriority {
-    fn default() -> Self {
-        Self::TakerFirst
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct PredatorCConfig {
@@ -658,7 +655,11 @@ struct ShadowLiveReport {
     window_id: u64,
     window_shots: usize,
     window_outcomes: usize,
+    // Backward-compatible strict gate bit used by existing risk/optimizer scripts.
     gate_ready: bool,
+    // Explicit strict/effective split to avoid semantic ambiguity in external audits.
+    gate_ready_strict: bool,
+    gate_ready_effective: bool,
     gate_fail_reasons: Vec<String>,
     observe_only: bool,
     started_at_ms: i64,
@@ -1652,11 +1653,16 @@ impl ShadowStats {
         let capital = self.predator_capital.read().await.clone();
         let capital_halt = self.predator_capital_halt.load(Ordering::Relaxed);
 
+        let gate_ready_strict = total_outcomes >= Self::GATE_MIN_OUTCOMES;
+        let gate_ready_effective = gate_ready_strict || eligible_count > 0 || executed_count > 0;
+
         let mut live = ShadowLiveReport {
             window_id: self.window_id.load(Ordering::Relaxed),
             window_shots: total_shots,
             window_outcomes: total_outcomes,
-            gate_ready: total_outcomes >= Self::GATE_MIN_OUTCOMES,
+            gate_ready: gate_ready_strict,
+            gate_ready_strict,
+            gate_ready_effective,
             gate_fail_reasons: Vec::new(),
             observe_only: self.observe_only(),
             started_at_ms: self.started_at_ms.load(Ordering::Relaxed),
@@ -1746,7 +1752,10 @@ impl ShadowStats {
         };
         live.gate_fail_reasons =
             gate_eval::compute_gate_fail_reasons(&live, Self::GATE_MIN_OUTCOMES);
-        live.gate_ready = live.window_outcomes >= Self::GATE_MIN_OUTCOMES;
+        live.gate_ready_strict = live.window_outcomes >= Self::GATE_MIN_OUTCOMES;
+        live.gate_ready_effective =
+            live.gate_ready_strict || live.eligible_count > 0 || live.executed_count > 0;
+        live.gate_ready = live.gate_ready_strict;
         live
     }
 
@@ -1756,7 +1765,7 @@ impl ShadowStats {
 
         let gate = GateEvaluation {
             window_id: live.window_id,
-            gate_ready: live.gate_ready,
+            gate_ready: live.gate_ready_strict,
             min_outcomes: Self::GATE_MIN_OUTCOMES,
             pass: failed.is_empty(),
             data_valid_ratio: live.data_valid_ratio,
@@ -1877,7 +1886,12 @@ async fn async_main() -> Result<()> {
 
     let execution_cfg = load_execution_config();
     let universe_cfg = load_universe_config();
-    let bus = RingBus::new(16_384);
+    let bus_capacity = std::env::var("POLYEDGE_BUS_CAPACITY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(32_768)
+        .clamp(4_096, 262_144);
+    let bus = RingBus::new(bus_capacity);
     let portfolio = Arc::new(PortfolioBook::default());
     let live_armed = std::env::var("POLYEDGE_LIVE_ARMED")
         .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
@@ -2110,7 +2124,12 @@ fn spawn_reference_feed(
         } else {
             symbols
         };
-        let (tx, mut rx) = mpsc::channel::<(RefLane, Result<RefTick>)>(32_768);
+        let ref_merge_queue_cap = std::env::var("POLYEDGE_REF_MERGE_QUEUE_CAP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(65_536)
+            .clamp(8_192, 262_144);
+        let (tx, mut rx) = mpsc::channel::<(RefLane, Result<RefTick>)>(ref_merge_queue_cap);
 
         let tx_direct = tx.clone();
         let symbols_direct = symbols.clone();
@@ -2397,6 +2416,16 @@ fn spawn_strategy_engine(
         let mut last_discovery_refresh = Instant::now() - Duration::from_secs(3600);
         let mut last_symbol_retry_refresh = Instant::now() - Duration::from_secs(3600);
         let mut last_fusion_mode = shared.fusion_cfg.read().await.mode.clone();
+        let strategy_max_coalesce = std::env::var("POLYEDGE_STRATEGY_MAX_COALESCE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1_024)
+            .clamp(128, 8_192);
+        let strategy_coalesce_min = std::env::var("POLYEDGE_STRATEGY_MIN_COALESCE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(128)
+            .clamp(32, 2_048);
         refresh_market_symbol_map(&shared).await;
 
         loop {
@@ -2449,8 +2478,9 @@ fn spawn_strategy_engine(
                     // Coalesce bursty queue traffic to the freshest observable state.
                     // This trims local backlog and avoids spending cycles on superseded snapshots.
                     let mut coalesced = 0_u64;
-                    let dynamic_cap = rx.len().saturating_add(64).min(4_096);
-                    let max_coalesced = dynamic_cap.max(256);
+                    let dynamic_cap = rx.len().saturating_add(64).min(strategy_max_coalesce);
+                    let max_coalesced = dynamic_cap.max(strategy_coalesce_min);
+                    let mut coalesced_direction_ticks: HashMap<String, RefTick> = HashMap::new();
                     while coalesced < max_coalesced as u64 {
                         match rx.try_recv() {
                             Ok(EngineEvent::BookTop(next_book)) => {
@@ -2458,14 +2488,8 @@ fn spawn_strategy_engine(
                                 coalesced += 1;
                             }
                             Ok(EngineEvent::RefTick(next_tick)) => {
-                                if !is_anchor_ref_source(next_tick.source.as_str()) {
-                                    shared
-                                    .predator_direction_detector
-                                    .write()
-                                    .await
-                                    .on_tick(&next_tick);
-                                }
-                                if !is_anchor_ref_source(next_tick.source.as_str())
+                                let next_is_anchor = is_anchor_ref_source(next_tick.source.as_str());
+                                if !next_is_anchor
                                     && !fast_tick_allowed_in_fusion_mode(
                                         next_tick.source.as_str(),
                                         &current_fusion_mode,
@@ -2473,6 +2497,16 @@ fn spawn_strategy_engine(
                                 {
                                     coalesced += 1;
                                     continue;
+                                }
+                                if !next_is_anchor {
+                                    let key = next_tick.symbol.clone();
+                                    let replace = coalesced_direction_ticks
+                                        .get(&key)
+                                        .map(|cur| should_replace_ref_tick(cur, &next_tick))
+                                        .unwrap_or(true);
+                                    if replace {
+                                        coalesced_direction_ticks.insert(key, next_tick.clone());
+                                    }
                                 }
                                 insert_latest_ref_tick(
                                     &mut latest_fast_ticks,
@@ -2492,6 +2526,12 @@ fn spawn_strategy_engine(
                                 break;
                             }
                             Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                        }
+                    }
+                    if !coalesced_direction_ticks.is_empty() {
+                        let mut detector = shared.predator_direction_detector.write().await;
+                        for tick in coalesced_direction_ticks.values() {
+                            detector.on_tick(tick);
                         }
                     }
                     if coalesced > 0 {
@@ -6170,11 +6210,8 @@ fn load_risk_limits_config() -> RiskLimits {
                 }
             }
             "[risk_controls.kill_switch]" => {
-                match key {
-                    "max_drawdown_pct" => {
-                        if let Ok(p) = val.parse::<f64>() { cfg.max_drawdown_pct = p.clamp(0.001, 1.0); }
-                    }
-                    _ => {}
+                if key == "max_drawdown_pct" {
+                    if let Ok(p) = val.parse::<f64>() { cfg.max_drawdown_pct = p.clamp(0.001, 1.0); }
                 }
             }
             _ => {}
@@ -6818,6 +6855,8 @@ fn persist_final_report_files(report: &ShadowFinalReport) {
             "window_shots": report.live.window_shots,
             "window_outcomes": report.live.window_outcomes,
             "gate_ready": report.live.gate_ready,
+            "gate_ready_strict": report.live.gate_ready_strict,
+            "gate_ready_effective": report.live.gate_ready_effective,
         },
         "data_chain": {
             "raw_fields": ["sha256", "source_seq", "ingest_seq", "event_ts_exchange_ms", "recv_ts_local_ns"],

@@ -3,12 +3,17 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import random
 import time
 from typing import Dict, List
 
 import websockets
 
-from .stats import percentile, summarize
+try:
+    from .stats import percentile, summarize
+except ImportError:
+    # Allow running as a direct script from repository root.
+    from stats import percentile, summarize
 
 
 async def run_ws_latency(seconds: int, symbol: str) -> Dict[str, float]:
@@ -19,77 +24,121 @@ async def run_ws_latency(seconds: int, symbol: str) -> Dict[str, float]:
     chainlink_lags: List[float] = []
     bin_lags: List[float] = []
 
+    def status_code_from_exc(exc: BaseException) -> int | None:
+        for attr in ("status_code", "status"):
+            val = getattr(exc, attr, None)
+            if isinstance(val, int):
+                return val
+        return None
+
+    async def sleep_with_backoff(
+        end_ts: float,
+        attempt: int,
+        *,
+        throttled: bool,
+    ) -> int:
+        # 429 needs slower reconnect cadence; other errors should retry faster.
+        base = 0.75 if throttled else 0.20
+        cap = 10.0 if throttled else 3.0
+        delay = min(cap, base * (2 ** min(attempt, 6)))
+        delay += random.uniform(0.0, min(0.35, delay * 0.25))
+        remaining = end_ts - time.time()
+        if remaining <= 0:
+            return attempt
+        await asyncio.sleep(min(delay, remaining))
+        return min(attempt + 1, 8)
+
     async def pm_task() -> None:
         url = "wss://ws-live-data.polymarket.com"
-        async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_size=2**22) as ws:
-            sub = {
-                "action": "subscribe",
-                "subscriptions": [
-                    {
-                        "topic": "crypto_prices",
-                        "type": "update",
-                        "filters": f'{{"symbol":"{symbol}"}}',
-                    },
-                    {
-                        # Chainlink RTDS does not currently support server-side symbol filters.
-                        # Subscribe to the topic and filter client-side to keep this probe simple.
-                        "topic": "crypto_prices_chainlink",
-                        "type": "*",
-                        "filters": "",
+        end = time.time() + seconds
+        attempt = 0
+        while time.time() < end:
+            try:
+                async with websockets.connect(
+                    url, ping_interval=20, ping_timeout=20, max_size=2**22
+                ) as ws:
+                    attempt = 0
+                    sub = {
+                        "action": "subscribe",
+                        "subscriptions": [
+                            {
+                                "topic": "crypto_prices",
+                                "type": "update",
+                                "filters": f'{{"symbol":"{symbol}"}}',
+                            },
+                            {
+                                # Chainlink RTDS does not currently support server-side symbol filters.
+                                # Subscribe to the topic and filter client-side to keep this probe simple.
+                                "topic": "crypto_prices_chainlink",
+                                "type": "*",
+                                "filters": "",
+                            },
+                        ],
                     }
-                ],
-            }
-            await ws.send(json.dumps(sub))
-            end = time.time() + seconds
-            while time.time() < end:
-                try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=3)
-                except asyncio.TimeoutError:
-                    continue
-                recv_ms = time.time() * 1000.0
-                if not raw:
-                    continue
-                try:
-                    msg = json.loads(raw)
-                except Exception:
-                    continue
-                topic = msg.get("topic")
-                if topic == "crypto_prices":
-                    if msg.get("type") != "update":
-                        continue
-                    payload = msg.get("payload") or {}
-                    sym = str(payload.get("symbol", "")).lower()
-                    ts = payload.get("timestamp")
-                    if sym != pm_symbol or ts is None:
-                        continue
-                    pm_lags.append(recv_ms - float(ts))
-                elif topic == "crypto_prices_chainlink":
-                    payload = msg.get("payload") or {}
-                    sym = str(payload.get("symbol", "")).lower()
-                    ts = payload.get("timestamp")
-                    if sym != chainlink_symbol or ts is None:
-                        continue
-                    chainlink_lags.append(recv_ms - float(ts))
+                    await ws.send(json.dumps(sub))
+                    while time.time() < end:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=3)
+                        except asyncio.TimeoutError:
+                            continue
+                        recv_ms = time.time() * 1000.0
+                        if not raw:
+                            continue
+                        try:
+                            msg = json.loads(raw)
+                        except Exception:
+                            continue
+                        topic = msg.get("topic")
+                        if topic == "crypto_prices":
+                            if msg.get("type") != "update":
+                                continue
+                            payload = msg.get("payload") or {}
+                            sym = str(payload.get("symbol", "")).lower()
+                            ts = payload.get("timestamp")
+                            if sym != pm_symbol or ts is None:
+                                continue
+                            pm_lags.append(recv_ms - float(ts))
+                        elif topic == "crypto_prices_chainlink":
+                            payload = msg.get("payload") or {}
+                            sym = str(payload.get("symbol", "")).lower()
+                            ts = payload.get("timestamp")
+                            if sym != chainlink_symbol or ts is None:
+                                continue
+                            chainlink_lags.append(recv_ms - float(ts))
+            except Exception as exc:
+                attempt = await sleep_with_backoff(
+                    end, attempt, throttled=status_code_from_exc(exc) == 429
+                )
 
     async def bin_task() -> None:
         # Keep this consistent with the Rust ref feed which uses `@trade`.
         url = f"wss://stream.binance.com:9443/ws/{bin_symbol}@trade"
-        async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_size=2**22) as ws:
-            end = time.time() + seconds
-            while time.time() < end:
-                try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=3)
-                except asyncio.TimeoutError:
-                    continue
-                recv_ms = time.time() * 1000.0
-                try:
-                    msg = json.loads(raw)
-                except Exception:
-                    continue
-                event_ts = msg.get("E")
-                if event_ts is None:
-                    continue
-                bin_lags.append(recv_ms - float(event_ts))
+        end = time.time() + seconds
+        attempt = 0
+        while time.time() < end:
+            try:
+                async with websockets.connect(
+                    url, ping_interval=20, ping_timeout=20, max_size=2**22
+                ) as ws:
+                    attempt = 0
+                    while time.time() < end:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=3)
+                        except asyncio.TimeoutError:
+                            continue
+                        recv_ms = time.time() * 1000.0
+                        try:
+                            msg = json.loads(raw)
+                        except Exception:
+                            continue
+                        event_ts = msg.get("E")
+                        if event_ts is None:
+                            continue
+                        bin_lags.append(recv_ms - float(event_ts))
+            except Exception as exc:
+                attempt = await sleep_with_backoff(
+                    end, attempt, throttled=status_code_from_exc(exc) == 429
+                )
 
     await asyncio.gather(pm_task(), bin_task())
     pm_stats = summarize(pm_lags)

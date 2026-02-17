@@ -61,6 +61,8 @@ def collect_engine_metrics(base_url: str, seconds: int, poll_interval: float) ->
         "roi_notional_10s_bps_p50": [],
         "pnl_10s_outlier_ratio": [],
         "gate_ready_ratio": [],
+        "gate_ready_ratio_strict": [],
+        "gate_ready_ratio_effective": [],
         "window_outcomes": [],
     }
 
@@ -102,7 +104,12 @@ def collect_engine_metrics(base_url: str, seconds: int, poll_interval: float) ->
                 value = live.get(key)
                 if isinstance(value, (int, float)):
                     series[key].append(float(value))
-            series["gate_ready_ratio"].append(1.0 if bool(live.get("gate_ready", False)) else 0.0)
+            gate_ready_strict = bool(live.get("gate_ready_strict", live.get("gate_ready", False)))
+            gate_ready_effective = bool(live.get("gate_ready_effective", gate_ready_strict))
+            series["gate_ready_ratio_strict"].append(1.0 if gate_ready_strict else 0.0)
+            series["gate_ready_ratio_effective"].append(1.0 if gate_ready_effective else 0.0)
+            # Backward-compatible key: keep this tied to effective semantics for downstream summaries.
+            series["gate_ready_ratio"].append(1.0 if gate_ready_effective else 0.0)
             feed_p50 = latency.get("feed_in_p50_ms")
             if isinstance(feed_p50, (int, float)):
                 series["feed_in_p50_ms"].append(float(feed_p50))
@@ -179,6 +186,8 @@ def main() -> None:
     )
     print_stat_block("pnl_10s_outlier_ratio", engine["stats"]["pnl_10s_outlier_ratio"], "")
     print_stat_block("gate_ready_ratio", engine["stats"]["gate_ready_ratio"], "")
+    print_stat_block("gate_ready_ratio_strict", engine["stats"]["gate_ready_ratio_strict"], "")
+    print_stat_block("gate_ready_ratio_effective", engine["stats"]["gate_ready_ratio_effective"], "")
     print_stat_block("window_outcomes", engine["stats"]["window_outcomes"], "")
 
     print("\n=== WS FEED LATENCY (RECV - SOURCE TS) ===")
