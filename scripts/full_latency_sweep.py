@@ -28,6 +28,40 @@ PROFILE_DEFAULTS: Dict[str, Dict[str, float]] = {
 }
 
 
+def post_json(base_url: str, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    resp = requests.post(f"{base_url.rstrip('/')}{path}", json=payload, timeout=8)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def get_json(base_url: str, path: str) -> Dict[str, Any]:
+    resp = requests.get(f"{base_url.rstrip('/')}{path}", timeout=8)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fusion_payload(mode: str, dedupe_window_ms: int) -> Dict[str, Any]:
+    if mode == "direct_only":
+        return {
+            "enable_udp": False,
+            "mode": "direct_only",
+            "dedupe_window_ms": int(dedupe_window_ms),
+        }
+    if mode == "udp_only":
+        return {
+            "enable_udp": True,
+            "mode": "udp_only",
+            "dedupe_window_ms": int(dedupe_window_ms),
+        }
+    if mode == "active_active":
+        return {
+            "enable_udp": True,
+            "mode": "active_active",
+            "dedupe_window_ms": int(dedupe_window_ms),
+        }
+    raise ValueError(f"unsupported fusion mode: {mode}")
+
+
 def utc_day(ts: float | None = None) -> str:
     dt = datetime.fromtimestamp(ts or time.time(), tz=timezone.utc)
     return dt.strftime("%Y-%m-%d")
@@ -42,6 +76,7 @@ def collect_engine_series(base_url: str, seconds: int, poll_interval: float) -> 
 
     series: Dict[str, List[float]] = {
         "tick_to_ack_p99_ms": [],
+        "tick_to_decision_p99_ms": [],
         "decision_queue_wait_p99_ms": [],
         "decision_compute_p99_ms": [],
         "feed_in_p99_ms": [],
@@ -81,6 +116,7 @@ def collect_engine_series(base_url: str, seconds: int, poll_interval: float) -> 
                     series[key].append(float(value))
 
             push("tick_to_ack_p99_ms", live.get("tick_to_ack_p99_ms"))
+            push("tick_to_decision_p99_ms", live.get("tick_to_decision_p99_ms"))
             push("decision_queue_wait_p99_ms", live.get("decision_queue_wait_p99_ms"))
             push("decision_compute_p99_ms", live.get("decision_compute_p99_ms"))
             push("quote_block_ratio", live.get("quote_block_ratio"))
@@ -144,6 +180,29 @@ def parse_args() -> argparse.Namespace:
     # When omitted, preserves the legacy location under datasets/reports/<day>/.
     p.add_argument("--run-id", default=None)
     p.add_argument("--skip-ws", action="store_true", help="skip CEX websocket latency probe (engine metrics only)")
+    p.add_argument(
+        "--fusion-mode",
+        choices=["direct_only", "udp_only", "active_active"],
+        default=None,
+        help="optionally force fusion mode before sampling",
+    )
+    p.add_argument(
+        "--dedupe-window-ms",
+        type=int,
+        default=30,
+        help="dedupe window when applying fusion mode",
+    )
+    p.add_argument(
+        "--reset-shadow",
+        action="store_true",
+        help="reset shadow metrics before sampling",
+    )
+    p.add_argument(
+        "--warmup-sec",
+        type=int,
+        default=0,
+        help="sleep after control actions before sampling",
+    )
     return p.parse_args()
 
 
@@ -155,6 +214,23 @@ def main() -> int:
     symbols = [s.strip().upper() for s in str(args.symbols).split(",") if s.strip()]
 
     started_ms = int(time.time() * 1000)
+    control: Dict[str, Any] = {}
+    if args.fusion_mode:
+        control["fusion_applied"] = post_json(
+            args.base_url,
+            "/control/reload_fusion",
+            fusion_payload(args.fusion_mode, args.dedupe_window_ms),
+        )
+    if args.reset_shadow:
+        control["shadow_reset"] = post_json(args.base_url, "/control/reset_shadow", {})
+    control["resume"] = post_json(args.base_url, "/control/resume", {})
+    if args.warmup_sec > 0:
+        time.sleep(max(0, int(args.warmup_sec)))
+    try:
+        control["pre_live"] = get_json(args.base_url, "/report/shadow/live")
+    except Exception:
+        control["pre_live"] = None
+
     async def run_all() -> tuple[Dict[str, Any], Dict[str, Any]]:
         engine_task = asyncio.to_thread(collect_engine_series, args.base_url, seconds, poll_interval)
         if args.skip_ws:
@@ -176,6 +252,11 @@ def main() -> int:
             "ts_ms": started_ms,
             "run_id": args.run_id,
             "skip_ws": bool(args.skip_ws),
+            "fusion_mode": args.fusion_mode,
+            "reset_shadow": bool(args.reset_shadow),
+            "warmup_sec": int(args.warmup_sec),
+            "dedupe_window_ms": int(args.dedupe_window_ms),
+            "control": control,
         },
         "engine": engine,
         "ws": ws,
