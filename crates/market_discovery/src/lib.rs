@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -84,7 +84,7 @@ impl MarketDiscovery {
         for offset in [0_i64, 1000, 2000, 3000] {
             let limit_s = limit.to_string();
             let offset_s = offset.to_string();
-            let markets: Vec<GammaMarket> = self
+            let response = self
                 .http
                 .get(&self.cfg.endpoint)
                 .query(&[
@@ -97,13 +97,34 @@ impl MarketDiscovery {
                     ("ascending", "false"),
                 ])
                 .send()
-                .await
-                .context("discovery request")?
-                .error_for_status()
-                .context("discovery status")?
-                .json()
-                .await
-                .context("discovery json")?;
+                .await;
+            let response = match response {
+                Ok(v) => v,
+                Err(err) => {
+                    if out.is_empty() {
+                        return Err(err).context("discovery request");
+                    }
+                    break;
+                }
+            };
+            let response = match response.error_for_status() {
+                Ok(v) => v,
+                Err(err) => {
+                    if out.is_empty() {
+                        return Err(err).context("discovery status");
+                    }
+                    break;
+                }
+            };
+            let markets: Vec<GammaMarket> = match response.json().await {
+                Ok(v) => v,
+                Err(err) => {
+                    if out.is_empty() {
+                        return Err(err).context("discovery json");
+                    }
+                    break;
+                }
+            };
 
             if markets.is_empty() {
                 break;
@@ -161,6 +182,9 @@ impl MarketDiscovery {
             }
         }
 
+        if out.is_empty() {
+            return Err(anyhow!("no markets discovered from gamma"));
+        }
         Ok(out)
     }
 }
