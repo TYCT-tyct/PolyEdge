@@ -2030,8 +2030,8 @@ async fn async_main() -> Result<()> {
     let strategy_input_queue_cap = std::env::var("POLYEDGE_STRATEGY_INPUT_QUEUE_CAP")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(8_192)
-        .clamp(512, 131_072);
+        .unwrap_or(2_048)
+        .clamp(256, 65_536);
     let (strategy_ingress_tx, strategy_ingress_rx) =
         mpsc::channel::<StrategyIngress>(strategy_input_queue_cap);
 
@@ -2170,6 +2170,10 @@ fn spawn_reference_feed(
                 .ok()
                 .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
                 .unwrap_or(true);
+        let strategy_ref_ingress_enabled = std::env::var("POLYEDGE_STRATEGY_REF_INGRESS_ENABLED")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+            .unwrap_or(false);
         let (tx, mut rx) = mpsc::channel::<(RefLane, Result<RefTick>)>(ref_merge_queue_cap);
 
         let tx_direct = tx.clone();
@@ -2318,17 +2322,19 @@ fn spawn_reference_feed(
                         metrics::histogram!("fusion.arrive_delta_ns").record(delta_ns as f64);
                     }
 
-                    let ingress = StrategyIngress::RefTick(tick.clone());
-                    if strategy_ingress_drop_on_full {
-                        match strategy_tx.try_send(ingress) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                metrics::counter!("strategy.ingress_ref_drop").increment(1);
+                    if strategy_ref_ingress_enabled {
+                        let ingress = StrategyIngress::RefTick(tick.clone());
+                        if strategy_ingress_drop_on_full {
+                            match strategy_tx.try_send(ingress) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    metrics::counter!("strategy.ingress_ref_drop").increment(1);
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => break,
                             }
-                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        } else if strategy_tx.send(ingress).await.is_err() {
+                            break;
                         }
-                    } else if strategy_tx.send(ingress).await.is_err() {
-                        break;
                     }
 
                     if ref_tick_bus_enabled {
