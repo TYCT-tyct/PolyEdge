@@ -116,6 +116,8 @@ struct PredatorCReloadReq {
     priority: Option<PredatorCPriority>,
     direction_detector: Option<DirectionConfig>,
     taker_sniper: Option<TakerSniperConfig>,
+    regime: Option<PredatorRegimeConfig>,
+    cross_symbol: Option<PredatorCrossSymbolConfig>,
     router: Option<RouterConfig>,
     compounder: Option<CompounderConfig>,
 }
@@ -141,6 +143,12 @@ async fn reload_predator_c(
     }
     if let Some(v) = req.taker_sniper {
         cfg.taker_sniper = v;
+    }
+    if let Some(v) = req.regime {
+        cfg.regime = v;
+    }
+    if let Some(v) = req.cross_symbol {
+        cfg.cross_symbol = v;
     }
     if let Some(v) = req.router {
         cfg.router = v;

@@ -20,7 +20,8 @@ use core_types::{
     new_id, BookTop, CapitalUpdate, ControlCommand, Direction, DirectionSignal, EdgeAttribution,
     EngineEvent, EnginePnLBreakdown, ExecutionStyle, ExecutionVenue, FairValueModel, InventoryState,
     MarketFeed, MarketHealth, OrderAck, OrderIntentV2, OrderSide, OrderTimeInForce,
-    ProbabilityEstimate, QuoteEval, QuoteIntent, QuotePolicy, RefPriceFeed, RefTick, RiskContext,
+    ProbabilityEstimate, QuoteEval, QuoteIntent, QuotePolicy, RefPriceFeed, RefTick, Regime,
+    RiskContext,
     SourceHealth,
     RiskManager, ShadowOutcome, ShadowShot, Signal, TimeframeClass, TimeframeOpp, ToxicDecision,
     ToxicFeatures, ToxicRegime,
@@ -129,6 +130,8 @@ struct PredatorCConfig {
     direction_detector: DirectionConfig,
     probability_engine: ProbabilityEngineConfig,
     taker_sniper: TakerSniperConfig,
+    regime: PredatorRegimeConfig,
+    cross_symbol: PredatorCrossSymbolConfig,
     router: RouterConfig,
     compounder: CompounderConfig,
 }
@@ -141,8 +144,62 @@ impl Default for PredatorCConfig {
             direction_detector: DirectionConfig::default(),
             probability_engine: ProbabilityEngineConfig::default(),
             taker_sniper: TakerSniperConfig::default(),
+            regime: PredatorRegimeConfig::default(),
+            cross_symbol: PredatorCrossSymbolConfig::default(),
             router: RouterConfig::default(),
             compounder: CompounderConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct PredatorRegimeConfig {
+    enabled: bool,
+    active_min_confidence: f64,
+    active_min_magnitude_pct: f64,
+    defend_tox_score: f64,
+    defend_on_toxic_danger: bool,
+    defend_min_source_health: f64,
+    quiet_min_edge_multiplier: f64,
+    quiet_chunk_scale: f64,
+}
+
+impl Default for PredatorRegimeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            active_min_confidence: 0.75,
+            active_min_magnitude_pct: 0.10,
+            defend_tox_score: 0.70,
+            defend_on_toxic_danger: true,
+            defend_min_source_health: 0.45,
+            quiet_min_edge_multiplier: 1.25,
+            quiet_chunk_scale: 0.50,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct PredatorCrossSymbolConfig {
+    enabled: bool,
+    leader_symbol: String,
+    follower_symbols: Vec<String>,
+    min_leader_confidence: f64,
+    min_leader_magnitude_pct: f64,
+    follower_stale_confidence_max: f64,
+    max_correlated_positions: usize,
+}
+
+impl Default for PredatorCrossSymbolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            leader_symbol: "BTCUSDT".to_string(),
+            follower_symbols: vec!["ETHUSDT".to_string(), "SOLUSDT".to_string()],
+            min_leader_confidence: 0.80,
+            min_leader_magnitude_pct: 0.12,
+            follower_stale_confidence_max: 0.65,
+            max_correlated_positions: 2,
         }
     }
 }
@@ -883,6 +940,10 @@ struct ShadowLiveReport {
     direction_signals_neutral: u64,
     taker_sniper_fired: u64,
     taker_sniper_skipped: u64,
+    predator_regime_active: u64,
+    predator_regime_quiet: u64,
+    predator_regime_defend: u64,
+    predator_cross_symbol_fired: u64,
     taker_sniper_skip_reasons_top: Vec<(String, u64)>,
     router_locked_by_tf_usdc: HashMap<String, f64>,
     capital_available_usdc: f64,
@@ -1018,6 +1079,10 @@ struct ShadowStats {
     predator_dir_neutral: AtomicU64,
     predator_taker_fired: AtomicU64,
     predator_taker_skipped: AtomicU64,
+    predator_regime_active: AtomicU64,
+    predator_regime_quiet: AtomicU64,
+    predator_regime_defend: AtomicU64,
+    predator_cross_symbol_fired: AtomicU64,
     predator_taker_skip_reasons: RwLock<HashMap<String, u64>>,
     predator_router_locked_by_tf_usdc: RwLock<HashMap<String, f64>>,
     predator_capital: RwLock<CapitalUpdate>,
@@ -1101,6 +1166,10 @@ impl ShadowStats {
             predator_dir_neutral: AtomicU64::new(0),
             predator_taker_fired: AtomicU64::new(0),
             predator_taker_skipped: AtomicU64::new(0),
+            predator_regime_active: AtomicU64::new(0),
+            predator_regime_quiet: AtomicU64::new(0),
+            predator_regime_defend: AtomicU64::new(0),
+            predator_cross_symbol_fired: AtomicU64::new(0),
             predator_taker_skip_reasons: RwLock::new(HashMap::new()),
             predator_router_locked_by_tf_usdc: RwLock::new(HashMap::new()),
             predator_capital: RwLock::new(CapitalUpdate {
@@ -1158,6 +1227,10 @@ impl ShadowStats {
         self.predator_dir_neutral.store(0, Ordering::Relaxed);
         self.predator_taker_fired.store(0, Ordering::Relaxed);
         self.predator_taker_skipped.store(0, Ordering::Relaxed);
+        self.predator_regime_active.store(0, Ordering::Relaxed);
+        self.predator_regime_quiet.store(0, Ordering::Relaxed);
+        self.predator_regime_defend.store(0, Ordering::Relaxed);
+        self.predator_cross_symbol_fired.store(0, Ordering::Relaxed);
         self.predator_taker_skip_reasons.write().await.clear();
         self.predator_router_locked_by_tf_usdc.write().await.clear();
         *self.predator_capital.write().await = CapitalUpdate {
@@ -1476,6 +1549,24 @@ impl ShadowStats {
 
     fn mark_predator_taker_fired(&self) {
         self.predator_taker_fired.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn mark_predator_regime(&self, regime: &Regime) {
+        match regime {
+            Regime::Active => {
+                self.predator_regime_active.fetch_add(1, Ordering::Relaxed);
+            }
+            Regime::Quiet => {
+                self.predator_regime_quiet.fetch_add(1, Ordering::Relaxed);
+            }
+            Regime::Defend => {
+                self.predator_regime_defend.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn mark_predator_cross_symbol_fired(&self) {
+        self.predator_cross_symbol_fired.fetch_add(1, Ordering::Relaxed);
     }
 
     async fn mark_predator_taker_skipped(&self, reason: &str) {
@@ -1819,6 +1910,11 @@ impl ShadowStats {
         let direction_signals_neutral = self.predator_dir_neutral.load(Ordering::Relaxed);
         let taker_sniper_fired = self.predator_taker_fired.load(Ordering::Relaxed);
         let taker_sniper_skipped = self.predator_taker_skipped.load(Ordering::Relaxed);
+        let predator_regime_active = self.predator_regime_active.load(Ordering::Relaxed);
+        let predator_regime_quiet = self.predator_regime_quiet.load(Ordering::Relaxed);
+        let predator_regime_defend = self.predator_regime_defend.load(Ordering::Relaxed);
+        let predator_cross_symbol_fired =
+            self.predator_cross_symbol_fired.load(Ordering::Relaxed);
         let skip_reasons = self.predator_taker_skip_reasons.read().await.clone();
         let mut skip_top = skip_reasons.into_iter().collect::<Vec<_>>();
         skip_top.sort_by(|a, b| b.1.cmp(&a.1));
@@ -1924,6 +2020,10 @@ impl ShadowStats {
             direction_signals_neutral,
             taker_sniper_fired,
             taker_sniper_skipped,
+            predator_regime_active,
+            predator_regime_quiet,
+            predator_regime_defend,
+            predator_cross_symbol_fired,
             taker_sniper_skip_reasons_top: skip_top,
             router_locked_by_tf_usdc,
             capital_available_usdc: capital.available_usdc,
@@ -3647,13 +3747,40 @@ fn spawn_strategy_engine(
                             tick_fast.recv_ts_ms,
                             tick_fast.recv_ts_local_ns,
                             now_ms,
+                            None,
                         )
                         .await;
+                        let mut total_res = res;
+                        if let Some(leader_direction) = shared
+                            .predator_latest_direction
+                            .read()
+                            .await
+                            .get(&symbol)
+                            .cloned()
+                        {
+                            let cross_res = run_predator_c_cross_symbol(
+                                &shared,
+                                &bus,
+                                &portfolio,
+                                &execution,
+                                &shadow,
+                                &mut market_rate_budget,
+                                &mut global_rate_budget,
+                                &predator_cfg,
+                                &leader_direction,
+                                tick_fast.recv_ts_ms,
+                                tick_fast.recv_ts_local_ns,
+                                now_ms,
+                            )
+                            .await;
+                            total_res.attempted = total_res.attempted.saturating_add(cross_res.attempted);
+                            total_res.executed = total_res.executed.saturating_add(cross_res.executed);
+                        }
                         if matches!(predator_cfg.priority, PredatorCPriority::TakerOnly) {
                             continue;
                         }
                         if matches!(predator_cfg.priority, PredatorCPriority::TakerFirst)
-                            && res.attempted > 0
+                            && total_res.attempted > 0
                         {
                             continue;
                         }
@@ -3719,8 +3846,32 @@ fn spawn_strategy_engine(
                                 tick_fast.recv_ts_ms,
                                 tick_fast.recv_ts_local_ns,
                                 now_ms,
+                                None,
                             )
                             .await;
+                            if let Some(leader_direction) = shared
+                                .predator_latest_direction
+                                .read()
+                                .await
+                                .get(&symbol)
+                                .cloned()
+                            {
+                                let _ = run_predator_c_cross_symbol(
+                                    &shared,
+                                    &bus,
+                                    &portfolio,
+                                    &execution,
+                                    &shadow,
+                                    &mut market_rate_budget,
+                                    &mut global_rate_budget,
+                                    &predator_cfg,
+                                    &leader_direction,
+                                    tick_fast.recv_ts_ms,
+                                    tick_fast.recv_ts_local_ns,
+                                    now_ms,
+                                )
+                                .await;
+                            }
                         }
                         continue;
                     }
@@ -4090,6 +4241,7 @@ async fn run_predator_c_for_symbol(
     tick_fast_recv_ts_ms: i64,
     tick_fast_recv_ts_local_ns: i64,
     now_ms: i64,
+    direction_override: Option<DirectionSignal>,
 ) -> PredatorExecResult {
     shared.shadow_stats.set_predator_enabled(predator_cfg.enabled);
     if !predator_cfg.enabled {
@@ -4100,34 +4252,28 @@ async fn run_predator_c_for_symbol(
         .latest_fast_ticks
         .get(symbol)
         .map(|tick| tick.source.clone());
-    if let Some(source) = primary_fast_source {
-        let health = {
-            let map = shared.source_health_latest.read().await;
-            map.get(&source).cloned()
-        };
-        if let Some(health) = health {
-            if health.sample_count >= source_health_cfg.min_samples
-                && health.score < source_health_cfg.min_score_for_trading
-            {
-                shared
-                    .shadow_stats
-                    .mark_predator_taker_skipped("source_health_low")
-                    .await;
-                return PredatorExecResult::default();
-            }
-        }
-    }
-
-    let direction_signal = {
-        let det = shared.predator_direction_detector.read().await;
-        det.evaluate(symbol, now_ms)
+    let primary_source_health = if let Some(source) = primary_fast_source.as_ref() {
+        let map = shared.source_health_latest.read().await;
+        map.get(source).cloned()
+    } else {
+        None
     };
-    let Some(direction_signal) = direction_signal else {
-        shared
-            .shadow_stats
-            .mark_predator_taker_skipped("no_direction_signal")
-            .await;
-        return PredatorExecResult::default();
+
+    let direction_signal = if let Some(sig) = direction_override {
+        sig
+    } else {
+        let direction_signal = {
+            let det = shared.predator_direction_detector.read().await;
+            det.evaluate(symbol, now_ms)
+        };
+        let Some(direction_signal) = direction_signal else {
+            shared
+                .shadow_stats
+                .mark_predator_taker_skipped("no_direction_signal")
+                .await;
+            return PredatorExecResult::default();
+        };
+        direction_signal
     };
 
     shared.shadow_stats.mark_predator_direction(&direction_signal.direction);
@@ -4156,6 +4302,34 @@ async fn run_predator_c_for_symbol(
         shared
             .shadow_stats
             .mark_predator_taker_skipped("no_symbol_markets")
+            .await;
+        return PredatorExecResult::default();
+    }
+
+    let (symbol_tox_score, symbol_tox_regime) =
+        symbol_toxic_snapshot(shared, &market_ids).await;
+    let regime = classify_predator_regime(
+        &predator_cfg.regime,
+        &direction_signal,
+        symbol_tox_score,
+        &symbol_tox_regime,
+        primary_source_health.as_ref(),
+        &source_health_cfg,
+    );
+    shared.shadow_stats.mark_predator_regime(&regime);
+    if matches!(regime, Regime::Defend) {
+        shared
+            .shadow_stats
+            .mark_predator_taker_skipped("predator_regime_defend")
+            .await;
+        return PredatorExecResult::default();
+    }
+    if matches!(regime, Regime::Quiet)
+        && !matches!(predator_cfg.priority, PredatorCPriority::TakerOnly)
+    {
+        shared
+            .shadow_stats
+            .mark_predator_taker_skipped("predator_regime_quiet")
             .await;
         return PredatorExecResult::default();
     }
@@ -4335,6 +4509,25 @@ async fn run_predator_c_for_symbol(
             .await;
     }
 
+    if matches!(regime, Regime::Quiet) {
+        let quiet_min_edge = predator_cfg.taker_sniper.min_edge_net_bps.max(0.0)
+            * predator_cfg.regime.quiet_min_edge_multiplier.max(1.0);
+        fire_plans_by_market.retain(|_, plan| plan.opportunity.edge_net_bps >= quiet_min_edge);
+        let chunk_scale = predator_cfg.regime.quiet_chunk_scale.clamp(0.05, 1.0);
+        for plan in fire_plans_by_market.values_mut() {
+            let len = plan.chunks.len();
+            if len <= 1 {
+                continue;
+            }
+            let keep = ((len as f64) * chunk_scale).ceil() as usize;
+            let keep = keep.clamp(1, len);
+            plan.chunks.truncate(keep);
+            if let Some(first) = plan.chunks.first_mut() {
+                first.send_delay_ms = 0;
+            }
+        }
+    }
+
     if fire_plans_by_market.is_empty() {
         return PredatorExecResult::default();
     }
@@ -4409,6 +4602,197 @@ async fn run_predator_c_for_symbol(
         }
     }
     out
+}
+
+async fn run_predator_c_cross_symbol(
+    shared: &Arc<EngineShared>,
+    bus: &RingBus<EngineEvent>,
+    portfolio: &Arc<PortfolioBook>,
+    execution: &Arc<ClobExecution>,
+    shadow: &Arc<ShadowExecutor>,
+    market_rate_budget: &mut HashMap<String, TokenBucket>,
+    global_rate_budget: &mut TokenBucket,
+    predator_cfg: &PredatorCConfig,
+    leader_direction: &DirectionSignal,
+    tick_fast_recv_ts_ms: i64,
+    tick_fast_recv_ts_local_ns: i64,
+    now_ms: i64,
+) -> PredatorExecResult {
+    let cross_cfg = &predator_cfg.cross_symbol;
+    if !cross_cfg.enabled {
+        return PredatorExecResult::default();
+    }
+    if !leader_direction
+        .symbol
+        .eq_ignore_ascii_case(&cross_cfg.leader_symbol)
+    {
+        return PredatorExecResult::default();
+    }
+    if matches!(leader_direction.direction, Direction::Neutral) {
+        return PredatorExecResult::default();
+    }
+    if leader_direction.confidence < cross_cfg.min_leader_confidence
+        || leader_direction.magnitude_pct.abs() < cross_cfg.min_leader_magnitude_pct
+    {
+        return PredatorExecResult::default();
+    }
+    let follower_symbols = cross_cfg
+        .follower_symbols
+        .iter()
+        .filter(|s| !s.eq_ignore_ascii_case(&leader_direction.symbol))
+        .cloned()
+        .collect::<Vec<_>>();
+    if follower_symbols.is_empty() {
+        return PredatorExecResult::default();
+    }
+
+    let correlated_used = correlated_locked_positions_for_symbols(shared, &follower_symbols, now_ms).await;
+    let mut slots_left = cross_cfg
+        .max_correlated_positions
+        .saturating_sub(correlated_used);
+    if slots_left == 0 {
+        return PredatorExecResult::default();
+    }
+
+    let mut out = PredatorExecResult::default();
+    for follower in follower_symbols {
+        if slots_left == 0 {
+            break;
+        }
+        let follower_sig = {
+            let det = shared.predator_direction_detector.read().await;
+            det.evaluate(&follower, now_ms)
+        };
+        if let Some(sig) = follower_sig {
+            let same_dir = sig.direction == leader_direction.direction;
+            if same_dir && sig.confidence > cross_cfg.follower_stale_confidence_max {
+                continue;
+            }
+        }
+
+        let mut forced = leader_direction.clone();
+        forced.symbol = follower.clone();
+        let res = run_predator_c_for_symbol(
+            shared,
+            bus,
+            portfolio,
+            execution,
+            shadow,
+            market_rate_budget,
+            global_rate_budget,
+            predator_cfg,
+            &follower,
+            tick_fast_recv_ts_ms,
+            tick_fast_recv_ts_local_ns,
+            now_ms,
+            Some(forced),
+        )
+        .await;
+        if res.attempted > 0 {
+            slots_left = slots_left.saturating_sub(1);
+            shared.shadow_stats.mark_predator_cross_symbol_fired();
+        }
+        out.attempted = out.attempted.saturating_add(res.attempted);
+        out.executed = out.executed.saturating_add(res.executed);
+    }
+    out
+}
+
+async fn correlated_locked_positions_for_symbols(
+    shared: &Arc<EngineShared>,
+    symbols: &[String],
+    now_ms: i64,
+) -> usize {
+    if symbols.is_empty() {
+        return 0;
+    }
+    let locks = {
+        let mut router = shared.predator_router.write().await;
+        router.snapshot_locks(now_ms)
+    };
+    if locks.is_empty() {
+        return 0;
+    }
+    let symbol_set = symbols
+        .iter()
+        .map(|s| s.to_ascii_uppercase())
+        .collect::<std::collections::HashSet<_>>();
+    let market_to_symbol = shared.market_to_symbol.read().await.clone();
+    locks
+        .iter()
+        .filter(|lock| {
+            market_to_symbol
+                .get(&lock.market_id)
+                .map(|s| symbol_set.contains(&s.to_ascii_uppercase()))
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+async fn symbol_toxic_snapshot(
+    shared: &Arc<EngineShared>,
+    market_ids: &[String],
+) -> (f64, ToxicRegime) {
+    if market_ids.is_empty() {
+        return (0.0, ToxicRegime::Safe);
+    }
+    let states = shared.tox_state.read().await;
+    let mut max_score = 0.0_f64;
+    let mut has_caution = false;
+    let mut has_danger = false;
+    for market_id in market_ids {
+        if let Some(st) = states.get(market_id) {
+            max_score = max_score.max(st.last_tox_score);
+            match st.last_regime {
+                ToxicRegime::Danger => has_danger = true,
+                ToxicRegime::Caution => has_caution = true,
+                ToxicRegime::Safe => {}
+            }
+        }
+    }
+    let regime = if has_danger {
+        ToxicRegime::Danger
+    } else if has_caution {
+        ToxicRegime::Caution
+    } else {
+        ToxicRegime::Safe
+    };
+    (max_score, regime)
+}
+
+fn classify_predator_regime(
+    cfg: &PredatorRegimeConfig,
+    direction_signal: &DirectionSignal,
+    tox_score: f64,
+    tox_regime: &ToxicRegime,
+    source_health: Option<&SourceHealth>,
+    source_health_cfg: &SourceHealthConfig,
+) -> Regime {
+    if !cfg.enabled {
+        return Regime::Active;
+    }
+    let source_low = source_health
+        .map(|h| {
+            h.sample_count >= source_health_cfg.min_samples
+                && h.score < cfg.defend_min_source_health.max(source_health_cfg.min_score_for_trading)
+        })
+        .unwrap_or(false);
+    if source_low {
+        return Regime::Defend;
+    }
+    if tox_score >= cfg.defend_tox_score {
+        return Regime::Defend;
+    }
+    if cfg.defend_on_toxic_danger && matches!(tox_regime, ToxicRegime::Danger) {
+        return Regime::Defend;
+    }
+    if direction_signal.confidence >= cfg.active_min_confidence
+        && direction_signal.magnitude_pct.abs() >= cfg.active_min_magnitude_pct
+    {
+        Regime::Active
+    } else {
+        Regime::Quiet
+    }
 }
 
 async fn predator_execute_opportunity(
@@ -7018,6 +7402,8 @@ fn load_predator_c_config() -> PredatorCConfig {
     let mut in_prob = false;
     let mut in_sniper = false;
     let mut in_gatling = false;
+    let mut in_regime = false;
+    let mut in_cross = false;
     let mut in_router = false;
     let mut in_compounder = false;
 
@@ -7032,11 +7418,22 @@ fn load_predator_c_config() -> PredatorCConfig {
             in_prob = line == "[predator_c.probability_engine]";
             in_sniper = line == "[predator_c.taker_sniper]";
             in_gatling = line == "[predator_c.gatling]";
+            in_regime = line == "[predator_c.regime]";
+            in_cross = line == "[predator_c.cross_symbol]";
             in_router = line == "[predator_c.router]";
             in_compounder = line == "[predator_c.compounder]";
             continue;
         }
-        if !(in_root || in_dir || in_prob || in_sniper || in_gatling || in_router || in_compounder) {
+        if !(in_root
+            || in_dir
+            || in_prob
+            || in_sniper
+            || in_gatling
+            || in_regime
+            || in_cross
+            || in_router
+            || in_compounder)
+        {
             continue;
         }
 
@@ -7231,6 +7628,94 @@ fn load_predator_c_config() -> PredatorCConfig {
                 "stop_on_reject" | "gatling_stop_on_reject" => {
                     if let Ok(parsed) = val.parse::<bool>() {
                         cfg.taker_sniper.gatling_stop_on_reject = parsed;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if in_regime {
+            match key {
+                "enabled" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.regime.enabled = parsed;
+                    }
+                }
+                "active_min_confidence" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.regime.active_min_confidence = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "active_min_magnitude_pct" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.regime.active_min_magnitude_pct = parsed.max(0.0);
+                    }
+                }
+                "defend_tox_score" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.regime.defend_tox_score = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "defend_on_toxic_danger" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.regime.defend_on_toxic_danger = parsed;
+                    }
+                }
+                "defend_min_source_health" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.regime.defend_min_source_health = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "quiet_min_edge_multiplier" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.regime.quiet_min_edge_multiplier = parsed.clamp(1.0, 10.0);
+                    }
+                }
+                "quiet_chunk_scale" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.regime.quiet_chunk_scale = parsed.clamp(0.05, 1.0);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if in_cross {
+            match key {
+                "enabled" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.cross_symbol.enabled = parsed;
+                    }
+                }
+                "leader_symbol" => {
+                    cfg.cross_symbol.leader_symbol = val.trim().to_string();
+                }
+                "follower_symbols" => {
+                    let parsed = parse_toml_array_of_strings(v.trim());
+                    if !parsed.is_empty() {
+                        cfg.cross_symbol.follower_symbols = parsed;
+                    }
+                }
+                "min_leader_confidence" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.cross_symbol.min_leader_confidence = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "min_leader_magnitude_pct" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.cross_symbol.min_leader_magnitude_pct = parsed.max(0.0);
+                    }
+                }
+                "follower_stale_confidence_max" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.cross_symbol.follower_stale_confidence_max = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "max_correlated_positions" => {
+                    if let Ok(parsed) = val.parse::<usize>() {
+                        cfg.cross_symbol.max_correlated_positions = parsed.max(1);
                     }
                 }
                 _ => {}
@@ -8627,5 +9112,92 @@ timeframes = ["5m", "15m", "1h", "1d"]
         assert!(row.score > 0.75);
         assert!(row.jitter_ms < cfg.jitter_limit_ms);
         assert!(row.price_deviation_bps < cfg.deviation_limit_bps);
+    }
+
+    #[test]
+    fn classify_predator_regime_defend_on_toxicity_or_source_health() {
+        let cfg = PredatorRegimeConfig::default();
+        let source_cfg = SourceHealthConfig::default();
+        let signal = DirectionSignal {
+            symbol: "BTCUSDT".to_string(),
+            direction: Direction::Up,
+            magnitude_pct: 0.25,
+            confidence: 0.92,
+            recommended_tf: TimeframeClass::Tf15m,
+            velocity_bps_per_sec: 10.0,
+            acceleration: 1.0,
+            tick_consistency: 3,
+            ts_ns: 1,
+        };
+
+        let regime_tox = classify_predator_regime(
+            &cfg,
+            &signal,
+            0.95,
+            &ToxicRegime::Danger,
+            None,
+            &source_cfg,
+        );
+        assert_eq!(regime_tox, Regime::Defend);
+
+        let source_low = SourceHealth {
+            source: "binance_udp".to_string(),
+            latency_ms: 20.0,
+            jitter_ms: 5.0,
+            out_of_order_rate: 0.0,
+            gap_rate: 0.0,
+            price_deviation_bps: 0.0,
+            score: 0.10,
+            sample_count: source_cfg.min_samples,
+            ts_ms: 1,
+        };
+        let regime_source = classify_predator_regime(
+            &cfg,
+            &signal,
+            0.10,
+            &ToxicRegime::Safe,
+            Some(&source_low),
+            &source_cfg,
+        );
+        assert_eq!(regime_source, Regime::Defend);
+    }
+
+    #[test]
+    fn classify_predator_regime_switches_between_active_and_quiet() {
+        let cfg = PredatorRegimeConfig::default();
+        let source_cfg = SourceHealthConfig::default();
+        let mut active_signal = DirectionSignal {
+            symbol: "BTCUSDT".to_string(),
+            direction: Direction::Up,
+            magnitude_pct: 0.20,
+            confidence: 0.85,
+            recommended_tf: TimeframeClass::Tf5m,
+            velocity_bps_per_sec: 8.0,
+            acceleration: 1.2,
+            tick_consistency: 3,
+            ts_ns: 1,
+        };
+
+        let active = classify_predator_regime(
+            &cfg,
+            &active_signal,
+            0.15,
+            &ToxicRegime::Safe,
+            None,
+            &source_cfg,
+        );
+        assert_eq!(active, Regime::Active);
+
+        active_signal.confidence = 0.45;
+        active_signal.magnitude_pct = 0.02;
+        let quiet = classify_predator_regime(
+            &cfg,
+            &active_signal,
+            0.10,
+            &ToxicRegime::Safe,
+            None,
+            &source_cfg,
+        );
+        assert_eq!(quiet, Regime::Quiet);
     }
 }

@@ -405,6 +405,14 @@ pub enum ToxicRegime {
     Danger,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum Regime {
+    Active,
+    Quiet,
+    Defend,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToxicFeatures {
     pub market_id: String,

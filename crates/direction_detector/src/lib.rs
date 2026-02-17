@@ -260,7 +260,7 @@ fn is_binance_source(source: &str) -> bool {
 
 fn is_secondary_source(source: &str) -> bool {
     let s = source.to_ascii_lowercase();
-    s.contains("coinbase") || s.contains("bybit")
+    s.contains("coinbase") || s.contains("bybit") || s.contains("chainlink")
 }
 
 fn kinematics_from_ticks(ticks: &VecDeque<(i64, f64)>) -> (f64, f64, u8) {
@@ -537,6 +537,25 @@ mod tests {
         det.on_tick(&tick("coinbase_ws", "BTCUSDT", now - 60_000, 100.0));
         det.on_tick(&tick("binance_ws", "BTCUSDT", now - 1_000, 100.2));
         det.on_tick(&tick("coinbase_ws", "BTCUSDT", now, 100.21));
+        let sig = det.evaluate("BTCUSDT", now).unwrap();
+        assert_eq!(sig.direction, Direction::Up);
+    }
+
+    #[test]
+    fn source_vote_accepts_chainlink_as_secondary() {
+        let mut det = DirectionDetector::new(DirectionConfig {
+            min_ticks_for_signal: 3,
+            threshold_15m_pct: 0.10,
+            min_consecutive_ticks: 1,
+            min_velocity_bps_per_sec: 0.0,
+            require_secondary_confirmation: true,
+            ..DirectionConfig::default()
+        });
+        let now = 1_000_000i64;
+        det.on_tick(&tick("binance_udp", "BTCUSDT", now - 60_000, 100.0));
+        det.on_tick(&tick("chainlink_rtds", "BTCUSDT", now - 60_000, 100.0));
+        det.on_tick(&tick("binance_udp", "BTCUSDT", now - 1_000, 100.2));
+        det.on_tick(&tick("chainlink_rtds", "BTCUSDT", now, 100.21));
         let sig = det.evaluate("BTCUSDT", now).unwrap();
         assert_eq!(sig.direction, Direction::Up);
     }

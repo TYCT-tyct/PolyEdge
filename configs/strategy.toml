@@ -71,6 +71,25 @@ min_edge_net_bps = 10.0
 max_spread = 0.08
 cooldown_ms_per_market = 800
 
+[predator_c.regime]
+enabled = true
+active_min_confidence = 0.75
+active_min_magnitude_pct = 0.10
+defend_tox_score = 0.70
+defend_on_toxic_danger = true
+defend_min_source_health = 0.45
+quiet_min_edge_multiplier = 1.25
+quiet_chunk_scale = 0.50
+
+[predator_c.cross_symbol]
+enabled = true
+leader_symbol = "BTCUSDT"
+follower_symbols = ["ETHUSDT", "SOLUSDT"]
+min_leader_confidence = 0.80
+min_leader_magnitude_pct = 0.12
+follower_stale_confidence_max = 0.65
+max_correlated_positions = 2
+
 [predator_c.gatling]
 enabled = true
 chunk_notional_usdc = 5.0
