@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use settlement_compounder::{CompounderConfig, SettlementCompounder};
 use sha2::{Digest, Sha256};
 use strategy_maker::{MakerConfig, MakerQuotePolicy};
-use taker_sniper::{TakerAction, TakerSniper, TakerSniperConfig};
+use taker_sniper::{FirePlan, TakerAction, TakerSniper, TakerSniperConfig};
 use timeframe_router::{RouterConfig, TimeframeRouter};
 use tokio::sync::{mpsc, RwLock};
 
@@ -3648,6 +3648,7 @@ fn spawn_strategy_engine(
 struct PredatorExecResult {
     attempted: u64,
     executed: u64,
+    stop_firing: bool,
 }
 
 async fn run_predator_c_for_symbol(
@@ -3824,7 +3825,7 @@ async fn run_predator_c_for_symbol(
         });
     }
 
-    let mut candidates: Vec<TimeframeOpp> = Vec::new();
+    let mut fire_plans_by_market: HashMap<String, FirePlan> = HashMap::new();
     let mut skip_reasons: Vec<String> = Vec::new();
     {
         let mut sniper = shared.predator_taker_sniper.write().await;
@@ -3844,8 +3845,8 @@ async fn run_predator_c_for_symbol(
             );
             match decision.action {
                 TakerAction::Fire => {
-                    if let Some(opp) = decision.opportunity {
-                        candidates.push(opp);
+                    if let Some(plan) = decision.fire_plan {
+                        fire_plans_by_market.insert(plan.opportunity.market_id.clone(), plan);
                     }
                 }
                 TakerAction::Skip => {
@@ -3861,19 +3862,28 @@ async fn run_predator_c_for_symbol(
             .await;
     }
 
-    if candidates.is_empty() {
+    if fire_plans_by_market.is_empty() {
         return PredatorExecResult::default();
     }
 
     // Router selects + locks.
-    let mut locked_opps: Vec<TimeframeOpp> = Vec::new();
+    let mut locked_plans: Vec<FirePlan> = Vec::new();
     let mut locked_by_tf_usdc: HashMap<String, f64> = HashMap::new();
     {
         let mut router = shared.predator_router.write().await;
-        let selected = router.route(candidates, total_capital_usdc.max(0.0), now_ms);
+        let selected = router.route(
+            fire_plans_by_market
+                .values()
+                .map(|plan| plan.opportunity.clone())
+                .collect::<Vec<_>>(),
+            total_capital_usdc.max(0.0),
+            now_ms,
+        );
         for opp in selected {
             if router.lock(&opp, now_ms) {
-                locked_opps.push(opp);
+                if let Some(plan) = fire_plans_by_market.remove(&opp.market_id) {
+                    locked_plans.push(plan);
+                }
             }
         }
         for (tf, v) in router.locked_by_tf_usdc(now_ms) {
@@ -3885,32 +3895,45 @@ async fn run_predator_c_for_symbol(
         .set_predator_router_locked_by_tf_usdc(locked_by_tf_usdc)
         .await;
 
-    if locked_opps.is_empty() {
+    if locked_plans.is_empty() {
         return PredatorExecResult::default();
     }
 
     let mut out = PredatorExecResult::default();
-    for opp in locked_opps {
-        shared.shadow_stats.mark_predator_taker_fired();
-        let res = predator_execute_opportunity(
-            shared,
-            bus,
-            portfolio,
-            execution,
-            shadow,
-            market_rate_budget,
-            global_rate_budget,
-            &maker_cfg,
-            predator_cfg,
-            &direction_signal,
-            &opp,
-            tick_fast_recv_ts_ms,
-            tick_fast_recv_ts_local_ns,
-            now_ms,
-        )
-        .await;
-        out.attempted = out.attempted.saturating_add(res.attempted);
-        out.executed = out.executed.saturating_add(res.executed);
+    for plan in locked_plans {
+        let opp = &plan.opportunity;
+        for (idx, chunk) in plan.chunks.iter().enumerate() {
+            if chunk.size <= 0.0 {
+                continue;
+            }
+            if idx > 0 && chunk.send_delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(chunk.send_delay_ms)).await;
+            }
+            shared.shadow_stats.mark_predator_taker_fired();
+            let res = predator_execute_opportunity(
+                shared,
+                bus,
+                portfolio,
+                execution,
+                shadow,
+                market_rate_budget,
+                global_rate_budget,
+                &maker_cfg,
+                predator_cfg,
+                &direction_signal,
+                opp,
+                chunk.size,
+                tick_fast_recv_ts_ms,
+                tick_fast_recv_ts_local_ns,
+                now_ms,
+            )
+            .await;
+            out.attempted = out.attempted.saturating_add(res.attempted);
+            out.executed = out.executed.saturating_add(res.executed);
+            if plan.stop_on_reject && res.stop_firing {
+                break;
+            }
+        }
     }
     out
 }
@@ -3927,6 +3950,7 @@ async fn predator_execute_opportunity(
     predator_cfg: &PredatorCConfig,
     _direction_signal: &DirectionSignal,
     opp: &TimeframeOpp,
+    chunk_size: f64,
     tick_fast_recv_ts_ms: i64,
     tick_fast_recv_ts_local_ns: i64,
     now_ms: i64,
@@ -3935,7 +3959,7 @@ async fn predator_execute_opportunity(
         market_id: opp.market_id.clone(),
         side: opp.side.clone(),
         price: opp.entry_price,
-        size: opp.size,
+        size: chunk_size,
         ttl_ms: maker_cfg.ttl_ms,
     };
 
@@ -4186,6 +4210,7 @@ async fn predator_execute_opportunity(
                 .mark_blocked_with_reason(&format!("exchange_reject_{reject_code}"))
                 .await;
             metrics::counter!("execution.place_rejected").increment(1);
+            out.stop_firing = true;
         }
         Err(err) => {
             let reason = classify_execution_error_reason(&err);
@@ -6259,6 +6284,7 @@ fn load_predator_c_config() -> PredatorCConfig {
     let mut in_root = false;
     let mut in_dir = false;
     let mut in_sniper = false;
+    let mut in_gatling = false;
     let mut in_router = false;
     let mut in_compounder = false;
 
@@ -6271,11 +6297,12 @@ fn load_predator_c_config() -> PredatorCConfig {
             in_root = line == "[predator_c]";
             in_dir = line == "[predator_c.direction_detector]";
             in_sniper = line == "[predator_c.taker_sniper]";
+            in_gatling = line == "[predator_c.gatling]";
             in_router = line == "[predator_c.router]";
             in_compounder = line == "[predator_c.compounder]";
             continue;
         }
-        if !(in_root || in_dir || in_sniper || in_router || in_compounder) {
+        if !(in_root || in_dir || in_sniper || in_gatling || in_router || in_compounder) {
             continue;
         }
 
@@ -6378,8 +6405,13 @@ fn load_predator_c_config() -> PredatorCConfig {
             continue;
         }
 
-        if in_sniper {
+        if in_sniper || in_gatling {
             match key {
+                "enabled" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.taker_sniper.gatling_enabled = parsed;
+                    }
+                }
                 "min_direction_confidence" => {
                     if let Ok(parsed) = val.parse::<f64>() {
                         cfg.taker_sniper.min_direction_confidence = parsed.clamp(0.0, 1.0);
@@ -6398,6 +6430,36 @@ fn load_predator_c_config() -> PredatorCConfig {
                 "cooldown_ms_per_market" => {
                     if let Ok(parsed) = val.parse::<u64>() {
                         cfg.taker_sniper.cooldown_ms_per_market = parsed;
+                    }
+                }
+                "gatling_enabled" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.taker_sniper.gatling_enabled = parsed;
+                    }
+                }
+                "chunk_notional_usdc" | "gatling_chunk_notional_usdc" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.taker_sniper.gatling_chunk_notional_usdc = parsed.max(0.1);
+                    }
+                }
+                "min_chunks" | "gatling_min_chunks" => {
+                    if let Ok(parsed) = val.parse::<usize>() {
+                        cfg.taker_sniper.gatling_min_chunks = parsed.max(1);
+                    }
+                }
+                "max_chunks" | "gatling_max_chunks" => {
+                    if let Ok(parsed) = val.parse::<usize>() {
+                        cfg.taker_sniper.gatling_max_chunks = parsed.max(1);
+                    }
+                }
+                "spacing_ms" | "gatling_spacing_ms" => {
+                    if let Ok(parsed) = val.parse::<u64>() {
+                        cfg.taker_sniper.gatling_spacing_ms = parsed.min(250);
+                    }
+                }
+                "stop_on_reject" | "gatling_stop_on_reject" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.taker_sniper.gatling_stop_on_reject = parsed;
                     }
                 }
                 _ => {}

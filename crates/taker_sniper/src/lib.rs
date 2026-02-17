@@ -9,6 +9,12 @@ pub struct TakerSniperConfig {
     pub min_edge_net_bps: f64,
     pub max_spread: f64,
     pub cooldown_ms_per_market: u64,
+    pub gatling_enabled: bool,
+    pub gatling_chunk_notional_usdc: f64,
+    pub gatling_min_chunks: usize,
+    pub gatling_max_chunks: usize,
+    pub gatling_spacing_ms: u64,
+    pub gatling_stop_on_reject: bool,
 }
 
 impl Default for TakerSniperConfig {
@@ -18,6 +24,12 @@ impl Default for TakerSniperConfig {
             min_edge_net_bps: 10.0,
             max_spread: 0.08,
             cooldown_ms_per_market: 800,
+            gatling_enabled: true,
+            gatling_chunk_notional_usdc: 5.0,
+            gatling_min_chunks: 1,
+            gatling_max_chunks: 4,
+            gatling_spacing_ms: 12,
+            gatling_stop_on_reject: true,
         }
     }
 }
@@ -29,9 +41,22 @@ pub enum TakerAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FireChunk {
+    pub size: f64,
+    pub send_delay_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FirePlan {
+    pub opportunity: TimeframeOpp,
+    pub chunks: Vec<FireChunk>,
+    pub stop_on_reject: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TakerDecision {
     pub action: TakerAction,
-    pub opportunity: Option<TimeframeOpp>,
+    pub fire_plan: Option<FirePlan>,
     pub reason: String,
 }
 
@@ -128,9 +153,10 @@ impl TakerSniper {
         };
         self.last_fire_ms_by_market
             .insert(market_id.to_string(), now_ms);
+        let fire_plan = build_fire_plan(&self.cfg, opp);
         TakerDecision {
             action: TakerAction::Fire,
-            opportunity: Some(opp),
+            fire_plan: Some(fire_plan),
             reason: "fire".to_string(),
         }
     }
@@ -139,8 +165,48 @@ impl TakerSniper {
 fn skip(reason: &str) -> TakerDecision {
     TakerDecision {
         action: TakerAction::Skip,
-        opportunity: None,
+        fire_plan: None,
         reason: reason.to_string(),
+    }
+}
+
+fn build_fire_plan(cfg: &TakerSniperConfig, opportunity: TimeframeOpp) -> FirePlan {
+    let total_size = opportunity.size.max(0.0);
+    let notional = (opportunity.entry_price.max(0.0) * total_size).max(0.0);
+    let min_chunks = cfg.gatling_min_chunks.max(1);
+    let max_chunks = cfg.gatling_max_chunks.max(min_chunks);
+    let desired_chunks = if cfg.gatling_enabled && cfg.gatling_chunk_notional_usdc > 0.0 {
+        ((notional / cfg.gatling_chunk_notional_usdc).ceil() as usize).clamp(min_chunks, max_chunks)
+    } else {
+        1
+    };
+
+    let mut chunks = Vec::with_capacity(desired_chunks);
+    if desired_chunks == 1 {
+        chunks.push(FireChunk {
+            size: total_size,
+            send_delay_ms: 0,
+        });
+    } else {
+        let mut remain = total_size;
+        let base = total_size / desired_chunks as f64;
+        for idx in 0..desired_chunks {
+            let mut size = if idx + 1 == desired_chunks { remain } else { base };
+            if idx + 1 != desired_chunks {
+                size = size.max(0.01);
+                remain = (remain - size).max(0.0);
+            }
+            chunks.push(FireChunk {
+                size,
+                send_delay_ms: if idx == 0 { 0 } else { cfg.gatling_spacing_ms },
+            });
+        }
+    }
+
+    FirePlan {
+        opportunity,
+        chunks,
+        stop_on_reject: cfg.gatling_stop_on_reject,
     }
 }
 
@@ -203,6 +269,7 @@ mod tests {
             min_edge_net_bps: 5.0,
             max_spread: 0.08,
             cooldown_ms_per_market: 0,
+            ..TakerSniperConfig::default()
         });
         let sig = up_signal(0.9);
         let d = sniper.evaluate(
@@ -219,7 +286,7 @@ mod tests {
             1_000_000,
         );
         assert!(matches!(d.action, TakerAction::Fire));
-        assert!(d.opportunity.is_some());
+        assert!(d.fire_plan.is_some());
     }
 
     #[test]
@@ -351,5 +418,38 @@ mod tests {
             1_000_000,
         );
         assert!(matches!(d.action, TakerAction::Fire));
+    }
+
+    #[test]
+    fn gatling_plan_splits_into_chunks() {
+        let mut sniper = TakerSniper::new(TakerSniperConfig {
+            gatling_enabled: true,
+            gatling_chunk_notional_usdc: 2.0,
+            gatling_min_chunks: 2,
+            gatling_max_chunks: 5,
+            ..TakerSniperConfig::default()
+        });
+        let sig = up_signal(0.9);
+        let d = sniper.evaluate(
+            "m1",
+            "BTCUSDT",
+            TimeframeClass::Tf15m,
+            &sig,
+            0.90,
+            0.01,
+            2.0,
+            80.0,
+            120.0,
+            10.0,
+            1_000_000,
+        );
+        assert!(matches!(d.action, TakerAction::Fire));
+        let Some(plan) = d.fire_plan else {
+            panic!("expected fire plan");
+        };
+        assert!(plan.chunks.len() >= 2);
+        assert!(plan.stop_on_reject);
+        let total: f64 = plan.chunks.iter().map(|c| c.size).sum();
+        assert!((total - 10.0).abs() < 1e-6);
     }
 }
