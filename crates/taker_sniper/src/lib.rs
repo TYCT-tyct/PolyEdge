@@ -20,7 +20,7 @@ pub struct TakerSniperConfig {
 impl Default for TakerSniperConfig {
     fn default() -> Self {
         Self {
-            min_direction_confidence: 0.70,
+            min_direction_confidence: 0.60,
             min_edge_net_bps: 10.0,
             max_spread: 0.08,
             cooldown_ms_per_market: 800,
