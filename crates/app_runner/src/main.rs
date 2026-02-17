@@ -158,6 +158,7 @@ struct EngineShared {
     fair_value_cfg: Arc<StdRwLock<BasisMrConfig>>,
     toxicity_cfg: Arc<RwLock<Arc<ToxicityConfig>>>,
     risk_manager: Arc<DefaultRiskManager>,
+    risk_limits: Arc<StdRwLock<RiskLimits>>,
     universe_symbols: Arc<Vec<String>>,
     universe_market_types: Arc<Vec<String>>,
     universe_timeframes: Arc<Vec<String>>,
@@ -2005,6 +2006,7 @@ async fn async_main() -> Result<()> {
         fair_value_cfg,
         toxicity_cfg,
         risk_manager,
+        risk_limits: risk_limits.clone(),
         universe_symbols: universe_symbols.clone(),
         universe_market_types: universe_market_types.clone(),
         universe_timeframes: universe_timeframes.clone(),
@@ -3143,10 +3145,29 @@ fn spawn_strategy_engine(
 
                     let fee_bps = get_fee_rate_bps_cached(&shared, &book.market_id).await;
                     let drawdown = portfolio.snapshot().max_drawdown_pct;
+                    let risk_limits_snapshot = shared
+                        .risk_limits
+                        .read()
+                        .map(|g| g.clone())
+                        .unwrap_or_else(|_| RiskLimits::default());
 
                     for mut intent in intents.drain(..) {
                         let intent_decision_start = Instant::now();
                         shared.shadow_stats.mark_attempted();
+
+                        let pre_market_notional =
+                            inventory.exposure_notional + pending_market_exposure;
+                        let pre_asset_notional =
+                            inventory.exposure_notional + pending_total_exposure;
+                        let pre_scale = adaptive_size_scale(
+                            drawdown,
+                            pre_market_notional,
+                            pre_asset_notional,
+                            &risk_limits_snapshot,
+                            tox_decision.tox_score,
+                            &tox_decision.regime,
+                        );
+                        intent.size = (intent.size * pre_scale).max(0.01);
 
                         let risk_start = Instant::now();
                         let proposed_notional_usdc =
@@ -3794,11 +3815,31 @@ async fn predator_execute_opportunity(
         0.0
     };
 
-    let proposed_notional_usdc = (intent.price.max(0.0) * intent.size.max(0.0)).max(0.0);
     let inventory = inventory_for_market(portfolio, &intent.market_id);
     let pending_market_exposure = execution.open_order_notional_for_market(&intent.market_id);
     let pending_total_exposure = execution.open_order_notional_total();
     let drawdown = portfolio.snapshot().max_drawdown_pct;
+    let risk_limits_snapshot = shared
+        .risk_limits
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_else(|_| RiskLimits::default());
+    let (tox_score, tox_regime) = {
+        let map = shared.tox_state.read().await;
+        map.get(&intent.market_id)
+            .map(|st| (st.last_tox_score, st.last_regime.clone()))
+            .unwrap_or((0.0, ToxicRegime::Safe))
+    };
+    let pre_scale = adaptive_size_scale(
+        drawdown,
+        inventory.exposure_notional + pending_market_exposure,
+        inventory.exposure_notional + pending_total_exposure,
+        &risk_limits_snapshot,
+        tox_score,
+        &tox_regime,
+    );
+    intent.size = (intent.size * pre_scale).max(0.01);
+    let proposed_notional_usdc = (intent.price.max(0.0) * intent.size.max(0.0)).max(0.0);
     let ctx = RiskContext {
         market_id: intent.market_id.clone(),
         symbol: opp.symbol.clone(),
@@ -4773,6 +4814,41 @@ fn cooldown_secs_for_score(tox_score: f64, cfg: &ToxicityConfig) -> u64 {
         .round() as u64
 }
 
+fn adaptive_size_scale(
+    drawdown_pct: f64,
+    market_notional: f64,
+    asset_notional: f64,
+    limits: &RiskLimits,
+    tox_score: f64,
+    tox_regime: &ToxicRegime,
+) -> f64 {
+    let dd_cap = limits.max_drawdown_pct.abs().max(0.01);
+    let dd_ratio = (drawdown_pct.abs() / dd_cap).clamp(0.0, 1.0);
+    let drawdown_scale = (1.0 - 0.75 * dd_ratio).clamp(0.25, 1.0);
+
+    let market_util = if limits.max_market_notional > 0.0 {
+        (market_notional.max(0.0) / limits.max_market_notional).clamp(0.0, 2.0)
+    } else {
+        1.0
+    };
+    let asset_util = if limits.max_asset_notional > 0.0 {
+        (asset_notional.max(0.0) / limits.max_asset_notional).clamp(0.0, 2.0)
+    } else {
+        1.0
+    };
+    let util = market_util.max(asset_util);
+    let exposure_scale = (1.0 - 0.80 * util).clamp(0.20, 1.0);
+
+    let regime_scale = match tox_regime {
+        ToxicRegime::Safe => 1.0,
+        ToxicRegime::Caution => 0.70,
+        ToxicRegime::Danger => 0.40,
+    };
+    let tox_scale = (regime_scale * (1.0 - 0.35 * tox_score.clamp(0.0, 1.0))).clamp(0.20, 1.0);
+
+    (drawdown_scale * exposure_scale * tox_scale).clamp(0.05, 1.0)
+}
+
 fn net_markout(markout_bps: Option<f64>, shot: &ShadowShot) -> Option<f64> {
     markout_bps.map(|v| v - shot.fee_paid_bps + shot.rebate_est_bps)
 }
@@ -4951,6 +5027,7 @@ fn should_replace_ref_tick(current: &RefTick, next: &RefTick) -> bool {
     let staleness_budget_us = fusion_staleness_budget_us();
     if next.recv_ts_local_ns > 0
         && current.recv_ts_local_ns > 0
+        && next.source != current.source
         && next.recv_ts_local_ns > current.recv_ts_local_ns
     {
         let arrival_delta_us = (next.recv_ts_local_ns - current.recv_ts_local_ns) / 1_000;
@@ -6293,8 +6370,23 @@ fn load_risk_limits_config() -> RiskLimits {
                 }
             }
             "[risk_controls.kill_switch]" => {
-                if key == "max_drawdown_pct" {
-                    if let Ok(p) = val.parse::<f64>() { cfg.max_drawdown_pct = p.clamp(0.001, 1.0); }
+                match key {
+                    "max_drawdown_pct" => {
+                        if let Ok(p) = val.parse::<f64>() {
+                            cfg.max_drawdown_pct = p.clamp(0.001, 1.0);
+                        }
+                    }
+                    "max_loss_streak" => {
+                        if let Ok(p) = val.parse::<u32>() {
+                            cfg.max_loss_streak = p.max(1);
+                        }
+                    }
+                    "cooldown_sec" => {
+                        if let Ok(p) = val.parse::<u64>() {
+                            cfg.cooldown_sec = p.max(1);
+                        }
+                    }
+                    _ => {}
                 }
             }
             _ => {}
