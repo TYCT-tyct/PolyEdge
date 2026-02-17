@@ -87,8 +87,8 @@ impl RiskManager for DefaultRiskManager {
         if ctx.loss_streak >= limits.max_loss_streak && limits.max_loss_streak > 0 {
             if let Ok(mut st) = self.state.lock() {
                 if now_ms > 0 {
-                    // Use saturating_add to prevent overflow
-                    st.cooldown_until_ms = st.cooldown_until_ms
+                    // Start cooldown window from "now", not from previous value.
+                    st.cooldown_until_ms = now_ms
                         .saturating_add((limits.cooldown_sec as i64).saturating_mul(1_000));
                 }
             }
@@ -153,3 +153,66 @@ impl RiskManager for DefaultRiskManager {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx(now_ms: i64) -> RiskContext {
+        RiskContext {
+            market_id: "m1".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            order_count: 0,
+            proposed_size: 1.0,
+            proposed_notional_usdc: 1.0,
+            market_notional: 0.0,
+            asset_notional: 0.0,
+            drawdown_pct: 0.0,
+            loss_streak: 0,
+            now_ms,
+        }
+    }
+
+    #[test]
+    fn loss_streak_sets_cooldown_from_current_time() {
+        let limits = Arc::new(RwLock::new(RiskLimits {
+            max_loss_streak: 1,
+            cooldown_sec: 60,
+            ..RiskLimits::default()
+        }));
+        let rm = DefaultRiskManager::new(limits);
+
+        let mut tripped = ctx(1_000_000);
+        tripped.loss_streak = 1;
+        let d = rm.evaluate(&tripped);
+        assert!(!d.allow);
+        assert_eq!(d.reason, "loss_streak");
+
+        // Should be blocked by cooldown at +59s.
+        let d = rm.evaluate(&ctx(1_059_000));
+        assert!(!d.allow);
+        assert_eq!(d.reason, "cooldown");
+
+        // Cooldown should end at +60s.
+        let d = rm.evaluate(&ctx(1_060_000));
+        assert!(d.allow);
+        assert_eq!(d.reason, "ok");
+    }
+
+    #[test]
+    fn notional_cap_scales_size_proportionally() {
+        let limits = Arc::new(RwLock::new(RiskLimits {
+            max_market_notional: 10.0,
+            ..RiskLimits::default()
+        }));
+        let rm = DefaultRiskManager::new(limits);
+        let d = rm.evaluate(&RiskContext {
+            market_notional: 8.0,
+            proposed_notional_usdc: 4.0,
+            proposed_size: 2.0,
+            ..ctx(1_000_000)
+        });
+        assert!(d.allow);
+        // Remaining notional is 2.0 out of requested 4.0 => 50% size cap.
+        assert!((d.capped_size - 1.0).abs() < 1e-9);
+    }
+}
