@@ -114,9 +114,24 @@ fn normalize_symbols(symbols: &[String]) -> Vec<String> {
 
 fn udp_bindings(default_port: u16, symbols: &[String]) -> Vec<(String, u16)> {
     let raw = std::env::var("POLYEDGE_UDP_SYMBOL_PORTS").unwrap_or_default();
-    let map = parse_symbol_port_map(&raw);
+    udp_bindings_from_raw(default_port, symbols, &raw)
+}
+
+fn udp_bindings_from_raw(default_port: u16, symbols: &[String], raw: &str) -> Vec<(String, u16)> {
+    let map = parse_symbol_port_map(raw);
     if map.is_empty() {
-        return vec![];
+        if symbols.len() <= 1 {
+            return vec![];
+        }
+        return symbols
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, symbol)| {
+                let delta = u16::try_from(idx).ok()?;
+                let port = default_port.checked_add(delta)?;
+                Some((symbol.clone(), port))
+            })
+            .collect();
     }
     let mut out = Vec::<(String, u16)>::new();
     for symbol in symbols {
@@ -191,5 +206,23 @@ mod tests {
         let map = parse_symbol_port_map("BTCUSDT:6666,bad,ETHUSDT:notaport, :7777");
         assert_eq!(map.get("BTCUSDT"), Some(&6666));
         assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn udp_bindings_defaults_to_sequential_ports_for_multi_symbol() {
+        let symbols = vec![
+            "BTCUSDT".to_string(),
+            "ETHUSDT".to_string(),
+            "SOLUSDT".to_string(),
+        ];
+        let bindings = udp_bindings_from_raw(6666, &symbols, "");
+        assert_eq!(
+            bindings,
+            vec![
+                ("BTCUSDT".to_string(), 6666),
+                ("ETHUSDT".to_string(), 6667),
+                ("SOLUSDT".to_string(), 6668),
+            ]
+        );
     }
 }

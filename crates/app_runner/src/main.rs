@@ -2368,6 +2368,7 @@ fn spawn_strategy_engine(
         let mut rx = bus.subscribe();
         let mut last_discovery_refresh = Instant::now() - Duration::from_secs(3600);
         let mut last_symbol_retry_refresh = Instant::now() - Duration::from_secs(3600);
+        let mut last_fusion_mode = shared.fusion_cfg.read().await.mode.clone();
         refresh_market_symbol_map(&shared).await;
 
         loop {
@@ -2381,6 +2382,17 @@ fn spawn_strategy_engine(
                 continue;
             };
             let dispatch_start = Instant::now();
+            let current_fusion_mode = shared.fusion_cfg.read().await.mode.clone();
+            if current_fusion_mode != last_fusion_mode {
+                latest_fast_ticks.retain(|_, tick| {
+                    fast_tick_allowed_in_fusion_mode(tick.source.as_str(), &current_fusion_mode)
+                });
+                last_fusion_mode = current_fusion_mode.clone();
+                shared
+                    .shadow_stats
+                    .record_issue("fusion_mode_switch_fast_cache_reset")
+                    .await;
+            }
 
             match event {
                 EngineEvent::RefTick(tick) => {
@@ -2392,6 +2404,14 @@ fn spawn_strategy_engine(
                             .write()
                             .await
                             .on_tick(&tick);
+                    }
+                    if !is_anchor_ref_source(tick.source.as_str())
+                        && !fast_tick_allowed_in_fusion_mode(
+                            tick.source.as_str(),
+                            &current_fusion_mode,
+                        )
+                    {
+                        continue;
                     }
                     insert_latest_ref_tick(&mut latest_fast_ticks, &mut latest_anchor_ticks, tick);
                 }
@@ -2412,10 +2432,19 @@ fn spawn_strategy_engine(
                             Ok(EngineEvent::RefTick(next_tick)) => {
                                 if !is_anchor_ref_source(next_tick.source.as_str()) {
                                     shared
-                                        .predator_direction_detector
-                                        .write()
-                                        .await
-                                        .on_tick(&next_tick);
+                                    .predator_direction_detector
+                                    .write()
+                                    .await
+                                    .on_tick(&next_tick);
+                                }
+                                if !is_anchor_ref_source(next_tick.source.as_str())
+                                    && !fast_tick_allowed_in_fusion_mode(
+                                        next_tick.source.as_str(),
+                                        &current_fusion_mode,
+                                    )
+                                {
+                                    coalesced += 1;
+                                    continue;
                                 }
                                 insert_latest_ref_tick(
                                     &mut latest_fast_ticks,
@@ -4908,9 +4937,7 @@ fn pick_latest_tick<'a>(
     latest_ticks: &'a HashMap<String, RefTick>,
     symbol: &str,
 ) -> Option<&'a RefTick> {
-    latest_ticks
-        .get(symbol)
-        .or_else(|| latest_ticks.values().max_by_key(|t| t.recv_ts_ms))
+    latest_ticks.get(symbol)
 }
 
 async fn get_fee_rate_bps_cached(shared: &EngineShared, market_id: &str) -> f64 {
