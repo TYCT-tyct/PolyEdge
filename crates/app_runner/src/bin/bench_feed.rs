@@ -1,6 +1,8 @@
 use anyhow::Result;
 use futures::StreamExt;
-use poly_wire::{decode_book_top24, WIRE_BOOK_TOP24_SIZE};
+use poly_wire::{
+    decode_auto, WirePacket, WIRE_BOOK_TOP24_SIZE, WIRE_MAX_PACKET_SIZE, WIRE_MOMENTUM_TICK32_SIZE,
+};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::Write;
@@ -109,17 +111,20 @@ async fn main() -> Result<()> {
 
     // 4. UDP Task
     tokio::spawn(async move {
-        let mut buf = [0u8; WIRE_BOOK_TOP24_SIZE];
+        let mut buf = [0u8; WIRE_MAX_PACKET_SIZE];
         let mut last_event_ts_ms = 0_u64;
         loop {
             match socket.recv_from(&mut buf).await {
                 Ok((amt, _)) => {
                     let recv_ts = now_micros();
-                    if amt != WIRE_BOOK_TOP24_SIZE {
+                    if amt != WIRE_BOOK_TOP24_SIZE && amt != WIRE_MOMENTUM_TICK32_SIZE {
                         continue;
                     }
-                    if let Ok(packet) = decode_book_top24(&buf) {
-                        let event_ts_ms = packet.ts_micros / 1_000;
+                    if let Ok(packet) = decode_auto(&buf[..amt]) {
+                        let event_ts_ms = match packet {
+                            WirePacket::BookTop24(v) => v.ts_micros / 1_000,
+                            WirePacket::MomentumTick32(v) => v.ts_micros / 1_000,
+                        };
                         if last_event_ts_ms > 0 && event_ts_ms < last_event_ts_ms {
                             warn!("⚠️ UDP timestamp backjump: {} -> {}", last_event_ts_ms, event_ts_ms);
                         }

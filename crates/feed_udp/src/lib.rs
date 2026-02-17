@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use core_types::{DynStream, RefPriceFeed, RefTick};
-use poly_wire::{decode_book_top24, WIRE_BOOK_TOP24_SIZE};
+use poly_wire::{
+    decode_auto, WirePacket, WIRE_BOOK_TOP24_SIZE, WIRE_MAX_PACKET_SIZE,
+    WIRE_MOMENTUM_TICK32_SIZE,
+};
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
 #[cfg(target_os = "linux")]
@@ -119,7 +122,7 @@ fn spawn_recv_loop(
                 }
             }
 
-            let mut buf = [0u8; WIRE_BOOK_TOP24_SIZE];
+            let mut buf = [0u8; WIRE_MAX_PACKET_SIZE];
             loop {
                 let recv = socket.recv_from(&mut buf);
                 let (amt, _src) = match recv {
@@ -143,12 +146,13 @@ fn spawn_recv_loop(
                         continue;
                     }
                 };
-                if amt != WIRE_BOOK_TOP24_SIZE {
+                if amt != WIRE_BOOK_TOP24_SIZE && amt != WIRE_MOMENTUM_TICK32_SIZE {
                     continue;
                 }
 
-                let packet = match decode_book_top24(&buf) {
-                    Ok(pkt) => pkt,
+                let (ts_micros, bid, ask) = match decode_auto(&buf[..amt]) {
+                    Ok(WirePacket::BookTop24(pkt)) => (pkt.ts_micros, pkt.bid, pkt.ask),
+                    Ok(WirePacket::MomentumTick32(pkt)) => (pkt.ts_micros, pkt.bid, pkt.ask),
                     Err(err) => {
                         let send_err = if tuning.drop_on_full {
                             match tx.try_send(Err(err.into())) {
@@ -166,8 +170,8 @@ fn spawn_recv_loop(
                 };
 
                 let recv_ns = now_ns();
-                let event_ms = (packet.ts_micros / 1_000) as i64;
-                let mid = (packet.bid + packet.ask) * 0.5;
+                let event_ms = (ts_micros / 1_000) as i64;
+                let mid = (bid + ask) * 0.5;
                 if !mid.is_finite() || mid <= 0.0 {
                     continue;
                 }
@@ -177,7 +181,7 @@ fn spawn_recv_loop(
                     symbol: symbol.clone(),
                     event_ts_ms: event_ms,
                     recv_ts_ms: recv_ns / 1_000_000,
-                    source_seq: stable_udp_seq(packet.ts_micros, packet.bid, packet.ask),
+                    source_seq: stable_udp_seq(ts_micros, bid, ask),
                     event_ts_exchange_ms: event_ms,
                     recv_ts_local_ns: recv_ns,
                     ingest_ts_local_ns: now_ns(),

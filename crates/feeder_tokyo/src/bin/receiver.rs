@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
-use poly_wire::{decode_book_top24, now_micros, WIRE_BOOK_TOP24_SIZE};
+use poly_wire::{
+    decode_auto, now_micros, WirePacket, WIRE_BOOK_TOP24_SIZE, WIRE_MAX_PACKET_SIZE,
+    WIRE_MOMENTUM_TICK32_SIZE,
+};
 use std::net::UdpSocket;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
@@ -33,11 +36,11 @@ fn main() -> Result<()> {
         .context("set receiver UDP socket nonblocking")?;
 
     eprintln!(
-        "receiver: listening={} packet_size={} print_every={} (busy-spin mode)",
-        bind_addr, WIRE_BOOK_TOP24_SIZE, print_every
+        "receiver: listening={} packet_sizes=[{},{}] print_every={} (busy-spin mode)",
+        bind_addr, WIRE_BOOK_TOP24_SIZE, WIRE_MOMENTUM_TICK32_SIZE, print_every
     );
 
-    let mut buf = [0u8; WIRE_BOOK_TOP24_SIZE];
+    let mut buf = [0u8; WIRE_MAX_PACKET_SIZE];
     let mut last_packet_ts: u64 = 0;
     let mut recv_ok: u64 = 0;
     let mut dropped_out_of_order: u64 = 0;
@@ -46,31 +49,32 @@ fn main() -> Result<()> {
     loop {
         match socket.recv_from(&mut buf) {
             Ok((amt, _src)) => {
-                if amt != WIRE_BOOK_TOP24_SIZE {
+                if amt != WIRE_BOOK_TOP24_SIZE && amt != WIRE_MOMENTUM_TICK32_SIZE {
                     dropped_size = dropped_size.saturating_add(1);
                     continue;
                 }
 
-                let packet = match decode_book_top24(&buf) {
-                    Ok(pkt) => pkt,
+                let (ts_micros, bid, ask) = match decode_auto(&buf[..amt]) {
+                    Ok(WirePacket::BookTop24(pkt)) => (pkt.ts_micros, pkt.bid, pkt.ask),
+                    Ok(WirePacket::MomentumTick32(pkt)) => (pkt.ts_micros, pkt.bid, pkt.ask),
                     Err(_) => continue,
                 };
 
-                if packet.ts_micros < last_packet_ts {
+                if ts_micros < last_packet_ts {
                     dropped_out_of_order = dropped_out_of_order.saturating_add(1);
                     continue;
                 }
-                last_packet_ts = packet.ts_micros;
+                last_packet_ts = ts_micros;
 
                 recv_ok = recv_ok.saturating_add(1);
                 if recv_ok.is_multiple_of(print_every) {
                     let now = now_micros();
-                    let latency_us = now.saturating_sub(packet.ts_micros);
+                    let latency_us = now.saturating_sub(ts_micros);
                     println!(
                         "latency_us={} bid={:.8} ask={:.8} recv_ok={} drop_ooo={} drop_size={}",
                         latency_us,
-                        packet.bid,
-                        packet.ask,
+                        bid,
+                        ask,
                         recv_ok,
                         dropped_out_of_order,
                         dropped_size

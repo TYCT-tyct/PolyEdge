@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use poly_wire::{encode_book_top24, now_micros, WireBookTop24, WIRE_BOOK_TOP24_SIZE};
+use poly_wire::{encode_with_mode, now_micros, WireBookTop24, WireMode, WIRE_MAX_PACKET_SIZE};
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 #[cfg(target_os = "linux")]
@@ -147,6 +147,46 @@ struct RedundancyController {
     last_error_event: std::time::Instant,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct VelocityEstimator {
+    prev_ts_micros: u64,
+    prev_mid: f64,
+}
+
+impl VelocityEstimator {
+    fn velocity_bps_per_sec(&mut self, packet: &WireBookTop24) -> f64 {
+        let mid = (packet.bid + packet.ask) * 0.5;
+        if !mid.is_finite() || mid <= 0.0 {
+            return 0.0;
+        }
+        if self.prev_ts_micros == 0 || self.prev_mid <= 0.0 || !self.prev_mid.is_finite() {
+            self.prev_ts_micros = packet.ts_micros;
+            self.prev_mid = mid;
+            return 0.0;
+        }
+
+        let dt_micros = packet.ts_micros.saturating_sub(self.prev_ts_micros);
+        if dt_micros == 0 {
+            return 0.0;
+        }
+        let dt_sec = dt_micros as f64 / 1_000_000.0;
+        if dt_sec <= 0.0 {
+            return 0.0;
+        }
+        let ret = (mid - self.prev_mid) / self.prev_mid;
+        let velocity = (ret * 10_000.0) / dt_sec;
+
+        self.prev_ts_micros = packet.ts_micros;
+        self.prev_mid = mid;
+
+        if velocity.is_finite() {
+            velocity
+        } else {
+            0.0
+        }
+    }
+}
+
 impl RedundancyController {
     fn new(tuning: SenderTuning) -> Self {
         let base = tuning.redundancy.max(1);
@@ -287,13 +327,15 @@ async fn run_route(route: &Route, tuning: SenderTuning) -> Result<()> {
         route.bind_addr, route.target, route.symbol, tuning.redundancy, tuning.sndbuf_bytes
     );
 
-    let mut packet_buf = [0u8; WIRE_BOOK_TOP24_SIZE];
+    let wire_mode = WireMode::from_env("POLYEDGE_WIRE_MODE");
+    let mut packet_buf = [0u8; WIRE_MAX_PACKET_SIZE];
     let mut frames: u64 = 0;
     let mut packets_ok: u64 = 0;
     let mut dropped_would_block: u64 = 0;
     let mut dropped_conn_refused: u64 = 0;
     let mut dropped_other: u64 = 0;
     let mut redundancy_ctl = RedundancyController::new(tuning);
+    let mut velocity_estimator = VelocityEstimator::default();
     let mut last_log = std::time::Instant::now();
 
     loop {
@@ -316,11 +358,18 @@ async fn run_route(route: &Route, tuning: SenderTuning) -> Result<()> {
             };
 
             if let Some(packet) = parse_book_ticker(&text) {
-                encode_book_top24(&packet, &mut packet_buf).context("encode 24-byte packet")?;
+                let velocity_bps_per_sec = velocity_estimator.velocity_bps_per_sec(&packet);
+                let packet_len = encode_with_mode(
+                    &packet,
+                    velocity_bps_per_sec,
+                    wire_mode,
+                    &mut packet_buf,
+                )
+                .context("encode wire packet")?;
                 frames = frames.saturating_add(1);
 
                 for _ in 0..redundancy_ctl.current() {
-                    match socket.send_to(&packet_buf, target_addr) {
+                    match socket.send_to(&packet_buf[..packet_len], target_addr) {
                         Ok(_) => packets_ok = packets_ok.saturating_add(1),
                         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                             dropped_would_block = dropped_would_block.saturating_add(1);
@@ -340,8 +389,9 @@ async fn run_route(route: &Route, tuning: SenderTuning) -> Result<()> {
 
             if last_log.elapsed().as_secs() >= 5 {
                 eprintln!(
-                    "sender: symbol={} frames={} packets_ok={} dropped_would_block={} dropped_conn_refused={} dropped_other={} redundancy={}",
+                    "sender: symbol={} wire_mode={:?} frames={} packets_ok={} dropped_would_block={} dropped_conn_refused={} dropped_other={} redundancy={}",
                     route.symbol,
+                    wire_mode,
                     frames,
                     packets_ok,
                     dropped_would_block,
