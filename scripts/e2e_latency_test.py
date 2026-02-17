@@ -6,6 +6,7 @@ from __future__ import annotations
 import atexit
 import argparse
 import asyncio
+import concurrent.futures
 import json
 import math
 import time
@@ -23,6 +24,60 @@ PROFILE_DEFAULTS: Dict[str, Dict[str, float]] = {
     "standard": {"seconds": 120, "poll_interval": 2.0},
     "deep": {"seconds": 300, "poll_interval": 2.0},
 }
+
+ENGINE_SERIES_KEYS = [
+    "tick_to_decision_p99_ms",
+    "decision_queue_wait_p99_ms",
+    "decision_compute_p99_ms",
+    "tick_to_ack_p99_ms",
+    "ack_only_p99_ms",
+    "feed_in_p50_ms",
+    "source_latency_p99_ms",
+    "local_backlog_p99_ms",
+    "data_valid_ratio",
+    "seq_gap_rate",
+    "ts_inversion_rate",
+    "stale_tick_drop_ratio",
+    "quote_block_ratio",
+    "policy_block_ratio",
+    "queue_depth_p99",
+    "event_backlog_p99",
+    "pnl_10s_p50_bps_raw",
+    "pnl_10s_p50_bps_robust",
+    "ev_net_usdc_p50",
+    "ev_net_usdc_p10",
+    "ev_positive_ratio",
+    "eligible_count",
+    "executed_count",
+    "executed_over_eligible",
+    "net_markout_10s_usdc_p50",
+    "roi_notional_10s_bps_p50",
+    "pnl_10s_outlier_ratio",
+    "window_outcomes",
+    "gate_ready_ratio",
+    "gate_ready_ratio_strict",
+    "gate_ready_ratio_effective",
+]
+
+
+def empty_engine_result(failures: int = 1) -> Dict[str, Any]:
+    return {
+        "samples": 0,
+        "failures": failures,
+        "stats": {k: summarize([]) for k in ENGINE_SERIES_KEYS},
+    }
+
+
+def empty_ws_result() -> Dict[str, Any]:
+    empty_stat = summarize([])
+    return {
+        "pm_lag_ms": empty_stat,
+        "chainlink_lag_ms": empty_stat,
+        "bin_lag_ms": empty_stat,
+        "delta_pm_minus_bin_p50_ms": float("nan"),
+        "delta_chainlink_minus_bin_p50_ms": float("nan"),
+        "delta_pm_minus_chainlink_p50_ms": float("nan"),
+    }
 
 
 def collect_engine_metrics(base_url: str, seconds: int, poll_interval: float) -> Dict[str, Any]:
@@ -133,6 +188,7 @@ def main() -> None:
     parser.add_argument("--base-url", default="http://127.0.0.1:8080")
     parser.add_argument("--seconds", type=int, default=None)
     parser.add_argument("--poll-interval", type=float, default=None)
+    parser.add_argument("--hard-timeout-sec", type=int, default=None)
     parser.add_argument("--json-out", default="")
     args = parser.parse_args()
     profile_defaults = PROFILE_DEFAULTS[args.profile]
@@ -140,12 +196,34 @@ def main() -> None:
         args.seconds = int(profile_defaults["seconds"])
     if args.poll_interval is None:
         args.poll_interval = float(profile_defaults["poll_interval"])
+    if args.hard_timeout_sec is None:
+        # Run-time guard for stalled endpoints; benchmark should stop close to target window.
+        args.hard_timeout_sec = int(max(args.seconds + 25, args.seconds * 1.35))
     print(
-        f"[profile] {args.profile} seconds={args.seconds} poll_interval={args.poll_interval}"
+        f"[profile] {args.profile} seconds={args.seconds} poll_interval={args.poll_interval} hard_timeout={args.hard_timeout_sec}"
     )
 
     print("=== ENGINE WS-FIRST METRICS ===")
-    engine = collect_engine_metrics(args.base_url, args.seconds, args.poll_interval)
+    ws: Dict[str, Any]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        engine_future = pool.submit(
+            collect_engine_metrics, args.base_url, args.seconds, args.poll_interval
+        )
+        try:
+            ws = asyncio.run(
+                asyncio.wait_for(
+                    run_ws_latency(args.seconds, args.symbol), timeout=args.hard_timeout_sec
+                )
+            )
+        except Exception:
+            print("[warn] ws probe timeout/error; fallback to empty ws stats")
+            ws = empty_ws_result()
+        try:
+            engine = engine_future.result(timeout=args.hard_timeout_sec)
+        except concurrent.futures.TimeoutError:
+            print("[warn] engine probe timeout; fallback to empty engine stats")
+            engine = empty_engine_result(failures=1)
+
     print(f"base_url={args.base_url} symbol={args.symbol} mode={args.mode}")
     print(f"samples={engine['samples']} failures={engine['failures']}")
     print_stat_block("tick_to_decision_p99", engine["stats"]["tick_to_decision_p99_ms"], "ms")
@@ -191,7 +269,6 @@ def main() -> None:
     print_stat_block("window_outcomes", engine["stats"]["window_outcomes"], "")
 
     print("\n=== WS FEED LATENCY (RECV - SOURCE TS) ===")
-    ws = asyncio.run(run_ws_latency(args.seconds, args.symbol))
     print_stat_block("rtds_crypto_prices", ws["pm_lag_ms"], "ms")
     print_stat_block("rtds_chainlink", ws["chainlink_lag_ms"], "ms")
     print_stat_block("binance_ws", ws["bin_lag_ms"], "ms")
