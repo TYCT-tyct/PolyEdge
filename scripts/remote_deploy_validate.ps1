@@ -36,7 +36,7 @@ Invoke-Remote "echo connected && uname -a && date -u +%Y-%m-%dT%H:%M:%SZ"
 
 Write-Host "[2/7] Ensure repository is up to date"
 $repoSyncTemplate = @'
-set -e; if [ -d __REPO_DIR__/.git ]; then cd __REPO_DIR__ && git fetch origin && git checkout __BRANCH__ && git pull --ff-only origin __BRANCH__; else git clone --branch __BRANCH__ __REPO_URL__ __REPO_DIR__; fi
+set -e; if [ -d __REPO_DIR__ ] && git -C __REPO_DIR__ rev-parse --is-inside-work-tree >/dev/null 2>&1; then cd __REPO_DIR__ && git fetch origin && git checkout __BRANCH__ && git pull --ff-only origin __BRANCH__; elif [ -e __REPO_DIR__ ]; then rm -rf __REPO_DIR__ && git clone --branch __BRANCH__ __REPO_URL__ __REPO_DIR__; else git clone --branch __BRANCH__ __REPO_URL__ __REPO_DIR__; fi
 '@
 $repoSync = $repoSyncTemplate.Replace("__REPO_DIR__", $RepoDir).Replace("__BRANCH__", $Branch).Replace("__REPO_URL__", $RepoUrl)
 Invoke-Remote $repoSync
