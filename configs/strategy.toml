@@ -71,6 +71,17 @@ max_chunks = 4
 spacing_ms = 12
 stop_on_reject = true
 
+[predator_c.exit]
+enabled = true
+t3_take_ratio = 0.60
+t15_min_unrealized_usdc = 0.0
+t60_true_prob_floor = 0.70
+t300_force_exit_ms = 300000
+t300_hold_prob_threshold = 0.95
+t300_hold_time_to_expiry_ms = 300000
+max_single_trade_loss_usdc = 1.0
+flatten_on_trigger = true
+
 [predator_c.router]
 max_locked_pct_5m = 0.30
 max_locked_pct_15m = 0.40
@@ -108,10 +119,17 @@ fail_cost_bps = 1.0
 
 [exit]
 enabled = true
-time_stop_ms = 2000
+time_stop_ms = 300000
 edge_decay_bps = -2.0
 adverse_move_bps = -8.0
 flatten_on_trigger = true
+t3_take_ratio = 0.60
+t15_min_unrealized_usdc = 0.0
+t60_true_prob_floor = 0.70
+t300_force_exit_ms = 300000
+t300_hold_prob_threshold = 0.95
+t300_hold_time_to_expiry_ms = 300000
+max_single_trade_loss_usdc = 1.0
 
 # ===== Risk Controls (P2) =====
 

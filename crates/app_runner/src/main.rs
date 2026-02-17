@@ -25,6 +25,7 @@ use core_types::{
 };
 use dashmap::DashMap;
 use direction_detector::{DirectionConfig, DirectionDetector};
+use exit_manager::{ExitManager, ExitManagerConfig, ExitReason, MarketEvalInput, PositionLifecycle};
 use execution_clob::{ClobExecution, ExecutionMode};
 use fair_value::{BasisMrConfig, BasisMrFairValue};
 use feed_polymarket::PolymarketFeed;
@@ -178,6 +179,7 @@ struct EngineShared {
     predator_taker_sniper: Arc<RwLock<TakerSniper>>,
     predator_router: Arc<RwLock<TimeframeRouter>>,
     predator_compounder: Arc<RwLock<SettlementCompounder>>,
+    predator_exit_manager: Arc<RwLock<ExitManager>>,
 }
 
 #[derive(Serialize)]
@@ -232,6 +234,13 @@ struct ExitReloadReq {
     edge_decay_bps: Option<f64>,
     adverse_move_bps: Option<f64>,
     flatten_on_trigger: Option<bool>,
+    t3_take_ratio: Option<f64>,
+    t15_min_unrealized_usdc: Option<f64>,
+    t60_true_prob_floor: Option<f64>,
+    t300_force_exit_ms: Option<u64>,
+    t300_hold_prob_threshold: Option<f64>,
+    t300_hold_time_to_expiry_ms: Option<u64>,
+    max_single_trade_loss_usdc: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -385,17 +394,53 @@ struct ExitConfig {
     edge_decay_bps: f64,
     adverse_move_bps: f64,
     flatten_on_trigger: bool,
+    t3_take_ratio: f64,
+    t15_min_unrealized_usdc: f64,
+    t60_true_prob_floor: f64,
+    t300_force_exit_ms: u64,
+    t300_hold_prob_threshold: f64,
+    t300_hold_time_to_expiry_ms: u64,
+    max_single_trade_loss_usdc: f64,
 }
 
 impl Default for ExitConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            time_stop_ms: 2_000,
+            time_stop_ms: 300_000,
             edge_decay_bps: -2.0,
             adverse_move_bps: -8.0,
             flatten_on_trigger: true,
+            t3_take_ratio: 0.60,
+            t15_min_unrealized_usdc: 0.0,
+            t60_true_prob_floor: 0.70,
+            t300_force_exit_ms: 300_000,
+            t300_hold_prob_threshold: 0.95,
+            t300_hold_time_to_expiry_ms: 300_000,
+            max_single_trade_loss_usdc: 1.0,
         }
+    }
+}
+
+fn to_exit_manager_config(cfg: &ExitConfig) -> ExitManagerConfig {
+    ExitManagerConfig {
+        t3_take_ratio: cfg.t3_take_ratio.clamp(0.0, 5.0),
+        t15_min_unrealized_usdc: cfg.t15_min_unrealized_usdc,
+        t60_true_prob_floor: cfg.t60_true_prob_floor.clamp(0.0, 1.0),
+        t300_force_exit_ms: cfg.t300_force_exit_ms.max(1_000),
+        t300_hold_prob_threshold: cfg.t300_hold_prob_threshold.clamp(0.0, 1.0),
+        t300_hold_time_to_expiry_ms: cfg.t300_hold_time_to_expiry_ms.max(1_000),
+        max_single_trade_loss_usdc: cfg.max_single_trade_loss_usdc.max(0.0),
+    }
+}
+
+fn exit_reason_label(reason: ExitReason) -> &'static str {
+    match reason {
+        ExitReason::StopLoss => "stop_loss",
+        ExitReason::TakeProfit3s => "t_plus_3s",
+        ExitReason::TakeProfit15s => "t_plus_15s",
+        ExitReason::ProbGuard60s => "t_plus_60s_prob_guard",
+        ExitReason::ForceClose300s => "t_plus_300s_force",
     }
 }
 
@@ -1947,6 +1992,7 @@ async fn async_main() -> Result<()> {
     let fusion_cfg = Arc::new(RwLock::new(load_fusion_config()));
     let edge_model_cfg = Arc::new(RwLock::new(load_edge_model_config()));
     let exit_cfg = Arc::new(RwLock::new(load_exit_config()));
+    let exit_cfg0 = exit_cfg.read().await.clone();
     let fair_value_cfg = Arc::new(StdRwLock::new(load_fair_value_config()));
     let toxicity_cfg = Arc::new(RwLock::new(Arc::new(ToxicityConfig::default())));
     let risk_limits = Arc::new(StdRwLock::new(load_risk_limits_config()));
@@ -1990,6 +2036,9 @@ async fn async_main() -> Result<()> {
     let predator_compounder = Arc::new(RwLock::new(SettlementCompounder::new(
         predator_cfg0.compounder.clone(),
     )));
+    let predator_exit_manager = Arc::new(RwLock::new(ExitManager::new(to_exit_manager_config(
+        &exit_cfg0,
+    ))));
     let shared = Arc::new(EngineShared {
         latest_books: Arc::new(RwLock::new(HashMap::new())),
         latest_signals: Arc::new(DashMap::new()),
@@ -2026,6 +2075,7 @@ async fn async_main() -> Result<()> {
         predator_taker_sniper,
         predator_router,
         predator_compounder,
+        predator_exit_manager,
     });
     let strategy_input_queue_cap = std::env::var("POLYEDGE_STRATEGY_INPUT_QUEUE_CAP")
         .ok()
@@ -4133,6 +4183,29 @@ async fn predator_execute_opportunity(
             intent.size = accepted_size;
             shared.shadow_stats.mark_executed();
             out.executed = out.executed.saturating_add(1);
+            let accepted_notional_usdc = (intent.price.max(0.0) * intent.size.max(0.0)).max(0.0);
+            let entry_edge_usdc = (opp.edge_net_bps / 10_000.0) * accepted_notional_usdc;
+            {
+                let mut exit_mgr = shared.predator_exit_manager.write().await;
+                exit_mgr.register(PositionLifecycle {
+                    position_id: ack_v2.order_id.clone(),
+                    market_id: intent.market_id.clone(),
+                    symbol: opp.symbol.clone(),
+                    opened_at_ms: now_ms,
+                    entry_edge_usdc,
+                    entry_notional_usdc: accepted_notional_usdc,
+                });
+            }
+            spawn_predator_exit_lifecycle(
+                shared.clone(),
+                bus.clone(),
+                ack_v2.order_id.clone(),
+                intent.market_id.clone(),
+                opp.symbol.clone(),
+                intent.side.clone(),
+                intent.price,
+                intent.size,
+            );
 
             let ack_only_ms = if ack_v2.exchange_latency_ms > 0.0 {
                 ack_v2.exchange_latency_ms
@@ -4221,6 +4294,133 @@ async fn predator_execute_opportunity(
     }
 
     out
+}
+
+fn spawn_predator_exit_lifecycle(
+    shared: Arc<EngineShared>,
+    bus: RingBus<EngineEvent>,
+    position_id: String,
+    market_id: String,
+    symbol: String,
+    side: OrderSide,
+    entry_price: f64,
+    size: f64,
+) {
+    spawn_detached("predator_exit_lifecycle", false, async move {
+        let checkpoints = [3_000_u64, 15_000_u64, 60_000_u64, 300_000_u64];
+        let mut elapsed_ms = 0_u64;
+        for checkpoint in checkpoints {
+            let wait_ms = checkpoint.saturating_sub(elapsed_ms);
+            elapsed_ms = checkpoint;
+            if wait_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+            }
+
+            let exit_cfg = shared.exit_cfg.read().await.clone();
+            if !exit_cfg.enabled {
+                continue;
+            }
+
+            let now_ms = Utc::now().timestamp_millis();
+            let true_prob = estimate_true_prob_for_side(&shared, &market_id, &side).await;
+            let unrealized_pnl_usdc =
+                estimate_unrealized_pnl_usdc(&shared, &market_id, &side, entry_price, size)
+                    .await
+                    .unwrap_or(0.0);
+            let time_to_expiry_ms = estimate_time_to_expiry_ms(&shared, &market_id, now_ms).await;
+
+            let action = {
+                let mut manager = shared.predator_exit_manager.write().await;
+                manager.evaluate_market(
+                    &market_id,
+                    MarketEvalInput {
+                        now_ms,
+                        unrealized_pnl_usdc,
+                        true_prob,
+                        time_to_expiry_ms,
+                    },
+                )
+            };
+
+            if let Some(action) = action {
+                let reason = exit_reason_label(action.reason);
+                shared.shadow_stats.record_exit_reason(reason).await;
+                if exit_cfg.flatten_on_trigger {
+                    let _ = bus.publish(EngineEvent::Control(ControlCommand::Flatten));
+                }
+                tracing::info!(
+                    position_id = %position_id,
+                    market_id = %market_id,
+                    symbol = %symbol,
+                    reason,
+                    "predator exit lifecycle triggered"
+                );
+                break;
+            }
+        }
+
+        // Ensure stale lifecycle entries don't leak forever if no exit action is triggered.
+        if elapsed_ms >= 300_000 {
+            let _ = shared.predator_exit_manager.write().await.close(&position_id);
+        }
+    });
+}
+
+async fn estimate_true_prob_for_side(
+    shared: &Arc<EngineShared>,
+    market_id: &str,
+    side: &OrderSide,
+) -> f64 {
+    let p_yes = shared
+        .latest_signals
+        .get(market_id)
+        .map(|sig| sig.value().signal.fair_yes.clamp(0.0, 1.0))
+        .unwrap_or(0.5);
+    match side {
+        OrderSide::BuyYes | OrderSide::SellNo => p_yes,
+        OrderSide::BuyNo | OrderSide::SellYes => 1.0 - p_yes,
+    }
+}
+
+async fn estimate_time_to_expiry_ms(
+    shared: &Arc<EngineShared>,
+    market_id: &str,
+    now_ms: i64,
+) -> i64 {
+    let timeframe = shared
+        .market_to_timeframe
+        .read()
+        .await
+        .get(market_id)
+        .cloned();
+    let frame_ms = match timeframe {
+        Some(TimeframeClass::Tf5m) => 5 * 60 * 1_000,
+        Some(TimeframeClass::Tf15m) => 15 * 60 * 1_000,
+        Some(TimeframeClass::Tf1h) => 60 * 60 * 1_000,
+        Some(TimeframeClass::Tf1d) => 24 * 60 * 60 * 1_000,
+        None => return i64::MAX,
+    } as i64;
+    let rem = frame_ms - now_ms.rem_euclid(frame_ms);
+    rem.max(0)
+}
+
+async fn estimate_unrealized_pnl_usdc(
+    shared: &Arc<EngineShared>,
+    market_id: &str,
+    side: &OrderSide,
+    entry_price: f64,
+    size: f64,
+) -> Option<f64> {
+    let book = shared.latest_books.read().await.get(market_id).cloned()?;
+    let mark = match side {
+        OrderSide::BuyYes | OrderSide::SellYes => book.bid_yes.max(0.0),
+        OrderSide::BuyNo | OrderSide::SellNo => book.bid_no.max(0.0),
+    };
+    let dir = match side {
+        OrderSide::BuyYes | OrderSide::BuyNo => 1.0,
+        OrderSide::SellYes | OrderSide::SellNo => -1.0,
+    };
+    Some((mark - entry_price) * size * dir)
 }
 
 fn spawn_shadow_outcome_task(
@@ -4345,18 +4545,31 @@ fn spawn_shadow_outcome_task(
         if shot.delay_ms == 10 {
             let exit_cfg = shared.exit_cfg.read().await.clone();
             if exit_cfg.enabled {
-                let elapsed_ms = ((now_ns() - shot.t0_ns).max(0) as f64) / 1_000_000.0;
-                let net_10s = outcome.net_markout_10s_bps.unwrap_or(0.0);
-                let exit_reason = if net_10s <= exit_cfg.adverse_move_bps {
-                    Some("adverse_move")
-                } else if net_10s <= exit_cfg.edge_decay_bps {
-                    Some("edge_decay")
-                } else if elapsed_ms > exit_cfg.time_stop_ms as f64 {
-                    Some("time_stop")
-                } else {
-                    None
+                let true_prob = shared
+                    .latest_signals
+                    .get(&shot.market_id)
+                    .map(|sig| {
+                        let p_yes = sig.value().signal.fair_yes.clamp(0.0, 1.0);
+                        match shot.side {
+                            OrderSide::BuyYes | OrderSide::SellNo => p_yes,
+                            OrderSide::BuyNo | OrderSide::SellYes => 1.0 - p_yes,
+                        }
+                    })
+                    .unwrap_or(0.5);
+                let action = {
+                    let mut manager = shared.predator_exit_manager.write().await;
+                    manager.evaluate_market(
+                        &shot.market_id,
+                        MarketEvalInput {
+                            now_ms: Utc::now().timestamp_millis(),
+                            unrealized_pnl_usdc: outcome.net_markout_10s_usdc.unwrap_or(0.0),
+                            true_prob,
+                            time_to_expiry_ms: i64::MAX,
+                        },
+                    )
                 };
-                if let Some(reason) = exit_reason {
+                if let Some(action) = action {
+                    let reason = exit_reason_label(action.reason);
                     shared.shadow_stats.record_exit_reason(reason).await;
                     if exit_cfg.flatten_on_trigger {
                         let _ = bus.publish(EngineEvent::Control(ControlCommand::Flatten));
@@ -6230,7 +6443,7 @@ fn load_exit_config() -> ExitConfig {
             continue;
         }
         if line.starts_with('[') && line.ends_with(']') {
-            in_section = line == "[exit]";
+            in_section = line == "[exit]" || line == "[predator_c.exit]";
             continue;
         }
         if !in_section {
@@ -6249,7 +6462,7 @@ fn load_exit_config() -> ExitConfig {
             }
             "time_stop_ms" => {
                 if let Ok(parsed) = val.parse::<u64>() {
-                    cfg.time_stop_ms = parsed.clamp(50, 60_000);
+                    cfg.time_stop_ms = parsed.clamp(50, 600_000);
                 }
             }
             "edge_decay_bps" => {
@@ -6265,6 +6478,41 @@ fn load_exit_config() -> ExitConfig {
             "flatten_on_trigger" => {
                 if let Ok(parsed) = val.parse::<bool>() {
                     cfg.flatten_on_trigger = parsed;
+                }
+            }
+            "t3_take_ratio" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.t3_take_ratio = parsed.clamp(0.0, 5.0);
+                }
+            }
+            "t15_min_unrealized_usdc" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.t15_min_unrealized_usdc = parsed;
+                }
+            }
+            "t60_true_prob_floor" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.t60_true_prob_floor = parsed.clamp(0.0, 1.0);
+                }
+            }
+            "t300_force_exit_ms" => {
+                if let Ok(parsed) = val.parse::<u64>() {
+                    cfg.t300_force_exit_ms = parsed.clamp(1_000, 1_800_000);
+                }
+            }
+            "t300_hold_prob_threshold" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.t300_hold_prob_threshold = parsed.clamp(0.0, 1.0);
+                }
+            }
+            "t300_hold_time_to_expiry_ms" => {
+                if let Ok(parsed) = val.parse::<u64>() {
+                    cfg.t300_hold_time_to_expiry_ms = parsed.clamp(1_000, 1_800_000);
+                }
+            }
+            "max_single_trade_loss_usdc" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.max_single_trade_loss_usdc = parsed.max(0.0);
                 }
             }
             _ => {}

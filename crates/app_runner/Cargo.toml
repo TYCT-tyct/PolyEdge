@@ -11,6 +11,7 @@ chrono.workspace = true
 dashmap.workspace = true
 core_types = { path = "../core_types" }
 direction_detector = { path = "../direction_detector" }
+exit_manager = { path = "../exit_manager" }
 execution_clob = { path = "../execution_clob" }
 fair_value = { path = "../fair_value" }
 feed_polymarket = { path = "../feed_polymarket" }

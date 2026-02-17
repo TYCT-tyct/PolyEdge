@@ -49,6 +49,7 @@ dependencies = [
  "dashmap",
  "direction_detector",
  "execution_clob",
+ "exit_manager",
  "fair_value",
  "feed_polymarket",
  "feed_reference",
@@ -462,6 +463,13 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "exit_manager"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

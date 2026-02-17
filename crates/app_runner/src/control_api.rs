@@ -257,6 +257,34 @@ async fn reload_exit(
     if let Some(v) = req.flatten_on_trigger {
         cfg.flatten_on_trigger = v;
     }
+    if let Some(v) = req.t3_take_ratio {
+        cfg.t3_take_ratio = v.clamp(0.0, 5.0);
+    }
+    if let Some(v) = req.t15_min_unrealized_usdc {
+        cfg.t15_min_unrealized_usdc = v;
+    }
+    if let Some(v) = req.t60_true_prob_floor {
+        cfg.t60_true_prob_floor = v.clamp(0.0, 1.0);
+    }
+    if let Some(v) = req.t300_force_exit_ms {
+        cfg.t300_force_exit_ms = v.clamp(1_000, 1_800_000);
+    }
+    if let Some(v) = req.t300_hold_prob_threshold {
+        cfg.t300_hold_prob_threshold = v.clamp(0.0, 1.0);
+    }
+    if let Some(v) = req.t300_hold_time_to_expiry_ms {
+        cfg.t300_hold_time_to_expiry_ms = v.clamp(1_000, 1_800_000);
+    }
+    if let Some(v) = req.max_single_trade_loss_usdc {
+        cfg.max_single_trade_loss_usdc = v.max(0.0);
+    }
+    let manager_cfg = to_exit_manager_config(&cfg);
+    state
+        .shared
+        .predator_exit_manager
+        .write()
+        .await
+        .set_cfg(manager_cfg);
     let snapshot = cfg.clone();
     append_jsonl(
         &dataset_path("reports", "exit_reload.jsonl"),
