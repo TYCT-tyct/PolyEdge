@@ -161,6 +161,8 @@ struct EngineShared {
     http: Client,
     clob_endpoint: String,
     strategy_cfg: Arc<RwLock<Arc<MakerConfig>>>,
+    settlement_cfg: Arc<RwLock<SettlementConfig>>,
+    settlement_prices: Arc<RwLock<HashMap<String, f64>>>,
     fusion_cfg: Arc<RwLock<FusionConfig>>,
     edge_model_cfg: Arc<RwLock<EdgeModelConfig>>,
     exit_cfg: Arc<RwLock<ExitConfig>>,
@@ -422,6 +424,32 @@ impl Default for ExitConfig {
             t300_hold_prob_threshold: 0.95,
             t300_hold_time_to_expiry_ms: 300_000,
             max_single_trade_loss_usdc: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SettlementConfig {
+    enabled: bool,
+    endpoint: String,
+    poll_interval_ms: u64,
+    timeout_ms: u64,
+    symbols: Vec<String>,
+}
+
+impl Default for SettlementConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: String::new(),
+            poll_interval_ms: 1_000,
+            timeout_ms: 800,
+            symbols: vec![
+                "BTCUSDT".to_string(),
+                "ETHUSDT".to_string(),
+                "SOLUSDT".to_string(),
+                "XRPUSDT".to_string(),
+            ],
         }
     }
 }
@@ -1993,6 +2021,7 @@ async fn async_main() -> Result<()> {
     }
     let shadow = Arc::new(ShadowExecutor::default());
     let strategy_cfg = Arc::new(RwLock::new(Arc::new(load_strategy_config())));
+    let settlement_cfg = Arc::new(RwLock::new(load_settlement_config()));
     let fusion_cfg = Arc::new(RwLock::new(load_fusion_config()));
     let edge_model_cfg = Arc::new(RwLock::new(load_edge_model_config()));
     let exit_cfg = Arc::new(RwLock::new(load_exit_config()));
@@ -2061,6 +2090,8 @@ async fn async_main() -> Result<()> {
         http: Client::new(),
         clob_endpoint: execution_cfg.clob_endpoint.clone(),
         strategy_cfg,
+        settlement_cfg: settlement_cfg.clone(),
+        settlement_prices: Arc::new(RwLock::new(HashMap::new())),
         fusion_cfg: fusion_cfg.clone(),
         edge_model_cfg: edge_model_cfg.clone(),
         exit_cfg: exit_cfg.clone(),
@@ -2119,6 +2150,7 @@ async fn async_main() -> Result<()> {
         shared.clone(),
         strategy_ingress_tx.clone(),
     );
+    spawn_settlement_feed(shared.clone());
     spawn_market_feed(
         bus.clone(),
         shared.shadow_stats.clone(),
@@ -2405,6 +2437,93 @@ fn spawn_reference_feed(
             }
         }
     });
+}
+
+fn spawn_settlement_feed(shared: Arc<EngineShared>) {
+    spawn_detached("settlement_feed_orchestrator", true, async move {
+        loop {
+            let cfg = shared.settlement_cfg.read().await.clone();
+            if !cfg.enabled || cfg.endpoint.trim().is_empty() {
+                tokio::time::sleep(Duration::from_millis(1_000)).await;
+                continue;
+            }
+
+            let req = shared
+                .http
+                .get(cfg.endpoint.clone())
+                .timeout(Duration::from_millis(cfg.timeout_ms.max(100)));
+            match req.send().await {
+                Ok(resp) => match resp.json::<serde_json::Value>().await {
+                    Ok(value) => {
+                        let mut updates = HashMap::<String, f64>::new();
+                        let maybe_object = value.as_object();
+                        if let Some(obj) = maybe_object {
+                            for symbol in &cfg.symbols {
+                                for key in settlement_symbol_keys(symbol) {
+                                    if let Some(price) = obj.get(&key).and_then(value_to_f64) {
+                                        if price.is_finite() && price > 0.0 {
+                                            updates.insert(symbol.clone(), price);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !updates.is_empty() {
+                            let mut map = shared.settlement_prices.write().await;
+                            for (k, v) in updates {
+                                map.insert(k, v);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(?err, "settlement feed json decode failed");
+                        metrics::counter!("settlement.feed.decode_error").increment(1);
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!(?err, "settlement feed poll failed");
+                    metrics::counter!("settlement.feed.poll_error").increment(1);
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(cfg.poll_interval_ms.max(250))).await;
+        }
+    });
+}
+
+fn settlement_symbol_keys(symbol: &str) -> Vec<String> {
+    let mut keys = Vec::with_capacity(4);
+    let normalized = symbol.trim().to_ascii_uppercase();
+    keys.push(normalized.clone());
+    if let Some(base) = normalized.strip_suffix("USDT") {
+        keys.push(base.to_string());
+        keys.push(format!("{base}USD"));
+    }
+    keys.push(normalized.replace('_', ""));
+    keys
+}
+
+async fn settlement_prob_yes_for_symbol(
+    shared: &Arc<EngineShared>,
+    symbol: &str,
+    p_fast_yes: f64,
+) -> Option<f64> {
+    let settle_price = shared.settlement_prices.read().await.get(symbol).copied()?;
+    if settle_price <= 0.0 {
+        return None;
+    }
+    let fast_price = shared.latest_fast_ticks.get(symbol).map(|t| t.price)?;
+    if fast_price <= 0.0 {
+        return None;
+    }
+
+    // When fast and settlement feeds diverge, pull probability toward 0.5.
+    // This keeps execution conservative until settlement alignment recovers.
+    let gap = ((fast_price - settle_price) / settle_price).abs().clamp(0.0, 0.03);
+    let settle_blend = (gap * 20.0).clamp(0.0, 0.25);
+    let p = (p_fast_yes.clamp(0.0, 1.0) * (1.0 - settle_blend)) + (0.5 * settle_blend);
+    Some(p.clamp(0.0, 1.0))
 }
 
 fn spawn_market_feed(
@@ -3857,9 +3976,23 @@ async fn run_predator_c_for_symbol(
         let spread = spread_for_side(&book, &side);
         let fee_bps = get_fee_rate_bps_cached(shared, &market_id).await;
         let rebate_est_bps = get_rebate_bps_cached(shared, &market_id, fee_bps).await;
+        let book_top_lag_ms =
+            if tick_fast_recv_ts_local_ns > 0 && book.recv_ts_local_ns > 0 {
+                ((book.recv_ts_local_ns - tick_fast_recv_ts_local_ns).max(0) as f64) / 1_000_000.0
+            } else {
+                0.0
+            };
+        let settlement_prob_yes =
+            settlement_prob_yes_for_symbol(shared, symbol, sig_entry.signal.fair_yes).await;
         let probability = {
             let engine = shared.predator_probability_engine.read().await;
-            engine.estimate(&sig_entry.signal, &direction_signal, None, 0.0, now_ms)
+            engine.estimate(
+                &sig_entry.signal,
+                &direction_signal,
+                settlement_prob_yes,
+                book_top_lag_ms,
+                now_ms,
+            )
         };
         {
             let mut map = shared.predator_latest_probability.write().await;
@@ -6935,6 +7068,56 @@ fn load_execution_config() -> ExecutionConfig {
             }
             _ => {}
         }
+    }
+    cfg
+}
+
+fn load_settlement_config() -> SettlementConfig {
+    let path = Path::new("configs/settlement.toml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return SettlementConfig::default();
+    };
+    let mut cfg = SettlementConfig::default();
+    let mut in_section = false;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_section = line == "[settlement]";
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim().trim_matches('"');
+        match key {
+            "enabled" => {
+                if let Ok(parsed) = val.parse::<bool>() {
+                    cfg.enabled = parsed;
+                }
+            }
+            "endpoint" => cfg.endpoint = val.to_string(),
+            "poll_interval_ms" => {
+                if let Ok(parsed) = val.parse::<u64>() {
+                    cfg.poll_interval_ms = parsed.clamp(250, 10_000);
+                }
+            }
+            "timeout_ms" => {
+                if let Ok(parsed) = val.parse::<u64>() {
+                    cfg.timeout_ms = parsed.clamp(100, 5_000);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(symbols) = parse_toml_array_for_key(&raw, "symbols") {
+        cfg.symbols = symbols;
     }
     cfg
 }
