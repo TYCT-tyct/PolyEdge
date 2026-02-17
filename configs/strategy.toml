@@ -73,12 +73,12 @@ cooldown_ms_per_market = 800
 
 [predator_c.regime]
 enabled = true
-active_min_confidence = 0.75
-active_min_magnitude_pct = 0.10
-defend_tox_score = 0.70
-defend_on_toxic_danger = true
-defend_min_source_health = 0.45
-quiet_min_edge_multiplier = 1.25
+active_min_confidence = 0.65
+active_min_magnitude_pct = 0.04
+defend_tox_score = 0.90
+defend_on_toxic_danger = false
+defend_min_source_health = 0.15
+quiet_min_edge_multiplier = 1.05
 quiet_chunk_scale = 0.50
 
 [predator_c.cross_symbol]

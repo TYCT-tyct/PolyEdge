@@ -4325,7 +4325,7 @@ async fn run_predator_c_for_symbol(
         return PredatorExecResult::default();
     }
     if matches!(regime, Regime::Quiet)
-        && !matches!(predator_cfg.priority, PredatorCPriority::TakerOnly)
+        && matches!(predator_cfg.priority, PredatorCPriority::MakerFirst)
     {
         shared
             .shadow_stats
