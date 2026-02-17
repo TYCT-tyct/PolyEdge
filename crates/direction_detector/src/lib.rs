@@ -373,15 +373,19 @@ fn compute_confidence(
     direction: &Direction,
     min_sources_for_high_confidence: usize,
 ) -> f64 {
-    let total = latest_by_source.len();
-    if total == 0 || anchor_short <= 0.0 {
+    if latest_by_source.is_empty() || anchor_short <= 0.0 {
         return 0.0;
     }
     let mut consistent = 0usize;
+    let mut total = 0usize;
     // Use a small threshold for Neutral instead of exact equality
     // Floating-point exact equality is nearly impossible, so we use 0.1% threshold
     const NEUTRAL_THRESHOLD: f64 = 0.001;
-    for px in latest_by_source.values() {
+    for (source, px) in latest_by_source {
+        if is_chainlink_source(source) {
+            continue;
+        }
+        total += 1;
         let ret = (*px - anchor_short) / anchor_short;
         let ok = match direction {
             Direction::Up => ret > 0.0,
@@ -390,6 +394,21 @@ fn compute_confidence(
         };
         if ok {
             consistent += 1;
+        }
+    }
+    if total == 0 {
+        total = latest_by_source.len();
+        consistent = 0;
+        for px in latest_by_source.values() {
+            let ret = (*px - anchor_short) / anchor_short;
+            let ok = match direction {
+                Direction::Up => ret > 0.0,
+                Direction::Down => ret < 0.0,
+                Direction::Neutral => ret.abs() <= NEUTRAL_THRESHOLD,
+            };
+            if ok {
+                consistent += 1;
+            }
         }
     }
     let mut c = (consistent as f64 / total as f64).clamp(0.0, 1.0);

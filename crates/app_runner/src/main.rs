@@ -4252,20 +4252,50 @@ async fn run_predator_c_for_symbol(
         .latest_fast_ticks
         .get(symbol)
         .map(|tick| tick.source.clone());
-    let primary_source_health = if let Some(source) = primary_fast_source.as_ref() {
+    let primary_source_health = {
         let map = shared.source_health_latest.read().await;
-        map.get(source).cloned()
-    } else {
-        None
+        let from_fast = primary_fast_source
+            .as_ref()
+            .and_then(|source| map.get(source).cloned());
+        let best_binance = map
+            .values()
+            .filter(|h| h.source.to_ascii_lowercase().contains("binance"))
+            .max_by(|a, b| {
+                a.score
+                    .partial_cmp(&b.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .cloned();
+        match (from_fast, best_binance) {
+            (Some(a), Some(b)) => Some(if b.score > a.score { b } else { a }),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
     };
 
     let direction_signal = if let Some(sig) = direction_override {
         sig
     } else {
-        let direction_signal = {
+        let mut direction_signal = {
             let det = shared.predator_direction_detector.read().await;
             det.evaluate(symbol, now_ms)
         };
+        if direction_signal.is_none() {
+            let fallback_signal = shared
+                .predator_latest_direction
+                .read()
+                .await
+                .get(symbol)
+                .cloned();
+            if let Some(cached) = fallback_signal {
+                let cached_ms = cached.ts_ns.div_euclid(1_000_000);
+                let age_ms = now_ms.saturating_sub(cached_ms);
+                if age_ms <= 2_500 {
+                    direction_signal = Some(cached);
+                }
+            }
+        }
         let Some(direction_signal) = direction_signal else {
             shared
                 .shadow_stats
