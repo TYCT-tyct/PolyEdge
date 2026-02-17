@@ -317,37 +317,48 @@ def main() -> int:
                 "--json-out",
                 str(e2e_json),
             ]
-            run_cmd(cmd)
-            mode_result["e2e_json"] = str(e2e_json)
-            mode_result["summary_e2e"] = e2e_summary(read_json(e2e_json))
+            try:
+                run_cmd(cmd)
+                mode_result["e2e_json"] = str(e2e_json)
+                mode_result["summary_e2e"] = e2e_summary(read_json(e2e_json))
+            except subprocess.CalledProcessError as err:
+                mode_result["e2e_error"] = {
+                    "returncode": int(err.returncode),
+                    "command": cmd,
+                }
 
         if not args.skip_sweep:
-            run_cmd(
-                [
-                    sys.executable,
-                    "scripts/full_latency_sweep.py",
-                    "--profile",
-                    args.profile,
-                    "--base-url",
-                    args.base_url,
-                    "--out-root",
-                    args.out_root,
-                    "--run-id",
-                    f"{args.run_id}-{mode}",
-                    "--fusion-mode",
-                    mode,
-                    "--reset-shadow",
-                    "--warmup-sec",
-                    str(max(1, args.warmup_sec)),
-                    "--dedupe-window-ms",
-                    "30",
-                ]
-            )
-            sweep_files = sorted(
-                str(p)
-                for p in (Path(args.out_root) / utc_day() / "runs" / f"{args.run_id}-{mode}").glob("full_latency_sweep_*.json")
-            )
-            mode_result["sweep_jsons"] = sweep_files
+            sweep_cmd = [
+                sys.executable,
+                "scripts/full_latency_sweep.py",
+                "--profile",
+                args.profile,
+                "--base-url",
+                args.base_url,
+                "--out-root",
+                args.out_root,
+                "--run-id",
+                f"{args.run_id}-{mode}",
+                "--fusion-mode",
+                mode,
+                "--reset-shadow",
+                "--warmup-sec",
+                str(max(1, args.warmup_sec)),
+                "--dedupe-window-ms",
+                "30",
+            ]
+            try:
+                run_cmd(sweep_cmd)
+                sweep_files = sorted(
+                    str(p)
+                    for p in (Path(args.out_root) / utc_day() / "runs" / f"{args.run_id}-{mode}").glob("full_latency_sweep_*.json")
+                )
+                mode_result["sweep_jsons"] = sweep_files
+            except subprocess.CalledProcessError as err:
+                mode_result["sweep_error"] = {
+                    "returncode": int(err.returncode),
+                    "command": sweep_cmd,
+                }
 
         # Re-baseline live summary after sweep to prevent cross-window contamination.
         post_json(session, args.base_url, "/control/reload_fusion", mode_payload(mode))
