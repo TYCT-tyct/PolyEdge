@@ -19,9 +19,10 @@ use chrono::Utc;
 use core_types::{
     new_id, BookTop, CapitalUpdate, ControlCommand, Direction, DirectionSignal, EdgeAttribution,
     EngineEvent, EnginePnLBreakdown, ExecutionStyle, ExecutionVenue, FairValueModel, InventoryState,
-    MarketFeed, MarketHealth, OrderAck, OrderIntentV2, OrderSide, OrderTimeInForce, QuoteEval,
-    QuoteIntent, QuotePolicy, RefPriceFeed, RefTick, RiskContext, RiskManager, ShadowOutcome,
-    ShadowShot, Signal, TimeframeClass, TimeframeOpp, ToxicDecision, ToxicFeatures, ToxicRegime,
+    MarketFeed, MarketHealth, OrderAck, OrderIntentV2, OrderSide, OrderTimeInForce,
+    ProbabilityEstimate, QuoteEval, QuoteIntent, QuotePolicy, RefPriceFeed, RefTick, RiskContext,
+    RiskManager, ShadowOutcome, ShadowShot, Signal, TimeframeClass, TimeframeOpp, ToxicDecision,
+    ToxicFeatures, ToxicRegime,
 };
 use dashmap::DashMap;
 use direction_detector::{DirectionConfig, DirectionDetector};
@@ -36,6 +37,7 @@ use market_discovery::{DiscoveryConfig, MarketDiscovery};
 use observability::{init_metrics, init_tracing};
 use paper_executor::ShadowExecutor;
 use portfolio::PortfolioBook;
+use probability_engine::ProbabilityEngine;
 use reqwest::Client;
 use risk_engine::{DefaultRiskManager, RiskLimits};
 use serde::{Deserialize, Serialize};
@@ -176,6 +178,8 @@ struct EngineShared {
     predator_cfg: Arc<RwLock<PredatorCConfig>>,
     predator_direction_detector: Arc<RwLock<DirectionDetector>>,
     predator_latest_direction: Arc<RwLock<HashMap<String, DirectionSignal>>>,
+    predator_latest_probability: Arc<RwLock<HashMap<String, ProbabilityEstimate>>>,
+    predator_probability_engine: Arc<RwLock<ProbabilityEngine>>,
     predator_taker_sniper: Arc<RwLock<TakerSniper>>,
     predator_router: Arc<RwLock<TimeframeRouter>>,
     predator_compounder: Arc<RwLock<SettlementCompounder>>,
@@ -2029,6 +2033,8 @@ async fn async_main() -> Result<()> {
         predator_cfg0.direction_detector.clone(),
     )));
     let predator_latest_direction = Arc::new(RwLock::new(HashMap::new()));
+    let predator_latest_probability = Arc::new(RwLock::new(HashMap::new()));
+    let predator_probability_engine = Arc::new(RwLock::new(ProbabilityEngine::default()));
     let predator_taker_sniper = Arc::new(RwLock::new(TakerSniper::new(
         predator_cfg0.taker_sniper.clone(),
     )));
@@ -2072,6 +2078,8 @@ async fn async_main() -> Result<()> {
         predator_cfg: predator_cfg.clone(),
         predator_direction_detector,
         predator_latest_direction,
+        predator_latest_probability,
+        predator_probability_engine,
         predator_taker_sniper,
         predator_router,
         predator_compounder,
@@ -3849,8 +3857,15 @@ async fn run_predator_c_for_symbol(
         let spread = spread_for_side(&book, &side);
         let fee_bps = get_fee_rate_bps_cached(shared, &market_id).await;
         let rebate_est_bps = get_rebate_bps_cached(shared, &market_id, fee_bps).await;
-        let edge_gross_bps =
-            edge_gross_bps_for_side(sig_entry.signal.fair_yes, &side, entry_price);
+        let probability = {
+            let engine = shared.predator_probability_engine.read().await;
+            engine.estimate(&sig_entry.signal, &direction_signal, None, 0.0, now_ms)
+        };
+        {
+            let mut map = shared.predator_latest_probability.write().await;
+            map.insert(market_id.clone(), probability.clone());
+        }
+        let edge_gross_bps = edge_gross_bps_for_side(probability.p_settle, &side, entry_price);
         let edge_net_bps = edge_gross_bps - fee_bps + rebate_est_bps - edge_model_cfg.fail_cost_bps;
         let base_size = if predator_cfg.compounder.enabled {
             (quote_notional_usdc / entry_price.max(1e-6)).max(0.01)

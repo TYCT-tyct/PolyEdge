@@ -25,6 +25,7 @@ metrics-exporter-prometheus.workspace = true
 observability = { path = "../observability" }
 paper_executor = { path = "../paper_executor" }
 portfolio = { path = "../portfolio" }
+probability_engine = { path = "../probability_engine" }
 reqwest.workspace = true
 risk_engine = { path = "../risk_engine" }
 rustls.workspace = true

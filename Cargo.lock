@@ -64,6 +64,7 @@ dependencies = [
  "paper_executor",
  "poly_wire",
  "portfolio",
+ "probability_engine",
  "reqwest",
  "risk_engine",
  "rustls",
@@ -1504,6 +1505,14 @@ checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
  "syn",
+]
+
+[[package]]
+name = "probability_engine"
+version = "0.1.0"
+dependencies = [
+ "core_types",
+ "serde",
 ]
 
 [[package]]

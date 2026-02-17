@@ -1,0 +1,10 @@
+[package]
+name = "probability_engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+core_types = { path = "../core_types" }
+serde.workspace = true
+

@@ -162,6 +162,16 @@ pub struct CapitalUpdate {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProbabilityEstimate {
+    pub p_fast: f64,
+    pub p_settle: f64,
+    pub confidence: f64,
+    #[serde(default)]
+    pub settlement_source_degraded: bool,
+    pub ts_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TimeframeOpp {
     pub timeframe: TimeframeClass,
     pub market_id: String,

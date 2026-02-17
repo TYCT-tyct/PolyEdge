@@ -12,6 +12,7 @@ members = [
   "crates/direction_detector",
   "crates/taker_sniper",
   "crates/exit_manager",
+  "crates/probability_engine",
   "crates/timeframe_router",
   "crates/settlement_compounder",
   "crates/risk_engine",
