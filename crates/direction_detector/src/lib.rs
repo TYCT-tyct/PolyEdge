@@ -39,8 +39,8 @@ impl Default for DirectionConfig {
     fn default() -> Self {
         Self {
             window_max_sec: 120,
-            threshold_5m_pct: 0.05,
-            threshold_15m_pct: 0.10,
+            threshold_5m_pct: 0.03,
+            threshold_15m_pct: 0.05,
             threshold_1h_pct: 0.20,
             threshold_1d_pct: 0.50,
             lookback_short_sec: 15,
@@ -48,7 +48,7 @@ impl Default for DirectionConfig {
             min_sources_for_high_confidence: 2,
             min_ticks_for_signal: 5,
             min_consecutive_ticks: 2,
-            min_velocity_bps_per_sec: 5.0,
+            min_velocity_bps_per_sec: 3.0,
             min_acceleration: 0.0,
             momentum_spike_multiplier: 1.8,
             enable_source_vote_gate: true,
