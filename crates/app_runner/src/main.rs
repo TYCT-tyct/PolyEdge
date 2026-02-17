@@ -3184,15 +3184,12 @@ fn spawn_strategy_engine(
                                     )
                                     .await;
                                 }
-                                let is_live = execution.is_live();
-                                let ack_measured = ack_v2.exchange_latency_ms > 0.0;
-                                let ack_only_ms = if ack_measured {
+                                let ack_only_ms = if ack_v2.exchange_latency_ms > 0.0 {
                                     ack_v2.exchange_latency_ms
-                                } else if is_live {
-                                    // Live should always return exchange_latency_ms, but keep a fallback.
-                                    place_start.elapsed().as_secs_f64() * 1_000.0
                                 } else {
-                                    0.0
+                                    // In paper/shadow mode we still track local place_order RTT as
+                                    // the ack proxy so latency distributions are measurable.
+                                    place_start.elapsed().as_secs_f64() * 1_000.0
                                 };
                                 let tick_to_ack_ms =
                                     tick_to_decision_ms + order_build_ms + ack_only_ms;
@@ -3770,14 +3767,11 @@ async fn predator_execute_opportunity(
             shared.shadow_stats.mark_executed();
             out.executed = out.executed.saturating_add(1);
 
-            let is_live = execution.is_live();
-            let ack_measured = ack_v2.exchange_latency_ms > 0.0;
-            let ack_only_ms = if ack_measured {
+            let ack_only_ms = if ack_v2.exchange_latency_ms > 0.0 {
                 ack_v2.exchange_latency_ms
-            } else if is_live {
-                place_start.elapsed().as_secs_f64() * 1_000.0
             } else {
-                0.0
+                // Keep latency visibility in non-live mode via local order path RTT.
+                place_start.elapsed().as_secs_f64() * 1_000.0
             };
             let tick_to_ack_ms = order_build_ms + ack_only_ms;
             let capturable_window_ms = if ack_only_ms > 0.0 {
