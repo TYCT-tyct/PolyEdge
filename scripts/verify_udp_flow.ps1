@@ -1,7 +1,7 @@
 # verify_udp_flow.ps1 - Local Validation Script
 
 Write-Host "🚀 Building binaries..."
-cargo build --release --bin feeder_tokyo
+cargo build --release -p feeder_tokyo --bin sender
 cargo build --release --bin bench_feed
 
 if ($LASTEXITCODE -ne 0) {
@@ -28,7 +28,7 @@ $sender = Start-Job -ScriptBlock {
     $env:RUST_LOG = "info"
     $env:TARGET = "127.0.0.1:6666"
     $env:SYMBOL = "BTCUSDT"
-    ./target/release/feeder_tokyo.exe
+    ./target/release/sender.exe
 }
 
 Write-Host "⏳ Running for 15 seconds..."

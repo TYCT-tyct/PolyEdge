@@ -1,9 +1,8 @@
 use anyhow::Result;
 use futures::StreamExt;
-use poly_wire::WireBookTop;
+use poly_wire::{decode_book_top24, WIRE_BOOK_TOP24_SIZE};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,10 +14,8 @@ use tracing_subscriber::FmtSubscriber;
 
 #[derive(Debug, Deserialize)]
 struct BookTicker {
-    u: u64, // updateId
-    s: String,
-    b: String,
-    a: String,
+    #[serde(default, rename = "E")]
+    event_time_ms: u64,
 }
 
 fn now_micros() -> u64 {
@@ -26,20 +23,6 @@ fn now_micros() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_micros() as u64
-}
-
-fn process_match(id: u64, udp: u64, ws: u64, writer: &mut std::io::BufWriter<File>, stats: &mut Vec<f64>) {
-    let delta = (udp as i64) - (ws as i64);
-    let ms = delta as f64 / 1000.0;
-    let faster = if ms < 0.0 { "UDP" } else { "WS" };
-
-    // Log to CSV
-    let _ = writeln!(writer, "{},{},{},{:.3},{}", id, udp, ws, ms, faster);
-
-    // Stats
-    stats.push(ms);
-
-    info!("MATCH id={} | Delta: {:.3} ms {}", id, ms, if ms < 0.0 { "⚡ UDP FASTER ⚡" } else { "🐢 UDP SLOWER" });
 }
 
 #[tokio::main]
@@ -84,7 +67,7 @@ async fn main() -> Result<()> {
     let (_, mut read) = ws_stream.split();
 
     // 3. Shared State
-    // Map<update_id, (ws_ts, udp_ts)>
+    // Map<event_ts_ms, (ws_recv_ts, udp_recv_ts)>
     let tracker: Arc<Mutex<HashMap<u64, (Option<u64>, Option<u64>)>>> = Arc::new(Mutex::new(HashMap::new()));
 
 
@@ -109,7 +92,7 @@ async fn main() -> Result<()> {
     std::thread::spawn(move || {
         let file = std::fs::File::create("latency_report.csv").unwrap();
         let mut writer = std::io::BufWriter::new(file);
-        writeln!(writer, "update_id,udp_ts,ws_ts,delta_ms,faster_source").unwrap();
+        writeln!(writer, "event_ts_ms,udp_ts,ws_ts,delta_ms,faster_source").unwrap();
 
         while let Ok(entry) = rx_log.recv() {
             writeln!(writer, "{},{},{},{:.3},{}", entry.id, entry.udp, entry.ws, entry.delta, entry.faster).unwrap();
@@ -126,25 +109,23 @@ async fn main() -> Result<()> {
 
     // 4. UDP Task
     tokio::spawn(async move {
-        let mut buf = [0u8; 1024];
-        let mut last_seq = 0;
+        let mut buf = [0u8; WIRE_BOOK_TOP24_SIZE];
+        let mut last_event_ts_ms = 0_u64;
         loop {
             match socket.recv_from(&mut buf).await {
                 Ok((amt, _)) => {
                     let recv_ts = now_micros();
-                    if let Ok(wire) = bincode::deserialize::<WireBookTop>(&buf[..amt]) {
-                         // Gap Detection
-                         if last_seq > 0 {
-                            if wire.id > last_seq + 1 {
-                               warn!("⚠️ UDP Gap: {} -> {} (Lost {})", last_seq, wire.id, wire.id - last_seq - 1);
-                            } else if wire.id < last_seq {
-                               warn!("⚠️ UDP Restart/Order: {} -> {}", last_seq, wire.id);
-                            }
-                         }
-                         last_seq = wire.id;
-
+                    if amt != WIRE_BOOK_TOP24_SIZE {
+                        continue;
+                    }
+                    if let Ok(packet) = decode_book_top24(&buf) {
+                        let event_ts_ms = packet.ts_micros / 1_000;
+                        if last_event_ts_ms > 0 && event_ts_ms < last_event_ts_ms {
+                            warn!("⚠️ UDP timestamp backjump: {} -> {}", last_event_ts_ms, event_ts_ms);
+                        }
+                        last_event_ts_ms = event_ts_ms;
                         let mut map = tracker_udp.lock().unwrap();
-                        let entry = map.entry(wire.id).or_insert((None, None));
+                        let entry = map.entry(event_ts_ms).or_insert((None, None));
                         entry.1 = Some(recv_ts);
 
                         // Check match inside lock, but do NOT do I/O
@@ -155,7 +136,7 @@ async fn main() -> Result<()> {
                         };
 
                         if let Some(ws_ts) = match_found {
-                             map.remove(&wire.id);
+                             map.remove(&event_ts_ms);
                              // Release lock immediately
                              // drop(map); // Removed as per instruction
 
@@ -164,13 +145,13 @@ async fn main() -> Result<()> {
                              let faster = if ms < 0.0 { "UDP" } else { "WS" };
 
                              tx_log_udp.send(LogEntry {
-                                 id: wire.id, udp: recv_ts, ws: ws_ts, delta: ms, faster
+                                 id: event_ts_ms, udp: recv_ts, ws: ws_ts, delta: ms, faster
                              }).unwrap();
                         }
 
                         // Prune (Optimized: Check size less often?)
                          if map.len() > 5000 {
-                            map.retain(|k, _| *k > wire.id.saturating_sub(10000));
+                            map.retain(|k, _| *k > event_ts_ms.saturating_sub(10_000));
                         }
                     }
                 }
@@ -187,8 +168,11 @@ async fn main() -> Result<()> {
             Ok(Message::Text(text)) => {
                 let recv_ts = now_micros();
                 if let Ok(ticker) = serde_json::from_str::<BookTicker>(&text) {
+                    if ticker.event_time_ms == 0 {
+                        continue;
+                    }
                     let mut map = tracker_ws.lock().unwrap();
-                    let entry = map.entry(ticker.u).or_insert((None, None));
+                    let entry = map.entry(ticker.event_time_ms).or_insert((None, None));
                     entry.0 = Some(recv_ts);
 
                     let match_found = if let Some(udp_ts) = entry.1 {
@@ -198,14 +182,14 @@ async fn main() -> Result<()> {
                     };
 
                     if let Some(udp_ts) = match_found {
-                        map.remove(&ticker.u);
+                        map.remove(&ticker.event_time_ms);
 
                         let delta = (udp_ts as i64) - (recv_ts as i64);
                         let ms = delta as f64 / 1000.0;
                         let faster = if ms < 0.0 { "UDP" } else { "WS" };
 
                         tx_log_ws.send(LogEntry {
-                             id: ticker.u, udp: udp_ts, ws: recv_ts, delta: ms, faster
+                             id: ticker.event_time_ms, udp: udp_ts, ws: recv_ts, delta: ms, faster
                         }).unwrap();
                     }
                 }
@@ -225,8 +209,16 @@ async fn main() -> Result<()> {
                 let p99 = s[(len as f64 * 0.99) as usize];
                 let udp_fast_count = s.iter().filter(|&&x| x < 0.0).count();
 
-                info!("📊 STATS (Last 10s): Count={} | P50={:.3}ms | P99={:.3}ms | UDP Faster: {}/{} ({:.1}%)",
-                    len, p50, p99, udp_fast_count, len, (udp_fast_count as f64 / len as f64) * 100.0);
+                info!(
+                    "📊 STATS (Last 10s): Count={} | P50={:.3}ms | P90={:.3}ms | P99={:.3}ms | UDP Faster: {}/{} ({:.1}%)",
+                    len,
+                    p50,
+                    p90,
+                    p99,
+                    udp_fast_count,
+                    len,
+                    (udp_fast_count as f64 / len as f64) * 100.0
+                );
 
                 s.clear();
             }

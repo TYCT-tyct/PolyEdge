@@ -44,7 +44,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "bincode",
  "chrono",
  "core_types",
  "dashmap",
@@ -526,16 +525,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "bincode",
- "chrono",
  "core_types",
- "futures",
  "poly_wire",
- "serde",
- "socket2",
  "tokio",
  "tokio-stream",
- "tracing",
 ]
 
 [[package]]
@@ -543,16 +536,11 @@ name = "feeder_tokyo"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bincode",
  "futures",
  "poly_wire",
  "rustls",
- "serde",
- "serde_json",
- "socket2",
  "tokio",
  "tokio-tungstenite",
- "url",
 ]
 
 [[package]]

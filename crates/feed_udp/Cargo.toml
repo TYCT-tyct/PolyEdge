@@ -8,11 +8,5 @@ tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-futures = { workspace = true }
-bincode = { workspace = true }
-serde = { workspace = true }
 poly_wire = { path = "../poly_wire" }
-chrono = "0.4"
 core_types = { path = "../core_types" }
-tracing = { workspace = true }
-socket2 = "0.6.2"

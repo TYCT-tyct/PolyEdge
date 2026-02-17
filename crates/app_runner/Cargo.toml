@@ -40,5 +40,4 @@ mimalloc = "0.1"
 poly_wire = { path = "../poly_wire" }
 tokio-tungstenite.workspace = true
 tracing-subscriber.workspace = true
-bincode.workspace = true
 socket2 = "0.6.2"

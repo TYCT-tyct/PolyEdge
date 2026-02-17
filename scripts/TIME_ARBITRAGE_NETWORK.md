@@ -153,11 +153,11 @@ ssh -i dongjing.pem ubuntu@57.180.89.145
 
 # 编译
 cd /opt/PolyEdge
-cargo build -p feeder_tokyo --release
+cargo build -p feeder_tokyo --release --bin sender
 
 # 启动
 export TARGET=10.0.3.123:6666
-nohup ./target/release/feeder_tokyo > feeder.log 2>&1 &
+nohup ./target/release/sender > feeder.log 2>&1 &
 ```
 
 ### 3. 启动爱尔兰引擎

@@ -75,13 +75,13 @@ export SYMBOL="btcusdt"
 export SEND_BUFFER="16777216"
 
 cd /opt/PolyEdge
-./target/release/feeder_tokyo >> /var/log/feeder_tokyo.log 2>&1
+./target/release/sender >> /var/log/feeder_tokyo.log 2>&1
 EOF
 
     chmod +x /tmp/feeder_tokyo.sh
 
     log_success "东京服务器部署完成"
-    log_info "启动命令: export TARGET=10.0.3.123:6666 && cargo run -p feeder_tokyo --release"
+    log_info "启动命令: export TARGET=10.0.3.123:6666 && cargo run -p feeder_tokyo --bin sender --release"
 }
 
 # 部署爱尔兰服务器
@@ -171,7 +171,7 @@ Type=simple
 User=$user
 WorkingDirectory=/opt/PolyEdge
 Environment=TARGET=10.0.3.123:6666
-ExecStart=/opt/PolyEdge/target/release/feeder_tokyo
+ExecStart=/opt/PolyEdge/target/release/sender
 Restart=always
 RestartSec=5
 

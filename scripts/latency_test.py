@@ -108,7 +108,9 @@ class LatencyTester:
     async def run_relay(self, ireland_ip: str = "10.0.3.123"):
         """在东京运行 relay (需要部署到东京服务器)"""
         print(f"[{datetime.now()}] ℹ️  此模式需要在东京服务器运行 relay")
-        print(f"[{datetime.now()}] ℹ️  建议部署: cargo run -p feeder_tokyo")
+        print(
+            f"[{datetime.now()}] ℹ️  建议部署: cargo run -p feeder_tokyo --bin sender --release"
+        )
         print(f"[{datetime.now()}] ℹ️  TARGET={ireland_ip}:6666")
 
     def print_stats(self, label: str):
