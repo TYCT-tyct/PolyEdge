@@ -45,6 +45,9 @@ pwsh -File .\scripts\cargo_msvc.ps1 test -q
 - `POST /control/reload_allocator`
 - `POST /control/reload_risk`
 - `POST /control/reload_toxicity`
+- `POST /control/reload_fusion`
+- `POST /control/reload_edge_model`
+- `POST /control/reload_exit`
 - `POST /control/reload_perf_profile`
 
 ## Benchmarks
@@ -63,12 +66,6 @@ python scripts/e2e_latency_test.py --profile standard # ~120s
 python scripts/e2e_latency_test.py --profile deep     # ~300s
 ```
 
-Legacy REST comparison:
-
-```bash
-python scripts/legacy_rest_probe.py --symbol BTCUSDT --iterations 80
-```
-
 Conservative parameter regression:
 
 ```bash
@@ -81,17 +78,45 @@ python scripts/param_regression.py --profile quick --base-url http://127.0.0.1:8
 python scripts/param_regression.py --profile quick --max-estimated-sec 900 --max-runtime-sec 1200
 ```
 
+Walk-forward robust auto-tuning (recommended):
+
+```bash
+python scripts/param_regression.py --profile quick --selection-mode robust --walkforward-windows 2 --top-k-consensus 3
+```
+
+This now writes `auto_tuned_thresholds.json` (consensus payloads for `reload_strategy/reload_taker/reload_allocator/reload_toxicity`) under `datasets/reports/<utc-date>/runs/<run-id>/`.
+
 Long-run orchestrator with rollback:
 
 ```bash
 python scripts/long_regression_orchestrator.py --profile quick --base-url http://127.0.0.1:8080 --run-id long1
 ```
 
-`long_regression_orchestrator.py` also supports `quick/standard/deep` plus cycle/runtime budget guards:
+`long_regression_orchestrator.py` supports `quick/standard/deep`, champion/challenger drift, automatic rollback, and objective-driven promotion:
 
 ```bash
-python scripts/long_regression_orchestrator.py --profile quick --max-estimated-sec 1800 --max-runtime-sec 1800
+python scripts/long_regression_orchestrator.py --profile quick --max-estimated-sec 1800 --max-runtime-sec 1800 --min-objective-delta 0.0005
 ```
+
+Objective is optimized online as:
+
+```text
+EV_net - penalty(latency, decision_compute, feed, block_ratio, execution_shortfall, data_valid, instability, gate_fail)
+```
+
+Continuous optimization mode (recommended for remote shadow runs):
+
+```bash
+python scripts/long_regression_orchestrator.py --profile standard --continuous --base-url http://127.0.0.1:8080 --state-file datasets/reports/champion_state.json --stop-file datasets/reports/STOP_OPTIMIZER
+```
+
+Windows one-command wrapper (opens SSH tunnel + runs continuous optimizer):
+
+```powershell
+pwsh -File .\scripts\run_continuous_optimizer.ps1 -SshHost 54.77.232.166 -KeyPath "C:\Users\Shini\Documents\PolyEdge.pem" -Profile standard
+```
+
+The orchestrator forwards walk-forward tuning flags to `param_regression.py`, prefers consensus payloads from `auto_tuned_thresholds.json`, and persists champion state for restart-safe operation.
 
 Storm / fault-tolerance test (bounded runtime, no infinite loop):
 
@@ -109,6 +134,32 @@ Remote deploy + validate (from Windows host):
 
 ```powershell
 pwsh -File .\scripts\remote_deploy_validate.ps1 -RemoteHost 13.43.23.190 -KeyPath "C:\Users\Shini\Documents\test.pem" -BenchSeconds 180 -RegressionSeconds 1200 -Symbol BTCUSDT
+```
+
+## UDP Relay Binaries
+
+Tokyo sender (`tokio-tungstenite` + 24-byte bincode UDP packet):
+
+```bash
+TARGET=10.0.3.123:6666 SYMBOL=btcusdt cargo run -p feeder_tokyo --bin sender --release
+```
+
+Ireland receiver (busy-spin UDP read loop + latency print):
+
+```bash
+BIND_ADDR=0.0.0.0:6666 PRINT_EVERY=1 cargo run -p feeder_tokyo --bin receiver --release
+```
+
+Pin receiver to dedicated core (recommended on Linux):
+
+```bash
+taskset -c 2 BIND_ADDR=0.0.0.0:6666 PRINT_EVERY=1 cargo run -p feeder_tokyo --bin receiver --release
+```
+
+Kernel tuning helper (run as root on Linux):
+
+```bash
+sudo bash scripts/hft_kernel_tune.sh
 ```
 
 ## Key Live Metrics

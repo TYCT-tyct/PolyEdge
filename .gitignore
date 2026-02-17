@@ -33,3 +33,15 @@ debug_*.json
 scripts/deploy_optimize.sh
 scripts/network_optimize.sh
 scripts/latency_probe/live_latency.py
+
+# Secrets / keys (must never be committed)
+keys/
+temp_keys/
+*.pem
+*.ppk
+*.key
+*.p12
+*.pfx
+
+# Local machine artifacts
+*.marker
