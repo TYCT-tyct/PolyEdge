@@ -6951,6 +6951,49 @@ struct FeedLatencySample {
     ref_decode_ms: f64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct PathLagCalibState {
+    floor_ms: f64,
+    initialized: bool,
+    updated_ns: i64,
+}
+
+static PATH_LAG_CALIB: OnceLock<DashMap<String, PathLagCalibState>> = OnceLock::new();
+
+fn path_lag_calib_map() -> &'static DashMap<String, PathLagCalibState> {
+    PATH_LAG_CALIB.get_or_init(DashMap::new)
+}
+
+fn calibrate_path_lag_ms(source: &str, observed_delta_ms: f64, now_ns: i64) -> f64 {
+    const FLOOR_RISE_MS_PER_SEC: f64 = 0.20;
+    const FLOOR_CLAMP_MIN_MS: f64 = -10_000.0;
+    const FLOOR_CLAMP_MAX_MS: f64 = 10_000.0;
+    let key = source.to_string();
+    let mut state = path_lag_calib_map().get(&key).map(|v| *v).unwrap_or_default();
+    if !state.initialized {
+        state.floor_ms = observed_delta_ms;
+        state.initialized = true;
+        state.updated_ns = now_ns;
+    } else {
+        let dt_sec = ((now_ns - state.updated_ns).max(0) as f64) / 1_000_000_000.0;
+        let mut floor = state.floor_ms + dt_sec * FLOOR_RISE_MS_PER_SEC;
+        if observed_delta_ms < floor {
+            floor = observed_delta_ms;
+        }
+        state.floor_ms = floor.clamp(FLOOR_CLAMP_MIN_MS, FLOOR_CLAMP_MAX_MS);
+        state.updated_ns = now_ns;
+    }
+    path_lag_calib_map().insert(key, state);
+    (observed_delta_ms - state.floor_ms).max(0.0)
+}
+
+#[cfg(test)]
+fn reset_path_lag_calib_for_tests() {
+    if let Some(map) = PATH_LAG_CALIB.get() {
+        map.clear();
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TokenBucket {
     rps: f64,
@@ -6996,7 +7039,7 @@ fn estimate_feed_latency(tick: &RefTick, book: &BookTop) -> FeedLatencySample {
         .unwrap_or(tick_ingest_ms);
     let path_lag_ms = tick
         .ts_first_hop_ms
-        .map(|first| (tick.recv_ts_ms - first).max(0) as f64)
+        .map(|first| calibrate_path_lag_ms(&tick.source, (tick.recv_ts_ms - first) as f64, now))
         .unwrap_or(0.0);
     let book_recv_ms = if book.recv_ts_local_ns > 0 {
         (book.recv_ts_local_ns / 1_000_000).max(0)
@@ -10256,6 +10299,7 @@ mod tests {
 
     #[test]
     fn estimate_feed_latency_separates_source_and_backlog() {
+        reset_path_lag_calib_for_tests();
         let now = now_ns();
         let now_ms = now / 1_000_000;
         let tick = RefTick {
@@ -10290,6 +10334,51 @@ mod tests {
         assert!(sample.feed_in_ms >= 1.0);
         assert!(sample.feed_in_ms <= 4.0);
         assert!((sample.feed_in_ms - sample.ref_decode_ms).abs() < 0.0001);
+    }
+
+    #[test]
+    fn estimate_feed_latency_calibrates_path_lag_with_clock_offset() {
+        reset_path_lag_calib_for_tests();
+        let now = now_ns();
+        let now_ms = now / 1_000_000;
+        let book = BookTop {
+            market_id: "m".to_string(),
+            token_id_yes: "yes".to_string(),
+            token_id_no: "no".to_string(),
+            bid_yes: 0.49,
+            ask_yes: 0.51,
+            bid_no: 0.49,
+            ask_no: 0.51,
+            ts_ms: now_ms - 10,
+            recv_ts_local_ns: now - 5_000_000,
+        };
+
+        // First sample establishes floor with a negative raw delta (clock skew baseline).
+        let tick_floor = RefTick {
+            source: "binance_udp".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            source_seq: 1,
+            event_ts_ms: now_ms - 120,
+            recv_ts_ms: now_ms - 100,
+            event_ts_exchange_ms: now_ms - 120,
+            recv_ts_local_ns: now - 100_000_000,
+            ingest_ts_local_ns: now - 99_000_000,
+            ts_first_hop_ms: Some(now_ms - 90),
+            price: 70_000.0,
+        };
+        let first = estimate_feed_latency(&tick_floor, &book);
+        assert!(first.path_lag_ms <= 0.01);
+
+        // Second sample has larger delta and should show positive path lag after calibration.
+        let tick_next = RefTick {
+            source_seq: 2,
+            recv_ts_ms: now_ms - 80,
+            ts_first_hop_ms: Some(now_ms - 95),
+            ..tick_floor.clone()
+        };
+        let second = estimate_feed_latency(&tick_next, &book);
+        assert!(second.path_lag_ms >= 20.0);
+        assert!(second.path_lag_ms <= 35.0);
     }
 
     #[test]
