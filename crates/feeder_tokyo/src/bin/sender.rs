@@ -362,6 +362,7 @@ async fn run_route(route: &Route, tuning: SenderTuning) -> Result<()> {
                 let packet_len = encode_with_mode(
                     &packet,
                     velocity_bps_per_sec,
+                    Some((now_micros() / 1_000) as i64),
                     wire_mode,
                     &mut packet_buf,
                 )

@@ -2,6 +2,7 @@ use anyhow::Result;
 use futures::StreamExt;
 use poly_wire::{
     decode_auto, WirePacket, WIRE_BOOK_TOP24_SIZE, WIRE_MAX_PACKET_SIZE, WIRE_MOMENTUM_TICK32_SIZE,
+    WIRE_RELAY_TICK40_SIZE,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -117,13 +118,17 @@ async fn main() -> Result<()> {
             match socket.recv_from(&mut buf).await {
                 Ok((amt, _)) => {
                     let recv_ts = now_micros();
-                    if amt != WIRE_BOOK_TOP24_SIZE && amt != WIRE_MOMENTUM_TICK32_SIZE {
+                    if amt != WIRE_BOOK_TOP24_SIZE
+                        && amt != WIRE_MOMENTUM_TICK32_SIZE
+                        && amt != WIRE_RELAY_TICK40_SIZE
+                    {
                         continue;
                     }
                     if let Ok(packet) = decode_auto(&buf[..amt]) {
                         let event_ts_ms = match packet {
                             WirePacket::BookTop24(v) => v.ts_micros / 1_000,
                             WirePacket::MomentumTick32(v) => v.ts_micros / 1_000,
+                            WirePacket::RelayTick40(v) => v.ts_micros / 1_000,
                         };
                         if last_event_ts_ms > 0 && event_ts_ms < last_event_ts_ms {
                             warn!("⚠️ UDP timestamp backjump: {} -> {}", last_event_ts_ms, event_ts_ms);

@@ -859,6 +859,8 @@ struct GateEvaluation {
     decision_queue_wait_p99_ms: f64,
     decision_compute_p99_ms: f64,
     source_latency_p99_ms: f64,
+    exchange_lag_p99_ms: f64,
+    path_lag_p99_ms: f64,
     local_backlog_p99_ms: f64,
     failed_reasons: Vec<String>,
 }
@@ -901,6 +903,12 @@ struct LatencyBreakdown {
     source_latency_p50_ms: f64,
     source_latency_p90_ms: f64,
     source_latency_p99_ms: f64,
+    exchange_lag_p50_ms: f64,
+    exchange_lag_p90_ms: f64,
+    exchange_lag_p99_ms: f64,
+    path_lag_p50_ms: f64,
+    path_lag_p90_ms: f64,
+    path_lag_p99_ms: f64,
     book_latency_p50_ms: f64,
     book_latency_p90_ms: f64,
     book_latency_p99_ms: f64,
@@ -995,6 +1003,8 @@ struct ShadowLiveReport {
     decision_queue_wait_p99_ms: f64,
     decision_compute_p99_ms: f64,
     source_latency_p99_ms: f64,
+    exchange_lag_p99_ms: f64,
+    path_lag_p99_ms: f64,
     local_backlog_p99_ms: f64,
     lag_half_life_ms: f64,
     probability_total: u64,
@@ -1193,6 +1203,8 @@ struct ShadowSamples {
     capturable_window_ms: Vec<f64>,
     feed_in_ms: Vec<f64>,
     source_latency_ms: Vec<f64>,
+    exchange_lag_ms: Vec<f64>,
+    path_lag_ms: Vec<f64>,
     book_latency_ms: Vec<f64>,
     local_backlog_ms: Vec<f64>,
     ref_decode_ms: Vec<f64>,
@@ -1418,6 +1430,8 @@ impl ShadowStats {
         &self,
         feed_in_ms: f64,
         source_latency_ms: f64,
+        exchange_lag_ms: f64,
+        path_lag_ms: f64,
         book_latency_ms: f64,
         local_backlog_ms: f64,
         ref_decode_ms: f64,
@@ -1429,6 +1443,8 @@ impl ShadowStats {
             source_latency_ms,
             Self::SAMPLE_CAP,
         );
+        push_capped(&mut s.exchange_lag_ms, exchange_lag_ms, Self::SAMPLE_CAP);
+        push_capped(&mut s.path_lag_ms, path_lag_ms, Self::SAMPLE_CAP);
         push_capped(&mut s.book_latency_ms, book_latency_ms, Self::SAMPLE_CAP);
         push_capped(&mut s.local_backlog_ms, local_backlog_ms, Self::SAMPLE_CAP);
         push_capped(&mut s.ref_decode_ms, ref_decode_ms, Self::SAMPLE_CAP);
@@ -1748,6 +1764,8 @@ impl ShadowStats {
             capturable_window_ms,
             feed_in_ms,
             source_latency_ms,
+            exchange_lag_ms,
+            path_lag_ms,
             book_latency_ms,
             local_backlog_ms,
             ref_decode_ms,
@@ -2001,6 +2019,12 @@ impl ShadowStats {
             source_latency_p50_ms: percentile(&source_latency_ms, 0.50).unwrap_or(0.0),
             source_latency_p90_ms: percentile(&source_latency_ms, 0.90).unwrap_or(0.0),
             source_latency_p99_ms: percentile(&source_latency_ms, 0.99).unwrap_or(0.0),
+            exchange_lag_p50_ms: percentile(&exchange_lag_ms, 0.50).unwrap_or(0.0),
+            exchange_lag_p90_ms: percentile(&exchange_lag_ms, 0.90).unwrap_or(0.0),
+            exchange_lag_p99_ms: percentile(&exchange_lag_ms, 0.99).unwrap_or(0.0),
+            path_lag_p50_ms: percentile(&path_lag_ms, 0.50).unwrap_or(0.0),
+            path_lag_p90_ms: percentile(&path_lag_ms, 0.90).unwrap_or(0.0),
+            path_lag_p99_ms: percentile(&path_lag_ms, 0.99).unwrap_or(0.0),
             book_latency_p50_ms: percentile(&book_latency_ms, 0.50).unwrap_or(0.0),
             book_latency_p90_ms: percentile(&book_latency_ms, 0.90).unwrap_or(0.0),
             book_latency_p99_ms: percentile(&book_latency_ms, 0.99).unwrap_or(0.0),
@@ -2119,6 +2143,8 @@ impl ShadowStats {
             decision_queue_wait_p99_ms: latency.decision_queue_wait_p99_ms,
             decision_compute_p99_ms: latency.decision_compute_p99_ms,
             source_latency_p99_ms: latency.source_latency_p99_ms,
+            exchange_lag_p99_ms: latency.exchange_lag_p99_ms,
+            path_lag_p99_ms: latency.path_lag_p99_ms,
             local_backlog_p99_ms: latency.local_backlog_p99_ms,
             lag_half_life_ms,
             probability_total,
@@ -2209,6 +2235,8 @@ impl ShadowStats {
             decision_queue_wait_p99_ms: live.decision_queue_wait_p99_ms,
             decision_compute_p99_ms: live.decision_compute_p99_ms,
             source_latency_p99_ms: live.latency.source_latency_p99_ms,
+            exchange_lag_p99_ms: live.latency.exchange_lag_p99_ms,
+            path_lag_p99_ms: live.latency.path_lag_p99_ms,
             local_backlog_p99_ms: live.latency.local_backlog_p99_ms,
             failed_reasons: failed,
         };
@@ -3587,6 +3615,8 @@ fn spawn_strategy_engine(
                         .push_latency_sample(
                             feed_in_ms,
                             latency_sample.source_latency_ms,
+                            latency_sample.exchange_lag_ms,
+                            latency_sample.path_lag_ms,
                             latency_sample.book_latency_ms,
                             latency_sample.local_backlog_ms,
                             latency_sample.ref_decode_ms,
@@ -3595,6 +3625,10 @@ fn spawn_strategy_engine(
                     metrics::histogram!("latency.feed_in_ms").record(feed_in_ms);
                     metrics::histogram!("latency.source_latency_ms")
                         .record(latency_sample.source_latency_ms);
+                    metrics::histogram!("latency.exchange_lag_ms")
+                        .record(latency_sample.exchange_lag_ms);
+                    metrics::histogram!("latency.path_lag_ms")
+                        .record(latency_sample.path_lag_ms);
                     metrics::histogram!("latency.book_latency_ms")
                         .record(latency_sample.book_latency_ms);
                     metrics::histogram!("latency.local_backlog_ms")
@@ -6910,6 +6944,8 @@ fn sigmoid(x: f64) -> f64 {
 struct FeedLatencySample {
     feed_in_ms: f64,
     source_latency_ms: f64,
+    exchange_lag_ms: f64,
+    path_lag_ms: f64,
     book_latency_ms: f64,
     local_backlog_ms: f64,
     ref_decode_ms: f64,
@@ -6954,6 +6990,14 @@ fn estimate_feed_latency(tick: &RefTick, book: &BookTop) -> FeedLatencySample {
     let now_ms = now / 1_000_000;
     let tick_source_ms = tick.event_ts_exchange_ms.max(tick.event_ts_ms);
     let tick_ingest_ms = (tick.recv_ts_ms - tick_source_ms).max(0) as f64;
+    let exchange_lag_ms = tick
+        .ts_first_hop_ms
+        .map(|first| (first - tick_source_ms).max(0) as f64)
+        .unwrap_or(tick_ingest_ms);
+    let path_lag_ms = tick
+        .ts_first_hop_ms
+        .map(|first| (tick.recv_ts_ms - first).max(0) as f64)
+        .unwrap_or(0.0);
     let book_recv_ms = if book.recv_ts_local_ns > 0 {
         (book.recv_ts_local_ns / 1_000_000).max(0)
     } else {
@@ -6987,6 +7031,8 @@ fn estimate_feed_latency(tick: &RefTick, book: &BookTop) -> FeedLatencySample {
     FeedLatencySample {
         feed_in_ms,
         source_latency_ms,
+        exchange_lag_ms,
+        path_lag_ms,
         book_latency_ms: book_ingest_ms,
         local_backlog_ms,
         ref_decode_ms,
@@ -10221,6 +10267,7 @@ mod tests {
             event_ts_exchange_ms: now_ms - 300,
             recv_ts_local_ns: now - 200_000_000,
             ingest_ts_local_ns: now - 198_000_000,
+            ts_first_hop_ms: None,
             price: 70_000.0,
         };
         let book = BookTop {
@@ -10256,6 +10303,7 @@ mod tests {
             event_ts_exchange_ms: 1_000,
             recv_ts_local_ns: 1_000_000_000,
             ingest_ts_local_ns: 1_000_100_000,
+            ts_first_hop_ms: None,
             price: 100.0,
         };
         let mut next = current.clone();
@@ -10278,6 +10326,7 @@ mod tests {
             event_ts_exchange_ms: 1_000,
             recv_ts_local_ns: 1_000_000_000,
             ingest_ts_local_ns: 1_000_050_000,
+            ts_first_hop_ms: None,
             price: 100.0,
         };
         let mut second = first.clone();

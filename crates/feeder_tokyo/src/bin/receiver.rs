@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use poly_wire::{
     decode_auto, now_micros, WirePacket, WIRE_BOOK_TOP24_SIZE, WIRE_MAX_PACKET_SIZE,
-    WIRE_MOMENTUM_TICK32_SIZE,
+    WIRE_MOMENTUM_TICK32_SIZE, WIRE_RELAY_TICK40_SIZE,
 };
 use std::net::UdpSocket;
 #[cfg(target_os = "linux")]
@@ -36,8 +36,8 @@ fn main() -> Result<()> {
         .context("set receiver UDP socket nonblocking")?;
 
     eprintln!(
-        "receiver: listening={} packet_sizes=[{},{}] print_every={} (busy-spin mode)",
-        bind_addr, WIRE_BOOK_TOP24_SIZE, WIRE_MOMENTUM_TICK32_SIZE, print_every
+        "receiver: listening={} packet_sizes=[{},{},{}] print_every={} (busy-spin mode)",
+        bind_addr, WIRE_BOOK_TOP24_SIZE, WIRE_MOMENTUM_TICK32_SIZE, WIRE_RELAY_TICK40_SIZE, print_every
     );
 
     let mut buf = [0u8; WIRE_MAX_PACKET_SIZE];
@@ -49,7 +49,10 @@ fn main() -> Result<()> {
     loop {
         match socket.recv_from(&mut buf) {
             Ok((amt, _src)) => {
-                if amt != WIRE_BOOK_TOP24_SIZE && amt != WIRE_MOMENTUM_TICK32_SIZE {
+                if amt != WIRE_BOOK_TOP24_SIZE
+                    && amt != WIRE_MOMENTUM_TICK32_SIZE
+                    && amt != WIRE_RELAY_TICK40_SIZE
+                {
                     dropped_size = dropped_size.saturating_add(1);
                     continue;
                 }
@@ -57,6 +60,7 @@ fn main() -> Result<()> {
                 let (ts_micros, bid, ask) = match decode_auto(&buf[..amt]) {
                     Ok(WirePacket::BookTop24(pkt)) => (pkt.ts_micros, pkt.bid, pkt.ask),
                     Ok(WirePacket::MomentumTick32(pkt)) => (pkt.ts_micros, pkt.bid, pkt.ask),
+                    Ok(WirePacket::RelayTick40(pkt)) => (pkt.ts_micros, pkt.bid, pkt.ask),
                     Err(_) => continue,
                 };
 

@@ -559,6 +559,7 @@ mod tests {
             event_ts_exchange_ms: recv_ts_ms,
             recv_ts_local_ns: recv_ts_ms * 1_000_000,
             ingest_ts_local_ns: recv_ts_ms * 1_000_000,
+            ts_first_hop_ms: None,
             price,
         }
     }

@@ -214,6 +214,7 @@ async fn run_binance_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> R
                     event_ts_exchange_ms: event_ts,
                     recv_ts_local_ns: recv_ns,
                     ingest_ts_local_ns: ingest_ns,
+                    ts_first_hop_ms: None,
                     price,
                 };
 
@@ -452,6 +453,7 @@ async fn run_chainlink_rtds_stream(symbols: &[String], tx: &mpsc::Sender<RefTick
                     event_ts_exchange_ms: event_ts,
                     recv_ts_local_ns: recv_ns,
                     ingest_ts_local_ns: ingest_ns,
+                    ts_first_hop_ms: None,
                     price,
                 };
 

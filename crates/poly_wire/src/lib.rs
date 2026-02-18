@@ -10,7 +10,11 @@ pub const WIRE_BOOK_TOP24_SIZE: usize = 24;
 /// Layout (Little Endian):
 /// [ts_micros: u64][bid: f64][ask: f64][velocity_bps_per_sec: f64]
 pub const WIRE_MOMENTUM_TICK32_SIZE: usize = 32;
-pub const WIRE_MAX_PACKET_SIZE: usize = WIRE_MOMENTUM_TICK32_SIZE;
+/// Relay packet extension (first-hop timestamp carried from Tokyo sender).
+/// Layout (Little Endian):
+/// [ts_micros: u64][bid: f64][ask: f64][velocity_bps_per_sec: f64][ts_first_hop_ms: i64]
+pub const WIRE_RELAY_TICK40_SIZE: usize = 40;
+pub const WIRE_MAX_PACKET_SIZE: usize = WIRE_RELAY_TICK40_SIZE;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 pub struct WireBookTop24 {
@@ -25,6 +29,15 @@ pub struct WireMomentumTick32 {
     pub bid: f64,
     pub ask: f64,
     pub velocity_bps_per_sec: f64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub struct WireRelayTick40 {
+    pub ts_micros: u64,
+    pub bid: f64,
+    pub ask: f64,
+    pub velocity_bps_per_sec: f64,
+    pub ts_first_hop_ms: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +66,7 @@ impl WireMode {
 pub enum WirePacket {
     BookTop24(WireBookTop24),
     MomentumTick32(WireMomentumTick32),
+    RelayTick40(WireRelayTick40),
 }
 
 #[derive(Debug)]
@@ -113,6 +127,22 @@ pub fn decode_momentum_tick32(
 }
 
 #[inline]
+pub fn encode_relay_tick40(
+    packet: &WireRelayTick40,
+    out: &mut [u8; WIRE_RELAY_TICK40_SIZE],
+) -> Result<(), bincode::Error> {
+    let mut cursor = Cursor::new(out.as_mut_slice());
+    wire_options().serialize_into(&mut cursor, packet)
+}
+
+#[inline]
+pub fn decode_relay_tick40(
+    input: &[u8; WIRE_RELAY_TICK40_SIZE],
+) -> Result<WireRelayTick40, bincode::Error> {
+    wire_options().deserialize(input.as_slice())
+}
+
+#[inline]
 pub fn decode_auto(input: &[u8]) -> Result<WirePacket, WireDecodeError> {
     match input.len() {
         WIRE_BOOK_TOP24_SIZE => {
@@ -129,6 +159,13 @@ pub fn decode_auto(input: &[u8]) -> Result<WirePacket, WireDecodeError> {
                 .map(WirePacket::MomentumTick32)
                 .map_err(WireDecodeError::Bincode)
         }
+        WIRE_RELAY_TICK40_SIZE => {
+            let mut buf = [0u8; WIRE_RELAY_TICK40_SIZE];
+            buf.copy_from_slice(input);
+            decode_relay_tick40(&buf)
+                .map(WirePacket::RelayTick40)
+                .map_err(WireDecodeError::Bincode)
+        }
         other => Err(WireDecodeError::UnsupportedSize(other)),
     }
 }
@@ -137,6 +174,7 @@ pub fn decode_auto(input: &[u8]) -> Result<WirePacket, WireDecodeError> {
 pub fn encode_with_mode(
     packet24: &WireBookTop24,
     velocity_bps_per_sec: f64,
+    ts_first_hop_ms: Option<i64>,
     mode: WireMode,
     out: &mut [u8; WIRE_MAX_PACKET_SIZE],
 ) -> Result<usize, bincode::Error> {
@@ -147,8 +185,7 @@ pub fn encode_with_mode(
             out[..WIRE_BOOK_TOP24_SIZE].copy_from_slice(&view);
             Ok(WIRE_BOOK_TOP24_SIZE)
         }
-        WireMode::Fixed32 | WireMode::Auto => {
-            // Auto prefers the richer packet while receivers stay backward-compatible.
+        WireMode::Fixed32 => {
             let mut view = [0u8; WIRE_MOMENTUM_TICK32_SIZE];
             let packet32 = WireMomentumTick32 {
                 ts_micros: packet24.ts_micros,
@@ -159,6 +196,20 @@ pub fn encode_with_mode(
             encode_momentum_tick32(&packet32, &mut view)?;
             out[..WIRE_MOMENTUM_TICK32_SIZE].copy_from_slice(&view);
             Ok(WIRE_MOMENTUM_TICK32_SIZE)
+        }
+        WireMode::Auto => {
+            // Auto prefers the richer relay packet while receivers stay backward-compatible.
+            let mut view = [0u8; WIRE_RELAY_TICK40_SIZE];
+            let packet40 = WireRelayTick40 {
+                ts_micros: packet24.ts_micros,
+                bid: packet24.bid,
+                ask: packet24.ask,
+                velocity_bps_per_sec,
+                ts_first_hop_ms: ts_first_hop_ms.unwrap_or_else(|| (packet24.ts_micros / 1_000) as i64),
+            };
+            encode_relay_tick40(&packet40, &mut view)?;
+            out[..WIRE_RELAY_TICK40_SIZE].copy_from_slice(&view);
+            Ok(WIRE_RELAY_TICK40_SIZE)
         }
     }
 }
@@ -229,10 +280,11 @@ mod tests {
             _ => panic!("expected WirePacket::BookTop24"),
         }
 
-        let mut raw32 = [0u8; WIRE_MOMENTUM_TICK32_SIZE];
-        let n = encode_with_mode(&book24, 3.2, WireMode::Fixed32, &mut raw32).expect("encode mode");
+        let mut raw32 = [0u8; WIRE_MAX_PACKET_SIZE];
+        let n = encode_with_mode(&book24, 3.2, None, WireMode::Fixed32, &mut raw32)
+            .expect("encode mode");
         assert_eq!(n, WIRE_MOMENTUM_TICK32_SIZE);
-        match decode_auto(&raw32).expect("decode auto 32") {
+        match decode_auto(&raw32[..n]).expect("decode auto 32") {
             WirePacket::MomentumTick32(v) => {
                 assert_eq!(v.ts_micros, book24.ts_micros);
                 assert_eq!(v.bid, book24.bid);
@@ -240,6 +292,21 @@ mod tests {
                 assert_eq!(v.velocity_bps_per_sec, 3.2);
             }
             _ => panic!("expected WirePacket::MomentumTick32"),
+        }
+
+        let mut raw40 = [0u8; WIRE_MAX_PACKET_SIZE];
+        let n = encode_with_mode(&book24, 5.4, Some(123456), WireMode::Auto, &mut raw40)
+            .expect("encode mode auto");
+        assert_eq!(n, WIRE_RELAY_TICK40_SIZE);
+        match decode_auto(&raw40[..n]).expect("decode auto 40") {
+            WirePacket::RelayTick40(v) => {
+                assert_eq!(v.ts_micros, book24.ts_micros);
+                assert_eq!(v.bid, book24.bid);
+                assert_eq!(v.ask, book24.ask);
+                assert_eq!(v.velocity_bps_per_sec, 5.4);
+                assert_eq!(v.ts_first_hop_ms, 123456);
+            }
+            _ => panic!("expected WirePacket::RelayTick40"),
         }
     }
 

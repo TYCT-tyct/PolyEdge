@@ -24,6 +24,10 @@ pub struct RefTick {
     /// This enables measuring pure local decode/ingest latency independent of exchange clocks.
     #[serde(default)]
     pub ingest_ts_local_ns: i64,
+    /// First-hop local timestamp recorded at Tokyo relay ingress.
+    /// Used to split exchange-lag vs private-path-lag in reports.
+    #[serde(default)]
+    pub ts_first_hop_ms: Option<i64>,
     pub price: f64,
 }
 
@@ -797,6 +801,7 @@ mod tests {
             event_ts_exchange_ms: 1,
             recv_ts_local_ns: 2,
             ingest_ts_local_ns: 2,
+            ts_first_hop_ms: None,
             price: 50000.0,
         });
 

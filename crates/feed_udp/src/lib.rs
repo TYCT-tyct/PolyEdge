@@ -146,13 +146,21 @@ fn spawn_recv_loop(
                         continue;
                     }
                 };
-                if amt != WIRE_BOOK_TOP24_SIZE && amt != WIRE_MOMENTUM_TICK32_SIZE {
+                if amt != WIRE_BOOK_TOP24_SIZE
+                    && amt != WIRE_MOMENTUM_TICK32_SIZE
+                    && amt != poly_wire::WIRE_RELAY_TICK40_SIZE
+                {
                     continue;
                 }
 
-                let (ts_micros, bid, ask) = match decode_auto(&buf[..amt]) {
-                    Ok(WirePacket::BookTop24(pkt)) => (pkt.ts_micros, pkt.bid, pkt.ask),
-                    Ok(WirePacket::MomentumTick32(pkt)) => (pkt.ts_micros, pkt.bid, pkt.ask),
+                let (ts_micros, bid, ask, ts_first_hop_ms) = match decode_auto(&buf[..amt]) {
+                    Ok(WirePacket::BookTop24(pkt)) => (pkt.ts_micros, pkt.bid, pkt.ask, None),
+                    Ok(WirePacket::MomentumTick32(pkt)) => {
+                        (pkt.ts_micros, pkt.bid, pkt.ask, None)
+                    }
+                    Ok(WirePacket::RelayTick40(pkt)) => {
+                        (pkt.ts_micros, pkt.bid, pkt.ask, Some(pkt.ts_first_hop_ms))
+                    }
                     Err(err) => {
                         let send_err = if tuning.drop_on_full {
                             match tx.try_send(Err(err.into())) {
@@ -185,6 +193,7 @@ fn spawn_recv_loop(
                     event_ts_exchange_ms: event_ms,
                     recv_ts_local_ns: recv_ns,
                     ingest_ts_local_ns: now_ns(),
+                    ts_first_hop_ms,
                     price: mid,
                 };
 

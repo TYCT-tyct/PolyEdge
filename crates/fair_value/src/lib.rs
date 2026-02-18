@@ -141,6 +141,7 @@ mod tests {
             event_ts_exchange_ms: ts,
             recv_ts_local_ns: ts * 1_000_000,
             ingest_ts_local_ns: ts * 1_000_000,
+            ts_first_hop_ms: None,
             price: px,
         }
     }
