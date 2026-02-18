@@ -3224,7 +3224,6 @@ fn spawn_strategy_engine(
         let mut last_direction_tick_event_ms: HashMap<String, i64> = HashMap::new();
         let mut market_inventory: HashMap<String, InventoryState> = HashMap::new();
         let mut market_rate_budget: HashMap<String, TokenBucket> = HashMap::new();
-        let mut pending_books: HashMap<String, BookTop> = HashMap::new();
         let mut untracked_issue_cooldown: HashMap<String, Instant> = HashMap::new();
         let mut book_lag_sample_at: HashMap<String, Instant> = HashMap::new();
         let mut global_rate_budget = TokenBucket::new(
@@ -3269,40 +3268,33 @@ fn spawn_strategy_engine(
                 last_discovery_refresh = Instant::now();
             }
 
-            let ingress_event = if let Some(next_market) = pending_books.keys().next().cloned() {
-                let Some(book) = pending_books.remove(&next_market) else {
-                    continue;
-                };
-                StrategyIngress::BookTop(book)
-            } else {
-                tokio::select! {
-                    ctrl = control_rx.recv() => {
-                        match ctrl {
-                            Ok(EngineEvent::Control(ControlCommand::Pause)) => {
-                                *paused.write().await = true;
-                                shared.shadow_stats.set_paused(true);
-                            }
-                            Ok(EngineEvent::Control(ControlCommand::Resume)) => {
-                                *paused.write().await = false;
-                                shared.shadow_stats.set_paused(false);
-                            }
-                            Ok(EngineEvent::Control(ControlCommand::Flatten)) => {
-                                if let Err(err) = execution.flatten_all().await {
-                                    tracing::warn!(?err, "flatten from control event failed");
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(_) => {}
+            let ingress_event = tokio::select! {
+                ctrl = control_rx.recv() => {
+                    match ctrl {
+                        Ok(EngineEvent::Control(ControlCommand::Pause)) => {
+                            *paused.write().await = true;
+                            shared.shadow_stats.set_paused(true);
                         }
-                        continue;
+                        Ok(EngineEvent::Control(ControlCommand::Resume)) => {
+                            *paused.write().await = false;
+                            shared.shadow_stats.set_paused(false);
+                        }
+                        Ok(EngineEvent::Control(ControlCommand::Flatten)) => {
+                            if let Err(err) = execution.flatten_all().await {
+                                tracing::warn!(?err, "flatten from control event failed");
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => {}
                     }
-                    maybe_ingress = ingress_rx.recv() => {
-                        let Some(event) = maybe_ingress else {
-                            shared.shadow_stats.record_issue("strategy_ingress_closed").await;
-                            break;
-                        };
-                        event
-                    }
+                    continue;
+                }
+                maybe_ingress = ingress_rx.recv() => {
+                    let Some(event) = maybe_ingress else {
+                        shared.shadow_stats.record_issue("strategy_ingress_closed").await;
+                        break;
+                    };
+                    event
                 }
             };
 
@@ -3361,11 +3353,7 @@ fn spawn_strategy_engine(
                         }
                         match ingress_rx.try_recv() {
                             Ok(StrategyIngress::BookTop(next_book)) => {
-                                if next_book.market_id == book.market_id {
-                                    book = next_book;
-                                } else {
-                                    pending_books.insert(next_book.market_id.clone(), next_book);
-                                }
+                                book = next_book;
                                 coalesced += 1;
                             }
                             Ok(StrategyIngress::RefTick(next_tick)) => {
