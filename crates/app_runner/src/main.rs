@@ -3582,16 +3582,6 @@ fn spawn_strategy_engine(
                     let feed_in_ms = latency_sample.feed_in_ms;
                     let stale_tick_filter_ms =
                         shared.strategy_cfg.read().await.stale_tick_filter_ms;
-                    // Stale tick filtering must be based on *local* staleness/age, not exchange
-                    // event timestamps (which can be skewed across venues).
-                    if stale_ms > stale_tick_filter_ms {
-                        shared.shadow_stats.mark_stale_tick_dropped();
-                        shared.shadow_stats.record_issue("stale_tick_dropped").await;
-                        continue;
-                    }
-                    // Only record latency samples for ticks that survive stale filtering.
-                    // This keeps p99 aligned with actionable (tradable) flow instead of
-                    // including already-rejected backlog artifacts.
                     shared
                         .shadow_stats
                         .push_latency_sample(
@@ -3611,6 +3601,13 @@ fn spawn_strategy_engine(
                         .record(latency_sample.local_backlog_ms);
                     metrics::histogram!("latency.ref_decode_ms")
                         .record(latency_sample.ref_decode_ms);
+                    // Stale tick filtering must be based on *local* staleness/age, not exchange
+                    // event timestamps (which can be skewed across venues).
+                    if stale_ms > stale_tick_filter_ms {
+                        shared.shadow_stats.mark_stale_tick_dropped();
+                        shared.shadow_stats.record_issue("stale_tick_dropped").await;
+                        continue;
+                    }
                     if latency_sample.local_backlog_ms > strategy_max_decision_backlog_ms {
                         shared
                             .shadow_stats
