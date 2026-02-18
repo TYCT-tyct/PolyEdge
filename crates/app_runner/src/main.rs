@@ -2942,10 +2942,12 @@ fn spawn_reference_feed(
                         } else {
                             now_ns()
                         };
-                        let ws_recent = latest_ws_recv_ns_by_symbol
+                        let ws_gap_ns = latest_ws_recv_ns_by_symbol
                             .get(tick.symbol.as_str())
                             .copied()
-                            .map(|ws_ns| now_recv_ns.saturating_sub(ws_ns) <= udp_ws_freshness_ns())
+                            .map(|ws_ns| now_recv_ns.saturating_sub(ws_ns));
+                        let ws_cap_ready = ws_gap_ns
+                            .map(|gap_ns| gap_ns <= ws_primary_fallback_gap_ns())
                             .unwrap_or(false);
                         let fallback_active_now = fusion.mode == "websocket_primary"
                             && ws_primary_fallback_until_ns_by_symbol
@@ -2954,7 +2956,7 @@ fn spawn_reference_feed(
                                 .unwrap_or(false);
                         if should_arm_ws_primary_fallback(
                             fusion.mode.as_str(),
-                            ws_recent,
+                            ws_cap_ready,
                             fallback_active_now,
                         ) {
                             let cooldown_ns =
@@ -2987,7 +2989,7 @@ fn spawn_reference_feed(
                             fusion.mode.as_str(),
                             fallback_active,
                             share_high && projected_share_violation,
-                            ws_recent,
+                            ws_cap_ready,
                         );
 
                         if enforce_ws_primary {
@@ -2996,7 +2998,7 @@ fn spawn_reference_feed(
                             continue;
                         }
 
-                        if ws_recent && (jitter_high || freshness_low) {
+                        if ws_cap_ready && (jitter_high || freshness_low) {
                             let share_ratio = (effective_udp_share / target_share).max(1.0);
                             let base_keep_every = udp_downweight_keep_every().max(2);
                             let dynamic_keep = share_ratio.ceil() as usize;
@@ -7575,18 +7577,6 @@ fn fusion_staleness_budget_us_for_source(next_source: &str) -> i64 {
     })
 }
 
-fn udp_ws_freshness_ns() -> i64 {
-    static UDP_WS_FRESHNESS_NS: OnceLock<i64> = OnceLock::new();
-    *UDP_WS_FRESHNESS_NS.get_or_init(|| {
-        std::env::var("POLYEDGE_UDP_WS_FRESHNESS_MS")
-            .ok()
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(600)
-            .clamp(10, 2_000)
-            * 1_000_000
-    })
-}
-
 fn udp_min_freshness_score() -> f64 {
     static UDP_MIN_FRESHNESS_SCORE: OnceLock<f64> = OnceLock::new();
     *UDP_MIN_FRESHNESS_SCORE.get_or_init(|| {
@@ -7595,6 +7585,18 @@ fn udp_min_freshness_score() -> f64 {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(0.55)
             .clamp(0.0, 1.0)
+    })
+}
+
+fn ws_primary_fallback_gap_ns() -> i64 {
+    static WS_PRIMARY_FALLBACK_GAP_NS: OnceLock<i64> = OnceLock::new();
+    *WS_PRIMARY_FALLBACK_GAP_NS.get_or_init(|| {
+        std::env::var("POLYEDGE_WS_PRIMARY_FALLBACK_GAP_MS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(3_000)
+            .clamp(250, 10_000)
+            * 1_000_000
     })
 }
 
