@@ -17,6 +17,7 @@ pub(super) fn build_router(state: AppState) -> Router {
         .route("/control/pause", post(pause))
         .route("/control/resume", post(resume))
         .route("/control/flatten", post(flatten))
+        .route("/control/arm_live", post(arm_live))
         .route("/control/reset_shadow", post(reset_shadow))
         .route("/control/reload_strategy", post(reload_strategy))
         .route("/control/reload_taker", post(reload_taker))
@@ -90,6 +91,51 @@ async fn flatten(State(state): State<AppState>) -> impl IntoResponse {
             Json(serde_json::json!({"ok": false, "error": err.to_string()})),
         )
             .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ArmLiveReq {
+    armed: Option<bool>,
+}
+
+async fn arm_live(State(state): State<AppState>, Json(req): Json<ArmLiveReq>) -> impl IntoResponse {
+    let armed = req.armed.unwrap_or(true);
+    if !armed {
+        std::env::set_var("POLYEDGE_LIVE_ARMED", "false");
+        return Json(
+            serde_json::json!({"ok": true, "armed": false, "execution_live": state.execution.is_live()}),
+        )
+        .into_response();
+    }
+
+    let settlement_cfg = state.shared.settlement_cfg.read().await.clone();
+    let gate = settlement_live_gate_status(&settlement_cfg);
+    if !gate.ready {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "armed": false,
+                "error": "settlement_live_gate_failed",
+                "reason": gate.reason,
+            })),
+        )
+            .into_response();
+    }
+
+    std::env::set_var("POLYEDGE_LIVE_ARMED", "true");
+    let execution_live = state.execution.is_live();
+    let payload = serde_json::json!({
+        "ok": true,
+        "armed": true,
+        "execution_live": execution_live,
+        "restart_required": !execution_live,
+    });
+    if execution_live {
+        Json(payload).into_response()
+    } else {
+        (StatusCode::ACCEPTED, Json(payload)).into_response()
     }
 }
 
@@ -350,6 +396,9 @@ async fn reload_exit(
     let mut cfg = state.shared.exit_cfg.write().await;
     if let Some(v) = req.enabled {
         cfg.enabled = v;
+    }
+    if let Some(v) = req.t100ms_reversal_bps {
+        cfg.t100ms_reversal_bps = v;
     }
     if let Some(v) = req.t300ms_reversal_bps {
         cfg.t300ms_reversal_bps = v;

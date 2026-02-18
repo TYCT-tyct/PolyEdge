@@ -347,6 +347,7 @@ struct SourceHealthReloadReq {
 #[derive(Debug, Deserialize)]
 struct ExitReloadReq {
     enabled: Option<bool>,
+    t100ms_reversal_bps: Option<f64>,
     t300ms_reversal_bps: Option<f64>,
     time_stop_ms: Option<u64>,
     edge_decay_bps: Option<f64>,
@@ -513,6 +514,7 @@ impl Default for EdgeModelConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExitConfig {
     enabled: bool,
+    t100ms_reversal_bps: f64,
     t300ms_reversal_bps: f64,
     time_stop_ms: u64,
     edge_decay_bps: f64,
@@ -531,6 +533,7 @@ impl Default for ExitConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            t100ms_reversal_bps: -3.0,
             t300ms_reversal_bps: -2.0,
             time_stop_ms: 300_000,
             edge_decay_bps: -2.0,
@@ -551,6 +554,7 @@ impl Default for ExitConfig {
 struct SettlementConfig {
     enabled: bool,
     endpoint: String,
+    required_for_live: bool,
     poll_interval_ms: u64,
     timeout_ms: u64,
     symbols: Vec<String>,
@@ -561,6 +565,7 @@ impl Default for SettlementConfig {
         Self {
             enabled: true,
             endpoint: String::new(),
+            required_for_live: true,
             poll_interval_ms: 1_000,
             timeout_ms: 800,
             symbols: vec![
@@ -570,6 +575,37 @@ impl Default for SettlementConfig {
                 "XRPUSDT".to_string(),
             ],
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LiveGateStatus {
+    ready: bool,
+    reason: String,
+}
+
+fn settlement_live_gate_status(cfg: &SettlementConfig) -> LiveGateStatus {
+    if !cfg.required_for_live {
+        return LiveGateStatus {
+            ready: true,
+            reason: "settlement_required_for_live_disabled".to_string(),
+        };
+    }
+    if !cfg.enabled {
+        return LiveGateStatus {
+            ready: false,
+            reason: "settlement_feed_disabled".to_string(),
+        };
+    }
+    if cfg.endpoint.trim().is_empty() {
+        return LiveGateStatus {
+            ready: false,
+            reason: "settlement_endpoint_empty".to_string(),
+        };
+    }
+    LiveGateStatus {
+        ready: true,
+        reason: "ok".to_string(),
     }
 }
 
@@ -596,8 +632,10 @@ impl Default for SourceHealthConfig {
 
 fn to_exit_manager_config(cfg: &ExitConfig) -> ExitManagerConfig {
     ExitManagerConfig {
-        t100ms_reversal_bps: cfg.t300ms_reversal_bps.min(-1.0) * 1.5,
+        t100ms_reversal_bps: cfg.t100ms_reversal_bps,
         t300ms_reversal_bps: cfg.t300ms_reversal_bps,
+        // 收敛出场: PM 价格修复 85% 就走，不等时钟
+        convergence_exit_ratio: 0.85,
         t3_take_ratio: cfg.t3_take_ratio.clamp(0.0, 5.0),
         t15_min_unrealized_usdc: cfg.t15_min_unrealized_usdc,
         t60_true_prob_floor: cfg.t60_true_prob_floor.clamp(0.0, 1.0),
@@ -613,6 +651,8 @@ fn exit_reason_label(reason: ExitReason) -> &'static str {
         ExitReason::StopLoss => "stop_loss",
         ExitReason::Reversal100ms => "t_plus_100ms_reversal",
         ExitReason::Reversal300ms => "t_plus_300ms_reversal",
+        // 价格收敛到公允价值 85%+，套利利润已吃满
+        ExitReason::ConvergenceExit => "convergence_exit",
         ExitReason::TakeProfit3s => "t_plus_3s",
         ExitReason::TakeProfit15s => "t_plus_15s",
         ExitReason::ProbGuard60s => "t_plus_60s_prob_guard",
@@ -991,6 +1031,7 @@ struct ShadowLiveReport {
     predator_regime_defend: u64,
     predator_cross_symbol_fired: u64,
     taker_sniper_skip_reasons_top: Vec<(String, u64)>,
+    last_30s_taker_fallback_count: u64,
     router_locked_by_tf_usdc: HashMap<String, f64>,
     capital_available_usdc: f64,
     capital_base_quote_size: f64,
@@ -1129,6 +1170,7 @@ struct ShadowStats {
     predator_regime_quiet: AtomicU64,
     predator_regime_defend: AtomicU64,
     predator_cross_symbol_fired: AtomicU64,
+    predator_last_30s_taker_fallback_count: AtomicU64,
     predator_taker_skip_reasons: RwLock<HashMap<String, u64>>,
     predator_router_locked_by_tf_usdc: RwLock<HashMap<String, f64>>,
     predator_capital: RwLock<CapitalUpdate>,
@@ -1216,6 +1258,7 @@ impl ShadowStats {
             predator_regime_quiet: AtomicU64::new(0),
             predator_regime_defend: AtomicU64::new(0),
             predator_cross_symbol_fired: AtomicU64::new(0),
+            predator_last_30s_taker_fallback_count: AtomicU64::new(0),
             predator_taker_skip_reasons: RwLock::new(HashMap::new()),
             predator_router_locked_by_tf_usdc: RwLock::new(HashMap::new()),
             predator_capital: RwLock::new(CapitalUpdate {
@@ -1277,6 +1320,8 @@ impl ShadowStats {
         self.predator_regime_quiet.store(0, Ordering::Relaxed);
         self.predator_regime_defend.store(0, Ordering::Relaxed);
         self.predator_cross_symbol_fired.store(0, Ordering::Relaxed);
+        self.predator_last_30s_taker_fallback_count
+            .store(0, Ordering::Relaxed);
         self.predator_taker_skip_reasons.write().await.clear();
         self.predator_router_locked_by_tf_usdc.write().await.clear();
         *self.predator_capital.write().await = CapitalUpdate {
@@ -1623,6 +1668,11 @@ impl ShadowStats {
 
     fn mark_predator_taker_fired(&self) {
         self.predator_taker_fired.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn mark_predator_last_30s_taker_fallback(&self) {
+        self.predator_last_30s_taker_fallback_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn mark_predator_regime(&self, regime: &Regime) {
@@ -1992,6 +2042,9 @@ impl ShadowStats {
         let predator_regime_quiet = self.predator_regime_quiet.load(Ordering::Relaxed);
         let predator_regime_defend = self.predator_regime_defend.load(Ordering::Relaxed);
         let predator_cross_symbol_fired = self.predator_cross_symbol_fired.load(Ordering::Relaxed);
+        let last_30s_taker_fallback_count = self
+            .predator_last_30s_taker_fallback_count
+            .load(Ordering::Relaxed);
         let skip_reasons = self.predator_taker_skip_reasons.read().await.clone();
         let mut skip_top = skip_reasons.into_iter().collect::<Vec<_>>();
         skip_top.sort_by(|a, b| b.1.cmp(&a.1));
@@ -2102,6 +2155,7 @@ impl ShadowStats {
             predator_regime_defend,
             predator_cross_symbol_fired,
             taker_sniper_skip_reasons_top: skip_top,
+            last_30s_taker_fallback_count,
             router_locked_by_tf_usdc,
             capital_available_usdc: capital.available_usdc,
             capital_base_quote_size: capital.base_quote_size,
@@ -2243,6 +2297,7 @@ async fn async_main() -> Result<()> {
 
     let execution_cfg = load_execution_config();
     let universe_cfg = load_universe_config();
+    let settlement_cfg_boot = load_settlement_config();
     let bus_capacity = std::env::var("POLYEDGE_BUS_CAPACITY")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -2253,14 +2308,23 @@ async fn async_main() -> Result<()> {
     let live_armed = std::env::var("POLYEDGE_LIVE_ARMED")
         .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
         .unwrap_or(false);
-    let exec_mode = if execution_cfg.mode.eq_ignore_ascii_case("live") && live_armed {
-        ExecutionMode::Live
-    } else {
-        if execution_cfg.mode.eq_ignore_ascii_case("live") && !live_armed {
+    let live_gate = settlement_live_gate_status(&settlement_cfg_boot);
+    let exec_mode = if execution_cfg.mode.eq_ignore_ascii_case("live") {
+        if !live_armed {
             tracing::warn!(
                 "execution.mode=live but POLYEDGE_LIVE_ARMED is not true; forcing paper mode"
             );
+            ExecutionMode::Paper
+        } else if !live_gate.ready {
+            tracing::warn!(
+                reason = %live_gate.reason,
+                "execution.mode=live requested but settlement live gate failed; forcing paper mode"
+            );
+            ExecutionMode::Paper
+        } else {
+            ExecutionMode::Live
         }
+    } else {
         ExecutionMode::Paper
     };
     let execution = Arc::new(ClobExecution::new_with_order_routing(
@@ -2291,7 +2355,7 @@ async fn async_main() -> Result<()> {
     }
     let shadow = Arc::new(ShadowExecutor::default());
     let strategy_cfg = Arc::new(RwLock::new(Arc::new(load_strategy_config())));
-    let settlement_cfg = Arc::new(RwLock::new(load_settlement_config()));
+    let settlement_cfg = Arc::new(RwLock::new(settlement_cfg_boot));
     let fusion_cfg = Arc::new(RwLock::new(load_fusion_config()));
     let source_health_cfg = Arc::new(RwLock::new(load_source_health_config()));
     let edge_model_cfg = Arc::new(RwLock::new(load_edge_model_config()));
@@ -2397,7 +2461,7 @@ async fn async_main() -> Result<()> {
         // WSS User Channel: live 模式下启动实时 fill 通知
         // paper 模式下 wss_fill_tx = None，exit lifecycle 回退到纯 timer 路径
         wss_fill_tx: {
-            let is_live = execution_cfg.mode.as_str() == "live";
+            let is_live = matches!(exec_mode, ExecutionMode::Live);
             let api_key = std::env::var("POLYEDGE_CLOB_API_KEY").unwrap_or_default();
             if is_live && !api_key.is_empty() {
                 let wss_url = std::env::var("POLYEDGE_WSS_USER_URL")
@@ -3895,7 +3959,7 @@ fn spawn_strategy_engine(
                         )
                     {
                         let now_ms = Utc::now().timestamp_millis();
-                        let res = run_predator_c_for_symbol(
+                        let total_res = evaluate_and_route_v52(
                             &shared,
                             &bus,
                             &portfolio,
@@ -3911,54 +3975,6 @@ fn spawn_strategy_engine(
                             None,
                         )
                         .await;
-                        let mut total_res = res;
-                        if let Some(leader_direction) = shared
-                            .predator_latest_direction
-                            .read()
-                            .await
-                            .get(&symbol)
-                            .cloned()
-                        {
-                            let cross_res = run_predator_c_cross_symbol(
-                                &shared,
-                                &bus,
-                                &portfolio,
-                                &execution,
-                                &shadow,
-                                &mut market_rate_budget,
-                                &mut global_rate_budget,
-                                &predator_cfg,
-                                &leader_direction,
-                                tick_fast.recv_ts_ms,
-                                tick_fast.recv_ts_local_ns,
-                                now_ms,
-                            )
-                            .await;
-                            total_res.attempted =
-                                total_res.attempted.saturating_add(cross_res.attempted);
-                            total_res.executed =
-                                total_res.executed.saturating_add(cross_res.executed);
-                        }
-                        if predator_cfg.strategy_d.enabled {
-                            let d_res = run_predator_d_for_symbol(
-                                &shared,
-                                &bus,
-                                &portfolio,
-                                &execution,
-                                &shadow,
-                                &mut market_rate_budget,
-                                &mut global_rate_budget,
-                                &predator_cfg,
-                                &symbol,
-                                tick_fast.recv_ts_ms,
-                                tick_fast.recv_ts_local_ns,
-                                now_ms,
-                            )
-                            .await;
-                            total_res.attempted =
-                                total_res.attempted.saturating_add(d_res.attempted);
-                            total_res.executed = total_res.executed.saturating_add(d_res.executed);
-                        }
                         if matches!(predator_cfg.priority, PredatorCPriority::TakerOnly) {
                             continue;
                         }
@@ -4016,7 +4032,7 @@ fn spawn_strategy_engine(
                             && matches!(predator_cfg.priority, PredatorCPriority::MakerFirst)
                         {
                             let now_ms = Utc::now().timestamp_millis();
-                            let _ = run_predator_c_for_symbol(
+                            let _ = evaluate_and_route_v52(
                                 &shared,
                                 &bus,
                                 &portfolio,
@@ -4032,46 +4048,6 @@ fn spawn_strategy_engine(
                                 None,
                             )
                             .await;
-                            if let Some(leader_direction) = shared
-                                .predator_latest_direction
-                                .read()
-                                .await
-                                .get(&symbol)
-                                .cloned()
-                            {
-                                let _ = run_predator_c_cross_symbol(
-                                    &shared,
-                                    &bus,
-                                    &portfolio,
-                                    &execution,
-                                    &shadow,
-                                    &mut market_rate_budget,
-                                    &mut global_rate_budget,
-                                    &predator_cfg,
-                                    &leader_direction,
-                                    tick_fast.recv_ts_ms,
-                                    tick_fast.recv_ts_local_ns,
-                                    now_ms,
-                                )
-                                .await;
-                            }
-                            if predator_cfg.strategy_d.enabled {
-                                let _ = run_predator_d_for_symbol(
-                                    &shared,
-                                    &bus,
-                                    &portfolio,
-                                    &execution,
-                                    &shadow,
-                                    &mut market_rate_budget,
-                                    &mut global_rate_budget,
-                                    &predator_cfg,
-                                    &symbol,
-                                    tick_fast.recv_ts_ms,
-                                    tick_fast.recv_ts_local_ns,
-                                    now_ms,
-                                )
-                                .await;
-                            }
                         }
                         continue;
                     }
@@ -4243,6 +4219,17 @@ fn spawn_strategy_engine(
                         } else {
                             classify_execution_style(&book, &intent)
                         };
+                        if execution_style == ExecutionStyle::Taker {
+                            let time_to_expiry_ms = estimate_time_to_expiry_ms(
+                                &shared,
+                                &book.market_id,
+                                Utc::now().timestamp_millis(),
+                            )
+                            .await;
+                            if (0..=30_000).contains(&time_to_expiry_ms) {
+                                shared.shadow_stats.mark_predator_last_30s_taker_fallback();
+                            }
+                        }
                         let tif = match execution_style {
                             ExecutionStyle::Maker => OrderTimeInForce::PostOnly,
                             ExecutionStyle::Taker | ExecutionStyle::Arb => OrderTimeInForce::Fak,
@@ -4445,6 +4432,89 @@ struct PredatorExecResult {
     attempted: u64,
     executed: u64,
     stop_firing: bool,
+}
+
+async fn evaluate_and_route_v52(
+    shared: &Arc<EngineShared>,
+    bus: &RingBus<EngineEvent>,
+    portfolio: &Arc<PortfolioBook>,
+    execution: &Arc<ClobExecution>,
+    shadow: &Arc<ShadowExecutor>,
+    market_rate_budget: &mut HashMap<String, TokenBucket>,
+    global_rate_budget: &mut TokenBucket,
+    predator_cfg: &PredatorCConfig,
+    symbol: &str,
+    tick_fast_recv_ts_ms: i64,
+    tick_fast_recv_ts_local_ns: i64,
+    now_ms: i64,
+    direction_override: Option<DirectionSignal>,
+) -> PredatorExecResult {
+    let mut total = run_predator_c_for_symbol(
+        shared,
+        bus,
+        portfolio,
+        execution,
+        shadow,
+        market_rate_budget,
+        global_rate_budget,
+        predator_cfg,
+        symbol,
+        tick_fast_recv_ts_ms,
+        tick_fast_recv_ts_local_ns,
+        now_ms,
+        direction_override.clone(),
+    )
+    .await;
+
+    let leader_direction = if let Some(sig) = direction_override {
+        Some(sig)
+    } else {
+        shared
+            .predator_latest_direction
+            .read()
+            .await
+            .get(symbol)
+            .cloned()
+    };
+    if let Some(leader_direction) = leader_direction {
+        let cross_res = run_predator_c_cross_symbol(
+            shared,
+            bus,
+            portfolio,
+            execution,
+            shadow,
+            market_rate_budget,
+            global_rate_budget,
+            predator_cfg,
+            &leader_direction,
+            tick_fast_recv_ts_ms,
+            tick_fast_recv_ts_local_ns,
+            now_ms,
+        )
+        .await;
+        total.attempted = total.attempted.saturating_add(cross_res.attempted);
+        total.executed = total.executed.saturating_add(cross_res.executed);
+    }
+    if predator_cfg.strategy_d.enabled {
+        let d_res = run_predator_d_for_symbol(
+            shared,
+            bus,
+            portfolio,
+            execution,
+            shadow,
+            market_rate_budget,
+            global_rate_budget,
+            predator_cfg,
+            symbol,
+            tick_fast_recv_ts_ms,
+            tick_fast_recv_ts_local_ns,
+            now_ms,
+        )
+        .await;
+        total.attempted = total.attempted.saturating_add(d_res.attempted);
+        total.executed = total.executed.saturating_add(d_res.executed);
+    }
+    total
 }
 
 async fn run_predator_c_for_symbol(
@@ -5369,6 +5439,10 @@ async fn predator_execute_opportunity(
             .await;
         return PredatorExecResult::default();
     };
+    let time_to_expiry_ms = estimate_time_to_expiry_ms(shared, &intent.market_id, now_ms).await;
+    if time_to_expiry_ms >= 0 && time_to_expiry_ms <= 30_000 {
+        shared.shadow_stats.mark_predator_last_30s_taker_fallback();
+    }
 
     // Same interpretation as the maker path: positive means our fast ref tick arrived earlier
     // than the Polymarket book update. For Predator, the ref tick is per-symbol while the book
@@ -5558,12 +5632,18 @@ async fn predator_execute_opportunity(
             spawn_predator_exit_lifecycle(
                 shared.clone(),
                 bus.clone(),
+                execution.clone(),
                 ack_v2.order_id.clone(),
                 intent.market_id.clone(),
                 opp.symbol.clone(),
                 intent.side.clone(),
                 intent.price,
                 intent.size,
+                maker_cfg.ttl_ms,
+                // 入场时 Binance 公允价值: PM 价 + gap
+                // 公式: fair = pm_entry + edge_gross_bps/10000
+                // 这是入场时套利空间的上界，用于收敛比例计算
+                intent.price + opp.edge_gross_bps / 10_000.0,
             );
 
             let ack_only_ms = if ack_v2.exchange_latency_ms > 0.0 {
@@ -5655,21 +5735,81 @@ async fn predator_execute_opportunity(
     out
 }
 
+fn opposite_side_for_reentry(side: &OrderSide) -> OrderSide {
+    match side {
+        OrderSide::BuyYes => OrderSide::BuyNo,
+        OrderSide::BuyNo => OrderSide::BuyYes,
+        OrderSide::SellYes => OrderSide::SellNo,
+        OrderSide::SellNo => OrderSide::SellYes,
+    }
+}
+
+fn maker_reentry_price_for_side(book: &BookTop, side: &OrderSide) -> f64 {
+    match side {
+        OrderSide::BuyYes => book.bid_yes,
+        OrderSide::BuyNo => book.bid_no,
+        OrderSide::SellYes => book.ask_yes,
+        OrderSide::SellNo => book.ask_no,
+    }
+}
+
+fn build_reversal_reentry_order(
+    market_id: &str,
+    side: &OrderSide,
+    book: &BookTop,
+    size: f64,
+    ttl_ms: u64,
+    fee_rate_bps: f64,
+) -> Option<OrderIntentV2> {
+    let reentry_side = opposite_side_for_reentry(side);
+    let price = maker_reentry_price_for_side(book, &reentry_side);
+    if !price.is_finite() || price <= 0.0 {
+        return None;
+    }
+    let token_id = match reentry_side {
+        OrderSide::BuyYes | OrderSide::SellYes => book.token_id_yes.clone(),
+        OrderSide::BuyNo | OrderSide::SellNo => book.token_id_no.clone(),
+    };
+    Some(OrderIntentV2 {
+        market_id: market_id.to_string(),
+        token_id: Some(token_id),
+        side: reentry_side,
+        price,
+        size: size.max(0.01),
+        ttl_ms: ttl_ms.max(100),
+        style: ExecutionStyle::Maker,
+        tif: OrderTimeInForce::PostOnly,
+        max_slippage_bps: 0.0,
+        fee_rate_bps,
+        expected_edge_net_bps: 0.0,
+        client_order_id: Some(new_id()),
+        hold_to_resolution: false,
+        prebuilt_payload: None,
+    })
+}
+
 fn spawn_predator_exit_lifecycle(
     shared: Arc<EngineShared>,
     bus: RingBus<EngineEvent>,
+    execution: Arc<ClobExecution>,
     position_id: String,
     market_id: String,
     symbol: String,
     side: OrderSide,
     entry_price: f64,
     size: f64,
+    maker_ttl_ms: u64,
+    // 入场时的 Binance 公允价值，用于计算收敛比例
+    // 0.0 表示无效，跳过收敛出场检查
+    entry_fair_yes: f64,
 ) {
     // WSS: 订阅 fill 事件（paper 模式下 wss_fill_tx 为 None，直接跳过）
     let mut fill_rx = shared
         .wss_fill_tx
         .as_ref()
         .map(|tx| tx.subscribe());
+    // 入场时的 PM 盘口中间价 = entry_price
+    let entry_pm_mid_yes = entry_price;
 
     spawn_detached("predator_exit_lifecycle", false, async move {
         let checkpoints = [3_000_u64, 15_000_u64, 60_000_u64, 300_000_u64];
@@ -5736,6 +5876,13 @@ fn spawn_predator_exit_lifecycle(
                     .unwrap_or(0.0);
             let time_to_expiry_ms = estimate_time_to_expiry_ms(&shared, &market_id, now_ms).await;
 
+            // 实时读取 PM 盘口中间价 — 收敛出场的关键输入
+            // 设计: 不增加任何外部调用，直接读内存中的盘口快照
+            let pm_mid_yes = {
+                let books = shared.latest_books.read().await;
+                books.get(&market_id).map(|b| (b.bid_yes + b.ask_yes) / 2.0).unwrap_or(0.0)
+            };
+
             let action = {
                 let mut manager = shared.predator_exit_manager.write().await;
                 manager.evaluate_market(
@@ -5745,15 +5892,72 @@ fn spawn_predator_exit_lifecycle(
                         unrealized_pnl_usdc,
                         true_prob,
                         time_to_expiry_ms,
+                        // 实时 PM 盘口中间价，用于计算收敛比例
+                        pm_mid_yes,
+                        entry_pm_mid_yes,
+                        entry_fair_yes,
                     },
                 )
             };
 
             if let Some(action) = action {
-                let reason = exit_reason_label(action.reason);
+                let reason_kind = action.reason.clone();
+                let reason = exit_reason_label(reason_kind.clone());
                 shared.shadow_stats.record_exit_reason(reason).await;
                 if exit_cfg.flatten_on_trigger {
                     let _ = bus.publish(EngineEvent::Control(ControlCommand::Flatten));
+                }
+                if matches!(
+                    reason_kind,
+                    ExitReason::Reversal100ms | ExitReason::Reversal300ms
+                ) {
+                    let maybe_book = shared.latest_books.read().await.get(&market_id).cloned();
+                    if let Some(book) = maybe_book {
+                        let fee_rate_bps = get_fee_rate_bps_cached(&shared, &market_id).await;
+                        if let Some(reentry_order) = build_reversal_reentry_order(
+                            &market_id,
+                            &side,
+                            &book,
+                            size,
+                            maker_ttl_ms,
+                            fee_rate_bps,
+                        ) {
+                            let quote_intent = QuoteIntent {
+                                market_id: reentry_order.market_id.clone(),
+                                side: reentry_order.side.clone(),
+                                price: reentry_order.price,
+                                size: reentry_order.size,
+                                ttl_ms: reentry_order.ttl_ms,
+                            };
+                            publish_if_telemetry_subscribers(
+                                &bus,
+                                EngineEvent::QuoteIntent(quote_intent),
+                            );
+                            match execution.place_order_v2(reentry_order).await {
+                                Ok(ack) if ack.accepted => {
+                                    shared.shadow_stats.mark_executed();
+                                    publish_if_telemetry_subscribers(
+                                        &bus,
+                                        EngineEvent::OrderAck(OrderAck {
+                                            order_id: ack.order_id,
+                                            market_id: ack.market_id,
+                                            accepted: true,
+                                            ts_ms: ack.ts_ms,
+                                        }),
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(err) => {
+                                    tracing::warn!(
+                                        market_id = %market_id,
+                                        symbol = %symbol,
+                                        error = %err,
+                                        "reversal maker re-entry failed"
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
                 tracing::info!(
                     position_id = %position_id,
@@ -5976,6 +6180,10 @@ fn spawn_shadow_outcome_task(
                             unrealized_pnl_usdc: outcome.net_markout_10s_usdc.unwrap_or(0.0),
                             true_prob,
                             time_to_expiry_ms: i64::MAX,
+                            // 轮询路径暂无实时 PM 盘口数据，收敛出场由 WSS fill 事件驱动
+                            pm_mid_yes: 0.0,
+                            entry_pm_mid_yes: 0.0,
+                            entry_fair_yes: 0.0,
                         },
                     )
                 };
@@ -7961,6 +8169,11 @@ fn load_exit_config() -> ExitConfig {
                     cfg.t300ms_reversal_bps = parsed;
                 }
             }
+            "t100ms_reversal_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.t100ms_reversal_bps = parsed;
+                }
+            }
             "time_stop_ms" => {
                 if let Ok(parsed) = val.parse::<u64>() {
                     cfg.time_stop_ms = parsed.clamp(50, 600_000);
@@ -8772,6 +8985,11 @@ fn load_settlement_config() -> SettlementConfig {
                 }
             }
             "endpoint" => cfg.endpoint = val.to_string(),
+            "required_for_live" => {
+                if let Ok(parsed) = val.parse::<bool>() {
+                    cfg.required_for_live = parsed;
+                }
+            }
             "poll_interval_ms" => {
                 if let Ok(parsed) = val.parse::<u64>() {
                     cfg.poll_interval_ms = parsed.clamp(250, 10_000);
@@ -9378,6 +9596,7 @@ fn persist_final_report_files(report: &ShadowFinalReport) {
             "gate_ready": report.live.gate_ready,
             "gate_ready_strict": report.live.gate_ready_strict,
             "gate_ready_effective": report.live.gate_ready_effective,
+            "last_30s_taker_fallback_count": report.live.last_30s_taker_fallback_count,
         },
         "data_chain": {
             "raw_fields": ["sha256", "source_seq", "ingest_seq", "event_ts_exchange_ms", "recv_ts_local_ns"],
@@ -9632,6 +9851,29 @@ mod tests {
             classify_execution_style(&book, &taker),
             ExecutionStyle::Taker
         );
+    }
+
+    #[test]
+    fn reversal_taker_flatten_then_opposite_maker_reentry_order_shape() {
+        let book = BookTop {
+            market_id: "m".to_string(),
+            token_id_yes: "yes".to_string(),
+            token_id_no: "no".to_string(),
+            bid_yes: 0.48,
+            ask_yes: 0.52,
+            bid_no: 0.47,
+            ask_no: 0.53,
+            ts_ms: 1,
+            recv_ts_local_ns: 1_000_000,
+        };
+        let order = build_reversal_reentry_order("m", &OrderSide::BuyYes, &book, 2.0, 400, 2.5)
+            .expect("reentry order");
+        assert_eq!(order.side, OrderSide::BuyNo);
+        assert_eq!(order.token_id.as_deref(), Some("no"));
+        assert_eq!(order.price, book.bid_no);
+        assert_eq!(order.style, ExecutionStyle::Maker);
+        assert_eq!(order.tif, OrderTimeInForce::PostOnly);
+        assert!(order.size > 0.0);
     }
 
     #[test]

@@ -4,6 +4,7 @@ enabled = true
 # Response JSON should be an object with symbol keys, e.g.
 # { "BTCUSDT": 69012.5, "ETHUSDT": 3810.2, "SOLUSDT": 186.3, "XRPUSDT": 0.91 }
 endpoint = ""
+required_for_live = true
 poll_interval_ms = 1000
 timeout_ms = 800
 symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]

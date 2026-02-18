@@ -178,6 +178,27 @@ pub struct ProbabilityEstimate {
     pub ts_ms: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum Stage {
+    Early,
+    Momentum,
+    Maturity,
+    Late,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecutionIntent {
+    pub market_id: String,
+    pub symbol: String,
+    pub side: OrderSide,
+    pub style: ExecutionStyle,
+    pub stage: Stage,
+    pub edge_net_bps: f64,
+    pub confidence: f64,
+    pub ts_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SourceHealth {
     pub source: String,
