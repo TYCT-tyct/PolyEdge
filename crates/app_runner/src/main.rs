@@ -3224,6 +3224,7 @@ fn spawn_strategy_engine(
         let mut last_direction_tick_event_ms: HashMap<String, i64> = HashMap::new();
         let mut market_inventory: HashMap<String, InventoryState> = HashMap::new();
         let mut market_rate_budget: HashMap<String, TokenBucket> = HashMap::new();
+        let mut pending_books: HashMap<String, BookTop> = HashMap::new();
         let mut untracked_issue_cooldown: HashMap<String, Instant> = HashMap::new();
         let mut book_lag_sample_at: HashMap<String, Instant> = HashMap::new();
         let mut global_rate_budget = TokenBucket::new(
@@ -3237,18 +3238,18 @@ fn spawn_strategy_engine(
         let strategy_max_coalesce = std::env::var("POLYEDGE_STRATEGY_MAX_COALESCE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(256)
-            .clamp(32, 4_096);
+            .unwrap_or(96)
+            .clamp(8, 1_024);
         let strategy_coalesce_min = std::env::var("POLYEDGE_STRATEGY_MIN_COALESCE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(16)
-            .clamp(1, 1_024);
+            .unwrap_or(4)
+            .clamp(1, 64);
         let strategy_coalesce_budget_us = std::env::var("POLYEDGE_STRATEGY_COALESCE_BUDGET_US")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(400)
-            .clamp(50, 10_000);
+            .unwrap_or(200)
+            .clamp(20, 2_000);
         let strategy_drop_stale_book_ms = std::env::var("POLYEDGE_STRATEGY_DROP_STALE_BOOK_MS")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
@@ -3268,33 +3269,40 @@ fn spawn_strategy_engine(
                 last_discovery_refresh = Instant::now();
             }
 
-            let ingress_event = tokio::select! {
-                ctrl = control_rx.recv() => {
-                    match ctrl {
-                        Ok(EngineEvent::Control(ControlCommand::Pause)) => {
-                            *paused.write().await = true;
-                            shared.shadow_stats.set_paused(true);
-                        }
-                        Ok(EngineEvent::Control(ControlCommand::Resume)) => {
-                            *paused.write().await = false;
-                            shared.shadow_stats.set_paused(false);
-                        }
-                        Ok(EngineEvent::Control(ControlCommand::Flatten)) => {
-                            if let Err(err) = execution.flatten_all().await {
-                                tracing::warn!(?err, "flatten from control event failed");
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(_) => {}
-                    }
+            let ingress_event = if let Some(next_market) = pending_books.keys().next().cloned() {
+                let Some(book) = pending_books.remove(&next_market) else {
                     continue;
-                }
-                maybe_ingress = ingress_rx.recv() => {
-                    let Some(event) = maybe_ingress else {
-                        shared.shadow_stats.record_issue("strategy_ingress_closed").await;
-                        break;
-                    };
-                    event
+                };
+                StrategyIngress::BookTop(book)
+            } else {
+                tokio::select! {
+                    ctrl = control_rx.recv() => {
+                        match ctrl {
+                            Ok(EngineEvent::Control(ControlCommand::Pause)) => {
+                                *paused.write().await = true;
+                                shared.shadow_stats.set_paused(true);
+                            }
+                            Ok(EngineEvent::Control(ControlCommand::Resume)) => {
+                                *paused.write().await = false;
+                                shared.shadow_stats.set_paused(false);
+                            }
+                            Ok(EngineEvent::Control(ControlCommand::Flatten)) => {
+                                if let Err(err) = execution.flatten_all().await {
+                                    tracing::warn!(?err, "flatten from control event failed");
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(_) => {}
+                        }
+                        continue;
+                    }
+                    maybe_ingress = ingress_rx.recv() => {
+                        let Some(event) = maybe_ingress else {
+                            shared.shadow_stats.record_issue("strategy_ingress_closed").await;
+                            break;
+                        };
+                        event
+                    }
                 }
             };
 
@@ -3331,45 +3339,33 @@ fn spawn_strategy_engine(
                 StrategyIngress::BookTop(mut book) => {
                     let parse_us = dispatch_start.elapsed().as_secs_f64() * 1_000_000.0;
                     shared.shadow_stats.push_parse_us(parse_us).await;
-                    // Coalesce bursty queue traffic to the freshest observable state.
-                    // This trims local backlog and avoids spending cycles on superseded snapshots.
+                    // Keep only the freshest observable state under burst.
                     let mut coalesced = 0_u64;
                     let coalesce_start = Instant::now();
-                    let dynamic_cap = ingress_rx
-                        .len()
-                        .saturating_add(64)
-                        .min(strategy_max_coalesce);
-                    let max_coalesced = dynamic_cap.max(strategy_coalesce_min);
-                    // -----------------------------------------------------------------------
-                    // A: 自适应 coalesce budget — 根据观测到的 book_top_lag p50 动态调整
-                    // 快速 feed (lag < 15ms): 100μs，立即处理，最小化决策延迟
-                    // 中速 feed (lag 15-40ms): 200μs，适度聚合
-                    // 慢速 feed (lag 40-80ms): 400μs，默认值
-                    // 极慢 feed (lag > 80ms): 800μs，多聚合减少无效计算
-                    // -----------------------------------------------------------------------
-                    let adaptive_coalesce_us = {
-                        let symbol_key = book.market_id.as_str();
-                        let lag_p50 = shared
+                    let queue_len = ingress_rx.len();
+                    let coalesce_policy = compute_coalesce_policy(
+                        queue_len,
+                        shared
                             .shadow_stats
-                            .book_top_lag_p50_ms_for_symbol_sync(symbol_key);
-                        match lag_p50 {
-                            Some(l) if l >= 80.0 => 800_u64,
-                            Some(l) if l >= 40.0 => strategy_coalesce_budget_us,
-                            Some(l) if l >= 15.0 => 200_u64,
-                            Some(_) => 100_u64,
-                            None => strategy_coalesce_budget_us, // 样本不足，回退静态值
-                        }
-                    };
-                    while coalesced < max_coalesced as u64 {
+                            .book_top_lag_p50_ms_for_symbol_sync(book.market_id.as_str()),
+                        strategy_max_coalesce,
+                        strategy_coalesce_min,
+                        strategy_coalesce_budget_us,
+                    );
+                    while coalesced < coalesce_policy.max_events as u64 {
                         if coalesced > 0
                             && (coalesce_start.elapsed().as_micros() as u64)
-                                >= adaptive_coalesce_us
+                                >= coalesce_policy.budget_us
                         {
                             break;
                         }
                         match ingress_rx.try_recv() {
                             Ok(StrategyIngress::BookTop(next_book)) => {
-                                book = next_book;
+                                if next_book.market_id == book.market_id {
+                                    book = next_book;
+                                } else {
+                                    pending_books.insert(next_book.market_id.clone(), next_book);
+                                }
                                 coalesced += 1;
                             }
                             Ok(StrategyIngress::RefTick(next_tick)) => {
@@ -7000,6 +6996,43 @@ fn estimate_feed_latency(tick: &RefTick, book: &BookTop) -> FeedLatencySample {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CoalescePolicy {
+    max_events: usize,
+    budget_us: u64,
+}
+
+fn compute_coalesce_policy(
+    queue_len: usize,
+    lag_p50_ms: Option<f64>,
+    strategy_max_coalesce: usize,
+    strategy_coalesce_min: usize,
+    strategy_coalesce_budget_us: u64,
+) -> CoalescePolicy {
+    // For shallow queues, process immediately to minimize tail latency.
+    if queue_len < 8 {
+        return CoalescePolicy {
+            max_events: 0,
+            budget_us: 0,
+        };
+    }
+
+    let dynamic_cap = queue_len.saturating_add(32).min(strategy_max_coalesce);
+    let max_events = dynamic_cap.max(strategy_coalesce_min);
+    let budget_us = match lag_p50_ms {
+        Some(l) if l >= 80.0 => 300_u64,
+        Some(l) if l >= 40.0 => strategy_coalesce_budget_us,
+        Some(l) if l >= 15.0 => 100_u64,
+        Some(_) => 50_u64,
+        None => strategy_coalesce_budget_us,
+    };
+
+    CoalescePolicy {
+        max_events,
+        budget_us,
+    }
+}
+
 fn is_anchor_ref_source(source: &str) -> bool {
     source == "chainlink_rtds"
 }
@@ -10256,5 +10289,22 @@ timeframes = ["5m", "15m", "1h", "1d"]
             &source_cfg,
         );
         assert_eq!(quiet, Regime::Quiet);
+    }
+
+    #[test]
+    fn compute_coalesce_policy_skips_for_shallow_queue() {
+        let p = compute_coalesce_policy(3, Some(10.0), 96, 4, 200);
+        assert_eq!(p.max_events, 0);
+        assert_eq!(p.budget_us, 0);
+    }
+
+    #[test]
+    fn compute_coalesce_policy_scales_for_deep_queue() {
+        let p = compute_coalesce_policy(40, Some(50.0), 96, 4, 200);
+        assert!(p.max_events >= 40);
+        assert_eq!(p.budget_us, 200);
+
+        let fast = compute_coalesce_policy(40, Some(10.0), 96, 4, 200);
+        assert_eq!(fast.budget_us, 50);
     }
 }
