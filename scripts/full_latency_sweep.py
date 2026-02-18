@@ -191,7 +191,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--dedupe-window-ms",
         type=int,
-        default=30,
+        default=120,
         help="dedupe window when applying fusion mode",
     )
     p.add_argument(

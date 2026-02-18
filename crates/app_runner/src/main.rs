@@ -2485,7 +2485,7 @@ async fn async_main() -> Result<()> {
     let strategy_input_queue_cap = std::env::var("POLYEDGE_STRATEGY_INPUT_QUEUE_CAP")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(2_048)
+        .unwrap_or(1_024)
         .clamp(256, 65_536);
     let (strategy_ingress_tx, strategy_ingress_rx) =
         mpsc::channel::<StrategyIngress>(strategy_input_queue_cap);
@@ -3238,17 +3238,17 @@ fn spawn_strategy_engine(
         let strategy_max_coalesce = std::env::var("POLYEDGE_STRATEGY_MAX_COALESCE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(512)
+            .unwrap_or(384)
             .clamp(8, 1_024);
         let strategy_coalesce_min = std::env::var("POLYEDGE_STRATEGY_MIN_COALESCE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(32)
+            .unwrap_or(16)
             .clamp(1, 128);
         let strategy_coalesce_budget_us = std::env::var("POLYEDGE_STRATEGY_COALESCE_BUDGET_US")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(800)
+            .unwrap_or(500)
             .clamp(20, 2_000);
         let strategy_drop_stale_book_ms = std::env::var("POLYEDGE_STRATEGY_DROP_STALE_BOOK_MS")
             .ok()
