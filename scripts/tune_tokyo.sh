@@ -65,8 +65,8 @@ POLYEDGE_UDP_SNDBUF_BYTES=4194304
 # UDP 发送器绑定到核心 2（与接收器分离）
 POLYEDGE_SENDER_PIN_CORE=2
 
-# 东京 → 爱尔兰 UDP 目标（爱尔兰服务器 IP）
-POLYEDGE_UDP_TARGET_HOST=54.77.232.166
+# 东京 → 爱尔兰 UDP 目标（跨区域 VPC peering 走私网）
+POLYEDGE_UDP_TARGET_HOST=10.0.3.123
 EOF
 
 echo "[F2] 环境变量写入 $ENV_FILE"
@@ -96,7 +96,7 @@ fi
 # F2-5: CPU governor
 # -----------------------------------------------------------------------
 if command -v cpupower &>/dev/null; then
-    cpupower frequency-set -g performance
+    cpupower frequency-set -g performance || true
     echo "[F2] ✅ CPU governor 设置为 performance"
 elif [ -d /sys/devices/system/cpu/cpu0/cpufreq ]; then
     for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do

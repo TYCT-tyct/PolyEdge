@@ -23,9 +23,6 @@ net.core.wmem_default = 1048576
 net.ipv4.tcp_rmem = 4096 1048576 8388608
 net.ipv4.tcp_wmem = 4096 1048576 8388608
 
-# 减少 TCP 延迟 — 禁用 Nagle 算法（reqwest 已设置，内核层保险）
-net.ipv4.tcp_nodelay = 1
-
 # Busy poll — 减少 epoll 唤醒延迟（50μs）
 # 适用于低延迟 WebSocket 连接（Polymarket CLOB）
 net.core.busy_read = 50
@@ -85,7 +82,7 @@ fi
 # F1-4: 禁用 CPU 频率调节（保持最高频率）
 # -----------------------------------------------------------------------
 if command -v cpupower &>/dev/null; then
-    cpupower frequency-set -g performance
+    cpupower frequency-set -g performance || true
     echo "[F1] ✅ CPU governor 设置为 performance"
 elif [ -d /sys/devices/system/cpu/cpu0/cpufreq ]; then
     for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
