@@ -2794,7 +2794,8 @@ fn spawn_reference_feed(
             HashMap::new();
         let mut latest_ws_recv_ns_by_symbol: HashMap<String, i64> = HashMap::new();
         let mut ws_primary_fallback_until_ns_by_symbol: HashMap<String, i64> = HashMap::new();
-        let mut fast_source_mix_by_symbol: HashMap<String, (u64, u64)> = HashMap::new();
+        let mut accepted_fast_mix_by_symbol: HashMap<String, (u64, u64)> = HashMap::new();
+        let mut accepted_fast_mix_total: (u64, u64) = (0, 0);
         let mut source_health_cfg = shared.source_health_cfg.read().await.clone();
         let mut source_health_cfg_refresh_at = Instant::now();
         let ref_tick_bus_enabled = std::env::var("POLYEDGE_REF_TICK_BUS_ENABLED")
@@ -2844,9 +2845,6 @@ fn spawn_reference_feed(
                         }
                     }
                     last_published_by_symbol.insert(tick.symbol.clone(), (source_ts, tick.price));
-                    stats
-                        .mark_ref_tick(tick.source.as_str(), tick.recv_ts_ms)
-                        .await;
                     if source_health_cfg_refresh_at.elapsed() >= Duration::from_millis(500) {
                         source_health_cfg = shared.source_health_cfg.read().await.clone();
                         source_health_cfg_refresh_at = Instant::now();
@@ -2854,21 +2852,6 @@ fn spawn_reference_feed(
                     let source_key = tick.source.clone();
                     let symbol_key = tick.symbol.clone();
                     let recv_ts_ms = tick.recv_ts_ms;
-                    if source_key == "binance_udp" || source_key == "binance_ws" {
-                        let entry = fast_source_mix_by_symbol
-                            .entry(symbol_key.clone())
-                            .or_default();
-                        if source_key == "binance_udp" {
-                            entry.0 = entry.0.saturating_add(1);
-                        } else {
-                            entry.1 = entry.1.saturating_add(1);
-                        }
-                        let total = entry.0.saturating_add(entry.1);
-                        if total > 100_000 {
-                            entry.0 /= 2;
-                            entry.1 /= 2;
-                        }
-                    }
                     if source_key == "binance_ws" {
                         let recv_ns = if tick.recv_ts_local_ns > 0 {
                             tick.recv_ts_local_ns
@@ -2897,8 +2880,9 @@ fn spawn_reference_feed(
                     runtime.last_recv_ts_ms = recv_ts_ms;
 
                     {
-                        let per_symbol =
-                            latest_price_by_symbol_source.entry(symbol_key).or_default();
+                        let per_symbol = latest_price_by_symbol_source
+                            .entry(symbol_key.clone())
+                            .or_default();
                         per_symbol.insert(source_key.clone(), tick.price);
                         if per_symbol.len() >= 2 {
                             let values = per_symbol.values().copied().collect::<Vec<_>>();
@@ -2927,21 +2911,14 @@ fn spawn_reference_feed(
                         map.insert(source_key.clone(), source_health.clone());
                     }
                     if tick.source == "binance_udp" {
-                        let udp_samples = source_runtime
-                            .get("binance_udp")
-                            .map(|s| s.sample_count)
-                            .unwrap_or(0);
-                        let ws_samples = source_runtime
-                            .get("binance_ws")
-                            .map(|s| s.sample_count)
-                            .unwrap_or(0);
+                        let (udp_samples, ws_samples) = accepted_fast_mix_total;
                         let fast_total = udp_samples.saturating_add(ws_samples);
                         let udp_share = if fast_total > 0 {
                             udp_samples as f64 / fast_total as f64
                         } else {
                             0.0
                         };
-                        let (sym_udp_samples, sym_ws_samples) = fast_source_mix_by_symbol
+                        let (sym_udp_samples, sym_ws_samples) = accepted_fast_mix_by_symbol
                             .get(tick.symbol.as_str())
                             .copied()
                             .unwrap_or((0, 0));
@@ -2970,18 +2947,16 @@ fn spawn_reference_feed(
                             .copied()
                             .map(|ws_ns| now_recv_ns.saturating_sub(ws_ns) <= udp_ws_freshness_ns())
                             .unwrap_or(false);
-                        let ws_health_good = source_runtime
-                            .get("binance_ws")
-                            .map(|ws| {
-                                ws.sample_count >= (source_health_cfg.min_samples / 2).max(8)
-                                    && ws.deviation_ema_bps
-                                        <= source_health_cfg.deviation_limit_bps * 1.2
-                            })
-                            .unwrap_or(false);
-
-                        if fusion.mode == "websocket_primary"
-                            && (!ws_recent || !ws_health_good || jitter_high || freshness_low)
-                        {
+                        let fallback_active_now = fusion.mode == "websocket_primary"
+                            && ws_primary_fallback_until_ns_by_symbol
+                                .get(tick.symbol.as_str())
+                                .map(|until| now_recv_ns < *until)
+                                .unwrap_or(false);
+                        if should_arm_ws_primary_fallback(
+                            fusion.mode.as_str(),
+                            ws_recent,
+                            fallback_active_now,
+                        ) {
                             let cooldown_ns =
                                 (fusion.fallback_cooldown_sec as i64).saturating_mul(1_000_000_000);
                             let fallback_until = now_recv_ns.saturating_add(cooldown_ns.max(0));
@@ -3001,38 +2976,36 @@ fn spawn_reference_feed(
 
                         let target_share = fusion.udp_share_cap.clamp(0.05, 0.95);
                         let share_high = effective_udp_share > target_share;
-                        let enforce_ws_primary =
-                            matches!(fusion.mode.as_str(), "active_active" | "websocket_primary")
-                                && !fallback_active
-                                && share_high
-                                && ws_recent
-                                && ws_health_good;
+                        let enforce_ws_primary = should_enforce_udp_share_cap(
+                            fusion.mode.as_str(),
+                            fallback_active,
+                            share_high,
+                            ws_recent,
+                        );
 
-                        if enforce_ws_primary || jitter_high || freshness_low {
-                            if ws_recent && ws_health_good {
-                                let share_ratio = (effective_udp_share / target_share).max(1.0);
-                                let base_keep_every = udp_downweight_keep_every().max(2);
-                                let dynamic_keep = share_ratio.ceil() as usize;
-                                let jitter_boost = if jitter_high { 2 } else { 1 };
-                                let freshness_boost = if freshness_low { 2 } else { 1 };
-                                let keep_every = base_keep_every
-                                    .max(dynamic_keep)
-                                    .max(base_keep_every.saturating_mul(jitter_boost))
-                                    .max(base_keep_every.saturating_mul(freshness_boost))
-                                    .clamp(2, 16);
-                                if (ingest_seq % keep_every as u64) != 0 {
-                                    metrics::counter!("fusion.udp_downweight_drop").increment(1);
-                                    if enforce_ws_primary {
-                                        metrics::counter!("fusion.udp_share_cap_drop").increment(1);
-                                    }
-                                    if jitter_high {
-                                        metrics::counter!("fusion.udp_jitter_drop").increment(1);
-                                    }
-                                    if freshness_low {
-                                        metrics::counter!("fusion.udp_freshness_drop").increment(1);
-                                    }
-                                    continue;
+                        if ws_recent && (enforce_ws_primary || jitter_high || freshness_low) {
+                            let share_ratio = (effective_udp_share / target_share).max(1.0);
+                            let base_keep_every = udp_downweight_keep_every().max(2);
+                            let dynamic_keep = share_ratio.ceil() as usize;
+                            let jitter_boost = if jitter_high { 2 } else { 1 };
+                            let freshness_boost = if freshness_low { 2 } else { 1 };
+                            let keep_every = base_keep_every
+                                .max(dynamic_keep)
+                                .max(base_keep_every.saturating_mul(jitter_boost))
+                                .max(base_keep_every.saturating_mul(freshness_boost))
+                                .clamp(2, 16);
+                            if (ingest_seq % keep_every as u64) != 0 {
+                                metrics::counter!("fusion.udp_downweight_drop").increment(1);
+                                if enforce_ws_primary {
+                                    metrics::counter!("fusion.udp_share_cap_drop").increment(1);
                                 }
+                                if jitter_high {
+                                    metrics::counter!("fusion.udp_jitter_drop").increment(1);
+                                }
+                                if freshness_low {
+                                    metrics::counter!("fusion.udp_freshness_drop").increment(1);
+                                }
+                                continue;
                             }
                         }
                     }
@@ -3054,6 +3027,33 @@ fn spawn_reference_feed(
                     if !valid {
                         stats.record_issue("invalid_ref_tick").await;
                         continue;
+                    }
+                    stats
+                        .mark_ref_tick(tick.source.as_str(), tick.recv_ts_ms)
+                        .await;
+                    if source_key == "binance_udp" || source_key == "binance_ws" {
+                        let entry = accepted_fast_mix_by_symbol
+                            .entry(symbol_key.clone())
+                            .or_default();
+                        if source_key == "binance_udp" {
+                            entry.0 = entry.0.saturating_add(1);
+                            accepted_fast_mix_total.0 = accepted_fast_mix_total.0.saturating_add(1);
+                        } else {
+                            entry.1 = entry.1.saturating_add(1);
+                            accepted_fast_mix_total.1 = accepted_fast_mix_total.1.saturating_add(1);
+                        }
+                        let total = entry.0.saturating_add(entry.1);
+                        if total > 100_000 {
+                            entry.0 /= 2;
+                            entry.1 /= 2;
+                        }
+                        let total_global = accepted_fast_mix_total
+                            .0
+                            .saturating_add(accepted_fast_mix_total.1);
+                        if total_global > 1_000_000 {
+                            accepted_fast_mix_total.0 /= 2;
+                            accepted_fast_mix_total.1 /= 2;
+                        }
                     }
 
                     if is_anchor {
@@ -7458,6 +7458,24 @@ fn fast_tick_allowed_in_fusion_mode(source: &str, mode: &str) -> bool {
     }
 }
 
+#[inline]
+fn should_arm_ws_primary_fallback(mode: &str, ws_recent: bool, fallback_active: bool) -> bool {
+    mode == "websocket_primary" && !ws_recent && !fallback_active
+}
+
+#[inline]
+fn should_enforce_udp_share_cap(
+    mode: &str,
+    fallback_active: bool,
+    share_high: bool,
+    ws_recent: bool,
+) -> bool {
+    matches!(mode, "active_active" | "websocket_primary")
+        && !fallback_active
+        && share_high
+        && ws_recent
+}
+
 fn ref_event_ts_ms(tick: &RefTick) -> i64 {
     tick.event_ts_exchange_ms.max(tick.event_ts_ms)
 }
@@ -10564,6 +10582,64 @@ mod tests {
         assert!(!fast_tick_allowed_in_fusion_mode(
             "binance_udp",
             "direct_only"
+        ));
+    }
+
+    #[test]
+    fn websocket_primary_fallback_arms_only_when_ws_unavailable() {
+        assert!(should_arm_ws_primary_fallback(
+            "websocket_primary",
+            false,
+            false
+        ));
+        assert!(!should_arm_ws_primary_fallback(
+            "websocket_primary",
+            true,
+            false
+        ));
+        assert!(!should_arm_ws_primary_fallback(
+            "websocket_primary",
+            false,
+            true
+        ));
+        assert!(!should_arm_ws_primary_fallback(
+            "active_active",
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn udp_share_cap_enforced_only_when_ws_is_available_and_no_fallback() {
+        assert!(should_enforce_udp_share_cap(
+            "websocket_primary",
+            false,
+            true,
+            true
+        ));
+        assert!(should_enforce_udp_share_cap(
+            "active_active",
+            false,
+            true,
+            true
+        ));
+        assert!(!should_enforce_udp_share_cap(
+            "websocket_primary",
+            true,
+            true,
+            true
+        ));
+        assert!(!should_enforce_udp_share_cap(
+            "websocket_primary",
+            false,
+            true,
+            false
+        ));
+        assert!(!should_enforce_udp_share_cap(
+            "websocket_primary",
+            false,
+            false,
+            true
         ));
     }
 

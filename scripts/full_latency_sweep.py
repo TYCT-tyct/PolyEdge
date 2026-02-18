@@ -89,10 +89,17 @@ def utc_day(ts: float | None = None) -> str:
     return dt.strftime("%Y-%m-%d")
 
 
-def collect_engine_series(base_url: str, seconds: int, poll_interval: float) -> Dict[str, Any]:
+def collect_engine_series(
+    base_url: str,
+    seconds: int,
+    poll_interval: float,
+    progress_sec: int,
+) -> Dict[str, Any]:
     session = requests.Session()
     atexit.register(session.close)
+    started = time.time()
     deadline = time.time() + max(1, seconds)
+    next_progress = started + max(1, progress_sec)
     samples = 0
     failures = 0
     last_live: Dict[str, Any] | None = None
@@ -173,6 +180,14 @@ def collect_engine_series(base_url: str, seconds: int, poll_interval: float) -> 
             samples += 1
         except Exception:
             failures += 1
+        now = time.time()
+        if progress_sec > 0 and now >= next_progress:
+            elapsed = int(now - started)
+            print(
+                f"[sweep] elapsed={elapsed}s/{seconds}s samples={samples} failures={failures}",
+                flush=True,
+            )
+            next_progress = now + max(1, progress_sec)
         time.sleep(max(0.2, poll_interval))
 
     return {
@@ -254,6 +269,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="optional websocket-primary fallback cooldown",
     )
+    p.add_argument(
+        "--progress-sec",
+        type=int,
+        default=10,
+        help="print progress heartbeat every N seconds (0 disables)",
+    )
     return p.parse_args()
 
 
@@ -287,9 +308,20 @@ def main() -> int:
         control["pre_live"] = get_json(args.base_url, "/report/shadow/live")
     except Exception:
         control["pre_live"] = None
+    print(
+        f"[sweep] start profile={args.profile} mode={args.fusion_mode or 'unchanged'} "
+        f"seconds={seconds} poll={poll_interval}s",
+        flush=True,
+    )
 
     async def run_all() -> tuple[Dict[str, Any], Dict[str, Any]]:
-        engine_task = asyncio.to_thread(collect_engine_series, args.base_url, seconds, poll_interval)
+        engine_task = asyncio.to_thread(
+            collect_engine_series,
+            args.base_url,
+            seconds,
+            poll_interval,
+            int(args.progress_sec),
+        )
         if args.skip_ws:
             engine_res = await engine_task
             return engine_res, {}

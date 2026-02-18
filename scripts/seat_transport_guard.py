@@ -7,6 +7,7 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,8 +21,17 @@ def utc_day(ts: float | None = None) -> str:
     return dt.strftime("%Y-%m-%d")
 
 
+def log(msg: str) -> None:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"[guard][{ts}] {msg}", flush=True)
+
+
 def run(cmd: List[str]) -> None:
+    started = time.time()
+    log(f"run: {' '.join(cmd)}")
     proc = subprocess.run(cmd, check=False)
+    elapsed = time.time() - started
+    log(f"exit={proc.returncode} elapsed={elapsed:.1f}s")
     if proc.returncode != 0:
         raise RuntimeError(f"command failed (exit={proc.returncode}): {' '.join(cmd)}")
 
@@ -180,6 +190,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--jitter-threshold-ms", type=float, default=25.0)
     p.add_argument("--fallback-cooldown-sec", type=int, default=300)
     p.add_argument(
+        "--skip-storm",
+        action="store_true",
+        help="skip storm_test.py phase for quick transport-only validation",
+    )
+    p.add_argument(
         "--no-rollback",
         action="store_true",
         help="do not apply rollback when regression is detected",
@@ -212,6 +227,8 @@ def run_phase(
         "--reset-shadow",
         "--warmup-sec",
         str(args.warmup_sec),
+        "--progress-sec",
+        "10",
     ]
     if include_candidate_params:
         sweep_cmd.extend(
@@ -226,24 +243,25 @@ def run_phase(
         )
     run(sweep_cmd)
 
-    storm_cmd = [
-        sys.executable,
-        "scripts/storm_test.py",
-        "--base-url",
-        args.base_url,
-        "--duration-sec",
-        str(args.storm_duration_sec),
-        "--concurrency",
-        str(args.storm_concurrency),
-        "--burst-rps",
-        str(args.storm_burst_rps),
-        "--out-root",
-        args.out_root,
-        "--run-id",
-        run_id,
-        "--use-run-dir",
-    ]
-    run(storm_cmd)
+    if not args.skip_storm:
+        storm_cmd = [
+            sys.executable,
+            "scripts/storm_test.py",
+            "--base-url",
+            args.base_url,
+            "--duration-sec",
+            str(args.storm_duration_sec),
+            "--concurrency",
+            str(args.storm_concurrency),
+            "--burst-rps",
+            str(args.storm_burst_rps),
+            "--out-root",
+            args.out_root,
+            "--run-id",
+            run_id,
+            "--use-run-dir",
+        ]
+        run(storm_cmd)
     return Path(args.out_root) / utc_day() / "runs" / run_id
 
 
@@ -252,7 +270,13 @@ def main() -> int:
     baseline_run_id = f"{args.run_id}-baseline"
     candidate_run_id = f"{args.run_id}-candidate"
 
+    log(
+        f"start run_id={args.run_id} baseline={args.baseline_mode} "
+        f"candidate={args.candidate_mode} profile={args.profile} skip_storm={args.skip_storm}"
+    )
+    log("phase=baseline")
     baseline_dir = run_phase(args.baseline_mode, baseline_run_id, args, False)
+    log("phase=candidate")
     candidate_dir = run_phase(args.candidate_mode, candidate_run_id, args, True)
 
     base_sweep = latest_sweep(baseline_dir)
@@ -288,6 +312,7 @@ def main() -> int:
     rollback_resp: Dict[str, Any] | None = None
 
     if regressed and not args.no_rollback:
+        log("regression detected; applying rollback to direct_only")
         rollback_payload = build_fusion_payload(
             mode="direct_only",
             dedupe_window_ms=args.dedupe_window_ms,
@@ -299,6 +324,10 @@ def main() -> int:
         post_json(args.base_url, "/control/reset_shadow", {})
         post_json(args.base_url, "/control/resume", {})
         rollback_applied = True
+    elif regressed:
+        log("regression detected; rollback skipped by --no-rollback")
+    else:
+        log("no regression detected")
 
     summary = {
         "ts_utc": datetime.now(timezone.utc).isoformat(),
