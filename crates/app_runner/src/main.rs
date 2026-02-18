@@ -1,10 +1,10 @@
 use std::collections::{HashMap, VecDeque};
-use std::future::Future;
 use std::fs::{self, OpenOptions};
+use std::future::Future;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
 use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
@@ -18,18 +18,18 @@ use axum::{Json, Router};
 use chrono::Utc;
 use core_types::{
     new_id, BookTop, CapitalUpdate, ControlCommand, Direction, DirectionSignal, EdgeAttribution,
-    EngineEvent, EnginePnLBreakdown, ExecutionStyle, ExecutionVenue, FairValueModel, InventoryState,
-    MarketFeed, MarketHealth, OrderAck, OrderIntentV2, OrderSide, OrderTimeInForce,
+    EngineEvent, EnginePnLBreakdown, ExecutionStyle, ExecutionVenue, FairValueModel,
+    InventoryState, MarketFeed, MarketHealth, OrderAck, OrderIntentV2, OrderSide, OrderTimeInForce,
     ProbabilityEstimate, QuoteEval, QuoteIntent, QuotePolicy, RefPriceFeed, RefTick, Regime,
-    RiskContext,
-    SourceHealth,
-    RiskManager, ShadowOutcome, ShadowShot, Signal, TimeframeClass, TimeframeOpp, ToxicDecision,
-    ToxicFeatures, ToxicRegime,
+    RiskContext, RiskManager, ShadowOutcome, ShadowShot, Signal, SourceHealth, TimeframeClass,
+    TimeframeOpp, ToxicDecision, ToxicFeatures, ToxicRegime,
 };
 use dashmap::DashMap;
 use direction_detector::{DirectionConfig, DirectionDetector};
-use exit_manager::{ExitManager, ExitManagerConfig, ExitReason, MarketEvalInput, PositionLifecycle};
 use execution_clob::{ClobExecution, ExecutionMode};
+use exit_manager::{
+    ExitManager, ExitManagerConfig, ExitReason, MarketEvalInput, PositionLifecycle,
+};
 use fair_value::{BasisMrConfig, BasisMrFairValue};
 use feed_polymarket::PolymarketFeed;
 use feed_reference::MultiSourceRefFeed;
@@ -63,8 +63,8 @@ use engine_core::{
     is_quote_reject_reason, normalize_reject_code,
 };
 use stats_utils::{
-    freshness_ms, now_ns, percentile, policy_block_ratio, push_capped,
-    percentile_deque_capped, quote_block_ratio, robust_filter_iqr, value_to_f64,
+    freshness_ms, now_ns, percentile, percentile_deque_capped, policy_block_ratio, push_capped,
+    quote_block_ratio, robust_filter_iqr, value_to_f64,
 };
 
 #[derive(Clone)]
@@ -122,7 +122,6 @@ enum PredatorCPriority {
     TakerOnly,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct PredatorCConfig {
     enabled: bool,
@@ -130,6 +129,7 @@ struct PredatorCConfig {
     direction_detector: DirectionConfig,
     probability_engine: ProbabilityEngineConfig,
     taker_sniper: TakerSniperConfig,
+    strategy_d: PredatorDConfig,
     regime: PredatorRegimeConfig,
     cross_symbol: PredatorCrossSymbolConfig,
     router: RouterConfig,
@@ -144,10 +144,34 @@ impl Default for PredatorCConfig {
             direction_detector: DirectionConfig::default(),
             probability_engine: ProbabilityEngineConfig::default(),
             taker_sniper: TakerSniperConfig::default(),
+            strategy_d: PredatorDConfig::default(),
             regime: PredatorRegimeConfig::default(),
             cross_symbol: PredatorCrossSymbolConfig::default(),
             router: RouterConfig::default(),
             compounder: CompounderConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct PredatorDConfig {
+    enabled: bool,
+    min_gap_bps: f64,
+    min_edge_net_bps: f64,
+    min_confidence: f64,
+    max_notional_usdc: f64,
+    cooldown_ms_per_market: u64,
+}
+
+impl Default for PredatorDConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_gap_bps: 25.0,
+            min_edge_net_bps: 15.0,
+            min_confidence: 0.65,
+            max_notional_usdc: 25.0,
+            cooldown_ms_per_market: 500,
         }
     }
 }
@@ -245,9 +269,12 @@ struct EngineShared {
     predator_latest_probability: Arc<RwLock<HashMap<String, ProbabilityEstimate>>>,
     predator_probability_engine: Arc<RwLock<ProbabilityEngine>>,
     predator_taker_sniper: Arc<RwLock<TakerSniper>>,
+    predator_d_last_fire_ms: Arc<RwLock<HashMap<String, i64>>>,
     predator_router: Arc<RwLock<TimeframeRouter>>,
     predator_compounder: Arc<RwLock<SettlementCompounder>>,
     predator_exit_manager: Arc<RwLock<ExitManager>>,
+    /// WSS User Channel fill broadcaster — None in paper mode
+    wss_fill_tx: Option<Arc<tokio::sync::broadcast::Sender<execution_clob::wss_user_feed::WssFillEvent>>>,
 }
 
 #[derive(Serialize)]
@@ -300,6 +327,12 @@ struct ProbabilityReloadReq {
     momentum_gain: Option<f64>,
     lag_penalty_per_ms: Option<f64>,
     confidence_floor: Option<f64>,
+    sigma_annual: Option<f64>,
+    horizon_sec: Option<f64>,
+    drift_annual: Option<f64>,
+    velocity_drift_gain: Option<f64>,
+    acceleration_drift_gain: Option<f64>,
+    fair_blend_weight: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -342,6 +375,11 @@ struct RiskReloadReq {
     daily_drawdown_cap_pct: Option<f64>,
     max_loss_streak: Option<u32>,
     cooldown_sec: Option<u64>,
+    progressive_enabled: Option<bool>,
+    drawdown_tier1_ratio: Option<f64>,
+    drawdown_tier2_ratio: Option<f64>,
+    tier1_size_scale: Option<f64>,
+    tier2_size_scale: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -521,7 +559,7 @@ struct SettlementConfig {
 impl Default for SettlementConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             endpoint: String::new(),
             poll_interval_ms: 1_000,
             timeout_ms: 800,
@@ -558,6 +596,7 @@ impl Default for SourceHealthConfig {
 
 fn to_exit_manager_config(cfg: &ExitConfig) -> ExitManagerConfig {
     ExitManagerConfig {
+        t100ms_reversal_bps: cfg.t300ms_reversal_bps.min(-1.0) * 1.5,
         t300ms_reversal_bps: cfg.t300ms_reversal_bps,
         t3_take_ratio: cfg.t3_take_ratio.clamp(0.0, 5.0),
         t15_min_unrealized_usdc: cfg.t15_min_unrealized_usdc,
@@ -572,6 +611,7 @@ fn to_exit_manager_config(cfg: &ExitConfig) -> ExitManagerConfig {
 fn exit_reason_label(reason: ExitReason) -> &'static str {
     match reason {
         ExitReason::StopLoss => "stop_loss",
+        ExitReason::Reversal100ms => "t_plus_100ms_reversal",
         ExitReason::Reversal300ms => "t_plus_300ms_reversal",
         ExitReason::TakeProfit3s => "t_plus_3s",
         ExitReason::TakeProfit15s => "t_plus_15s",
@@ -588,6 +628,10 @@ struct ExecutionConfig {
     clob_endpoint: String,
     #[serde(default)]
     order_endpoint: Option<String>,
+    #[serde(default)]
+    order_backup_endpoint: Option<String>,
+    #[serde(default)]
+    order_failover_timeout_ms: u64,
 }
 
 impl Default for ExecutionConfig {
@@ -598,6 +642,8 @@ impl Default for ExecutionConfig {
             http_timeout_ms: 3000,
             clob_endpoint: "https://clob.polymarket.com".to_string(),
             order_endpoint: None,
+            order_backup_endpoint: None,
+            order_failover_timeout_ms: 200,
         }
     }
 }
@@ -1298,7 +1344,9 @@ impl ShadowStats {
     }
 
     fn loss_streak(&self) -> u32 {
-        self.loss_streak.load(Ordering::Relaxed).min(u32::MAX as u64) as u32
+        self.loss_streak
+            .load(Ordering::Relaxed)
+            .min(u32::MAX as u64) as u32
     }
 
     async fn window_outcomes_len(&self) -> usize {
@@ -1327,12 +1375,20 @@ impl ShadowStats {
     ) {
         let mut s = self.samples.write().await;
         push_capped(&mut s.feed_in_ms, feed_in_ms, Self::SAMPLE_CAP);
-        push_capped(&mut s.source_latency_ms, source_latency_ms, Self::SAMPLE_CAP);
+        push_capped(
+            &mut s.source_latency_ms,
+            source_latency_ms,
+            Self::SAMPLE_CAP,
+        );
         push_capped(&mut s.book_latency_ms, book_latency_ms, Self::SAMPLE_CAP);
         push_capped(&mut s.local_backlog_ms, local_backlog_ms, Self::SAMPLE_CAP);
         push_capped(&mut s.ref_decode_ms, ref_decode_ms, Self::SAMPLE_CAP);
         // Contract: decision_queue_wait is the queue/backlog time we spent waiting locally.
-        push_capped(&mut s.decision_queue_wait_ms, local_backlog_ms, Self::SAMPLE_CAP);
+        push_capped(
+            &mut s.decision_queue_wait_ms,
+            local_backlog_ms,
+            Self::SAMPLE_CAP,
+        );
     }
 
     async fn push_decision_compute_ms(&self, ms: f64) {
@@ -1364,6 +1420,23 @@ impl ShadowStats {
         let mut by_symbol = self.book_top_lag_by_symbol_ms.write().await;
         let entry = by_symbol.entry(symbol.to_string()).or_default();
         push_capped(entry, ms, 4_096);
+    }
+
+    // -----------------------------------------------------------------------
+    // A: 自适应 coalesce budget 辅助 — 同步读取 p50 lag（非 async）
+    // 用 try_read() 避免在热路径上引入 await 点；
+    // 锁竞争时返回 None，调用方回退到静态默认值。
+    // -----------------------------------------------------------------------
+    fn book_top_lag_p50_ms_for_symbol_sync(&self, symbol: &str) -> Option<f64> {
+        let by_symbol = self.book_top_lag_by_symbol_ms.try_read().ok()?;
+        let samples = by_symbol.get(symbol)?;
+        if samples.len() < 8 {
+            return None; // 样本不足，不可信
+        }
+        let mut sorted = samples.clone();
+        sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let idx = (sorted.len() as f64 * 0.50) as usize;
+        sorted.get(idx.min(sorted.len().saturating_sub(1))).copied()
     }
 
     async fn record_survival_probe(&self, symbol: &str, delay_ms: u64, survived: bool) {
@@ -1407,7 +1480,8 @@ impl ShadowStats {
             self.probability_degraded.fetch_add(1, Ordering::Relaxed);
         }
         let mut s = self.samples.write().await;
-        let delta_bps = ((estimate.p_settle - estimate.p_fast).abs() * 10_000.0).clamp(0.0, 10_000.0);
+        let delta_bps =
+            ((estimate.p_settle - estimate.p_fast).abs() * 10_000.0).clamp(0.0, 10_000.0);
         push_capped(&mut s.settle_fast_delta_bps, delta_bps, Self::SAMPLE_CAP);
         push_capped(
             &mut s.probability_confidence,
@@ -1566,7 +1640,8 @@ impl ShadowStats {
     }
 
     fn mark_predator_cross_symbol_fired(&self) {
-        self.predator_cross_symbol_fired.fetch_add(1, Ordering::Relaxed);
+        self.predator_cross_symbol_fired
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     async fn mark_predator_taker_skipped(&self, reason: &str) {
@@ -1780,7 +1855,10 @@ impl ShadowStats {
         let mut source_mix_ratio = HashMap::new();
         if ref_ticks_total > 0 {
             for (source, cnt) in &source_counts {
-                source_mix_ratio.insert(source.clone(), (*cnt as f64 / ref_ticks_total as f64).clamp(0.0, 1.0));
+                source_mix_ratio.insert(
+                    source.clone(),
+                    (*cnt as f64 / ref_ticks_total as f64).clamp(0.0, 1.0),
+                );
             }
         }
         let mut exit_reason_top = exit_reason_counts.into_iter().collect::<Vec<_>>();
@@ -1913,8 +1991,7 @@ impl ShadowStats {
         let predator_regime_active = self.predator_regime_active.load(Ordering::Relaxed);
         let predator_regime_quiet = self.predator_regime_quiet.load(Ordering::Relaxed);
         let predator_regime_defend = self.predator_regime_defend.load(Ordering::Relaxed);
-        let predator_cross_symbol_fired =
-            self.predator_cross_symbol_fired.load(Ordering::Relaxed);
+        let predator_cross_symbol_fired = self.predator_cross_symbol_fired.load(Ordering::Relaxed);
         let skip_reasons = self.predator_taker_skip_reasons.read().await.clone();
         let mut skip_top = skip_reasons.into_iter().collect::<Vec<_>>();
         skip_top.sort_by(|a, b| b.1.cmp(&a.1));
@@ -2186,14 +2263,13 @@ async fn async_main() -> Result<()> {
         }
         ExecutionMode::Paper
     };
-    let order_endpoint = execution_cfg
-        .order_endpoint
-        .clone()
-        .unwrap_or_else(|| execution_cfg.clob_endpoint.clone());
-    let execution = Arc::new(ClobExecution::new_with_timeout(
+    let execution = Arc::new(ClobExecution::new_with_order_routing(
         exec_mode,
-        order_endpoint,
+        execution_cfg.clob_endpoint.clone(),
+        execution_cfg.order_endpoint.clone(),
+        execution_cfg.order_backup_endpoint.clone(),
         Duration::from_millis(execution_cfg.http_timeout_ms),
+        Duration::from_millis(execution_cfg.order_failover_timeout_ms.max(10)),
     ));
 
     // Optional: prewarm the execution HTTP client pool to reduce first-ack latency spikes.
@@ -2264,7 +2340,10 @@ async fn async_main() -> Result<()> {
     let predator_taker_sniper = Arc::new(RwLock::new(TakerSniper::new(
         predator_cfg0.taker_sniper.clone(),
     )));
-    let predator_router = Arc::new(RwLock::new(TimeframeRouter::new(predator_cfg0.router.clone())));
+    let predator_d_last_fire_ms = Arc::new(RwLock::new(HashMap::new()));
+    let predator_router = Arc::new(RwLock::new(TimeframeRouter::new(
+        predator_cfg0.router.clone(),
+    )));
     let predator_compounder = Arc::new(RwLock::new(SettlementCompounder::new(
         predator_cfg0.compounder.clone(),
     )));
@@ -2311,9 +2390,29 @@ async fn async_main() -> Result<()> {
         predator_latest_probability,
         predator_probability_engine,
         predator_taker_sniper,
+        predator_d_last_fire_ms,
         predator_router,
         predator_compounder,
         predator_exit_manager,
+        // WSS User Channel: live 模式下启动实时 fill 通知
+        // paper 模式下 wss_fill_tx = None，exit lifecycle 回退到纯 timer 路径
+        wss_fill_tx: {
+            let is_live = execution_cfg.mode.as_str() == "live";
+            let api_key = std::env::var("POLYEDGE_CLOB_API_KEY").unwrap_or_default();
+            if is_live && !api_key.is_empty() {
+                let wss_url = std::env::var("POLYEDGE_WSS_USER_URL")
+                    .unwrap_or_else(|_| "wss://ws-subscriptions-clob.polymarket.com/ws/user".to_string());
+                let (tx, _rx) = tokio::sync::broadcast::channel::<execution_clob::wss_user_feed::WssFillEvent>(64);
+                let tx = Arc::new(tx);
+                let tx_clone = tx.clone();
+                tokio::spawn(async move {
+                    execution_clob::wss_user_feed::run_wss_loop_with_sender(tx_clone, wss_url, api_key).await;
+                });
+                Some(tx)
+            } else {
+                None
+            }
+        },
     });
     let strategy_input_queue_cap = std::env::var("POLYEDGE_STRATEGY_INPUT_QUEUE_CAP")
         .ok()
@@ -2454,11 +2553,10 @@ fn spawn_reference_feed(
             .ok()
             .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
             .unwrap_or(true);
-        let strategy_ingress_drop_on_full =
-            std::env::var("POLYEDGE_STRATEGY_INGRESS_DROP_ON_FULL")
-                .ok()
-                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
-                .unwrap_or(true);
+        let strategy_ingress_drop_on_full = std::env::var("POLYEDGE_STRATEGY_INGRESS_DROP_ON_FULL")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+            .unwrap_or(true);
         let strategy_ref_ingress_enabled = std::env::var("POLYEDGE_STRATEGY_REF_INGRESS_ENABLED")
             .ok()
             .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
@@ -2532,7 +2630,8 @@ fn spawn_reference_feed(
         let mut last_source_ts_by_stream: HashMap<String, i64> = HashMap::new();
         let mut last_published_by_symbol: HashMap<String, (i64, f64)> = HashMap::new();
         let mut source_runtime: HashMap<String, SourceRuntimeStats> = HashMap::new();
-        let mut latest_price_by_symbol_source: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        let mut latest_price_by_symbol_source: HashMap<String, HashMap<String, f64>> =
+            HashMap::new();
         let mut source_health_cfg = shared.source_health_cfg.read().await.clone();
         let mut source_health_cfg_refresh_at = Instant::now();
         let ref_tick_bus_enabled = std::env::var("POLYEDGE_REF_TICK_BUS_ENABLED")
@@ -2548,7 +2647,10 @@ fn spawn_reference_feed(
                     if fusion.mode == "udp_only" && !matches!(lane, RefLane::Udp) && !is_anchor {
                         continue;
                     }
-                    if fusion.mode == "direct_only" && !matches!(lane, RefLane::Direct) && !is_anchor {
+                    if fusion.mode == "direct_only"
+                        && !matches!(lane, RefLane::Direct)
+                        && !is_anchor
+                    {
                         continue;
                     }
                     ingest_seq = ingest_seq.saturating_add(1);
@@ -2580,7 +2682,9 @@ fn spawn_reference_feed(
                         }
                     }
                     last_published_by_symbol.insert(tick.symbol.clone(), (source_ts, tick.price));
-                    stats.mark_ref_tick(tick.source.as_str(), tick.recv_ts_ms).await;
+                    stats
+                        .mark_ref_tick(tick.source.as_str(), tick.recv_ts_ms)
+                        .await;
                     if source_health_cfg_refresh_at.elapsed() >= Duration::from_millis(500) {
                         source_health_cfg = shared.source_health_cfg.read().await.clone();
                         source_health_cfg_refresh_at = Instant::now();
@@ -2608,16 +2712,15 @@ fn spawn_reference_feed(
                     runtime.last_recv_ts_ms = recv_ts_ms;
 
                     {
-                        let per_symbol = latest_price_by_symbol_source
-                            .entry(symbol_key)
-                            .or_default();
+                        let per_symbol =
+                            latest_price_by_symbol_source.entry(symbol_key).or_default();
                         per_symbol.insert(source_key.clone(), tick.price);
                         if per_symbol.len() >= 2 {
                             let values = per_symbol.values().copied().collect::<Vec<_>>();
                             if let Some(median) = median_price(&values) {
                                 if median.is_finite() && median > 0.0 {
-                                    let dev_bps =
-                                        ((tick.price - median).abs() / median * 10_000.0).clamp(0.0, 10_000.0);
+                                    let dev_bps = ((tick.price - median).abs() / median * 10_000.0)
+                                        .clamp(0.0, 10_000.0);
                                     if runtime.sample_count <= 1 {
                                         runtime.deviation_ema_bps = dev_bps;
                                     } else {
@@ -2804,7 +2907,9 @@ async fn settlement_prob_yes_for_symbol(
 fn blend_settlement_probability(p_fast_yes: f64, fast_price: f64, settle_price: f64) -> f64 {
     // When fast and settlement feeds diverge, pull probability toward 0.5.
     // This keeps execution conservative until settlement alignment recovers.
-    let gap = ((fast_price - settle_price) / settle_price).abs().clamp(0.0, 0.03);
+    let gap = ((fast_price - settle_price) / settle_price)
+        .abs()
+        .clamp(0.0, 0.03);
     let settle_blend = (gap * 20.0).clamp(0.0, 0.25);
     let p = (p_fast_yes.clamp(0.0, 1.0) * (1.0 - settle_blend)) + (0.5 * settle_blend);
     p.clamp(0.0, 1.0)
@@ -2851,7 +2956,8 @@ fn build_source_health_snapshot(
     let price_deviation_bps = stats.deviation_ema_bps.max(0.0);
 
     let jitter_penalty = (jitter_ms / cfg.jitter_limit_ms.max(1e-6)).clamp(0.0, 2.0);
-    let deviation_penalty = (price_deviation_bps / cfg.deviation_limit_bps.max(1e-6)).clamp(0.0, 2.0);
+    let deviation_penalty =
+        (price_deviation_bps / cfg.deviation_limit_bps.max(1e-6)).clamp(0.0, 2.0);
     let out_of_order_penalty = (out_of_order_rate / 0.02).clamp(0.0, 2.0);
     let gap_penalty = (gap_rate / 0.02).clamp(0.0, 2.0);
     let coverage = (stats.sample_count as f64 / cfg.min_samples.max(1) as f64).clamp(0.0, 1.0);
@@ -2893,11 +2999,10 @@ fn spawn_market_feed(
     const RECONNECT_BASE_MS: u64 = 250;
     const RECONNECT_MAX_MS: u64 = 10_000;
     spawn_detached("market_feed_orchestrator", true, async move {
-        let strategy_ingress_drop_on_full =
-            std::env::var("POLYEDGE_STRATEGY_INGRESS_DROP_ON_FULL")
-                .ok()
-                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
-                .unwrap_or(true);
+        let strategy_ingress_drop_on_full = std::env::var("POLYEDGE_STRATEGY_INGRESS_DROP_ON_FULL")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+            .unwrap_or(true);
         let mut reconnects: u64 = 0;
         loop {
             let feed = PolymarketFeed::new_with_universe(
@@ -3083,12 +3188,11 @@ fn spawn_strategy_engine(
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(800.0)
             .clamp(50.0, 5_000.0);
-        let strategy_max_decision_backlog_ms =
-            std::env::var("POLYEDGE_MAX_DECISION_BACKLOG_MS")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(0.90)
-                .clamp(0.10, 50.0);
+        let strategy_max_decision_backlog_ms = std::env::var("POLYEDGE_MAX_DECISION_BACKLOG_MS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.90)
+            .clamp(0.10, 50.0);
         let mut stale_book_drops: u64 = 0;
         refresh_market_symbol_map(&shared).await;
 
@@ -3170,10 +3274,30 @@ fn spawn_strategy_engine(
                         .saturating_add(64)
                         .min(strategy_max_coalesce);
                     let max_coalesced = dynamic_cap.max(strategy_coalesce_min);
+                    // -----------------------------------------------------------------------
+                    // A: 自适应 coalesce budget — 根据观测到的 book_top_lag p50 动态调整
+                    // 快速 feed (lag < 15ms): 100μs，立即处理，最小化决策延迟
+                    // 中速 feed (lag 15-40ms): 200μs，适度聚合
+                    // 慢速 feed (lag 40-80ms): 400μs，默认值
+                    // 极慢 feed (lag > 80ms): 800μs，多聚合减少无效计算
+                    // -----------------------------------------------------------------------
+                    let adaptive_coalesce_us = {
+                        let symbol_key = book.market_id.as_str();
+                        let lag_p50 = shared
+                            .shadow_stats
+                            .book_top_lag_p50_ms_for_symbol_sync(symbol_key);
+                        match lag_p50 {
+                            Some(l) if l >= 80.0 => 800_u64,
+                            Some(l) if l >= 40.0 => strategy_coalesce_budget_us,
+                            Some(l) if l >= 15.0 => 200_u64,
+                            Some(_) => 100_u64,
+                            None => strategy_coalesce_budget_us, // 样本不足，回退静态值
+                        }
+                    };
                     while coalesced < max_coalesced as u64 {
                         if coalesced > 0
                             && (coalesce_start.elapsed().as_micros() as u64)
-                                >= strategy_coalesce_budget_us
+                                >= adaptive_coalesce_us
                         {
                             break;
                         }
@@ -3183,7 +3307,8 @@ fn spawn_strategy_engine(
                                 coalesced += 1;
                             }
                             Ok(StrategyIngress::RefTick(next_tick)) => {
-                                let next_is_anchor = is_anchor_ref_source(next_tick.source.as_str());
+                                let next_is_anchor =
+                                    is_anchor_ref_source(next_tick.source.as_str());
                                 if !next_is_anchor
                                     && !fast_tick_allowed_in_fusion_mode(
                                         next_tick.source.as_str(),
@@ -3202,7 +3327,10 @@ fn spawn_strategy_engine(
                             }
                             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                                shared.shadow_stats.record_issue("strategy_ingress_disconnected").await;
+                                shared
+                                    .shadow_stats
+                                    .record_issue("strategy_ingress_disconnected")
+                                    .await;
                                 break;
                             }
                         }
@@ -3245,10 +3373,7 @@ fn spawn_strategy_engine(
                     shared.shadow_stats.mark_filled(fills.len() as u64);
                     for fill in fills {
                         portfolio.apply_fill(&fill);
-                        publish_if_telemetry_subscribers(
-                            &bus,
-                            EngineEvent::Fill(fill.clone()),
-                        );
+                        publish_if_telemetry_subscribers(&bus, EngineEvent::Fill(fill.clone()));
                         let ingest_seq = next_normalized_ingest_seq();
                         append_jsonl(
                             &dataset_path("normalized", "fills.jsonl"),
@@ -3321,8 +3446,7 @@ fn spawn_strategy_engine(
                         let fusion = shared.fusion_cfg.read().await;
                         fusion.mode.clone()
                     };
-                    if !fast_tick_allowed_in_fusion_mode(tick_fast.source.as_str(), &fusion_mode)
-                    {
+                    if !fast_tick_allowed_in_fusion_mode(tick_fast.source.as_str(), &fusion_mode) {
                         shared
                             .shadow_stats
                             .record_issue("tick_source_mode_mismatch")
@@ -3371,7 +3495,8 @@ fn spawn_strategy_engine(
                     //
                     // Guardrail: if the tick is already old, this is not a meaningful "lag window"
                     // measurement and would inflate p50/p99. We only sample when the tick is fresh.
-                    let tick_age_ms = freshness_ms(Utc::now().timestamp_millis(), tick_fast.recv_ts_ms);
+                    let tick_age_ms =
+                        freshness_ms(Utc::now().timestamp_millis(), tick_fast.recv_ts_ms);
                     let stale_ms = tick_age_ms.max(0) as f64;
                     let book_top_lag_ms = if tick_age_ms <= 1_500
                         && tick_fast.recv_ts_local_ns > 0
@@ -3418,10 +3543,12 @@ fn spawn_strategy_engine(
                     metrics::histogram!("latency.feed_in_ms").record(feed_in_ms);
                     metrics::histogram!("latency.source_latency_ms")
                         .record(latency_sample.source_latency_ms);
-                    metrics::histogram!("latency.book_latency_ms").record(latency_sample.book_latency_ms);
+                    metrics::histogram!("latency.book_latency_ms")
+                        .record(latency_sample.book_latency_ms);
                     metrics::histogram!("latency.local_backlog_ms")
                         .record(latency_sample.local_backlog_ms);
-                    metrics::histogram!("latency.ref_decode_ms").record(latency_sample.ref_decode_ms);
+                    metrics::histogram!("latency.ref_decode_ms")
+                        .record(latency_sample.ref_decode_ms);
                     if latency_sample.local_backlog_ms > strategy_max_decision_backlog_ms {
                         shared
                             .shadow_stats
@@ -3547,8 +3674,10 @@ fn spawn_strategy_engine(
                         );
                         let mut tox_decision = evaluate_toxicity(&tox_features, &tox_cfg);
                         let score_scale = (tox_cfg.k_spread / 1.5).clamp(0.25, 4.0);
-                        tox_decision.tox_score = (tox_decision.tox_score * score_scale).clamp(0.0, 1.0);
-                        tox_decision.regime = if tox_decision.tox_score >= tox_cfg.caution_threshold {
+                        tox_decision.tox_score =
+                            (tox_decision.tox_score * score_scale).clamp(0.0, 1.0);
+                        tox_decision.regime = if tox_decision.tox_score >= tox_cfg.caution_threshold
+                        {
                             ToxicRegime::Danger
                         } else if tox_decision.tox_score >= tox_cfg.safe_threshold {
                             ToxicRegime::Caution
@@ -3560,7 +3689,9 @@ fn spawn_strategy_engine(
                         let mut cooldown_until_ms1 = cooldown_until_ms0;
                         if now_ms < cooldown_until_ms0 {
                             tox_decision.regime = ToxicRegime::Danger;
-                            tox_decision.reason_codes.push("cooldown_active".to_string());
+                            tox_decision
+                                .reason_codes
+                                .push("cooldown_active".to_string());
                         }
                         // Note: cooldown is based on the pre-warmup regime, matching the old behavior.
                         if matches!(tox_decision.regime, ToxicRegime::Danger) {
@@ -3605,7 +3736,11 @@ fn spawn_strategy_engine(
                         // Step D: rank decision (read-lock, uses updated market_score).
                         let active_by_rank = {
                             let states = shared.tox_state.read().await;
-                            is_market_in_top_n(&states, &book.market_id, tox_cfg.active_top_n_markets)
+                            is_market_in_top_n(
+                                &states,
+                                &book.market_id,
+                                tox_cfg.active_top_n_markets,
+                            )
                         };
 
                         (
@@ -3799,8 +3934,30 @@ fn spawn_strategy_engine(
                                 now_ms,
                             )
                             .await;
-                            total_res.attempted = total_res.attempted.saturating_add(cross_res.attempted);
-                            total_res.executed = total_res.executed.saturating_add(cross_res.executed);
+                            total_res.attempted =
+                                total_res.attempted.saturating_add(cross_res.attempted);
+                            total_res.executed =
+                                total_res.executed.saturating_add(cross_res.executed);
+                        }
+                        if predator_cfg.strategy_d.enabled {
+                            let d_res = run_predator_d_for_symbol(
+                                &shared,
+                                &bus,
+                                &portfolio,
+                                &execution,
+                                &shadow,
+                                &mut market_rate_budget,
+                                &mut global_rate_budget,
+                                &predator_cfg,
+                                &symbol,
+                                tick_fast.recv_ts_ms,
+                                tick_fast.recv_ts_local_ns,
+                                now_ms,
+                            )
+                            .await;
+                            total_res.attempted =
+                                total_res.attempted.saturating_add(d_res.attempted);
+                            total_res.executed = total_res.executed.saturating_add(d_res.executed);
                         }
                         if matches!(predator_cfg.priority, PredatorCPriority::TakerOnly) {
                             continue;
@@ -3892,6 +4049,23 @@ fn spawn_strategy_engine(
                                     &mut global_rate_budget,
                                     &predator_cfg,
                                     &leader_direction,
+                                    tick_fast.recv_ts_ms,
+                                    tick_fast.recv_ts_local_ns,
+                                    now_ms,
+                                )
+                                .await;
+                            }
+                            if predator_cfg.strategy_d.enabled {
+                                let _ = run_predator_d_for_symbol(
+                                    &shared,
+                                    &bus,
+                                    &portfolio,
+                                    &execution,
+                                    &shadow,
+                                    &mut market_rate_budget,
+                                    &mut global_rate_budget,
+                                    &predator_cfg,
+                                    &symbol,
                                     tick_fast.recv_ts_ms,
                                     tick_fast.recv_ts_local_ns,
                                     now_ms,
@@ -4079,7 +4253,7 @@ fn spawn_strategy_engine(
                         };
                         let v2_intent = OrderIntentV2 {
                             market_id: intent.market_id.clone(),
-                            token_id: Some(token_id),
+                            token_id: Some(token_id.clone()),
                             side: intent.side.clone(),
                             price: intent.price,
                             size: intent.size,
@@ -4091,6 +4265,25 @@ fn spawn_strategy_engine(
                             expected_edge_net_bps: edge_net,
                             client_order_id: Some(new_id()),
                             hold_to_resolution: false,
+                            // B: 预序列化 JSON payload — 在信号确认后立即构建，
+                            // 跳过 place_order_v2 内部的 serde_json 开销。
+                            prebuilt_payload: serde_json::to_vec(&serde_json::json!({
+                                "market_id": intent.market_id,
+                                "token_id": token_id,
+                                "side": intent.side.to_string(),
+                                "price": intent.price,
+                                "size": intent.size,
+                                "ttl_ms": intent.ttl_ms,
+                                "style": execution_style.to_string(),
+                                "tif": match execution_style {
+                                    ExecutionStyle::Maker => "GTC",
+                                    _ => "FAK",
+                                },
+                                "max_slippage_bps": cfg.taker_max_slippage_bps,
+                                "fee_rate_bps": fee_bps,
+                                "expected_edge_net_bps": edge_net,
+                                "hold_to_resolution": false,
+                            })).ok(),
                         };
                         let order_build_ms = order_build_start.elapsed().as_secs_f64() * 1_000.0;
                         // Start measuring ack-only RTT right before the await.
@@ -4269,7 +4462,9 @@ async fn run_predator_c_for_symbol(
     now_ms: i64,
     direction_override: Option<DirectionSignal>,
 ) -> PredatorExecResult {
-    shared.shadow_stats.set_predator_enabled(predator_cfg.enabled);
+    shared
+        .shadow_stats
+        .set_predator_enabled(predator_cfg.enabled);
     if !predator_cfg.enabled {
         return PredatorExecResult::default();
     }
@@ -4332,7 +4527,9 @@ async fn run_predator_c_for_symbol(
         direction_signal
     };
 
-    shared.shadow_stats.mark_predator_direction(&direction_signal.direction);
+    shared
+        .shadow_stats
+        .mark_predator_direction(&direction_signal.direction);
     {
         let mut map = shared.predator_latest_direction.write().await;
         map.insert(symbol.to_string(), direction_signal.clone());
@@ -4362,8 +4559,7 @@ async fn run_predator_c_for_symbol(
         return PredatorExecResult::default();
     }
 
-    let (symbol_tox_score, symbol_tox_regime) =
-        symbol_toxic_snapshot(shared, &market_ids).await;
+    let (symbol_tox_score, symbol_tox_regime) = symbol_toxic_snapshot(shared, &market_ids).await;
     let regime = classify_predator_regime(
         &predator_cfg.regime,
         &direction_signal,
@@ -4477,12 +4673,11 @@ async fn run_predator_c_for_symbol(
         let spread = spread_for_side(&book, &side);
         let fee_bps = get_fee_rate_bps_cached(shared, &market_id).await;
         let rebate_est_bps = get_rebate_bps_cached(shared, &market_id, fee_bps).await;
-        let book_top_lag_ms =
-            if tick_fast_recv_ts_local_ns > 0 && book.recv_ts_local_ns > 0 {
-                ((book.recv_ts_local_ns - tick_fast_recv_ts_local_ns).max(0) as f64) / 1_000_000.0
-            } else {
-                0.0
-            };
+        let book_top_lag_ms = if tick_fast_recv_ts_local_ns > 0 && book.recv_ts_local_ns > 0 {
+            ((book.recv_ts_local_ns - tick_fast_recv_ts_local_ns).max(0) as f64) / 1_000_000.0
+        } else {
+            0.0
+        };
         let settlement_prob_yes =
             settlement_prob_yes_for_symbol(shared, symbol, sig_entry.signal.fair_yes, now_ms).await;
         let probability = {
@@ -4510,7 +4705,11 @@ async fn run_predator_c_for_symbol(
         } else {
             maker_cfg.base_quote_size.max(0.01)
         };
-        let tf_weight = tf_weights.get(&timeframe).copied().unwrap_or(1.0).clamp(0.0, 1.0);
+        let tf_weight = tf_weights
+            .get(&timeframe)
+            .copied()
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
         if tf_weight <= 0.0 {
             continue;
         }
@@ -4533,19 +4732,19 @@ async fn run_predator_c_for_symbol(
     {
         let mut sniper = shared.predator_taker_sniper.write().await;
         for cin in cand_inputs {
-            let decision = sniper.evaluate(
-                &cin.market_id,
+            let decision = sniper.evaluate(&taker_sniper::EvaluateCtx {
+                market_id: &cin.market_id,
                 symbol,
-                cin.timeframe.clone(),
-                &direction_signal,
-                cin.entry_price,
-                cin.spread,
-                cin.fee_bps,
-                cin.edge_gross_bps,
-                cin.edge_net_bps,
-                cin.size,
+                timeframe: cin.timeframe.clone(),
+                direction_signal: &direction_signal,
+                entry_price: cin.entry_price,
+                spread: cin.spread,
+                fee_bps: cin.fee_bps,
+                edge_gross_bps: cin.edge_gross_bps,
+                edge_net_bps: cin.edge_net_bps,
+                size: cin.size,
                 now_ms,
-            );
+            });
             match decision.action {
                 TakerAction::Fire => {
                     if let Some(plan) = decision.fire_plan {
@@ -4621,8 +4820,17 @@ async fn run_predator_c_for_symbol(
         return PredatorExecResult::default();
     }
 
+    // -----------------------------------------------------------------------
+    // E: 多市场并发执行 — HTTP/2 多路复用，locked_plans 并发发射
+    // 每个 plan 内部的 chunks 仍然串行（保留 send_delay_ms 语义），
+    // 但不同市场的 plan 之间完全并发，共享同一 TCP 连接的多个 H2 stream。
+    // 风险检查（router.lock）已在上方串行完成，此处只做 IO。
+    // -----------------------------------------------------------------------
     let mut out = PredatorExecResult::default();
-    for plan in locked_plans {
+
+    // 单市场快路径：避免 join_all 开销
+    if locked_plans.len() == 1 {
+        let plan = locked_plans.into_iter().next().unwrap();
         let opp = &plan.opportunity;
         for (idx, chunk) in plan.chunks.iter().enumerate() {
             if chunk.size <= 0.0 {
@@ -4656,6 +4864,272 @@ async fn run_predator_c_for_symbol(
                 break;
             }
         }
+        return out;
+    }
+
+    // 多市场并发路径：每个 plan 独立 async 块，join_all 并发等待
+    let plan_futures: Vec<_> = locked_plans
+        .into_iter()
+        .map(|plan| {
+            let shared = shared.clone();
+            let bus = bus.clone();
+            let portfolio = portfolio.clone();
+            let execution = execution.clone();
+            let shadow = shadow.clone();
+            let maker_cfg = maker_cfg.clone();
+            let direction_signal = direction_signal.clone();
+            // 注意: rate_budget 在并发前已经通过 router.lock 扣除，
+            // 此处传入独立副本（每个市场独立限速桶）
+            let mut market_rate_budget_local = market_rate_budget.clone();
+            let mut global_rate_budget_local = global_rate_budget.clone();
+            async move {
+                let mut plan_result = PredatorExecResult::default();
+                let opp = &plan.opportunity;
+                for (idx, chunk) in plan.chunks.iter().enumerate() {
+                    if chunk.size <= 0.0 {
+                        continue;
+                    }
+                    if idx > 0 && chunk.send_delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(chunk.send_delay_ms)).await;
+                    }
+                    shared.shadow_stats.mark_predator_taker_fired();
+                    let res = predator_execute_opportunity(
+                        &shared,
+                        &bus,
+                        &portfolio,
+                        &execution,
+                        &shadow,
+                        &mut market_rate_budget_local,
+                        &mut global_rate_budget_local,
+                        &maker_cfg,
+                        predator_cfg,
+                        &direction_signal,
+                        opp,
+                        chunk.size,
+                        tick_fast_recv_ts_ms,
+                        tick_fast_recv_ts_local_ns,
+                        now_ms,
+                    )
+                    .await;
+                    plan_result.attempted = plan_result.attempted.saturating_add(res.attempted);
+                    plan_result.executed = plan_result.executed.saturating_add(res.executed);
+                    if plan.stop_on_reject && res.stop_firing {
+                        break;
+                    }
+                }
+                plan_result
+            }
+        })
+        .collect();
+
+    let results = futures::future::join_all(plan_futures).await;
+    for r in results {
+        out.attempted = out.attempted.saturating_add(r.attempted);
+        out.executed = out.executed.saturating_add(r.executed);
+    }
+    out
+}
+
+async fn run_predator_d_for_symbol(
+    shared: &Arc<EngineShared>,
+    bus: &RingBus<EngineEvent>,
+    portfolio: &Arc<PortfolioBook>,
+    execution: &Arc<ClobExecution>,
+    shadow: &Arc<ShadowExecutor>,
+    market_rate_budget: &mut HashMap<String, TokenBucket>,
+    global_rate_budget: &mut TokenBucket,
+    predator_cfg: &PredatorCConfig,
+    symbol: &str,
+    tick_fast_recv_ts_ms: i64,
+    tick_fast_recv_ts_local_ns: i64,
+    now_ms: i64,
+) -> PredatorExecResult {
+    let d_cfg = &predator_cfg.strategy_d;
+    if !predator_cfg.enabled || !d_cfg.enabled {
+        return PredatorExecResult::default();
+    }
+
+    let direction_signal = {
+        let mut direction_signal = {
+            let det = shared.predator_direction_detector.read().await;
+            det.evaluate(symbol, now_ms)
+        };
+        if direction_signal.is_none() {
+            let fallback_signal = shared
+                .predator_latest_direction
+                .read()
+                .await
+                .get(symbol)
+                .cloned();
+            if let Some(cached) = fallback_signal {
+                let cached_ms = cached.ts_ns.div_euclid(1_000_000);
+                let age_ms = now_ms.saturating_sub(cached_ms);
+                if age_ms <= 2_500 {
+                    direction_signal = Some(cached);
+                }
+            }
+        }
+        let Some(sig) = direction_signal else {
+            return PredatorExecResult::default();
+        };
+        sig
+    };
+    if matches!(direction_signal.direction, Direction::Neutral) {
+        return PredatorExecResult::default();
+    }
+
+    let side = match direction_signal.direction {
+        Direction::Up => OrderSide::BuyYes,
+        Direction::Down => OrderSide::BuyNo,
+        Direction::Neutral => OrderSide::BuyYes,
+    };
+    let maker_cfg = shared.strategy_cfg.read().await.clone();
+    let edge_model_cfg = shared.edge_model_cfg.read().await.clone();
+    let market_ids = shared
+        .symbol_to_markets
+        .read()
+        .await
+        .get(symbol)
+        .cloned()
+        .unwrap_or_default();
+    if market_ids.is_empty() {
+        return PredatorExecResult::default();
+    }
+
+    let mut out = PredatorExecResult::default();
+    for market_id in market_ids.into_iter().take(32) {
+        if d_cfg.cooldown_ms_per_market > 0 {
+            let last_fire = shared
+                .predator_d_last_fire_ms
+                .read()
+                .await
+                .get(&market_id)
+                .copied()
+                .unwrap_or(0);
+            if now_ms.saturating_sub(last_fire) < d_cfg.cooldown_ms_per_market as i64 {
+                continue;
+            }
+        }
+
+        let book = shared.latest_books.read().await.get(&market_id).cloned();
+        let Some(book) = book else {
+            continue;
+        };
+        let entry_price = aggressive_price_for_side(&book, &side);
+        if entry_price <= 0.0 {
+            continue;
+        }
+        let spread = spread_for_side(&book, &side);
+        let mid_px = mid_for_side(&book, &side).max(1e-6);
+        let spread_bps = (spread / mid_px) * 10_000.0;
+        if spread_bps < d_cfg.min_gap_bps {
+            continue;
+        }
+
+        let sig_entry = shared
+            .latest_signals
+            .get(&market_id)
+            .map(|v| v.value().clone());
+        let Some(sig_entry) = sig_entry else {
+            continue;
+        };
+        if now_ms.saturating_sub(sig_entry.ts_ms) > 5_000 {
+            continue;
+        }
+
+        let book_top_lag_ms = if tick_fast_recv_ts_local_ns > 0 && book.recv_ts_local_ns > 0 {
+            ((book.recv_ts_local_ns - tick_fast_recv_ts_local_ns).max(0) as f64) / 1_000_000.0
+        } else {
+            0.0
+        };
+        let settlement_prob_yes =
+            settlement_prob_yes_for_symbol(shared, symbol, sig_entry.signal.fair_yes, now_ms).await;
+        let probability = {
+            let engine = shared.predator_probability_engine.read().await;
+            engine.estimate(
+                &sig_entry.signal,
+                &direction_signal,
+                settlement_prob_yes,
+                book_top_lag_ms,
+                now_ms,
+            )
+        };
+        if probability.confidence < d_cfg.min_confidence {
+            continue;
+        }
+        let fee_bps = get_fee_rate_bps_cached(shared, &market_id).await;
+        let rebate_est_bps = get_rebate_bps_cached(shared, &market_id, fee_bps).await;
+        let edge_gross_bps = edge_gross_bps_for_side(probability.p_settle, &side, entry_price);
+        let edge_net_bps = edge_gross_bps - fee_bps + rebate_est_bps - edge_model_cfg.fail_cost_bps;
+        if edge_net_bps < d_cfg.min_edge_net_bps {
+            continue;
+        }
+        let timeframe = shared
+            .market_to_timeframe
+            .read()
+            .await
+            .get(&market_id)
+            .cloned()
+            .unwrap_or(TimeframeClass::Tf5m);
+        let max_notional = d_cfg.max_notional_usdc.max(maker_cfg.base_quote_size);
+        let size = (max_notional / entry_price.max(1e-6)).max(0.01);
+        let lock_minutes = match timeframe {
+            TimeframeClass::Tf5m => 5.0,
+            TimeframeClass::Tf15m => 15.0,
+            TimeframeClass::Tf1h => 60.0,
+            TimeframeClass::Tf1d => 1440.0,
+        };
+        let notional_usdc = (entry_price.max(0.0) * size.max(0.0)).max(0.0);
+        let edge_net_usdc = (edge_net_bps / 10_000.0) * notional_usdc;
+        let density = if lock_minutes <= 0.0 {
+            0.0
+        } else {
+            edge_net_usdc / lock_minutes
+        };
+        let opp = TimeframeOpp {
+            timeframe,
+            market_id: market_id.clone(),
+            symbol: symbol.to_string(),
+            direction: direction_signal.direction.clone(),
+            side: side.clone(),
+            entry_price,
+            size,
+            edge_gross_bps,
+            edge_net_bps,
+            edge_net_usdc,
+            fee_bps,
+            lock_minutes,
+            density,
+            confidence: probability.confidence,
+            ts_ms: now_ms,
+        };
+        let res = predator_execute_opportunity(
+            shared,
+            bus,
+            portfolio,
+            execution,
+            shadow,
+            market_rate_budget,
+            global_rate_budget,
+            &maker_cfg,
+            predator_cfg,
+            &direction_signal,
+            &opp,
+            size,
+            tick_fast_recv_ts_ms,
+            tick_fast_recv_ts_local_ns,
+            now_ms,
+        )
+        .await;
+        if res.attempted > 0 {
+            shared
+                .predator_d_last_fire_ms
+                .write()
+                .await
+                .insert(market_id, now_ms);
+        }
+        out.attempted = out.attempted.saturating_add(res.attempted);
+        out.executed = out.executed.saturating_add(res.executed);
     }
     out
 }
@@ -4702,7 +5176,8 @@ async fn run_predator_c_cross_symbol(
         return PredatorExecResult::default();
     }
 
-    let correlated_used = correlated_locked_positions_for_symbols(shared, &follower_symbols, now_ms).await;
+    let correlated_used =
+        correlated_locked_positions_for_symbols(shared, &follower_symbols, now_ms).await;
     let mut slots_left = cross_cfg
         .max_correlated_positions
         .saturating_sub(correlated_used);
@@ -4830,7 +5305,10 @@ fn classify_predator_regime(
     let source_low = source_health
         .map(|h| {
             h.sample_count >= source_health_cfg.min_samples
-                && h.score < cfg.defend_min_source_health.max(source_health_cfg.min_score_for_trading)
+                && h.score
+                    < cfg
+                        .defend_min_source_health
+                        .max(source_health_cfg.min_score_for_trading)
         })
         .unwrap_or(false);
     if source_low {
@@ -4878,7 +5356,12 @@ async fn predator_execute_opportunity(
 
     shared.shadow_stats.mark_attempted();
 
-    let book = shared.latest_books.read().await.get(&intent.market_id).cloned();
+    let book = shared
+        .latest_books
+        .read()
+        .await
+        .get(&intent.market_id)
+        .cloned();
     let Some(book) = book else {
         shared
             .shadow_stats
@@ -4891,14 +5374,12 @@ async fn predator_execute_opportunity(
     // than the Polymarket book update. For Predator, the ref tick is per-symbol while the book
     // is per-market, so this is still a useful (if approximate) window estimate.
     let tick_age_ms = freshness_ms(now_ms, tick_fast_recv_ts_ms);
-    let book_top_lag_ms = if tick_age_ms <= 1_500
-        && tick_fast_recv_ts_local_ns > 0
-        && book.recv_ts_local_ns > 0
-    {
-        ((book.recv_ts_local_ns - tick_fast_recv_ts_local_ns).max(0) as f64) / 1_000_000.0
-    } else {
-        0.0
-    };
+    let book_top_lag_ms =
+        if tick_age_ms <= 1_500 && tick_fast_recv_ts_local_ns > 0 && book.recv_ts_local_ns > 0 {
+            ((book.recv_ts_local_ns - tick_fast_recv_ts_local_ns).max(0) as f64) / 1_000_000.0
+        } else {
+            0.0
+        };
 
     let inventory = inventory_for_market(portfolio, &intent.market_id);
     let pending_market_exposure = execution.open_order_notional_for_market(&intent.market_id);
@@ -5014,7 +5495,7 @@ async fn predator_execute_opportunity(
     };
     let v2_intent = OrderIntentV2 {
         market_id: intent.market_id.clone(),
-        token_id: Some(token_id),
+        token_id: Some(token_id.clone()),
         side: intent.side.clone(),
         price: intent.price,
         size: intent.size,
@@ -5026,6 +5507,21 @@ async fn predator_execute_opportunity(
         expected_edge_net_bps: opp.edge_net_bps,
         client_order_id: Some(new_id()),
         hold_to_resolution: false,
+        // B: 预序列化 JSON payload — 跳过 place_order_v2 内部 serde 开销
+        prebuilt_payload: serde_json::to_vec(&serde_json::json!({
+            "market_id": intent.market_id,
+            "token_id": token_id,
+            "side": intent.side.to_string(),
+            "price": intent.price,
+            "size": intent.size,
+            "ttl_ms": intent.ttl_ms,
+            "style": "Taker",
+            "tif": "FAK",
+            "max_slippage_bps": maker_cfg.taker_max_slippage_bps,
+            "fee_rate_bps": opp.fee_bps,
+            "expected_edge_net_bps": opp.edge_net_bps,
+            "hold_to_resolution": false,
+        })).ok(),
     };
     let order_build_ms = order_build_start.elapsed().as_secs_f64() * 1_000.0;
     let place_start = Instant::now();
@@ -5169,19 +5665,67 @@ fn spawn_predator_exit_lifecycle(
     entry_price: f64,
     size: f64,
 ) {
+    // WSS: 订阅 fill 事件（paper 模式下 wss_fill_tx 为 None，直接跳过）
+    let mut fill_rx = shared
+        .wss_fill_tx
+        .as_ref()
+        .map(|tx| tx.subscribe());
+
     spawn_detached("predator_exit_lifecycle", false, async move {
         let checkpoints = [3_000_u64, 15_000_u64, 60_000_u64, 300_000_u64];
         let mut elapsed_ms = 0_u64;
-        for checkpoint in checkpoints {
+
+        'outer: for checkpoint in checkpoints {
             let wait_ms = checkpoint.saturating_sub(elapsed_ms);
             elapsed_ms = checkpoint;
+
+            // -----------------------------------------------------------------------
+            // WSS: 在等待 checkpoint 期间同时监听实时 fill 事件
+            // fill 到来时立即触发 exit 评估，不等下一个 checkpoint
+            // -----------------------------------------------------------------------
             if wait_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                let sleep = tokio::time::sleep(Duration::from_millis(wait_ms));
+                tokio::pin!(sleep);
+
+                loop {
+                    // -----------------------------------------------------------------------
+                    // WSS: 用 OptionFuture 优雅处理 fill_rx 为 None 的情况（paper 模式）
+                    // None → Poll::Pending（永不触发），Some(rx) → 等待下一个 fill 事件
+                    // -----------------------------------------------------------------------
+                    let fill_fut = futures::future::OptionFuture::from(
+                        fill_rx.as_mut().map(|rx| rx.recv()),
+                    );
+                    tokio::select! {
+                        biased;
+                        // 优先检查 WSS fill 事件（低延迟路径）
+                        Some(fill_result) = fill_fut => {
+                            if let Ok(fill) = fill_result {
+                                // 只处理属于本仓位的 fill 事件
+                                if fill.order_id == position_id || fill.market_id == market_id {
+                                    tracing::info!(
+                                        position_id = %position_id,
+                                        market_id = %market_id,
+                                        fill_price = fill.price,
+                                        fill_size = fill.size,
+                                        event_type = %fill.event_type,
+                                        "wss_user_feed: fill detected, triggering early exit eval"
+                                    );
+                                    metrics::counter!("wss.fill_detected").increment(1);
+                                    break; // 跳出 loop，进入 exit 评估
+                                }
+                                // 不是本仓位的 fill，继续等待
+                            }
+                            // receiver lagged 或 channel 关闭，回退到 timer
+                        }
+                        // timer 到期，正常 checkpoint 评估
+                        _ = &mut sleep => break,
+                    }
+                }
             }
 
             let exit_cfg = shared.exit_cfg.read().await.clone();
             if !exit_cfg.enabled {
-                continue;
+                continue 'outer;
             }
 
             let now_ms = Utc::now().timestamp_millis();
@@ -5218,13 +5762,17 @@ fn spawn_predator_exit_lifecycle(
                     reason,
                     "predator exit lifecycle triggered"
                 );
-                break;
+                break 'outer;
             }
         }
 
         // Ensure stale lifecycle entries don't leak forever if no exit action is triggered.
         if elapsed_ms >= 300_000 {
-            let _ = shared.predator_exit_manager.write().await.close(&position_id);
+            let _ = shared
+                .predator_exit_manager
+                .write()
+                .await
+                .close(&position_id);
         }
     });
 }
@@ -5533,11 +6081,7 @@ async fn refresh_market_symbol_map(shared: &EngineShared) {
                     .entry(m.symbol.clone())
                     .or_default()
                     .push(m.market_id.clone());
-                if let Some(tf) = m
-                    .timeframe
-                    .as_deref()
-                    .and_then(parse_timeframe_class)
-                {
+                if let Some(tf) = m.timeframe.as_deref().and_then(parse_timeframe_class) {
                     timeframe_map.insert(m.market_id.clone(), tf);
                 }
                 if let Some(t) = m.token_id_yes {
@@ -6273,7 +6817,7 @@ fn should_replace_ref_tick(current: &RefTick, next: &RefTick) -> bool {
         return false;
     }
 
-    let staleness_budget_us = fusion_staleness_budget_us();
+    let staleness_budget_us = fusion_staleness_budget_us_for_source(next.source.as_str());
     if next.recv_ts_local_ns > 0
         && current.recv_ts_local_ns > 0
         && next.source != current.source
@@ -6319,9 +6863,28 @@ fn should_replace_ref_tick(current: &RefTick, next: &RefTick) -> bool {
     next_event > current_event + 1
 }
 
-fn fusion_staleness_budget_us() -> i64 {
-    static BUDGET_US: OnceLock<i64> = OnceLock::new();
-    *BUDGET_US.get_or_init(|| {
+// -----------------------------------------------------------------------
+// D: Fusion staleness budget 按数据源精细化
+// UDP 路径 (binance_udp) 延迟 < 1ms，可以用更紧的 200μs 窗口；
+// 其他源（直连 WS、Chainlink）保留宽松的 600μs 默认值。
+// -----------------------------------------------------------------------
+fn fusion_staleness_budget_us_for_source(next_source: &str) -> i64 {
+    static BUDGET_UDP_US: OnceLock<i64> = OnceLock::new();
+    static BUDGET_DEFAULT_US: OnceLock<i64> = OnceLock::new();
+
+    // UDP 路径: 更激进，默认 200μs
+    if next_source.contains("udp") {
+        return *BUDGET_UDP_US.get_or_init(|| {
+            std::env::var("POLYEDGE_FUSION_STALENESS_UDP_US")
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(200)
+                .clamp(50, 2_000)
+        });
+    }
+
+    // 其他源: 默认 600μs
+    *BUDGET_DEFAULT_US.get_or_init(|| {
         std::env::var("POLYEDGE_FUSION_STALENESS_BUDGET_US")
             .ok()
             .and_then(|v| v.parse::<i64>().ok())
@@ -6553,8 +7116,8 @@ async fn maybe_spawn_scoring_refresh(
             // Conservative estimate: maker rebates are a fraction of taker fees and depend on
             // scoring + market share. Default rebate_factor is 0.0 unless explicitly configured.
             // Cap the pool fraction at 20% of fee_bps as a hard upper bound.
-            entry.rebate_bps_est = (fee_bps.max(0.0) * 0.20 * hit_ratio * rebate_factor)
-                .clamp(0.0, fee_bps.max(0.0));
+            entry.rebate_bps_est =
+                (fee_bps.max(0.0) * 0.20 * hit_ratio * rebate_factor).clamp(0.0, fee_bps.max(0.0));
             entry.fetched_at = Instant::now();
             let log_row = serde_json::json!({
                 "ts_ms": Utc::now().timestamp_millis(),
@@ -7037,6 +7600,20 @@ fn parse_toml_array_of_strings(val: &str) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
+fn parse_gatling_symbol_section(section: &str) -> Option<String> {
+    const PREFIX: &str = "[predator_c.gatling_symbols.";
+    if !(section.starts_with(PREFIX) && section.ends_with(']')) {
+        return None;
+    }
+    let inner = &section[PREFIX.len()..section.len() - 1];
+    let symbol = inner.trim();
+    if symbol.is_empty() {
+        None
+    } else {
+        Some(symbol.to_string())
+    }
+}
+
 fn parse_toml_array_for_key(raw: &str, key: &str) -> Option<Vec<String>> {
     let mut collecting = false;
     let mut buf = String::new();
@@ -7458,10 +8035,12 @@ fn load_predator_c_config() -> PredatorCConfig {
     let mut in_prob = false;
     let mut in_sniper = false;
     let mut in_gatling = false;
+    let mut in_strategy_d = false;
     let mut in_regime = false;
     let mut in_cross = false;
     let mut in_router = false;
     let mut in_compounder = false;
+    let mut gatling_symbol_section: Option<String> = None;
 
     for line in raw.lines() {
         let line = line.trim();
@@ -7469,11 +8048,13 @@ fn load_predator_c_config() -> PredatorCConfig {
             continue;
         }
         if line.starts_with('[') && line.ends_with(']') {
+            gatling_symbol_section = parse_gatling_symbol_section(line);
             in_root = line == "[predator_c]";
             in_dir = line == "[predator_c.direction_detector]";
             in_prob = line == "[predator_c.probability_engine]";
             in_sniper = line == "[predator_c.taker_sniper]";
             in_gatling = line == "[predator_c.gatling]";
+            in_strategy_d = line == "[predator_c.strategy_d]";
             in_regime = line == "[predator_c.regime]";
             in_cross = line == "[predator_c.cross_symbol]";
             in_router = line == "[predator_c.router]";
@@ -7485,10 +8066,12 @@ fn load_predator_c_config() -> PredatorCConfig {
             || in_prob
             || in_sniper
             || in_gatling
+            || in_strategy_d
             || in_regime
             || in_cross
             || in_router
-            || in_compounder)
+            || in_compounder
+            || gatling_symbol_section.is_some())
         {
             continue;
         }
@@ -7587,6 +8170,21 @@ fn load_predator_c_config() -> PredatorCConfig {
                         cfg.direction_detector.momentum_spike_multiplier = parsed.max(1.0);
                     }
                 }
+                "min_tick_rate_spike_ratio" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.direction_detector.min_tick_rate_spike_ratio = parsed.max(1.0);
+                    }
+                }
+                "tick_rate_short_ms" => {
+                    if let Ok(parsed) = val.parse::<i64>() {
+                        cfg.direction_detector.tick_rate_short_ms = parsed.clamp(50, 10_000);
+                    }
+                }
+                "tick_rate_long_ms" => {
+                    if let Ok(parsed) = val.parse::<i64>() {
+                        cfg.direction_detector.tick_rate_long_ms = parsed.clamp(100, 60_000);
+                    }
+                }
                 "enable_source_vote_gate" => {
                     if let Ok(parsed) = val.parse::<bool>() {
                         cfg.direction_detector.enable_source_vote_gate = parsed;
@@ -7622,6 +8220,36 @@ fn load_predator_c_config() -> PredatorCConfig {
                 "confidence_floor" => {
                     if let Ok(parsed) = val.parse::<f64>() {
                         cfg.probability_engine.confidence_floor = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "sigma_annual" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.probability_engine.sigma_annual = parsed.clamp(0.05, 5.0);
+                    }
+                }
+                "horizon_sec" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.probability_engine.horizon_sec = parsed.clamp(1.0, 900.0);
+                    }
+                }
+                "drift_annual" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.probability_engine.drift_annual = parsed.clamp(-10.0, 10.0);
+                    }
+                }
+                "velocity_drift_gain" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.probability_engine.velocity_drift_gain = parsed.clamp(0.0, 5.0);
+                    }
+                }
+                "acceleration_drift_gain" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.probability_engine.acceleration_drift_gain = parsed.clamp(0.0, 5.0);
+                    }
+                }
+                "fair_blend_weight" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.probability_engine.fair_blend_weight = parsed.clamp(0.0, 1.0);
                     }
                 }
                 _ => {}
@@ -7684,6 +8312,85 @@ fn load_predator_c_config() -> PredatorCConfig {
                 "stop_on_reject" | "gatling_stop_on_reject" => {
                     if let Ok(parsed) = val.parse::<bool>() {
                         cfg.taker_sniper.gatling_stop_on_reject = parsed;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if in_strategy_d {
+            match key {
+                "enabled" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.strategy_d.enabled = parsed;
+                    }
+                }
+                "min_gap_bps" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.strategy_d.min_gap_bps = parsed.max(0.0);
+                    }
+                }
+                "min_edge_net_bps" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.strategy_d.min_edge_net_bps = parsed.max(0.0);
+                    }
+                }
+                "min_confidence" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.strategy_d.min_confidence = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "max_notional_usdc" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.strategy_d.max_notional_usdc = parsed.max(0.0);
+                    }
+                }
+                "cooldown_ms_per_market" => {
+                    if let Ok(parsed) = val.parse::<u64>() {
+                        cfg.strategy_d.cooldown_ms_per_market = parsed;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if let Some(symbol) = gatling_symbol_section.as_deref() {
+            let entry = cfg
+                .taker_sniper
+                .gatling_by_symbol
+                .entry(symbol.to_ascii_uppercase())
+                .or_default();
+            match key {
+                "enabled" | "gatling_enabled" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        entry.enabled = Some(parsed);
+                    }
+                }
+                "chunk_notional_usdc" | "gatling_chunk_notional_usdc" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        entry.chunk_notional_usdc = Some(parsed.max(0.01));
+                    }
+                }
+                "min_chunks" | "gatling_min_chunks" => {
+                    if let Ok(parsed) = val.parse::<usize>() {
+                        entry.min_chunks = Some(parsed.max(1));
+                    }
+                }
+                "max_chunks" | "gatling_max_chunks" => {
+                    if let Ok(parsed) = val.parse::<usize>() {
+                        entry.max_chunks = Some(parsed.max(1));
+                    }
+                }
+                "spacing_ms" | "gatling_spacing_ms" => {
+                    if let Ok(parsed) = val.parse::<u64>() {
+                        entry.spacing_ms = Some(parsed.min(1_000));
+                    }
+                }
+                "stop_on_reject" | "gatling_stop_on_reject" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        entry.stop_on_reject = Some(parsed);
                     }
                 }
                 _ => {}
@@ -7874,11 +8581,14 @@ fn load_risk_limits_config() -> RiskLimits {
         return RiskLimits::default();
     };
 
-    let mut cfg = RiskLimits::default();
-    // Set safer defaults than the hardcoded 1.5% if parsing fails
-    cfg.max_drawdown_pct = 0.20;
-    cfg.max_asset_notional = 50.0;
-    cfg.max_market_notional = 10.0;
+    // 文件解析失败时的安全回退值——比 Default 更保守
+    // 使用 struct update syntax 一次性初始化，避免二次赋值
+    let mut cfg = RiskLimits {
+        max_drawdown_pct: 0.20,
+        max_asset_notional: 50.0,
+        max_market_notional: 10.0,
+        ..RiskLimits::default()
+    };
 
     let mut section = "";
     for line in raw.lines() {
@@ -7897,40 +8607,70 @@ fn load_risk_limits_config() -> RiskLimits {
         let val = v.trim().trim_matches('"');
 
         match section {
-            "[risk_controls.exposure_limits]" => {
-                match key {
-                    "max_total_exposure_usdc" => {
-                        if let Ok(p) = val.parse::<f64>() { cfg.max_asset_notional = p.max(0.0); }
+            "[risk_controls.exposure_limits]" => match key {
+                "max_total_exposure_usdc" => {
+                    if let Ok(p) = val.parse::<f64>() {
+                        cfg.max_asset_notional = p.max(0.0);
                     }
-                    "max_per_market_exposure_usdc" => {
-                        if let Ok(p) = val.parse::<f64>() { cfg.max_market_notional = p.max(0.0); }
-                    }
-                    "max_concurrent_positions" => {
-                        if let Ok(p) = val.parse::<usize>() { cfg.max_open_orders = p.max(1); }
-                    }
-                    _ => {}
                 }
-            }
-            "[risk_controls.kill_switch]" => {
-                match key {
-                    "max_drawdown_pct" => {
-                        if let Ok(p) = val.parse::<f64>() {
-                            cfg.max_drawdown_pct = p.clamp(0.001, 1.0);
-                        }
+                "max_per_market_exposure_usdc" => {
+                    if let Ok(p) = val.parse::<f64>() {
+                        cfg.max_market_notional = p.max(0.0);
                     }
-                    "max_loss_streak" => {
-                        if let Ok(p) = val.parse::<u32>() {
-                            cfg.max_loss_streak = p.max(1);
-                        }
-                    }
-                    "cooldown_sec" => {
-                        if let Ok(p) = val.parse::<u64>() {
-                            cfg.cooldown_sec = p.max(1);
-                        }
-                    }
-                    _ => {}
                 }
-            }
+                "max_concurrent_positions" => {
+                    if let Ok(p) = val.parse::<usize>() {
+                        cfg.max_open_orders = p.max(1);
+                    }
+                }
+                _ => {}
+            },
+            "[risk_controls.kill_switch]" => match key {
+                "max_drawdown_pct" => {
+                    if let Ok(p) = val.parse::<f64>() {
+                        cfg.max_drawdown_pct = p.clamp(0.001, 1.0);
+                    }
+                }
+                "max_loss_streak" => {
+                    if let Ok(p) = val.parse::<u32>() {
+                        cfg.max_loss_streak = p.max(1);
+                    }
+                }
+                "cooldown_sec" => {
+                    if let Ok(p) = val.parse::<u64>() {
+                        cfg.cooldown_sec = p.max(1);
+                    }
+                }
+                _ => {}
+            },
+            "[risk_controls.progressive_limits]" => match key {
+                "enabled" => {
+                    if let Ok(p) = val.parse::<bool>() {
+                        cfg.progressive_enabled = p;
+                    }
+                }
+                "drawdown_tier1_ratio" => {
+                    if let Ok(p) = val.parse::<f64>() {
+                        cfg.drawdown_tier1_ratio = p.clamp(0.05, 0.99);
+                    }
+                }
+                "drawdown_tier2_ratio" => {
+                    if let Ok(p) = val.parse::<f64>() {
+                        cfg.drawdown_tier2_ratio = p.clamp(cfg.drawdown_tier1_ratio, 0.999);
+                    }
+                }
+                "tier1_size_scale" => {
+                    if let Ok(p) = val.parse::<f64>() {
+                        cfg.tier1_size_scale = p.clamp(0.01, 1.0);
+                    }
+                }
+                "tier2_size_scale" => {
+                    if let Ok(p) = val.parse::<f64>() {
+                        cfg.tier2_size_scale = p.clamp(0.01, 1.0);
+                    }
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -7980,6 +8720,19 @@ fn load_execution_config() -> ExecutionConfig {
                     cfg.order_endpoint = None;
                 } else {
                     cfg.order_endpoint = Some(v);
+                }
+            }
+            "order_backup_endpoint" => {
+                let v = val.to_string();
+                if v.is_empty() {
+                    cfg.order_backup_endpoint = None;
+                } else {
+                    cfg.order_backup_endpoint = Some(v);
+                }
+            }
+            "order_failover_timeout_ms" => {
+                if let Ok(parsed) = val.parse::<u64>() {
+                    cfg.order_failover_timeout_ms = parsed.clamp(10, 5_000);
                 }
             }
             _ => {}
@@ -8245,7 +8998,8 @@ fn append_jsonl_line(path: &Path, line: String) {
         match tx.try_send(req) {
             Ok(_) => {
                 let cap = JSONL_QUEUE_CAP.load(Ordering::Relaxed) as usize;
-                JSONL_QUEUE_DEPTH.store(cap.saturating_sub(tx.capacity()) as u64, Ordering::Relaxed);
+                JSONL_QUEUE_DEPTH
+                    .store(cap.saturating_sub(tx.capacity()) as u64, Ordering::Relaxed);
                 return;
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(req)) => {
@@ -9183,17 +9937,13 @@ timeframes = ["5m", "15m", "1h", "1d"]
             velocity_bps_per_sec: 10.0,
             acceleration: 1.0,
             tick_consistency: 3,
+            triple_confirm: true,
+            momentum_spike: false,
             ts_ns: 1,
         };
 
-        let regime_tox = classify_predator_regime(
-            &cfg,
-            &signal,
-            0.95,
-            &ToxicRegime::Danger,
-            None,
-            &source_cfg,
-        );
+        let regime_tox =
+            classify_predator_regime(&cfg, &signal, 0.95, &ToxicRegime::Danger, None, &source_cfg);
         assert_eq!(regime_tox, Regime::Defend);
 
         let source_low = SourceHealth {
@@ -9231,6 +9981,8 @@ timeframes = ["5m", "15m", "1h", "1d"]
             velocity_bps_per_sec: 8.0,
             acceleration: 1.2,
             tick_consistency: 3,
+            triple_confirm: true,
+            momentum_spike: false,
             ts_ns: 1,
         };
 

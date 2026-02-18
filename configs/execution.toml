@@ -6,3 +6,5 @@ clob_endpoint = "https://clob.polymarket.com"
 # Optional: separate endpoint for authenticated order operations (typically a localhost gateway).
 # If omitted, the engine uses `clob_endpoint` for both reads and order writes.
 order_endpoint = "http://127.0.0.1:9001"
+order_backup_endpoint = "http://127.0.0.1:9002"
+order_failover_timeout_ms = 200

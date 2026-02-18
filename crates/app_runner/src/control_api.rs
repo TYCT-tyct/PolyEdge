@@ -109,6 +109,7 @@ async fn reset_shadow(State(state): State<AppState>) -> impl IntoResponse {
         let mut compounder = state.shared.predator_compounder.write().await;
         *compounder = SettlementCompounder::new(cfg.compounder);
     }
+    state.shared.predator_d_last_fire_ms.write().await.clear();
     Json(serde_json::json!({"ok": true, "shadow_reset": true, "window_id": window_id}))
 }
 
@@ -118,6 +119,7 @@ struct PredatorCReloadReq {
     priority: Option<PredatorCPriority>,
     direction_detector: Option<DirectionConfig>,
     taker_sniper: Option<TakerSniperConfig>,
+    strategy_d: Option<PredatorDConfig>,
     regime: Option<PredatorRegimeConfig>,
     cross_symbol: Option<PredatorCrossSymbolConfig>,
     router: Option<RouterConfig>,
@@ -145,6 +147,9 @@ async fn reload_predator_c(
     }
     if let Some(v) = req.taker_sniper {
         cfg.taker_sniper = v;
+    }
+    if let Some(v) = req.strategy_d {
+        cfg.strategy_d = v;
     }
     if let Some(v) = req.regime {
         cfg.regime = v;
@@ -184,7 +189,9 @@ async fn reload_predator_c(
         &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "predator_c": snapshot}),
     );
 
-    Json(PredatorCReloadResp { predator_c: snapshot })
+    Json(PredatorCReloadResp {
+        predator_c: snapshot,
+    })
 }
 
 async fn reload_regime(
@@ -280,6 +287,24 @@ async fn reload_probability(
     }
     if let Some(v) = req.confidence_floor {
         cfg.confidence_floor = v.clamp(0.0, 1.0);
+    }
+    if let Some(v) = req.sigma_annual {
+        cfg.sigma_annual = v.clamp(0.05, 5.0);
+    }
+    if let Some(v) = req.horizon_sec {
+        cfg.horizon_sec = v.clamp(1.0, 900.0);
+    }
+    if let Some(v) = req.drift_annual {
+        cfg.drift_annual = v.clamp(-10.0, 10.0);
+    }
+    if let Some(v) = req.velocity_drift_gain {
+        cfg.velocity_drift_gain = v.clamp(0.0, 5.0);
+    }
+    if let Some(v) = req.acceleration_drift_gain {
+        cfg.acceleration_drift_gain = v.clamp(0.0, 5.0);
+    }
+    if let Some(v) = req.fair_blend_weight {
+        cfg.fair_blend_weight = v.clamp(0.0, 1.0);
     }
     engine.set_cfg(cfg.clone());
     drop(engine);
@@ -377,16 +402,9 @@ async fn reload_exit(
     Json(snapshot)
 }
 
-async fn report_direction(
-    State(state): State<AppState>,
-) -> Json<serde_json::Value> {
+async fn report_direction(State(state): State<AppState>) -> Json<serde_json::Value> {
     let now = Utc::now().timestamp_millis();
-    let latest = state
-        .shared
-        .predator_latest_direction
-        .read()
-        .await
-        .clone();
+    let latest = state.shared.predator_latest_direction.read().await.clone();
     Json(serde_json::json!({"ts_ms": now, "latest": latest}))
 }
 
@@ -594,10 +612,7 @@ async fn reload_risk(
     State(state): State<AppState>,
     Json(req): Json<RiskReloadReq>,
 ) -> Json<RiskReloadResp> {
-    let mut cfg = state
-        .risk_limits
-        .write()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut cfg = state.risk_limits.write().unwrap_or_else(|e| e.into_inner());
     if let Some(v) = req.max_market_notional {
         cfg.max_market_notional = v.max(0.0);
     }
@@ -615,6 +630,21 @@ async fn reload_risk(
     }
     if let Some(v) = req.cooldown_sec {
         cfg.cooldown_sec = v.max(1);
+    }
+    if let Some(v) = req.progressive_enabled {
+        cfg.progressive_enabled = v;
+    }
+    if let Some(v) = req.drawdown_tier1_ratio {
+        cfg.drawdown_tier1_ratio = v.clamp(0.05, 0.99);
+    }
+    if let Some(v) = req.drawdown_tier2_ratio {
+        cfg.drawdown_tier2_ratio = v.clamp(cfg.drawdown_tier1_ratio, 0.999);
+    }
+    if let Some(v) = req.tier1_size_scale {
+        cfg.tier1_size_scale = v.clamp(0.01, 1.0);
+    }
+    if let Some(v) = req.tier2_size_scale {
+        cfg.tier2_size_scale = v.clamp(0.01, 1.0);
     }
     let snapshot = cfg.clone();
     append_jsonl(
@@ -670,13 +700,22 @@ async fn reload_toxicity(
         std::mem::swap(&mut next.safe_threshold, &mut next.caution_threshold);
     }
     if next.markout_1s_caution_bps < next.markout_1s_danger_bps {
-        std::mem::swap(&mut next.markout_1s_caution_bps, &mut next.markout_1s_danger_bps);
+        std::mem::swap(
+            &mut next.markout_1s_caution_bps,
+            &mut next.markout_1s_danger_bps,
+        );
     }
     if next.markout_5s_caution_bps < next.markout_5s_danger_bps {
-        std::mem::swap(&mut next.markout_5s_caution_bps, &mut next.markout_5s_danger_bps);
+        std::mem::swap(
+            &mut next.markout_5s_caution_bps,
+            &mut next.markout_5s_danger_bps,
+        );
     }
     if next.markout_10s_caution_bps < next.markout_10s_danger_bps {
-        std::mem::swap(&mut next.markout_10s_caution_bps, &mut next.markout_10s_danger_bps);
+        std::mem::swap(
+            &mut next.markout_10s_caution_bps,
+            &mut next.markout_10s_danger_bps,
+        );
     }
     *state.toxicity_cfg.write().await = std::sync::Arc::new(next.clone());
     append_jsonl(

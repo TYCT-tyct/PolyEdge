@@ -460,10 +460,14 @@ dependencies = [
  "async-trait",
  "chrono",
  "core_types",
+ "futures",
  "parking_lot",
  "reqwest",
  "serde",
  "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
 ]
 
 [[package]]

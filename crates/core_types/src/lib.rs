@@ -150,6 +150,13 @@ pub struct DirectionSignal {
     /// Count of consecutive same-direction ticks used by the triple-confirm gate.
     #[serde(default)]
     pub tick_consistency: u8,
+    /// Whether the triple-confirm gate passed (velocity + acceleration/volume + consecutive ticks).
+    /// Used by downstream scorers (e.g. WinRateScore) to assess signal quality.
+    #[serde(default)]
+    pub triple_confirm: bool,
+    /// Whether the velocity exceeded the momentum-spike multiplier threshold.
+    #[serde(default)]
+    pub momentum_spike: bool,
     pub ts_ns: i64,
 }
 
@@ -313,6 +320,11 @@ pub struct OrderIntentV2 {
     pub expected_edge_net_bps: f64,
     #[serde(default)]
     pub hold_to_resolution: bool,
+    /// B: 预序列化 JSON payload — 在信号确认后立即构建，跳过 place_order_v2 里的 serde 开销。
+    /// 设置后 execution_clob 直接用此字节串作为 HTTP body，不再重新序列化。
+    /// `None` 时回退到原始序列化路径，保证向后兼容。
+    #[serde(skip)]
+    pub prebuilt_payload: Option<Vec<u8>>,
 }
 
 impl From<QuoteIntent> for OrderIntentV2 {
@@ -331,6 +343,7 @@ impl From<QuoteIntent> for OrderIntentV2 {
             fee_rate_bps: 0.0,
             expected_edge_net_bps: 0.0,
             hold_to_resolution: false,
+            prebuilt_payload: None,
         }
     }
 }

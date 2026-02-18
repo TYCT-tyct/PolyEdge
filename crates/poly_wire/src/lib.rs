@@ -44,7 +44,7 @@ impl WireMode {
         match raw.trim().to_ascii_lowercase().as_str() {
             "24" | "book24" | "top24" | "fixed24" => Self::Fixed24,
             "32" | "momentum32" | "tick32" | "fixed32" => Self::Fixed32,
-            "auto" | _ => Self::Auto,
+            _ => Self::Auto,
         }
     }
 }

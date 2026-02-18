@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -10,6 +10,8 @@ use chrono::Utc;
 use core_types::{new_id, ExecutionVenue, OrderAck, OrderAckV2, OrderIntentV2, QuoteIntent};
 use parking_lot::{Mutex, RwLock};
 use reqwest::Client;
+
+pub mod wss_user_feed;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionMode {
@@ -21,6 +23,9 @@ pub struct ClobExecution {
     mode: ExecutionMode,
     http: Client,
     clob_endpoint: String,
+    order_primary_endpoint: String,
+    order_backup_endpoint: Option<String>,
+    order_failover_timeout: Duration,
     open_orders: Arc<RwLock<HashMap<String, PaperOpenOrder>>>,
     last_prune: Mutex<Instant>,
     ack_probe: Option<Arc<AckProbe>>,
@@ -32,6 +37,9 @@ impl Clone for ClobExecution {
             mode: self.mode,
             http: self.http.clone(),
             clob_endpoint: self.clob_endpoint.clone(),
+            order_primary_endpoint: self.order_primary_endpoint.clone(),
+            order_backup_endpoint: self.order_backup_endpoint.clone(),
+            order_failover_timeout: self.order_failover_timeout,
             open_orders: self.open_orders.clone(),
             last_prune: Mutex::new(Instant::now()),
             ack_probe: self.ack_probe.clone(),
@@ -57,13 +65,38 @@ struct PaperOpenOrder {
 
 impl ClobExecution {
     pub fn new(mode: ExecutionMode, clob_endpoint: String) -> Self {
-        Self::new_with_timeout(mode, clob_endpoint, std::time::Duration::from_millis(3_000))
+        Self::new_with_order_routing(
+            mode,
+            clob_endpoint,
+            None,
+            None,
+            std::time::Duration::from_millis(3_000),
+            std::time::Duration::from_millis(200),
+        )
     }
 
     pub fn new_with_timeout(
         mode: ExecutionMode,
         clob_endpoint: String,
         timeout: std::time::Duration,
+    ) -> Self {
+        Self::new_with_order_routing(
+            mode,
+            clob_endpoint,
+            None,
+            None,
+            timeout,
+            std::time::Duration::from_millis(200),
+        )
+    }
+
+    pub fn new_with_order_routing(
+        mode: ExecutionMode,
+        clob_endpoint: String,
+        order_primary_endpoint: Option<String>,
+        order_backup_endpoint: Option<String>,
+        timeout: std::time::Duration,
+        order_failover_timeout: std::time::Duration,
     ) -> Self {
         let http = Client::builder()
             // Keep the request budget bounded (engine must never hang on IO).
@@ -127,10 +160,21 @@ impl ClobExecution {
                 })
             });
 
+        let primary = order_primary_endpoint
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| clob_endpoint.trim().trim_end_matches('/').to_string());
+        let backup = order_backup_endpoint
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty() && v != &primary);
+
         Self {
             mode,
             http,
             clob_endpoint,
+            order_primary_endpoint: primary,
+            order_backup_endpoint: backup,
+            order_failover_timeout,
             open_orders: Arc::new(RwLock::new(HashMap::new())),
             last_prune: Mutex::new(Instant::now()),
             ack_probe,
@@ -171,6 +215,15 @@ impl ClobExecution {
         for url in urls {
             let _ = self.http.get(url).send().await;
         }
+    }
+
+    pub fn order_endpoints(&self) -> Vec<String> {
+        let mut out = Vec::with_capacity(2);
+        out.push(self.order_primary_endpoint.clone());
+        if let Some(backup) = &self.order_backup_endpoint {
+            out.push(backup.clone());
+        }
+        out
     }
 
     /// Prune expired orders with lazy cleanup (only every 60 seconds)
@@ -235,7 +288,10 @@ impl ExecutionVenue for ClobExecution {
                 // at a low sampling rate to estimate ack_only_ms without placing orders.
                 let mut exchange_latency_ms = 0.0;
                 if let Some(probe) = &self.ack_probe {
-                    let n = probe.counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                    let n = probe
+                        .counter
+                        .fetch_add(1, Ordering::Relaxed)
+                        .wrapping_add(1);
                     if n % probe.every == 0 {
                         let t0 = Instant::now();
                         let _ = self.http.get(&probe.url).send().await;
@@ -267,121 +323,143 @@ impl ExecutionVenue for ClobExecution {
                     });
                 }
 
-                let payload = serde_json::json!({
-                    "market_id": intent.market_id,
-                    "token_id": intent.token_id,
-                    "side": intent.side.to_string(),
-                    "price": intent.price,
-                    "size": intent.size,
-                    "ttl_ms": intent.ttl_ms,
-                    "style": intent.style.to_string(),
-                    "tif": intent.tif.to_string(),
-                    "client_order_id": intent.client_order_id,
-                    "max_slippage_bps": intent.max_slippage_bps,
-                    "fee_rate_bps": intent.fee_rate_bps,
-                    "expected_edge_net_bps": intent.expected_edge_net_bps,
-                    "hold_to_resolution": intent.hold_to_resolution,
-                });
+                // -----------------------------------------------------------------------
+                // B: 预序列化快路径 — 跳过 serde_json 序列化开销
+                // 若调用方已预构建 JSON payload，直接用；否则走原始序列化路径。
+                // -----------------------------------------------------------------------
+                let body_bytes: Vec<u8> = if let Some(ref prebuilt) = intent.prebuilt_payload {
+                    prebuilt.clone()
+                } else {
+                    let payload = serde_json::json!({
+                        "market_id": intent.market_id,
+                        "token_id": intent.token_id,
+                        "side": intent.side.to_string(),
+                        "price": intent.price,
+                        "size": intent.size,
+                        "ttl_ms": intent.ttl_ms,
+                        "style": intent.style.to_string(),
+                        "tif": intent.tif.to_string(),
+                        "client_order_id": intent.client_order_id,
+                        "max_slippage_bps": intent.max_slippage_bps,
+                        "fee_rate_bps": intent.fee_rate_bps,
+                        "expected_edge_net_bps": intent.expected_edge_net_bps,
+                        "hold_to_resolution": intent.hold_to_resolution,
+                    });
+                    serde_json::to_vec(&payload).unwrap_or_default()
+                };
 
-                // Simple retry logic - retry immediately on network errors
-                const MAX_RETRIES: u32 = 3;
-                for attempt in 0..MAX_RETRIES {
-                    let res = match self
-                        .http
-                        .post(format!("{}/orders", self.clob_endpoint))
-                        .json(&payload)
-                        .send()
-                        .await
-                    {
-                        Ok(res) => res,
-                        Err(e) => {
-                            if attempt < MAX_RETRIES - 1 {
-                                continue; // Retry immediately
+                const MAX_RETRIES: u32 = 2;
+                let mut last_network_error: Option<String> = None;
+                for (idx, endpoint) in self.order_endpoints().iter().enumerate() {
+                    let primary_leg = idx == 0;
+                    for attempt in 0..MAX_RETRIES {
+                        let mut req = self
+                            .http
+                            .post(format!("{endpoint}/orders"))
+                            .header("content-type", "application/json")
+                            .body(body_bytes.clone());
+                        if primary_leg && self.order_failover_timeout > Duration::from_millis(0) {
+                            req = req.timeout(self.order_failover_timeout);
+                        }
+                        let res = match req.send().await {
+                            Ok(res) => res,
+                            Err(err) => {
+                                last_network_error = Some(err.to_string());
+                                if attempt + 1 < MAX_RETRIES {
+                                    continue;
+                                }
+                                break;
                             }
-                            // All retries exhausted
+                        };
+
+                        let status = res.status();
+                        let raw = res.text().await.unwrap_or_default();
+                        let payload_value = serde_json::from_str::<serde_json::Value>(&raw)
+                            .unwrap_or_else(|_| {
+                                serde_json::json!({
+                                    "raw": raw,
+                                })
+                            });
+                        let order_id = payload_value
+                            .get("order_id")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| payload_value.get("id").and_then(|v| v.as_str()))
+                            .or_else(|| payload_value.get("orderID").and_then(|v| v.as_str()))
+                            .map(ToString::to_string)
+                            .unwrap_or_else(new_id);
+                        let accepted_size = payload_value
+                            .get("accepted_size")
+                            .and_then(|v| v.as_f64())
+                            .or_else(|| payload_value.get("size").and_then(|v| v.as_f64()))
+                            .unwrap_or_else(|| {
+                                if status.is_success() {
+                                    intent.size
+                                } else {
+                                    0.0
+                                }
+                            })
+                            .max(0.0);
+                        let mut accepted = payload_value
+                            .get("accepted")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(status.is_success());
+                        let mut reject_code = payload_value
+                            .get("reject_code")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| payload_value.get("reason").and_then(|v| v.as_str()))
+                            .or_else(|| payload_value.get("error").and_then(|v| v.as_str()))
+                            .map(ToString::to_string);
+
+                        if !status.is_success() {
+                            accepted = false;
+                            if reject_code.is_none() {
+                                reject_code = Some(format!("http_{}", status.as_u16()));
+                            }
+                        }
+                        if accepted_size <= 0.0 {
+                            accepted = false;
+                        }
+                        if status.is_server_error() && attempt + 1 < MAX_RETRIES {
+                            continue;
+                        }
+                        if accepted {
                             return Ok(OrderAckV2 {
-                                order_id: new_id(),
+                                order_id,
                                 market_id: intent.market_id,
-                                accepted: false,
-                                accepted_size: 0.0,
-                                reject_code: Some(format!("network_error: {}", e)),
+                                accepted: true,
+                                accepted_size,
+                                reject_code: None,
                                 exchange_latency_ms: started.elapsed().as_secs_f64() * 1_000.0,
                                 ts_ms: Utc::now().timestamp_millis(),
                             });
                         }
-                    };
-
-                    let status = res.status();
-                    // Process response (read text first so we can still return a useful reject_code
-                    // even when the server returns non-JSON bodies).
-                    let raw = res.text().await.unwrap_or_default();
-                    let payload_value =
-                        serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_else(|_| {
-                            serde_json::json!({
-                                "raw": raw,
-                            })
-                        });
-                    let order_id = payload_value
-                        .get("order_id")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| payload_value.get("id").and_then(|v| v.as_str()))
-                        .or_else(|| payload_value.get("orderID").and_then(|v| v.as_str()))
-                        .map(ToString::to_string)
-                        .unwrap_or_else(new_id);
-                    let accepted_size = payload_value
-                        .get("accepted_size")
-                        .and_then(|v| v.as_f64())
-                        .or_else(|| payload_value.get("size").and_then(|v| v.as_f64()))
-                        .unwrap_or_else(|| if status.is_success() { intent.size } else { 0.0 });
-                    let mut accepted = payload_value
-                        .get("accepted")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(status.is_success());
-                    let mut reject_code = payload_value
-                        .get("reject_code")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| payload_value.get("reason").and_then(|v| v.as_str()))
-                        .or_else(|| payload_value.get("error").and_then(|v| v.as_str()))
-                        .map(ToString::to_string);
-
-                    // Force "not accepted" on HTTP errors even if the payload is missing/odd.
-                    if !status.is_success() {
-                        accepted = false;
-                        if reject_code.is_none() {
-                            reject_code = Some(format!("http_{}", status.as_u16()));
+                        if primary_leg {
+                            break;
                         }
+                        return Ok(OrderAckV2 {
+                            order_id,
+                            market_id: intent.market_id,
+                            accepted: false,
+                            accepted_size: 0.0,
+                            reject_code,
+                            exchange_latency_ms: started.elapsed().as_secs_f64() * 1_000.0,
+                            ts_ms: Utc::now().timestamp_millis(),
+                        });
                     }
-
-                    if accepted_size <= 0.0 {
-                        accepted = false;
-                    }
-
-                    // Only retry on server errors (5xx)
-                    if status.is_server_error() && attempt < MAX_RETRIES - 1 {
-                        continue;
-                    }
-
-                    let exchange_latency_ms = started.elapsed().as_secs_f64() * 1_000.0;
-                    return Ok(OrderAckV2 {
-                        order_id,
-                        market_id: intent.market_id,
-                        accepted,
-                        accepted_size,
-                        reject_code,
-                        exchange_latency_ms,
-                        ts_ms: Utc::now().timestamp_millis(),
-                    });
                 }
-                // All retries exhausted
-                return Ok(OrderAckV2 {
+
+                let reject_code = last_network_error
+                    .map(|e| format!("network_error:{e}"))
+                    .unwrap_or_else(|| "network_error_after_failover".to_string());
+                Ok(OrderAckV2 {
                     order_id: new_id(),
                     market_id: intent.market_id,
                     accepted: false,
                     accepted_size: 0.0,
-                    reject_code: Some("network_error_after_retry".to_string()),
+                    reject_code: Some(reject_code),
                     exchange_latency_ms: started.elapsed().as_secs_f64() * 1_000.0,
                     ts_ms: Utc::now().timestamp_millis(),
-                });
+                })
             }
         }
     }
@@ -393,15 +471,24 @@ impl ExecutionVenue for ClobExecution {
                 Ok(())
             }
             ExecutionMode::Live => {
-                let res = self
-                    .http
-                    .delete(format!("{}/orders/{order_id}", self.clob_endpoint))
-                    .send()
-                    .await?;
-                if !res.status().is_success() {
-                    bail!("cancel failed with status {}", res.status());
+                let mut last_status: Option<reqwest::StatusCode> = None;
+                for endpoint in self.order_endpoints() {
+                    let res = self
+                        .http
+                        .delete(format!("{endpoint}/orders/{order_id}"))
+                        .send()
+                        .await?;
+                    if res.status().is_success() {
+                        return Ok(());
+                    }
+                    last_status = Some(res.status());
                 }
-                Ok(())
+                bail!(
+                    "cancel failed with status {}",
+                    last_status
+                        .map(|s| s.as_u16().to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                )
             }
         }
     }
@@ -411,13 +498,57 @@ impl ExecutionVenue for ClobExecution {
         match self.mode {
             ExecutionMode::Paper => Ok(()),
             ExecutionMode::Live => {
-                let base = self.clob_endpoint.trim_end_matches('/');
-                let res = self.http.post(format!("{base}/flatten")).send().await?;
-                if !res.status().is_success() {
-                    bail!("flatten failed with status {}", res.status());
+                let mut last_status: Option<reqwest::StatusCode> = None;
+                for endpoint in self.order_endpoints() {
+                    let res = self.http.post(format!("{endpoint}/flatten")).send().await?;
+                    if res.status().is_success() {
+                        return Ok(());
+                    }
+                    last_status = Some(res.status());
                 }
-                Ok(())
+                bail!(
+                    "flatten failed with status {}",
+                    last_status
+                        .map(|s| s.as_u16().to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                )
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn order_endpoints_include_backup_when_configured() {
+        let exec = ClobExecution::new_with_order_routing(
+            ExecutionMode::Paper,
+            "https://clob.polymarket.com".to_string(),
+            Some("http://127.0.0.1:9001".to_string()),
+            Some("http://127.0.0.1:9002".to_string()),
+            Duration::from_millis(1_000),
+            Duration::from_millis(200),
+        );
+        let endpoints = exec.order_endpoints();
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints[0], "http://127.0.0.1:9001");
+        assert_eq!(endpoints[1], "http://127.0.0.1:9002");
+    }
+
+    #[test]
+    fn order_endpoints_dedup_empty_backup() {
+        let exec = ClobExecution::new_with_order_routing(
+            ExecutionMode::Paper,
+            "https://clob.polymarket.com".to_string(),
+            Some("http://127.0.0.1:9001".to_string()),
+            Some("http://127.0.0.1:9001".to_string()),
+            Duration::from_millis(1_000),
+            Duration::from_millis(200),
+        );
+        let endpoints = exec.order_endpoints();
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0], "http://127.0.0.1:9001");
     }
 }

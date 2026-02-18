@@ -11,6 +11,11 @@ pub struct RiskLimits {
     pub max_drawdown_pct: f64,
     pub max_loss_streak: u32,
     pub cooldown_sec: u64,
+    pub progressive_enabled: bool,
+    pub drawdown_tier1_ratio: f64,
+    pub drawdown_tier2_ratio: f64,
+    pub tier1_size_scale: f64,
+    pub tier2_size_scale: f64,
 }
 
 impl Default for RiskLimits {
@@ -22,6 +27,11 @@ impl Default for RiskLimits {
             max_drawdown_pct: 0.015,
             max_loss_streak: 5,
             cooldown_sec: 60,
+            progressive_enabled: true,
+            drawdown_tier1_ratio: 0.50,
+            drawdown_tier2_ratio: 0.80,
+            tier1_size_scale: 0.70,
+            tier2_size_scale: 0.40,
         }
     }
 }
@@ -62,7 +72,9 @@ impl RiskManager for DefaultRiskManager {
         let now_ms = ctx.now_ms;
 
         // Cooldown gate (e.g. after a loss streak trigger).
-        let cooldown_active = self.state.lock()
+        let cooldown_active = self
+            .state
+            .lock()
             .map(|st| now_ms > 0 && now_ms < st.cooldown_until_ms)
             .unwrap_or(false); // Fail closed if lock fails
 
@@ -74,13 +86,30 @@ impl RiskManager for DefaultRiskManager {
             };
         }
 
+        let drawdown_abs = ctx.drawdown_pct.abs();
         // Hard drawdown stop - use abs to handle negative drawdown values
-        if ctx.drawdown_pct.abs() >= limits.max_drawdown_pct {
+        if drawdown_abs >= limits.max_drawdown_pct {
             return RiskDecision {
                 allow: false,
                 reason: "drawdown_stop".to_string(),
                 capped_size: 0.0,
             };
+        }
+        let mut progressive_scale: f64 = 1.0;
+        let mut progressive_reason: Option<&'static str> = None;
+        if limits.progressive_enabled && limits.max_drawdown_pct > 0.0 {
+            let tier1 = limits.max_drawdown_pct * limits.drawdown_tier1_ratio.clamp(0.05, 0.99);
+            let tier2 = limits.max_drawdown_pct
+                * limits
+                    .drawdown_tier2_ratio
+                    .clamp(limits.drawdown_tier1_ratio.clamp(0.05, 0.99), 0.999);
+            if drawdown_abs >= tier2 {
+                progressive_scale = progressive_scale.min(limits.tier2_size_scale.clamp(0.01, 1.0));
+                progressive_reason = Some("drawdown_tier2");
+            } else if drawdown_abs >= tier1 {
+                progressive_scale = progressive_scale.min(limits.tier1_size_scale.clamp(0.01, 1.0));
+                progressive_reason = Some("drawdown_tier1");
+            }
         }
 
         // Loss streak stop: once tripped, enter cooldown window.
@@ -88,8 +117,8 @@ impl RiskManager for DefaultRiskManager {
             if let Ok(mut st) = self.state.lock() {
                 if now_ms > 0 {
                     // Start cooldown window from "now", not from previous value.
-                    st.cooldown_until_ms = now_ms
-                        .saturating_add((limits.cooldown_sec as i64).saturating_mul(1_000));
+                    st.cooldown_until_ms =
+                        now_ms.saturating_add((limits.cooldown_sec as i64).saturating_mul(1_000));
                 }
             }
             return RiskDecision {
@@ -127,7 +156,7 @@ impl RiskManager for DefaultRiskManager {
             return RiskDecision {
                 allow: capped_size > 0.0,
                 reason: "market_notional_limit".to_string(),
-                capped_size,
+                capped_size: (capped_size * progressive_scale).max(0.0),
             };
         }
 
@@ -141,14 +170,15 @@ impl RiskManager for DefaultRiskManager {
             return RiskDecision {
                 allow: capped_size > 0.0,
                 reason: "asset_notional_limit".to_string(),
-                capped_size,
+                capped_size: (capped_size * progressive_scale).max(0.0),
             };
         }
 
+        let capped = (ctx.proposed_size.max(0.0) * progressive_scale).max(0.0);
         RiskDecision {
-            allow: true,
-            reason: "ok".to_string(),
-            capped_size: ctx.proposed_size.max(0.0),
+            allow: capped > 0.0,
+            reason: progressive_reason.unwrap_or("ok").to_string(),
+            capped_size: capped,
         }
     }
 }
@@ -214,5 +244,32 @@ mod tests {
         assert!(d.allow);
         // Remaining notional is 2.0 out of requested 4.0 => 50% size cap.
         assert!((d.capped_size - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn progressive_drawdown_scales_size_before_hard_stop() {
+        let limits = Arc::new(RwLock::new(RiskLimits {
+            max_drawdown_pct: 0.20,
+            drawdown_tier1_ratio: 0.50,
+            drawdown_tier2_ratio: 0.80,
+            tier1_size_scale: 0.70,
+            tier2_size_scale: 0.40,
+            progressive_enabled: true,
+            ..RiskLimits::default()
+        }));
+        let rm = DefaultRiskManager::new(limits);
+        let mut low = ctx(1_000_000);
+        low.drawdown_pct = 0.11;
+        let d_low = rm.evaluate(&low);
+        assert!(d_low.allow);
+        assert_eq!(d_low.reason, "drawdown_tier1");
+        assert!((d_low.capped_size - 0.70).abs() < 1e-9);
+
+        let mut high = ctx(1_000_100);
+        high.drawdown_pct = 0.17;
+        let d_high = rm.evaluate(&high);
+        assert!(d_high.allow);
+        assert_eq!(d_high.reason, "drawdown_tier2");
+        assert!((d_high.capped_size - 0.40).abs() < 1e-9);
     }
 }
