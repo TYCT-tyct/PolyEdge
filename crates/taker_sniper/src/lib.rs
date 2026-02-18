@@ -43,9 +43,8 @@ pub struct TakerSniperConfig {
     pub gatling_stop_on_reject: bool,
     #[serde(default)]
     pub gatling_by_symbol: HashMap<String, SymbolGatlingConfig>,
-    /// 胜率评分最低阈值 (0-100)。
-    /// 总分低于此值的机会会被跳过，宁可少交易不能亚交易。
-    /// 评分维度: 信号质量(0-40) + 市场质量(0-35) + 时序质量(0-25)
+    /// Minimum quality score (0..100) required to fire.
+    /// Score = signal (0..40) + market (0..35) + timing (0..25).
     #[serde(default = "default_min_win_rate_score")]
     pub min_win_rate_score: f64,
 }
@@ -58,7 +57,8 @@ impl Default for TakerSniperConfig {
     fn default() -> Self {
         Self {
             min_direction_confidence: 0.60,
-            min_edge_net_bps: 10.0,
+            // Conservative default for taker path; config can override this.
+            min_edge_net_bps: 200.0,
             max_spread: 0.08,
             cooldown_ms_per_market: 800,
             gatling_enabled: true,
@@ -99,10 +99,7 @@ pub struct TakerDecision {
     pub reason: String,
 }
 
-// ============================================================
-// 评估上下文 — 将 12 个分散参数聚合为一个语义单元
-// 调用方通过结构体字面量构造，字段名即文档，无需注释参数顺序
-// ============================================================
+// Inputs for a single taker decision.
 #[derive(Debug, Clone)]
 pub struct EvaluateCtx<'a> {
     pub market_id: &'a str,
@@ -171,9 +168,7 @@ impl TakerSniper {
             }
         }
 
-        // 胜率评分过滤: 只在高质量机会下注
-        // 评分维度: 信号质量 + 市场质量 + 时序质量
-        // 实现哲学: 宁可少交易，不能亚交易
+        // Quality gate: skip weak opportunities.
         if self.cfg.min_win_rate_score > 0.0 {
             let score = compute_win_rate_score(ctx);
             if score < self.cfg.min_win_rate_score {
@@ -398,37 +393,25 @@ fn direction_to_side(dir: &Direction) -> core_types::OrderSide {
     }
 }
 
-/// 动态费率门槛: 根据价格区间决定最低净 edge 要求
-///
-/// 设计哲学: Polymarket taker fee 随价格区间急剧变化
-///   - 极端价格 (>0.92 / <0.08): fee ≈ 0.5-1%, 低门槛即可盈利
-///   - 中间价格 (~0.50): fee ≈ 3.15% (315 bps), 需要极大 edge 才值得交易
-///
-/// 门槛设计原则: 宁可少交易, 不可亏钱
-///   - 0.92-1.00: 30 bps  → 极端价格, 费率最低, 最容易盈利
-///   - 0.85-0.92: 80 bps  → 高概率区间, 费率尚可
-///   - 0.75-0.85: 200 bps → 中高区间, 费率开始显著
-///   - 0.60-0.75: 400 bps → 中间偏高, 费率很高, 需要大 edge
-///   - 0.40-0.60: 800 bps → 50¢ 附近, 费率最高, 几乎不应交易
-///
-/// confidence 放宽: 高置信度信号可放宽最多 25% 门槛
+/// Dynamic edge gate by entry price bucket.
+/// Near 0.50 prices require much larger edge due fee drag and toxicity.
 #[inline]
 fn dynamic_fee_gate_min_edge_bps(entry_price: f64, confidence: f64) -> f64 {
     let p = entry_price.clamp(0.0, 1.0);
-    // 对称处理: p 和 1-p 的费率结构相同
+    // Fee behavior is approximately symmetric around 0.50.
     let base_gate = if p >= 0.92 || p <= 0.08 {
-        30.0
-    } else if p >= 0.85 || p <= 0.15 {
         80.0
+    } else if p >= 0.85 || p <= 0.15 {
+        150.0
     } else if p >= 0.75 || p <= 0.25 {
-        200.0
+        300.0
     } else if p >= 0.60 || p <= 0.40 {
-        400.0
+        600.0
     } else {
-        // 50¢ 附近: Polymarket fee ≈ 315 bps, 需要 800 bps 才有净利润空间
-        800.0
+        // Around 0.50, require a much larger edge.
+        1200.0
     };
-    // 高置信度信号可放宽最多 25% (confidence=1.0 时 relax=0.75)
+    // High confidence can relax at most 25%.
     let confidence_relax =
         (1.0 - (confidence.clamp(0.0, 1.0) - 0.5).max(0.0) * 0.4).clamp(0.75, 1.0);
     base_gate * confidence_relax
@@ -473,8 +456,8 @@ mod tests {
             entry_price: 0.95,
             spread: 0.01,
             fee_bps: 2.0,
-            edge_gross_bps: 30.0,
-            edge_net_bps: 32.0,
+            edge_gross_bps: 80.0,
+            edge_net_bps: 80.0, // 0.95 区间需要 > 67.2 bps (80*0.84)
             size: 10.0,
             now_ms: 1_000_000,
         });
@@ -543,8 +526,8 @@ mod tests {
             entry_price: 0.95,
             spread: 0.01,
             fee_bps: 2.0,
-            edge_gross_bps: 30.0,
-            edge_net_bps: 32.0,
+            edge_gross_bps: 80.0,
+            edge_net_bps: 80.0, // 0.95 区间需要 > 67.2 bps
             size: 10.0,
             now_ms: 1_000_000,
         });
@@ -557,8 +540,8 @@ mod tests {
             entry_price: 0.95,
             spread: 0.01,
             fee_bps: 2.0,
-            edge_gross_bps: 30.0,
-            edge_net_bps: 32.0,
+            edge_gross_bps: 80.0,
+            edge_net_bps: 80.0,
             size: 10.0,
             now_ms: 1_000_500,
         });
@@ -619,10 +602,11 @@ mod tests {
 
     #[test]
     fn dynamic_fee_gate_allows_extreme_price_with_small_edge() {
-        // 0.95 区间: 30 bps * 0.75 (confidence=0.9 放宽) = 22.5 bps
-        // edge_net_bps=40 > 22.5, 应该 Fire
+        // 0.95 区间: 80 bps base * 0.84 (confidence=0.9 放宽) = 67.2 bps
+        // edge_net_bps=80 > 67.2, 应该 Fire
         let mut sniper = TakerSniper::new(TakerSniperConfig {
             min_edge_net_bps: 10.0,
+            min_win_rate_score: 0.0, // 只测试 fee gate 行为
             ..TakerSniperConfig::default()
         });
         let sig = up_signal(0.9);
@@ -634,8 +618,8 @@ mod tests {
             entry_price: 0.95,
             spread: 0.01,
             fee_bps: 2.0,
-            edge_gross_bps: 40.0,
-            edge_net_bps: 40.0,
+            edge_gross_bps: 80.0,
+            edge_net_bps: 80.0, // 80 > 67.2 bps → Fire
             size: 10.0,
             now_ms: 1_000_000,
         });
@@ -645,16 +629,17 @@ mod tests {
     #[test]
     fn dynamic_fee_gate_relaxes_with_higher_confidence() {
         // 验证高置信度确实能放宽门槛 (在极端价格区间)
-        // 0.85 区间: 80 bps base
-        //   confidence=0.55: relax = 1 - (0.55-0.5)*0.4 = 0.98 → 需要 78.4 bps
-        //   confidence=0.95: relax = 1 - (0.95-0.5)*0.4 = 0.82 → 需要 65.6 bps
+        // 0.85 区间: 150 bps base
+        //   confidence=0.55: relax = 1 - (0.55-0.5)*0.4 = 0.98 → 需要 147 bps
+        //   confidence=0.95: relax = 1 - (0.95-0.5)*0.4 = 0.82 → 需要 123 bps
         let mut sniper = TakerSniper::new(TakerSniperConfig {
             min_edge_net_bps: 10.0,
+            min_win_rate_score: 0.0, // 只测试 fee gate 行为，禁用胜率过滤
             ..TakerSniperConfig::default()
         });
         let low = up_signal(0.55);
         let high = up_signal(0.95);
-        // 低置信度: edge=70 bps < 78.4 bps → Skip
+        // 低置信度: edge=130 bps < 147 bps → Skip
         let d_low = sniper.evaluate(&EvaluateCtx {
             market_id: "m1",
             symbol: "BTCUSDT",
@@ -663,13 +648,13 @@ mod tests {
             entry_price: 0.85,
             spread: 0.01,
             fee_bps: 2.0,
-            edge_gross_bps: 70.0,
-            edge_net_bps: 70.0,
+            edge_gross_bps: 130.0,
+            edge_net_bps: 130.0,
             size: 10.0,
             now_ms: 1_000_000,
         });
         assert!(matches!(d_low.action, TakerAction::Skip));
-        // 高置信度: edge=70 bps > 65.6 bps → Fire
+        // 高置信度: edge=130 bps > 123 bps → Fire
         let d_high = sniper.evaluate(&EvaluateCtx {
             market_id: "m2",
             symbol: "BTCUSDT",
@@ -678,8 +663,8 @@ mod tests {
             entry_price: 0.85,
             spread: 0.01,
             fee_bps: 2.0,
-            edge_gross_bps: 70.0,
-            edge_net_bps: 70.0,
+            edge_gross_bps: 130.0,
+            edge_net_bps: 130.0,
             size: 10.0,
             now_ms: 1_000_000,
         });
@@ -704,8 +689,8 @@ mod tests {
             entry_price: 0.90,
             spread: 0.01,
             fee_bps: 2.0,
-            edge_gross_bps: 80.0,
-            edge_net_bps: 120.0,
+            edge_gross_bps: 200.0,
+            edge_net_bps: 200.0, // 0.90 区间需要 > 150 bps
             size: 10.0,
             now_ms: 1_000_000,
         });
@@ -722,6 +707,7 @@ mod tests {
     #[test]
     fn symbol_level_gatling_override_applied() {
         let mut sniper = TakerSniper::new(TakerSniperConfig {
+            min_edge_net_bps: 5.0, // 测试 gatling 行为，不测试 edge 门槛
             gatling_enabled: false,
             gatling_chunk_notional_usdc: 10.0,
             gatling_min_chunks: 1,
@@ -748,8 +734,8 @@ mod tests {
             entry_price: 0.90,
             spread: 0.01,
             fee_bps: 2.0,
-            edge_gross_bps: 80.0,
-            edge_net_bps: 120.0,
+            edge_gross_bps: 200.0,
+            edge_net_bps: 200.0, // 0.90 区间需要 > 150 bps
             size: 10.0,
             now_ms: 1_000_000,
         });

@@ -403,6 +403,9 @@ async fn reload_exit(
     if let Some(v) = req.t300ms_reversal_bps {
         cfg.t300ms_reversal_bps = v;
     }
+    if let Some(v) = req.convergence_exit_ratio {
+        cfg.convergence_exit_ratio = v.clamp(0.0, 1.0);
+    }
     if let Some(v) = req.time_stop_ms {
         cfg.time_stop_ms = v.clamp(50, 60_000);
     }

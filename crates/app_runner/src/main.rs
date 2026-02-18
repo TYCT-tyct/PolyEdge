@@ -349,6 +349,7 @@ struct ExitReloadReq {
     enabled: Option<bool>,
     t100ms_reversal_bps: Option<f64>,
     t300ms_reversal_bps: Option<f64>,
+    convergence_exit_ratio: Option<f64>,
     time_stop_ms: Option<u64>,
     edge_decay_bps: Option<f64>,
     adverse_move_bps: Option<f64>,
@@ -516,6 +517,7 @@ struct ExitConfig {
     enabled: bool,
     t100ms_reversal_bps: f64,
     t300ms_reversal_bps: f64,
+    convergence_exit_ratio: f64,
     time_stop_ms: u64,
     edge_decay_bps: f64,
     adverse_move_bps: f64,
@@ -535,6 +537,7 @@ impl Default for ExitConfig {
             enabled: true,
             t100ms_reversal_bps: -3.0,
             t300ms_reversal_bps: -2.0,
+            convergence_exit_ratio: 0.85,
             time_stop_ms: 300_000,
             edge_decay_bps: -2.0,
             adverse_move_bps: -8.0,
@@ -634,8 +637,7 @@ fn to_exit_manager_config(cfg: &ExitConfig) -> ExitManagerConfig {
     ExitManagerConfig {
         t100ms_reversal_bps: cfg.t100ms_reversal_bps,
         t300ms_reversal_bps: cfg.t300ms_reversal_bps,
-        // 收敛出场: PM 价格修复 85% 就走，不等时钟
-        convergence_exit_ratio: 0.85,
+        convergence_exit_ratio: cfg.convergence_exit_ratio.clamp(0.0, 1.0),
         t3_take_ratio: cfg.t3_take_ratio.clamp(0.0, 5.0),
         t15_min_unrealized_usdc: cfg.t15_min_unrealized_usdc,
         t60_true_prob_floor: cfg.t60_true_prob_floor.clamp(0.0, 1.0),
@@ -8172,6 +8174,11 @@ fn load_exit_config() -> ExitConfig {
             "t100ms_reversal_bps" => {
                 if let Ok(parsed) = val.parse::<f64>() {
                     cfg.t100ms_reversal_bps = parsed;
+                }
+            }
+            "convergence_exit_ratio" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.convergence_exit_ratio = parsed.clamp(0.0, 1.0);
                 }
             }
             "time_stop_ms" => {
