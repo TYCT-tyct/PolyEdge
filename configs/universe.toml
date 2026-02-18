@@ -3,17 +3,6 @@ assets = [
   "ETHUSDT",
   "SOLUSDT",
   "XRPUSDT",
-  "BNBUSDT",
-  "DOGEUSDT",
-  "ADAUSDT",
-  "AVAXUSDT",
-  "LINKUSDT",
-  "MATICUSDT",
-  "LTCUSDT",
-  "DOTUSDT",
-  "TRXUSDT",
-  "TONUSDT",
-  "NEARUSDT",
 ]
 market_types = ["updown"]
 timeframes = ["5m", "15m", "1h", "1d"]

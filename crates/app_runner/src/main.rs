@@ -3237,17 +3237,17 @@ fn spawn_strategy_engine(
         let strategy_max_coalesce = std::env::var("POLYEDGE_STRATEGY_MAX_COALESCE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(96)
+            .unwrap_or(512)
             .clamp(8, 1_024);
         let strategy_coalesce_min = std::env::var("POLYEDGE_STRATEGY_MIN_COALESCE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(4)
-            .clamp(1, 64);
+            .unwrap_or(32)
+            .clamp(1, 128);
         let strategy_coalesce_budget_us = std::env::var("POLYEDGE_STRATEGY_COALESCE_BUDGET_US")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(200)
+            .unwrap_or(800)
             .clamp(20, 2_000);
         let strategy_drop_stale_book_ms = std::env::var("POLYEDGE_STRATEGY_DROP_STALE_BOOK_MS")
             .ok()
