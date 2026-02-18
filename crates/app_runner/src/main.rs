@@ -2993,7 +2993,6 @@ fn spawn_reference_feed(
                             fusion.mode.as_str(),
                             fallback_active,
                             share_high && projected_share_violation,
-                            ws_cap_ready,
                         );
 
                         if enforce_ws_primary {
@@ -7489,12 +7488,8 @@ fn should_enforce_udp_share_cap(
     mode: &str,
     fallback_active: bool,
     share_high: bool,
-    ws_recent: bool,
 ) -> bool {
-    matches!(mode, "active_active" | "websocket_primary")
-        && !fallback_active
-        && share_high
-        && ws_recent
+    matches!(mode, "active_active" | "websocket_primary") && !fallback_active && share_high
 }
 
 fn ref_event_ts_ms(tick: &RefTick) -> i64 {
@@ -10653,36 +10648,26 @@ mod tests {
     }
 
     #[test]
-    fn udp_share_cap_enforced_only_when_ws_is_available_and_no_fallback() {
+    fn udp_share_cap_enforced_when_not_in_fallback() {
         assert!(should_enforce_udp_share_cap(
             "websocket_primary",
             false,
-            true,
             true
         ));
         assert!(should_enforce_udp_share_cap(
             "active_active",
             false,
-            true,
             true
         ));
         assert!(!should_enforce_udp_share_cap(
             "websocket_primary",
-            true,
             true,
             true
         ));
         assert!(!should_enforce_udp_share_cap(
             "websocket_primary",
             false,
-            true,
             false
-        ));
-        assert!(!should_enforce_udp_share_cap(
-            "websocket_primary",
-            false,
-            false,
-            true
         ));
     }
 
