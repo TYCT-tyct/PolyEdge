@@ -12,7 +12,7 @@ It is intended for audit and traceability when commit history spans multiple ref
 | `feat/v52-exit-and-fallback` | `30e93d5`, `a499802`, `ce68b68` | Exit lifecycle, reversal handling, and fallback behavior. |
 | `feat/v52-live-gates` | `f9c9ad8`, `6f07242` | Settlement/live hard gate and degraded-source guard. |
 | `feat/v52-reporting-fallback-metric` | `f9c9ad8`, `2ac06ea` | Live report continuity, fallback counter, and queue-focused reporting. |
-| `feat/v52-reversal-switch-integration` | `TBD (this change set)` | End-to-end reversal flatten + opposite maker re-entry integration test. |
+| `feat/v52-reversal-switch-integration` | `019315d` | End-to-end reversal flatten + opposite maker re-entry integration test. |
 | `feat/v52-queue-opt` | `53d612a`, `24b8bfe`, `6282bc8`, `2ac06ea` | Queue wait tail optimization and hot-loop stall removal. |
 
 ## Working Tree Hygiene
