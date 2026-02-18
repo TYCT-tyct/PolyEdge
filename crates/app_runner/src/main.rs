@@ -1448,12 +1448,11 @@ impl ShadowStats {
         push_capped(&mut s.book_latency_ms, book_latency_ms, Self::SAMPLE_CAP);
         push_capped(&mut s.local_backlog_ms, local_backlog_ms, Self::SAMPLE_CAP);
         push_capped(&mut s.ref_decode_ms, ref_decode_ms, Self::SAMPLE_CAP);
-        // Contract: decision_queue_wait is the queue/backlog time we spent waiting locally.
-        push_capped(
-            &mut s.decision_queue_wait_ms,
-            local_backlog_ms,
-            Self::SAMPLE_CAP,
-        );
+    }
+
+    async fn push_decision_queue_wait_ms(&self, ms: f64) {
+        let mut s = self.samples.write().await;
+        push_capped(&mut s.decision_queue_wait_ms, ms, Self::SAMPLE_CAP);
     }
 
     async fn push_decision_compute_ms(&self, ms: f64) {
@@ -2513,8 +2512,8 @@ async fn async_main() -> Result<()> {
     let strategy_input_queue_cap = std::env::var("POLYEDGE_STRATEGY_INPUT_QUEUE_CAP")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1_024)
-        .clamp(256, 65_536);
+        .unwrap_or(768)
+        .clamp(128, 8_192);
     let (strategy_ingress_tx, strategy_ingress_rx) =
         mpsc::channel::<StrategyIngress>(strategy_input_queue_cap);
 
@@ -2643,8 +2642,8 @@ fn spawn_reference_feed(
         let ref_merge_queue_cap = std::env::var("POLYEDGE_REF_MERGE_QUEUE_CAP")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(16_384)
-            .clamp(2_048, 262_144);
+            .unwrap_or(8_192)
+            .clamp(1_024, 65_536);
         let ref_merge_drop_on_full = std::env::var("POLYEDGE_REF_MERGE_DROP_ON_FULL")
             .ok()
             .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
@@ -3266,17 +3265,17 @@ fn spawn_strategy_engine(
         let strategy_max_coalesce = std::env::var("POLYEDGE_STRATEGY_MAX_COALESCE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(384)
+            .unwrap_or(256)
             .clamp(8, 1_024);
         let strategy_coalesce_min = std::env::var("POLYEDGE_STRATEGY_MIN_COALESCE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(16)
+            .unwrap_or(4)
             .clamp(1, 128);
         let strategy_coalesce_budget_us = std::env::var("POLYEDGE_STRATEGY_COALESCE_BUDGET_US")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(500)
+            .unwrap_or(120)
             .clamp(20, 2_000);
         let strategy_drop_stale_book_ms = std::env::var("POLYEDGE_STRATEGY_DROP_STALE_BOOK_MS")
             .ok()
@@ -3650,6 +3649,12 @@ fn spawn_strategy_engine(
                         metrics::counter!("strategy.decision_backlog_guard").increment(1);
                         continue;
                     }
+                    shared
+                        .shadow_stats
+                        .push_decision_queue_wait_ms(latency_sample.local_backlog_ms)
+                        .await;
+                    metrics::histogram!("latency.decision_queue_wait_ms")
+                        .record(latency_sample.local_backlog_ms);
                     let signal_start = Instant::now();
                     let signal = fair.evaluate(eval_tick, &book);
                     if signal.edge_bps_bid > 0.0 || signal.edge_bps_ask > 0.0 {
@@ -4364,8 +4369,6 @@ fn spawn_strategy_engine(
                                     .record(tick_to_decision_ms);
                                 metrics::histogram!("latency.decision_compute_ms")
                                     .record(decision_compute_ms);
-                                metrics::histogram!("latency.decision_queue_wait_ms")
-                                    .record(latency_sample.local_backlog_ms);
                                 if ack_only_ms > 0.0 {
                                     metrics::histogram!("latency.ack_only_ms").record(ack_only_ms);
                                     metrics::histogram!("latency.tick_to_ack_ms")
@@ -7096,21 +7099,34 @@ fn compute_coalesce_policy(
     strategy_coalesce_budget_us: u64,
 ) -> CoalescePolicy {
     // For shallow queues, process immediately to minimize tail latency.
-    if queue_len < 8 {
+    if queue_len < 12 {
         return CoalescePolicy {
             max_events: 0,
             budget_us: 0,
         };
     }
 
-    let dynamic_cap = queue_len.saturating_add(32).min(strategy_max_coalesce);
+    // If queue is already deep, prioritize drain speed to collapse backlog spikes quickly.
+    if queue_len >= 128 {
+        let max_events = queue_len.min(strategy_max_coalesce).max(strategy_coalesce_min);
+        let budget_us = strategy_coalesce_budget_us.max(800).min(3_000);
+        return CoalescePolicy {
+            max_events,
+            budget_us,
+        };
+    }
+
+    let dynamic_cap = queue_len
+        .saturating_div(2)
+        .saturating_add(8)
+        .min(strategy_max_coalesce);
     let max_events = dynamic_cap.max(strategy_coalesce_min);
     let budget_us = match lag_p50_ms {
-        Some(l) if l >= 80.0 => 300_u64,
-        Some(l) if l >= 40.0 => strategy_coalesce_budget_us,
-        Some(l) if l >= 15.0 => 100_u64,
-        Some(_) => 50_u64,
-        None => strategy_coalesce_budget_us,
+        Some(l) if l >= 80.0 => 220_u64,
+        Some(l) if l >= 40.0 => strategy_coalesce_budget_us.min(160),
+        Some(l) if l >= 15.0 => 80_u64,
+        Some(_) => 40_u64,
+        None => strategy_coalesce_budget_us.min(120),
     };
 
     CoalescePolicy {
@@ -10725,10 +10741,18 @@ timeframes = ["5m", "15m", "1h", "1d"]
     #[test]
     fn compute_coalesce_policy_scales_for_deep_queue() {
         let p = compute_coalesce_policy(40, Some(50.0), 96, 4, 200);
-        assert!(p.max_events >= 40);
-        assert_eq!(p.budget_us, 200);
+        assert!(p.max_events >= 24);
+        assert!(p.max_events <= 40);
+        assert_eq!(p.budget_us, 160);
 
         let fast = compute_coalesce_policy(40, Some(10.0), 96, 4, 200);
-        assert_eq!(fast.budget_us, 50);
+        assert_eq!(fast.budget_us, 40);
+    }
+
+    #[test]
+    fn compute_coalesce_policy_uses_drain_mode_for_very_deep_queue() {
+        let p = compute_coalesce_policy(200, Some(60.0), 256, 4, 120);
+        assert_eq!(p.max_events, 200);
+        assert_eq!(p.budget_us, 800);
     }
 }
