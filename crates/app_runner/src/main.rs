@@ -2795,6 +2795,7 @@ fn spawn_reference_feed(
         let mut latest_ws_recv_ns_global: i64 = 0;
         let mut ws_primary_fallback_until_ns: i64 = 0;
         let mut ws_primary_ready_seen = false;
+        let mut ws_cap_breach_started_ns: i64 = 0;
         let mut accepted_fast_mix_by_symbol: HashMap<String, (u64, u64)> = HashMap::new();
         let mut accepted_fast_mix_total: (u64, u64) = (0, 0);
         let mut source_health_cfg = shared.source_health_cfg.read().await.clone();
@@ -2951,13 +2952,19 @@ fn spawn_reference_feed(
                         let ws_cap_ready = ws_gap_ns <= ws_primary_fallback_gap_ns();
                         if ws_cap_ready {
                             ws_primary_ready_seen = true;
+                            ws_cap_breach_started_ns = 0;
+                        } else if ws_primary_ready_seen && ws_cap_breach_started_ns == 0 {
+                            ws_cap_breach_started_ns = now_recv_ns;
                         }
+                        let ws_breach_persisted = ws_cap_breach_started_ns > 0
+                            && now_recv_ns.saturating_sub(ws_cap_breach_started_ns)
+                                >= ws_primary_fallback_arm_ns();
                         let fallback_active_now = fusion.mode == "websocket_primary"
                             && now_recv_ns < ws_primary_fallback_until_ns;
                         if should_arm_ws_primary_fallback(
                             fusion.mode.as_str(),
                             ws_cap_ready,
-                            ws_primary_ready_seen,
+                            ws_breach_persisted,
                             fallback_active_now,
                         ) {
                             let cooldown_ns =
@@ -7471,10 +7478,10 @@ fn fast_tick_allowed_in_fusion_mode(source: &str, mode: &str) -> bool {
 fn should_arm_ws_primary_fallback(
     mode: &str,
     ws_cap_ready: bool,
-    ws_ready_seen: bool,
+    ws_breach_persisted: bool,
     fallback_active: bool,
 ) -> bool {
-    mode == "websocket_primary" && ws_ready_seen && !ws_cap_ready && !fallback_active
+    mode == "websocket_primary" && ws_breach_persisted && !ws_cap_ready && !fallback_active
 }
 
 #[inline]
@@ -7598,6 +7605,18 @@ fn ws_primary_fallback_gap_ns() -> i64 {
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(3_000)
             .clamp(250, 10_000)
+            * 1_000_000
+    })
+}
+
+fn ws_primary_fallback_arm_ns() -> i64 {
+    static WS_PRIMARY_FALLBACK_ARM_NS: OnceLock<i64> = OnceLock::new();
+    *WS_PRIMARY_FALLBACK_ARM_NS.get_or_init(|| {
+        std::env::var("POLYEDGE_WS_PRIMARY_FALLBACK_ARM_MS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(2_000)
+            .clamp(200, 15_000)
             * 1_000_000
     })
 }
