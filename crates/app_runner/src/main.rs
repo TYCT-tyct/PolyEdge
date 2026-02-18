@@ -7610,7 +7610,7 @@ fn ws_primary_fallback_arm_ns() -> i64 {
         std::env::var("POLYEDGE_WS_PRIMARY_FALLBACK_ARM_MS")
             .ok()
             .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(8_000)
+            .unwrap_or(2_000)
             .clamp(200, 15_000)
             * 1_000_000
     })
