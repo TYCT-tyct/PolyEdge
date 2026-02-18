@@ -93,6 +93,12 @@ enum StrategyIngress {
 }
 
 #[derive(Debug, Clone)]
+struct StrategyIngressMsg {
+    enqueued_ns: i64,
+    payload: StrategyIngress,
+}
+
+#[derive(Debug, Clone)]
 struct FeeRateEntry {
     fee_bps: f64,
     fetched_at: Instant,
@@ -2515,7 +2521,7 @@ async fn async_main() -> Result<()> {
         .unwrap_or(768)
         .clamp(128, 8_192);
     let (strategy_ingress_tx, strategy_ingress_rx) =
-        mpsc::channel::<StrategyIngress>(strategy_input_queue_cap);
+        mpsc::channel::<StrategyIngressMsg>(strategy_input_queue_cap);
 
     let state = AppState {
         paused: paused.clone(),
@@ -2624,7 +2630,7 @@ fn spawn_reference_feed(
     symbols: Vec<String>,
     fusion_cfg: Arc<RwLock<FusionConfig>>,
     shared: Arc<EngineShared>,
-    strategy_tx: mpsc::Sender<StrategyIngress>,
+    strategy_tx: mpsc::Sender<StrategyIngressMsg>,
 ) {
     #[derive(Clone, Copy)]
     enum RefLane {
@@ -2870,7 +2876,10 @@ fn spawn_reference_feed(
                     }
 
                     if strategy_ref_ingress_enabled {
-                        let ingress = StrategyIngress::RefTick(tick.clone());
+                        let ingress = StrategyIngressMsg {
+                            enqueued_ns: now_ns(),
+                            payload: StrategyIngress::RefTick(tick.clone()),
+                        };
                         if strategy_ingress_drop_on_full {
                             match strategy_tx.try_send(ingress) {
                                 Ok(()) => {}
@@ -3081,7 +3090,7 @@ fn spawn_market_feed(
     symbols: Vec<String>,
     market_types: Vec<String>,
     timeframes: Vec<String>,
-    strategy_tx: mpsc::Sender<StrategyIngress>,
+    strategy_tx: mpsc::Sender<StrategyIngressMsg>,
 ) {
     const TS_INVERSION_TOLERANCE_MS: i64 = 250;
     const TS_BACKJUMP_RESET_MS: i64 = 5_000;
@@ -3204,7 +3213,10 @@ fn spawn_market_feed(
                             continue;
                         }
 
-                        let ingress = StrategyIngress::BookTop(book.clone());
+                        let ingress = StrategyIngressMsg {
+                            enqueued_ns: now_ns(),
+                            payload: StrategyIngress::BookTop(book.clone()),
+                        };
                         if strategy_ingress_drop_on_full {
                             match strategy_tx.try_send(ingress) {
                                 Ok(()) => {}
@@ -3240,7 +3252,7 @@ fn spawn_strategy_engine(
     shadow: Arc<ShadowExecutor>,
     paused: Arc<RwLock<bool>>,
     shared: Arc<EngineShared>,
-    mut ingress_rx: mpsc::Receiver<StrategyIngress>,
+    mut ingress_rx: mpsc::Receiver<StrategyIngressMsg>,
 ) {
     spawn_detached("strategy_engine", true, async move {
         let fair = BasisMrFairValue::new(shared.fair_value_cfg.clone());
@@ -3297,7 +3309,7 @@ fn spawn_strategy_engine(
                 last_discovery_refresh = Instant::now();
             }
 
-            let ingress_event = tokio::select! {
+            let ingress_msg = tokio::select! {
                 ctrl = control_rx.recv() => {
                     match ctrl {
                         Ok(EngineEvent::Control(ControlCommand::Pause)) => {
@@ -3326,6 +3338,8 @@ fn spawn_strategy_engine(
                     event
                 }
             };
+            let mut ingress_enqueued_ns = ingress_msg.enqueued_ns;
+            let ingress_event = ingress_msg.payload;
 
             let dispatch_start = Instant::now();
             let current_fusion_mode = shared.fusion_cfg.read().await.mode.clone();
@@ -3381,11 +3395,18 @@ fn spawn_strategy_engine(
                             break;
                         }
                         match ingress_rx.try_recv() {
-                            Ok(StrategyIngress::BookTop(next_book)) => {
+                            Ok(StrategyIngressMsg {
+                                enqueued_ns,
+                                payload: StrategyIngress::BookTop(next_book),
+                            }) => {
                                 book = next_book;
+                                ingress_enqueued_ns = enqueued_ns;
                                 coalesced += 1;
                             }
-                            Ok(StrategyIngress::RefTick(next_tick)) => {
+                            Ok(StrategyIngressMsg {
+                                payload: StrategyIngress::RefTick(next_tick),
+                                ..
+                            }) => {
                                 let next_is_anchor =
                                     is_anchor_ref_source(next_tick.source.as_str());
                                 if !next_is_anchor
@@ -3649,12 +3670,16 @@ fn spawn_strategy_engine(
                         metrics::counter!("strategy.decision_backlog_guard").increment(1);
                         continue;
                     }
+                    let queue_wait_ms = if ingress_enqueued_ns > 0 {
+                        ((now_ns() - ingress_enqueued_ns).max(0) as f64) / 1_000_000.0
+                    } else {
+                        latency_sample.local_backlog_ms
+                    };
                     shared
                         .shadow_stats
-                        .push_decision_queue_wait_ms(latency_sample.local_backlog_ms)
+                        .push_decision_queue_wait_ms(queue_wait_ms)
                         .await;
-                    metrics::histogram!("latency.decision_queue_wait_ms")
-                        .record(latency_sample.local_backlog_ms);
+                    metrics::histogram!("latency.decision_queue_wait_ms").record(queue_wait_ms);
                     let signal_start = Instant::now();
                     let signal = fair.evaluate(eval_tick, &book);
                     if signal.edge_bps_bid > 0.0 || signal.edge_bps_ask > 0.0 {
