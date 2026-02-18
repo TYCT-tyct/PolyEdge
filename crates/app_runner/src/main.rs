@@ -3066,18 +3066,29 @@ fn spawn_strategy_engine(
         let strategy_max_coalesce = std::env::var("POLYEDGE_STRATEGY_MAX_COALESCE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(2_048)
-            .clamp(256, 16_384);
+            .unwrap_or(256)
+            .clamp(32, 4_096);
         let strategy_coalesce_min = std::env::var("POLYEDGE_STRATEGY_MIN_COALESCE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(256)
-            .clamp(64, 4_096);
+            .unwrap_or(16)
+            .clamp(1, 1_024);
+        let strategy_coalesce_budget_us = std::env::var("POLYEDGE_STRATEGY_COALESCE_BUDGET_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(400)
+            .clamp(50, 10_000);
         let strategy_drop_stale_book_ms = std::env::var("POLYEDGE_STRATEGY_DROP_STALE_BOOK_MS")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(800.0)
             .clamp(50.0, 5_000.0);
+        let strategy_max_decision_backlog_ms =
+            std::env::var("POLYEDGE_MAX_DECISION_BACKLOG_MS")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.90)
+                .clamp(0.10, 50.0);
         let mut stale_book_drops: u64 = 0;
         refresh_market_symbol_map(&shared).await;
 
@@ -3153,12 +3164,19 @@ fn spawn_strategy_engine(
                     // Coalesce bursty queue traffic to the freshest observable state.
                     // This trims local backlog and avoids spending cycles on superseded snapshots.
                     let mut coalesced = 0_u64;
+                    let coalesce_start = Instant::now();
                     let dynamic_cap = ingress_rx
                         .len()
                         .saturating_add(64)
                         .min(strategy_max_coalesce);
                     let max_coalesced = dynamic_cap.max(strategy_coalesce_min);
                     while coalesced < max_coalesced as u64 {
+                        if coalesced > 0
+                            && (coalesce_start.elapsed().as_micros() as u64)
+                                >= strategy_coalesce_budget_us
+                        {
+                            break;
+                        }
                         match ingress_rx.try_recv() {
                             Ok(StrategyIngress::BookTop(next_book)) => {
                                 book = next_book;
@@ -3404,6 +3422,14 @@ fn spawn_strategy_engine(
                     metrics::histogram!("latency.local_backlog_ms")
                         .record(latency_sample.local_backlog_ms);
                     metrics::histogram!("latency.ref_decode_ms").record(latency_sample.ref_decode_ms);
+                    if latency_sample.local_backlog_ms > strategy_max_decision_backlog_ms {
+                        shared
+                            .shadow_stats
+                            .mark_blocked_with_reason("decision_backlog_guard")
+                            .await;
+                        metrics::counter!("strategy.decision_backlog_guard").increment(1);
+                        continue;
+                    }
                     let signal_start = Instant::now();
                     let signal = fair.evaluate(eval_tick, &book);
                     if signal.edge_bps_bid > 0.0 || signal.edge_bps_ask > 0.0 {
