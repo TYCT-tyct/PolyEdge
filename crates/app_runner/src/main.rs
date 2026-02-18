@@ -64,7 +64,7 @@ use engine_core::{
 };
 use stats_utils::{
     freshness_ms, now_ns, percentile, percentile_deque_capped, policy_block_ratio, push_capped,
-    quote_block_ratio, robust_filter_iqr, value_to_f64,
+    quote_block_ratio, ratio_u64, robust_filter_iqr, value_to_f64,
 };
 
 #[derive(Clone)]
@@ -280,7 +280,8 @@ struct EngineShared {
     predator_compounder: Arc<RwLock<SettlementCompounder>>,
     predator_exit_manager: Arc<RwLock<ExitManager>>,
     /// WSS User Channel fill broadcaster — None in paper mode
-    wss_fill_tx: Option<Arc<tokio::sync::broadcast::Sender<execution_clob::wss_user_feed::WssFillEvent>>>,
+    wss_fill_tx:
+        Option<Arc<tokio::sync::broadcast::Sender<execution_clob::wss_user_feed::WssFillEvent>>>,
 }
 
 #[derive(Serialize)]
@@ -347,6 +348,7 @@ struct SourceHealthReloadReq {
     gap_window_ms: Option<i64>,
     jitter_limit_ms: Option<f64>,
     deviation_limit_bps: Option<f64>,
+    freshness_limit_ms: Option<f64>,
     min_score_for_trading: Option<f64>,
 }
 
@@ -626,6 +628,7 @@ struct SourceHealthConfig {
     gap_window_ms: i64,
     jitter_limit_ms: f64,
     deviation_limit_bps: f64,
+    freshness_limit_ms: f64,
     min_score_for_trading: f64,
 }
 
@@ -636,6 +639,7 @@ impl Default for SourceHealthConfig {
             gap_window_ms: 2_000,
             jitter_limit_ms: 12.0,
             deviation_limit_bps: 30.0,
+            freshness_limit_ms: 2_000.0,
             min_score_for_trading: 0.45,
         }
     }
@@ -915,6 +919,7 @@ struct LatencyBreakdown {
     path_lag_p50_ms: f64,
     path_lag_p90_ms: f64,
     path_lag_p99_ms: f64,
+    path_lag_coverage_ratio: f64,
     book_latency_p50_ms: f64,
     book_latency_p90_ms: f64,
     book_latency_p99_ms: f64,
@@ -1034,6 +1039,7 @@ struct ShadowLiveReport {
     survival_10ms_by_symbol: HashMap<String, f64>,
     survival_probe_10ms_by_symbol: HashMap<String, f64>,
     blocked_reason_counts: HashMap<String, u64>,
+    policy_block_reason_distribution: HashMap<String, u64>,
     source_mix_ratio: HashMap<String, f64>,
     source_health: Vec<SourceHealth>,
     exit_reason_top: Vec<(String, u64)>,
@@ -1450,7 +1456,9 @@ impl ShadowStats {
             Self::SAMPLE_CAP,
         );
         push_capped(&mut s.exchange_lag_ms, exchange_lag_ms, Self::SAMPLE_CAP);
-        push_capped(&mut s.path_lag_ms, path_lag_ms, Self::SAMPLE_CAP);
+        if path_lag_ms.is_finite() && path_lag_ms >= 0.0 {
+            push_capped(&mut s.path_lag_ms, path_lag_ms, Self::SAMPLE_CAP);
+        }
         push_capped(&mut s.book_latency_ms, book_latency_ms, Self::SAMPLE_CAP);
         push_capped(&mut s.local_backlog_ms, local_backlog_ms, Self::SAMPLE_CAP);
         push_capped(&mut s.ref_decode_ms, ref_decode_ms, Self::SAMPLE_CAP);
@@ -1929,6 +1937,14 @@ impl ShadowStats {
         if dedupe_dropped > 0 {
             blocked_reason_counts.insert("ref_dedupe_dropped".to_string(), dedupe_dropped);
         }
+        let mut policy_block_reason_distribution = HashMap::new();
+        if policy_blocked > 0 {
+            for (reason, count) in &blocked_reason_counts {
+                if is_policy_block_reason(reason.as_str()) {
+                    policy_block_reason_distribution.insert(reason.clone(), *count);
+                }
+            }
+        }
         let mut source_mix_ratio = HashMap::new();
         if ref_ticks_total > 0 {
             for (source, cnt) in &source_counts {
@@ -2030,6 +2046,7 @@ impl ShadowStats {
             path_lag_p50_ms: percentile(&path_lag_ms, 0.50).unwrap_or(0.0),
             path_lag_p90_ms: percentile(&path_lag_ms, 0.90).unwrap_or(0.0),
             path_lag_p99_ms: percentile(&path_lag_ms, 0.99).unwrap_or(0.0),
+            path_lag_coverage_ratio: ratio_u64(path_lag_ms.len() as u64, source_latency_ms.len() as u64),
             book_latency_p50_ms: percentile(&book_latency_ms, 0.50).unwrap_or(0.0),
             book_latency_p90_ms: percentile(&book_latency_ms, 0.90).unwrap_or(0.0),
             book_latency_p99_ms: percentile(&book_latency_ms, 0.99).unwrap_or(0.0),
@@ -2173,6 +2190,7 @@ impl ShadowStats {
             survival_10ms_by_symbol,
             survival_probe_10ms_by_symbol,
             blocked_reason_counts,
+            policy_block_reason_distribution,
             source_mix_ratio,
             source_health: Vec::new(),
             exit_reason_top,
@@ -2501,13 +2519,19 @@ async fn async_main() -> Result<()> {
             let is_live = matches!(exec_mode, ExecutionMode::Live);
             let api_key = std::env::var("POLYEDGE_CLOB_API_KEY").unwrap_or_default();
             if is_live && !api_key.is_empty() {
-                let wss_url = std::env::var("POLYEDGE_WSS_USER_URL")
-                    .unwrap_or_else(|_| "wss://ws-subscriptions-clob.polymarket.com/ws/user".to_string());
-                let (tx, _rx) = tokio::sync::broadcast::channel::<execution_clob::wss_user_feed::WssFillEvent>(64);
+                let wss_url = std::env::var("POLYEDGE_WSS_USER_URL").unwrap_or_else(|_| {
+                    "wss://ws-subscriptions-clob.polymarket.com/ws/user".to_string()
+                });
+                let (tx, _rx) = tokio::sync::broadcast::channel::<
+                    execution_clob::wss_user_feed::WssFillEvent,
+                >(64);
                 let tx = Arc::new(tx);
                 let tx_clone = tx.clone();
                 tokio::spawn(async move {
-                    execution_clob::wss_user_feed::run_wss_loop_with_sender(tx_clone, wss_url, api_key).await;
+                    execution_clob::wss_user_feed::run_wss_loop_with_sender(
+                        tx_clone, wss_url, api_key,
+                    )
+                    .await;
                 });
                 Some(tx)
             } else {
@@ -2518,8 +2542,8 @@ async fn async_main() -> Result<()> {
     let strategy_input_queue_cap = std::env::var("POLYEDGE_STRATEGY_INPUT_QUEUE_CAP")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(768)
-        .clamp(128, 8_192);
+        .unwrap_or(512)
+        .clamp(128, 5_760);
     let (strategy_ingress_tx, strategy_ingress_rx) =
         mpsc::channel::<StrategyIngressMsg>(strategy_input_queue_cap);
 
@@ -2648,8 +2672,8 @@ fn spawn_reference_feed(
         let ref_merge_queue_cap = std::env::var("POLYEDGE_REF_MERGE_QUEUE_CAP")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(8_192)
-            .clamp(1_024, 65_536);
+            .unwrap_or(4_096)
+            .clamp(1_024, 32_768);
         let ref_merge_drop_on_full = std::env::var("POLYEDGE_REF_MERGE_DROP_ON_FULL")
             .ok()
             .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
@@ -2733,6 +2757,8 @@ fn spawn_reference_feed(
         let mut source_runtime: HashMap<String, SourceRuntimeStats> = HashMap::new();
         let mut latest_price_by_symbol_source: HashMap<String, HashMap<String, f64>> =
             HashMap::new();
+        let mut latest_ws_recv_ns_by_symbol: HashMap<String, i64> = HashMap::new();
+        let mut fast_source_mix_by_symbol: HashMap<String, (u64, u64)> = HashMap::new();
         let mut source_health_cfg = shared.source_health_cfg.read().await.clone();
         let mut source_health_cfg_refresh_at = Instant::now();
         let ref_tick_bus_enabled = std::env::var("POLYEDGE_REF_TICK_BUS_ENABLED")
@@ -2792,6 +2818,29 @@ fn spawn_reference_feed(
                     let source_key = tick.source.clone();
                     let symbol_key = tick.symbol.clone();
                     let recv_ts_ms = tick.recv_ts_ms;
+                    if source_key == "binance_udp" || source_key == "binance_ws" {
+                        let entry = fast_source_mix_by_symbol
+                            .entry(symbol_key.clone())
+                            .or_default();
+                        if source_key == "binance_udp" {
+                            entry.0 = entry.0.saturating_add(1);
+                        } else {
+                            entry.1 = entry.1.saturating_add(1);
+                        }
+                        let total = entry.0.saturating_add(entry.1);
+                        if total > 100_000 {
+                            entry.0 /= 2;
+                            entry.1 /= 2;
+                        }
+                    }
+                    if source_key == "binance_ws" {
+                        let recv_ns = if tick.recv_ts_local_ns > 0 {
+                            tick.recv_ts_local_ns
+                        } else {
+                            now_ns()
+                        };
+                        latest_ws_recv_ns_by_symbol.insert(symbol_key.clone(), recv_ns);
+                    }
                     let latency_ms = recv_ts_ms.saturating_sub(source_ts).max(0) as f64;
                     let runtime = source_runtime.entry(source_key.clone()).or_default();
                     runtime.sample_count = runtime.sample_count.saturating_add(1);
@@ -2839,7 +2888,81 @@ fn spawn_reference_feed(
                     );
                     if runtime.sample_count % 8 == 0 {
                         let mut map = shared.source_health_latest.write().await;
-                        map.insert(source_key, source_health);
+                        map.insert(source_key.clone(), source_health.clone());
+                    }
+                    if tick.source == "binance_udp" {
+                        let udp_samples = source_runtime
+                            .get("binance_udp")
+                            .map(|s| s.sample_count)
+                            .unwrap_or(0);
+                        let ws_samples = source_runtime
+                            .get("binance_ws")
+                            .map(|s| s.sample_count)
+                            .unwrap_or(0);
+                        let fast_total = udp_samples.saturating_add(ws_samples);
+                        let udp_share = if fast_total > 0 {
+                            udp_samples as f64 / fast_total as f64
+                        } else {
+                            0.0
+                        };
+                        let (sym_udp_samples, sym_ws_samples) = fast_source_mix_by_symbol
+                            .get(tick.symbol.as_str())
+                            .copied()
+                            .unwrap_or((0, 0));
+                        let sym_fast_total = sym_udp_samples.saturating_add(sym_ws_samples);
+                        let udp_share_symbol = if sym_fast_total > 0 {
+                            sym_udp_samples as f64 / sym_fast_total as f64
+                        } else {
+                            udp_share
+                        };
+                        let effective_udp_share = if sym_fast_total >= 32 {
+                            udp_share_symbol
+                        } else {
+                            udp_share
+                        };
+                        let jitter_high =
+                            source_health.jitter_ms > udp_jitter_downweight_threshold_ms();
+                        let freshness_low =
+                            source_health.freshness_score < udp_min_freshness_score();
+                        let share_high = effective_udp_share > udp_target_share();
+                        if jitter_high || share_high || freshness_low {
+                            let now_recv_ns = if tick.recv_ts_local_ns > 0 {
+                                tick.recv_ts_local_ns
+                            } else {
+                                now_ns()
+                            };
+                            let ws_recent = latest_ws_recv_ns_by_symbol
+                                .get(tick.symbol.as_str())
+                                .copied()
+                                .map(|ws_ns| {
+                                    now_recv_ns.saturating_sub(ws_ns) <= udp_ws_freshness_ns()
+                                })
+                                .unwrap_or(false);
+                            let ws_health_good = source_runtime
+                                .get("binance_ws")
+                                .map(|ws| {
+                                    ws.sample_count >= (source_health_cfg.min_samples / 2).max(8)
+                                        && ws.deviation_ema_bps
+                                            <= source_health_cfg.deviation_limit_bps * 1.2
+                                })
+                                .unwrap_or(false);
+                            if ws_recent && ws_health_good {
+                                let target = udp_target_share().max(0.05);
+                                let share_ratio = (effective_udp_share / target).max(1.0);
+                                let base_keep_every = udp_downweight_keep_every().max(2);
+                                let dynamic_keep = share_ratio.ceil() as usize;
+                                let jitter_boost = if jitter_high { 2 } else { 1 };
+                                let freshness_boost = if freshness_low { 2 } else { 1 };
+                                let keep_every = base_keep_every
+                                    .max(dynamic_keep.saturating_mul(jitter_boost))
+                                    .max(base_keep_every.saturating_mul(freshness_boost))
+                                    .clamp(2, 16);
+                                if (ingest_seq % keep_every as u64) != 0 {
+                                    metrics::counter!("fusion.udp_downweight_drop").increment(1);
+                                    continue;
+                                }
+                            }
+                        }
                     }
                     // Hot-path logging: avoid dynamic JSON trees + extra stringify passes.
                     // Build a single JSONL line and hand it to the async writer.
@@ -3057,6 +3180,13 @@ fn build_source_health_snapshot(
     let out_of_order_rate = (stats.out_of_order_count as f64 / n).clamp(0.0, 1.0);
     let gap_rate = (stats.gap_count as f64 / n).clamp(0.0, 1.0);
     let price_deviation_bps = stats.deviation_ema_bps.max(0.0);
+    let freshness_age_ms = if stats.last_recv_ts_ms > 0 {
+        now_ms.saturating_sub(stats.last_recv_ts_ms).max(0) as f64
+    } else {
+        cfg.freshness_limit_ms * 4.0
+    };
+    let freshness_penalty = (freshness_age_ms / cfg.freshness_limit_ms.max(1e-6)).clamp(0.0, 2.0);
+    let freshness_score = (1.0 - freshness_penalty * 0.5).clamp(0.0, 1.0);
 
     let jitter_penalty = (jitter_ms / cfg.jitter_limit_ms.max(1e-6)).clamp(0.0, 2.0);
     let deviation_penalty =
@@ -3065,10 +3195,11 @@ fn build_source_health_snapshot(
     let gap_penalty = (gap_rate / 0.02).clamp(0.0, 2.0);
     let coverage = (stats.sample_count as f64 / cfg.min_samples.max(1) as f64).clamp(0.0, 1.0);
     let raw_score = 1.0
-        - (0.35 * jitter_penalty)
-        - (0.30 * deviation_penalty)
-        - (0.20 * out_of_order_penalty)
-        - (0.15 * gap_penalty);
+        - (0.30 * jitter_penalty)
+        - (0.25 * deviation_penalty)
+        - (0.18 * out_of_order_penalty)
+        - (0.12 * gap_penalty)
+        - (0.15 * freshness_penalty);
     let score = (raw_score.clamp(0.0, 1.0) * (0.25 + 0.75 * coverage)).clamp(0.0, 1.0);
 
     SourceHealth {
@@ -3078,6 +3209,7 @@ fn build_source_health_snapshot(
         out_of_order_rate,
         gap_rate,
         price_deviation_bps,
+        freshness_score,
         score,
         sample_count: stats.sample_count,
         ts_ms: now_ms,
@@ -3106,6 +3238,17 @@ fn spawn_market_feed(
             .ok()
             .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
             .unwrap_or(true);
+        let strategy_book_dedupe_window_ms =
+            std::env::var("POLYEDGE_BOOK_INGRESS_DEDUPE_WINDOW_MS")
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(25)
+                .clamp(0, 500);
+        let strategy_book_dedupe_bps = std::env::var("POLYEDGE_BOOK_INGRESS_DEDUPE_BPS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.05)
+            .clamp(0.0, 5.0);
         let mut reconnects: u64 = 0;
         loop {
             let feed = PolymarketFeed::new_with_universe(
@@ -3128,6 +3271,8 @@ fn spawn_market_feed(
             };
             let mut ingest_seq: u64 = 0;
             let mut last_source_ts_by_market: HashMap<String, i64> = HashMap::new();
+            let mut last_enqueued_book_by_market: HashMap<String, (i64, f64, f64, f64, f64)> =
+                HashMap::new();
             // Only reset reconnect backoff once we observe actual book traffic (not just a successful
             // handshake). This avoids a reconnect storm when discovery/WS is returning 200 but no
             // updates are delivered.
@@ -3211,6 +3356,47 @@ fn spawn_market_feed(
                         if !valid {
                             stats.record_issue("invalid_book_top").await;
                             continue;
+                        }
+
+                        if strategy_book_dedupe_window_ms > 0 {
+                            let book_recv_ms = if book.recv_ts_local_ns > 0 {
+                                (book.recv_ts_local_ns / 1_000_000).max(0)
+                            } else {
+                                Utc::now().timestamp_millis()
+                            };
+                            if let Some((
+                                prev_recv_ms,
+                                prev_bid_yes,
+                                prev_ask_yes,
+                                prev_bid_no,
+                                prev_ask_no,
+                            )) = last_enqueued_book_by_market.get(&book.market_id)
+                            {
+                                let within_window = (book_recv_ms - *prev_recv_ms).abs()
+                                    <= strategy_book_dedupe_window_ms;
+                                let max_diff_bps = max_book_top_diff_bps(
+                                    *prev_bid_yes,
+                                    *prev_ask_yes,
+                                    *prev_bid_no,
+                                    *prev_ask_no,
+                                    &book,
+                                );
+                                if within_window && max_diff_bps <= strategy_book_dedupe_bps {
+                                    metrics::counter!("strategy.ingress_book_dedupe_drop")
+                                        .increment(1);
+                                    continue;
+                                }
+                            }
+                            last_enqueued_book_by_market.insert(
+                                book.market_id.clone(),
+                                (
+                                    book_recv_ms,
+                                    book.bid_yes,
+                                    book.ask_yes,
+                                    book.bid_no,
+                                    book.ask_no,
+                                ),
+                            );
                         }
 
                         let ingress = StrategyIngressMsg {
@@ -3647,8 +3833,11 @@ fn spawn_strategy_engine(
                         .record(latency_sample.source_latency_ms);
                     metrics::histogram!("latency.exchange_lag_ms")
                         .record(latency_sample.exchange_lag_ms);
-                    metrics::histogram!("latency.path_lag_ms")
-                        .record(latency_sample.path_lag_ms);
+                    if latency_sample.path_lag_ms.is_finite() && latency_sample.path_lag_ms >= 0.0
+                    {
+                        metrics::histogram!("latency.path_lag_ms")
+                            .record(latency_sample.path_lag_ms);
+                    }
                     metrics::histogram!("latency.book_latency_ms")
                         .record(latency_sample.book_latency_ms);
                     metrics::histogram!("latency.local_backlog_ms")
@@ -4121,6 +4310,16 @@ fn spawn_strategy_engine(
 
                     for mut intent in intents.drain(..) {
                         let intent_decision_start = Instant::now();
+                        let open_orders_now = execution.open_orders_count();
+                        let risk_open_orders_soft_cap =
+                            risk_limits_snapshot.max_open_orders.saturating_sub(1);
+                        if open_orders_now >= risk_open_orders_soft_cap.max(1) {
+                            shared
+                                .shadow_stats
+                                .mark_blocked_with_reason("open_orders_pressure_precheck")
+                                .await;
+                            continue;
+                        }
                         shared.shadow_stats.mark_attempted();
 
                         let pre_market_notional =
@@ -4329,7 +4528,8 @@ fn spawn_strategy_engine(
                                 "fee_rate_bps": fee_bps,
                                 "expected_edge_net_bps": edge_net,
                                 "hold_to_resolution": false,
-                            })).ok(),
+                            }))
+                            .ok(),
                         };
                         let order_build_ms = order_build_start.elapsed().as_secs_f64() * 1_000.0;
                         // Start measuring ack-only RTT right before the await.
@@ -5436,6 +5636,7 @@ fn classify_predator_regime(
                     < cfg
                         .defend_min_source_health
                         .max(source_health_cfg.min_score_for_trading)
+                || (h.sample_count >= source_health_cfg.min_samples && h.freshness_score < 0.25)
         })
         .unwrap_or(false);
     if source_low {
@@ -5481,8 +5682,6 @@ async fn predator_execute_opportunity(
         ttl_ms: maker_cfg.ttl_ms,
     };
 
-    shared.shadow_stats.mark_attempted();
-
     let book = shared
         .latest_books
         .read()
@@ -5521,6 +5720,16 @@ async fn predator_execute_opportunity(
         .read()
         .map(|g| g.clone())
         .unwrap_or_else(|_| RiskLimits::default());
+    let open_orders_now = execution.open_orders_count();
+    let risk_open_orders_soft_cap = risk_limits_snapshot.max_open_orders.saturating_sub(1);
+    if open_orders_now >= risk_open_orders_soft_cap.max(1) {
+        shared
+            .shadow_stats
+            .mark_blocked_with_reason("open_orders_pressure_precheck")
+            .await;
+        return PredatorExecResult::default();
+    }
+    shared.shadow_stats.mark_attempted();
     let (tox_score, tox_regime) = {
         let map = shared.tox_state.read().await;
         map.get(&intent.market_id)
@@ -5652,7 +5861,8 @@ async fn predator_execute_opportunity(
             "fee_rate_bps": opp.fee_bps,
             "expected_edge_net_bps": opp.edge_net_bps,
             "hold_to_resolution": false,
-        })).ok(),
+        }))
+        .ok(),
     };
     let order_build_ms = order_build_start.elapsed().as_secs_f64() * 1_000.0;
     let place_start = Instant::now();
@@ -5861,10 +6071,7 @@ fn spawn_predator_exit_lifecycle(
     entry_fair_yes: f64,
 ) {
     // WSS: 订阅 fill 事件（paper 模式下 wss_fill_tx 为 None，直接跳过）
-    let mut fill_rx = shared
-        .wss_fill_tx
-        .as_ref()
-        .map(|tx| tx.subscribe());
+    let mut fill_rx = shared.wss_fill_tx.as_ref().map(|tx| tx.subscribe());
     // 入场时的 PM 盘口中间价 = entry_price
     let entry_pm_mid_yes = entry_price;
 
@@ -5889,9 +6096,8 @@ fn spawn_predator_exit_lifecycle(
                     // WSS: 用 OptionFuture 优雅处理 fill_rx 为 None 的情况（paper 模式）
                     // None → Poll::Pending（永不触发），Some(rx) → 等待下一个 fill 事件
                     // -----------------------------------------------------------------------
-                    let fill_fut = futures::future::OptionFuture::from(
-                        fill_rx.as_mut().map(|rx| rx.recv()),
-                    );
+                    let fill_fut =
+                        futures::future::OptionFuture::from(fill_rx.as_mut().map(|rx| rx.recv()));
                     tokio::select! {
                         biased;
                         // 优先检查 WSS fill 事件（低延迟路径）
@@ -5937,7 +6143,10 @@ fn spawn_predator_exit_lifecycle(
             // 设计: 不增加任何外部调用，直接读内存中的盘口快照
             let pm_mid_yes = {
                 let books = shared.latest_books.read().await;
-                books.get(&market_id).map(|b| (b.bid_yes + b.ask_yes) / 2.0).unwrap_or(0.0)
+                books
+                    .get(&market_id)
+                    .map(|b| (b.bid_yes + b.ask_yes) / 2.0)
+                    .unwrap_or(0.0)
             };
 
             let action = {
@@ -6609,6 +6818,17 @@ fn compute_market_score_from_snapshot(
     score.clamp(0.0, 100.0)
 }
 
+fn non_risk_gate_relax_ratio() -> f64 {
+    static RELAX_RATIO: OnceLock<f64> = OnceLock::new();
+    *RELAX_RATIO.get_or_init(|| {
+        std::env::var("POLYEDGE_NON_RISK_GATE_RELAX_RATIO")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.85)
+            .clamp(0.50, 1.0)
+    })
+}
+
 fn adaptive_min_edge_bps(
     base_min_edge_bps: f64,
     tox_score: f64,
@@ -6619,6 +6839,7 @@ fn adaptive_min_edge_bps(
     window_outcomes: usize,
     gate_min_outcomes: usize,
 ) -> f64 {
+    let relax_ratio = non_risk_gate_relax_ratio();
     if window_outcomes < gate_min_outcomes {
         let progress = (window_outcomes as f64 / gate_min_outcomes.max(1) as f64).clamp(0.0, 1.0);
         let warmup_floor = (base_min_edge_bps * 0.15).max(0.5);
@@ -6627,11 +6848,11 @@ fn adaptive_min_edge_bps(
         if no_quote_rate > 0.85 {
             warmup_edge *= 0.80;
         }
-        return warmup_edge.clamp(0.25, base_min_edge_bps.max(0.25));
+        return (warmup_edge * relax_ratio).clamp(0.25, base_min_edge_bps.max(0.25));
     }
 
     if markout_samples < 20 {
-        return (base_min_edge_bps * 0.5).max(1.0);
+        return ((base_min_edge_bps * 0.5) * relax_ratio).max(1.0);
     }
     let mut out = base_min_edge_bps * (1.0 + tox_score * 0.6);
     if markout_10s_p50 < 0.0 {
@@ -6643,7 +6864,7 @@ fn adaptive_min_edge_bps(
     if no_quote_rate > 0.95 {
         out *= 0.9;
     }
-    out.clamp(1.0, base_min_edge_bps * 2.5)
+    (out * relax_ratio).clamp(1.0, base_min_edge_bps * 2.5)
 }
 
 fn edge_gate_bps(
@@ -6665,10 +6886,12 @@ fn edge_gate_bps(
 }
 
 fn adaptive_max_spread(base_max_spread: f64, tox_score: f64, markout_samples: usize) -> f64 {
+    let relax_ratio = non_risk_gate_relax_ratio();
     if markout_samples < 20 {
-        return (base_max_spread * 1.2).clamp(0.003, 0.08);
+        return (base_max_spread * (1.2 + (1.0 - relax_ratio) * 0.5)).clamp(0.003, 0.08);
     }
-    (base_max_spread * (1.0 - tox_score * 0.35)).clamp(0.002, base_max_spread)
+    (base_max_spread * (1.0 - tox_score * 0.35 + (1.0 - relax_ratio) * 0.2))
+        .clamp(0.002, base_max_spread * 1.15)
 }
 
 async fn timeframe_weight(shared: &Arc<EngineShared>, timeframe: &TimeframeClass) -> f64 {
@@ -6819,10 +7042,14 @@ fn should_observe_only_symbol(
 
     // Keep SOL observe-only unless the local "ref lead vs book" lag is within a tight bound.
     // This avoids letting one slow/volatile venue degrade the overall engine quality.
-    book_top_lag_ms > 130.0
+    let relax = (1.0 - non_risk_gate_relax_ratio()).clamp(0.0, 0.5);
+    let lag_guard_ms = 130.0 + 80.0 * relax;
+    let stale_guard_ms = 250.0 + 120.0 * relax;
+    let spread_guard = 0.020 + 0.006 * relax;
+    book_top_lag_ms > lag_guard_ms
         || matches!(tox.regime, ToxicRegime::Danger)
-        || stale_ms > 250.0
-        || spread_yes > 0.020
+        || stale_ms > stale_guard_ms
+        || spread_yes > spread_guard
 }
 
 fn estimate_queue_fill_proxy(tox_score: f64, spread_yes: f64, stale_ms: f64) -> f64 {
@@ -6997,7 +7224,10 @@ fn calibrate_path_lag_ms(source: &str, observed_delta_ms: f64, now_ns: i64) -> f
     const FLOOR_CLAMP_MIN_MS: f64 = -10_000.0;
     const FLOOR_CLAMP_MAX_MS: f64 = 10_000.0;
     let key = source.to_string();
-    let mut state = path_lag_calib_map().get(&key).map(|v| *v).unwrap_or_default();
+    let mut state = path_lag_calib_map()
+        .get(&key)
+        .map(|v| *v)
+        .unwrap_or_default();
     if !state.initialized {
         state.floor_ms = observed_delta_ms;
         state.initialized = true;
@@ -7068,7 +7298,7 @@ fn estimate_feed_latency(tick: &RefTick, book: &BookTop) -> FeedLatencySample {
     let path_lag_ms = tick
         .ts_first_hop_ms
         .map(|first| calibrate_path_lag_ms(&tick.source, (tick.recv_ts_ms - first) as f64, now))
-        .unwrap_or(0.0);
+        .unwrap_or(f64::NAN);
     let book_recv_ms = if book.recv_ts_local_ns > 0 {
         (book.recv_ts_local_ns / 1_000_000).max(0)
     } else {
@@ -7133,7 +7363,9 @@ fn compute_coalesce_policy(
 
     // If queue is already deep, prioritize drain speed to collapse backlog spikes quickly.
     if queue_len >= 128 {
-        let max_events = queue_len.min(strategy_max_coalesce).max(strategy_coalesce_min);
+        let max_events = queue_len
+            .min(strategy_max_coalesce)
+            .max(strategy_coalesce_min);
         let budget_us = strategy_coalesce_budget_us.max(800).min(3_000);
         return CoalescePolicy {
             max_events,
@@ -7263,6 +7495,62 @@ fn fusion_staleness_budget_us_for_source(next_source: &str) -> i64 {
     })
 }
 
+fn udp_jitter_downweight_threshold_ms() -> f64 {
+    static UDP_JITTER_THRESH_MS: OnceLock<f64> = OnceLock::new();
+    *UDP_JITTER_THRESH_MS.get_or_init(|| {
+        std::env::var("POLYEDGE_UDP_JITTER_DOWNWEIGHT_MS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(8.0)
+            .clamp(1.0, 100.0)
+    })
+}
+
+fn udp_target_share() -> f64 {
+    static UDP_TARGET_SHARE: OnceLock<f64> = OnceLock::new();
+    *UDP_TARGET_SHARE.get_or_init(|| {
+        std::env::var("POLYEDGE_UDP_TARGET_SHARE")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.38)
+            .clamp(0.05, 0.95)
+    })
+}
+
+fn udp_ws_freshness_ns() -> i64 {
+    static UDP_WS_FRESHNESS_NS: OnceLock<i64> = OnceLock::new();
+    *UDP_WS_FRESHNESS_NS.get_or_init(|| {
+        std::env::var("POLYEDGE_UDP_WS_FRESHNESS_MS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(600)
+            .clamp(10, 2_000)
+            * 1_000_000
+    })
+}
+
+fn udp_min_freshness_score() -> f64 {
+    static UDP_MIN_FRESHNESS_SCORE: OnceLock<f64> = OnceLock::new();
+    *UDP_MIN_FRESHNESS_SCORE.get_or_init(|| {
+        std::env::var("POLYEDGE_UDP_MIN_FRESHNESS_SCORE")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.55)
+            .clamp(0.0, 1.0)
+    })
+}
+
+fn udp_downweight_keep_every() -> usize {
+    static UDP_KEEP_EVERY: OnceLock<usize> = OnceLock::new();
+    *UDP_KEEP_EVERY.get_or_init(|| {
+        std::env::var("POLYEDGE_UDP_DOWNWEIGHT_KEEP_EVERY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(3)
+            .clamp(2, 32)
+    })
+}
+
 fn is_ref_tick_duplicate(
     current_source_ts_ms: i64,
     current_price: f64,
@@ -7279,6 +7567,27 @@ fn is_ref_tick_duplicate(
     let denom = prev_price.abs().max(1e-9);
     let rel_bps = ((current_price - prev_price).abs() / denom) * 10_000.0;
     rel_bps <= cfg.dedupe_price_bps
+}
+
+fn max_book_top_diff_bps(
+    prev_bid_yes: f64,
+    prev_ask_yes: f64,
+    prev_bid_no: f64,
+    prev_ask_no: f64,
+    next: &BookTop,
+) -> f64 {
+    fn diff_bps(a: f64, b: f64) -> f64 {
+        if !a.is_finite() || !b.is_finite() {
+            return f64::INFINITY;
+        }
+        let denom = a.abs().max(1e-9);
+        ((a - b).abs() / denom) * 10_000.0
+    }
+
+    diff_bps(prev_bid_yes, next.bid_yes)
+        .max(diff_bps(prev_ask_yes, next.ask_yes))
+        .max(diff_bps(prev_bid_no, next.bid_no))
+        .max(diff_bps(prev_ask_no, next.ask_no))
 }
 
 fn should_replace_anchor_tick(current: &RefTick, next: &RefTick) -> bool {
@@ -8252,6 +8561,11 @@ fn load_source_health_config() -> SourceHealthConfig {
             "deviation_limit_bps" => {
                 if let Ok(parsed) = val.parse::<f64>() {
                     cfg.deviation_limit_bps = parsed.clamp(0.1, 10_000.0);
+                }
+            }
+            "freshness_limit_ms" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.freshness_limit_ms = parsed.clamp(50.0, 60_000.0);
                 }
             }
             "min_score_for_trading" => {
@@ -9652,6 +9966,20 @@ fn persist_final_report_files(report: &ShadowFinalReport) {
             md.push_str(&format!("- {}: {}\n", reason, count));
         }
     }
+    if report.live.policy_block_reason_distribution.is_empty() {
+        md.push_str("\n## Policy Block Reason Distribution\n- none\n");
+    } else {
+        md.push_str("\n## Policy Block Reason Distribution\n");
+        let mut rows = report
+            .live
+            .policy_block_reason_distribution
+            .iter()
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| b.1.cmp(a.1));
+        for (reason, count) in rows {
+            md.push_str(&format!("- {}: {}\n", reason, count));
+        }
+    }
     let _ = fs::write(md_path, md);
 
     let latency_csv = reports_dir.join("latency_breakdown_12h.csv");
@@ -10024,9 +10352,9 @@ mod tests {
         let predator_compounder = Arc::new(RwLock::new(SettlementCompounder::new(
             predator_cfg_value.compounder.clone(),
         )));
-        let predator_exit_manager = Arc::new(RwLock::new(ExitManager::new(to_exit_manager_config(
-            &exit_cfg_value,
-        ))));
+        let predator_exit_manager = Arc::new(RwLock::new(ExitManager::new(
+            to_exit_manager_config(&exit_cfg_value),
+        )));
         let (wss_tx, _rx) = tokio::sync::broadcast::channel(64);
         let wss_tx = Arc::new(wss_tx);
 
@@ -10309,10 +10637,9 @@ mod tests {
         let _ = listener.await;
 
         let report = shared.shadow_stats.build_live_report().await;
-        let has_reversal_reason = report
-            .exit_reason_top
-            .iter()
-            .any(|(reason, count)| *count > 0 && (reason == "t_plus_100ms_reversal" || reason == "t_plus_300ms_reversal"));
+        let has_reversal_reason = report.exit_reason_top.iter().any(|(reason, count)| {
+            *count > 0 && (reason == "t_plus_100ms_reversal" || reason == "t_plus_300ms_reversal")
+        });
 
         assert!(
             seen_direction_signal.load(Ordering::Relaxed),
@@ -10641,8 +10968,8 @@ timeframes = ["5m", "15m", "1h", "1d"]
             latency_sq_sum_ms: 256.0 * (24.0f64.powi(2) + 18.0f64.powi(2)),
             out_of_order_count: 12,
             gap_count: 16,
-            last_event_ts_ms: 1_000,
-            last_recv_ts_ms: 1_010,
+            last_event_ts_ms: 1_699_999_994_900,
+            last_recv_ts_ms: 1_699_999_995_000,
             deviation_ema_bps: 80.0,
         };
         let row = build_source_health_snapshot("binance", &stats, &cfg, 1_700_000_000_000);
@@ -10650,6 +10977,7 @@ timeframes = ["5m", "15m", "1h", "1d"]
         assert!(row.gap_rate > 0.01);
         assert!(row.out_of_order_rate > 0.01);
         assert!(row.jitter_ms > cfg.jitter_limit_ms);
+        assert!(row.freshness_score < 0.5);
     }
 
     #[test]
@@ -10661,14 +10989,15 @@ timeframes = ["5m", "15m", "1h", "1d"]
             latency_sq_sum_ms: 512.0 * (4.0f64.powi(2) + 0.8f64.powi(2)),
             out_of_order_count: 0,
             gap_count: 0,
-            last_event_ts_ms: 1_000,
-            last_recv_ts_ms: 1_004,
+            last_event_ts_ms: 1_699_999_999_996,
+            last_recv_ts_ms: 1_699_999_999_998,
             deviation_ema_bps: 3.0,
         };
         let row = build_source_health_snapshot("coinbase", &stats, &cfg, 1_700_000_000_000);
         assert!(row.score > 0.75);
         assert!(row.jitter_ms < cfg.jitter_limit_ms);
         assert!(row.price_deviation_bps < cfg.deviation_limit_bps);
+        assert!(row.freshness_score > 0.9);
     }
 
     #[test]
@@ -10700,6 +11029,7 @@ timeframes = ["5m", "15m", "1h", "1d"]
             out_of_order_rate: 0.0,
             gap_rate: 0.0,
             price_deviation_bps: 0.0,
+            freshness_score: 1.0,
             score: 0.10,
             sample_count: source_cfg.min_samples,
             ts_ms: 1,
