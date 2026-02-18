@@ -3260,6 +3260,7 @@ fn spawn_strategy_engine(
             .unwrap_or(0.90)
             .clamp(0.10, 50.0);
         let mut stale_book_drops: u64 = 0;
+        let symbol_refresh_inflight = Arc::new(AtomicBool::new(false));
         refresh_market_symbol_map(&shared).await;
 
         loop {
@@ -3465,9 +3466,16 @@ fn spawn_strategy_engine(
                                 untracked_issue_cooldown.insert(book.market_id.clone(), now);
                             }
                         }
-                        if last_symbol_retry_refresh.elapsed() >= Duration::from_secs(15) {
-                            refresh_market_symbol_map(&shared).await;
+                        if last_symbol_retry_refresh.elapsed() >= Duration::from_secs(15)
+                            && !symbol_refresh_inflight.swap(true, Ordering::AcqRel)
+                        {
                             last_symbol_retry_refresh = Instant::now();
+                            let shared_refresh = shared.clone();
+                            let inflight = symbol_refresh_inflight.clone();
+                            spawn_detached("symbol_map_refresh", false, async move {
+                                refresh_market_symbol_map(&shared_refresh).await;
+                                inflight.store(false, Ordering::Release);
+                            });
                         }
                         continue;
                     };
