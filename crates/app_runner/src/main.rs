@@ -9830,6 +9830,101 @@ fn build_market_scorecard(shots: &[ShadowShot], outcomes: &[ShadowOutcome]) -> V
 mod tests {
     use super::*;
     use core_types::QuoteIntent;
+    use execution_clob::wss_user_feed::WssFillEvent;
+    use std::sync::atomic::AtomicBool;
+    use tokio::time::{sleep, timeout};
+
+    fn test_engine_shared_with_wss() -> (
+        Arc<EngineShared>,
+        Arc<tokio::sync::broadcast::Sender<WssFillEvent>>,
+    ) {
+        let strategy_cfg = Arc::new(RwLock::new(Arc::new(MakerConfig::default())));
+        let settlement_cfg = Arc::new(RwLock::new(SettlementConfig::default()));
+        let source_health_cfg = Arc::new(RwLock::new(SourceHealthConfig::default()));
+        let fusion_cfg = Arc::new(RwLock::new(FusionConfig::default()));
+        let edge_model_cfg = Arc::new(RwLock::new(EdgeModelConfig::default()));
+        let exit_cfg_value = ExitConfig {
+            enabled: true,
+            flatten_on_trigger: true,
+            ..ExitConfig::default()
+        };
+        let exit_cfg = Arc::new(RwLock::new(exit_cfg_value.clone()));
+        let fair_value_cfg = Arc::new(StdRwLock::new(BasisMrConfig::default()));
+        let toxicity_cfg = Arc::new(RwLock::new(Arc::new(ToxicityConfig::default())));
+        let risk_limits = Arc::new(StdRwLock::new(RiskLimits::default()));
+        let risk_manager = Arc::new(DefaultRiskManager::new(risk_limits.clone()));
+        let predator_cfg_value = PredatorCConfig::default();
+        let predator_cfg = Arc::new(RwLock::new(predator_cfg_value.clone()));
+        let predator_direction_detector = Arc::new(RwLock::new(DirectionDetector::new(
+            predator_cfg_value.direction_detector.clone(),
+        )));
+        let predator_probability_engine = Arc::new(RwLock::new(ProbabilityEngine::new(
+            predator_cfg_value.probability_engine.clone(),
+        )));
+        let predator_taker_sniper = Arc::new(RwLock::new(TakerSniper::new(
+            predator_cfg_value.taker_sniper.clone(),
+        )));
+        let predator_router = Arc::new(RwLock::new(TimeframeRouter::new(
+            predator_cfg_value.router.clone(),
+        )));
+        let predator_compounder = Arc::new(RwLock::new(SettlementCompounder::new(
+            predator_cfg_value.compounder.clone(),
+        )));
+        let predator_exit_manager = Arc::new(RwLock::new(ExitManager::new(to_exit_manager_config(
+            &exit_cfg_value,
+        ))));
+        let (wss_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let wss_tx = Arc::new(wss_tx);
+
+        let shared = Arc::new(EngineShared {
+            latest_books: Arc::new(RwLock::new(HashMap::new())),
+            latest_signals: Arc::new(DashMap::new()),
+            latest_fast_ticks: Arc::new(DashMap::new()),
+            latest_anchor_ticks: Arc::new(DashMap::new()),
+            market_to_symbol: Arc::new(RwLock::new(HashMap::new())),
+            token_to_symbol: Arc::new(RwLock::new(HashMap::new())),
+            market_to_timeframe: Arc::new(RwLock::new(HashMap::new())),
+            symbol_to_markets: Arc::new(RwLock::new(HashMap::new())),
+            fee_cache: Arc::new(RwLock::new(HashMap::new())),
+            fee_refresh_inflight: Arc::new(RwLock::new(HashMap::new())),
+            scoring_cache: Arc::new(RwLock::new(HashMap::new())),
+            scoring_refresh_inflight: Arc::new(RwLock::new(HashMap::new())),
+            http: Client::new(),
+            clob_endpoint: "http://127.0.0.1:0".to_string(),
+            strategy_cfg,
+            settlement_cfg,
+            source_health_cfg,
+            source_health_latest: Arc::new(RwLock::new(HashMap::new())),
+            settlement_prices: Arc::new(RwLock::new(HashMap::new())),
+            fusion_cfg,
+            edge_model_cfg,
+            exit_cfg,
+            fair_value_cfg,
+            toxicity_cfg,
+            risk_manager,
+            risk_limits,
+            universe_symbols: Arc::new(vec!["BTCUSDT".to_string()]),
+            universe_market_types: Arc::new(vec!["updown".to_string()]),
+            universe_timeframes: Arc::new(vec!["5m".to_string(), "15m".to_string()]),
+            rate_limit_rps: 20.0,
+            scoring_rebate_factor: 0.0,
+            tox_state: Arc::new(RwLock::new(HashMap::new())),
+            shadow_stats: Arc::new(ShadowStats::new()),
+            predator_cfg,
+            predator_direction_detector,
+            predator_latest_direction: Arc::new(RwLock::new(HashMap::new())),
+            predator_latest_probability: Arc::new(RwLock::new(HashMap::new())),
+            predator_probability_engine,
+            predator_taker_sniper,
+            predator_d_last_fire_ms: Arc::new(RwLock::new(HashMap::new())),
+            predator_router,
+            predator_compounder,
+            predator_exit_manager,
+            wss_fill_tx: Some(wss_tx.clone()),
+        });
+
+        (shared, wss_tx)
+    }
 
     #[test]
     fn robust_filter_marks_outliers() {
@@ -9910,6 +10005,165 @@ mod tests {
         assert_eq!(order.style, ExecutionStyle::Maker);
         assert_eq!(order.tif, OrderTimeInForce::PostOnly);
         assert!(order.size > 0.0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reversal_taker_to_opposite_maker_reentry_end_to_end_records_report() {
+        let (shared, wss_tx) = test_engine_shared_with_wss();
+        let bus = RingBus::new(256);
+        let execution = Arc::new(ClobExecution::new(
+            ExecutionMode::Paper,
+            "http://127.0.0.1:0".to_string(),
+        ));
+        let market_id = "m_reversal".to_string();
+        let symbol = "BTCUSDT".to_string();
+        let now_ms = Utc::now().timestamp_millis();
+
+        shared.latest_books.write().await.insert(
+            market_id.clone(),
+            BookTop {
+                market_id: market_id.clone(),
+                token_id_yes: "yes_token".to_string(),
+                token_id_no: "no_token".to_string(),
+                bid_yes: 0.45,
+                ask_yes: 0.46,
+                bid_no: 0.54,
+                ask_no: 0.55,
+                ts_ms: now_ms,
+                recv_ts_local_ns: now_ns(),
+            },
+        );
+        shared.latest_signals.insert(
+            market_id.clone(),
+            SignalCacheEntry {
+                signal: Signal {
+                    market_id: market_id.clone(),
+                    fair_yes: 0.74,
+                    edge_bps_bid: 12.0,
+                    edge_bps_ask: -12.0,
+                    confidence: 0.92,
+                },
+                ts_ms: now_ms,
+            },
+        );
+
+        let seen_direction_signal = Arc::new(AtomicBool::new(false));
+        let seen_flatten = Arc::new(AtomicBool::new(false));
+        let mut rx = bus.subscribe();
+        let execution_for_listener = execution.clone();
+        let seen_direction_signal_l = seen_direction_signal.clone();
+        let seen_flatten_l = seen_flatten.clone();
+        let listener = tokio::spawn(async move {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                match timeout(Duration::from_millis(250), rx.recv()).await {
+                    Ok(Ok(EngineEvent::DirectionSignal(_))) => {
+                        seen_direction_signal_l.store(true, Ordering::Relaxed);
+                    }
+                    Ok(Ok(EngineEvent::Control(ControlCommand::Flatten))) => {
+                        seen_flatten_l.store(true, Ordering::Relaxed);
+                        let _ = execution_for_listener.flatten_all().await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let _ = bus.publish(EngineEvent::DirectionSignal(DirectionSignal {
+            symbol: symbol.clone(),
+            direction: Direction::Up,
+            magnitude_pct: 0.32,
+            confidence: 0.93,
+            recommended_tf: TimeframeClass::Tf5m,
+            velocity_bps_per_sec: 12.0,
+            acceleration: 3.0,
+            tick_consistency: 4,
+            triple_confirm: true,
+            momentum_spike: true,
+            ts_ns: now_ns(),
+        }));
+
+        let entry_ack = execution
+            .place_order_v2(OrderIntentV2 {
+                market_id: market_id.clone(),
+                token_id: Some("yes_token".to_string()),
+                side: OrderSide::BuyYes,
+                price: 0.52,
+                size: 2.0,
+                ttl_ms: 500,
+                style: ExecutionStyle::Taker,
+                tif: OrderTimeInForce::Fak,
+                max_slippage_bps: 10.0,
+                fee_rate_bps: 2.0,
+                expected_edge_net_bps: 15.0,
+                client_order_id: Some(new_id()),
+                hold_to_resolution: false,
+                prebuilt_payload: None,
+            })
+            .await
+            .expect("paper entry ack");
+        assert!(entry_ack.accepted);
+
+        {
+            let mut manager = shared.predator_exit_manager.write().await;
+            manager.register(PositionLifecycle {
+                position_id: entry_ack.order_id.clone(),
+                market_id: market_id.clone(),
+                symbol: symbol.clone(),
+                opened_at_ms: now_ms,
+                entry_edge_usdc: 0.20,
+                entry_notional_usdc: 1.04,
+            });
+        }
+
+        spawn_predator_exit_lifecycle(
+            shared.clone(),
+            bus.clone(),
+            execution.clone(),
+            entry_ack.order_id.clone(),
+            market_id.clone(),
+            symbol.clone(),
+            OrderSide::BuyYes,
+            0.52,
+            2.0,
+            500,
+            0.70,
+        );
+
+        sleep(Duration::from_millis(120)).await;
+        let _ = wss_tx.send(WssFillEvent {
+            order_id: entry_ack.order_id.clone(),
+            market_id: market_id.clone(),
+            price: 0.45,
+            size: 2.0,
+            event_type: "trade".to_string(),
+            ts_ms: Utc::now().timestamp_millis(),
+        });
+        sleep(Duration::from_millis(900)).await;
+        let _ = listener.await;
+
+        let report = shared.shadow_stats.build_live_report().await;
+        let has_reversal_reason = report
+            .exit_reason_top
+            .iter()
+            .any(|(reason, count)| *count > 0 && (reason == "t_plus_100ms_reversal" || reason == "t_plus_300ms_reversal"));
+
+        assert!(
+            seen_direction_signal.load(Ordering::Relaxed),
+            "direction signal stage must be observed"
+        );
+        assert!(
+            seen_flatten.load(Ordering::Relaxed),
+            "reversal path must publish flatten control"
+        );
+        assert!(
+            has_reversal_reason,
+            "live report must record reversal exit reason"
+        );
+        assert!(
+            report.executed_count >= 1,
+            "live report must include executed re-entry orders"
+        );
     }
 
     #[test]
