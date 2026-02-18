@@ -83,6 +83,8 @@ def collect_engine_series(base_url: str, seconds: int, poll_interval: float) -> 
         "decision_compute_p99_ms": [],
         "feed_in_p99_ms": [],
         "source_latency_p99_ms": [],
+        "exchange_lag_p99_ms": [],
+        "path_lag_p99_ms": [],
         "local_backlog_p99_ms": [],
         "book_top_lag_p50_ms": [],
         "book_top_lag_p90_ms": [],
@@ -143,6 +145,8 @@ def collect_engine_series(base_url: str, seconds: int, poll_interval: float) -> 
 
             push("feed_in_p99_ms", latency.get("feed_in_p99_ms"))
             push("source_latency_p99_ms", live.get("source_latency_p99_ms"))
+            push("exchange_lag_p99_ms", live.get("exchange_lag_p99_ms"))
+            push("path_lag_p99_ms", live.get("path_lag_p99_ms"))
             push("local_backlog_p99_ms", live.get("local_backlog_p99_ms"))
 
             samples += 1
@@ -161,6 +165,11 @@ def collect_engine_series(base_url: str, seconds: int, poll_interval: float) -> 
             "book_top_lag_by_symbol_p50_ms": (last_live or {}).get("book_top_lag_by_symbol_p50_ms"),
             "survival_10ms_by_symbol": (last_live or {}).get("survival_10ms_by_symbol"),
             "survival_probe_10ms_by_symbol": (last_live or {}).get("survival_probe_10ms_by_symbol"),
+            "blocked_reason_counts": (last_live or {}).get("blocked_reason_counts"),
+            "policy_block_reason_distribution": (last_live or {}).get("policy_block_reason_distribution"),
+            "source_mix_ratio": (last_live or {}).get("source_mix_ratio"),
+            "source_health": (last_live or {}).get("source_health"),
+            "last_30s_taker_fallback_count": (last_live or {}).get("last_30s_taker_fallback_count"),
         },
     }
 

@@ -130,7 +130,11 @@ impl ExitManager {
         self.open.len()
     }
 
-    pub fn evaluate_market(&mut self, market_id: &str, input: MarketEvalInput) -> Option<ExitAction> {
+    pub fn evaluate_market(
+        &mut self,
+        market_id: &str,
+        input: MarketEvalInput,
+    ) -> Option<ExitAction> {
         let position = self
             .open
             .values()
@@ -231,7 +235,12 @@ mod tests {
         }
     }
 
-    fn eval(now_ms: i64, unrealized_pnl_usdc: f64, true_prob: f64, time_to_expiry_ms: i64) -> MarketEvalInput {
+    fn eval(
+        now_ms: i64,
+        unrealized_pnl_usdc: f64,
+        true_prob: f64,
+        time_to_expiry_ms: i64,
+    ) -> MarketEvalInput {
         MarketEvalInput {
             now_ms,
             unrealized_pnl_usdc,
@@ -248,7 +257,10 @@ mod tests {
         let mut manager = ExitManager::new(ExitManagerConfig::default());
         manager.register(sample_position(1_000));
         let action = manager.evaluate_market("m1", eval(1_100, -1.1, 0.9, 600_000));
-        assert!(matches!(action.map(|a| a.reason), Some(ExitReason::StopLoss)));
+        assert!(matches!(
+            action.map(|a| a.reason),
+            Some(ExitReason::StopLoss)
+        ));
     }
 
     #[test]
@@ -256,7 +268,10 @@ mod tests {
         let mut manager = ExitManager::new(ExitManagerConfig::default());
         manager.register(sample_position(1_000));
         let action = manager.evaluate_market("m1", eval(1_150, -0.02, 0.9, 600_000));
-        assert!(matches!(action.map(|a| a.reason), Some(ExitReason::Reversal100ms)));
+        assert!(matches!(
+            action.map(|a| a.reason),
+            Some(ExitReason::Reversal100ms)
+        ));
     }
 
     #[test]
@@ -280,7 +295,10 @@ mod tests {
         let mut manager = ExitManager::new(ExitManagerConfig::default());
         manager.register(sample_position(1_000));
         let action = manager.evaluate_market("m1", eval(1_400, -0.01, 0.9, 500_000));
-        assert!(matches!(action.map(|a| a.reason), Some(ExitReason::Reversal300ms)));
+        assert!(matches!(
+            action.map(|a| a.reason),
+            Some(ExitReason::Reversal300ms)
+        ));
     }
 
     #[test]
@@ -288,7 +306,10 @@ mod tests {
         let mut manager = ExitManager::new(ExitManagerConfig::default());
         manager.register(sample_position(1_000));
         let action = manager.evaluate_market("m1", eval(4_500, 0.7, 0.8, 500_000));
-        assert!(matches!(action.map(|a| a.reason), Some(ExitReason::TakeProfit3s)));
+        assert!(matches!(
+            action.map(|a| a.reason),
+            Some(ExitReason::TakeProfit3s)
+        ));
     }
 
     #[test]
@@ -296,7 +317,10 @@ mod tests {
         let mut manager = ExitManager::new(ExitManagerConfig::default());
         manager.register(sample_position(1_000));
         let action = manager.evaluate_market("m1", eval(20_500, 0.01, 0.9, 450_000));
-        assert!(matches!(action.map(|a| a.reason), Some(ExitReason::TakeProfit15s)));
+        assert!(matches!(
+            action.map(|a| a.reason),
+            Some(ExitReason::TakeProfit15s)
+        ));
     }
 
     #[test]
@@ -304,7 +328,10 @@ mod tests {
         let mut manager = ExitManager::new(ExitManagerConfig::default());
         manager.register(sample_position(1_000));
         let action = manager.evaluate_market("m1", eval(62_000, -0.2, 0.65, 360_000));
-        assert!(matches!(action.map(|a| a.reason), Some(ExitReason::ProbGuard60s)));
+        assert!(matches!(
+            action.map(|a| a.reason),
+            Some(ExitReason::ProbGuard60s)
+        ));
     }
 
     #[test]
@@ -312,7 +339,10 @@ mod tests {
         let mut manager = ExitManager::new(ExitManagerConfig::default());
         manager.register(sample_position(1_000));
         let action = manager.evaluate_market("m1", eval(305_000, -0.01, 0.93, 1_000_000));
-        assert!(matches!(action.map(|a| a.reason), Some(ExitReason::ForceClose300s)));
+        assert!(matches!(
+            action.map(|a| a.reason),
+            Some(ExitReason::ForceClose300s)
+        ));
     }
 
     #[test]
@@ -360,7 +390,10 @@ mod tests {
                 entry_fair_yes: 0.80,
             },
         );
-        assert!(matches!(action.map(|a| a.reason), Some(ExitReason::ConvergenceExit)));
+        assert!(matches!(
+            action.map(|a| a.reason),
+            Some(ExitReason::ConvergenceExit)
+        ));
     }
 
     #[test]

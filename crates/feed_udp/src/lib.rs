@@ -2,8 +2,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use core_types::{DynStream, RefPriceFeed, RefTick};
 use poly_wire::{
-    decode_auto, WirePacket, WIRE_BOOK_TOP24_SIZE, WIRE_MAX_PACKET_SIZE,
-    WIRE_MOMENTUM_TICK32_SIZE,
+    decode_auto, WirePacket, WIRE_BOOK_TOP24_SIZE, WIRE_MAX_PACKET_SIZE, WIRE_MOMENTUM_TICK32_SIZE,
 };
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
@@ -70,7 +69,8 @@ impl RefPriceFeed for UdpBinanceFeed {
         let normalized_symbols = normalize_symbols(&symbols);
         let bindings = udp_bindings(self.port, &normalized_symbols);
         let tuning = UdpRecvTuning::from_env();
-        let core_map = parse_port_core_map(&std::env::var("POLYEDGE_UDP_PIN_CORES").unwrap_or_default());
+        let core_map =
+            parse_port_core_map(&std::env::var("POLYEDGE_UDP_PIN_CORES").unwrap_or_default());
 
         if bindings.is_empty() {
             let symbol = normalized_symbols
@@ -127,7 +127,9 @@ fn spawn_recv_loop(
                 let recv = socket.recv_from(&mut buf);
                 let (amt, _src) = match recv {
                     Ok(v) => v,
-                    Err(err) if tuning.user_spin && err.kind() == std::io::ErrorKind::WouldBlock => {
+                    Err(err)
+                        if tuning.user_spin && err.kind() == std::io::ErrorKind::WouldBlock =>
+                    {
                         std::hint::spin_loop();
                         continue;
                     }
@@ -153,11 +155,10 @@ fn spawn_recv_loop(
                     continue;
                 }
 
+                let recv_ns = now_ns();
                 let (ts_micros, bid, ask, ts_first_hop_ms) = match decode_auto(&buf[..amt]) {
                     Ok(WirePacket::BookTop24(pkt)) => (pkt.ts_micros, pkt.bid, pkt.ask, None),
-                    Ok(WirePacket::MomentumTick32(pkt)) => {
-                        (pkt.ts_micros, pkt.bid, pkt.ask, None)
-                    }
+                    Ok(WirePacket::MomentumTick32(pkt)) => (pkt.ts_micros, pkt.bid, pkt.ask, None),
                     Ok(WirePacket::RelayTick40(pkt)) => {
                         (pkt.ts_micros, pkt.bid, pkt.ask, Some(pkt.ts_first_hop_ms))
                     }
@@ -177,7 +178,7 @@ fn spawn_recv_loop(
                     }
                 };
 
-                let recv_ns = now_ns();
+
                 let event_ms = (ts_micros / 1_000) as i64;
                 let mid = (bid + ask) * 0.5;
                 if !mid.is_finite() || mid <= 0.0 {

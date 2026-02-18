@@ -91,6 +91,8 @@ def parse_args() -> argparse.Namespace:
     # explicitly testing pause/resume semantics.
     p.add_argument("--churn-pause-resume", action="store_true")
     p.add_argument("--once", action="store_true")
+    # P4: 轻量级探测端点，使用 /health/latency 代替 /report/shadow/live
+    p.add_argument("--lightweight", action="store_true", help="使用轻量级 /health/latency 端点而非 /report/shadow/live")
     return p.parse_args()
 
 
@@ -166,10 +168,13 @@ def main() -> int:
     consecutive_failures = 0
     samples: List[ProbeResult] = []
 
+    # P4: 选择端点 - 轻量级或完整报告
+    endpoint = "/health/latency" if args.lightweight else "/report/shadow/live"
+
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
             if args.once:
-                probe = request_json(session, "GET", f"{args.base_url}/report/shadow/live", args.timeout_sec)
+                probe = request_json(session, "GET", f"{args.base_url}{endpoint}", args.timeout_sec)
                 samples.append(probe)
             else:
                 while True:
@@ -185,7 +190,7 @@ def main() -> int:
                             request_json,
                             session,
                             "GET",
-                            f"{args.base_url}/report/shadow/live",
+                            f"{args.base_url}{endpoint}",
                             args.timeout_sec,
                             None,
                         )

@@ -92,7 +92,11 @@ pub async fn run_wss_loop_with_sender(
                 tracing::info!("wss_user_feed: connection closed, reconnecting");
             }
             Err(err) => {
-                tracing::warn!(?err, backoff_ms, "wss_user_feed: connection error, retrying");
+                tracing::warn!(
+                    ?err,
+                    backoff_ms,
+                    "wss_user_feed: connection error, retrying"
+                );
             }
         }
         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;

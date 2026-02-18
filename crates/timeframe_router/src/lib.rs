@@ -63,8 +63,7 @@ impl TimeframeRouter {
     }
 
     pub fn prune_expired(&mut self, now_ms: i64) {
-        self.locks_by_market
-            .retain(|_, l| l.unlock_at_ms > now_ms);
+        self.locks_by_market.retain(|_, l| l.unlock_at_ms > now_ms);
     }
 
     pub fn active_positions(&mut self, now_ms: i64) -> usize {
@@ -110,9 +109,13 @@ impl TimeframeRouter {
             return Vec::new();
         }
 
-        let locked_total = self.locks_by_market.values().map(|l| l.notional_usdc).sum::<f64>();
-        let reserve = (total_capital_usdc * self.cfg.liquidity_reserve_pct.clamp(0.0, 0.95))
-            .max(0.0);
+        let locked_total = self
+            .locks_by_market
+            .values()
+            .map(|l| l.notional_usdc)
+            .sum::<f64>();
+        let reserve =
+            (total_capital_usdc * self.cfg.liquidity_reserve_pct.clamp(0.0, 0.95)).max(0.0);
         let mut deployable = (total_capital_usdc - reserve - locked_total).max(0.0);
         if deployable < 1e-9 {
             return Vec::new();
@@ -144,16 +147,19 @@ impl TimeframeRouter {
             if notional > self.cfg.max_order_notional_usdc.max(0.0) {
                 continue;
             }
-            if locked_total + out.iter().map(|o| (o.entry_price * o.size).max(0.0)).sum::<f64>()
+            if locked_total
+                + out
+                    .iter()
+                    .map(|o| (o.entry_price * o.size).max(0.0))
+                    .sum::<f64>()
                 + notional
                 > self.cfg.max_total_notional_usdc.max(0.0)
             {
                 continue;
             }
 
-            let tf_limit = (self.max_locked_pct(&opp.timeframe).clamp(0.0, 1.0)
-                * total_capital_usdc)
-                .max(0.0);
+            let tf_limit =
+                (self.max_locked_pct(&opp.timeframe).clamp(0.0, 1.0) * total_capital_usdc).max(0.0);
             let tf_locked = *locked_by_tf.get(&opp.timeframe).unwrap_or(&0.0);
             if tf_locked + notional > tf_limit {
                 continue;
@@ -212,7 +218,13 @@ mod tests {
     use super::*;
     use core_types::{Direction, OrderSide};
 
-    fn opp(tf: TimeframeClass, density: f64, market_id: &str, entry_price: f64, size: f64) -> TimeframeOpp {
+    fn opp(
+        tf: TimeframeClass,
+        density: f64,
+        market_id: &str,
+        entry_price: f64,
+        size: f64,
+    ) -> TimeframeOpp {
         TimeframeOpp {
             timeframe: tf,
             market_id: market_id.to_string(),
@@ -269,7 +281,11 @@ mod tests {
                 unlock_at_ms: 10_000,
             },
         );
-        let routed = router.route(vec![opp(TimeframeClass::Tf15m, 0.2, "m1", 0.5, 10.0)], 100.0, 1_000);
+        let routed = router.route(
+            vec![opp(TimeframeClass::Tf15m, 0.2, "m1", 0.5, 10.0)],
+            100.0,
+            1_000,
+        );
         assert!(routed.is_empty());
     }
 
@@ -281,7 +297,11 @@ mod tests {
             ..RouterConfig::default()
         });
         // total=10, reserve=2 => deployable=8; order notional=9 => should skip.
-        let routed = router.route(vec![opp(TimeframeClass::Tf15m, 0.2, "m1", 0.9, 10.0)], 10.0, 1_000);
+        let routed = router.route(
+            vec![opp(TimeframeClass::Tf15m, 0.2, "m1", 0.9, 10.0)],
+            10.0,
+            1_000,
+        );
         assert!(routed.is_empty());
     }
 
@@ -304,7 +324,11 @@ mod tests {
                 unlock_at_ms: 10_000,
             },
         );
-        let routed = router.route(vec![opp(TimeframeClass::Tf5m, 0.2, "m1", 0.5, 10.0)], 10.0, 1_000);
+        let routed = router.route(
+            vec![opp(TimeframeClass::Tf5m, 0.2, "m1", 0.5, 10.0)],
+            10.0,
+            1_000,
+        );
         assert!(routed.is_empty());
     }
 }

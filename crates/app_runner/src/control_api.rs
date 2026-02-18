@@ -3,6 +3,7 @@ use super::*;
 pub(super) fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/health/latency", get(health_latency))  // P4: 轻量级延迟探测
         .route("/metrics", get(metrics))
         .route("/state/positions", get(positions))
         .route("/state/pnl", get(pnl))
@@ -42,6 +43,22 @@ async fn health(State(state): State<AppState>) -> Json<HealthResp> {
         status: "ok",
         paused,
     })
+}
+
+// P4: 轻量级延迟探测端点 - 简单返回，不遍历大量数据
+// storm_test 可以打这个端点来获得更真实的 RTT
+async fn health_latency(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let paused = *state.paused.read().await;
+    let now = std::time::Instant::now();
+
+    // 轻量探测 - 不做复杂计算，直接返回状态
+    Json(serde_json::json!({
+        "status": "ok",
+        "paused": paused,
+        "timestamp_ms": chrono::Utc::now().timestamp_millis(),
+        "probe_latency_us": now.elapsed().as_micros() as u64,
+        "note": "轻量级探测端点，用于 storm_test RTT 测试"
+    }))
 }
 
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
@@ -377,6 +394,9 @@ async fn reload_source_health(
     }
     if let Some(v) = req.deviation_limit_bps {
         cfg.deviation_limit_bps = v.clamp(0.1, 10_000.0);
+    }
+    if let Some(v) = req.freshness_limit_ms {
+        cfg.freshness_limit_ms = v.clamp(50.0, 60_000.0);
     }
     if let Some(v) = req.min_score_for_trading {
         cfg.min_score_for_trading = v.clamp(0.0, 1.0);

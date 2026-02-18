@@ -11,8 +11,8 @@ pub struct MarketDescriptor {
     pub token_id_no: Option<String>,
     pub event_slug: Option<String>,
     pub end_date: Option<String>,
-    pub timeframe: Option<String>,    // "5m" / "15m" / "1h" / "1d"
-    pub market_type: Option<String>,  // "updown" / "above_below" / "range"
+    pub timeframe: Option<String>,   // "5m" / "15m" / "1h" / "1d"
+    pub market_type: Option<String>, // "updown" / "above_below" / "range"
     pub best_bid: Option<f64>,
     pub best_ask: Option<f64>,
 }
@@ -158,7 +158,12 @@ impl MarketDiscovery {
                     let Some(tf) = timeframe else {
                         continue;
                     };
-                    if !self.cfg.timeframes.iter().any(|t| t.eq_ignore_ascii_case(tf)) {
+                    if !self
+                        .cfg
+                        .timeframes
+                        .iter()
+                        .any(|t| t.eq_ignore_ascii_case(tf))
+                    {
                         continue;
                     }
                 }

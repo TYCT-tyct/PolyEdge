@@ -26,6 +26,10 @@ Param(
   [ValidateSet("maker_first", "taker_first", "taker_only")]
   [string]$PredatorPriority = "taker_first",
 
+  # Optional baseline run dir for automatic regression attribution + gate.
+  [string]$BaselineRunDir = "",
+  [switch]$RegressionGate = $false,
+
   # Optional: three-window A/B is more about gate/EV than raw latency; keep opt-in for latency work.
   [switch]$DoThreeWindow = $false
 )
@@ -105,9 +109,10 @@ $BaseUrl = "http://127.0.0.1:$LocalPort"
 $RunDir = "datasets/reports/$Day/runs/$RunId"
 $SnapDir = "$RunDir/snapshots"
 
-Write-Host ("run_id=" + $RunId)
-Write-Host ("base_url=" + $BaseUrl)
-Write-Host ("run_dir=" + $RunDir)
+  Write-Host ("run_id=" + $RunId)
+  Write-Host ("base_url=" + $BaseUrl)
+  Write-Host ("run_dir=" + $RunDir)
+  if ($BaselineRunDir) { Write-Host ("baseline_run_dir=" + $BaselineRunDir) }
 
 # Start SSH tunnel in background.
 $sshArgs = @(
@@ -143,12 +148,22 @@ try {
 
   # Safety: resume (no-op if already).
   Write-JsonFile "$SnapDir/resume_pre.json" (Invoke-RestJson "POST" "$BaseUrl/control/resume" @{} 5)
+  Write-JsonFile "$SnapDir/reset_shadow_pre_sweeps.json" (Invoke-RestJson "POST" "$BaseUrl/control/reset_shadow" @{} 5)
+  Start-Sleep -Seconds 5
 
   # Sweeps (engine series + ws probe; base_url points to remote via tunnel).
   for ($i = 1; $i -le [Math]::Max(1, $SweepRepeats); $i++) {
+    if ($i -gt 1) {
+      Write-Host ("reset_shadow before sweep " + $i)
+      Write-JsonFile "$SnapDir/reset_shadow_before_sweep_$i.json" (Invoke-RestJson "POST" "$BaseUrl/control/reset_shadow" @{} 5)
+      Start-Sleep -Seconds 5
+    }
     Write-Host ("sweep=" + $i + "/" + $SweepRepeats)
-    & python scripts/full_latency_sweep.py --profile $SweepProfile --base-url $BaseUrl --out-root "datasets/reports" --run-id $RunId --skip-ws
+    & python scripts/full_latency_sweep.py --profile $SweepProfile --base-url $BaseUrl --out-root "datasets/reports" --run-id $RunId --skip-ws --reset-shadow --warmup-sec 5
     if ($LASTEXITCODE -ne 0) { throw "full_latency_sweep failed (exit=$LASTEXITCODE)" }
+    if ($i -lt $SweepRepeats) {
+      Start-Sleep -Seconds 5
+    }
   }
   Write-JsonFile "$SnapDir/shadow_live_after_sweeps.json" (Invoke-RestJson "GET" "$BaseUrl/report/shadow/live" $null 5)
 
@@ -166,6 +181,22 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "three_window_verify failed (exit=$LASTEXITCODE)" }
     Write-JsonFile "$SnapDir/shadow_live_after_threew.json" (Invoke-RestJson "GET" "$BaseUrl/report/shadow/live" $null 5)
     Try-JsonSnapshot "$SnapDir/pnl_by_engine_after_threew.json" "$BaseUrl/report/pnl/by_engine" | Out-Null
+  }
+
+  if ($BaselineRunDir -and (Test-Path $BaselineRunDir)) {
+    Write-Host "analyze_fullchain_run (with baseline)"
+    $analysisJson = "$RunDir/regression_analysis.json"
+    $analysisArgs = @(
+      "scripts/analyze_fullchain_run.py",
+      "--run-dir", $RunDir,
+      "--baseline-run-dir", $BaselineRunDir,
+      "--json-out", $analysisJson
+    )
+    if ($RegressionGate) {
+      $analysisArgs += "--fail-on-regression"
+    }
+    & python @analysisArgs
+    if ($LASTEXITCODE -ne 0) { throw "analyze_fullchain_run failed (exit=$LASTEXITCODE)" }
   }
 
   # Post snapshots + safety resume
@@ -204,6 +235,7 @@ try {
 - $RunDir/snapshots/*.prom: /metrics before/after.
 - datasets/reports/$Day/runs/$RunId/full_latency_sweep_*.json: engine series + ws probe results.
 - datasets/reports/$Day/runs/$RunId/storm_test_summary.json + storm_test_trace.jsonl: stress polling + control churn.
+- datasets/reports/$Day/runs/$RunId/regression_analysis.json: optional baseline diff + likely cause attribution.
 
 ## What To Look At First
 - snapshots/shadow_live_pre.json vs snapshots/shadow_live_after_storm.json

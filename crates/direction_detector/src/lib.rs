@@ -160,7 +160,8 @@ impl DirectionDetector {
         }
 
         w.latest_by_source.insert(tick.source.clone(), tick.price);
-        w.latest_ts_by_source.insert(tick.source.clone(), tick.recv_ts_ms);
+        w.latest_ts_by_source
+            .insert(tick.source.clone(), tick.recv_ts_ms);
 
         // --------------------------------------------------------
         // 增量维护连续方向计数
@@ -169,7 +170,13 @@ impl DirectionDetector {
         if let Some(&(_, prev_price)) = w.ticks.back() {
             if prev_price > 0.0 && tick.price > 0.0 {
                 let delta = tick.price - prev_price;
-                let sign: i8 = if delta > 0.0 { 1 } else if delta < 0.0 { -1 } else { 0 };
+                let sign: i8 = if delta > 0.0 {
+                    1
+                } else if delta < 0.0 {
+                    -1
+                } else {
+                    0
+                };
                 if sign == 0 {
                     w.consecutive_dir_count = 0;
                     w.last_dir_sign = 0;
@@ -199,12 +206,15 @@ impl DirectionDetector {
         self.tick_counter += 1;
         if self.tick_counter >= 100 {
             self.tick_counter = 0;
-            let window_cutoff = now.saturating_sub((self.cfg.window_max_sec as i64).saturating_mul(1_000));
+            let window_cutoff =
+                now.saturating_sub((self.cfg.window_max_sec as i64).saturating_mul(1_000));
             let short_cutoff = now.saturating_sub(short_ms);
             let long_cutoff = now.saturating_sub(long_ms);
             // 重新精确计算计数器（每 100 ticks 一次，分摊成本）
-            w.short_window_count = w.ticks.iter().filter(|(ts, _)| *ts >= short_cutoff).count() as u32;
-            w.long_window_count = w.ticks.iter().filter(|(ts, _)| *ts >= long_cutoff).count() as u32;
+            w.short_window_count =
+                w.ticks.iter().filter(|(ts, _)| *ts >= short_cutoff).count() as u32;
+            w.long_window_count =
+                w.ticks.iter().filter(|(ts, _)| *ts >= long_cutoff).count() as u32;
             while matches!(w.ticks.front(), Some((ts, _)) if *ts < window_cutoff) {
                 w.ticks.pop_front();
             }
@@ -279,7 +289,10 @@ impl DirectionDetector {
         // 替代原来的 tick_rate_spike_ratio() O(2n) 全量扫描
         // --------------------------------------------------------
         let short_ms = self.cfg_tick_rate_short_ms.clamp(50, 10_000);
-        let long_ms = self.cfg_tick_rate_long_ms.max(short_ms + 50).clamp(100, 60_000);
+        let long_ms = self
+            .cfg_tick_rate_long_ms
+            .max(short_ms + 50)
+            .clamp(100, 60_000);
         let short_rate = w.short_window_count as f64 / (short_ms as f64 / 1_000.0);
         let long_rate = (w.long_window_count as f64 / (long_ms as f64 / 1_000.0)).max(1e-6);
         let tick_rate_ratio = short_rate / long_rate;
@@ -290,7 +303,8 @@ impl DirectionDetector {
         //   普通动量 → 需要 min_consecutive_ticks 个同向 Tick
         // 设计哲学: 极强动量本身是高置信度，等待第 2 个 Tick 会损失套利窗口
         // --------------------------------------------------------
-        let required_ticks = if velocity_abs >= self.cfg.fast_confirm_velocity_bps_per_sec.max(1.0) {
+        let required_ticks = if velocity_abs >= self.cfg.fast_confirm_velocity_bps_per_sec.max(1.0)
+        {
             1u8
         } else {
             self.cfg.min_consecutive_ticks.max(1)
@@ -428,7 +442,6 @@ fn is_chainlink_source(source: &str) -> bool {
     b.windows(9).any(|w| w.eq_ignore_ascii_case(b"chainlink"))
 }
 
-
 // ============================================================
 // kinematics_from_ticks — 计算速度和加速度
 // 注意: tick_consistency 现在由 SymbolWindow 增量维护
@@ -448,7 +461,6 @@ fn kinematics_from_ticks(ticks: &VecDeque<(i64, f64)>) -> (f64, f64) {
     let acceleration = (v2 - v1) / dt_s.max(1e-6);
     (v2, acceleration)
 }
-
 
 fn velocity_bps_per_sec(t0_ms: i64, p0: f64, t1_ms: i64, p1: f64) -> f64 {
     if p0 <= 0.0 || p1 <= 0.0 {
@@ -480,7 +492,6 @@ fn find_anchor_price(ticks: &VecDeque<(i64, f64)>, target_ms: i64) -> Option<f64
     }
     ticks.get(idx - 1).map(|(_, px)| *px)
 }
-
 
 fn recommended_timeframe(cfg: &DirectionConfig, abs_magnitude_pct: f64) -> TimeframeClass {
     if abs_magnitude_pct >= cfg.threshold_1d_pct {

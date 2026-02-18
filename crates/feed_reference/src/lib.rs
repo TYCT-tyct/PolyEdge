@@ -111,7 +111,11 @@ enum TickDispatch {
     Closed,
 }
 
-fn dispatch_ref_tick(tx: &mpsc::Sender<RefTick>, tick: RefTick, source: &'static str) -> TickDispatch {
+fn dispatch_ref_tick(
+    tx: &mpsc::Sender<RefTick>,
+    tick: RefTick,
+    source: &'static str,
+) -> TickDispatch {
     static DROP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     match tx.try_send(tick) {
@@ -119,11 +123,7 @@ fn dispatch_ref_tick(tx: &mpsc::Sender<RefTick>, tick: RefTick, source: &'static
         Err(mpsc::error::TrySendError::Full(_)) => {
             let dropped = DROP_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
             if dropped.is_multiple_of(1024) {
-                tracing::warn!(
-                    source,
-                    dropped,
-                    "ref tick queue full, dropping stale ticks"
-                );
+                tracing::warn!(source, dropped, "ref tick queue full, dropping stale ticks");
             }
             TickDispatch::Dropped
         }

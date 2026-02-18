@@ -205,7 +205,8 @@ pub fn encode_with_mode(
                 bid: packet24.bid,
                 ask: packet24.ask,
                 velocity_bps_per_sec,
-                ts_first_hop_ms: ts_first_hop_ms.unwrap_or_else(|| (packet24.ts_micros / 1_000) as i64),
+                ts_first_hop_ms: ts_first_hop_ms
+                    .unwrap_or_else(|| (packet24.ts_micros / 1_000) as i64),
             };
             encode_relay_tick40(&packet40, &mut view)?;
             out[..WIRE_RELAY_TICK40_SIZE].copy_from_slice(&view);

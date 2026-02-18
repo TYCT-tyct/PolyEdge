@@ -30,7 +30,9 @@ fn now_micros() -> u64 {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    rustls::crypto::ring::default_provider().install_default().unwrap();
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .unwrap();
     tracing::subscriber::set_global_default(
         FmtSubscriber::builder()
             .with_max_level(tracing::Level::INFO)
@@ -46,7 +48,7 @@ async fn main() -> Result<()> {
     info!("   - Relay:  UDP Port {} (Tokyo)", udp_port);
 
     // 1. Setup UDP Listener (Optimized)
-    use socket2::{Socket, Domain, Type, Protocol};
+    use socket2::{Domain, Protocol, Socket, Type};
     use std::net::SocketAddr;
 
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
@@ -64,15 +66,18 @@ async fn main() -> Result<()> {
     info!("✅ UDP Listening on {} (Buffer: 8MB)", addr_str);
 
     // 2. Setup WS Listener
-    let ws_url = format!("wss://stream.binance.com:9443/ws/{}@bookTicker", symbol.to_lowercase());
+    let ws_url = format!(
+        "wss://stream.binance.com:9443/ws/{}@bookTicker",
+        symbol.to_lowercase()
+    );
     let (ws_stream, _) = connect_async(&ws_url).await?;
     info!("✅ WS Connected to {}", ws_url);
     let (_, mut read) = ws_stream.split();
 
     // 3. Shared State
     // Map<event_ts_ms, (ws_recv_ts, udp_recv_ts)>
-    let tracker: Arc<Mutex<HashMap<u64, (Option<u64>, Option<u64>)>>> = Arc::new(Mutex::new(HashMap::new()));
-
+    let tracker: Arc<Mutex<HashMap<u64, (Option<u64>, Option<u64>)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     // I/O Thread Setup
     struct LogEntry {
@@ -98,7 +103,12 @@ async fn main() -> Result<()> {
         writeln!(writer, "event_ts_ms,udp_ts,ws_ts,delta_ms,faster_source").unwrap();
 
         while let Ok(entry) = rx_log.recv() {
-            writeln!(writer, "{},{},{},{:.3},{}", entry.id, entry.udp, entry.ws, entry.delta, entry.faster).unwrap();
+            writeln!(
+                writer,
+                "{},{},{},{:.3},{}",
+                entry.id, entry.udp, entry.ws, entry.delta, entry.faster
+            )
+            .unwrap();
             stats_clone.lock().unwrap().push(entry.delta);
 
             // Only log extreme lag or periodic sample to avoid console spam?
@@ -131,7 +141,10 @@ async fn main() -> Result<()> {
                             WirePacket::RelayTick40(v) => v.ts_micros / 1_000,
                         };
                         if last_event_ts_ms > 0 && event_ts_ms < last_event_ts_ms {
-                            warn!("⚠️ UDP timestamp backjump: {} -> {}", last_event_ts_ms, event_ts_ms);
+                            warn!(
+                                "⚠️ UDP timestamp backjump: {} -> {}",
+                                last_event_ts_ms, event_ts_ms
+                            );
                         }
                         last_event_ts_ms = event_ts_ms;
                         let mut map = tracker_udp.lock().unwrap();
@@ -142,21 +155,27 @@ async fn main() -> Result<()> {
                         let match_found = entry.0;
 
                         if let Some(ws_ts) = match_found {
-                             map.remove(&event_ts_ms);
-                             // Release lock immediately
-                             // drop(map); // Removed as per instruction
+                            map.remove(&event_ts_ms);
+                            // Release lock immediately
+                            // drop(map); // Removed as per instruction
 
-                             let delta = (recv_ts as i64) - (ws_ts as i64);
-                             let ms = delta as f64 / 1000.0;
-                             let faster = if ms < 0.0 { "UDP" } else { "WS" };
+                            let delta = (recv_ts as i64) - (ws_ts as i64);
+                            let ms = delta as f64 / 1000.0;
+                            let faster = if ms < 0.0 { "UDP" } else { "WS" };
 
-                             tx_log_udp.send(LogEntry {
-                                 id: event_ts_ms, udp: recv_ts, ws: ws_ts, delta: ms, faster
-                             }).unwrap();
+                            tx_log_udp
+                                .send(LogEntry {
+                                    id: event_ts_ms,
+                                    udp: recv_ts,
+                                    ws: ws_ts,
+                                    delta: ms,
+                                    faster,
+                                })
+                                .unwrap();
                         }
 
                         // Prune (Optimized: Check size less often?)
-                         if map.len() > 5000 {
+                        if map.len() > 5000 {
                             map.retain(|k, _| *k > event_ts_ms.saturating_sub(10_000));
                         }
                     }
@@ -190,13 +209,19 @@ async fn main() -> Result<()> {
                         let ms = delta as f64 / 1000.0;
                         let faster = if ms < 0.0 { "UDP" } else { "WS" };
 
-                        tx_log_ws.send(LogEntry {
-                             id: ticker.event_time_ms, udp: udp_ts, ws: recv_ts, delta: ms, faster
-                        }).unwrap();
+                        tx_log_ws
+                            .send(LogEntry {
+                                id: ticker.event_time_ms,
+                                udp: udp_ts,
+                                ws: recv_ts,
+                                delta: ms,
+                                faster,
+                            })
+                            .unwrap();
                     }
                 }
             }
-             Ok(Message::Ping(_)) => {}
+            Ok(Message::Ping(_)) => {}
             _ => {}
         }
 

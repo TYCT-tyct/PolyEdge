@@ -1,6 +1,6 @@
 use chrono::Utc;
-use std::collections::VecDeque;
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 
 pub fn push_capped<T>(dst: &mut Vec<T>, value: T, cap: usize) {
     dst.push(value);
@@ -31,9 +31,8 @@ pub fn percentile_deque_capped(values: &VecDeque<f64>, p: f64, cap: usize) -> Op
     // Most recent samples are more relevant; take from the back.
     let mut v: Vec<f64> = values.iter().rev().take(n).copied().collect();
     let idx = ((v.len() as f64 - 1.0) * p.clamp(0.0, 1.0)).round() as usize;
-    let (_, nth, _) = v.select_nth_unstable_by(idx, |a, b| {
-        a.partial_cmp(b).unwrap_or(Ordering::Equal)
-    });
+    let (_, nth, _) =
+        v.select_nth_unstable_by(idx, |a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
     Some(*nth)
 }
 

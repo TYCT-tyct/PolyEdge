@@ -5,7 +5,19 @@ pub(super) fn is_quote_reject_reason(reason: &str) -> bool {
 }
 
 pub(super) fn is_policy_block_reason(reason: &str) -> bool {
-    reason == "risk_capped_zero" || reason.starts_with("risk:")
+    reason == "risk_capped_zero"
+        || reason.starts_with("risk:")
+        || reason.starts_with("rate_budget_")
+        || matches!(
+            reason,
+            "open_orders_pressure_precheck"
+                | "taker_slippage_budget"
+                | "market_rank_blocked"
+                | "symbol_quality_guard"
+                | "decision_backlog_guard"
+                | "no_quote_policy"
+                | "no_quote_edge"
+        )
 }
 
 pub(super) fn classify_execution_style(
@@ -72,5 +84,20 @@ pub(super) fn classify_execution_error_reason(err: &anyhow::Error) -> &'static s
         "execution_network"
     } else {
         "execution_error"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_block_reason_includes_runtime_gates() {
+        assert!(is_policy_block_reason("risk:exposure"));
+        assert!(is_policy_block_reason("risk_capped_zero"));
+        assert!(is_policy_block_reason("rate_budget_global"));
+        assert!(is_policy_block_reason("open_orders_pressure_precheck"));
+        assert!(is_policy_block_reason("decision_backlog_guard"));
+        assert!(!is_policy_block_reason("ref_dedupe_dropped"));
     }
 }

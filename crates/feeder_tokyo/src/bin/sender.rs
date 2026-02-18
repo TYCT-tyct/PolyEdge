@@ -64,7 +64,10 @@ fn main() -> Result<()> {
                 {
                     Ok(v) => v,
                     Err(err) => {
-                        eprintln!("sender: symbol={} runtime build failed: {}", route.symbol, err);
+                        eprintln!(
+                            "sender: symbol={} runtime build failed: {}",
+                            route.symbol, err
+                        );
                         return;
                     }
                 };
@@ -114,11 +117,12 @@ fn load_sender_tuning() -> SenderTuning {
         .filter(|v| *v > 0)
         .unwrap_or(2)
         .min(8);
-    let adaptive_err_threshold_per_sec = std::env::var("POLYEDGE_UDP_REDUNDANCY_ERR_THRESHOLD_PER_SEC")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(2)
-        .max(1);
+    let adaptive_err_threshold_per_sec =
+        std::env::var("POLYEDGE_UDP_REDUNDANCY_ERR_THRESHOLD_PER_SEC")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(2)
+            .max(1);
     let adaptive_cooldown_sec = std::env::var("POLYEDGE_UDP_REDUNDANCY_COOLDOWN_SEC")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -261,7 +265,8 @@ fn resolve_routes() -> Vec<Route> {
 }
 
 fn assign_route_cores(routes: &mut [Route]) {
-    let per_symbol = parse_symbol_core_map(&std::env::var("POLYEDGE_SENDER_PIN_CORES").unwrap_or_default());
+    let per_symbol =
+        parse_symbol_core_map(&std::env::var("POLYEDGE_SENDER_PIN_CORES").unwrap_or_default());
     let fallback = std::env::var("POLYEDGE_SENDER_PIN_CORE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok());
@@ -523,7 +528,8 @@ mod tests {
 
     #[test]
     fn parse_symbol_targets_accepts_valid_tokens() {
-        let routes = parse_symbol_targets("btcusdt=10.0.3.123:6666,ethusdt=10.0.3.123:6667", "9999");
+        let routes =
+            parse_symbol_targets("btcusdt=10.0.3.123:6666,ethusdt=10.0.3.123:6667", "9999");
         assert_eq!(routes.len(), 2);
         assert_eq!(routes[0].0, "btcusdt");
         assert_eq!(routes[0].1, "0.0.0.0:9999");

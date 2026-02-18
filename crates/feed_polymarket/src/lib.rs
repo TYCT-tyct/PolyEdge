@@ -197,7 +197,7 @@ impl PolymarketFeed {
 
         let (mut ws, _) = timeout(
             WS_CONNECT_TIMEOUT,
-            connect_async(&self.endpoints.clob_ws_market)
+            connect_async(&self.endpoints.clob_ws_market),
         )
         .await
         .context("connect polymarket market ws timeout")?
@@ -404,13 +404,10 @@ async fn run_book_update_loop(
 ) -> Result<()> {
     let token_market_map = fetch_token_market_map(gamma_endpoint, token_ids).await?;
 
-    let (mut ws, _) = timeout(
-        WS_CONNECT_TIMEOUT,
-        connect_async(endpoint)
-    )
-    .await
-    .with_context(|| format!("connect polymarket ws timeout: {endpoint}"))?
-    .with_context(|| format!("connect polymarket ws: {endpoint}"))?;
+    let (mut ws, _) = timeout(WS_CONNECT_TIMEOUT, connect_async(endpoint))
+        .await
+        .with_context(|| format!("connect polymarket ws timeout: {endpoint}"))?
+        .with_context(|| format!("connect polymarket ws: {endpoint}"))?;
 
     let sub = serde_json::json!({
         "type": "market",

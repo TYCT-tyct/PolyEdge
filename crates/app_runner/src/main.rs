@@ -2924,8 +2924,8 @@ fn spawn_reference_feed(
                             source_health.jitter_ms > udp_jitter_downweight_threshold_ms();
                         let freshness_low =
                             source_health.freshness_score < udp_min_freshness_score();
-                        let share_high = effective_udp_share > udp_target_share();
-                        if jitter_high || share_high || freshness_low {
+                        // REMOVED: success penalty (share_high). We want UDP to win if it's fast.
+                        if jitter_high || freshness_low {
                             let now_recv_ns = if tick.recv_ts_local_ns > 0 {
                                 tick.recv_ts_local_ns
                             } else {
@@ -7064,7 +7064,8 @@ fn estimate_queue_fill_prob(shot: &ShadowShot, book: &BookTop, latency_ms: f64) 
         OrderSide::BuyNo | OrderSide::SellNo => (book.ask_no - book.bid_no).max(0.0),
     };
     let spread_pen = (spread / 0.03).clamp(0.0, 1.0);
-    let delay_pen = (shot.delay_ms as f64 / 25.0).clamp(0.0, 1.0);
+    // P3: 调整 delay_pen 分母从 25 到 50，减少延迟惩罚权重
+    let delay_pen = (shot.delay_ms as f64 / 50.0).clamp(0.0, 1.0);
     let latency_pen = (latency_ms / 100.0).clamp(0.0, 1.0);
     (1.0 - (shot.tox_score * 0.35 + spread_pen * 0.30 + delay_pen * 0.20 + latency_pen * 0.15))
         .clamp(0.0, 1.0)
@@ -7512,8 +7513,10 @@ fn udp_target_share() -> f64 {
         std::env::var("POLYEDGE_UDP_TARGET_SHARE")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.38)
-            .clamp(0.05, 0.95)
+            // SEAT Latency Fabric v1.0: WebSocket 为主通道，UDP 仅本地采集
+            // 默认 0.05 表示 UDP 只作为紧急 fallback
+            .unwrap_or(0.05)
+            .clamp(0.01, 0.30)
     })
 }
 
@@ -7970,7 +7973,8 @@ fn evaluate_fillable(
         return (false, None, 0.0);
     }
     let queue_fill_prob = estimate_queue_fill_prob(shot, book, latency_ms);
-    if queue_fill_prob < 0.55 {
+    // P3: 降低 fillability 门槛从 0.55 到 0.45，允许更多有效机会通过
+    if queue_fill_prob < 0.45 {
         return (false, None, queue_fill_prob);
     }
     let mut slippage = match shot.side {
@@ -8001,7 +8005,8 @@ fn classify_unfilled_outcome(
     if spread > 0.05 {
         return EdgeAttribution::SpreadTooWide;
     }
-    if queue_fill_prob < 0.55 {
+    // P3: 降低门槛与上面保持一致
+    if queue_fill_prob < 0.45 {
         return EdgeAttribution::LatencyTail;
     }
     if latency_ms > 100.0 {

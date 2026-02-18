@@ -76,7 +76,7 @@ fair_blend_weight = 0.35
 
 [predator_c.taker_sniper]
 min_direction_confidence = 0.60
-min_edge_net_bps = 10.0
+min_edge_net_bps = 8.5
 max_spread = 0.08
 cooldown_ms_per_market = 800
 
@@ -134,7 +134,7 @@ spacing_ms = 14
 [predator_c.strategy_d]
 enabled = false
 min_gap_bps = 25.0
-min_edge_net_bps = 15.0
+min_edge_net_bps = 12.75
 min_confidence = 0.65
 max_notional_usdc = 25.0
 cooldown_ms_per_market = 500
@@ -175,17 +175,21 @@ daily_loss_cap_usdc = 1.0
 
 [fusion]
 enable_udp = true
-mode = "active_active"
+# SEAT Latency Fabric v1.0: WebSocket 为主通道，UDP 仅紧急 fallback
+# 可选: "direct_only"(WS优先) / "active_active"(双路) / "udp_only"(仅UDP)
+mode = "direct_only"
 udp_port = 6666
-dedupe_window_ms = 120
+# 更激进去重窗口
+dedupe_window_ms = 8
 dedupe_price_bps = 0.2
 
 [source_health]
 min_samples = 64
 gap_window_ms = 2000
-jitter_limit_ms = 12.0
+jitter_limit_ms = 10.0
 deviation_limit_bps = 30.0
-min_score_for_trading = 0.45
+freshness_limit_ms = 1500.0
+min_score_for_trading = 0.40
 
 [edge_model]
 model = "ev_net"

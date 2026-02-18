@@ -14,7 +14,9 @@ fn main() -> Result<()> {
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(1);
-    let pin_core = std::env::var("PIN_CORE").ok().and_then(|v| v.parse::<usize>().ok());
+    let pin_core = std::env::var("PIN_CORE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
     let busy_poll_us = std::env::var("BUSY_POLL_US")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
@@ -37,7 +39,11 @@ fn main() -> Result<()> {
 
     eprintln!(
         "receiver: listening={} packet_sizes=[{},{},{}] print_every={} (busy-spin mode)",
-        bind_addr, WIRE_BOOK_TOP24_SIZE, WIRE_MOMENTUM_TICK32_SIZE, WIRE_RELAY_TICK40_SIZE, print_every
+        bind_addr,
+        WIRE_BOOK_TOP24_SIZE,
+        WIRE_MOMENTUM_TICK32_SIZE,
+        WIRE_RELAY_TICK40_SIZE,
+        print_every
     );
 
     let mut buf = [0u8; WIRE_MAX_PACKET_SIZE];
@@ -76,12 +82,7 @@ fn main() -> Result<()> {
                     let latency_us = now.saturating_sub(ts_micros);
                     println!(
                         "latency_us={} bid={:.8} ask={:.8} recv_ok={} drop_ooo={} drop_size={}",
-                        latency_us,
-                        bid,
-                        ask,
-                        recv_ok,
-                        dropped_out_of_order,
-                        dropped_size
+                        latency_us, bid, ask, recv_ok, dropped_out_of_order, dropped_size
                     );
                 }
             }
@@ -127,7 +128,10 @@ fn apply_udp_socket_tuning(
             )
         };
         if rc != 0 {
-            anyhow::bail!("set SO_BUSY_POLL failed: {}", std::io::Error::last_os_error());
+            anyhow::bail!(
+                "set SO_BUSY_POLL failed: {}",
+                std::io::Error::last_os_error()
+            );
         }
     }
     Ok(())

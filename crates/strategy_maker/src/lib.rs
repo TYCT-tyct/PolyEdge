@@ -30,7 +30,8 @@ impl Default for MakerConfig {
             ttl_ms: 400,
             taker_trigger_bps: 8.0,
             taker_max_slippage_bps: 25.0,
-            stale_tick_filter_ms: 2_000.0,
+            // SEAT Latency Fabric v1.0: 更激进的过期过滤
+            stale_tick_filter_ms: 120.0,  // 从 2000ms 降到 120ms
             market_tier_profile: "balanced".to_string(),
             capital_fraction_kelly: 0.35,
             variance_penalty_lambda: 0.25,

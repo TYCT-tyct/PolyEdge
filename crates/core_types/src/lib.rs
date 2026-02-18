@@ -211,6 +211,8 @@ pub struct SourceHealth {
     pub out_of_order_rate: f64,
     pub gap_rate: f64,
     pub price_deviation_bps: f64,
+    #[serde(default)]
+    pub freshness_score: f64,
     pub score: f64,
     #[serde(default)]
     pub sample_count: u64,

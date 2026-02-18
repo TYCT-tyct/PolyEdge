@@ -104,7 +104,8 @@ pub(super) fn compute_gate_fail_reasons(
             live.ref_freshness_ms
         ));
     }
-    if live.probability_total >= min_outcomes as u64 && live.settlement_source_degraded_ratio > 0.50 {
+    if live.probability_total >= min_outcomes as u64 && live.settlement_source_degraded_ratio > 0.50
+    {
         failed.push(format!(
             "settlement_source_degraded_ratio {:.4} > 0.50",
             live.settlement_source_degraded_ratio
