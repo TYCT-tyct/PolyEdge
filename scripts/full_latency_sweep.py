@@ -41,26 +41,47 @@ def get_json(base_url: str, path: str) -> Dict[str, Any]:
     return resp.json()
 
 
-def fusion_payload(mode: str, dedupe_window_ms: int) -> Dict[str, Any]:
+def fusion_payload(
+    mode: str,
+    dedupe_window_ms: int,
+    udp_share_cap: float | None = None,
+    jitter_threshold_ms: float | None = None,
+    fallback_cooldown_sec: int | None = None,
+) -> Dict[str, Any]:
     if mode == "direct_only":
-        return {
+        payload = {
             "enable_udp": False,
             "mode": "direct_only",
             "dedupe_window_ms": int(dedupe_window_ms),
         }
-    if mode == "udp_only":
-        return {
+    elif mode == "udp_only":
+        payload = {
             "enable_udp": True,
             "mode": "udp_only",
             "dedupe_window_ms": int(dedupe_window_ms),
         }
-    if mode == "active_active":
-        return {
+    elif mode == "active_active":
+        payload = {
             "enable_udp": True,
             "mode": "active_active",
             "dedupe_window_ms": int(dedupe_window_ms),
         }
-    raise ValueError(f"unsupported fusion mode: {mode}")
+    elif mode == "websocket_primary":
+        payload = {
+            "enable_udp": True,
+            "mode": "websocket_primary",
+            "dedupe_window_ms": int(dedupe_window_ms),
+        }
+    else:
+        raise ValueError(f"unsupported fusion mode: {mode}")
+
+    if udp_share_cap is not None:
+        payload["udp_share_cap"] = float(udp_share_cap)
+    if jitter_threshold_ms is not None:
+        payload["jitter_threshold_ms"] = float(jitter_threshold_ms)
+    if fallback_cooldown_sec is not None:
+        payload["fallback_cooldown_sec"] = int(fallback_cooldown_sec)
+    return payload
 
 
 def utc_day(ts: float | None = None) -> str:
@@ -167,6 +188,7 @@ def collect_engine_series(base_url: str, seconds: int, poll_interval: float) -> 
             "survival_probe_10ms_by_symbol": (last_live or {}).get("survival_probe_10ms_by_symbol"),
             "blocked_reason_counts": (last_live or {}).get("blocked_reason_counts"),
             "policy_block_reason_distribution": (last_live or {}).get("policy_block_reason_distribution"),
+            "gate_block_reason_distribution": (last_live or {}).get("gate_block_reason_distribution"),
             "source_mix_ratio": (last_live or {}).get("source_mix_ratio"),
             "source_health": (last_live or {}).get("source_health"),
             "last_30s_taker_fallback_count": (last_live or {}).get("last_30s_taker_fallback_count"),
@@ -193,7 +215,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-ws", action="store_true", help="skip CEX websocket latency probe (engine metrics only)")
     p.add_argument(
         "--fusion-mode",
-        choices=["direct_only", "udp_only", "active_active"],
+        choices=["direct_only", "udp_only", "active_active", "websocket_primary"],
         default=None,
         help="optionally force fusion mode before sampling",
     )
@@ -214,6 +236,24 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="sleep after control actions before sampling",
     )
+    p.add_argument(
+        "--udp-share-cap",
+        type=float,
+        default=None,
+        help="optional udp share cap when applying fusion mode",
+    )
+    p.add_argument(
+        "--jitter-threshold-ms",
+        type=float,
+        default=None,
+        help="optional jitter threshold when applying fusion mode",
+    )
+    p.add_argument(
+        "--fallback-cooldown-sec",
+        type=int,
+        default=None,
+        help="optional websocket-primary fallback cooldown",
+    )
     return p.parse_args()
 
 
@@ -230,7 +270,13 @@ def main() -> int:
         control["fusion_applied"] = post_json(
             args.base_url,
             "/control/reload_fusion",
-            fusion_payload(args.fusion_mode, args.dedupe_window_ms),
+            fusion_payload(
+                args.fusion_mode,
+                args.dedupe_window_ms,
+                args.udp_share_cap,
+                args.jitter_threshold_ms,
+                args.fallback_cooldown_sec,
+            ),
         )
     if args.reset_shadow:
         control["shadow_reset"] = post_json(args.base_url, "/control/reset_shadow", {})
@@ -267,6 +313,9 @@ def main() -> int:
             "reset_shadow": bool(args.reset_shadow),
             "warmup_sec": int(args.warmup_sec),
             "dedupe_window_ms": int(args.dedupe_window_ms),
+            "udp_share_cap": args.udp_share_cap,
+            "jitter_threshold_ms": args.jitter_threshold_ms,
+            "fallback_cooldown_sec": args.fallback_cooldown_sec,
             "control": control,
         },
         "engine": engine,

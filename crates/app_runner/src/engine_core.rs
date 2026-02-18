@@ -5,18 +5,25 @@ pub(super) fn is_quote_reject_reason(reason: &str) -> bool {
 }
 
 pub(super) fn is_policy_block_reason(reason: &str) -> bool {
-    reason == "risk_capped_zero"
-        || reason.starts_with("risk:")
+    // Metrics contract: policy_blocked only counts hard risk blocks.
+    reason == "risk_capped_zero" || reason.starts_with("risk:")
+}
+
+pub(super) fn is_gate_block_reason(reason: &str) -> bool {
+    is_policy_block_reason(reason)
         || reason.starts_with("rate_budget_")
         || matches!(
             reason,
             "open_orders_pressure_precheck"
                 | "taker_slippage_budget"
                 | "market_rank_blocked"
+                | "market_score_low"
                 | "symbol_quality_guard"
                 | "decision_backlog_guard"
                 | "no_quote_policy"
                 | "no_quote_edge"
+                | "edge_below_dynamic_gate"
+                | "edge_notional_too_small"
         )
 }
 
@@ -92,12 +99,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn policy_block_reason_includes_runtime_gates() {
+    fn policy_block_reason_only_counts_hard_risk() {
         assert!(is_policy_block_reason("risk:exposure"));
         assert!(is_policy_block_reason("risk_capped_zero"));
-        assert!(is_policy_block_reason("rate_budget_global"));
-        assert!(is_policy_block_reason("open_orders_pressure_precheck"));
-        assert!(is_policy_block_reason("decision_backlog_guard"));
+        assert!(!is_policy_block_reason("rate_budget_global"));
+        assert!(!is_policy_block_reason("open_orders_pressure_precheck"));
+        assert!(!is_policy_block_reason("decision_backlog_guard"));
         assert!(!is_policy_block_reason("ref_dedupe_dropped"));
+    }
+
+    #[test]
+    fn gate_block_reason_keeps_soft_gates_for_diagnosis() {
+        assert!(is_gate_block_reason("risk:exposure"));
+        assert!(is_gate_block_reason("rate_budget_global"));
+        assert!(is_gate_block_reason("market_rank_blocked"));
+        assert!(is_gate_block_reason("edge_below_dynamic_gate"));
+        assert!(!is_gate_block_reason("ref_dedupe_dropped"));
     }
 }

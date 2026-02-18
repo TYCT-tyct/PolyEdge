@@ -10,6 +10,7 @@ use chrono::Utc;
 use core_types::{new_id, ExecutionVenue, OrderAck, OrderAckV2, OrderIntentV2, QuoteIntent};
 use parking_lot::{Mutex, RwLock};
 use reqwest::Client;
+use serde::Serialize;
 
 pub mod wss_user_feed;
 
@@ -61,6 +62,45 @@ struct AckProbe {
 struct PaperOpenOrder {
     intent: QuoteIntent,
     created_at: Instant,
+}
+
+#[derive(Serialize)]
+struct LiveOrderPayload<'a> {
+    market_id: &'a str,
+    token_id: Option<&'a str>,
+    side: &'a str,
+    price: f64,
+    size: f64,
+    ttl_ms: u64,
+    style: &'a str,
+    tif: &'a str,
+    client_order_id: Option<&'a str>,
+    max_slippage_bps: f64,
+    fee_rate_bps: f64,
+    expected_edge_net_bps: f64,
+    hold_to_resolution: bool,
+}
+
+fn encode_live_order_payload(intent: &OrderIntentV2) -> Vec<u8> {
+    let side = intent.side.to_string();
+    let style = intent.style.to_string();
+    let tif = intent.tif.to_string();
+    let payload = LiveOrderPayload {
+        market_id: intent.market_id.as_str(),
+        token_id: intent.token_id.as_deref(),
+        side: side.as_str(),
+        price: intent.price,
+        size: intent.size,
+        ttl_ms: intent.ttl_ms,
+        style: style.as_str(),
+        tif: tif.as_str(),
+        client_order_id: intent.client_order_id.as_deref(),
+        max_slippage_bps: intent.max_slippage_bps,
+        fee_rate_bps: intent.fee_rate_bps,
+        expected_edge_net_bps: intent.expected_edge_net_bps,
+        hold_to_resolution: intent.hold_to_resolution,
+    };
+    serde_json::to_vec(&payload).unwrap_or_default()
 }
 
 impl ClobExecution {
@@ -323,29 +363,10 @@ impl ExecutionVenue for ClobExecution {
                     });
                 }
 
-                // -----------------------------------------------------------------------
-                // B: 预序列化快路径 — 跳过 serde_json 序列化开销
-                // 若调用方已预构建 JSON payload，直接用；否则走原始序列化路径。
-                // -----------------------------------------------------------------------
                 let body_bytes: Vec<u8> = if let Some(ref prebuilt) = intent.prebuilt_payload {
                     prebuilt.clone()
                 } else {
-                    let payload = serde_json::json!({
-                        "market_id": intent.market_id,
-                        "token_id": intent.token_id,
-                        "side": intent.side.to_string(),
-                        "price": intent.price,
-                        "size": intent.size,
-                        "ttl_ms": intent.ttl_ms,
-                        "style": intent.style.to_string(),
-                        "tif": intent.tif.to_string(),
-                        "client_order_id": intent.client_order_id,
-                        "max_slippage_bps": intent.max_slippage_bps,
-                        "fee_rate_bps": intent.fee_rate_bps,
-                        "expected_edge_net_bps": intent.expected_edge_net_bps,
-                        "hold_to_resolution": intent.hold_to_resolution,
-                    });
-                    serde_json::to_vec(&payload).unwrap_or_default()
+                    encode_live_order_payload(&intent)
                 };
 
                 const MAX_RETRIES: u32 = 2;

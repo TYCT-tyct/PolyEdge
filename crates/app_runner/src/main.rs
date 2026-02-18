@@ -59,8 +59,8 @@ mod gate_eval;
 mod orchestration;
 mod stats_utils;
 use engine_core::{
-    classify_execution_error_reason, classify_execution_style, is_policy_block_reason,
-    is_quote_reject_reason, normalize_reject_code,
+    classify_execution_error_reason, classify_execution_style, is_gate_block_reason,
+    is_policy_block_reason, is_quote_reject_reason, normalize_reject_code,
 };
 use stats_utils::{
     freshness_ms, now_ns, percentile, percentile_deque_capped, policy_block_ratio, push_capped,
@@ -316,6 +316,11 @@ struct FusionReloadReq {
     mode: Option<String>,
     udp_port: Option<u16>,
     dedupe_window_ms: Option<i64>,
+    dedupe_price_bps: Option<f64>,
+    udp_share_cap: Option<f64>,
+    jitter_threshold_ms: Option<f64>,
+    fallback_cooldown_sec: Option<u64>,
+    udp_local_only: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -483,16 +488,24 @@ struct FusionConfig {
     udp_port: u16,
     dedupe_window_ms: i64,
     dedupe_price_bps: f64,
+    udp_share_cap: f64,
+    jitter_threshold_ms: f64,
+    fallback_cooldown_sec: u64,
+    udp_local_only: bool,
 }
 
 impl Default for FusionConfig {
     fn default() -> Self {
         Self {
             enable_udp: true,
-            mode: "active_active".to_string(),
+            mode: "direct_only".to_string(),
             udp_port: 6666,
             dedupe_window_ms: 120,
             dedupe_price_bps: 0.2,
+            udp_share_cap: 0.35,
+            jitter_threshold_ms: 25.0,
+            fallback_cooldown_sec: 300,
+            udp_local_only: true,
         }
     }
 }
@@ -864,6 +877,8 @@ struct GateEvaluation {
     ev_positive_ratio: f64,
     quote_block_ratio: f64,
     policy_block_ratio: f64,
+    gate_blocked: u64,
+    gate_block_ratio: f64,
     strategy_uptime_pct: f64,
     tick_to_ack_p99_ms: f64,
     decision_queue_wait_p99_ms: f64,
@@ -1006,6 +1021,8 @@ struct ShadowLiveReport {
     ev_positive_ratio: f64,
     quote_block_ratio: f64,
     policy_block_ratio: f64,
+    gate_blocked: u64,
+    gate_block_ratio: f64,
     queue_depth_p99: f64,
     event_backlog_p99: f64,
     tick_to_decision_p50_ms: f64,
@@ -1040,6 +1057,7 @@ struct ShadowLiveReport {
     survival_probe_10ms_by_symbol: HashMap<String, f64>,
     blocked_reason_counts: HashMap<String, u64>,
     policy_block_reason_distribution: HashMap<String, u64>,
+    gate_block_reason_distribution: HashMap<String, u64>,
     source_mix_ratio: HashMap<String, f64>,
     source_health: Vec<SourceHealth>,
     exit_reason_top: Vec<(String, u64)>,
@@ -1938,6 +1956,8 @@ impl ShadowStats {
             blocked_reason_counts.insert("ref_dedupe_dropped".to_string(), dedupe_dropped);
         }
         let mut policy_block_reason_distribution = HashMap::new();
+        let mut gate_block_reason_distribution = HashMap::new();
+        let mut gate_blocked: u64 = 0;
         if policy_blocked > 0 {
             for (reason, count) in &blocked_reason_counts {
                 if is_policy_block_reason(reason.as_str()) {
@@ -1945,6 +1965,13 @@ impl ShadowStats {
                 }
             }
         }
+        for (reason, count) in &blocked_reason_counts {
+            if is_gate_block_reason(reason.as_str()) {
+                gate_block_reason_distribution.insert(reason.clone(), *count);
+                gate_blocked = gate_blocked.saturating_add(*count);
+            }
+        }
+        let gate_block_ratio = ratio_u64(gate_blocked, attempted.saturating_add(gate_blocked));
         let mut source_mix_ratio = HashMap::new();
         if ref_ticks_total > 0 {
             for (source, cnt) in &source_counts {
@@ -2046,7 +2073,10 @@ impl ShadowStats {
             path_lag_p50_ms: percentile(&path_lag_ms, 0.50).unwrap_or(0.0),
             path_lag_p90_ms: percentile(&path_lag_ms, 0.90).unwrap_or(0.0),
             path_lag_p99_ms: percentile(&path_lag_ms, 0.99).unwrap_or(0.0),
-            path_lag_coverage_ratio: ratio_u64(path_lag_ms.len() as u64, source_latency_ms.len() as u64),
+            path_lag_coverage_ratio: ratio_u64(
+                path_lag_ms.len() as u64,
+                source_latency_ms.len() as u64,
+            ),
             book_latency_p50_ms: percentile(&book_latency_ms, 0.50).unwrap_or(0.0),
             book_latency_p90_ms: percentile(&book_latency_ms, 0.90).unwrap_or(0.0),
             book_latency_p99_ms: percentile(&book_latency_ms, 0.99).unwrap_or(0.0),
@@ -2157,6 +2187,8 @@ impl ShadowStats {
             ev_positive_ratio,
             quote_block_ratio,
             policy_block_ratio: policy_ratio,
+            gate_blocked,
+            gate_block_ratio,
             queue_depth_p99: percentile(&queue_depth, 0.99).unwrap_or(0.0),
             event_backlog_p99: percentile(&event_backlog, 0.99).unwrap_or(0.0),
             tick_to_decision_p50_ms: latency.tick_to_decision_p50_ms,
@@ -2191,6 +2223,7 @@ impl ShadowStats {
             survival_probe_10ms_by_symbol,
             blocked_reason_counts,
             policy_block_reason_distribution,
+            gate_block_reason_distribution,
             source_mix_ratio,
             source_health: Vec::new(),
             exit_reason_top,
@@ -2253,6 +2286,8 @@ impl ShadowStats {
             ev_positive_ratio: live.ev_positive_ratio,
             quote_block_ratio: live.quote_block_ratio,
             policy_block_ratio: live.policy_block_ratio,
+            gate_blocked: live.gate_blocked,
+            gate_block_ratio: live.gate_block_ratio,
             strategy_uptime_pct: live.strategy_uptime_pct,
             tick_to_ack_p99_ms: live.tick_to_ack_p99_ms,
             decision_queue_wait_p99_ms: live.decision_queue_wait_p99_ms,
@@ -2758,6 +2793,7 @@ fn spawn_reference_feed(
         let mut latest_price_by_symbol_source: HashMap<String, HashMap<String, f64>> =
             HashMap::new();
         let mut latest_ws_recv_ns_by_symbol: HashMap<String, i64> = HashMap::new();
+        let mut ws_primary_fallback_until_ns_by_symbol: HashMap<String, i64> = HashMap::new();
         let mut fast_source_mix_by_symbol: HashMap<String, (u64, u64)> = HashMap::new();
         let mut source_health_cfg = shared.source_health_cfg.read().await.clone();
         let mut source_health_cfg_refresh_at = Instant::now();
@@ -2921,44 +2957,80 @@ fn spawn_reference_feed(
                             udp_share
                         };
                         let jitter_high =
-                            source_health.jitter_ms > udp_jitter_downweight_threshold_ms();
+                            source_health.jitter_ms > fusion.jitter_threshold_ms.max(1.0);
                         let freshness_low =
                             source_health.freshness_score < udp_min_freshness_score();
-                        // REMOVED: success penalty (share_high). We want UDP to win if it's fast.
-                        if jitter_high || freshness_low {
-                            let now_recv_ns = if tick.recv_ts_local_ns > 0 {
-                                tick.recv_ts_local_ns
-                            } else {
-                                now_ns()
-                            };
-                            let ws_recent = latest_ws_recv_ns_by_symbol
+                        let now_recv_ns = if tick.recv_ts_local_ns > 0 {
+                            tick.recv_ts_local_ns
+                        } else {
+                            now_ns()
+                        };
+                        let ws_recent = latest_ws_recv_ns_by_symbol
+                            .get(tick.symbol.as_str())
+                            .copied()
+                            .map(|ws_ns| now_recv_ns.saturating_sub(ws_ns) <= udp_ws_freshness_ns())
+                            .unwrap_or(false);
+                        let ws_health_good = source_runtime
+                            .get("binance_ws")
+                            .map(|ws| {
+                                ws.sample_count >= (source_health_cfg.min_samples / 2).max(8)
+                                    && ws.deviation_ema_bps
+                                        <= source_health_cfg.deviation_limit_bps * 1.2
+                            })
+                            .unwrap_or(false);
+
+                        if fusion.mode == "websocket_primary"
+                            && (!ws_recent || !ws_health_good || jitter_high || freshness_low)
+                        {
+                            let cooldown_ns =
+                                (fusion.fallback_cooldown_sec as i64).saturating_mul(1_000_000_000);
+                            let fallback_until = now_recv_ns.saturating_add(cooldown_ns.max(0));
+                            ws_primary_fallback_until_ns_by_symbol
+                                .insert(tick.symbol.clone(), fallback_until);
+                            metrics::counter!("fusion.ws_primary_fallback_arm").increment(1);
+                        }
+
+                        let fallback_active = fusion.mode == "websocket_primary"
+                            && ws_primary_fallback_until_ns_by_symbol
                                 .get(tick.symbol.as_str())
-                                .copied()
-                                .map(|ws_ns| {
-                                    now_recv_ns.saturating_sub(ws_ns) <= udp_ws_freshness_ns()
-                                })
+                                .map(|until| now_recv_ns < *until)
                                 .unwrap_or(false);
-                            let ws_health_good = source_runtime
-                                .get("binance_ws")
-                                .map(|ws| {
-                                    ws.sample_count >= (source_health_cfg.min_samples / 2).max(8)
-                                        && ws.deviation_ema_bps
-                                            <= source_health_cfg.deviation_limit_bps * 1.2
-                                })
-                                .unwrap_or(false);
+                        if fallback_active {
+                            metrics::counter!("fusion.ws_primary_fallback_active").increment(1);
+                        }
+
+                        let target_share = fusion.udp_share_cap.clamp(0.05, 0.95);
+                        let share_high = effective_udp_share > target_share;
+                        let enforce_ws_primary =
+                            matches!(fusion.mode.as_str(), "active_active" | "websocket_primary")
+                                && !fallback_active
+                                && share_high
+                                && ws_recent
+                                && ws_health_good;
+
+                        if enforce_ws_primary || jitter_high || freshness_low {
                             if ws_recent && ws_health_good {
-                                let target = udp_target_share().max(0.05);
-                                let share_ratio = (effective_udp_share / target).max(1.0);
+                                let share_ratio = (effective_udp_share / target_share).max(1.0);
                                 let base_keep_every = udp_downweight_keep_every().max(2);
                                 let dynamic_keep = share_ratio.ceil() as usize;
                                 let jitter_boost = if jitter_high { 2 } else { 1 };
                                 let freshness_boost = if freshness_low { 2 } else { 1 };
                                 let keep_every = base_keep_every
-                                    .max(dynamic_keep.saturating_mul(jitter_boost))
+                                    .max(dynamic_keep)
+                                    .max(base_keep_every.saturating_mul(jitter_boost))
                                     .max(base_keep_every.saturating_mul(freshness_boost))
                                     .clamp(2, 16);
                                 if (ingest_seq % keep_every as u64) != 0 {
                                     metrics::counter!("fusion.udp_downweight_drop").increment(1);
+                                    if enforce_ws_primary {
+                                        metrics::counter!("fusion.udp_share_cap_drop").increment(1);
+                                    }
+                                    if jitter_high {
+                                        metrics::counter!("fusion.udp_jitter_drop").increment(1);
+                                    }
+                                    if freshness_low {
+                                        metrics::counter!("fusion.udp_freshness_drop").increment(1);
+                                    }
                                     continue;
                                 }
                             }
@@ -3833,8 +3905,7 @@ fn spawn_strategy_engine(
                         .record(latency_sample.source_latency_ms);
                     metrics::histogram!("latency.exchange_lag_ms")
                         .record(latency_sample.exchange_lag_ms);
-                    if latency_sample.path_lag_ms.is_finite() && latency_sample.path_lag_ms >= 0.0
-                    {
+                    if latency_sample.path_lag_ms.is_finite() && latency_sample.path_lag_ms >= 0.0 {
                         metrics::histogram!("latency.path_lag_ms")
                             .record(latency_sample.path_lag_ms);
                     }
@@ -4510,27 +4581,12 @@ fn spawn_strategy_engine(
                             expected_edge_net_bps: edge_net,
                             client_order_id: Some(new_id()),
                             hold_to_resolution: false,
-                            // B: 预序列化 JSON payload — 在信号确认后立即构建，
-                            // 跳过 place_order_v2 内部的 serde_json 开销。
-                            prebuilt_payload: serde_json::to_vec(&serde_json::json!({
-                                "market_id": intent.market_id,
-                                "token_id": token_id,
-                                "side": intent.side.to_string(),
-                                "price": intent.price,
-                                "size": intent.size,
-                                "ttl_ms": intent.ttl_ms,
-                                "style": execution_style.to_string(),
-                                "tif": match execution_style {
-                                    ExecutionStyle::Maker => "GTC",
-                                    _ => "FAK",
-                                },
-                                "max_slippage_bps": cfg.taker_max_slippage_bps,
-                                "fee_rate_bps": fee_bps,
-                                "expected_edge_net_bps": edge_net,
-                                "hold_to_resolution": false,
-                            }))
-                            .ok(),
+                            prebuilt_payload: None,
                         };
+                        let mut v2_intent = v2_intent;
+                        if execution.is_live() {
+                            v2_intent.prebuilt_payload = prebuild_order_payload(&v2_intent);
+                        }
                         let order_build_ms = order_build_start.elapsed().as_secs_f64() * 1_000.0;
                         // Start measuring ack-only RTT right before the await.
                         let place_start = Instant::now();
@@ -5847,23 +5903,12 @@ async fn predator_execute_opportunity(
         expected_edge_net_bps: opp.edge_net_bps,
         client_order_id: Some(new_id()),
         hold_to_resolution: false,
-        // B: 预序列化 JSON payload — 跳过 place_order_v2 内部 serde 开销
-        prebuilt_payload: serde_json::to_vec(&serde_json::json!({
-            "market_id": intent.market_id,
-            "token_id": token_id,
-            "side": intent.side.to_string(),
-            "price": intent.price,
-            "size": intent.size,
-            "ttl_ms": intent.ttl_ms,
-            "style": "Taker",
-            "tif": "FAK",
-            "max_slippage_bps": maker_cfg.taker_max_slippage_bps,
-            "fee_rate_bps": opp.fee_bps,
-            "expected_edge_net_bps": opp.edge_net_bps,
-            "hold_to_resolution": false,
-        }))
-        .ok(),
+        prebuilt_payload: None,
     };
+    let mut v2_intent = v2_intent;
+    if execution.is_live() {
+        v2_intent.prebuilt_payload = prebuild_order_payload(&v2_intent);
+    }
     let order_build_ms = order_build_start.elapsed().as_secs_f64() * 1_000.0;
     let place_start = Instant::now();
 
@@ -7079,18 +7124,23 @@ fn is_market_in_top_n(
     if top_n == 0 {
         return true;
     }
-    let mut ranked = states
-        .iter()
-        .map(|(id, st)| (id.clone(), st.market_score))
-        .collect::<Vec<_>>();
-    if ranked.is_empty() {
+    if states.is_empty() {
         return true;
     }
-    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
-    ranked
-        .into_iter()
-        .take(top_n.max(1))
-        .any(|(id, _)| id == market_id)
+    let Some(target) = states.get(market_id) else {
+        return false;
+    };
+    let target_score = target.market_score;
+
+    // O(n) rank check without heap allocations/sorting.
+    let better = states
+        .iter()
+        .filter(|(id, st)| {
+            st.market_score > target_score
+                || (st.market_score == target_score && id.as_str() < market_id)
+        })
+        .count();
+    better < top_n.max(1)
 }
 
 fn cooldown_secs_for_score(tox_score: f64, cfg: &ToxicityConfig) -> u64 {
@@ -7402,7 +7452,8 @@ fn fast_tick_allowed_in_fusion_mode(source: &str, mode: &str) -> bool {
     match mode {
         "udp_only" => source == "binance_udp",
         "direct_only" => source != "binance_udp" && !is_anchor_ref_source(source),
-        // active_active and unknown future modes: allow all fast sources.
+        "active_active" | "websocket_primary" => true,
+        // Unknown future modes: keep permissive to avoid accidental data blackout.
         _ => true,
     }
 }
@@ -7493,30 +7544,6 @@ fn fusion_staleness_budget_us_for_source(next_source: &str) -> i64 {
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(600)
             .clamp(50, 5_000)
-    })
-}
-
-fn udp_jitter_downweight_threshold_ms() -> f64 {
-    static UDP_JITTER_THRESH_MS: OnceLock<f64> = OnceLock::new();
-    *UDP_JITTER_THRESH_MS.get_or_init(|| {
-        std::env::var("POLYEDGE_UDP_JITTER_DOWNWEIGHT_MS")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(8.0)
-            .clamp(1.0, 100.0)
-    })
-}
-
-fn udp_target_share() -> f64 {
-    static UDP_TARGET_SHARE: OnceLock<f64> = OnceLock::new();
-    *UDP_TARGET_SHARE.get_or_init(|| {
-        std::env::var("POLYEDGE_UDP_TARGET_SHARE")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            // SEAT Latency Fabric v1.0: WebSocket 为主通道，UDP 仅本地采集
-            // 默认 0.05 表示 UDP 只作为紧急 fallback
-            .unwrap_or(0.05)
-            .clamp(0.01, 0.30)
     })
 }
 
@@ -8048,6 +8075,43 @@ fn aggressive_price_for_side(book: &BookTop, side: &OrderSide) -> f64 {
     }
 }
 
+#[derive(Serialize)]
+struct PrebuiltOrderPayload<'a> {
+    market_id: &'a str,
+    token_id: Option<&'a str>,
+    side: &'a str,
+    price: f64,
+    size: f64,
+    ttl_ms: u64,
+    style: &'a str,
+    tif: &'a str,
+    max_slippage_bps: f64,
+    fee_rate_bps: f64,
+    expected_edge_net_bps: f64,
+    hold_to_resolution: bool,
+}
+
+fn prebuild_order_payload(intent: &OrderIntentV2) -> Option<Vec<u8>> {
+    let side = intent.side.to_string();
+    let style = intent.style.to_string();
+    let tif = intent.tif.to_string();
+    let payload = PrebuiltOrderPayload {
+        market_id: intent.market_id.as_str(),
+        token_id: intent.token_id.as_deref(),
+        side: side.as_str(),
+        price: intent.price,
+        size: intent.size,
+        ttl_ms: intent.ttl_ms,
+        style: style.as_str(),
+        tif: tif.as_str(),
+        max_slippage_bps: intent.max_slippage_bps,
+        fee_rate_bps: intent.fee_rate_bps,
+        expected_edge_net_bps: intent.expected_edge_net_bps,
+        hold_to_resolution: intent.hold_to_resolution,
+    };
+    serde_json::to_vec(&payload).ok()
+}
+
 fn spread_for_side(book: &BookTop, side: &OrderSide) -> f64 {
     match side {
         OrderSide::BuyYes | OrderSide::SellYes => (book.ask_yes - book.bid_yes).max(0.0),
@@ -8478,7 +8542,7 @@ fn load_fusion_config() -> FusionConfig {
             continue;
         }
         if line.starts_with('[') && line.ends_with(']') {
-            in_section = line == "[fusion]";
+            in_section = line == "[fusion]" || line == "[transport]";
             continue;
         }
         if !in_section {
@@ -8498,7 +8562,7 @@ fn load_fusion_config() -> FusionConfig {
             "mode" => {
                 let norm = val.to_ascii_lowercase();
                 cfg.mode = match norm.as_str() {
-                    "active_active" | "direct_only" | "udp_only" => norm,
+                    "active_active" | "direct_only" | "udp_only" | "websocket_primary" => norm,
                     _ => cfg.mode,
                 };
             }
@@ -8515,6 +8579,26 @@ fn load_fusion_config() -> FusionConfig {
             "dedupe_price_bps" => {
                 if let Ok(parsed) = val.parse::<f64>() {
                     cfg.dedupe_price_bps = parsed.clamp(0.0, 50.0);
+                }
+            }
+            "udp_share_cap" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.udp_share_cap = parsed.clamp(0.05, 0.95);
+                }
+            }
+            "jitter_threshold_ms" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.jitter_threshold_ms = parsed.clamp(1.0, 2_000.0);
+                }
+            }
+            "fallback_cooldown_sec" => {
+                if let Ok(parsed) = val.parse::<u64>() {
+                    cfg.fallback_cooldown_sec = parsed.clamp(0, 3_600);
+                }
+            }
+            "udp_local_only" => {
+                if let Ok(parsed) = val.parse::<bool>() {
+                    cfg.udp_local_only = parsed;
                 }
             }
             _ => {}
@@ -9888,6 +9972,10 @@ fn persist_final_report_files(report: &ShadowFinalReport) {
         report.gate.policy_block_ratio
     ));
     md.push_str(&format!(
+        "- gate_block_ratio: {:.4}\n",
+        report.gate.gate_block_ratio
+    ));
+    md.push_str(&format!(
         "- strategy_uptime_pct: {:.2}\n",
         report.gate.strategy_uptime_pct
     ));
@@ -9978,6 +10066,20 @@ fn persist_final_report_files(report: &ShadowFinalReport) {
         let mut rows = report
             .live
             .policy_block_reason_distribution
+            .iter()
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| b.1.cmp(a.1));
+        for (reason, count) in rows {
+            md.push_str(&format!("- {}: {}\n", reason, count));
+        }
+    }
+    if report.live.gate_block_reason_distribution.is_empty() {
+        md.push_str("\n## Gate Block Reason Distribution\n- none\n");
+    } else {
+        md.push_str("\n## Gate Block Reason Distribution\n");
+        let mut rows = report
+            .live
+            .gate_block_reason_distribution
             .iter()
             .collect::<Vec<_>>();
         rows.sort_by(|a, b| b.1.cmp(a.1));
@@ -10450,6 +10552,31 @@ mod tests {
     }
 
     #[test]
+    fn websocket_primary_mode_keeps_dual_fast_sources() {
+        assert!(fast_tick_allowed_in_fusion_mode(
+            "binance_ws",
+            "websocket_primary"
+        ));
+        assert!(fast_tick_allowed_in_fusion_mode(
+            "binance_udp",
+            "websocket_primary"
+        ));
+        assert!(!fast_tick_allowed_in_fusion_mode(
+            "binance_udp",
+            "direct_only"
+        ));
+    }
+
+    #[test]
+    fn fusion_default_stays_safe_baseline() {
+        let cfg = FusionConfig::default();
+        assert_eq!(cfg.mode, "direct_only");
+        assert!(cfg.enable_udp);
+        assert!(cfg.udp_share_cap > 0.0 && cfg.udp_share_cap <= 1.0);
+        assert!(cfg.jitter_threshold_ms >= 1.0);
+    }
+
+    #[test]
     fn classify_execution_style_for_yes_side() {
         let book = BookTop {
             market_id: "m".to_string(),
@@ -10728,7 +10855,7 @@ mod tests {
 
         // First sample establishes floor with a negative raw delta (clock skew baseline).
         let tick_floor = RefTick {
-            source: "binance_udp".to_string(),
+            source: "binance_udp_calib".to_string(),
             symbol: "BTCUSDT".to_string(),
             source_seq: 1,
             event_ts_ms: now_ms - 120,
@@ -10865,7 +10992,7 @@ mod tests {
             "SOLUSDT", &cfg, &tox, 120.0, 0.01, 180.0
         ));
         assert!(should_observe_only_symbol(
-            "SOLUSDT", &cfg, &tox, 260.0, 0.01, 80.0
+            "SOLUSDT", &cfg, &tox, 320.0, 0.01, 80.0
         ));
         assert!(should_observe_only_symbol(
             "SOLUSDT", &cfg, &tox, 120.0, 0.03, 80.0
@@ -11089,6 +11216,50 @@ timeframes = ["5m", "15m", "1h", "1d"]
             &source_cfg,
         );
         assert_eq!(quiet, Regime::Quiet);
+    }
+
+    #[test]
+    fn is_market_in_top_n_matches_score_order_without_sorting() {
+        let mut states = HashMap::<String, MarketToxicState>::new();
+        let mut s1 = MarketToxicState::default();
+        s1.market_score = 95.0;
+        states.insert("m1".to_string(), s1);
+        let mut s2 = MarketToxicState::default();
+        s2.market_score = 88.0;
+        states.insert("m2".to_string(), s2);
+        let mut s3 = MarketToxicState::default();
+        s3.market_score = 70.0;
+        states.insert("m3".to_string(), s3);
+
+        assert!(is_market_in_top_n(&states, "m1", 1));
+        assert!(!is_market_in_top_n(&states, "m2", 1));
+        assert!(is_market_in_top_n(&states, "m2", 2));
+        assert!(!is_market_in_top_n(&states, "m3", 2));
+    }
+
+    #[test]
+    fn prebuild_order_payload_uses_intent_tif_and_style() {
+        let intent = OrderIntentV2 {
+            market_id: "m1".to_string(),
+            side: OrderSide::BuyYes,
+            token_id: Some("t1".to_string()),
+            price: 0.52,
+            size: 5.0,
+            ttl_ms: 120,
+            style: ExecutionStyle::Maker,
+            tif: OrderTimeInForce::PostOnly,
+            client_order_id: Some("cid1".to_string()),
+            max_slippage_bps: 12.0,
+            fee_rate_bps: 2.0,
+            expected_edge_net_bps: 8.0,
+            hold_to_resolution: false,
+            prebuilt_payload: None,
+        };
+        let bytes = prebuild_order_payload(&intent).expect("payload");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(value["style"], "maker");
+        assert_eq!(value["tif"], "POST_ONLY");
+        assert_eq!(value["token_id"], "t1");
     }
 
     #[test]

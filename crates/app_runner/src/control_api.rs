@@ -3,7 +3,7 @@ use super::*;
 pub(super) fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/health/latency", get(health_latency))  // P4: 轻量级延迟探测
+        .route("/health/latency", get(health_latency)) // P4: 轻量级延迟探测
         .route("/metrics", get(metrics))
         .route("/state/positions", get(positions))
         .route("/state/pnl", get(pnl))
@@ -284,7 +284,10 @@ async fn reload_fusion(
     }
     if let Some(v) = req.mode {
         let norm = v.to_ascii_lowercase();
-        if matches!(norm.as_str(), "active_active" | "direct_only" | "udp_only") {
+        if matches!(
+            norm.as_str(),
+            "active_active" | "direct_only" | "udp_only" | "websocket_primary"
+        ) {
             cfg.mode = norm;
         }
     }
@@ -293,6 +296,21 @@ async fn reload_fusion(
     }
     if let Some(v) = req.dedupe_window_ms {
         cfg.dedupe_window_ms = v.clamp(0, 2_000);
+    }
+    if let Some(v) = req.dedupe_price_bps {
+        cfg.dedupe_price_bps = v.clamp(0.0, 50.0);
+    }
+    if let Some(v) = req.udp_share_cap {
+        cfg.udp_share_cap = v.clamp(0.05, 0.95);
+    }
+    if let Some(v) = req.jitter_threshold_ms {
+        cfg.jitter_threshold_ms = v.clamp(1.0, 2_000.0);
+    }
+    if let Some(v) = req.fallback_cooldown_sec {
+        cfg.fallback_cooldown_sec = v.clamp(0, 3_600);
+    }
+    if let Some(v) = req.udp_local_only {
+        cfg.udp_local_only = v;
     }
     let snapshot = cfg.clone();
     append_jsonl(

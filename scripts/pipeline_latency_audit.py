@@ -228,6 +228,12 @@ def mode_payload(mode: str) -> Dict[str, Any]:
         return {"enable_udp": True, "mode": "udp_only", "dedupe_window_ms": 30}
     if mode == "active_active":
         return {"enable_udp": True, "mode": "active_active", "dedupe_window_ms": 30}
+    if mode == "websocket_primary":
+        return {
+            "enable_udp": True,
+            "mode": "websocket_primary",
+            "dedupe_window_ms": 30,
+        }
     raise ValueError(f"unsupported mode: {mode}")
 
 
@@ -312,7 +318,7 @@ def main() -> int:
     args = parse_args()
     out_dir = Path(args.out_root) / utc_day() / "runs" / args.run_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    modes = ["direct_only", "udp_only", "active_active"]
+    modes = ["direct_only", "udp_only", "active_active", "websocket_primary"]
 
     session = requests.Session()
     atexit.register(session.close)

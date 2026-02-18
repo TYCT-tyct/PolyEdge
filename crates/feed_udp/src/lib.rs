@@ -178,7 +178,6 @@ fn spawn_recv_loop(
                     }
                 };
 
-
                 let event_ms = (ts_micros / 1_000) as i64;
                 let mid = (bid + ask) * 0.5;
                 if !mid.is_finite() || mid <= 0.0 {
