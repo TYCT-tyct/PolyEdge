@@ -2792,8 +2792,9 @@ fn spawn_reference_feed(
         let mut source_runtime: HashMap<String, SourceRuntimeStats> = HashMap::new();
         let mut latest_price_by_symbol_source: HashMap<String, HashMap<String, f64>> =
             HashMap::new();
-        let mut latest_ws_recv_ns_by_symbol: HashMap<String, i64> = HashMap::new();
-        let mut ws_primary_fallback_until_ns_by_symbol: HashMap<String, i64> = HashMap::new();
+        let mut latest_ws_recv_ns_global: i64 = 0;
+        let mut ws_primary_fallback_until_ns: i64 = 0;
+        let mut ws_primary_ready_seen = false;
         let mut accepted_fast_mix_by_symbol: HashMap<String, (u64, u64)> = HashMap::new();
         let mut accepted_fast_mix_total: (u64, u64) = (0, 0);
         let mut source_health_cfg = shared.source_health_cfg.read().await.clone();
@@ -2858,7 +2859,7 @@ fn spawn_reference_feed(
                         } else {
                             now_ns()
                         };
-                        latest_ws_recv_ns_by_symbol.insert(symbol_key.clone(), recv_ns);
+                        latest_ws_recv_ns_global = latest_ws_recv_ns_global.max(recv_ns);
                     }
                     let latency_ms = recv_ts_ms.saturating_sub(source_ts).max(0) as f64;
                     let runtime = source_runtime.entry(source_key.clone()).or_default();
@@ -2942,36 +2943,32 @@ fn spawn_reference_feed(
                         } else {
                             now_ns()
                         };
-                        let ws_gap_ns = latest_ws_recv_ns_by_symbol
-                            .get(tick.symbol.as_str())
-                            .copied()
-                            .map(|ws_ns| now_recv_ns.saturating_sub(ws_ns));
-                        let ws_cap_ready = ws_gap_ns
-                            .map(|gap_ns| gap_ns <= ws_primary_fallback_gap_ns())
-                            .unwrap_or(false);
+                        let ws_gap_ns = if latest_ws_recv_ns_global > 0 {
+                            now_recv_ns.saturating_sub(latest_ws_recv_ns_global)
+                        } else {
+                            i64::MAX
+                        };
+                        let ws_cap_ready = ws_gap_ns <= ws_primary_fallback_gap_ns();
+                        if ws_cap_ready {
+                            ws_primary_ready_seen = true;
+                        }
                         let fallback_active_now = fusion.mode == "websocket_primary"
-                            && ws_primary_fallback_until_ns_by_symbol
-                                .get(tick.symbol.as_str())
-                                .map(|until| now_recv_ns < *until)
-                                .unwrap_or(false);
+                            && now_recv_ns < ws_primary_fallback_until_ns;
                         if should_arm_ws_primary_fallback(
                             fusion.mode.as_str(),
                             ws_cap_ready,
+                            ws_primary_ready_seen,
                             fallback_active_now,
                         ) {
                             let cooldown_ns =
                                 (fusion.fallback_cooldown_sec as i64).saturating_mul(1_000_000_000);
-                            let fallback_until = now_recv_ns.saturating_add(cooldown_ns.max(0));
-                            ws_primary_fallback_until_ns_by_symbol
-                                .insert(tick.symbol.clone(), fallback_until);
+                            ws_primary_fallback_until_ns =
+                                now_recv_ns.saturating_add(cooldown_ns.max(0));
                             metrics::counter!("fusion.ws_primary_fallback_arm").increment(1);
                         }
 
                         let fallback_active = fusion.mode == "websocket_primary"
-                            && ws_primary_fallback_until_ns_by_symbol
-                                .get(tick.symbol.as_str())
-                                .map(|until| now_recv_ns < *until)
-                                .unwrap_or(false);
+                            && now_recv_ns < ws_primary_fallback_until_ns;
                         if fallback_active {
                             metrics::counter!("fusion.ws_primary_fallback_active").increment(1);
                         }
@@ -7471,8 +7468,13 @@ fn fast_tick_allowed_in_fusion_mode(source: &str, mode: &str) -> bool {
 }
 
 #[inline]
-fn should_arm_ws_primary_fallback(mode: &str, ws_recent: bool, fallback_active: bool) -> bool {
-    mode == "websocket_primary" && !ws_recent && !fallback_active
+fn should_arm_ws_primary_fallback(
+    mode: &str,
+    ws_cap_ready: bool,
+    ws_ready_seen: bool,
+    fallback_active: bool,
+) -> bool {
+    mode == "websocket_primary" && ws_ready_seen && !ws_cap_ready && !fallback_active
 }
 
 #[inline]
@@ -10602,20 +10604,30 @@ mod tests {
         assert!(should_arm_ws_primary_fallback(
             "websocket_primary",
             false,
+            true,
             false
         ));
         assert!(!should_arm_ws_primary_fallback(
             "websocket_primary",
+            true,
             true,
             false
         ));
         assert!(!should_arm_ws_primary_fallback(
             "websocket_primary",
             false,
+            true,
             true
         ));
         assert!(!should_arm_ws_primary_fallback(
             "active_active",
+            false,
+            true,
+            false
+        ));
+        assert!(!should_arm_ws_primary_fallback(
+            "websocket_primary",
+            false,
             false,
             false
         ));
