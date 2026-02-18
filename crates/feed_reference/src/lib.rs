@@ -135,18 +135,10 @@ async fn run_binance_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> R
     if symbols.is_empty() {
         anyhow::bail!("binance symbols list is empty");
     }
-    let stream_kind = std::env::var("POLYEDGE_BINANCE_STREAM_KIND")
-        .unwrap_or_else(|_| "bookTicker".to_string())
-        .to_ascii_lowercase();
-    let stream_suffix = if stream_kind == "trade" {
-        "trade"
-    } else {
-        "bookTicker"
-    };
 
     let streams = symbols
         .iter()
-        .map(|s| format!("{}@{stream_suffix}", s.to_lowercase()))
+        .map(|s| format!("{}@trade", s.to_lowercase()))
         .collect::<Vec<_>>()
         .join("/");
     let endpoint_candidates = binance_ws_endpoints(&streams);
@@ -200,14 +192,9 @@ async fn run_binance_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> R
                 let Ok(payload) = serde_json::from_str::<BinanceWsMessage>(&text) else {
                     continue;
                 };
-                let market = payload.into_market();
-                let symbol = market.symbol;
-                let price = market
-                    .bid
-                    .zip(market.ask)
-                    .map(|(b, a)| (b + a) * 0.5)
-                    .or(market.trade_price)
-                    .unwrap_or(0.0);
+                let trade = payload.into_trade();
+                let symbol = trade.symbol;
+                let price = trade.price;
 
                 // Validate price before creating tick
                 if !validate_price(price) {
@@ -215,7 +202,7 @@ async fn run_binance_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> R
                     continue;
                 }
 
-                let event_ts = market.event_ts.unwrap_or_else(now_ms);
+                let event_ts = trade.event_ts.unwrap_or_else(now_ms);
                 let ingest_ns = now_ns();
 
                 let tick = RefTick {
@@ -482,34 +469,30 @@ async fn run_chainlink_rtds_stream(symbols: &[String], tx: &mpsc::Sender<RefTick
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum BinanceWsMessage {
-    Envelope { data: BinanceMarket },
-    Market(BinanceMarket),
+    Envelope { data: BinanceTrade },
+    Trade(BinanceTrade),
 }
 
 impl BinanceWsMessage {
-    fn into_market(self) -> BinanceMarket {
+    fn into_trade(self) -> BinanceTrade {
         match self {
             Self::Envelope { data } => data,
-            Self::Market(data) => data,
+            Self::Trade(data) => data,
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
-struct BinanceMarket {
+struct BinanceTrade {
     #[serde(rename = "s")]
     symbol: String,
-    #[serde(rename = "p", default, deserialize_with = "de_opt_f64_from_str")]
-    trade_price: Option<f64>,
-    #[serde(rename = "b", default, deserialize_with = "de_opt_f64_from_str")]
-    bid: Option<f64>,
-    #[serde(rename = "a", default, deserialize_with = "de_opt_f64_from_str")]
-    ask: Option<f64>,
+    #[serde(rename = "p", deserialize_with = "de_f64_from_str")]
+    price: f64,
     #[serde(rename = "E")]
     event_ts: Option<i64>,
 }
 
-fn de_opt_f64_from_str<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+fn de_f64_from_str<'de, D>(deserializer: D) -> Result<f64, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -519,14 +502,11 @@ where
         Num(f64),
         Str(String),
     }
-    let v = Option::<NumOrStr>::deserialize(deserializer)?;
-    match v {
-        Some(NumOrStr::Num(n)) => Ok(Some(n)),
-        Some(NumOrStr::Str(s)) => s
+    match NumOrStr::deserialize(deserializer)? {
+        NumOrStr::Num(v) => Ok(v),
+        NumOrStr::Str(s) => s
             .parse::<f64>()
-            .map(Some)
             .map_err(|e| serde::de::Error::custom(format!("invalid f64 string: {e}"))),
-        None => Ok(None),
     }
 }
 
