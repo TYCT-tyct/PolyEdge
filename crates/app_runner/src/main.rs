@@ -3589,6 +3589,9 @@ fn spawn_strategy_engine(
                         shared.shadow_stats.record_issue("stale_tick_dropped").await;
                         continue;
                     }
+                    // Only record latency samples for ticks that survive stale filtering.
+                    // This keeps p99 aligned with actionable (tradable) flow instead of
+                    // including already-rejected backlog artifacts.
                     shared
                         .shadow_stats
                         .push_latency_sample(
