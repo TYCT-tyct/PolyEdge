@@ -177,7 +177,8 @@ daily_loss_cap_usdc = 1.0
 enable_udp = true
 mode = "active_active"
 udp_port = 6666
-dedupe_window_ms = 30
+dedupe_window_ms = 120
+dedupe_price_bps = 0.2
 
 [source_health]
 min_samples = 64

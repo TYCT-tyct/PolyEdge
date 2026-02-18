@@ -474,6 +474,7 @@ struct FusionConfig {
     mode: String,
     udp_port: u16,
     dedupe_window_ms: i64,
+    dedupe_price_bps: f64,
 }
 
 impl Default for FusionConfig {
@@ -482,7 +483,8 @@ impl Default for FusionConfig {
             enable_udp: true,
             mode: "active_active".to_string(),
             udp_port: 6666,
-            dedupe_window_ms: 30,
+            dedupe_window_ms: 120,
+            dedupe_price_bps: 0.2,
         }
     }
 }
@@ -2740,8 +2742,7 @@ fn spawn_reference_feed(
                     }
                     last_source_ts_by_stream.insert(stream_key, source_ts);
                     if let Some((prev_ts, prev_px)) = last_published_by_symbol.get(&tick.symbol) {
-                        if (source_ts - *prev_ts).abs() <= fusion.dedupe_window_ms
-                            && (tick.price - *prev_px).abs() <= f64::EPSILON
+                        if is_ref_tick_duplicate(source_ts, tick.price, *prev_ts, *prev_px, &fusion)
                         {
                             stats.mark_ref_dedupe_dropped();
                             continue;
@@ -7132,6 +7133,24 @@ fn fusion_staleness_budget_us_for_source(next_source: &str) -> i64 {
     })
 }
 
+fn is_ref_tick_duplicate(
+    current_source_ts_ms: i64,
+    current_price: f64,
+    prev_source_ts_ms: i64,
+    prev_price: f64,
+    cfg: &FusionConfig,
+) -> bool {
+    if (current_source_ts_ms - prev_source_ts_ms).abs() > cfg.dedupe_window_ms {
+        return false;
+    }
+    if !current_price.is_finite() || !prev_price.is_finite() {
+        return false;
+    }
+    let denom = prev_price.abs().max(1e-9);
+    let rel_bps = ((current_price - prev_price).abs() / denom) * 10_000.0;
+    rel_bps <= cfg.dedupe_price_bps
+}
+
 fn should_replace_anchor_tick(current: &RefTick, next: &RefTick) -> bool {
     let current_event = ref_event_ts_ms(current);
     let next_event = ref_event_ts_ms(next);
@@ -8047,6 +8066,11 @@ fn load_fusion_config() -> FusionConfig {
             "dedupe_window_ms" => {
                 if let Ok(parsed) = val.parse::<i64>() {
                     cfg.dedupe_window_ms = parsed.clamp(0, 2_000);
+                }
+            }
+            "dedupe_price_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.dedupe_price_bps = parsed.clamp(0.0, 50.0);
                 }
             }
             _ => {}
@@ -9948,6 +9972,18 @@ mod tests {
         assert_eq!(percentile(&values, 0.50), Some(3.0));
         assert_eq!(percentile(&values, 0.0), Some(1.0));
         assert_eq!(percentile(&values, 1.0), Some(5.0));
+    }
+
+    #[test]
+    fn ref_tick_dedupe_uses_relative_bps_and_window() {
+        let cfg = FusionConfig {
+            dedupe_window_ms: 120,
+            dedupe_price_bps: 0.2,
+            ..FusionConfig::default()
+        };
+        assert!(is_ref_tick_duplicate(1_000, 100.001, 980, 100.0, &cfg));
+        assert!(!is_ref_tick_duplicate(1_500, 100.001, 980, 100.0, &cfg));
+        assert!(!is_ref_tick_duplicate(1_000, 100.005, 980, 100.0, &cfg));
     }
 
     #[test]
