@@ -339,7 +339,6 @@ pub(super) fn spawn_reference_feed(
                         stats.set_fallback_state(fallback_state);
 
                         let target_share = fusion.udp_share_cap.clamp(0.05, 0.95);
-                        let share_high = effective_udp_share > target_share;
                         let projected_udp_share = if fast_total > 0 {
                             (udp_samples.saturating_add(1) as f64)
                                 / (fast_total.saturating_add(1) as f64)
@@ -353,7 +352,7 @@ pub(super) fn spawn_reference_feed(
                         let enforce_ws_primary = should_enforce_udp_share_cap(
                             fusion.mode.as_str(),
                             fallback_active,
-                            share_high && projected_share_violation,
+                            projected_share_violation,
                         );
 
                         if enforce_ws_primary {
