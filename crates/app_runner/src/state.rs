@@ -33,6 +33,7 @@ use crate::report_io::{
     append_jsonl, build_market_scorecard, dataset_path, fillability_ratio,
     next_normalized_ingest_seq, survival_ratio,
 };
+use crate::seat_runtime::SeatRuntimeHandle;
 use crate::stats_utils::{
     freshness_ms, percentile, policy_block_ratio, push_capped, quote_block_ratio, ratio_u64,
     robust_filter_iqr,
@@ -55,6 +56,7 @@ pub(crate) struct AppState {
     pub(crate) shadow_stats: Arc<ShadowStats>,
     pub(crate) perf_profile: Arc<RwLock<PerfProfile>>,
     pub(crate) shared: Arc<EngineShared>,
+    pub(crate) seat: Arc<SeatRuntimeHandle>,
 }
 
 #[derive(Debug, Clone)]

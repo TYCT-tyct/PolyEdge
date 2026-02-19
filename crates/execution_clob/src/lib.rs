@@ -32,6 +32,16 @@ pub struct ClobExecution {
     ack_probe: Option<Arc<AckProbe>>,
 }
 
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            let normalized = v.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
 impl Clone for ClobExecution {
     fn clone(&self) -> Self {
         Self {
@@ -350,6 +360,17 @@ impl ExecutionVenue for ClobExecution {
                 })
             }
             ExecutionMode::Live => {
+                if env_flag_enabled("POLYEDGE_FORCE_PAPER") {
+                    return Ok(OrderAckV2 {
+                        order_id: new_id(),
+                        market_id: intent.market_id,
+                        accepted: false,
+                        accepted_size: 0.0,
+                        reject_code: Some("force_paper_guard".to_string()),
+                        exchange_latency_ms: 0.0,
+                        ts_ms: Utc::now().timestamp_millis(),
+                    });
+                }
                 // Validate price is finite and within valid range before sending
                 if !intent.price.is_finite() || intent.price <= 0.0 || intent.price >= 1.0 {
                     return Ok(OrderAckV2 {
@@ -492,6 +513,9 @@ impl ExecutionVenue for ClobExecution {
                 Ok(())
             }
             ExecutionMode::Live => {
+                if env_flag_enabled("POLYEDGE_FORCE_PAPER") {
+                    bail!("force_paper_guard: cancel blocked in live mode");
+                }
                 let mut last_status: Option<reqwest::StatusCode> = None;
                 for endpoint in self.order_endpoints() {
                     let res = self
@@ -519,6 +543,9 @@ impl ExecutionVenue for ClobExecution {
         match self.mode {
             ExecutionMode::Paper => Ok(()),
             ExecutionMode::Live => {
+                if env_flag_enabled("POLYEDGE_FORCE_PAPER") {
+                    bail!("force_paper_guard: flatten blocked in live mode");
+                }
                 let mut last_status: Option<reqwest::StatusCode> = None;
                 for endpoint in self.order_endpoints() {
                     let res = self.http.post(format!("{endpoint}/flatten")).send().await?;
@@ -541,6 +568,16 @@ impl ExecutionVenue for ClobExecution {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_flag_enabled_parses_common_true_values() {
+        for value in ["1", "true", "TRUE", "yes", "on"] {
+            std::env::set_var("POLYEDGE_TEST_FLAG", value);
+            assert!(env_flag_enabled("POLYEDGE_TEST_FLAG"), "value={value}");
+        }
+        std::env::remove_var("POLYEDGE_TEST_FLAG");
+        assert!(!env_flag_enabled("POLYEDGE_TEST_FLAG"));
+    }
 
     #[test]
     fn order_endpoints_include_backup_when_configured() {

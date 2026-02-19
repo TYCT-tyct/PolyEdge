@@ -1,0 +1,32 @@
+[seat]
+enabled = true
+control_base_url = "http://127.0.0.1:8080"
+optimizer_url = "http://127.0.0.1:8091"
+
+runtime_tick_sec = 60
+activation_check_sec = 3600
+
+layer1_interval_sec = 3600
+layer2_interval_sec = 21600
+layer3_interval_sec = 86400
+
+layer2_shadow_sec = 2700
+layer3_shadow_sec = 6000
+
+smoothing_sec = 1800
+monitor_sec = 3600
+
+rollback_pause_sec = 86400
+global_pause_sec = 172800
+layer0_lock_sec = 172800
+black_swan_lock_sec = 172800
+
+layer1_min_trades = 300
+layer2_min_trades = 800
+layer2_min_uptime_sec = 259200
+layer3_min_trades = 2000
+layer3_min_uptime_sec = 1209600
+
+source_health_floor = 0.30
+history_retention_days = 180
+objective_drawdown_penalty = 5.0

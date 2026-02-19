@@ -6,6 +6,7 @@ use risk_engine::RiskLimits;
 use serde::{Deserialize, Serialize};
 use strategy_maker::MakerConfig;
 
+use crate::seat_types::SeatConfig;
 use crate::state::{
     EdgeModelConfig, ExecutionConfig, ExitConfig, FusionConfig, PerfProfile, PredatorCConfig,
     PredatorCPriority, SettlementConfig, SourceHealthConfig,
@@ -136,6 +137,24 @@ fn parse_toml_array_of_strings(val: &str) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
+#[cfg(test)]
+pub(crate) fn parse_toml_array_for_key(raw: &str, key: &str) -> Option<Vec<String>> {
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        if k.trim() != key {
+            continue;
+        }
+        return Some(parse_toml_array_of_strings(v.trim()));
+    }
+    None
+}
+
 fn parse_gatling_symbol_section(section: &str) -> Option<String> {
     const PREFIX: &str = "[predator_c.gatling_symbols.";
     if !(section.starts_with(PREFIX) && section.ends_with(']')) {
@@ -147,50 +166,6 @@ fn parse_gatling_symbol_section(section: &str) -> Option<String> {
         None
     } else {
         Some(symbol.to_string())
-    }
-}
-
-pub(super) fn parse_toml_array_for_key(raw: &str, key: &str) -> Option<Vec<String>> {
-    let mut collecting = false;
-    let mut buf = String::new();
-
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-
-        if !collecting {
-            let Some((k, v)) = trimmed.split_once('=') else {
-                continue;
-            };
-            if k.trim() != key {
-                continue;
-            }
-            let value = v.trim();
-            buf.push_str(value);
-            collecting = !(value.starts_with('[') && value.ends_with(']'));
-            if !collecting {
-                break;
-            }
-            continue;
-        }
-
-        // Keep concatenating multiline array items until closing ']'.
-        buf.push_str(trimmed);
-        if trimmed.ends_with(']') {
-            break;
-        }
-    }
-
-    if buf.is_empty() {
-        return None;
-    }
-    let parsed = parse_toml_array_of_strings(&buf);
-    if parsed.is_empty() {
-        None
-    } else {
-        Some(parsed)
     }
 }
 
@@ -1267,8 +1242,8 @@ pub(super) fn load_risk_limits_config() -> RiskLimits {
         return RiskLimits::default();
     };
 
-    // 文件解析失败时的安全回退值——比 Default 更保守
-    // 使用 struct update syntax 一次性初始化，避免二次赋值
+    // Conservative fallback values when parsing is partial or malformed.
+    // Keep defaults via struct update syntax to avoid piecemeal re-assignment.
     let mut cfg = RiskLimits {
         max_drawdown_pct: 0.20,
         max_asset_notional: 50.0,
@@ -1368,61 +1343,49 @@ pub(super) fn load_execution_config() -> ExecutionConfig {
     let Ok(raw) = fs::read_to_string(path) else {
         return ExecutionConfig::default();
     };
+    #[derive(Debug, Deserialize, Default)]
+    struct ExecutionFile {
+        execution: Option<ExecutionSection>,
+    }
+
+    #[derive(Debug, Deserialize, Default)]
+    struct ExecutionSection {
+        mode: Option<String>,
+        rate_limit_rps: Option<f64>,
+        http_timeout_ms: Option<u64>,
+        clob_endpoint: Option<String>,
+        order_endpoint: Option<String>,
+        order_backup_endpoint: Option<String>,
+        order_failover_timeout_ms: Option<u64>,
+    }
+
+    let Ok(parsed) = toml::from_str::<ExecutionFile>(&raw) else {
+        return ExecutionConfig::default();
+    };
+    let Some(section) = parsed.execution else {
+        return ExecutionConfig::default();
+    };
     let mut cfg = ExecutionConfig::default();
-    let mut in_execution = false;
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if line.starts_with('[') && line.ends_with(']') {
-            in_execution = line == "[execution]";
-            continue;
-        }
-        if !in_execution {
-            continue;
-        }
-        let Some((k, v)) = line.split_once('=') else {
-            continue;
-        };
-        let key = k.trim();
-        let val = v.trim().trim_matches('"');
-        match key {
-            "mode" => cfg.mode = val.to_string(),
-            "rate_limit_rps" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.rate_limit_rps = parsed.max(0.1);
-                }
-            }
-            "http_timeout_ms" => {
-                if let Ok(parsed) = val.parse::<u64>() {
-                    cfg.http_timeout_ms = parsed.max(100);
-                }
-            }
-            "clob_endpoint" => cfg.clob_endpoint = val.to_string(),
-            "order_endpoint" => {
-                let v = val.to_string();
-                if v.is_empty() {
-                    cfg.order_endpoint = None;
-                } else {
-                    cfg.order_endpoint = Some(v);
-                }
-            }
-            "order_backup_endpoint" => {
-                let v = val.to_string();
-                if v.is_empty() {
-                    cfg.order_backup_endpoint = None;
-                } else {
-                    cfg.order_backup_endpoint = Some(v);
-                }
-            }
-            "order_failover_timeout_ms" => {
-                if let Ok(parsed) = val.parse::<u64>() {
-                    cfg.order_failover_timeout_ms = parsed.clamp(10, 5_000);
-                }
-            }
-            _ => {}
-        }
+    if let Some(v) = section.mode {
+        cfg.mode = v;
+    }
+    if let Some(v) = section.rate_limit_rps {
+        cfg.rate_limit_rps = v.max(0.1);
+    }
+    if let Some(v) = section.http_timeout_ms {
+        cfg.http_timeout_ms = v.max(100);
+    }
+    if let Some(v) = section.clob_endpoint {
+        cfg.clob_endpoint = v;
+    }
+    if let Some(v) = section.order_endpoint {
+        cfg.order_endpoint = (!v.trim().is_empty()).then_some(v);
+    }
+    if let Some(v) = section.order_backup_endpoint {
+        cfg.order_backup_endpoint = (!v.trim().is_empty()).then_some(v);
+    }
+    if let Some(v) = section.order_failover_timeout_ms {
+        cfg.order_failover_timeout_ms = v.clamp(10, 5_000);
     }
     cfg
 }
@@ -1432,52 +1395,45 @@ pub(super) fn load_settlement_config() -> SettlementConfig {
     let Ok(raw) = fs::read_to_string(path) else {
         return SettlementConfig::default();
     };
-    let mut cfg = SettlementConfig::default();
-    let mut in_section = false;
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if line.starts_with('[') && line.ends_with(']') {
-            in_section = line == "[settlement]";
-            continue;
-        }
-        if !in_section {
-            continue;
-        }
-        let Some((k, v)) = line.split_once('=') else {
-            continue;
-        };
-        let key = k.trim();
-        let val = v.trim().trim_matches('"');
-        match key {
-            "enabled" => {
-                if let Ok(parsed) = val.parse::<bool>() {
-                    cfg.enabled = parsed;
-                }
-            }
-            "endpoint" => cfg.endpoint = val.to_string(),
-            "required_for_live" => {
-                if let Ok(parsed) = val.parse::<bool>() {
-                    cfg.required_for_live = parsed;
-                }
-            }
-            "poll_interval_ms" => {
-                if let Ok(parsed) = val.parse::<u64>() {
-                    cfg.poll_interval_ms = parsed.clamp(250, 10_000);
-                }
-            }
-            "timeout_ms" => {
-                if let Ok(parsed) = val.parse::<u64>() {
-                    cfg.timeout_ms = parsed.clamp(100, 5_000);
-                }
-            }
-            _ => {}
-        }
+    #[derive(Debug, Deserialize, Default)]
+    struct SettlementFile {
+        settlement: Option<SettlementSection>,
     }
-    if let Some(symbols) = parse_toml_array_for_key(&raw, "symbols") {
-        cfg.symbols = symbols;
+
+    #[derive(Debug, Deserialize, Default)]
+    struct SettlementSection {
+        enabled: Option<bool>,
+        endpoint: Option<String>,
+        required_for_live: Option<bool>,
+        poll_interval_ms: Option<u64>,
+        timeout_ms: Option<u64>,
+        symbols: Option<Vec<String>>,
+    }
+
+    let Ok(parsed) = toml::from_str::<SettlementFile>(&raw) else {
+        return SettlementConfig::default();
+    };
+    let Some(section) = parsed.settlement else {
+        return SettlementConfig::default();
+    };
+    let mut cfg = SettlementConfig::default();
+    if let Some(v) = section.enabled {
+        cfg.enabled = v;
+    }
+    if let Some(v) = section.endpoint {
+        cfg.endpoint = v;
+    }
+    if let Some(v) = section.required_for_live {
+        cfg.required_for_live = v;
+    }
+    if let Some(v) = section.poll_interval_ms {
+        cfg.poll_interval_ms = v.clamp(250, 10_000);
+    }
+    if let Some(v) = section.timeout_ms {
+        cfg.timeout_ms = v.clamp(100, 5_000);
+    }
+    if let Some(v) = section.symbols {
+        cfg.symbols = v;
     }
     cfg
 }
@@ -1487,21 +1443,33 @@ pub(super) fn load_universe_config() -> UniverseConfig {
     let Ok(raw) = fs::read_to_string(path) else {
         return UniverseConfig::default();
     };
+    #[derive(Debug, Deserialize, Default)]
+    struct UniverseFile {
+        assets: Option<Vec<String>>,
+        market_types: Option<Vec<String>>,
+        timeframes: Option<Vec<String>>,
+        tier_whitelist: Option<Vec<String>>,
+        tier_blacklist: Option<Vec<String>>,
+    }
+
+    let Ok(parsed) = toml::from_str::<UniverseFile>(&raw) else {
+        return UniverseConfig::default();
+    };
     let mut cfg = UniverseConfig::default();
-    if let Some(parsed) = parse_toml_array_for_key(&raw, "assets") {
-        cfg.assets = parsed;
+    if let Some(v) = parsed.assets {
+        cfg.assets = v;
     }
-    if let Some(parsed) = parse_toml_array_for_key(&raw, "market_types") {
-        cfg.market_types = parsed;
+    if let Some(v) = parsed.market_types {
+        cfg.market_types = v;
     }
-    if let Some(parsed) = parse_toml_array_for_key(&raw, "timeframes") {
-        cfg.timeframes = parsed;
+    if let Some(v) = parsed.timeframes {
+        cfg.timeframes = v;
     }
-    if let Some(parsed) = parse_toml_array_for_key(&raw, "tier_whitelist") {
-        cfg.tier_whitelist = parsed;
+    if let Some(v) = parsed.tier_whitelist {
+        cfg.tier_whitelist = v;
     }
-    if let Some(parsed) = parse_toml_array_for_key(&raw, "tier_blacklist") {
-        cfg.tier_blacklist = parsed;
+    if let Some(v) = parsed.tier_blacklist {
+        cfg.tier_blacklist = v;
     }
     cfg
 }
@@ -1511,51 +1479,172 @@ pub(super) fn load_perf_profile_config() -> PerfProfile {
     let Ok(raw) = fs::read_to_string(path) else {
         return PerfProfile::default();
     };
+    #[derive(Debug, Deserialize, Default)]
+    struct LatencyFile {
+        runtime: Option<RuntimeSection>,
+    }
 
+    #[derive(Debug, Deserialize, Default)]
+    struct RuntimeSection {
+        tail_guard: Option<f64>,
+        io_flush_batch: Option<usize>,
+        io_queue_capacity: Option<usize>,
+        json_mode: Option<String>,
+        io_drop_on_full: Option<bool>,
+    }
+
+    let Ok(parsed) = toml::from_str::<LatencyFile>(&raw) else {
+        return PerfProfile::default();
+    };
+    let Some(section) = parsed.runtime else {
+        return PerfProfile::default();
+    };
     let mut cfg = PerfProfile::default();
-    let mut in_runtime = false;
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+    if let Some(v) = section.tail_guard {
+        cfg.tail_guard = v.clamp(0.50, 0.9999);
+    }
+    if let Some(v) = section.io_flush_batch {
+        cfg.io_flush_batch = v.clamp(1, 4096);
+    }
+    if let Some(v) = section.io_queue_capacity {
+        cfg.io_queue_capacity = v.clamp(256, 262_144);
+    }
+    if let Some(v) = section.json_mode {
+        cfg.json_mode = v;
+    }
+    if let Some(v) = section.io_drop_on_full {
+        cfg.io_drop_on_full = v;
+    }
+    cfg
+}
+
+pub(super) fn load_seat_config() -> SeatConfig {
+    let path = Path::new("configs/seat.toml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        let mut cfg = SeatConfig::default();
+        if let Ok(url) = std::env::var("POLYEDGE_SEAT_OPTIMIZER_URL") {
+            if !url.trim().is_empty() {
+                cfg.optimizer_url = url;
+            }
         }
-        if line.starts_with('[') && line.ends_with(']') {
-            in_runtime = line == "[runtime]";
-            continue;
-        }
-        if !in_runtime {
-            continue;
-        }
-        let Some((k, v)) = line.split_once('=') else {
-            continue;
-        };
-        let key = k.trim();
-        let val = v.trim().trim_matches('"');
-        match key {
-            "tail_guard" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.tail_guard = parsed.clamp(0.50, 0.9999);
-                }
-            }
-            "io_flush_batch" => {
-                if let Ok(parsed) = val.parse::<usize>() {
-                    cfg.io_flush_batch = parsed.clamp(1, 4096);
-                }
-            }
-            "io_queue_capacity" => {
-                if let Ok(parsed) = val.parse::<usize>() {
-                    cfg.io_queue_capacity = parsed.clamp(256, 262_144);
-                }
-            }
-            "json_mode" => {
-                cfg.json_mode = val.to_string();
-            }
-            "io_drop_on_full" => {
-                if let Ok(parsed) = val.parse::<bool>() {
-                    cfg.io_drop_on_full = parsed;
-                }
-            }
-            _ => {}
+        return cfg;
+    };
+
+    #[derive(Debug, Deserialize, Default)]
+    struct SeatFile {
+        seat: Option<SeatSection>,
+    }
+
+    #[derive(Debug, Deserialize, Default)]
+    struct SeatSection {
+        enabled: Option<bool>,
+        control_base_url: Option<String>,
+        optimizer_url: Option<String>,
+        runtime_tick_sec: Option<u64>,
+        activation_check_sec: Option<u64>,
+        layer1_interval_sec: Option<u64>,
+        layer2_interval_sec: Option<u64>,
+        layer3_interval_sec: Option<u64>,
+        layer2_shadow_sec: Option<u64>,
+        layer3_shadow_sec: Option<u64>,
+        smoothing_sec: Option<u64>,
+        monitor_sec: Option<u64>,
+        rollback_pause_sec: Option<u64>,
+        global_pause_sec: Option<u64>,
+        layer0_lock_sec: Option<u64>,
+        layer1_min_trades: Option<u64>,
+        layer2_min_trades: Option<u64>,
+        layer2_min_uptime_sec: Option<u64>,
+        layer3_min_trades: Option<u64>,
+        layer3_min_uptime_sec: Option<u64>,
+        black_swan_lock_sec: Option<u64>,
+        source_health_floor: Option<f64>,
+        history_retention_days: Option<u32>,
+        objective_drawdown_penalty: Option<f64>,
+    }
+
+    let Ok(parsed) = toml::from_str::<SeatFile>(&raw) else {
+        return SeatConfig::default();
+    };
+    let Some(section) = parsed.seat else {
+        return SeatConfig::default();
+    };
+    let mut cfg = SeatConfig::default();
+    if let Some(v) = section.enabled {
+        cfg.enabled = v;
+    }
+    if let Some(v) = section.control_base_url {
+        cfg.control_base_url = v;
+    }
+    if let Some(v) = section.optimizer_url {
+        cfg.optimizer_url = v;
+    }
+    if let Some(v) = section.runtime_tick_sec {
+        cfg.runtime_tick_sec = v.clamp(5, 300);
+    }
+    if let Some(v) = section.activation_check_sec {
+        cfg.activation_check_sec = v.clamp(60, 86_400);
+    }
+    if let Some(v) = section.layer1_interval_sec {
+        cfg.layer1_interval_sec = v.clamp(60, 86_400);
+    }
+    if let Some(v) = section.layer2_interval_sec {
+        cfg.layer2_interval_sec = v.clamp(300, 86_400);
+    }
+    if let Some(v) = section.layer3_interval_sec {
+        cfg.layer3_interval_sec = v.clamp(900, 7 * 86_400);
+    }
+    if let Some(v) = section.layer2_shadow_sec {
+        cfg.layer2_shadow_sec = v.clamp(60, 8 * 3_600);
+    }
+    if let Some(v) = section.layer3_shadow_sec {
+        cfg.layer3_shadow_sec = v.clamp(6_000, 12 * 3_600);
+    }
+    if let Some(v) = section.smoothing_sec {
+        cfg.smoothing_sec = v.clamp(60, 12 * 3_600);
+    }
+    if let Some(v) = section.monitor_sec {
+        cfg.monitor_sec = v.clamp(60, 24 * 3_600);
+    }
+    if let Some(v) = section.rollback_pause_sec {
+        cfg.rollback_pause_sec = v.clamp(60, 7 * 24 * 3_600);
+    }
+    if let Some(v) = section.global_pause_sec {
+        cfg.global_pause_sec = v.clamp(60, 14 * 24 * 3_600);
+    }
+    if let Some(v) = section.layer0_lock_sec {
+        cfg.layer0_lock_sec = v.clamp(60, 14 * 24 * 3_600);
+    }
+    if let Some(v) = section.layer1_min_trades {
+        cfg.layer1_min_trades = v.max(1);
+    }
+    if let Some(v) = section.layer2_min_trades {
+        cfg.layer2_min_trades = v.max(cfg.layer1_min_trades);
+    }
+    if let Some(v) = section.layer2_min_uptime_sec {
+        cfg.layer2_min_uptime_sec = v.max(3_600);
+    }
+    if let Some(v) = section.layer3_min_trades {
+        cfg.layer3_min_trades = v.max(cfg.layer2_min_trades);
+    }
+    if let Some(v) = section.layer3_min_uptime_sec {
+        cfg.layer3_min_uptime_sec = v.max(24 * 3_600);
+    }
+    if let Some(v) = section.black_swan_lock_sec {
+        cfg.black_swan_lock_sec = v.clamp(60, 14 * 24 * 3_600);
+    }
+    if let Some(v) = section.source_health_floor {
+        cfg.source_health_floor = v.clamp(0.0, 1.0);
+    }
+    if let Some(v) = section.history_retention_days {
+        cfg.history_retention_days = v.clamp(7, 720);
+    }
+    if let Some(v) = section.objective_drawdown_penalty {
+        cfg.objective_drawdown_penalty = v.clamp(0.1, 100.0);
+    }
+    if let Ok(url) = std::env::var("POLYEDGE_SEAT_OPTIMIZER_URL") {
+        if !url.trim().is_empty() {
+            cfg.optimizer_url = url;
         }
     }
     cfg

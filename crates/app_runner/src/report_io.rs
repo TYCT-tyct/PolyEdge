@@ -30,7 +30,12 @@ pub(super) fn dataset_date() -> String {
 }
 
 pub(super) fn dataset_dir(kind: &str) -> PathBuf {
-    PathBuf::from("datasets").join(kind).join(dataset_date())
+    let root = std::env::var("POLYEDGE_DATASET_ROOT")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("datasets"));
+    root.join(kind).join(dataset_date())
 }
 
 pub(super) fn dataset_path(kind: &str, filename: &str) -> PathBuf {

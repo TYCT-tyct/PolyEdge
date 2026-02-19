@@ -298,16 +298,14 @@ pub(super) fn should_replace_ref_tick(current: &RefTick, next: &RefTick) -> bool
     next_event > current_event + 1
 }
 
-// -----------------------------------------------------------------------
-// D: Fusion staleness budget 按数据源精细化
-// UDP 路径 (binance_udp) 延迟 < 1ms，可以用更紧的 200μs 窗口；
-// 其他源（直连 WS、Chainlink）保留宽松的 600μs 默认值。
-// -----------------------------------------------------------------------
+// Source-specific fusion staleness budgets:
+// - UDP path (`binance_udp`) has sub-millisecond latency, so use a tighter 200us window.
+// - Other sources (direct WS, Chainlink) keep a looser 600us default.
 pub(super) fn fusion_staleness_budget_us_for_source(next_source: &str) -> i64 {
     static BUDGET_UDP_US: OnceLock<i64> = OnceLock::new();
     static BUDGET_DEFAULT_US: OnceLock<i64> = OnceLock::new();
 
-    // UDP 路径: 更激进，默认 200μs
+    // UDP path: aggressive freshness window (default 200us).
     if next_source.contains("udp") {
         return *BUDGET_UDP_US.get_or_init(|| {
             std::env::var("POLYEDGE_FUSION_STALENESS_UDP_US")
@@ -318,7 +316,7 @@ pub(super) fn fusion_staleness_budget_us_for_source(next_source: &str) -> i64 {
         });
     }
 
-    // 其他源: 默认 600μs
+    // Other sources: default 600us window.
     *BUDGET_DEFAULT_US.get_or_init(|| {
         std::env::var("POLYEDGE_FUSION_STALENESS_BUDGET_US")
             .ok()

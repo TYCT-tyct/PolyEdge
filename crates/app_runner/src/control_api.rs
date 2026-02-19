@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -30,13 +30,14 @@ use crate::state::{
     StrategyReloadReq, StrategyReloadResp, TakerReloadReq, TakerReloadResp, ToxicityConfig,
     ToxicityFinalReport, ToxicityLiveReport, ToxicityReloadReq,
 };
+use crate::seat_types::{SeatForceLayerReq, SeatManualOverrideReq};
 use crate::stats_utils::percentile;
 use crate::toxicity_report::build_toxicity_live_report;
 
 pub(super) fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/health/latency", get(health_latency)) // P4: 轻量级延迟探测
+        .route("/health/latency", get(health_latency)) // P4: lightweight latency probe
         .route("/metrics", get(metrics))
         .route("/state/positions", get(positions))
         .route("/state/pnl", get(pnl))
@@ -48,10 +49,17 @@ pub(super) fn build_router(state: AppState) -> Router {
         .route("/report/capital", get(report_capital))
         .route("/report/toxicity/live", get(report_toxicity_live))
         .route("/report/toxicity/final", get(report_toxicity_final))
+        .route("/report/seat/status", get(report_seat_status))
+        .route("/report/seat/history", get(report_seat_history))
         .route("/control/pause", post(pause))
         .route("/control/resume", post(resume))
         .route("/control/flatten", post(flatten))
         .route("/control/arm_live", post(arm_live))
+        .route("/control/seat/pause", post(seat_pause))
+        .route("/control/seat/resume", post(seat_resume))
+        .route("/control/seat/force_layer", post(seat_force_layer))
+        .route("/control/seat/manual_override", post(seat_manual_override))
+        .route("/control/seat/clear_override", post(seat_clear_override))
         .route("/control/reset_shadow", post(reset_shadow))
         .route("/control/reload_strategy", post(reload_strategy))
         .route("/control/reload_taker", post(reload_taker))
@@ -78,19 +86,19 @@ async fn health(State(state): State<AppState>) -> Json<HealthResp> {
     })
 }
 
-// P4: 轻量级延迟探测端点 - 简单返回，不遍历大量数据
-// storm_test 可以打这个端点来获得更真实的 RTT
+// P4: lightweight latency probe endpoint.
+// Used by storm_test to measure realistic HTTP RTT with minimal server-side work.
 async fn health_latency(State(state): State<AppState>) -> Json<serde_json::Value> {
     let paused = *state.paused.read().await;
     let now = std::time::Instant::now();
 
-    // 轻量探测 - 不做复杂计算，直接返回状态
+    // Keep this handler intentionally small and allocation-light.
     Json(serde_json::json!({
         "status": "ok",
         "paused": paused,
         "timestamp_ms": chrono::Utc::now().timestamp_millis(),
         "probe_latency_us": now.elapsed().as_micros() as u64,
-        "note": "轻量级探测端点，用于 storm_test RTT 测试"
+        "note": "lightweight endpoint for storm-test RTT probing"
     }))
 }
 
@@ -150,6 +158,25 @@ struct ArmLiveReq {
 }
 
 async fn arm_live(State(state): State<AppState>, Json(req): Json<ArmLiveReq>) -> impl IntoResponse {
+    let force_paper = std::env::var("POLYEDGE_FORCE_PAPER")
+        .ok()
+        .map(|v| {
+            let normalized = v.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false);
+    if force_paper {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "armed": false,
+                "error": "force_paper_guard_enabled",
+            })),
+        )
+            .into_response();
+    }
+
     let armed = req.armed.unwrap_or(true);
     if !armed {
         std::env::set_var("POLYEDGE_LIVE_ARMED", "false");
@@ -187,6 +214,60 @@ async fn arm_live(State(state): State<AppState>, Json(req): Json<ArmLiveReq>) ->
     } else {
         (StatusCode::ACCEPTED, Json(payload)).into_response()
     }
+}
+
+async fn seat_pause(State(state): State<AppState>) -> impl IntoResponse {
+    let status = state.seat.pause("manual_pause".to_string()).await;
+    Json(serde_json::json!({"ok": true, "status": status}))
+}
+
+async fn seat_resume(State(state): State<AppState>) -> impl IntoResponse {
+    let status = state.seat.resume().await;
+    Json(serde_json::json!({"ok": true, "status": status}))
+}
+
+async fn seat_force_layer(
+    State(state): State<AppState>,
+    Json(req): Json<SeatForceLayerReq>,
+) -> impl IntoResponse {
+    let status = state.seat.force_layer(req).await;
+    Json(serde_json::json!({"ok": true, "status": status}))
+}
+
+async fn seat_manual_override(
+    State(state): State<AppState>,
+    Json(req): Json<SeatManualOverrideReq>,
+) -> impl IntoResponse {
+    match state.seat.manual_override(req).await {
+        Ok(status) => Json(serde_json::json!({"ok": true, "status": status})).into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn seat_clear_override(State(state): State<AppState>) -> impl IntoResponse {
+    let status = state.seat.clear_manual_override().await;
+    Json(serde_json::json!({"ok": true, "status": status}))
+}
+
+#[derive(Debug, Deserialize)]
+struct SeatHistoryQuery {
+    limit: Option<usize>,
+}
+
+async fn report_seat_status(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.seat.status().await)
+}
+
+async fn report_seat_history(
+    State(state): State<AppState>,
+    Query(query): Query<SeatHistoryQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(120).clamp(1, 2_000);
+    Json(state.seat.history(limit))
 }
 
 async fn reset_shadow(State(state): State<AppState>) -> impl IntoResponse {

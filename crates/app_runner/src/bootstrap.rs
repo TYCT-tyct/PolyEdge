@@ -23,20 +23,43 @@ use tokio::sync::{mpsc, RwLock};
 use crate::config_loader::{
     load_edge_model_config, load_execution_config, load_exit_config, load_fair_value_config,
     load_fusion_config, load_perf_profile_config, load_predator_c_config, load_risk_limits_config,
-    load_settlement_config, load_source_health_config, load_strategy_config, load_universe_config,
+    load_seat_config, load_settlement_config, load_source_health_config, load_strategy_config,
+    load_universe_config,
 };
 use crate::feed_runtime::{spawn_market_feed, spawn_reference_feed, spawn_settlement_feed};
 use crate::report_io::{ensure_dataset_dirs, init_jsonl_writer};
+use crate::seat_runtime::SeatRuntimeHandle;
 use crate::state::{
     settlement_live_gate_status, to_exit_manager_config, AllocatorConfig, AppState, EngineShared,
     ShadowStats, StrategyIngressMsg, ToxicityConfig,
 };
 use crate::{control_api, orchestration, spawn_detached, spawn_strategy_engine};
 
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            let normalized = v.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
 pub(super) async fn async_main() -> Result<()> {
     let _guard = init_tracing("app_runner");
     let prometheus = init_metrics();
     ensure_dataset_dirs();
+    let control_port = std::env::var("POLYEDGE_CONTROL_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(8080);
+    std::env::set_var("POLYEDGE_CONTROL_PORT", control_port.to_string());
+    let mut seat_cfg = load_seat_config();
+    if seat_cfg.control_base_url.trim().is_empty() {
+        seat_cfg.control_base_url = format!("http://127.0.0.1:{control_port}");
+    }
+    let seat = SeatRuntimeHandle::spawn(seat_cfg);
+    let seat_fill_counter = seat.live_fill_counter();
 
     let execution_cfg = load_execution_config();
     let universe_cfg = load_universe_config();
@@ -48,11 +71,17 @@ pub(super) async fn async_main() -> Result<()> {
         .clamp(4_096, 262_144);
     let bus = RingBus::new(bus_capacity);
     let portfolio = Arc::new(PortfolioBook::default());
-    let live_armed = std::env::var("POLYEDGE_LIVE_ARMED")
-        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-        .unwrap_or(false);
+    let live_armed = env_flag_enabled("POLYEDGE_LIVE_ARMED");
+    let force_paper = env_flag_enabled("POLYEDGE_FORCE_PAPER");
     let live_gate = settlement_live_gate_status(&settlement_cfg_boot);
-    let exec_mode = if execution_cfg.mode.eq_ignore_ascii_case("live") {
+    let exec_mode = if force_paper {
+        if execution_cfg.mode.eq_ignore_ascii_case("live") {
+            tracing::warn!(
+                "POLYEDGE_FORCE_PAPER is enabled; forcing paper mode despite execution.mode=live"
+            );
+        }
+        ExecutionMode::Paper
+    } else if execution_cfg.mode.eq_ignore_ascii_case("live") {
         if !live_armed {
             tracing::warn!(
                 "execution.mode=live but POLYEDGE_LIVE_ARMED is not true; forcing paper mode"
@@ -215,11 +244,26 @@ pub(super) async fn async_main() -> Result<()> {
                 >(64);
                 let tx = Arc::new(tx);
                 let tx_clone = tx.clone();
+                let fill_counter = seat_fill_counter.clone();
                 tokio::spawn(async move {
                     execution_clob::wss_user_feed::run_wss_loop_with_sender(
                         tx_clone, wss_url, api_key,
                     )
                     .await;
+                });
+                let mut fill_rx = tx.subscribe();
+                spawn_detached("seat_live_fill_counter", false, async move {
+                    loop {
+                        match fill_rx.recv().await {
+                            Ok(event) => {
+                                if event.event_type == "trade" {
+                                    fill_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
                 });
                 Some(tx)
             } else {
@@ -251,6 +295,7 @@ pub(super) async fn async_main() -> Result<()> {
         shadow_stats: shared.shadow_stats.clone(),
         perf_profile: perf_profile.clone(),
         shared: shared.clone(),
+        seat: seat.clone(),
     };
 
     spawn_reference_feed(
@@ -293,7 +338,7 @@ pub(super) async fn async_main() -> Result<()> {
 
     let app = control_api::build_router(state);
 
-    let addr: SocketAddr = "0.0.0.0:8080".parse()?;
+    let addr: SocketAddr = format!("0.0.0.0:{control_port}").parse()?;
     tracing::info!(%addr, "control api started");
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
     Ok(())
