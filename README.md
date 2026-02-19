@@ -180,6 +180,8 @@ sudo bash scripts/hft_kernel_tune.sh
 - `queue_depth_p99/event_backlog_p99`
 
 Metric formulas, units, and gate thresholds are defined in `docs/metrics_contract.md`.
+Runtime control/fusion state transitions are documented in `docs/runtime_state_machines.md`.
+SEAT v2.3 runtime controls and remote acceptance workflow are documented in `docs/seat_v23_runbook.md`.
 CI validates contract drift with:
 
 ```bash
