@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 const KEY_BID: &[u8] = br#""b":""#;
@@ -344,14 +345,44 @@ async fn run_route(route: &Route, tuning: SenderTuning) -> Result<()> {
     let mut last_log = std::time::Instant::now();
 
     loop {
-        let url = format!("wss://fstream.binance.com/ws/{}@bookTicker", route.symbol);
-        let (mut ws_stream, _) = match connect_async(&url).await {
-            Ok(v) => v,
-            Err(err) => {
-                eprintln!("sender: websocket connect error: {err}");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                continue;
+        let endpoint_candidates = pick_best_fstream_ws_endpoint(fstream_ws_endpoints(&route.symbol)).await;
+        let mut ws_stream = None;
+        let mut last_err: Option<String> = None;
+        for endpoint in endpoint_candidates {
+            match timeout(
+                Duration::from_secs(
+                    std::env::var("POLYEDGE_FSTREAM_WS_CONNECT_TIMEOUT_SEC")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(3)
+                        .max(1),
+                ),
+                connect_async(&endpoint),
+            )
+            .await
+            {
+                Ok(Ok((socket, _))) => {
+                    ws_stream = Some(socket);
+                    break;
+                }
+                Ok(Err(err)) => {
+                    last_err = Some(format!("{endpoint}: {err}"));
+                    continue;
+                }
+                Err(_) => {
+                    last_err = Some(format!("{endpoint}: connect timeout"));
+                    continue;
+                }
             }
+        }
+        let Some(mut ws_stream) = ws_stream else {
+            eprintln!(
+                "sender: websocket connect error for symbol={} last={}",
+                route.symbol,
+                last_err.unwrap_or_else(|| "no endpoint available".to_string())
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
         };
 
         while let Some(frame) = ws_stream.next().await {
@@ -415,6 +446,86 @@ async fn run_route(route: &Route, tuning: SenderTuning) -> Result<()> {
         );
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
+}
+
+async fn pick_best_fstream_ws_endpoint(endpoints: Vec<String>) -> Vec<String> {
+    if endpoints.len() <= 1 {
+        return endpoints;
+    }
+    let timeout_dur = Duration::from_secs(
+        std::env::var("POLYEDGE_WS_PROBE_TIMEOUT_SEC")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(2)
+            .max(1),
+    );
+    let mut join_set = tokio::task::JoinSet::new();
+    for ep in endpoints.iter().cloned() {
+        join_set.spawn(async move {
+            let started = Instant::now();
+            let ok = timeout(timeout_dur, connect_async(&ep)).await;
+            match ok {
+                Ok(Ok((ws, _resp))) => {
+                    drop(ws);
+                    Some((ep, started.elapsed().as_secs_f64() * 1_000.0))
+                }
+                _ => None,
+            }
+        });
+    }
+    let mut results: Vec<(String, f64)> = Vec::new();
+    while let Some(res) = join_set.join_next().await {
+        if let Ok(Some(v)) = res {
+            results.push(v);
+        }
+    }
+    if results.is_empty() {
+        return endpoints;
+    }
+    results.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let best = results[0].0.clone();
+    eprintln!(
+        "sender: symbol endpoint selected={} handshake_ms={:.3} candidates={}",
+        best,
+        results[0].1,
+        endpoints.len()
+    );
+    let mut out = Vec::with_capacity(endpoints.len());
+    out.push(best.clone());
+    for ep in endpoints {
+        if ep != best {
+            out.push(ep);
+        }
+    }
+    out
+}
+
+fn fstream_ws_endpoints(symbol: &str) -> Vec<String> {
+    if let Ok(raw) = std::env::var("POLYEDGE_BINANCE_FSTREAM_WS_BASES") {
+        let out = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|v| v.starts_with("ws://") || v.starts_with("wss://"))
+            .map(|base| format!("{}/ws/{}@bookTicker", base.trim_end_matches('/'), symbol))
+            .collect::<Vec<_>>();
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    if let Ok(base) = std::env::var("POLYEDGE_BINANCE_FSTREAM_WS_BASE") {
+        if base.starts_with("ws://") || base.starts_with("wss://") {
+            return vec![format!(
+                "{}/ws/{}@bookTicker",
+                base.trim_end_matches('/'),
+                symbol
+            )];
+        }
+    }
+    vec![
+        format!("wss://fstream.binance.com/ws/{}@bookTicker", symbol),
+        format!("wss://fstream1.binance.com/ws/{}@bookTicker", symbol),
+        format!("wss://fstream2.binance.com/ws/{}@bookTicker", symbol),
+    ]
 }
 
 #[cfg(target_os = "linux")]
