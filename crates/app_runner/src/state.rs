@@ -81,8 +81,6 @@ pub(crate) struct FeeRateEntry {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ScoringState {
-    pub(crate) scoring_true: u64,
-    pub(crate) scoring_total: u64,
     pub(crate) rebate_bps_est: f64,
     pub(crate) fetched_at: Instant,
 }
@@ -312,7 +310,6 @@ pub(crate) struct EngineShared {
     pub(crate) fee_cache: Arc<RwLock<HashMap<String, FeeRateEntry>>>,
     pub(crate) fee_refresh_inflight: Arc<RwLock<HashMap<String, Instant>>>,
     pub(crate) scoring_cache: Arc<RwLock<HashMap<String, ScoringState>>>,
-    pub(crate) scoring_refresh_inflight: Arc<RwLock<HashMap<String, Instant>>>,
     pub(crate) http: Client,
     pub(crate) clob_endpoint: String,
     pub(crate) strategy_cfg: Arc<RwLock<Arc<MakerConfig>>>,
@@ -331,7 +328,6 @@ pub(crate) struct EngineShared {
     pub(crate) universe_market_types: Arc<Vec<String>>,
     pub(crate) universe_timeframes: Arc<Vec<String>>,
     pub(crate) rate_limit_rps: f64,
-    pub(crate) scoring_rebate_factor: f64,
     pub(crate) tox_state: Arc<RwLock<HashMap<String, MarketToxicState>>>,
     pub(crate) shadow_stats: Arc<ShadowStats>,
     pub(crate) predator_cfg: Arc<RwLock<PredatorCConfig>>,
@@ -373,6 +369,11 @@ pub(crate) struct StrategyReloadReq {
     pub(crate) variance_penalty_lambda: Option<f64>,
     pub(crate) min_eval_notional_usdc: Option<f64>,
     pub(crate) min_expected_edge_usdc: Option<f64>,
+    pub(crate) v52: Option<V52Config>,
+    pub(crate) v52_time_phase: Option<V52TimePhaseConfig>,
+    pub(crate) v52_execution: Option<V52ExecutionConfig>,
+    pub(crate) v52_dual_arb: Option<V52DualArbConfig>,
+    pub(crate) v52_reversal: Option<V52ReversalConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -446,6 +447,7 @@ pub(crate) struct ExitReloadReq {
 pub(crate) struct StrategyReloadResp {
     pub(crate) maker: MakerConfig,
     pub(crate) fair_value: BasisMrConfig,
+    pub(crate) v52: V52Config,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1526,15 +1528,6 @@ impl ShadowStats {
             .min(u32::MAX as u64) as u32
     }
 
-    pub(crate) async fn window_outcomes_len(&self) -> usize {
-        self.outcomes.read().await.len()
-    }
-
-    pub(crate) async fn push_tick_to_decision_ms(&self, ms: f64) {
-        let mut s = self.samples.write().await;
-        push_capped(&mut s.tick_to_decision_ms, ms, Self::SAMPLE_CAP);
-    }
-
     pub(crate) async fn push_depth_sample(
         &self,
         event_backlog: f64,
@@ -1578,11 +1571,6 @@ impl ShadowStats {
         push_capped(&mut s.decision_queue_wait_ms, ms, Self::SAMPLE_CAP);
     }
 
-    pub(crate) async fn push_decision_compute_ms(&self, ms: f64) {
-        let mut s = self.samples.write().await;
-        push_capped(&mut s.decision_compute_ms, ms, Self::SAMPLE_CAP);
-    }
-
     pub(crate) async fn push_ack_only_ms(&self, ms: f64) {
         let mut s = self.samples.write().await;
         push_capped(&mut s.ack_only_ms, ms, Self::SAMPLE_CAP);
@@ -1609,16 +1597,11 @@ impl ShadowStats {
         push_capped(entry, ms, 4_096);
     }
 
-    // -----------------------------------------------------------------------
-    // A: 自适应 coalesce budget 辅助 — 同步读取 p50 lag（非 async）
-    // 用 try_read() 避免在热路径上引入 await 点；
-    // 锁竞争时返回 None，调用方回退到静态默认值。
-    // -----------------------------------------------------------------------
     pub(crate) fn book_top_lag_p50_ms_for_symbol_sync(&self, symbol: &str) -> Option<f64> {
         let by_symbol = self.book_top_lag_by_symbol_ms.try_read().ok()?;
         let samples = by_symbol.get(symbol)?;
         if samples.len() < 8 {
-            return None; // 样本不足，不可信
+            return None;
         }
         let mut sorted = samples.clone();
         sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -1639,16 +1622,6 @@ impl ShadowStats {
     pub(crate) async fn push_signal_us(&self, us: f64) {
         let mut s = self.samples.write().await;
         push_capped(&mut s.signal_us, us, Self::SAMPLE_CAP);
-    }
-
-    pub(crate) async fn push_quote_us(&self, us: f64) {
-        let mut s = self.samples.write().await;
-        push_capped(&mut s.quote_us, us, Self::SAMPLE_CAP);
-    }
-
-    pub(crate) async fn push_risk_us(&self, us: f64) {
-        let mut s = self.samples.write().await;
-        push_capped(&mut s.risk_us, us, Self::SAMPLE_CAP);
     }
 
     pub(crate) async fn push_shadow_fill_ms(&self, ms: f64) {
@@ -1687,10 +1660,6 @@ impl ShadowStats {
 
     pub(crate) fn mark_candidate(&self) {
         self.candidate_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(crate) fn mark_quoted(&self, n: u64) {
-        self.quoted_count.fetch_add(n, Ordering::Relaxed);
     }
 
     pub(crate) fn mark_eligible(&self) {

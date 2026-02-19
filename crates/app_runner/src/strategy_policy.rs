@@ -214,44 +214,6 @@ pub(super) fn non_risk_gate_relax_ratio() -> f64 {
     })
 }
 
-pub(super) fn adaptive_min_edge_bps(
-    base_min_edge_bps: f64,
-    tox_score: f64,
-    markout_samples: usize,
-    no_quote_rate: f64,
-    markout_10s_p50: f64,
-    markout_10s_p25: f64,
-    window_outcomes: usize,
-    gate_min_outcomes: usize,
-) -> f64 {
-    let relax_ratio = non_risk_gate_relax_ratio();
-    if window_outcomes < gate_min_outcomes {
-        let progress = (window_outcomes as f64 / gate_min_outcomes.max(1) as f64).clamp(0.0, 1.0);
-        let warmup_floor = (base_min_edge_bps * 0.15).max(0.5);
-        let warmup_target = (base_min_edge_bps * 0.50).max(warmup_floor);
-        let mut warmup_edge = warmup_floor + (warmup_target - warmup_floor) * progress;
-        if no_quote_rate > 0.85 {
-            warmup_edge *= 0.80;
-        }
-        return (warmup_edge * relax_ratio).clamp(0.25, base_min_edge_bps.max(0.25));
-    }
-
-    if markout_samples < 20 {
-        return ((base_min_edge_bps * 0.5) * relax_ratio).max(1.0);
-    }
-    let mut out = base_min_edge_bps * (1.0 + tox_score * 0.6);
-    if markout_10s_p50 < 0.0 {
-        out += (-markout_10s_p50) * 0.50;
-    }
-    if markout_10s_p25 < 0.0 {
-        out += (-markout_10s_p25) * 0.35;
-    }
-    if no_quote_rate > 0.95 {
-        out *= 0.9;
-    }
-    (out * relax_ratio).clamp(1.0, base_min_edge_bps * 2.5)
-}
-
 pub(super) fn edge_gate_bps(
     cfg: &EdgeModelConfig,
     tox_score: f64,
@@ -335,85 +297,6 @@ pub(super) async fn timeframe_weight(
     } else {
         (baseline * 1.4).clamp(0.0, 1.0)
     }
-}
-
-pub(super) fn should_force_taker(
-    cfg: &MakerConfig,
-    tox: &ToxicDecision,
-    edge_net_bps: f64,
-    confidence: f64,
-    markout_samples: usize,
-    no_quote_rate: f64,
-    window_outcomes: usize,
-    gate_min_outcomes: usize,
-    symbol: &str,
-) -> bool {
-    let profile = cfg.market_tier_profile.to_ascii_lowercase();
-    let aggressive_profile =
-        profile.contains("taker") || profile.contains("aggressive") || profile.contains("latency");
-
-    let warmup_factor = if window_outcomes < gate_min_outcomes {
-        let progress = (window_outcomes as f64 / gate_min_outcomes.max(1) as f64).clamp(0.0, 1.0);
-        // Lower trigger during warmup so the funnel can collect enough comparable samples.
-        (0.70 + 0.30 * progress).clamp(0.60, 1.0)
-    } else {
-        1.0
-    };
-    let no_quote_factor = if no_quote_rate > 0.90 { 0.85 } else { 1.0 };
-    let mut trigger_bps = cfg.taker_trigger_bps.max(0.0) * warmup_factor * no_quote_factor;
-    if symbol.eq_ignore_ascii_case("SOLUSDT")
-        && (profile.contains("sol_guard") || !aggressive_profile)
-    {
-        trigger_bps *= 1.25;
-    }
-
-    if edge_net_bps < trigger_bps {
-        return false;
-    }
-    if matches!(tox.regime, ToxicRegime::Danger) {
-        return false;
-    }
-
-    if matches!(tox.regime, ToxicRegime::Caution) && !aggressive_profile {
-        return false;
-    }
-
-    let min_conf = if markout_samples < 20 || window_outcomes < gate_min_outcomes {
-        0.45
-    } else {
-        0.55
-    };
-    if confidence < min_conf && !aggressive_profile {
-        return false;
-    }
-
-    true
-}
-
-pub(super) fn adaptive_taker_slippage_bps(
-    base_slippage_bps: f64,
-    market_tier_profile: &str,
-    symbol: &str,
-    markout_samples: usize,
-    no_quote_rate: f64,
-    window_outcomes: usize,
-    gate_min_outcomes: usize,
-) -> f64 {
-    let mut out = base_slippage_bps.max(1.0);
-    let profile = market_tier_profile.to_ascii_lowercase();
-    let aggressive = profile.contains("aggressive") || profile.contains("latency");
-
-    if window_outcomes < gate_min_outcomes || markout_samples < 20 {
-        out *= if no_quote_rate > 0.85 { 1.40 } else { 1.20 };
-    }
-    if aggressive {
-        out *= 1.10;
-    }
-    if symbol.eq_ignore_ascii_case("SOLUSDT") && (profile.contains("sol_guard") || !aggressive) {
-        out *= 0.80;
-    }
-
-    out.clamp(5.0, 60.0)
 }
 
 pub(super) fn should_observe_only_symbol(

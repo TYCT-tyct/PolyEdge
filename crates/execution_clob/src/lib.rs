@@ -263,6 +263,15 @@ impl ClobExecution {
             .sum()
     }
 
+    pub fn has_open_order(&self, order_id: &str) -> bool {
+        self.prune_expired_orders();
+        self.open_orders.read().contains_key(order_id)
+    }
+
+    pub fn mark_order_closed_local(&self, order_id: &str) {
+        self.open_orders.write().remove(order_id);
+    }
+
     /// Best-effort warmup for the internal HTTP client pool. Intended to run on startup so the
     /// first order/ack path doesn't pay DNS+TLS handshake cost.
     pub async fn prewarm_urls(&self, urls: &[String]) {
@@ -469,6 +478,21 @@ impl ExecutionVenue for ClobExecution {
                             continue;
                         }
                         if accepted {
+                            if matches!(intent.tif, core_types::OrderTimeInForce::PostOnly) {
+                                self.open_orders.write().insert(
+                                    order_id.clone(),
+                                    PaperOpenOrder {
+                                        intent: QuoteIntent {
+                                            market_id: intent.market_id.clone(),
+                                            side: intent.side.clone(),
+                                            price: intent.price,
+                                            size: accepted_size.max(0.0),
+                                            ttl_ms: intent.ttl_ms,
+                                        },
+                                        created_at: Instant::now(),
+                                    },
+                                );
+                            }
                             return Ok(OrderAckV2 {
                                 order_id,
                                 market_id: intent.market_id,
@@ -528,6 +552,7 @@ impl ExecutionVenue for ClobExecution {
                         .send()
                         .await?;
                     if res.status().is_success() {
+                        self.open_orders.write().remove(order_id);
                         return Ok(());
                     }
                     last_status = Some(res.status());

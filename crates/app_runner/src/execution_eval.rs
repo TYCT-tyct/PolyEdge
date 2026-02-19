@@ -1,12 +1,10 @@
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
 use core_types::{BookTop, EdgeAttribution, OrderIntentV2, OrderSide, QuoteIntent, ShadowShot};
 use reqwest::Client;
 use serde::Serialize;
 
-use crate::report_io::{append_jsonl, dataset_path};
-use crate::state::{EngineShared, FeeRateEntry, ScoringState};
+use crate::state::{EngineShared, FeeRateEntry};
 use crate::stats_utils::value_to_f64;
 use crate::strategy_policy::estimate_queue_fill_prob;
 use crate::spawn_detached;
@@ -94,87 +92,6 @@ pub(super) async fn maybe_spawn_fee_refresh(
     });
 }
 
-pub(super) async fn maybe_spawn_scoring_refresh(
-    shared: &EngineShared,
-    market_id: &str,
-    order_id: &str,
-    fee_bps: f64,
-    now: Instant,
-    refresh_backoff: Duration,
-) {
-    if market_id.is_empty() || order_id.is_empty() {
-        return;
-    }
-    {
-        let inflight = shared.scoring_refresh_inflight.read().await;
-        if let Some(last_attempt) = inflight.get(market_id) {
-            if now.duration_since(*last_attempt) < refresh_backoff {
-                return;
-            }
-        }
-    }
-    {
-        let mut inflight = shared.scoring_refresh_inflight.write().await;
-        if let Some(last_attempt) = inflight.get(market_id) {
-            if now.duration_since(*last_attempt) < refresh_backoff {
-                return;
-            }
-        }
-        inflight.insert(market_id.to_string(), now);
-    }
-
-    let market = market_id.to_string();
-    let order = order_id.to_string();
-    let http = shared.http.clone();
-    let clob_endpoint = shared.clob_endpoint.clone();
-    let scoring_cache = shared.scoring_cache.clone();
-    let inflight = shared.scoring_refresh_inflight.clone();
-    let rebate_factor = shared.scoring_rebate_factor;
-    spawn_detached("scoring_refresh", false, async move {
-        if let Some((scoring_ok, raw)) = fetch_order_scoring(&http, &clob_endpoint, &order).await {
-            let mut cache = scoring_cache.write().await;
-            let mut entry = cache.get(&market).cloned().unwrap_or(ScoringState {
-                scoring_true: 0,
-                scoring_total: 0,
-                rebate_bps_est: 0.0,
-                fetched_at: Instant::now(),
-            });
-            entry.scoring_total = entry.scoring_total.saturating_add(1);
-            if scoring_ok {
-                entry.scoring_true = entry.scoring_true.saturating_add(1);
-            }
-            let hit_ratio = if entry.scoring_total == 0 {
-                0.0
-            } else {
-                (entry.scoring_true as f64 / entry.scoring_total as f64).clamp(0.0, 1.0)
-            };
-            // Conservative estimate: maker rebates are a fraction of taker fees and depend on
-            // scoring + market share. Default rebate_factor is 0.0 unless explicitly configured.
-            // Cap the pool fraction at 20% of fee_bps as a hard upper bound.
-            entry.rebate_bps_est =
-                (fee_bps.max(0.0) * 0.20 * hit_ratio * rebate_factor).clamp(0.0, fee_bps.max(0.0));
-            entry.fetched_at = Instant::now();
-            let log_row = serde_json::json!({
-                "ts_ms": Utc::now().timestamp_millis(),
-                "market_id": market,
-                "order_id": order,
-                "scoring_ok": scoring_ok,
-                "scoring_true": entry.scoring_true,
-                "scoring_total": entry.scoring_total,
-                "hit_ratio": hit_ratio,
-                "rebate_bps_est": entry.rebate_bps_est,
-                "raw": raw
-            });
-            cache.insert(market.clone(), entry);
-            append_jsonl(
-                &dataset_path("normalized", "scoring_feedback.jsonl"),
-                &log_row,
-            );
-        }
-        inflight.write().await.remove(&market);
-    });
-}
-
 pub(super) async fn fetch_fee_rate_bps(
     http: &Client,
     clob_endpoint: &str,
@@ -206,40 +123,6 @@ pub(super) async fn fetch_fee_rate_bps(
         if candidate.is_some() {
             return candidate;
         }
-    }
-    None
-}
-
-pub(super) async fn fetch_order_scoring(
-    http: &Client,
-    clob_endpoint: &str,
-    order_id: &str,
-) -> Option<(bool, serde_json::Value)> {
-    let base = clob_endpoint.trim_end_matches('/');
-    let endpoints = [
-        format!("{base}/order-scoring?order_id={order_id}"),
-        format!("{base}/order-scoring?orderId={order_id}"),
-        format!("{base}/orders-scoring?order_id={order_id}"),
-    ];
-    for url in endpoints {
-        let Ok(resp) = http.get(&url).send().await else {
-            continue;
-        };
-        let Ok(resp) = resp.error_for_status() else {
-            continue;
-        };
-        let Ok(value) = resp.json::<serde_json::Value>().await else {
-            continue;
-        };
-        let scoring = value
-            .get("scoring")
-            .and_then(|v| v.as_bool())
-            .or_else(|| value.get("is_scoring").and_then(|v| v.as_bool()))
-            .or_else(|| value.get("isScoring").and_then(|v| v.as_bool()))
-            .or_else(|| value.get("eligible").and_then(|v| v.as_bool()))
-            .or_else(|| value.as_bool())
-            .unwrap_or(false);
-        return Some((scoring, value));
     }
     None
 }
@@ -312,7 +195,6 @@ pub(super) fn evaluate_fillable(
         return (false, None, 0.0);
     }
     let queue_fill_prob = estimate_queue_fill_prob(shot, book, latency_ms);
-    // P3: 降低 fillability 门槛从 0.55 到 0.45，允许更多有效机会通过
     if queue_fill_prob < 0.45 {
         return (false, None, queue_fill_prob);
     }
@@ -344,7 +226,6 @@ pub(super) fn classify_unfilled_outcome(
     if spread > 0.05 {
         return EdgeAttribution::SpreadTooWide;
     }
-    // P3: 降低门槛与上面保持一致
     if queue_fill_prob < 0.45 {
         return EdgeAttribution::LatencyTail;
     }

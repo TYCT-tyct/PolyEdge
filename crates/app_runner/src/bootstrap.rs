@@ -182,13 +182,6 @@ pub(super) async fn async_main() -> Result<()> {
     let universe_timeframes = Arc::new(universe_cfg.timeframes.clone());
     init_jsonl_writer(perf_profile.clone()).await;
 
-    let scoring_rebate_factor = std::env::var("POLYEDGE_SCORING_REBATE_FACTOR")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        // Worst-case by default: assume no rebate unless we have hard evidence.
-        .unwrap_or(0.0)
-        .clamp(0.0, 1.0);
-
     let risk_manager = Arc::new(DefaultRiskManager::new(risk_limits.clone()));
     let predator_cfg = Arc::new(RwLock::new(load_predator_c_config()));
     let predator_cfg0 = predator_cfg.read().await.clone();
@@ -225,7 +218,6 @@ pub(super) async fn async_main() -> Result<()> {
         fee_cache: Arc::new(RwLock::new(HashMap::new())),
         fee_refresh_inflight: Arc::new(RwLock::new(HashMap::new())),
         scoring_cache: Arc::new(RwLock::new(HashMap::new())),
-        scoring_refresh_inflight: Arc::new(RwLock::new(HashMap::new())),
         http: Client::new(),
         clob_endpoint: execution_cfg.clob_endpoint.clone(),
         strategy_cfg,
@@ -244,7 +236,6 @@ pub(super) async fn async_main() -> Result<()> {
         universe_market_types: universe_market_types.clone(),
         universe_timeframes: universe_timeframes.clone(),
         rate_limit_rps: execution_cfg.rate_limit_rps.max(0.1),
-        scoring_rebate_factor,
         tox_state,
         shadow_stats,
         predator_cfg: predator_cfg.clone(),

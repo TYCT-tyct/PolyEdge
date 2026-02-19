@@ -1,5 +1,3 @@
-use core_types::{BookTop, ExecutionStyle, OrderSide};
-
 pub(super) fn is_quote_reject_reason(reason: &str) -> bool {
     reason.starts_with("execution_") || reason.starts_with("exchange_reject")
 }
@@ -25,42 +23,6 @@ pub(super) fn is_gate_block_reason(reason: &str) -> bool {
                 | "edge_below_dynamic_gate"
                 | "edge_notional_too_small"
         )
-}
-
-pub(super) fn classify_execution_style(
-    book: &BookTop,
-    intent: &core_types::QuoteIntent,
-) -> ExecutionStyle {
-    match intent.side {
-        OrderSide::BuyYes => {
-            if intent.price >= book.ask_yes {
-                ExecutionStyle::Taker
-            } else {
-                ExecutionStyle::Maker
-            }
-        }
-        OrderSide::SellYes => {
-            if intent.price <= book.bid_yes {
-                ExecutionStyle::Taker
-            } else {
-                ExecutionStyle::Maker
-            }
-        }
-        OrderSide::BuyNo => {
-            if intent.price >= book.ask_no {
-                ExecutionStyle::Taker
-            } else {
-                ExecutionStyle::Maker
-            }
-        }
-        OrderSide::SellNo => {
-            if intent.price <= book.bid_no {
-                ExecutionStyle::Taker
-            } else {
-                ExecutionStyle::Maker
-            }
-        }
-    }
 }
 
 pub(super) fn normalize_reject_code(raw: &str) -> String {

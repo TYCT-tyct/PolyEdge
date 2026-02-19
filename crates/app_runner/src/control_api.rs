@@ -351,6 +351,32 @@ struct PredatorCReloadResp {
     predator_c: PredatorCConfig,
 }
 
+fn normalize_v52_config(v52: &mut V52Config) {
+    v52.time_phase.early_min_ratio = v52.time_phase.early_min_ratio.clamp(0.11, 0.99);
+    v52.time_phase.late_max_ratio = v52.time_phase.late_max_ratio.clamp(0.01, 0.54);
+    if v52.time_phase.late_max_ratio >= v52.time_phase.early_min_ratio {
+        v52.time_phase.late_max_ratio = 0.10;
+        v52.time_phase.early_min_ratio = 0.55;
+    }
+    v52.time_phase.allow_timeframes = v52
+        .time_phase
+        .allow_timeframes
+        .iter()
+        .map(|s| s.to_ascii_lowercase())
+        .filter(|s| s == "5m" || s == "15m")
+        .collect::<Vec<_>>();
+    if v52.time_phase.allow_timeframes.is_empty() {
+        v52.time_phase.allow_timeframes = vec!["5m".to_string(), "15m".to_string()];
+    }
+    v52.execution.late_force_taker_remaining_ms =
+        v52.execution.late_force_taker_remaining_ms.clamp(1_000, 60_000);
+    v52.execution.maker_wait_ms_before_force =
+        v52.execution.maker_wait_ms_before_force.clamp(50, 10_000);
+    v52.dual_arb.safety_margin_bps = v52.dual_arb.safety_margin_bps.clamp(0.0, 100.0);
+    v52.dual_arb.threshold = v52.dual_arb.threshold.clamp(0.50, 1.10);
+    v52.dual_arb.fee_buffer_mode = "conservative_taker".to_string();
+}
+
 async fn reload_predator_c(
     State(state): State<AppState>,
     Json(req): Json<PredatorCReloadReq>,
@@ -398,30 +424,7 @@ async fn reload_predator_c(
     if let Some(v) = req.v52_reversal {
         cfg.v52.reversal = v;
     }
-    cfg.v52.time_phase.early_min_ratio = cfg.v52.time_phase.early_min_ratio.clamp(0.11, 0.99);
-    cfg.v52.time_phase.late_max_ratio = cfg.v52.time_phase.late_max_ratio.clamp(0.01, 0.54);
-    if cfg.v52.time_phase.late_max_ratio >= cfg.v52.time_phase.early_min_ratio {
-        cfg.v52.time_phase.late_max_ratio = 0.10;
-        cfg.v52.time_phase.early_min_ratio = 0.55;
-    }
-    cfg.v52.time_phase.allow_timeframes = cfg
-        .v52
-        .time_phase
-        .allow_timeframes
-        .iter()
-        .map(|s| s.to_ascii_lowercase())
-        .filter(|s| s == "5m" || s == "15m")
-        .collect::<Vec<_>>();
-    if cfg.v52.time_phase.allow_timeframes.is_empty() {
-        cfg.v52.time_phase.allow_timeframes = vec!["5m".to_string(), "15m".to_string()];
-    }
-    cfg.v52.execution.late_force_taker_remaining_ms =
-        cfg.v52.execution.late_force_taker_remaining_ms.clamp(1_000, 60_000);
-    cfg.v52.execution.maker_wait_ms_before_force =
-        cfg.v52.execution.maker_wait_ms_before_force.clamp(50, 10_000);
-    cfg.v52.dual_arb.safety_margin_bps = cfg.v52.dual_arb.safety_margin_bps.clamp(0.0, 100.0);
-    cfg.v52.dual_arb.threshold = cfg.v52.dual_arb.threshold.clamp(0.50, 1.10);
-    cfg.v52.dual_arb.fee_buffer_mode = "conservative_taker".to_string();
+    normalize_v52_config(&mut cfg.v52);
     let snapshot = cfg.clone();
     drop(cfg);
 
@@ -776,9 +779,6 @@ async fn reload_strategy(
     if let Some(v) = req.stale_tick_filter_ms {
         next.stale_tick_filter_ms = v.clamp(50.0, 5_000.0);
     }
-    if let Some(v) = req.market_tier_profile {
-        next.market_tier_profile = v;
-    }
     if let Some(v) = req.capital_fraction_kelly {
         next.capital_fraction_kelly = v.clamp(0.01, 1.0);
     }
@@ -790,6 +790,29 @@ async fn reload_strategy(
     }
     if let Some(v) = req.min_expected_edge_usdc {
         next.min_expected_edge_usdc = v.max(0.0);
+    }
+    let v52_cfg = {
+        let mut predator_cfg = state.shared.predator_cfg.write().await;
+        if let Some(v) = req.v52 {
+            predator_cfg.v52 = v;
+        }
+        if let Some(v) = req.v52_time_phase {
+            predator_cfg.v52.time_phase = v;
+        }
+        if let Some(v) = req.v52_execution {
+            predator_cfg.v52.execution = v;
+        }
+        if let Some(v) = req.v52_dual_arb {
+            predator_cfg.v52.dual_arb = v;
+        }
+        if let Some(v) = req.v52_reversal {
+            predator_cfg.v52.reversal = v;
+        }
+        normalize_v52_config(&mut predator_cfg.v52);
+        predator_cfg.v52.clone()
+    };
+    if let Some(v) = req.market_tier_profile {
+        next.market_tier_profile = v;
     }
     let mut fair_cfg = state
         .fair_value_cfg
@@ -815,12 +838,14 @@ async fn reload_strategy(
         &serde_json::json!({
             "ts_ms": Utc::now().timestamp_millis(),
             "maker": maker_cfg,
-            "fair_value": fair_cfg
+            "fair_value": fair_cfg,
+            "v52": v52_cfg
         }),
     );
     Json(StrategyReloadResp {
         maker: maker_cfg,
         fair_value: fair_cfg,
+        v52: v52_cfg,
     })
 }
 

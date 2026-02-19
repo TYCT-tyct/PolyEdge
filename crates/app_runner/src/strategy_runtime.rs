@@ -100,6 +100,19 @@ pub(crate) fn allow_dual_side_arb(
     yes_price + no_price + fee_buffer + safety_margin < cfg.threshold
 }
 
+fn side_to_direction(side: &OrderSide) -> Direction {
+    match side {
+        OrderSide::BuyYes | OrderSide::SellNo => Direction::Up,
+        OrderSide::BuyNo | OrderSide::SellYes => Direction::Down,
+    }
+}
+
+fn direction_signal_for_side(base: &DirectionSignal, side: &OrderSide) -> DirectionSignal {
+    let mut out = base.clone();
+    out.direction = side_to_direction(side);
+    out
+}
+
 pub(crate) fn should_force_taker_fallback(
     phase: TimePhase,
     time_to_expiry_ms: i64,
@@ -459,8 +472,6 @@ pub(super) async fn run_predator_c_for_symbol(
         (0.0, predator_cfg.compounder.initial_capital_usdc.max(0.0))
     };
 
-    // Build candidate opportunities using cached fair values per market (do NOT call fair.evaluate
-    // here; the fair model is stateful per symbol and would be advanced multiple times).
     #[derive(Debug, Clone)]
     struct PredatorCandIn {
         market_id: String,
@@ -472,6 +483,7 @@ pub(super) async fn run_predator_c_for_symbol(
         edge_gross_bps: f64,
         edge_net_bps: f64,
         size: f64,
+        dual_pair: bool,
     }
 
     let market_ids = market_ids.into_iter().take(32).collect::<Vec<_>>();
@@ -490,7 +502,7 @@ pub(super) async fn run_predator_c_for_symbol(
             .collect::<HashMap<String, BookTop>>()
     };
 
-    let mut cand_inputs = Vec::<PredatorCandIn>::new();
+    let mut cand_inputs_by_market: HashMap<String, Vec<PredatorCandIn>> = HashMap::new();
     for market_id in market_ids {
         let Some(timeframe) = tf_by_market.get(&market_id).cloned() else {
             continue;
@@ -573,17 +585,6 @@ pub(super) async fn run_predator_c_for_symbol(
                 .mark_blocked_with_reason("dual_arb_gate_blocked")
                 .await;
         }
-        let (side, entry_price, edge_gross_bps, edge_net_bps) = if no_edge_net > yes_edge_net {
-            (OrderSide::BuyNo, no_price, no_edge_gross, no_edge_net)
-        } else {
-            (OrderSide::BuyYes, yes_price, yes_edge_gross, yes_edge_net)
-        };
-        let spread = spread_for_side(&book, &side);
-        let base_size = if predator_cfg.compounder.enabled {
-            (quote_notional_usdc / entry_price.max(1e-6)).max(0.01)
-        } else {
-            maker_cfg.base_quote_size.max(0.01)
-        };
         let tf_weight = tf_weights
             .get(&timeframe)
             .copied()
@@ -597,31 +598,95 @@ pub(super) async fn run_predator_c_for_symbol(
             TimePhase::Maturity => 1.0,
             TimePhase::Late => 1.25,
         };
-        let size = (base_size * tf_weight * phase_size_scale).max(0.01);
-
-        cand_inputs.push(PredatorCandIn {
-            market_id,
-            timeframe,
-            side,
-            entry_price,
-            spread,
-            fee_bps,
-            edge_gross_bps,
-            edge_net_bps,
-            size,
-        });
+        let side_size_scale = (tf_weight * phase_size_scale).max(0.0);
+        let mk_size = |entry_price: f64| {
+            let base_size = if predator_cfg.compounder.enabled {
+                (quote_notional_usdc / entry_price.max(1e-6)).max(0.01)
+            } else {
+                maker_cfg.base_quote_size.max(0.01)
+            };
+            (base_size * side_size_scale).max(0.01)
+        };
+        let push_candidate = |bucket: &mut Vec<PredatorCandIn>,
+                              side: OrderSide,
+                              entry_price: f64,
+                              spread: f64,
+                              edge_gross_bps: f64,
+                              edge_net_bps: f64,
+                              dual_pair: bool| {
+            bucket.push(PredatorCandIn {
+                market_id: market_id.clone(),
+                timeframe: timeframe.clone(),
+                side,
+                entry_price,
+                spread,
+                fee_bps,
+                edge_gross_bps,
+                edge_net_bps,
+                size: mk_size(entry_price),
+                dual_pair,
+            });
+        };
+        let bucket = cand_inputs_by_market.entry(market_id.clone()).or_default();
+        if dual_arb_ok && yes_edge_net > 0.0 && no_edge_net > 0.0 {
+            push_candidate(
+                bucket,
+                OrderSide::BuyYes,
+                yes_price,
+                spread_for_side(&book, &OrderSide::BuyYes),
+                yes_edge_gross,
+                yes_edge_net,
+                true,
+            );
+            push_candidate(
+                bucket,
+                OrderSide::BuyNo,
+                no_price,
+                spread_for_side(&book, &OrderSide::BuyNo),
+                no_edge_gross,
+                no_edge_net,
+                true,
+            );
+        } else {
+            let (side, entry_price, edge_gross_bps, edge_net_bps) = if no_edge_net > yes_edge_net {
+                (OrderSide::BuyNo, no_price, no_edge_gross, no_edge_net)
+            } else {
+                (OrderSide::BuyYes, yes_price, yes_edge_gross, yes_edge_net)
+            };
+            push_candidate(
+                bucket,
+                side.clone(),
+                entry_price,
+                spread_for_side(&book, &side),
+                edge_gross_bps,
+                edge_net_bps,
+                false,
+            );
+        }
     }
 
     let mut fire_plans_by_market: HashMap<String, FirePlan> = HashMap::new();
+    let mut dual_fire_pairs: Vec<(FirePlan, FirePlan)> = Vec::new();
     let mut skip_reasons: Vec<String> = Vec::new();
     {
         let mut sniper = shared.predator_taker_sniper.write().await;
-        for cin in cand_inputs {
-            let decision = sniper.evaluate(&taker_sniper::EvaluateCtx {
+        let normalize_plan = |mut plan: FirePlan, cin: &PredatorCandIn| {
+            plan.opportunity.side = cin.side.clone();
+            plan.opportunity.direction = side_to_direction(&cin.side);
+            plan.opportunity.entry_price = cin.entry_price;
+            plan.opportunity.edge_gross_bps = cin.edge_gross_bps;
+            plan.opportunity.edge_net_bps = cin.edge_net_bps;
+            plan.opportunity.ts_ms = now_ms;
+            plan
+        };
+        let evaluate = |sn: &mut taker_sniper::TakerSniper,
+                        cin: &PredatorCandIn,
+                        sig: &DirectionSignal| {
+            sn.evaluate(&taker_sniper::EvaluateCtx {
                 market_id: &cin.market_id,
                 symbol,
                 timeframe: cin.timeframe.clone(),
-                direction_signal: &direction_signal,
+                direction_signal: sig,
                 entry_price: cin.entry_price,
                 spread: cin.spread,
                 fee_bps: cin.fee_bps,
@@ -629,26 +694,72 @@ pub(super) async fn run_predator_c_for_symbol(
                 edge_net_bps: cin.edge_net_bps,
                 size: cin.size,
                 now_ms,
+            })
+        };
+        for (_, mut cands) in cand_inputs_by_market {
+            if cands.is_empty() {
+                continue;
+            }
+            cands.sort_by(|a, b| {
+                b.edge_net_bps
+                    .partial_cmp(&a.edge_net_bps)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
+            let dual_eligible = cands.len() == 2 && cands.iter().all(|c| c.dual_pair);
+            if dual_eligible {
+                let mut dry_cfg = sniper.cfg().clone();
+                dry_cfg.cooldown_ms_per_market = 0;
+                let mut dry_sniper = taker_sniper::TakerSniper::new(dry_cfg);
+
+                let primary = &cands[0];
+                let hedge = &cands[1];
+                let primary_sig = direction_signal_for_side(&direction_signal, &primary.side);
+                let hedge_sig = direction_signal_for_side(&direction_signal, &hedge.side);
+
+                let primary_probe = evaluate(&mut dry_sniper, primary, &primary_sig);
+                let hedge_probe = evaluate(&mut dry_sniper, hedge, &hedge_sig);
+                if matches!(primary_probe.action, TakerAction::Fire)
+                    && matches!(hedge_probe.action, TakerAction::Fire)
+                {
+                    let primary_live = evaluate(&mut sniper, primary, &primary_sig);
+                    match primary_live.action {
+                        TakerAction::Fire => {
+                            if let (Some(primary_plan), Some(hedge_plan)) =
+                                (primary_live.fire_plan, hedge_probe.fire_plan)
+                            {
+                                dual_fire_pairs.push((
+                                    normalize_plan(primary_plan, primary),
+                                    normalize_plan(hedge_plan, hedge),
+                                ));
+                                continue;
+                            }
+                            skip_reasons.push("dual_arb_plan_missing".to_string());
+                        }
+                        TakerAction::Skip => {
+                            skip_reasons.push(primary_live.reason);
+                        }
+                    }
+                } else {
+                    if matches!(primary_probe.action, TakerAction::Skip) {
+                        skip_reasons.push(primary_probe.reason);
+                    }
+                    if matches!(hedge_probe.action, TakerAction::Skip) {
+                        skip_reasons.push(hedge_probe.reason);
+                    }
+                }
+            }
+
+            let best = &cands[0];
+            let best_sig = direction_signal_for_side(&direction_signal, &best.side);
+            let decision = evaluate(&mut sniper, best, &best_sig);
             match decision.action {
                 TakerAction::Fire => {
                     if let Some(plan) = decision.fire_plan {
-                        let mut plan = plan;
-                        plan.opportunity.side = cin.side.clone();
-                        plan.opportunity.direction = match cin.side {
-                            OrderSide::BuyYes | OrderSide::SellNo => Direction::Up,
-                            OrderSide::BuyNo | OrderSide::SellYes => Direction::Down,
-                        };
-                        plan.opportunity.entry_price = cin.entry_price;
-                        plan.opportunity.edge_gross_bps = cin.edge_gross_bps;
-                        plan.opportunity.edge_net_bps = cin.edge_net_bps;
-                        plan.opportunity.ts_ms = now_ms;
+                        let plan = normalize_plan(plan, best);
                         fire_plans_by_market.insert(plan.opportunity.market_id.clone(), plan);
                     }
                 }
-                TakerAction::Skip => {
-                    skip_reasons.push(decision.reason);
-                }
+                TakerAction::Skip => skip_reasons.push(decision.reason),
             }
         }
     }
@@ -663,6 +774,9 @@ pub(super) async fn run_predator_c_for_symbol(
         let quiet_min_edge = predator_cfg.taker_sniper.min_edge_net_bps.max(0.0)
             * predator_cfg.regime.quiet_min_edge_multiplier.max(1.0);
         fire_plans_by_market.retain(|_, plan| plan.opportunity.edge_net_bps >= quiet_min_edge);
+        dual_fire_pairs.retain(|(a, b)| {
+            a.opportunity.edge_net_bps >= quiet_min_edge && b.opportunity.edge_net_bps >= quiet_min_edge
+        });
         let chunk_scale = predator_cfg.regime.quiet_chunk_scale.clamp(0.05, 1.0);
         for plan in fire_plans_by_market.values_mut() {
             let len = plan.chunks.len();
@@ -676,15 +790,30 @@ pub(super) async fn run_predator_c_for_symbol(
                 first.send_delay_ms = 0;
             }
         }
+        for (plan_a, plan_b) in dual_fire_pairs.iter_mut() {
+            for plan in [plan_a, plan_b] {
+                let len = plan.chunks.len();
+                if len <= 1 {
+                    continue;
+                }
+                let keep = ((len as f64) * chunk_scale).ceil() as usize;
+                let keep = keep.clamp(1, len);
+                plan.chunks.truncate(keep);
+                if let Some(first) = plan.chunks.first_mut() {
+                    first.send_delay_ms = 0;
+                }
+            }
+        }
     }
 
-    if fire_plans_by_market.is_empty() {
+    if fire_plans_by_market.is_empty() && dual_fire_pairs.is_empty() {
         return PredatorExecResult::default();
     }
 
-    // Router selects + locks.
     let mut locked_plans: Vec<FirePlan> = Vec::new();
+    let mut locked_dual_pairs: Vec<(FirePlan, FirePlan)> = Vec::new();
     let mut locked_by_tf_usdc: HashMap<String, f64> = HashMap::new();
+    let mut router_skip_reasons: Vec<String> = Vec::new();
     {
         let mut router = shared.predator_router.write().await;
         let selected = router.route(
@@ -702,68 +831,45 @@ pub(super) async fn run_predator_c_for_symbol(
                 }
             }
         }
+        for (plan_a, plan_b) in dual_fire_pairs {
+            let notional = (plan_a.opportunity.entry_price.max(0.0) * plan_a.opportunity.size.max(0.0))
+                + (plan_b.opportunity.entry_price.max(0.0) * plan_b.opportunity.size.max(0.0));
+            if notional <= 0.0 {
+                continue;
+            }
+            let mut lock_opp = if plan_a.opportunity.edge_net_bps >= plan_b.opportunity.edge_net_bps {
+                plan_a.opportunity.clone()
+            } else {
+                plan_b.opportunity.clone()
+            };
+            lock_opp.entry_price = 1.0;
+            lock_opp.size = notional.max(0.01);
+            if router.lock(&lock_opp, now_ms) {
+                locked_dual_pairs.push((plan_a, plan_b));
+            } else {
+                router_skip_reasons.push("dual_arb_router_lock_blocked".to_string());
+            }
+        }
         for (tf, v) in router.locked_by_tf_usdc(now_ms) {
             locked_by_tf_usdc.insert(tf.to_string(), v);
         }
+    }
+    for reason in router_skip_reasons {
+        shared
+            .shadow_stats
+            .mark_predator_taker_skipped(reason.as_str())
+            .await;
     }
     shared
         .shadow_stats
         .set_predator_router_locked_by_tf_usdc(locked_by_tf_usdc)
         .await;
 
-    if locked_plans.is_empty() {
+    if locked_plans.is_empty() && locked_dual_pairs.is_empty() {
         return PredatorExecResult::default();
     }
 
-    // -----------------------------------------------------------------------
-    // E: 多市场并发执行 — HTTP/2 多路复用，locked_plans 并发发射
-    // 每个 plan 内部的 chunks 仍然串行（保留 send_delay_ms 语义），
-    // 但不同市场的 plan 之间完全并发，共享同一 TCP 连接的多个 H2 stream。
-    // 风险检查（router.lock）已在上方串行完成，此处只做 IO。
-    // -----------------------------------------------------------------------
-    let mut out = PredatorExecResult::default();
-
-    // 单市场快路径：避免 join_all 开销
-    if locked_plans.len() == 1 {
-        let plan = locked_plans.into_iter().next().unwrap();
-        let opp = &plan.opportunity;
-        for (idx, chunk) in plan.chunks.iter().enumerate() {
-            if chunk.size <= 0.0 {
-                continue;
-            }
-            if idx > 0 && chunk.send_delay_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(chunk.send_delay_ms)).await;
-            }
-            shared.shadow_stats.mark_predator_taker_fired();
-            let res = predator_execute_opportunity(
-                shared,
-                bus,
-                portfolio,
-                execution,
-                shadow,
-                market_rate_budget,
-                global_rate_budget,
-                &maker_cfg,
-                predator_cfg,
-                &direction_signal,
-                opp,
-                chunk.size,
-                tick_fast_recv_ts_ms,
-                tick_fast_recv_ts_local_ns,
-                now_ms,
-            )
-            .await;
-            out.attempted = out.attempted.saturating_add(res.attempted);
-            out.executed = out.executed.saturating_add(res.executed);
-            if plan.stop_on_reject && res.stop_firing {
-                break;
-            }
-        }
-        return out;
-    }
-
-    // 多市场并发路径：每个 plan 独立 async 块，join_all 并发等待
-    let plan_futures: Vec<_> = locked_plans
+    let single_futures: Vec<_> = locked_plans
         .into_iter()
         .map(|plan| {
             let shared = shared.clone();
@@ -772,57 +878,153 @@ pub(super) async fn run_predator_c_for_symbol(
             let execution = execution.clone();
             let shadow = shadow.clone();
             let maker_cfg = maker_cfg.clone();
-            let direction_signal = direction_signal.clone();
-            // 注意: rate_budget 在并发前已经通过 router.lock 扣除，
-            // 此处传入独立副本（每个市场独立限速桶）
+            let direction_signal = direction_signal_for_side(&direction_signal, &plan.opportunity.side);
             let mut market_rate_budget_local = market_rate_budget.clone();
             let mut global_rate_budget_local = global_rate_budget.clone();
             async move {
-                let mut plan_result = PredatorExecResult::default();
-                let opp = &plan.opportunity;
-                for (idx, chunk) in plan.chunks.iter().enumerate() {
-                    if chunk.size <= 0.0 {
-                        continue;
-                    }
-                    if idx > 0 && chunk.send_delay_ms > 0 {
-                        tokio::time::sleep(Duration::from_millis(chunk.send_delay_ms)).await;
-                    }
-                    shared.shadow_stats.mark_predator_taker_fired();
-                    let res = predator_execute_opportunity(
-                        &shared,
-                        &bus,
-                        &portfolio,
-                        &execution,
-                        &shadow,
-                        &mut market_rate_budget_local,
-                        &mut global_rate_budget_local,
-                        &maker_cfg,
-                        predator_cfg,
-                        &direction_signal,
-                        opp,
-                        chunk.size,
-                        tick_fast_recv_ts_ms,
-                        tick_fast_recv_ts_local_ns,
-                        now_ms,
-                    )
-                    .await;
-                    plan_result.attempted = plan_result.attempted.saturating_add(res.attempted);
-                    plan_result.executed = plan_result.executed.saturating_add(res.executed);
-                    if plan.stop_on_reject && res.stop_firing {
-                        break;
-                    }
-                }
-                plan_result
+                execute_fire_plan(
+                    &shared,
+                    &bus,
+                    &portfolio,
+                    &execution,
+                    &shadow,
+                    &mut market_rate_budget_local,
+                    &mut global_rate_budget_local,
+                    &maker_cfg,
+                    predator_cfg,
+                    &direction_signal,
+                    &plan,
+                    tick_fast_recv_ts_ms,
+                    tick_fast_recv_ts_local_ns,
+                    now_ms,
+                )
+                .await
             }
         })
         .collect();
 
-    let results = futures::future::join_all(plan_futures).await;
-    for r in results {
+    let mut out = PredatorExecResult::default();
+    for r in futures::future::join_all(single_futures).await {
+        out.attempted = out.attempted.saturating_add(r.attempted);
+        out.executed = out.executed.saturating_add(r.executed);
+    }
+
+    let dual_futures: Vec<_> = locked_dual_pairs
+        .into_iter()
+        .map(|(plan_a, plan_b)| {
+            let shared = shared.clone();
+            let bus = bus.clone();
+            let portfolio = portfolio.clone();
+            let execution = execution.clone();
+            let shadow = shadow.clone();
+            let maker_cfg = maker_cfg.clone();
+            let dir_a = direction_signal_for_side(&direction_signal, &plan_a.opportunity.side);
+            let dir_b = direction_signal_for_side(&direction_signal, &plan_b.opportunity.side);
+            let mut market_rate_budget_local_a = market_rate_budget.clone();
+            let mut global_rate_budget_local_a = global_rate_budget.clone();
+            let mut market_rate_budget_local_b = market_rate_budget.clone();
+            let mut global_rate_budget_local_b = global_rate_budget.clone();
+            async move {
+                let leg_a = execute_fire_plan(
+                    &shared,
+                    &bus,
+                    &portfolio,
+                    &execution,
+                    &shadow,
+                    &mut market_rate_budget_local_a,
+                    &mut global_rate_budget_local_a,
+                    &maker_cfg,
+                    predator_cfg,
+                    &dir_a,
+                    &plan_a,
+                    tick_fast_recv_ts_ms,
+                    tick_fast_recv_ts_local_ns,
+                    now_ms,
+                );
+                let leg_b = execute_fire_plan(
+                    &shared,
+                    &bus,
+                    &portfolio,
+                    &execution,
+                    &shadow,
+                    &mut market_rate_budget_local_b,
+                    &mut global_rate_budget_local_b,
+                    &maker_cfg,
+                    predator_cfg,
+                    &dir_b,
+                    &plan_b,
+                    tick_fast_recv_ts_ms,
+                    tick_fast_recv_ts_local_ns,
+                    now_ms,
+                );
+                let (res_a, res_b) = tokio::join!(leg_a, leg_b);
+                PredatorExecResult {
+                    attempted: res_a.attempted.saturating_add(res_b.attempted),
+                    executed: res_a.executed.saturating_add(res_b.executed),
+                    stop_firing: res_a.stop_firing || res_b.stop_firing,
+                }
+            }
+        })
+        .collect();
+
+    for r in futures::future::join_all(dual_futures).await {
         out.attempted = out.attempted.saturating_add(r.attempted);
         out.executed = out.executed.saturating_add(r.executed);
     }
     out
+}
+
+async fn execute_fire_plan(
+    shared: &Arc<EngineShared>,
+    bus: &RingBus<EngineEvent>,
+    portfolio: &Arc<PortfolioBook>,
+    execution: &Arc<ClobExecution>,
+    shadow: &Arc<ShadowExecutor>,
+    market_rate_budget: &mut HashMap<String, TokenBucket>,
+    global_rate_budget: &mut TokenBucket,
+    maker_cfg: &MakerConfig,
+    predator_cfg: &PredatorCConfig,
+    direction_signal: &DirectionSignal,
+    plan: &FirePlan,
+    tick_fast_recv_ts_ms: i64,
+    tick_fast_recv_ts_local_ns: i64,
+    now_ms: i64,
+) -> PredatorExecResult {
+    let mut plan_result = PredatorExecResult::default();
+    let opp = &plan.opportunity;
+    for (idx, chunk) in plan.chunks.iter().enumerate() {
+        if chunk.size <= 0.0 {
+            continue;
+        }
+        if idx > 0 && chunk.send_delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(chunk.send_delay_ms)).await;
+        }
+        shared.shadow_stats.mark_predator_taker_fired();
+        let res = predator_execute_opportunity(
+            shared,
+            bus,
+            portfolio,
+            execution,
+            shadow,
+            market_rate_budget,
+            global_rate_budget,
+            maker_cfg,
+            predator_cfg,
+            direction_signal,
+            opp,
+            chunk.size,
+            tick_fast_recv_ts_ms,
+            tick_fast_recv_ts_local_ns,
+            now_ms,
+        )
+        .await;
+        plan_result.attempted = plan_result.attempted.saturating_add(res.attempted);
+        plan_result.executed = plan_result.executed.saturating_add(res.executed);
+        if plan.stop_on_reject && res.stop_firing {
+            break;
+        }
+    }
+    plan_result
 }
 
 pub(super) async fn run_predator_d_for_symbol(
@@ -1494,9 +1696,6 @@ pub(super) async fn predator_execute_opportunity(
                 intent.price,
                 intent.size,
                 maker_cfg.ttl_ms,
-                // 入场时 Binance 公允价值: PM 价 + gap
-                // 公式: fair = pm_entry + edge_gross_bps/10000
-                // 这是入场时套利空间的上界，用于收敛比例计算
                 intent.price + opp.edge_gross_bps / 10_000.0,
             );
 

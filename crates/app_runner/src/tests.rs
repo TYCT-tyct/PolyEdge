@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use core_types::{
     new_id, BookTop, ControlCommand, Direction, DirectionSignal, EngineEvent, ExecutionStyle,
-    ExecutionVenue, OrderIntentV2, OrderSide, OrderTimeInForce, QuoteIntent, RefTick, Regime,
+    ExecutionVenue, OrderIntentV2, OrderSide, OrderTimeInForce, RefTick, Regime,
     Stage,
     Signal, SourceHealth, TimeframeClass, ToxicDecision, ToxicRegime,
 };
@@ -28,7 +28,7 @@ use tokio::sync::RwLock;
 use tokio::time::{sleep, timeout};
 
 use crate::config_loader::parse_toml_array_for_key;
-use crate::engine_core::{classify_execution_style, normalize_reject_code};
+use crate::engine_core::normalize_reject_code;
 use crate::execution_eval::prebuild_order_payload;
 use crate::spawn_predator_exit_lifecycle;
 use crate::feed_runtime::{blend_settlement_probability, build_source_health_snapshot, SourceRuntimeStats};
@@ -44,9 +44,7 @@ use crate::state::{
     V52ExecutionConfig, V52TimePhaseConfig,
 };
 use crate::stats_utils::{now_ns, percentile, policy_block_ratio, quote_block_ratio, robust_filter_iqr};
-use crate::strategy_policy::{
-    adaptive_min_edge_bps, is_market_in_top_n, should_force_taker, should_observe_only_symbol,
-};
+use crate::strategy_policy::{is_market_in_top_n, should_observe_only_symbol};
 use crate::strategy_runtime::{
     allow_dual_side_arb, classify_predator_regime, classify_time_phase, should_force_taker_fallback,
     stage_for_phase, timeframe_total_ms, TimePhase,
@@ -107,7 +105,6 @@ fn test_engine_shared_with_wss() -> (
         fee_cache: Arc::new(RwLock::new(HashMap::new())),
         fee_refresh_inflight: Arc::new(RwLock::new(HashMap::new())),
         scoring_cache: Arc::new(RwLock::new(HashMap::new())),
-        scoring_refresh_inflight: Arc::new(RwLock::new(HashMap::new())),
         http: Client::new(),
         clob_endpoint: "http://127.0.0.1:0".to_string(),
         strategy_cfg,
@@ -126,7 +123,6 @@ fn test_engine_shared_with_wss() -> (
         universe_market_types: Arc::new(vec!["updown".to_string()]),
         universe_timeframes: Arc::new(vec!["5m".to_string(), "15m".to_string()]),
         rate_limit_rps: 20.0,
-        scoring_rebate_factor: 0.0,
         tox_state: Arc::new(RwLock::new(HashMap::new())),
         shadow_stats: Arc::new(ShadowStats::new()),
         predator_cfg,
@@ -258,40 +254,6 @@ fn fusion_default_stays_safe_baseline() {
     assert!(cfg.enable_udp);
     assert!(cfg.udp_share_cap > 0.0 && cfg.udp_share_cap <= 1.0);
     assert!(cfg.jitter_threshold_ms >= 1.0);
-}
-
-#[test]
-fn classify_execution_style_for_yes_side() {
-    let book = BookTop {
-        market_id: "m".to_string(),
-        token_id_yes: "yes".to_string(),
-        token_id_no: "no".to_string(),
-        bid_yes: 0.49,
-        ask_yes: 0.51,
-        bid_no: 0.49,
-        ask_no: 0.51,
-        ts_ms: 1,
-        recv_ts_local_ns: 1_000_000,
-    };
-    let maker = QuoteIntent {
-        market_id: "m".to_string(),
-        side: OrderSide::BuyYes,
-        price: 0.50,
-        size: 1.0,
-        ttl_ms: 300,
-    };
-    let taker = QuoteIntent {
-        price: 0.51,
-        ..maker.clone()
-    };
-    assert_eq!(
-        classify_execution_style(&book, &maker),
-        ExecutionStyle::Maker
-    );
-    assert_eq!(
-        classify_execution_style(&book, &taker),
-        ExecutionStyle::Taker
-    );
 }
 
 #[test]
@@ -615,51 +577,6 @@ fn upsert_latest_tick_slot_reports_source_switch_delta() {
     assert!(first_delta.is_none());
     let second_delta = upsert_latest_tick_slot(&ticks, second, should_replace_ref_tick);
     assert_eq!(second_delta, Some(400_000));
-}
-
-#[test]
-fn should_force_taker_respects_profile_and_regime() {
-    let mut cfg = MakerConfig::default();
-    cfg.taker_trigger_bps = 10.0;
-    cfg.market_tier_profile = "balanced".to_string();
-
-    let safe = ToxicDecision {
-        market_id: "m".to_string(),
-        symbol: "BTCUSDT".to_string(),
-        tox_score: 0.1,
-        regime: ToxicRegime::Safe,
-        reason_codes: vec![],
-        ts_ns: 1,
-    };
-    assert!(should_force_taker(
-        &cfg, &safe, 12.0, 0.8, 30, 0.1, 40, 30, "BTCUSDT"
-    ));
-    assert!(!should_force_taker(
-        &cfg, &safe, 8.0, 0.8, 30, 0.1, 40, 30, "BTCUSDT"
-    ));
-    assert!(!should_force_taker(
-        &cfg, &safe, 12.0, 0.4, 30, 0.1, 40, 30, "BTCUSDT"
-    ));
-
-    let caution = ToxicDecision {
-        regime: ToxicRegime::Caution,
-        ..safe.clone()
-    };
-    assert!(!should_force_taker(
-        &cfg, &caution, 12.0, 0.8, 30, 0.1, 40, 30, "BTCUSDT"
-    ));
-    cfg.market_tier_profile = "latency_aggressive".to_string();
-    assert!(should_force_taker(
-        &cfg, &caution, 12.0, 0.8, 30, 0.1, 40, 30, "BTCUSDT"
-    ));
-}
-
-#[test]
-fn adaptive_min_edge_bps_warmup_relaxes_threshold() {
-    let relaxed = adaptive_min_edge_bps(5.0, 0.3, 0, 0.95, 0.0, 0.0, 0, 30);
-    assert!(relaxed <= 1.0);
-    let progressed = adaptive_min_edge_bps(5.0, 0.3, 0, 0.20, 0.0, 0.0, 25, 30);
-    assert!(progressed >= relaxed);
 }
 
 #[test]

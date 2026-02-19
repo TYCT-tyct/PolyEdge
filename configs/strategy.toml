@@ -173,6 +173,26 @@ min_quote_size = 1.0
 # For micro-live: loss <= -1U triggers pause+flatten (enforced only when live-armed).
 daily_loss_cap_usdc = 1.0
 
+[v52.time_phase]
+early_min_ratio = 0.55
+late_max_ratio = 0.10
+allow_timeframes = ["5m", "15m"]
+
+[v52.execution]
+late_force_taker_remaining_ms = 30000
+maker_wait_ms_before_force = 800
+apply_force_taker_in_maturity = true
+apply_force_taker_in_late = true
+
+[v52.dual_arb]
+enabled = true
+safety_margin_bps = 3.0
+threshold = 0.99
+fee_buffer_mode = "conservative_taker"
+
+[v52.reversal]
+same_market_opposite_first = true
+
 [transport]
 # Production baseline: direct-only transport.
 mode = "direct_only"
