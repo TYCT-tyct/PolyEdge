@@ -140,6 +140,9 @@ def collect_engine_series(
         "survival_probe_25ms_n": [],
         "fillability_10ms": [],
         "window_outcomes": [],
+        "udp_share_effective": [],
+        "udp_local_drop_count": [],
+        "share_cap_drop_count": [],
     }
 
     while time.time() < deadline:
@@ -164,6 +167,9 @@ def collect_engine_series(
             push("ev_net_usdc_p50", live.get("ev_net_usdc_p50"))
             push("ev_positive_ratio", live.get("ev_positive_ratio"))
             push("window_outcomes", live.get("window_outcomes"))
+            push("udp_share_effective", live.get("udp_share_effective"))
+            push("udp_local_drop_count", live.get("udp_local_drop_count"))
+            push("share_cap_drop_count", live.get("share_cap_drop_count"))
             push("survival_5ms", live.get("survival_5ms"))
             push("survival_10ms", live.get("survival_10ms"))
             push("survival_25ms", live.get("survival_25ms"))
@@ -214,6 +220,13 @@ def collect_engine_series(
             "source_mix_ratio": (last_live or {}).get("source_mix_ratio"),
             "source_health": (last_live or {}).get("source_health"),
             "last_30s_taker_fallback_count": (last_live or {}).get("last_30s_taker_fallback_count"),
+            "udp_share_effective": (last_live or {}).get("udp_share_effective"),
+            "udp_local_drop_count": (last_live or {}).get("udp_local_drop_count"),
+            "share_cap_drop_count": (last_live or {}).get("share_cap_drop_count"),
+            "fallback_state": (last_live or {}).get("fallback_state"),
+            "fallback_trigger_reason_distribution": (last_live or {}).get(
+                "fallback_trigger_reason_distribution"
+            ),
         },
     }
 
