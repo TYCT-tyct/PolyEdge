@@ -105,6 +105,7 @@ fn init_schema(conn: &Connection) -> anyhow::Result<()> {
             bankroll_before REAL NOT NULL,
             bankroll_after REAL NOT NULL,
             settlement_price REAL NOT NULL,
+            chainlink_settlement_price REAL NULL,
             settlement_source TEXT NOT NULL,
             forced_settlement INTEGER NOT NULL,
             trade_duration_ms INTEGER NOT NULL,
@@ -151,6 +152,10 @@ fn init_schema(conn: &Connection) -> anyhow::Result<()> {
         );
         "#,
     )?;
+    let _ = conn.execute(
+        "ALTER TABLE paper_records ADD COLUMN chainlink_settlement_price REAL NULL",
+        [],
+    );
     Ok(())
 }
 
@@ -162,14 +167,14 @@ fn insert_trade(conn: &Connection, r: &PaperTradeRecord) -> anyhow::Result<()> {
             velocity_bps_per_sec, edge_bps, prob_fast, prob_settle, confidence, action, intent,
             requested_size_usdc, executed_size_usdc, entry_price, fill_price, slippage_bps,
             fee_usdc, realized_pnl_usdc, bankroll_before, bankroll_after, settlement_price,
-            settlement_source, forced_settlement, trade_duration_ms, seat_layer,
+            chainlink_settlement_price, settlement_source, forced_settlement, trade_duration_ms, seat_layer,
             tuned_params_before, tuned_params_after, rollback_triggered, shadow_pnl_comparison
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?,
-            ?, ?, ?, ?,
+            ?, ?, ?, ?, ?,
             ?, ?, ?, ?
         )
         "#,
@@ -198,6 +203,7 @@ fn insert_trade(conn: &Connection, r: &PaperTradeRecord) -> anyhow::Result<()> {
             r.bankroll_before,
             r.bankroll_after,
             r.settlement_price,
+            r.chainlink_settlement_price,
             r.settlement_source,
             if r.forced_settlement { 1_i64 } else { 0_i64 },
             r.trade_duration_ms,

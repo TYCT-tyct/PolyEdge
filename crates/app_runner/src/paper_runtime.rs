@@ -88,6 +88,7 @@ struct PaperRuntimeState {
     pnl_total_usdc: f64,
     intents: HashMap<String, PaperIntent>,
     open_lots: HashMap<String, VecDeque<PaperLot>>,
+    chainlink_aux_by_market: HashMap<String, f64>,
     records: VecDeque<PaperTradeRecord>,
     daily: BTreeMap<String, PaperDailyAgg>,
 }
@@ -205,12 +206,17 @@ impl PaperRuntimeHandle {
         self.persist_reports_locked(&mut s);
     }
 
-    pub(crate) async fn on_book(&self, book: &BookTop) {
+    pub(crate) async fn on_book(&self, book: &BookTop, chainlink_settlement_price: Option<f64>) {
         if !self.enabled {
             return;
         }
         let mut s = self.state.write().await;
         let now_ms = book.ts_ms.max(Utc::now().timestamp_millis());
+        if let Some(price) = chainlink_settlement_price {
+            if price.is_finite() && price > 0.0 {
+                s.chainlink_aux_by_market.insert(book.market_id.clone(), price);
+            }
+        }
         let mid_yes = (book.bid_yes + book.ask_yes) * 0.5;
         let mid_no = (book.bid_no + book.ask_no) * 0.5;
         self.force_settle_expired_locked(&mut s, &book.market_id, now_ms, mid_yes, mid_no);
@@ -246,6 +252,7 @@ impl PaperRuntimeHandle {
     pub(crate) async fn summary_json(&self) -> serde_json::Value {
         let s = self.state.read().await;
         let live = build_live_report(&s, &self.run_id, self.initial_capital);
+        let analytics = build_analytics(&s.records);
         serde_json::json!({
             "ts_ms": Utc::now().timestamp_millis(),
             "run_id": self.run_id,
@@ -260,6 +267,24 @@ impl PaperRuntimeHandle {
             "avg_trade_duration_ms": live.avg_trade_duration_ms,
             "median_trade_duration_ms": live.median_trade_duration_ms,
             "open_positions_count": live.open_positions_count,
+            "stage_distribution": analytics.stage_distribution,
+            "action_distribution": analytics.action_distribution,
+            "timeframe_distribution": analytics.timeframe_distribution,
+            "seat": {
+                "layer_distribution": analytics.seat_layer_distribution,
+                "rollback_count": analytics.seat_rollback_count,
+                "shadow_pnl_mean": analytics.shadow_pnl_mean,
+            },
+            "slippage": {
+                "avg_abs_slippage_bps": analytics.avg_abs_slippage_bps,
+                "avg_taker_abs_slippage_bps": analytics.avg_taker_abs_slippage_bps,
+                "worst_abs_slippage_bps": analytics.worst_abs_slippage_bps,
+            },
+            "reversal": {
+                "count": analytics.reversal_count,
+                "losing_count": analytics.reversal_losing_count,
+                "loss_rate": analytics.reversal_loss_rate,
+            }
         })
     }
 
@@ -371,6 +396,11 @@ impl PaperRuntimeHandle {
                     }
                 }
             };
+            let chainlink_settlement_price = s
+                .chainlink_aux_by_market
+                .get(&front.market_id)
+                .copied()
+                .filter(|v| v.is_finite() && *v > 0.0);
             let record = PaperTradeRecord {
                 ts_ms,
                 paper_mode: "shadow".to_string(),
@@ -396,6 +426,7 @@ impl PaperRuntimeHandle {
                 bankroll_before,
                 bankroll_after: s.bankroll,
                 settlement_price: fill.price,
+                chainlink_settlement_price,
                 settlement_source: "exit_fill".to_string(),
                 forced_settlement: false,
                 trade_duration_ms: ts_ms.saturating_sub(front.opened_ts_ms),
@@ -432,6 +463,11 @@ impl PaperRuntimeHandle {
             let Some(lots) = s.open_lots.get_mut(&key) else {
                 continue;
             };
+            let chainlink_settlement_price = s
+                .chainlink_aux_by_market
+                .get(market_id)
+                .copied()
+                .filter(|v| v.is_finite() && *v > 0.0);
             let mut settled = Vec::new();
             while let Some(front) = lots.front() {
                 if !is_expired(front.opened_ts_ms, now_ms, front.timeframe.as_str()) {
@@ -486,6 +522,7 @@ impl PaperRuntimeHandle {
                     bankroll_before,
                     bankroll_after: s.bankroll,
                     settlement_price: close_price,
+                    chainlink_settlement_price,
                     settlement_source: "pm_mid".to_string(),
                     forced_settlement: true,
                     trade_duration_ms: now_ms.saturating_sub(lot.opened_ts_ms),
@@ -515,6 +552,7 @@ impl PaperRuntimeHandle {
 
     fn persist_reports_locked(&self, s: &mut PaperRuntimeState) {
         let live = build_live_report(s, &self.run_id, self.initial_capital);
+        let analytics = build_analytics(&s.records);
         let summary = serde_json::json!({
             "run_id": self.run_id,
             "ts_ms": live.ts_ms,
@@ -532,10 +570,46 @@ impl PaperRuntimeHandle {
             "avg_trade_duration_ms": live.avg_trade_duration_ms,
             "median_trade_duration_ms": live.median_trade_duration_ms,
             "open_positions_count": live.open_positions_count,
+            "stage_distribution": analytics.stage_distribution,
+            "action_distribution": analytics.action_distribution,
+            "timeframe_distribution": analytics.timeframe_distribution,
+            "seat": {
+                "layer_distribution": analytics.seat_layer_distribution,
+                "rollback_count": analytics.seat_rollback_count,
+                "shadow_pnl_mean": analytics.shadow_pnl_mean,
+            },
+            "slippage": {
+                "avg_abs_slippage_bps": analytics.avg_abs_slippage_bps,
+                "avg_taker_abs_slippage_bps": analytics.avg_taker_abs_slippage_bps,
+                "worst_abs_slippage_bps": analytics.worst_abs_slippage_bps,
+            },
+            "reversal": {
+                "count": analytics.reversal_count,
+                "losing_count": analytics.reversal_losing_count,
+                "loss_rate": analytics.reversal_loss_rate,
+            }
         });
         let diagnosis = serde_json::json!({
             "ts_ms": live.ts_ms,
-            "alerts": build_diagnosis_alerts(&live),
+            "alerts": build_diagnosis_alerts(&live, &analytics),
+            "root_causes": build_root_causes(&live, &analytics),
+            "slippage": {
+                "avg_abs_slippage_bps": analytics.avg_abs_slippage_bps,
+                "avg_taker_abs_slippage_bps": analytics.avg_taker_abs_slippage_bps,
+                "worst_abs_slippage_bps": analytics.worst_abs_slippage_bps,
+            },
+            "reversal": {
+                "count": analytics.reversal_count,
+                "losing_count": analytics.reversal_losing_count,
+                "loss_rate": analytics.reversal_loss_rate,
+            },
+            "seat": {
+                "layer_distribution": analytics.seat_layer_distribution,
+                "rollback_count": analytics.seat_rollback_count,
+                "shadow_pnl_mean": analytics.shadow_pnl_mean,
+            },
+            "stage_distribution": analytics.stage_distribution,
+            "action_distribution": analytics.action_distribution,
         });
         let daily = build_daily_summaries(s);
         write_json_file(dataset_path("reports", "paper_live_latest.json"), &live);
@@ -728,7 +802,90 @@ fn build_daily_summaries(s: &PaperRuntimeState) -> Vec<PaperDailySummary> {
         .collect()
 }
 
-fn build_diagnosis_alerts(live: &PaperLiveReport) -> Vec<String> {
+#[derive(Default)]
+struct PaperAnalytics {
+    stage_distribution: BTreeMap<String, u64>,
+    action_distribution: BTreeMap<String, u64>,
+    timeframe_distribution: BTreeMap<String, u64>,
+    seat_layer_distribution: BTreeMap<String, u64>,
+    seat_rollback_count: u64,
+    shadow_pnl_mean: f64,
+    avg_abs_slippage_bps: f64,
+    avg_taker_abs_slippage_bps: f64,
+    worst_abs_slippage_bps: f64,
+    reversal_count: u64,
+    reversal_losing_count: u64,
+    reversal_loss_rate: f64,
+}
+
+fn build_analytics(records: &VecDeque<PaperTradeRecord>) -> PaperAnalytics {
+    let mut out = PaperAnalytics::default();
+    let mut abs_slippage_sum = 0.0;
+    let mut abs_slippage_cnt = 0_u64;
+    let mut taker_abs_slippage_sum = 0.0;
+    let mut taker_abs_slippage_cnt = 0_u64;
+    let mut shadow_pnl_sum = 0.0;
+    let mut shadow_pnl_cnt = 0_u64;
+
+    for r in records {
+        *out.stage_distribution.entry(enum_text(&r.stage)).or_default() += 1;
+        *out.action_distribution.entry(enum_text(&r.action)).or_default() += 1;
+        *out.timeframe_distribution.entry(r.timeframe.clone()).or_default() += 1;
+        if let Some(layer) = &r.seat_layer {
+            *out.seat_layer_distribution.entry(layer.clone()).or_default() += 1;
+        }
+        if r.rollback_triggered.is_some() {
+            out.seat_rollback_count = out.seat_rollback_count.saturating_add(1);
+        }
+        if let Some(v) = r.shadow_pnl_comparison {
+            if v.is_finite() {
+                shadow_pnl_sum += v;
+                shadow_pnl_cnt = shadow_pnl_cnt.saturating_add(1);
+            }
+        }
+
+        let abs_slippage = r.slippage_bps.abs();
+        if abs_slippage.is_finite() {
+            abs_slippage_sum += abs_slippage;
+            abs_slippage_cnt = abs_slippage_cnt.saturating_add(1);
+            out.worst_abs_slippage_bps = out.worst_abs_slippage_bps.max(abs_slippage);
+            if !matches!(r.intent, ExecutionStyle::Maker) {
+                taker_abs_slippage_sum += abs_slippage;
+                taker_abs_slippage_cnt = taker_abs_slippage_cnt.saturating_add(1);
+            }
+        }
+        if matches!(r.action, PaperAction::ReversalExit) {
+            out.reversal_count = out.reversal_count.saturating_add(1);
+            if r.realized_pnl_usdc < 0.0 {
+                out.reversal_losing_count = out.reversal_losing_count.saturating_add(1);
+            }
+        }
+    }
+
+    out.shadow_pnl_mean = if shadow_pnl_cnt == 0 {
+        0.0
+    } else {
+        shadow_pnl_sum / shadow_pnl_cnt as f64
+    };
+    out.avg_abs_slippage_bps = if abs_slippage_cnt == 0 {
+        0.0
+    } else {
+        abs_slippage_sum / abs_slippage_cnt as f64
+    };
+    out.avg_taker_abs_slippage_bps = if taker_abs_slippage_cnt == 0 {
+        0.0
+    } else {
+        taker_abs_slippage_sum / taker_abs_slippage_cnt as f64
+    };
+    out.reversal_loss_rate = if out.reversal_count == 0 {
+        0.0
+    } else {
+        out.reversal_losing_count as f64 / out.reversal_count as f64
+    };
+    out
+}
+
+fn build_diagnosis_alerts(live: &PaperLiveReport, analytics: &PaperAnalytics) -> Vec<String> {
     let mut alerts = Vec::new();
     if live.trades == 0 {
         alerts.push("no_trades_recorded".to_string());
@@ -742,7 +899,39 @@ fn build_diagnosis_alerts(live: &PaperLiveReport) -> Vec<String> {
     if live.max_drawdown_pct > 20.0 {
         alerts.push("drawdown_high".to_string());
     }
+    if analytics.avg_taker_abs_slippage_bps > 15.0 && live.trades >= 10 {
+        alerts.push("taker_slippage_high".to_string());
+    }
+    if analytics.reversal_loss_rate > 0.60 && analytics.reversal_count >= 10 {
+        alerts.push("reversal_exit_underperforming".to_string());
+    }
+    if analytics.seat_rollback_count >= 2 {
+        alerts.push("seat_rollback_frequent".to_string());
+    }
     alerts
+}
+
+fn build_root_causes(live: &PaperLiveReport, analytics: &PaperAnalytics) -> Vec<String> {
+    let mut causes = Vec::new();
+    if live.trades == 0 {
+        causes.push("entry_conditions_too_strict_or_feed_inactive".to_string());
+    }
+    if live.fee_ratio > 0.6 {
+        causes.push("fee_dominates_edge_tune_min_edge_or_taker_usage".to_string());
+    }
+    if analytics.avg_taker_abs_slippage_bps > 15.0 {
+        causes.push("taker_slippage_excessive_consider_maker_bias_or_spread_filter".to_string());
+    }
+    if analytics.reversal_loss_rate > 0.60 && analytics.reversal_count >= 10 {
+        causes.push("reversal_exit_rule_quality_low_check_velocity_and_edge_thresholds".to_string());
+    }
+    if live.max_drawdown_pct > 20.0 {
+        causes.push("risk_controls_too_loose_reduce_position_fraction_or_drawdown_limit".to_string());
+    }
+    if causes.is_empty() {
+        causes.push("no_critical_issue_detected".to_string());
+    }
+    causes
 }
 
 fn lot_key(market_id: &str, side: &OrderSide) -> String {

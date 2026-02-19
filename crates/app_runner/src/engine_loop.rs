@@ -273,7 +273,13 @@ pub(crate) fn spawn_strategy_engine(
                         .insert(book.market_id.clone(), book.clone());
 
                     if let Some(paper) = global_paper_runtime() {
-                        paper.on_book(&book).await;
+                        let chainlink_settlement_price =
+                            if let Some(symbol) = pick_market_symbol(&shared, &book).await {
+                                shared.settlement_prices.read().await.get(&symbol).copied()
+                            } else {
+                                None
+                            };
+                        paper.on_book(&book, chainlink_settlement_price).await;
                     }
                     let fills = shadow.on_book(&book);
                     shared.shadow_stats.mark_filled(fills.len() as u64);

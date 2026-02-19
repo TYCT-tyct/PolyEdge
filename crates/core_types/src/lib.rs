@@ -485,6 +485,7 @@ pub struct PaperTradeRecord {
     pub bankroll_before: f64,
     pub bankroll_after: f64,
     pub settlement_price: f64,
+    pub chainlink_settlement_price: Option<f64>,
     pub settlement_source: String,
     pub forced_settlement: bool,
     pub trade_duration_ms: i64,
