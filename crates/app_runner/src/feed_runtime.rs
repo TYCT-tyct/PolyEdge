@@ -347,10 +347,13 @@ pub(super) fn spawn_reference_feed(
                             1.0
                         };
                         let projected_share_violation = projected_udp_share > target_share;
+                        // In websocket_primary / active_active we hard-enforce the UDP share cap
+                        // outside explicit fallback windows. If WS is unhealthy, fallback state
+                        // should arm and take over; until then we still constrain UDP dominance.
                         let enforce_ws_primary = should_enforce_udp_share_cap(
                             fusion.mode.as_str(),
                             fallback_active,
-                            share_high && projected_share_violation && ws_cap_ready,
+                            share_high && projected_share_violation,
                         );
 
                         if enforce_ws_primary {
