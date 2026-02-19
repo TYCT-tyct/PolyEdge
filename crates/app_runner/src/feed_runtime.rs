@@ -138,6 +138,7 @@ pub(super) fn spawn_reference_feed(
         let mut accepted_fast_mix_by_symbol: HashMap<String, (u64, u64)> = HashMap::new();
         let mut accepted_fast_mix_total: (u64, u64) = (0, 0);
         let mut fusion = fusion_cfg.read().await.clone();
+        let mut last_fusion_mode = fusion.mode.clone();
         let mut fusion_cfg_refresh_at = Instant::now();
         let mut source_health_cfg = shared.source_health_cfg.read().await.clone();
         let mut source_health_cfg_refresh_at = Instant::now();
@@ -150,7 +151,17 @@ pub(super) fn spawn_reference_feed(
             match item {
                 Ok(tick) => {
                     if fusion_cfg_refresh_at.elapsed() >= Duration::from_millis(100) {
-                        fusion = fusion_cfg.read().await.clone();
+                        let next_fusion = fusion_cfg.read().await.clone();
+                        if next_fusion.mode != last_fusion_mode {
+                            accepted_fast_mix_by_symbol.clear();
+                            accepted_fast_mix_total = (0, 0);
+                            ws_primary_ready_seen = false;
+                            ws_primary_fallback_until_ns = 0;
+                            ws_cap_breach_started_ns = 0;
+                            stats.record_issue("fusion_mode_switch_fast_cache_reset").await;
+                            last_fusion_mode = next_fusion.mode.clone();
+                        }
+                        fusion = next_fusion;
                         fusion_cfg_refresh_at = Instant::now();
                     }
                     let is_anchor = is_anchor_ref_source(tick.source.as_str());
