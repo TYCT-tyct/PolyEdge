@@ -72,6 +72,18 @@ python scripts/transport_path_probe.py \
 
 Read `p50/p99/errors` for each target. If `ga/pl` p99 is worse than `direct`, infra path is not healthy yet.
 
+## One-Shot SEAT Fabric Verify
+```bash
+python scripts/verify_seat_fabric.py \
+  --base-url http://127.0.0.1:8080 \
+  --ga-url http://a2ea6e068a4cd04af.awsglobalaccelerator.com:8080 \
+  --privatelink-url http://<privatelink-endpoint>:8080 \
+  --run-id seat-final-ab-20260219-verify
+```
+
+This verifies runtime control plane, required live-report fields, static transport/execution config,
+and transport path readiness (direct/GA/PrivateLink) in a single JSON artifact.
+
 ## Output Files
 - `datasets/reports/<utc-day>/runs/<run-id>-baseline/full_latency_sweep_*.json`
 - `datasets/reports/<utc-day>/runs/<run-id>-candidate/full_latency_sweep_*.json`
