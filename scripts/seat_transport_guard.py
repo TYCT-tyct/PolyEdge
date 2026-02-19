@@ -140,7 +140,9 @@ def build_fusion_payload(
     dedupe_window_ms: int,
     udp_share_cap: Optional[float],
     jitter_threshold_ms: Optional[float],
+    fallback_arm_duration_ms: Optional[int],
     fallback_cooldown_sec: Optional[int],
+    udp_local_only: Optional[bool],
 ) -> Dict[str, Any]:
     if mode == "direct_only":
         payload: Dict[str, Any] = {
@@ -158,8 +160,12 @@ def build_fusion_payload(
         payload["udp_share_cap"] = float(udp_share_cap)
     if jitter_threshold_ms is not None:
         payload["jitter_threshold_ms"] = float(jitter_threshold_ms)
+    if fallback_arm_duration_ms is not None:
+        payload["fallback_arm_duration_ms"] = int(fallback_arm_duration_ms)
     if fallback_cooldown_sec is not None:
         payload["fallback_cooldown_sec"] = int(fallback_cooldown_sec)
+    if udp_local_only is not None:
+        payload["udp_local_only"] = bool(udp_local_only)
     return payload
 
 
@@ -174,7 +180,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--base-url", default="http://127.0.0.1:8080")
     p.add_argument("--out-root", default="datasets/reports")
     p.add_argument("--run-id", required=True)
-    p.add_argument("--profile", default="quick", choices=["quick", "standard", "deep"])
+    p.add_argument(
+        "--profile",
+        default="quick_60s",
+        choices=["quick_60s", "quick", "standard", "deep"],
+    )
     p.add_argument("--baseline-mode", default="direct_only", choices=["direct_only"])
     p.add_argument(
         "--candidate-mode",
@@ -188,7 +198,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup-sec", type=int, default=5)
     p.add_argument("--udp-share-cap", type=float, default=0.35)
     p.add_argument("--jitter-threshold-ms", type=float, default=25.0)
+    p.add_argument("--fallback-arm-duration-ms", type=int, default=8000)
     p.add_argument("--fallback-cooldown-sec", type=int, default=300)
+    p.add_argument("--udp-local-only", choices=["true", "false"], default="true")
     p.add_argument(
         "--skip-storm",
         action="store_true",
@@ -228,7 +240,7 @@ def run_phase(
         "--warmup-sec",
         str(args.warmup_sec),
         "--progress-sec",
-        "10",
+        "5",
     ]
     if include_candidate_params:
         sweep_cmd.extend(
@@ -237,8 +249,12 @@ def run_phase(
                 str(args.udp_share_cap),
                 "--jitter-threshold-ms",
                 str(args.jitter_threshold_ms),
+                "--fallback-arm-duration-ms",
+                str(args.fallback_arm_duration_ms),
                 "--fallback-cooldown-sec",
                 str(args.fallback_cooldown_sec),
+                "--udp-local-only",
+                str(args.udp_local_only),
             ]
         )
     run(sweep_cmd)
@@ -318,7 +334,9 @@ def main() -> int:
             dedupe_window_ms=args.dedupe_window_ms,
             udp_share_cap=None,
             jitter_threshold_ms=None,
+            fallback_arm_duration_ms=None,
             fallback_cooldown_sec=None,
+            udp_local_only=None,
         )
         rollback_resp = post_json(args.base_url, "/control/reload_fusion", rollback_payload)
         post_json(args.base_url, "/control/reset_shadow", {})

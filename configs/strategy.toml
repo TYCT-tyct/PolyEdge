@@ -8,7 +8,7 @@ ttl_ms = 500
 [taker]
 trigger_bps = 4.0
 max_slippage_bps = 30.0
-stale_tick_filter_ms = 2000
+stale_tick_filter_ms = 120
 market_tier_profile = "balanced_sol_guard"
 
 [online_calibration]
@@ -180,6 +180,7 @@ udp_local_only = true
 udp_share_cap = 0.35
 dedupe_window_ms = 8
 jitter_threshold_ms = 25
+fallback_arm_duration_ms = 8000
 fallback_cooldown_sec = 300
 
 [fusion]

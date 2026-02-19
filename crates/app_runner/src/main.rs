@@ -319,6 +319,7 @@ struct FusionReloadReq {
     dedupe_price_bps: Option<f64>,
     udp_share_cap: Option<f64>,
     jitter_threshold_ms: Option<f64>,
+    fallback_arm_duration_ms: Option<u64>,
     fallback_cooldown_sec: Option<u64>,
     udp_local_only: Option<bool>,
 }
@@ -490,6 +491,7 @@ struct FusionConfig {
     dedupe_price_bps: f64,
     udp_share_cap: f64,
     jitter_threshold_ms: f64,
+    fallback_arm_duration_ms: u64,
     fallback_cooldown_sec: u64,
     udp_local_only: bool,
 }
@@ -504,6 +506,7 @@ impl Default for FusionConfig {
             dedupe_price_bps: 0.2,
             udp_share_cap: 0.35,
             jitter_threshold_ms: 25.0,
+            fallback_arm_duration_ms: 8_000,
             fallback_cooldown_sec: 300,
             udp_local_only: true,
         }
@@ -1059,6 +1062,11 @@ struct ShadowLiveReport {
     policy_block_reason_distribution: HashMap<String, u64>,
     gate_block_reason_distribution: HashMap<String, u64>,
     source_mix_ratio: HashMap<String, f64>,
+    udp_share_effective: f64,
+    udp_local_drop_count: u64,
+    share_cap_drop_count: u64,
+    fallback_state: String,
+    fallback_trigger_reason_distribution: HashMap<String, u64>,
     source_health: Vec<SourceHealth>,
     exit_reason_top: Vec<(String, u64)>,
     edge_model_version: String,
@@ -1184,8 +1192,12 @@ struct ShadowStats {
     exit_reasons: RwLock<HashMap<String, u64>>,
     ref_ticks_total: AtomicU64,
     book_ticks_total: AtomicU64,
-    ref_source_counts: RwLock<HashMap<String, u64>>,
+    ref_source_counts: DashMap<String, u64>,
     ref_dedupe_dropped: AtomicU64,
+    share_cap_drop_count: AtomicU64,
+    udp_local_drop_count_baseline: AtomicU64,
+    fallback_state_code: AtomicU64,
+    fallback_trigger_reasons: RwLock<HashMap<String, u64>>,
     last_ref_tick_ms: AtomicI64,
     last_book_tick_ms: AtomicI64,
     shots: RwLock<Vec<ShadowShot>>,
@@ -1274,8 +1286,12 @@ impl ShadowStats {
             exit_reasons: RwLock::new(HashMap::new()),
             ref_ticks_total: AtomicU64::new(0),
             book_ticks_total: AtomicU64::new(0),
-            ref_source_counts: RwLock::new(HashMap::new()),
+            ref_source_counts: DashMap::new(),
             ref_dedupe_dropped: AtomicU64::new(0),
+            share_cap_drop_count: AtomicU64::new(0),
+            udp_local_drop_count_baseline: AtomicU64::new(feed_udp::udp_local_drop_count()),
+            fallback_state_code: AtomicU64::new(0),
+            fallback_trigger_reasons: RwLock::new(HashMap::new()),
             last_ref_tick_ms: AtomicI64::new(0),
             last_book_tick_ms: AtomicI64::new(0),
             shots: RwLock::new(Vec::new()),
@@ -1335,11 +1351,16 @@ impl ShadowStats {
         self.ref_ticks_total.store(0, Ordering::Relaxed);
         self.book_ticks_total.store(0, Ordering::Relaxed);
         self.ref_dedupe_dropped.store(0, Ordering::Relaxed);
+        self.share_cap_drop_count.store(0, Ordering::Relaxed);
+        self.udp_local_drop_count_baseline
+            .store(feed_udp::udp_local_drop_count(), Ordering::Relaxed);
+        self.fallback_state_code.store(0, Ordering::Relaxed);
         self.last_ref_tick_ms.store(0, Ordering::Relaxed);
         self.last_book_tick_ms.store(0, Ordering::Relaxed);
         self.blocked_reasons.write().await.clear();
         self.exit_reasons.write().await.clear();
-        self.ref_source_counts.write().await.clear();
+        self.ref_source_counts.clear();
+        self.fallback_trigger_reasons.write().await.clear();
         self.shots.write().await.clear();
         self.outcomes.write().await.clear();
         *self.samples.write().await = ShadowSamples::default();
@@ -1638,15 +1659,37 @@ impl ShadowStats {
         *reasons.entry(reason.to_string()).or_insert(0) += 1;
     }
 
-    async fn mark_ref_tick(&self, source: &str, ts_ms: i64) {
+    fn mark_ref_tick(&self, source: &str, ts_ms: i64) {
         self.ref_ticks_total.fetch_add(1, Ordering::Relaxed);
         self.last_ref_tick_ms.store(ts_ms, Ordering::Relaxed);
-        let mut counts = self.ref_source_counts.write().await;
-        *counts.entry(source.to_string()).or_insert(0) += 1;
+        self.ref_source_counts
+            .entry(source.to_string())
+            .and_modify(|count| *count = count.saturating_add(1))
+            .or_insert(1);
     }
 
     fn mark_ref_dedupe_dropped(&self) {
         self.ref_dedupe_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn mark_share_cap_drop(&self) {
+        self.share_cap_drop_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    async fn mark_fallback_trigger_reason(&self, reason: &str) {
+        let mut reasons = self.fallback_trigger_reasons.write().await;
+        *reasons.entry(reason.to_string()).or_insert(0) += 1;
+    }
+
+    fn set_fallback_state(&self, state: &str) {
+        let code = match state {
+            "ws_primary" => 0,
+            "armed" => 1,
+            "udp_fallback" => 2,
+            "cooldown" => 3,
+            _ => 0,
+        };
+        self.fallback_state_code.store(code, Ordering::Relaxed);
     }
 
     fn mark_book_tick(&self, ts_ms: i64) {
@@ -1814,7 +1857,11 @@ impl ShadowStats {
         } = self.samples.read().await.clone();
         let book_top_lag_by_symbol_ms = self.book_top_lag_by_symbol_ms.read().await.clone();
         let mut blocked_reason_counts = self.blocked_reasons.read().await.clone();
-        let source_counts = self.ref_source_counts.read().await.clone();
+        let source_counts = self
+            .ref_source_counts
+            .iter()
+            .map(|entry| (entry.key().clone(), *entry.value()))
+            .collect::<HashMap<_, _>>();
         let exit_reason_counts = self.exit_reasons.read().await.clone();
         let survival_probe_overall = *self.survival_probe_overall.read().await;
         let survival_probe_by_symbol = self.survival_probe_by_symbol.read().await.clone();
@@ -1981,6 +2028,19 @@ impl ShadowStats {
                 );
             }
         }
+        let udp_share_effective = source_mix_ratio.get("binance_udp").copied().unwrap_or(0.0);
+        let udp_local_drop_count = feed_udp::udp_local_drop_count()
+            .saturating_sub(self.udp_local_drop_count_baseline.load(Ordering::Relaxed));
+        let share_cap_drop_count = self.share_cap_drop_count.load(Ordering::Relaxed);
+        let fallback_state = match self.fallback_state_code.load(Ordering::Relaxed) {
+            1 => "armed",
+            2 => "udp_fallback",
+            3 => "cooldown",
+            _ => "ws_primary",
+        }
+        .to_string();
+        let fallback_trigger_reason_distribution =
+            self.fallback_trigger_reasons.read().await.clone();
         let mut exit_reason_top = exit_reason_counts.into_iter().collect::<Vec<_>>();
         exit_reason_top.sort_by(|a, b| b.1.cmp(&a.1));
         exit_reason_top.truncate(8);
@@ -2225,6 +2285,11 @@ impl ShadowStats {
             policy_block_reason_distribution,
             gate_block_reason_distribution,
             source_mix_ratio,
+            udp_share_effective,
+            udp_local_drop_count,
+            share_cap_drop_count,
+            fallback_state,
+            fallback_trigger_reason_distribution,
             source_health: Vec::new(),
             exit_reason_top,
             edge_model_version: "unknown".to_string(),
@@ -2798,6 +2863,8 @@ fn spawn_reference_feed(
         let mut ws_cap_breach_started_ns: i64 = 0;
         let mut accepted_fast_mix_by_symbol: HashMap<String, (u64, u64)> = HashMap::new();
         let mut accepted_fast_mix_total: (u64, u64) = (0, 0);
+        let mut fusion = fusion_cfg.read().await.clone();
+        let mut fusion_cfg_refresh_at = Instant::now();
         let mut source_health_cfg = shared.source_health_cfg.read().await.clone();
         let mut source_health_cfg_refresh_at = Instant::now();
         let ref_tick_bus_enabled = std::env::var("POLYEDGE_REF_TICK_BUS_ENABLED")
@@ -2808,7 +2875,10 @@ fn spawn_reference_feed(
         while let Some((lane, item)) = rx.recv().await {
             match item {
                 Ok(tick) => {
-                    let fusion = fusion_cfg.read().await.clone();
+                    if fusion_cfg_refresh_at.elapsed() >= Duration::from_millis(100) {
+                        fusion = fusion_cfg.read().await.clone();
+                        fusion_cfg_refresh_at = Instant::now();
+                    }
                     let is_anchor = is_anchor_ref_source(tick.source.as_str());
                     if fusion.mode == "udp_only" && !matches!(lane, RefLane::Udp) && !is_anchor {
                         continue;
@@ -2958,7 +3028,8 @@ fn spawn_reference_feed(
                         }
                         let ws_breach_persisted = ws_cap_breach_started_ns > 0
                             && now_recv_ns.saturating_sub(ws_cap_breach_started_ns)
-                                >= ws_primary_fallback_arm_ns();
+                                >= (fusion.fallback_arm_duration_ms as i64)
+                                    .saturating_mul(1_000_000);
                         let fallback_active_now = fusion.mode == "websocket_primary"
                             && now_recv_ns < ws_primary_fallback_until_ns;
                         if should_arm_ws_primary_fallback(
@@ -2972,6 +3043,7 @@ fn spawn_reference_feed(
                             ws_primary_fallback_until_ns =
                                 now_recv_ns.saturating_add(cooldown_ns.max(0));
                             metrics::counter!("fusion.ws_primary_fallback_arm").increment(1);
+                            stats.mark_fallback_trigger_reason("ws_gap_persisted").await;
                         }
 
                         let fallback_active = fusion.mode == "websocket_primary"
@@ -2979,6 +3051,18 @@ fn spawn_reference_feed(
                         if fallback_active {
                             metrics::counter!("fusion.ws_primary_fallback_active").increment(1);
                         }
+                        let fallback_state = if fallback_active {
+                            if ws_cap_ready {
+                                "cooldown"
+                            } else {
+                                "udp_fallback"
+                            }
+                        } else if ws_cap_breach_started_ns > 0 {
+                            "armed"
+                        } else {
+                            "ws_primary"
+                        };
+                        stats.set_fallback_state(fallback_state);
 
                         let target_share = fusion.udp_share_cap.clamp(0.05, 0.95);
                         let share_high = effective_udp_share > target_share;
@@ -2992,12 +3076,13 @@ fn spawn_reference_feed(
                         let enforce_ws_primary = should_enforce_udp_share_cap(
                             fusion.mode.as_str(),
                             fallback_active,
-                            share_high && projected_share_violation,
+                            share_high && projected_share_violation && ws_cap_ready,
                         );
 
                         if enforce_ws_primary {
                             metrics::counter!("fusion.udp_downweight_drop").increment(1);
                             metrics::counter!("fusion.udp_share_cap_drop").increment(1);
+                            stats.mark_share_cap_drop();
                             continue;
                         }
 
@@ -3024,28 +3109,24 @@ fn spawn_reference_feed(
                             }
                         }
                     }
-                    // Hot-path logging: avoid dynamic JSON trees + extra stringify passes.
-                    // Build a single JSONL line and hand it to the async writer.
-                    let tick_json =
-                        serde_json::to_string(&tick).unwrap_or_else(|_| "{}".to_string());
-                    let hash = sha256_hex(&tick_json);
-                    let line = format!(
-                        "{{\"ts_ms\":{},\"source_seq\":{},\"ingest_seq\":{},\"valid\":{},\"sha256\":\"{}\",\"tick\":{}}}",
-                        Utc::now().timestamp_millis(),
-                        source_seq,
-                        ingest_seq,
-                        valid,
-                        hash,
-                        tick_json
-                    );
-                    append_jsonl_line(&dataset_path("raw", "ref_ticks.jsonl"), line);
+                    if should_log_ref_tick(ingest_seq) {
+                        let tick_json =
+                            serde_json::to_string(&tick).unwrap_or_else(|_| "{}".to_string());
+                        let line = format!(
+                            "{{\"ts_ms\":{},\"source_seq\":{},\"ingest_seq\":{},\"valid\":{},\"tick\":{}}}",
+                            Utc::now().timestamp_millis(),
+                            source_seq,
+                            ingest_seq,
+                            valid,
+                            tick_json
+                        );
+                        append_jsonl_line(&dataset_path("raw", "ref_ticks.jsonl"), line);
+                    }
                     if !valid {
                         stats.record_issue("invalid_ref_tick").await;
                         continue;
                     }
-                    stats
-                        .mark_ref_tick(tick.source.as_str(), tick.recv_ts_ms)
-                        .await;
+                    stats.mark_ref_tick(tick.source.as_str(), tick.recv_ts_ms);
                     if source_key == "binance_udp" || source_key == "binance_ws" {
                         let entry = accepted_fast_mix_by_symbol
                             .entry(symbol_key.clone())
@@ -7484,11 +7565,7 @@ fn should_arm_ws_primary_fallback(
 }
 
 #[inline]
-fn should_enforce_udp_share_cap(
-    mode: &str,
-    fallback_active: bool,
-    share_high: bool,
-) -> bool {
+fn should_enforce_udp_share_cap(mode: &str, fallback_active: bool, share_high: bool) -> bool {
     matches!(mode, "active_active" | "websocket_primary") && !fallback_active && share_high
 }
 
@@ -7593,27 +7670,7 @@ fn udp_min_freshness_score() -> f64 {
 }
 
 fn ws_primary_fallback_gap_ns() -> i64 {
-    static WS_PRIMARY_FALLBACK_GAP_NS: OnceLock<i64> = OnceLock::new();
-    *WS_PRIMARY_FALLBACK_GAP_NS.get_or_init(|| {
-        std::env::var("POLYEDGE_WS_PRIMARY_FALLBACK_GAP_MS")
-            .ok()
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(3_000)
-            .clamp(250, 10_000)
-            * 1_000_000
-    })
-}
-
-fn ws_primary_fallback_arm_ns() -> i64 {
-    static WS_PRIMARY_FALLBACK_ARM_NS: OnceLock<i64> = OnceLock::new();
-    *WS_PRIMARY_FALLBACK_ARM_NS.get_or_init(|| {
-        std::env::var("POLYEDGE_WS_PRIMARY_FALLBACK_ARM_MS")
-            .ok()
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(8_000)
-            .clamp(200, 15_000)
-            * 1_000_000
-    })
+    3_000 * 1_000_000
 }
 
 fn udp_downweight_keep_every() -> usize {
@@ -7625,6 +7682,19 @@ fn udp_downweight_keep_every() -> usize {
             .unwrap_or(3)
             .clamp(2, 32)
     })
+}
+
+#[inline]
+fn should_log_ref_tick(ingest_seq: u64) -> bool {
+    static SAMPLE_EVERY: OnceLock<u64> = OnceLock::new();
+    let sample_every = *SAMPLE_EVERY.get_or_init(|| {
+        std::env::var("POLYEDGE_REF_TICK_LOG_SAMPLE_EVERY")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(32)
+            .clamp(1, 1024)
+    });
+    ingest_seq % sample_every == 0
 }
 
 fn is_ref_tick_duplicate(
@@ -8578,20 +8648,97 @@ fn load_strategy_config() -> MakerConfig {
 fn load_fusion_config() -> FusionConfig {
     let path = Path::new("configs/strategy.toml");
     let Ok(raw) = fs::read_to_string(path) else {
-        return FusionConfig::default();
+        let cfg = FusionConfig::default();
+        std::env::set_var(
+            "POLYEDGE_UDP_LOCAL_ONLY",
+            if cfg.udp_local_only { "true" } else { "false" },
+        );
+        return cfg;
     };
+
+    #[derive(Default)]
+    struct FusionPatch {
+        enable_udp: Option<bool>,
+        mode: Option<String>,
+        udp_port: Option<u16>,
+        dedupe_window_ms: Option<i64>,
+        dedupe_price_bps: Option<f64>,
+        udp_share_cap: Option<f64>,
+        jitter_threshold_ms: Option<f64>,
+        fallback_arm_duration_ms: Option<u64>,
+        fallback_cooldown_sec: Option<u64>,
+        udp_local_only: Option<bool>,
+    }
+
+    impl FusionPatch {
+        fn apply_to(self, cfg: &mut FusionConfig) {
+            if let Some(v) = self.enable_udp {
+                cfg.enable_udp = v;
+            }
+            if let Some(v) = self.mode {
+                cfg.mode = v;
+            }
+            if let Some(v) = self.udp_port {
+                cfg.udp_port = v.max(1);
+            }
+            if let Some(v) = self.dedupe_window_ms {
+                cfg.dedupe_window_ms = v.clamp(0, 2_000);
+            }
+            if let Some(v) = self.dedupe_price_bps {
+                cfg.dedupe_price_bps = v.clamp(0.0, 50.0);
+            }
+            if let Some(v) = self.udp_share_cap {
+                cfg.udp_share_cap = v.clamp(0.05, 0.95);
+            }
+            if let Some(v) = self.jitter_threshold_ms {
+                cfg.jitter_threshold_ms = v.clamp(1.0, 2_000.0);
+            }
+            if let Some(v) = self.fallback_arm_duration_ms {
+                cfg.fallback_arm_duration_ms = v.clamp(200, 15_000);
+            }
+            if let Some(v) = self.fallback_cooldown_sec {
+                cfg.fallback_cooldown_sec = v.clamp(0, 3_600);
+            }
+            if let Some(v) = self.udp_local_only {
+                cfg.udp_local_only = v;
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Section {
+        None,
+        Fusion,
+        Transport,
+    }
+
     let mut cfg = FusionConfig::default();
-    let mut in_section = false;
+    let mut fusion_patch = FusionPatch::default();
+    let mut transport_patch = FusionPatch::default();
+    let mut section = Section::None;
+    let mut saw_fusion = false;
+    let mut saw_transport = false;
+
     for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         if line.starts_with('[') && line.ends_with(']') {
-            in_section = line == "[fusion]" || line == "[transport]";
+            section = match line {
+                "[fusion]" => {
+                    saw_fusion = true;
+                    Section::Fusion
+                }
+                "[transport]" => {
+                    saw_transport = true;
+                    Section::Transport
+                }
+                _ => Section::None,
+            };
             continue;
         }
-        if !in_section {
+        if section == Section::None {
             continue;
         }
         let Some((k, v)) = line.split_once('=') else {
@@ -8599,57 +8746,90 @@ fn load_fusion_config() -> FusionConfig {
         };
         let key = k.trim();
         let val = v.trim().trim_matches('"');
+        let target = if section == Section::Transport {
+            &mut transport_patch
+        } else {
+            &mut fusion_patch
+        };
         match key {
             "enable_udp" => {
                 if let Ok(parsed) = val.parse::<bool>() {
-                    cfg.enable_udp = parsed;
+                    target.enable_udp = Some(parsed);
                 }
             }
             "mode" => {
                 let norm = val.to_ascii_lowercase();
-                cfg.mode = match norm.as_str() {
-                    "active_active" | "direct_only" | "udp_only" | "websocket_primary" => norm,
-                    _ => cfg.mode,
-                };
+                if matches!(
+                    norm.as_str(),
+                    "active_active" | "direct_only" | "udp_only" | "websocket_primary"
+                ) {
+                    target.mode = Some(norm);
+                }
             }
             "udp_port" => {
                 if let Ok(parsed) = val.parse::<u16>() {
-                    cfg.udp_port = parsed.max(1);
+                    target.udp_port = Some(parsed.max(1));
                 }
             }
             "dedupe_window_ms" => {
                 if let Ok(parsed) = val.parse::<i64>() {
-                    cfg.dedupe_window_ms = parsed.clamp(0, 2_000);
+                    target.dedupe_window_ms = Some(parsed.clamp(0, 2_000));
                 }
             }
             "dedupe_price_bps" => {
                 if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.dedupe_price_bps = parsed.clamp(0.0, 50.0);
+                    target.dedupe_price_bps = Some(parsed.clamp(0.0, 50.0));
                 }
             }
             "udp_share_cap" => {
                 if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.udp_share_cap = parsed.clamp(0.05, 0.95);
+                    target.udp_share_cap = Some(parsed.clamp(0.05, 0.95));
                 }
             }
             "jitter_threshold_ms" => {
                 if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.jitter_threshold_ms = parsed.clamp(1.0, 2_000.0);
+                    target.jitter_threshold_ms = Some(parsed.clamp(1.0, 2_000.0));
+                }
+            }
+            "fallback_arm_duration_ms" => {
+                if let Ok(parsed) = val.parse::<u64>() {
+                    target.fallback_arm_duration_ms = Some(parsed.clamp(200, 15_000));
                 }
             }
             "fallback_cooldown_sec" => {
                 if let Ok(parsed) = val.parse::<u64>() {
-                    cfg.fallback_cooldown_sec = parsed.clamp(0, 3_600);
+                    target.fallback_cooldown_sec = Some(parsed.clamp(0, 3_600));
                 }
             }
             "udp_local_only" => {
                 if let Ok(parsed) = val.parse::<bool>() {
-                    cfg.udp_local_only = parsed;
+                    target.udp_local_only = Some(parsed);
                 }
             }
             _ => {}
         }
     }
+
+    fusion_patch.apply_to(&mut cfg);
+    if saw_transport {
+        transport_patch.apply_to(&mut cfg);
+    }
+    if cfg.mode == "websocket_primary" {
+        cfg.udp_local_only = true;
+        cfg.udp_share_cap = cfg.udp_share_cap.clamp(0.05, 0.35);
+        cfg.jitter_threshold_ms = cfg.jitter_threshold_ms.max(25.0);
+        cfg.fallback_arm_duration_ms = cfg.fallback_arm_duration_ms.max(8_000);
+        cfg.fallback_cooldown_sec = cfg.fallback_cooldown_sec.max(300);
+    }
+    if saw_fusion && saw_transport {
+        tracing::warn!(
+            "both [fusion] and [transport] are present; [transport] now takes precedence"
+        );
+    }
+    std::env::set_var(
+        "POLYEDGE_UDP_LOCAL_ONLY",
+        if cfg.udp_local_only { "true" } else { "false" },
+    );
     cfg
 }
 
@@ -10654,11 +10834,7 @@ mod tests {
             false,
             true
         ));
-        assert!(should_enforce_udp_share_cap(
-            "active_active",
-            false,
-            true
-        ));
+        assert!(should_enforce_udp_share_cap("active_active", false, true));
         assert!(!should_enforce_udp_share_cap(
             "websocket_primary",
             true,

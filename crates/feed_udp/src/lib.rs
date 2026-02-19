@@ -4,15 +4,64 @@ use core_types::{DynStream, RefPriceFeed, RefTick};
 use poly_wire::{
     decode_auto, WirePacket, WIRE_BOOK_TOP24_SIZE, WIRE_MAX_PACKET_SIZE, WIRE_MOMENTUM_TICK32_SIZE,
 };
-use std::collections::HashMap;
-use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr, UdpSocket as StdUdpSocket};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 pub struct UdpBinanceFeed {
     port: u16,
+}
+
+static UDP_LOCAL_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+pub fn udp_local_drop_count() -> u64 {
+    UDP_LOCAL_DROP_COUNT.load(Ordering::Relaxed)
+}
+
+#[derive(Debug, Clone)]
+struct UdpLocalPolicy {
+    local_only: bool,
+    allow_private: bool,
+    allowlist: HashSet<IpAddr>,
+}
+
+impl UdpLocalPolicy {
+    fn from_env() -> Self {
+        let local_only = std::env::var("POLYEDGE_UDP_LOCAL_ONLY")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+            .unwrap_or(true);
+        let allow_private = std::env::var("POLYEDGE_UDP_LOCAL_ALLOW_PRIVATE")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+            .unwrap_or(false);
+        let allowlist =
+            parse_ip_allowlist(&std::env::var("POLYEDGE_UDP_LOCAL_ALLOW").unwrap_or_default());
+        Self {
+            local_only,
+            allow_private,
+            allowlist,
+        }
+    }
+
+    fn allows(&self, addr: &SocketAddr) -> bool {
+        if !self.local_only {
+            return true;
+        }
+        let ip = addr.ip();
+        if ip.is_loopback() {
+            return true;
+        }
+        if self.allow_private && is_private_ip(&ip) {
+            return true;
+        }
+        self.allowlist.contains(&ip)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -123,9 +172,11 @@ fn spawn_recv_loop(
             }
 
             let mut buf = [0u8; WIRE_MAX_PACKET_SIZE];
+            let mut local_policy = UdpLocalPolicy::from_env();
+            let mut local_policy_refresh_at = Instant::now();
             loop {
                 let recv = socket.recv_from(&mut buf);
-                let (amt, _src) = match recv {
+                let (amt, src) = match recv {
                     Ok(v) => v,
                     Err(err)
                         if tuning.user_spin && err.kind() == std::io::ErrorKind::WouldBlock =>
@@ -148,6 +199,14 @@ fn spawn_recv_loop(
                         continue;
                     }
                 };
+                if local_policy_refresh_at.elapsed() >= Duration::from_secs(1) {
+                    local_policy = UdpLocalPolicy::from_env();
+                    local_policy_refresh_at = Instant::now();
+                }
+                if !local_policy.allows(&src) {
+                    UDP_LOCAL_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 if amt != WIRE_BOOK_TOP24_SIZE
                     && amt != WIRE_MOMENTUM_TICK32_SIZE
                     && amt != poly_wire::WIRE_RELAY_TICK40_SIZE
@@ -366,6 +425,27 @@ fn parse_port_core_map(raw: &str) -> HashMap<u16, usize> {
     out
 }
 
+fn parse_ip_allowlist(raw: &str) -> HashSet<IpAddr> {
+    let mut out = HashSet::new();
+    for token in raw.split(',') {
+        let candidate = token.trim();
+        if candidate.is_empty() {
+            continue;
+        }
+        if let Ok(ip) = candidate.parse::<IpAddr>() {
+            out.insert(ip);
+        }
+    }
+    out
+}
+
+fn is_private_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_unique_local() || v6.is_unicast_link_local(),
+    }
+}
+
 #[inline]
 fn now_ns() -> i64 {
     std::time::SystemTime::now()
@@ -432,5 +512,14 @@ mod tests {
         let map = parse_port_core_map("6666:2,6667:3");
         assert_eq!(map.get(&6666), Some(&2usize));
         assert_eq!(map.get(&6667), Some(&3usize));
+    }
+
+    #[test]
+    fn parse_ip_allowlist_accepts_valid_ips() {
+        let allowlist = parse_ip_allowlist("127.0.0.1,10.0.0.2,::1,bad");
+        assert!(allowlist.contains(&"127.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(allowlist.contains(&"10.0.0.2".parse::<IpAddr>().unwrap()));
+        assert!(allowlist.contains(&"::1".parse::<IpAddr>().unwrap()));
+        assert_eq!(allowlist.len(), 3);
     }
 }

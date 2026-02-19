@@ -23,6 +23,7 @@ from latency_probe.stats import summarize
 from latency_probe.ws_probe import run_ws_latency
 
 PROFILE_DEFAULTS: Dict[str, Dict[str, float]] = {
+    "quick_60s": {"seconds": 60, "poll_interval": 2.0},
     "quick": {"seconds": 60, "poll_interval": 2.0},
     "standard": {"seconds": 120, "poll_interval": 2.0},
     "deep": {"seconds": 300, "poll_interval": 2.0},
@@ -46,7 +47,9 @@ def fusion_payload(
     dedupe_window_ms: int,
     udp_share_cap: float | None = None,
     jitter_threshold_ms: float | None = None,
+    fallback_arm_duration_ms: int | None = None,
     fallback_cooldown_sec: int | None = None,
+    udp_local_only: bool | None = None,
 ) -> Dict[str, Any]:
     if mode == "direct_only":
         payload = {
@@ -79,8 +82,12 @@ def fusion_payload(
         payload["udp_share_cap"] = float(udp_share_cap)
     if jitter_threshold_ms is not None:
         payload["jitter_threshold_ms"] = float(jitter_threshold_ms)
+    if fallback_arm_duration_ms is not None:
+        payload["fallback_arm_duration_ms"] = int(fallback_arm_duration_ms)
     if fallback_cooldown_sec is not None:
         payload["fallback_cooldown_sec"] = int(fallback_cooldown_sec)
+    if udp_local_only is not None:
+        payload["udp_local_only"] = bool(udp_local_only)
     return payload
 
 
@@ -218,7 +225,11 @@ async def collect_ws_all(seconds: int, symbols: List[str]) -> Dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="PolyEdge full latency sweep (bounded)")
-    p.add_argument("--profile", default="quick", choices=["quick", "standard", "deep"])
+    p.add_argument(
+        "--profile",
+        default="quick_60s",
+        choices=["quick_60s", "quick", "standard", "deep"],
+    )
     p.add_argument("--base-url", default="http://127.0.0.1:8080")
     p.add_argument("--seconds", type=int, default=None)
     p.add_argument("--poll-interval", type=float, default=None)
@@ -270,9 +281,21 @@ def parse_args() -> argparse.Namespace:
         help="optional websocket-primary fallback cooldown",
     )
     p.add_argument(
+        "--fallback-arm-duration-ms",
+        type=int,
+        default=None,
+        help="optional websocket-primary fallback arm duration",
+    )
+    p.add_argument(
+        "--udp-local-only",
+        choices=["true", "false"],
+        default=None,
+        help="override udp_local_only during fusion reload",
+    )
+    p.add_argument(
         "--progress-sec",
         type=int,
-        default=10,
+        default=5,
         help="print progress heartbeat every N seconds (0 disables)",
     )
     return p.parse_args()
@@ -296,7 +319,13 @@ def main() -> int:
                 args.dedupe_window_ms,
                 args.udp_share_cap,
                 args.jitter_threshold_ms,
+                args.fallback_arm_duration_ms,
                 args.fallback_cooldown_sec,
+                (
+                    None
+                    if args.udp_local_only is None
+                    else args.udp_local_only.lower() == "true"
+                ),
             ),
         )
     if args.reset_shadow:
@@ -348,6 +377,8 @@ def main() -> int:
             "udp_share_cap": args.udp_share_cap,
             "jitter_threshold_ms": args.jitter_threshold_ms,
             "fallback_cooldown_sec": args.fallback_cooldown_sec,
+            "fallback_arm_duration_ms": args.fallback_arm_duration_ms,
+            "udp_local_only": args.udp_local_only,
             "control": control,
         },
         "engine": engine,

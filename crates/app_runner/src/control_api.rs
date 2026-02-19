@@ -306,13 +306,31 @@ async fn reload_fusion(
     if let Some(v) = req.jitter_threshold_ms {
         cfg.jitter_threshold_ms = v.clamp(1.0, 2_000.0);
     }
+    if let Some(v) = req.fallback_arm_duration_ms {
+        cfg.fallback_arm_duration_ms = v.clamp(200, 15_000);
+    }
     if let Some(v) = req.fallback_cooldown_sec {
         cfg.fallback_cooldown_sec = v.clamp(0, 3_600);
     }
     if let Some(v) = req.udp_local_only {
         cfg.udp_local_only = v;
     }
+    if cfg.mode == "websocket_primary" {
+        cfg.udp_local_only = true;
+        cfg.udp_share_cap = cfg.udp_share_cap.clamp(0.05, 0.35);
+        cfg.jitter_threshold_ms = cfg.jitter_threshold_ms.max(25.0);
+        cfg.fallback_arm_duration_ms = cfg.fallback_arm_duration_ms.max(8_000);
+        cfg.fallback_cooldown_sec = cfg.fallback_cooldown_sec.max(300);
+    }
     let snapshot = cfg.clone();
+    std::env::set_var(
+        "POLYEDGE_UDP_LOCAL_ONLY",
+        if snapshot.udp_local_only {
+            "true"
+        } else {
+            "false"
+        },
+    );
     append_jsonl(
         &dataset_path("reports", "fusion_reload.jsonl"),
         &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "fusion": snapshot}),
