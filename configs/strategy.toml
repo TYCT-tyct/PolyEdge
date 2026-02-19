@@ -174,19 +174,14 @@ min_quote_size = 1.0
 daily_loss_cap_usdc = 1.0
 
 [transport]
-# Candidate profile for guarded promotion. Keep [fusion].mode as the safe baseline.
-mode = "websocket_primary"
+# Production baseline: direct-only transport.
+mode = "direct_only"
 udp_local_only = true
 udp_share_cap = 0.35
 dedupe_window_ms = 8
 jitter_threshold_ms = 25
 fallback_arm_duration_ms = 8000
 fallback_cooldown_sec = 300
-
-[aws]
-global_accelerator_enabled = true
-cpg_enabled = true
-private_link_enabled = false
 
 [fusion]
 enable_udp = true

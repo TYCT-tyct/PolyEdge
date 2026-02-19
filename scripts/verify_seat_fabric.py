@@ -161,7 +161,6 @@ def check_static_configs(strategy_toml: Path, execution_toml: Path) -> List[Chec
     try:
         strat = parse_simple_toml(strategy_toml)
         transport = strat.get("transport", {})
-        aws_flags = strat.get("aws", {})
         mode = transport.get("mode")
         udp_local_only = transport.get("udp_local_only", "").lower() == "true"
         cap = float(transport.get("udp_share_cap", "0") or 0)
@@ -175,24 +174,9 @@ def check_static_configs(strategy_toml: Path, execution_toml: Path) -> List[Chec
         )
         checks.append(
             CheckResult(
-                name="transport_websocket_primary_profile",
-                ok=(mode == "websocket_primary" and udp_local_only and cap <= 0.35 and cap > 0),
+                name="transport_direct_only_profile",
+                ok=(mode == "direct_only" and udp_local_only and cap <= 0.35 and cap > 0),
                 detail=f"mode={mode},udp_local_only={udp_local_only},udp_share_cap={cap}",
-            )
-        )
-        ga_enabled = aws_flags.get("global_accelerator_enabled", "").lower() == "true"
-        cpg_enabled = aws_flags.get("cpg_enabled", "").lower() == "true"
-        pl_enabled = aws_flags.get("private_link_enabled", "").lower() == "true"
-        checks.append(
-            CheckResult(
-                name="aws_transport_flags",
-                ok=bool(aws_flags) and ga_enabled and cpg_enabled and not pl_enabled,
-                detail=(
-                    f"ga={ga_enabled},cpg={cpg_enabled},private_link={pl_enabled}"
-                    if aws_flags
-                    else "missing [aws] section"
-                ),
-                extra=aws_flags if aws_flags else None,
             )
         )
     except Exception as err:
