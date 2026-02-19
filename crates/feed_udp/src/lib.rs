@@ -244,14 +244,14 @@ fn spawn_recv_loop(
                 }
 
                 let tick = RefTick {
-                    source: "binance_udp".to_string(),
+                    source: "binance_udp".into(),
                     symbol: symbol.clone(),
                     event_ts_ms: event_ms,
                     recv_ts_ms: recv_ns / 1_000_000,
                     source_seq: stable_udp_seq(ts_micros, bid, ask),
                     event_ts_exchange_ms: event_ms,
                     recv_ts_local_ns: recv_ns,
-                    ingest_ts_local_ns: now_ns(),
+                    ingest_ts_local_ns: recv_ns,
                     ts_first_hop_ms,
                     price: mid,
                 };

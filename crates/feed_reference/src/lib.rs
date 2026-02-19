@@ -206,7 +206,7 @@ async fn run_binance_stream(symbols: &[String], tx: &mpsc::Sender<RefTick>) -> R
                 let ingest_ns = now_ns();
 
                 let tick = RefTick {
-                    source: "binance_ws".to_string(),
+                    source: "binance_ws".into(),
                     symbol,
                     event_ts_ms: event_ts,
                     recv_ts_ms: recv_ms,
@@ -445,7 +445,7 @@ async fn run_chainlink_rtds_stream(symbols: &[String], tx: &mpsc::Sender<RefTick
                 let ingest_ns = now_ns();
 
                 let tick = RefTick {
-                    source: "chainlink_rtds".to_string(),
+                    source: "chainlink_rtds".into(),
                     symbol,
                     event_ts_ms: event_ts,
                     recv_ts_ms: recv_ms,

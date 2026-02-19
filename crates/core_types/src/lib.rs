@@ -5,12 +5,13 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
+use smol_str::SmolStr;
 use thiserror::Error;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RefTick {
-    pub source: String,
+    pub source: SmolStr,
     pub symbol: String,
     pub event_ts_ms: i64,
     pub recv_ts_ms: i64,

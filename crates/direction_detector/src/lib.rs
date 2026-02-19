@@ -153,15 +153,16 @@ impl DirectionDetector {
         // 后续 source_vote 直接比较 key，不再 to_ascii_lowercase()
         // --------------------------------------------------------
         if w.binance_source_key.is_none() && is_binance_source(&tick.source) {
-            w.binance_source_key = Some(tick.source.clone());
+            w.binance_source_key = Some(tick.source.to_string());
         }
         if w.chainlink_source_key.is_none() && is_chainlink_source(&tick.source) {
-            w.chainlink_source_key = Some(tick.source.clone());
+            w.chainlink_source_key = Some(tick.source.to_string());
         }
 
-        w.latest_by_source.insert(tick.source.clone(), tick.price);
+        w.latest_by_source
+            .insert(tick.source.to_string(), tick.price);
         w.latest_ts_by_source
-            .insert(tick.source.clone(), tick.recv_ts_ms);
+            .insert(tick.source.to_string(), tick.recv_ts_ms);
 
         // --------------------------------------------------------
         // 增量维护连续方向计数

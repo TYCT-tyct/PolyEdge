@@ -148,7 +148,7 @@ pub(super) async fn run_predator_c_for_symbol(
         let map = shared.source_health_latest.read().await;
         let from_fast = primary_fast_source
             .as_ref()
-            .and_then(|source| map.get(source).cloned());
+            .and_then(|source| map.get(source.as_str()).cloned());
         let best_binance = map
             .values()
             .filter(|h| h.source.to_ascii_lowercase().contains("binance"))

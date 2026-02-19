@@ -194,21 +194,25 @@ impl ClobExecution {
             .http2_keep_alive_while_idle(true)
             .build()
             .unwrap_or_else(|_| Client::new());
-        let ack_probe = std::env::var("POLYEDGE_ACK_ONLY_PROBE_URL")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .map(|url| {
-                let every = std::env::var("POLYEDGE_ACK_ONLY_PROBE_EVERY")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(20)
-                    .max(1);
-                Arc::new(AckProbe {
-                    url,
-                    every,
-                    counter: AtomicU64::new(0),
+        let ack_probe = if env_flag_enabled("POLYEDGE_ACK_ONLY_PROBE_ENABLED") {
+            std::env::var("POLYEDGE_ACK_ONLY_PROBE_URL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(|url| {
+                    let every = std::env::var("POLYEDGE_ACK_ONLY_PROBE_EVERY")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(20)
+                        .max(5);
+                    Arc::new(AckProbe {
+                        url,
+                        every,
+                        counter: AtomicU64::new(0),
+                    })
                 })
-            });
+        } else {
+            None
+        };
 
         let primary = order_primary_endpoint
             .map(|v| v.trim().trim_end_matches('/').to_string())

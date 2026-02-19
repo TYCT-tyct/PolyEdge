@@ -9,6 +9,7 @@ use feed_polymarket::PolymarketFeed;
 use feed_reference::MultiSourceRefFeed;
 use futures::StreamExt;
 use infra_bus::RingBus;
+use smol_str::SmolStr;
 use tokio::sync::{mpsc, RwLock};
 
 use crate::fusion_engine::{
@@ -128,8 +129,8 @@ pub(super) fn spawn_reference_feed(
         let mut ingest_seq: u64 = 0;
         let mut last_source_ts_by_stream: HashMap<String, i64> = HashMap::new();
         let mut last_published_by_symbol: HashMap<String, (i64, f64)> = HashMap::new();
-        let mut source_runtime: HashMap<String, SourceRuntimeStats> = HashMap::new();
-        let mut latest_price_by_symbol_source: HashMap<String, HashMap<String, f64>> =
+        let mut source_runtime: HashMap<SmolStr, SourceRuntimeStats> = HashMap::new();
+        let mut latest_price_by_symbol_source: HashMap<String, HashMap<SmolStr, f64>> =
             HashMap::new();
         let mut latest_ws_recv_ns_global: i64 = 0;
         let mut ws_primary_fallback_until_ns: i64 = 0;
@@ -139,6 +140,11 @@ pub(super) fn spawn_reference_feed(
         let mut accepted_fast_mix_total: (u64, u64) = (0, 0);
         let mut fusion = fusion_cfg.read().await.clone();
         let mut last_fusion_mode = fusion.mode.clone();
+        let fusion_cfg_refresh_interval_ms = std::env::var("POLYEDGE_FUSION_CFG_REFRESH_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(200)
+            .clamp(50, 2_000);
         let mut fusion_cfg_refresh_at = Instant::now();
         let mut source_health_cfg = shared.source_health_cfg.read().await.clone();
         let mut source_health_cfg_refresh_at = Instant::now();
@@ -150,7 +156,9 @@ pub(super) fn spawn_reference_feed(
         while let Some((lane, item)) = rx.recv().await {
             match item {
                 Ok(tick) => {
-                    if fusion_cfg_refresh_at.elapsed() >= Duration::from_millis(100) {
+                    if fusion_cfg_refresh_at.elapsed()
+                        >= Duration::from_millis(fusion_cfg_refresh_interval_ms)
+                    {
                         let next_fusion = fusion_cfg.read().await.clone();
                         if next_fusion.mode != last_fusion_mode {
                             accepted_fast_mix_by_symbol.clear();
@@ -265,7 +273,7 @@ pub(super) fn spawn_reference_feed(
                     );
                     if runtime.sample_count % 8 == 0 {
                         let mut map = shared.source_health_latest.write().await;
-                        map.insert(source_key.clone(), source_health.clone());
+                        map.insert(source_key.to_string(), source_health.clone());
                     }
                     if tick.source == "binance_udp" {
                         let (udp_samples, ws_samples) = accepted_fast_mix_total;

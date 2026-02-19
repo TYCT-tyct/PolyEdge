@@ -33,6 +33,7 @@ serde.workspace = true
 serde_json.workspace = true
 settlement_compounder = { path = "../settlement_compounder" }
 sha2.workspace = true
+smol_str.workspace = true
 strategy_maker = { path = "../strategy_maker" }
 taker_sniper = { path = "../taker_sniper" }
 timeframe_router = { path = "../timeframe_router" }

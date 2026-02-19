@@ -481,7 +481,7 @@ fn estimate_feed_latency_separates_source_and_backlog() {
     let now = now_ns();
     let now_ms = now / 1_000_000;
     let tick = RefTick {
-        source: "binance_ws".to_string(),
+        source: "binance_ws".to_string().into(),
         symbol: "BTCUSDT".to_string(),
         source_seq: now_ms as u64,
         event_ts_ms: now_ms - 300,
@@ -533,7 +533,7 @@ fn estimate_feed_latency_calibrates_path_lag_with_clock_offset() {
 
     // First sample establishes floor with a negative raw delta (clock skew baseline).
     let tick_floor = RefTick {
-        source: "binance_udp_calib".to_string(),
+        source: "binance_udp_calib".to_string().into(),
         symbol: "BTCUSDT".to_string(),
         source_seq: 1,
         event_ts_ms: now_ms - 120,
@@ -562,7 +562,7 @@ fn estimate_feed_latency_calibrates_path_lag_with_clock_offset() {
 #[test]
 fn should_replace_ref_tick_respects_staleness_budget_for_same_event() {
     let current = RefTick {
-        source: "binance_ws".to_string(),
+        source: "binance_ws".to_string().into(),
         symbol: "BTCUSDT".to_string(),
         source_seq: 10,
         event_ts_ms: 1_000,
@@ -574,7 +574,7 @@ fn should_replace_ref_tick_respects_staleness_budget_for_same_event() {
         price: 100.0,
     };
     let mut next = current.clone();
-    next.source = "binance_udp".to_string();
+    next.source = "binance_udp".to_string().into();
     next.recv_ts_local_ns = current.recv_ts_local_ns + 2_000_000;
     next.recv_ts_ms = current.recv_ts_ms + 2;
 
@@ -585,7 +585,7 @@ fn should_replace_ref_tick_respects_staleness_budget_for_same_event() {
 fn upsert_latest_tick_slot_reports_source_switch_delta() {
     let ticks = DashMap::<String, RefTick>::new();
     let first = RefTick {
-        source: "binance_ws".to_string(),
+        source: "binance_ws".to_string().into(),
         symbol: "BTCUSDT".to_string(),
         source_seq: 1,
         event_ts_ms: 1_000,
@@ -597,7 +597,7 @@ fn upsert_latest_tick_slot_reports_source_switch_delta() {
         price: 100.0,
     };
     let mut second = first.clone();
-    second.source = "binance_udp".to_string();
+    second.source = "binance_udp".to_string().into();
     second.event_ts_exchange_ms += 2;
     second.recv_ts_ms += 1;
     second.recv_ts_local_ns += 400_000;

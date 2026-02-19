@@ -311,6 +311,11 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help="print progress heartbeat every N seconds (0 disables)",
     )
+    p.add_argument(
+        "--allow-observe-only",
+        action="store_true",
+        help="allow sampling even when runtime reports observe_only=true/paused=true",
+    )
     return p.parse_args()
 
 
@@ -350,6 +355,20 @@ def main() -> int:
         control["pre_live"] = get_json(args.base_url, "/report/shadow/live")
     except Exception:
         control["pre_live"] = None
+    pre_live = control.get("pre_live") or {}
+    pre_live_paused = bool(pre_live.get("paused", False))
+    pre_live_observe_only = bool(pre_live.get("observe_only", False))
+    if (pre_live_paused or pre_live_observe_only) and not args.allow_observe_only:
+        state_flags = []
+        if pre_live_paused:
+            state_flags.append("paused=true")
+        if pre_live_observe_only:
+            state_flags.append("observe_only=true")
+        flags = ",".join(state_flags) if state_flags else "invalid_state"
+        raise RuntimeError(
+            f"runtime is not in active trading state ({flags}); "
+            "fix control mode first or pass --allow-observe-only"
+        )
     print(
         f"[sweep] start profile={args.profile} mode={args.fusion_mode or 'unchanged'} "
         f"seconds={seconds} poll={poll_interval}s",
