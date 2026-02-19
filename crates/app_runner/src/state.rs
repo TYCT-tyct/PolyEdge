@@ -28,6 +28,7 @@ use timeframe_router::{RouterConfig, TimeframeRouter};
 use tokio::sync::RwLock;
 
 use crate::engine_core::{is_gate_block_reason, is_policy_block_reason, is_quote_reject_reason};
+use crate::paper_runtime::PaperRuntimeHandle;
 use crate::gate_eval;
 use crate::report_io::{
     append_jsonl, build_market_scorecard, dataset_path, fillability_ratio,
@@ -57,6 +58,7 @@ pub(crate) struct AppState {
     pub(crate) perf_profile: Arc<RwLock<PerfProfile>>,
     pub(crate) shared: Arc<EngineShared>,
     pub(crate) seat: Arc<SeatRuntimeHandle>,
+    pub(crate) paper: Arc<PaperRuntimeHandle>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +115,8 @@ pub(crate) struct PredatorCConfig {
     pub(crate) cross_symbol: PredatorCrossSymbolConfig,
     pub(crate) router: RouterConfig,
     pub(crate) compounder: CompounderConfig,
+    #[serde(default)]
+    pub(crate) v52: V52Config,
 }
 
 impl Default for PredatorCConfig {
@@ -128,6 +132,94 @@ impl Default for PredatorCConfig {
             cross_symbol: PredatorCrossSymbolConfig::default(),
             router: RouterConfig::default(),
             compounder: CompounderConfig::default(),
+            v52: V52Config::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct V52Config {
+    pub(crate) time_phase: V52TimePhaseConfig,
+    pub(crate) execution: V52ExecutionConfig,
+    pub(crate) dual_arb: V52DualArbConfig,
+    pub(crate) reversal: V52ReversalConfig,
+}
+
+impl Default for V52Config {
+    fn default() -> Self {
+        Self {
+            time_phase: V52TimePhaseConfig::default(),
+            execution: V52ExecutionConfig::default(),
+            dual_arb: V52DualArbConfig::default(),
+            reversal: V52ReversalConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct V52TimePhaseConfig {
+    pub(crate) early_min_ratio: f64,
+    pub(crate) late_max_ratio: f64,
+    pub(crate) allow_timeframes: Vec<String>,
+}
+
+impl Default for V52TimePhaseConfig {
+    fn default() -> Self {
+        Self {
+            early_min_ratio: 0.55,
+            late_max_ratio: 0.10,
+            allow_timeframes: vec!["5m".to_string(), "15m".to_string()],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct V52ExecutionConfig {
+    pub(crate) late_force_taker_remaining_ms: u64,
+    pub(crate) maker_wait_ms_before_force: u64,
+    pub(crate) apply_force_taker_in_maturity: bool,
+    pub(crate) apply_force_taker_in_late: bool,
+}
+
+impl Default for V52ExecutionConfig {
+    fn default() -> Self {
+        Self {
+            late_force_taker_remaining_ms: 30_000,
+            maker_wait_ms_before_force: 800,
+            apply_force_taker_in_maturity: true,
+            apply_force_taker_in_late: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct V52DualArbConfig {
+    pub(crate) enabled: bool,
+    pub(crate) safety_margin_bps: f64,
+    pub(crate) threshold: f64,
+    pub(crate) fee_buffer_mode: String,
+}
+
+impl Default for V52DualArbConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            safety_margin_bps: 3.0,
+            threshold: 0.99,
+            fee_buffer_mode: "conservative_taker".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct V52ReversalConfig {
+    pub(crate) same_market_opposite_first: bool,
+}
+
+impl Default for V52ReversalConfig {
+    fn default() -> Self {
+        Self {
+            same_market_opposite_first: true,
         }
     }
 }

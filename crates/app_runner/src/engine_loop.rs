@@ -5,10 +5,11 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use core_types::{
-    new_id, BookTop, ControlCommand, EdgeAttribution, EngineEvent,
+    new_id, BookTop, ControlCommand, Direction, EdgeAttribution, EngineEvent,
     ExecutionStyle, ExecutionVenue, FairValueModel, InventoryState, MarketHealth, OrderAck,
-    OrderIntentV2, OrderSide, OrderTimeInForce, QuoteEval, QuoteIntent, QuotePolicy, RefTick,
-    RiskContext, RiskManager, ShadowOutcome, ShadowShot, TimeframeClass, ToxicRegime,
+    OrderIntentV2, OrderSide, OrderTimeInForce, PaperAction, QuoteEval, QuoteIntent, QuotePolicy,
+    RefTick, RiskContext, RiskManager, ShadowOutcome, ShadowShot, Stage, TimeframeClass,
+    ToxicRegime,
 };
 use execution_clob::ClobExecution;
 use exit_manager::{ExitReason, MarketEvalInput};
@@ -24,6 +25,7 @@ use tokio::sync::{mpsc, RwLock};
 use crate::engine_core::{
     classify_execution_error_reason, classify_execution_style, normalize_reject_code,
 };
+use crate::paper_runtime::{global_paper_runtime, PaperIntentCtx};
 use crate::execution_eval::{
     aggressive_price_for_side, classify_filled_outcome, classify_unfilled_outcome, edge_for_intent,
     evaluate_fillable, evaluate_survival, get_fee_rate_bps_cached, get_rebate_bps_cached,
@@ -37,7 +39,7 @@ use crate::report_io::{
     append_jsonl, current_jsonl_queue_depth, dataset_path, next_normalized_ingest_seq,
 };
 use crate::state::{
-    exit_reason_label, EngineShared, PredatorCPriority, ShadowStats, SignalCacheEntry,
+    exit_reason_label, EngineShared, ShadowStats, SignalCacheEntry,
     StrategyIngress, StrategyIngressMsg,
 };
 use crate::stats_utils::{freshness_ms, now_ns, percentile_deque_capped};
@@ -48,7 +50,9 @@ use crate::strategy_policy::{
     inventory_for_market, is_market_in_top_n, net_markout, roi_bps_from_usdc, should_force_taker,
     should_observe_only_symbol,
 };
-use crate::strategy_runtime::evaluate_and_route_v52;
+use crate::strategy_runtime::{
+    classify_time_phase, evaluate_and_route_v52, stage_for_phase, timeframe_total_ms, TimePhase,
+};
 use crate::toxicity_runtime::update_toxic_state_from_outcome;
 use crate::{publish_if_telemetry_subscribers, spawn_detached};
 
@@ -276,10 +280,17 @@ pub(crate) fn spawn_strategy_engine(
                         .await
                         .insert(book.market_id.clone(), book.clone());
 
+                    if let Some(paper) = global_paper_runtime() {
+                        paper.on_book(&book).await;
+                    }
                     let fills = shadow.on_book(&book);
                     shared.shadow_stats.mark_filled(fills.len() as u64);
                     for fill in fills {
+                        execution.mark_order_closed_local(&fill.order_id);
                         portfolio.apply_fill(&fill);
+                        if let Some(paper) = global_paper_runtime() {
+                            paper.on_fill(&fill).await;
+                        }
                         publish_if_telemetry_subscribers(&bus, EngineEvent::Fill(fill.clone()));
                         let ingest_seq = next_normalized_ingest_seq();
                         append_jsonl(
@@ -820,14 +831,9 @@ pub(crate) fn spawn_strategy_engine(
                     }
 
                     let predator_cfg = shared.predator_cfg.read().await.clone();
-                    if predator_cfg.enabled
-                        && matches!(
-                            predator_cfg.priority,
-                            PredatorCPriority::TakerFirst | PredatorCPriority::TakerOnly
-                        )
-                    {
+                    if predator_cfg.enabled {
                         let now_ms = Utc::now().timestamp_millis();
-                        let total_res = evaluate_and_route_v52(
+                        let _ = evaluate_and_route_v52(
                             &shared,
                             &bus,
                             &portfolio,
@@ -843,14 +849,7 @@ pub(crate) fn spawn_strategy_engine(
                             None,
                         )
                         .await;
-                        if matches!(predator_cfg.priority, PredatorCPriority::TakerOnly) {
-                            continue;
-                        }
-                        if matches!(predator_cfg.priority, PredatorCPriority::TakerFirst)
-                            && total_res.attempted > 0
-                        {
-                            continue;
-                        }
+                        continue;
                     }
 
                     let mut effective_cfg = (*cfg).clone();
@@ -895,27 +894,6 @@ pub(crate) fn spawn_strategy_engine(
                                 .shadow_stats
                                 .mark_blocked_with_reason("no_quote_policy")
                                 .await;
-                        }
-                        if predator_cfg.enabled
-                            && matches!(predator_cfg.priority, PredatorCPriority::MakerFirst)
-                        {
-                            let now_ms = Utc::now().timestamp_millis();
-                            let _ = evaluate_and_route_v52(
-                                &shared,
-                                &bus,
-                                &portfolio,
-                                &execution,
-                                &shadow,
-                                &mut market_rate_budget,
-                                &mut global_rate_budget,
-                                &predator_cfg,
-                                &symbol,
-                                tick_fast.recv_ts_ms,
-                                tick_fast.recv_ts_local_ns,
-                                now_ms,
-                                None,
-                            )
-                            .await;
                         }
                         continue;
                     }
@@ -1217,7 +1195,86 @@ pub(crate) fn spawn_strategy_engine(
                                     &bus,
                                     EngineEvent::OrderAck(ack.clone()),
                                 );
-                                shadow.register_order(&ack, intent.clone());
+                                shadow.register_order(
+                                    &ack,
+                                    intent.clone(),
+                                    execution_style.clone(),
+                                    ((book.bid_yes + book.ask_yes) * 0.5).max(0.0),
+                                );
+                                if let Some(paper) = global_paper_runtime() {
+                                    let timeframe_class = shared
+                                        .market_to_timeframe
+                                        .read()
+                                        .await
+                                        .get(&book.market_id)
+                                        .cloned();
+                                    let timeframe = timeframe_class
+                                        .as_ref()
+                                        .map(ToString::to_string)
+                                        .unwrap_or_else(|| "unknown".to_string());
+                                    let velocity_bps_per_sec = shared
+                                        .predator_latest_direction
+                                        .read()
+                                        .await
+                                        .get(symbol.as_str())
+                                        .map(|v| v.velocity_bps_per_sec)
+                                        .unwrap_or(0.0);
+                                    let stage = if let Some(tf) = timeframe_class.clone() {
+                                        if let Some(total_ms) = timeframe_total_ms(tf.clone()) {
+                                            let now_ms = Utc::now().timestamp_millis();
+                                            let rem_ms = (total_ms - now_ms.rem_euclid(total_ms)).max(0);
+                                            let rem_ratio =
+                                                (rem_ms as f64 / total_ms as f64).clamp(0.0, 1.0);
+                                            let predator_cfg = shared.predator_cfg.read().await.clone();
+                                            let phase =
+                                                classify_time_phase(rem_ratio, &predator_cfg.v52.time_phase);
+                                            let momentum_overlay = matches!(phase, TimePhase::Maturity)
+                                                && velocity_bps_per_sec.abs()
+                                                    >= predator_cfg
+                                                        .direction_detector
+                                                        .min_velocity_bps_per_sec;
+                                            stage_for_phase(phase, momentum_overlay)
+                                        } else {
+                                            Stage::Early
+                                        }
+                                    } else {
+                                        Stage::Early
+                                    };
+                                    let (prob_fast, prob_settle) = shared
+                                        .predator_latest_probability
+                                        .read()
+                                        .await
+                                        .get(book.market_id.as_str())
+                                        .map(|p| (p.p_fast, p.p_settle))
+                                        .unwrap_or((signal.fair_yes, signal.fair_yes));
+                                    let direction = match intent.side {
+                                        OrderSide::BuyYes | OrderSide::SellNo => Direction::Up,
+                                        OrderSide::BuyNo | OrderSide::SellYes => Direction::Down,
+                                    };
+                                    paper
+                                        .register_order_intent(
+                                            &ack,
+                                            PaperIntentCtx {
+                                                market_id: intent.market_id.clone(),
+                                                symbol: symbol.clone(),
+                                                timeframe,
+                                                stage,
+                                                direction,
+                                                velocity_bps_per_sec,
+                                                edge_bps: edge_net,
+                                                prob_fast,
+                                                prob_settle,
+                                                confidence: signal.confidence,
+                                                action: PaperAction::Enter,
+                                                intent: execution_style.clone(),
+                                                requested_size_usdc: (intent.price * intent.size)
+                                                    .max(0.0),
+                                                requested_size_contracts: intent.size,
+                                                entry_price: intent.price,
+                                            },
+                                        )
+                                        .await;
+                                }
 
                                 for delay_ms in [5_u64, 10_u64, 25_u64] {
                                     let shot = ShadowShot {
@@ -1349,10 +1406,52 @@ pub(crate) fn build_reversal_reentry_order(
     })
 }
 
+async fn reentry_candidate_for_market(
+    shared: &Arc<EngineShared>,
+    target_market_id: &str,
+    side: &OrderSide,
+    size: f64,
+    maker_ttl_ms: u64,
+    maker_min_edge_bps: f64,
+    fail_cost_bps: f64,
+) -> Option<(OrderIntentV2, BookTop)> {
+    let book = shared.latest_books.read().await.get(target_market_id).cloned()?;
+    let fee_rate_bps = get_fee_rate_bps_cached(shared, target_market_id).await;
+    let mut order = build_reversal_reentry_order(
+        target_market_id,
+        side,
+        &book,
+        size,
+        maker_ttl_ms,
+        fee_rate_bps,
+    )?;
+    let fair_yes = shared
+        .latest_signals
+        .get(target_market_id)
+        .map(|sig| sig.value().signal.fair_yes.clamp(0.0, 1.0))
+        .unwrap_or(0.5);
+    let quote_intent = QuoteIntent {
+        market_id: target_market_id.to_string(),
+        side: order.side.clone(),
+        price: order.price,
+        size: order.size,
+        ttl_ms: order.ttl_ms,
+    };
+    let rebate_bps = get_rebate_bps_cached(shared, target_market_id, fee_rate_bps).await;
+    let edge_net_bps =
+        edge_for_intent(fair_yes, &quote_intent) - fee_rate_bps + rebate_bps - fail_cost_bps;
+    if edge_net_bps < maker_min_edge_bps {
+        return None;
+    }
+    order.expected_edge_net_bps = edge_net_bps;
+    Some((order, book))
+}
+
 pub(crate) fn spawn_predator_exit_lifecycle(
     shared: Arc<EngineShared>,
     bus: RingBus<EngineEvent>,
     execution: Arc<ClobExecution>,
+    shadow: Arc<ShadowExecutor>,
     position_id: String,
     market_id: String,
     symbol: String,
@@ -1471,50 +1570,196 @@ pub(crate) fn spawn_predator_exit_lifecycle(
                     reason_kind,
                     ExitReason::Reversal100ms | ExitReason::Reversal300ms
                 ) {
-                    let maybe_book = shared.latest_books.read().await.get(&market_id).cloned();
-                    if let Some(book) = maybe_book {
-                        let fee_rate_bps = get_fee_rate_bps_cached(&shared, &market_id).await;
-                        if let Some(reentry_order) = build_reversal_reentry_order(
+                    let maker_cfg = shared.strategy_cfg.read().await.clone();
+                    let fail_cost_bps = shared.edge_model_cfg.read().await.fail_cost_bps;
+                    let same_market_first = shared
+                        .predator_cfg
+                        .read()
+                        .await
+                        .v52
+                        .reversal
+                        .same_market_opposite_first;
+                    let mut selected: Option<(OrderIntentV2, BookTop, String)> = None;
+
+                    if same_market_first {
+                        selected = reentry_candidate_for_market(
+                            &shared,
                             &market_id,
                             &side,
-                            &book,
                             size,
                             maker_ttl_ms,
-                            fee_rate_bps,
-                        ) {
-                            let quote_intent = QuoteIntent {
-                                market_id: reentry_order.market_id.clone(),
-                                side: reentry_order.side.clone(),
-                                price: reentry_order.price,
-                                size: reentry_order.size,
-                                ttl_ms: reentry_order.ttl_ms,
-                            };
-                            publish_if_telemetry_subscribers(
-                                &bus,
-                                EngineEvent::QuoteIntent(quote_intent),
-                            );
-                            match execution.place_order_v2(reentry_order).await {
-                                Ok(ack) if ack.accepted => {
-                                    shared.shadow_stats.mark_executed();
-                                    publish_if_telemetry_subscribers(
-                                        &bus,
-                                        EngineEvent::OrderAck(OrderAck {
-                                            order_id: ack.order_id,
-                                            market_id: ack.market_id,
-                                            accepted: true,
-                                            ts_ms: ack.ts_ms,
-                                        }),
-                                    );
+                            maker_cfg.min_edge_bps,
+                            fail_cost_bps,
+                        )
+                        .await
+                        .map(|(order, book)| (order, book, market_id.clone()));
+                        if selected.is_none() {
+                            shared
+                                .shadow_stats
+                                .mark_blocked_with_reason("reversal_rebuild_same_market_no_edge")
+                                .await;
+                        }
+                    }
+
+                    if selected.is_none() {
+                        let other_markets = shared
+                            .symbol_to_markets
+                            .read()
+                            .await
+                            .get(symbol.as_str())
+                            .cloned()
+                            .unwrap_or_default();
+                        for other_market_id in other_markets {
+                            if same_market_first && other_market_id == market_id {
+                                continue;
+                            }
+                            if !same_market_first && other_market_id != market_id {
+                                if let Some((order, book)) = reentry_candidate_for_market(
+                                    &shared,
+                                    other_market_id.as_str(),
+                                    &side,
+                                    size,
+                                    maker_ttl_ms,
+                                    maker_cfg.min_edge_bps,
+                                    fail_cost_bps,
+                                )
+                                .await
+                                {
+                                    selected = Some((order, book, other_market_id));
+                                    break;
                                 }
-                                Ok(_) => {}
-                                Err(err) => {
-                                    tracing::warn!(
-                                        market_id = %market_id,
-                                        symbol = %symbol,
-                                        error = %err,
-                                        "reversal maker re-entry failed"
-                                    );
+                                continue;
+                            }
+                            if let Some((order, book)) = reentry_candidate_for_market(
+                                &shared,
+                                other_market_id.as_str(),
+                                &side,
+                                size,
+                                maker_ttl_ms,
+                                maker_cfg.min_edge_bps,
+                                fail_cost_bps,
+                            )
+                            .await
+                            {
+                                selected = Some((order, book, other_market_id));
+                                break;
+                            }
+                        }
+                        if selected.is_none() {
+                            shared
+                                .shadow_stats
+                                .mark_blocked_with_reason("reversal_rebuild_cross_market_no_edge")
+                                .await;
+                        }
+                    }
+
+                    if let Some((reentry_order, book, target_market_id)) = selected {
+                        let quote_intent = QuoteIntent {
+                            market_id: reentry_order.market_id.clone(),
+                            side: reentry_order.side.clone(),
+                            price: reentry_order.price,
+                            size: reentry_order.size,
+                            ttl_ms: reentry_order.ttl_ms,
+                        };
+                        publish_if_telemetry_subscribers(
+                            &bus,
+                            EngineEvent::QuoteIntent(quote_intent.clone()),
+                        );
+                        match execution.place_order_v2(reentry_order).await {
+                            Ok(ack) if ack.accepted => {
+                                shared.shadow_stats.mark_executed();
+                                let ack_event = OrderAck {
+                                    order_id: ack.order_id,
+                                    market_id: ack.market_id,
+                                    accepted: true,
+                                    ts_ms: ack.ts_ms,
+                                };
+                                publish_if_telemetry_subscribers(
+                                    &bus,
+                                    EngineEvent::OrderAck(ack_event.clone()),
+                                );
+                                if let Some(paper) = global_paper_runtime() {
+                                    let timeframe_class = shared
+                                        .market_to_timeframe
+                                        .read()
+                                        .await
+                                        .get(&target_market_id)
+                                        .cloned();
+                                    let timeframe = timeframe_class
+                                        .as_ref()
+                                        .map(ToString::to_string)
+                                        .unwrap_or_else(|| "unknown".to_string());
+                                    let stage = if let Some(tf) = timeframe_class {
+                                        if let Some(total_ms) = timeframe_total_ms(tf.clone()) {
+                                            let rem_ms =
+                                                (total_ms - now_ms.rem_euclid(total_ms)).max(0);
+                                            let rem_ratio =
+                                                (rem_ms as f64 / total_ms as f64).clamp(0.0, 1.0);
+                                            let predator_cfg = shared.predator_cfg.read().await.clone();
+                                            let phase =
+                                                classify_time_phase(rem_ratio, &predator_cfg.v52.time_phase);
+                                            stage_for_phase(phase, true)
+                                        } else {
+                                            Stage::Maturity
+                                        }
+                                    } else {
+                                        Stage::Maturity
+                                    };
+                                    let entry_price = match quote_intent.side {
+                                        OrderSide::BuyYes | OrderSide::SellYes => {
+                                            (book.bid_yes + book.ask_yes) * 0.5
+                                        }
+                                        OrderSide::BuyNo | OrderSide::SellNo => {
+                                            (book.bid_no + book.ask_no) * 0.5
+                                        }
+                                    };
+                                    paper
+                                        .register_order_intent(
+                                            &ack_event,
+                                            PaperIntentCtx {
+                                                market_id: target_market_id.clone(),
+                                                symbol: symbol.clone(),
+                                                timeframe,
+                                                stage,
+                                                direction: match quote_intent.side {
+                                                    OrderSide::BuyYes | OrderSide::SellNo => {
+                                                        Direction::Up
+                                                    }
+                                                    OrderSide::BuyNo | OrderSide::SellYes => {
+                                                        Direction::Down
+                                                    }
+                                                },
+                                                velocity_bps_per_sec: 0.0,
+                                                edge_bps: 0.0,
+                                                prob_fast: 0.5,
+                                                prob_settle: 0.5,
+                                                confidence: 0.0,
+                                                action: PaperAction::ReversalExit,
+                                                intent: ExecutionStyle::Maker,
+                                                requested_size_usdc: (quote_intent.price
+                                                    * quote_intent.size)
+                                                    .max(0.0),
+                                                requested_size_contracts: quote_intent.size,
+                                                entry_price,
+                                            },
+                                        )
+                                        .await;
                                 }
+                                shadow.register_order(
+                                    &ack_event,
+                                    quote_intent.clone(),
+                                    ExecutionStyle::Maker,
+                                    ((book.bid_yes + book.ask_yes) * 0.5).max(0.0),
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                tracing::warn!(
+                                    market_id = %target_market_id,
+                                    symbol = %symbol,
+                                    error = %err,
+                                    "reversal maker re-entry failed"
+                                );
                             }
                         }
                     }

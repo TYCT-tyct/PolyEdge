@@ -7,7 +7,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
-use core_types::{ControlCommand, EngineEvent, ExecutionVenue, ToxicRegime};
+use core_types::{ControlCommand, EngineEvent, ExecutionVenue, PaperDailySummary, PaperTradeRecord, ToxicRegime};
 use direction_detector::DirectionConfig;
 use fair_value::BasisMrConfig;
 use probability_engine::ProbabilityEngineConfig;
@@ -29,6 +29,7 @@ use crate::state::{
     ShadowFinalReport, ShadowLiveReport, SourceHealthConfig, SourceHealthReloadReq,
     StrategyReloadReq, StrategyReloadResp, TakerReloadReq, TakerReloadResp, ToxicityConfig,
     ToxicityFinalReport, ToxicityLiveReport, ToxicityReloadReq,
+    V52Config, V52DualArbConfig, V52ExecutionConfig, V52ReversalConfig, V52TimePhaseConfig,
 };
 use crate::seat_types::{SeatForceLayerReq, SeatManualOverrideReq};
 use crate::stats_utils::percentile;
@@ -51,6 +52,10 @@ pub(super) fn build_router(state: AppState) -> Router {
         .route("/report/toxicity/final", get(report_toxicity_final))
         .route("/report/seat/status", get(report_seat_status))
         .route("/report/seat/history", get(report_seat_history))
+        .route("/report/paper/live", get(report_paper_live))
+        .route("/report/paper/history", get(report_paper_history))
+        .route("/report/paper/daily", get(report_paper_daily))
+        .route("/report/paper/summary", get(report_paper_summary))
         .route("/control/pause", post(pause))
         .route("/control/resume", post(resume))
         .route("/control/flatten", post(flatten))
@@ -60,6 +65,7 @@ pub(super) fn build_router(state: AppState) -> Router {
         .route("/control/seat/force_layer", post(seat_force_layer))
         .route("/control/seat/manual_override", post(seat_manual_override))
         .route("/control/seat/clear_override", post(seat_clear_override))
+        .route("/control/paper/reset", post(reset_paper))
         .route("/control/reset_shadow", post(reset_shadow))
         .route("/control/reload_strategy", post(reload_strategy))
         .route("/control/reload_taker", post(reload_taker))
@@ -270,6 +276,38 @@ async fn report_seat_history(
     Json(state.seat.history(limit))
 }
 
+#[derive(Debug, Deserialize)]
+struct PaperHistoryQuery {
+    limit: Option<usize>,
+}
+
+async fn report_paper_live(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.paper.live_report().await)
+}
+
+async fn report_paper_history(
+    State(state): State<AppState>,
+    Query(query): Query<PaperHistoryQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(200).clamp(1, 5000);
+    let rows: Vec<PaperTradeRecord> = state.paper.history(limit).await;
+    Json(rows)
+}
+
+async fn report_paper_daily(State(state): State<AppState>) -> impl IntoResponse {
+    let rows: Vec<PaperDailySummary> = state.paper.daily().await;
+    Json(rows)
+}
+
+async fn report_paper_summary(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.paper.summary_json().await)
+}
+
+async fn reset_paper(State(state): State<AppState>) -> impl IntoResponse {
+    state.paper.reset().await;
+    Json(serde_json::json!({"ok": true, "paper_reset": true}))
+}
+
 async fn reset_shadow(State(state): State<AppState>) -> impl IntoResponse {
     let window_id = state.shadow_stats.reset().await;
     state.tox_state.write().await.clear();
@@ -301,6 +339,11 @@ struct PredatorCReloadReq {
     cross_symbol: Option<PredatorCrossSymbolConfig>,
     router: Option<RouterConfig>,
     compounder: Option<CompounderConfig>,
+    v52: Option<V52Config>,
+    v52_time_phase: Option<V52TimePhaseConfig>,
+    v52_execution: Option<V52ExecutionConfig>,
+    v52_dual_arb: Option<V52DualArbConfig>,
+    v52_reversal: Option<V52ReversalConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -340,6 +383,45 @@ async fn reload_predator_c(
     if let Some(v) = req.compounder {
         cfg.compounder = v;
     }
+    if let Some(v) = req.v52 {
+        cfg.v52 = v;
+    }
+    if let Some(v) = req.v52_time_phase {
+        cfg.v52.time_phase = v;
+    }
+    if let Some(v) = req.v52_execution {
+        cfg.v52.execution = v;
+    }
+    if let Some(v) = req.v52_dual_arb {
+        cfg.v52.dual_arb = v;
+    }
+    if let Some(v) = req.v52_reversal {
+        cfg.v52.reversal = v;
+    }
+    cfg.v52.time_phase.early_min_ratio = cfg.v52.time_phase.early_min_ratio.clamp(0.11, 0.99);
+    cfg.v52.time_phase.late_max_ratio = cfg.v52.time_phase.late_max_ratio.clamp(0.01, 0.54);
+    if cfg.v52.time_phase.late_max_ratio >= cfg.v52.time_phase.early_min_ratio {
+        cfg.v52.time_phase.late_max_ratio = 0.10;
+        cfg.v52.time_phase.early_min_ratio = 0.55;
+    }
+    cfg.v52.time_phase.allow_timeframes = cfg
+        .v52
+        .time_phase
+        .allow_timeframes
+        .iter()
+        .map(|s| s.to_ascii_lowercase())
+        .filter(|s| s == "5m" || s == "15m")
+        .collect::<Vec<_>>();
+    if cfg.v52.time_phase.allow_timeframes.is_empty() {
+        cfg.v52.time_phase.allow_timeframes = vec!["5m".to_string(), "15m".to_string()];
+    }
+    cfg.v52.execution.late_force_taker_remaining_ms =
+        cfg.v52.execution.late_force_taker_remaining_ms.clamp(1_000, 60_000);
+    cfg.v52.execution.maker_wait_ms_before_force =
+        cfg.v52.execution.maker_wait_ms_before_force.clamp(50, 10_000);
+    cfg.v52.dual_arb.safety_margin_bps = cfg.v52.dual_arb.safety_margin_bps.clamp(0.0, 100.0);
+    cfg.v52.dual_arb.threshold = cfg.v52.dual_arb.threshold.clamp(0.50, 1.10);
+    cfg.v52.dual_arb.fee_buffer_mode = "conservative_taker".to_string();
     let snapshot = cfg.clone();
     drop(cfg);
 

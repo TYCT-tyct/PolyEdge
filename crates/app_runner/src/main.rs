@@ -19,6 +19,8 @@ mod feed_runtime;
 mod fusion_engine;
 mod gate_eval;
 mod orchestration;
+mod paper_runtime;
+mod paper_sqlite;
 mod report_io;
 mod seat_persist;
 mod seat_runtime;
@@ -74,8 +76,8 @@ where
 }
 
 pub(crate) use engine_loop::{
-    estimate_time_to_expiry_ms, spawn_predator_exit_lifecycle, spawn_shadow_outcome_task,
-    spawn_strategy_engine, PredatorExecResult,
+    spawn_predator_exit_lifecycle, spawn_shadow_outcome_task, spawn_strategy_engine,
+    PredatorExecResult,
 };
 
 #[cfg(test)]

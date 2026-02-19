@@ -4,8 +4,9 @@ use std::time::{Duration, Instant};
 
 use core_types::{
     new_id, BookTop, Direction, DirectionSignal, EngineEvent, ExecutionStyle, ExecutionVenue,
-    OrderAck, OrderIntentV2, OrderSide, OrderTimeInForce, QuoteIntent, Regime, RiskContext,
-    RiskManager, ShadowShot, SourceHealth, TimeframeClass, TimeframeOpp, ToxicRegime,
+    OrderAck, OrderIntentV2, OrderSide, OrderTimeInForce, PaperAction, QuoteIntent, Regime,
+    RiskContext, RiskManager, ShadowShot, SourceHealth, Stage, TimeframeClass, TimeframeOpp,
+    ToxicRegime,
 };
 use execution_clob::ClobExecution;
 use exit_manager::PositionLifecycle;
@@ -17,6 +18,7 @@ use strategy_maker::MakerConfig;
 use taker_sniper::{FirePlan, TakerAction};
 
 use crate::engine_core::{classify_execution_error_reason, normalize_reject_code};
+use crate::paper_runtime::{global_paper_runtime, PaperIntentCtx};
 use crate::execution_eval::{
     aggressive_price_for_side, edge_gross_bps_for_side, get_fee_rate_bps_cached,
     get_rebate_bps_cached, mid_for_side, prebuild_order_payload, spread_for_side,
@@ -25,15 +27,187 @@ use crate::feed_runtime::settlement_prob_yes_for_symbol;
 use crate::fusion_engine::TokenBucket;
 use crate::state::{
     EngineShared, PredatorCConfig, PredatorCPriority, PredatorRegimeConfig, SourceHealthConfig,
+    V52DualArbConfig, V52ExecutionConfig, V52TimePhaseConfig,
 };
 use crate::stats_utils::{freshness_ms, now_ns};
 use crate::strategy_policy::{
     adaptive_size_scale, edge_gate_bps, inventory_for_market, timeframe_weight,
 };
 use crate::{
-    estimate_time_to_expiry_ms, publish_if_telemetry_subscribers, spawn_predator_exit_lifecycle,
+    publish_if_telemetry_subscribers, spawn_predator_exit_lifecycle, spawn_detached,
     spawn_shadow_outcome_task, PredatorExecResult,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimePhase {
+    Early,
+    Maturity,
+    Late,
+}
+
+pub(crate) fn timeframe_total_ms(timeframe: TimeframeClass) -> Option<i64> {
+    match timeframe {
+        TimeframeClass::Tf5m => Some(300_000),
+        TimeframeClass::Tf15m => Some(900_000),
+        _ => None,
+    }
+}
+
+fn timeframe_tag(timeframe: TimeframeClass) -> &'static str {
+    match timeframe {
+        TimeframeClass::Tf5m => "5m",
+        TimeframeClass::Tf15m => "15m",
+        TimeframeClass::Tf1h => "1h",
+        TimeframeClass::Tf1d => "1d",
+    }
+}
+
+pub(crate) fn classify_time_phase(remaining_ratio: f64, cfg: &V52TimePhaseConfig) -> TimePhase {
+    if remaining_ratio <= cfg.late_max_ratio {
+        TimePhase::Late
+    } else if remaining_ratio <= cfg.early_min_ratio {
+        TimePhase::Maturity
+    } else {
+        TimePhase::Early
+    }
+}
+
+pub(crate) fn stage_for_phase(phase: TimePhase, momentum: bool) -> Stage {
+    match phase {
+        TimePhase::Early => Stage::Early,
+        TimePhase::Late => Stage::Late,
+        TimePhase::Maturity => {
+            if momentum {
+                Stage::Momentum
+            } else {
+                Stage::Maturity
+            }
+        }
+    }
+}
+
+pub(crate) fn allow_dual_side_arb(
+    yes_price: f64,
+    no_price: f64,
+    fee_rate_bps: f64,
+    cfg: &V52DualArbConfig,
+) -> bool {
+    if !cfg.enabled {
+        return false;
+    }
+    let fee_buffer = (fee_rate_bps.max(0.0) / 10_000.0).max(0.0);
+    let safety_margin = (cfg.safety_margin_bps.max(0.0) / 10_000.0).max(0.0);
+    yes_price + no_price + fee_buffer + safety_margin < cfg.threshold
+}
+
+pub(crate) fn should_force_taker_fallback(
+    phase: TimePhase,
+    time_to_expiry_ms: i64,
+    cfg: &V52ExecutionConfig,
+) -> bool {
+    let force_in_phase = match phase {
+        TimePhase::Early => false,
+        TimePhase::Maturity => cfg.apply_force_taker_in_maturity,
+        TimePhase::Late => cfg.apply_force_taker_in_late,
+    };
+    force_in_phase && time_to_expiry_ms <= cfg.late_force_taker_remaining_ms as i64
+}
+
+fn spawn_force_taker_fallback_for_maker(
+    shared: Arc<EngineShared>,
+    execution: Arc<ClobExecution>,
+    shadow: Arc<ShadowExecutor>,
+    market_id: String,
+    token_id: String,
+    side: OrderSide,
+    size: f64,
+    ttl_ms: u64,
+    maker_order_id: String,
+    fee_rate_bps: f64,
+    expected_edge_net_bps: f64,
+    timeframe: TimeframeClass,
+    force_remaining_ms: u64,
+    maker_wait_ms: u64,
+    taker_max_slippage_bps: f64,
+) {
+    spawn_detached("v52_force_taker_fallback", false, async move {
+        if maker_wait_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(maker_wait_ms)).await;
+        }
+        let Some(frame_total_ms) = timeframe_total_ms(timeframe) else {
+            return;
+        };
+        let threshold = force_remaining_ms as i64;
+        loop {
+            if !execution.has_open_order(&maker_order_id) {
+                return;
+            }
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let remain_ms = (frame_total_ms - now_ms.rem_euclid(frame_total_ms)).max(0);
+            if remain_ms <= threshold {
+                break;
+            }
+            let sleep_ms = (remain_ms - threshold).clamp(25, 250) as u64;
+            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+        }
+        if !execution.has_open_order(&maker_order_id) {
+            return;
+        }
+        if execution.cancel_order(&maker_order_id, &market_id).await.is_err() {
+            return;
+        }
+        shadow.cancel(&maker_order_id);
+        let book = shared.latest_books.read().await.get(&market_id).cloned();
+        let Some(book) = book else {
+            return;
+        };
+        let taker_price = aggressive_price_for_side(&book, &side);
+        if !taker_price.is_finite() || taker_price <= 0.0 {
+            return;
+        }
+        let order = OrderIntentV2 {
+            market_id: market_id.clone(),
+            token_id: Some(token_id),
+            side: side.clone(),
+            price: taker_price,
+            size: size.max(0.01),
+            ttl_ms: ttl_ms.min(150),
+            style: ExecutionStyle::Taker,
+            tif: OrderTimeInForce::Fak,
+            max_slippage_bps: taker_max_slippage_bps.max(0.0),
+            fee_rate_bps,
+            expected_edge_net_bps,
+            client_order_id: Some(new_id()),
+            hold_to_resolution: false,
+            prebuilt_payload: None,
+        };
+        match execution.place_order_v2(order).await {
+            Ok(ack) if ack.accepted => {
+                shared.shadow_stats.mark_predator_last_30s_taker_fallback();
+                shared.shadow_stats.mark_executed();
+                let ack_event = OrderAck {
+                    order_id: ack.order_id,
+                    market_id: ack.market_id,
+                    accepted: true,
+                    ts_ms: ack.ts_ms,
+                };
+                shadow.register_order(
+                    &ack_event,
+                    QuoteIntent {
+                        market_id,
+                        side,
+                        price: taker_price,
+                        size: size.max(0.01),
+                        ttl_ms: ttl_ms.min(150),
+                    },
+                    ExecutionStyle::Taker,
+                    ((book.bid_yes + book.ask_yes) * 0.5).max(0.0),
+                );
+            }
+            _ => {}
+        }
+    });
+}
 
 pub(super) async fn evaluate_and_route_v52(
     shared: &Arc<EngineShared>,
@@ -285,18 +459,13 @@ pub(super) async fn run_predator_c_for_symbol(
         (0.0, predator_cfg.compounder.initial_capital_usdc.max(0.0))
     };
 
-    let side = match direction_signal.direction {
-        Direction::Up => OrderSide::BuyYes,
-        Direction::Down => OrderSide::BuyNo,
-        Direction::Neutral => OrderSide::BuyYes,
-    };
-
     // Build candidate opportunities using cached fair values per market (do NOT call fair.evaluate
     // here; the fair model is stateful per symbol and would be advanced multiple times).
     #[derive(Debug, Clone)]
     struct PredatorCandIn {
         market_id: String,
         timeframe: TimeframeClass,
+        side: OrderSide,
         entry_price: f64,
         spread: f64,
         fee_bps: f64,
@@ -326,6 +495,26 @@ pub(super) async fn run_predator_c_for_symbol(
         let Some(timeframe) = tf_by_market.get(&market_id).cloned() else {
             continue;
         };
+        let Some(frame_total_ms) = timeframe_total_ms(timeframe.clone()) else {
+            shared
+                .shadow_stats
+                .mark_blocked_with_reason("v52_blocked_timeframe")
+                .await;
+            continue;
+        };
+        if !predator_cfg
+            .v52
+            .time_phase
+            .allow_timeframes
+            .iter()
+            .any(|v| v == timeframe_tag(timeframe.clone()))
+        {
+            shared
+                .shadow_stats
+                .mark_blocked_with_reason("v52_timeframe_not_allowed")
+                .await;
+            continue;
+        }
         let Some(book) = book_by_market.get(&market_id).cloned() else {
             continue;
         };
@@ -340,10 +529,15 @@ pub(super) async fn run_predator_c_for_symbol(
             continue;
         }
 
-        let entry_price = aggressive_price_for_side(&book, &side);
-        let spread = spread_for_side(&book, &side);
+        let time_to_expiry_ms = (frame_total_ms - now_ms.rem_euclid(frame_total_ms)).max(0);
+        let remaining_ratio = (time_to_expiry_ms as f64 / frame_total_ms as f64).clamp(0.0, 1.0);
+        let time_phase = classify_time_phase(remaining_ratio, &predator_cfg.v52.time_phase);
+
         let fee_bps = get_fee_rate_bps_cached(shared, &market_id).await;
         let rebate_est_bps = get_rebate_bps_cached(shared, &market_id, fee_bps).await;
+        let yes_price = aggressive_price_for_side(&book, &OrderSide::BuyYes);
+        let no_price = aggressive_price_for_side(&book, &OrderSide::BuyNo);
+        let dual_arb_ok = allow_dual_side_arb(yes_price, no_price, fee_bps, &predator_cfg.v52.dual_arb);
         let book_top_lag_ms = if tick_fast_recv_ts_local_ns > 0 && book.recv_ts_local_ns > 0 {
             ((book.recv_ts_local_ns - tick_fast_recv_ts_local_ns).max(0) as f64) / 1_000_000.0
         } else {
@@ -369,8 +563,22 @@ pub(super) async fn run_predator_c_for_symbol(
             .shadow_stats
             .push_probability_sample(&probability)
             .await;
-        let edge_gross_bps = edge_gross_bps_for_side(probability.p_settle, &side, entry_price);
-        let edge_net_bps = edge_gross_bps - fee_bps + rebate_est_bps - edge_model_cfg.fail_cost_bps;
+        let yes_edge_gross = edge_gross_bps_for_side(probability.p_settle, &OrderSide::BuyYes, yes_price);
+        let no_edge_gross = edge_gross_bps_for_side(probability.p_settle, &OrderSide::BuyNo, no_price);
+        let yes_edge_net = yes_edge_gross - fee_bps + rebate_est_bps - edge_model_cfg.fail_cost_bps;
+        let no_edge_net = no_edge_gross - fee_bps + rebate_est_bps - edge_model_cfg.fail_cost_bps;
+        if yes_edge_net > 0.0 && no_edge_net > 0.0 && !dual_arb_ok {
+            shared
+                .shadow_stats
+                .mark_blocked_with_reason("dual_arb_gate_blocked")
+                .await;
+        }
+        let (side, entry_price, edge_gross_bps, edge_net_bps) = if no_edge_net > yes_edge_net {
+            (OrderSide::BuyNo, no_price, no_edge_gross, no_edge_net)
+        } else {
+            (OrderSide::BuyYes, yes_price, yes_edge_gross, yes_edge_net)
+        };
+        let spread = spread_for_side(&book, &side);
         let base_size = if predator_cfg.compounder.enabled {
             (quote_notional_usdc / entry_price.max(1e-6)).max(0.01)
         } else {
@@ -384,11 +592,17 @@ pub(super) async fn run_predator_c_for_symbol(
         if tf_weight <= 0.0 {
             continue;
         }
-        let size = (base_size * tf_weight).max(0.01);
+        let phase_size_scale = match time_phase {
+            TimePhase::Early => 0.8,
+            TimePhase::Maturity => 1.0,
+            TimePhase::Late => 1.25,
+        };
+        let size = (base_size * tf_weight * phase_size_scale).max(0.01);
 
         cand_inputs.push(PredatorCandIn {
             market_id,
             timeframe,
+            side,
             entry_price,
             spread,
             fee_bps,
@@ -419,6 +633,16 @@ pub(super) async fn run_predator_c_for_symbol(
             match decision.action {
                 TakerAction::Fire => {
                     if let Some(plan) = decision.fire_plan {
+                        let mut plan = plan;
+                        plan.opportunity.side = cin.side.clone();
+                        plan.opportunity.direction = match cin.side {
+                            OrderSide::BuyYes | OrderSide::SellNo => Direction::Up,
+                            OrderSide::BuyNo | OrderSide::SellYes => Direction::Down,
+                        };
+                        plan.opportunity.entry_price = cin.entry_price;
+                        plan.opportunity.edge_gross_bps = cin.edge_gross_bps;
+                        plan.opportunity.edge_net_bps = cin.edge_net_bps;
+                        plan.opportunity.ts_ms = now_ms;
                         fire_plans_by_market.insert(plan.opportunity.market_id.clone(), plan);
                     }
                 }
@@ -1011,7 +1235,7 @@ pub(super) async fn predator_execute_opportunity(
     global_rate_budget: &mut TokenBucket,
     maker_cfg: &MakerConfig,
     predator_cfg: &PredatorCConfig,
-    _direction_signal: &DirectionSignal,
+    direction_signal: &DirectionSignal,
     opp: &TimeframeOpp,
     chunk_size: f64,
     tick_fast_recv_ts_ms: i64,
@@ -1039,8 +1263,24 @@ pub(super) async fn predator_execute_opportunity(
             .await;
         return PredatorExecResult::default();
     };
-    let time_to_expiry_ms = estimate_time_to_expiry_ms(shared, &intent.market_id, now_ms).await;
-    if time_to_expiry_ms >= 0 && time_to_expiry_ms <= 30_000 {
+    let Some(frame_total_ms) = timeframe_total_ms(opp.timeframe.clone()) else {
+        shared
+            .shadow_stats
+            .mark_blocked_with_reason("v52_blocked_timeframe")
+            .await;
+        return PredatorExecResult::default();
+    };
+    let time_to_expiry_ms = (frame_total_ms - now_ms.rem_euclid(frame_total_ms)).max(0);
+    let remaining_ratio = (time_to_expiry_ms as f64 / frame_total_ms as f64).clamp(0.0, 1.0);
+    let time_phase = classify_time_phase(remaining_ratio, &predator_cfg.v52.time_phase);
+    let force_taker_now =
+        should_force_taker_fallback(time_phase, time_to_expiry_ms, &predator_cfg.v52.execution);
+    let apply_force_taker_for_phase = match time_phase {
+        TimePhase::Early => false,
+        TimePhase::Maturity => predator_cfg.v52.execution.apply_force_taker_in_maturity,
+        TimePhase::Late => predator_cfg.v52.execution.apply_force_taker_in_late,
+    };
+    if force_taker_now {
         shared.shadow_stats.mark_predator_last_30s_taker_fallback();
     }
 
@@ -1177,6 +1417,11 @@ pub(super) async fn predator_execute_opportunity(
         OrderSide::BuyYes | OrderSide::SellYes => book.token_id_yes.clone(),
         OrderSide::BuyNo | OrderSide::SellNo => book.token_id_no.clone(),
     };
+    let execution_style = if force_taker_now {
+        ExecutionStyle::Taker
+    } else {
+        ExecutionStyle::Maker
+    };
     let v2_intent = OrderIntentV2 {
         market_id: intent.market_id.clone(),
         token_id: Some(token_id.clone()),
@@ -1184,9 +1429,17 @@ pub(super) async fn predator_execute_opportunity(
         price: intent.price,
         size: intent.size,
         ttl_ms: intent.ttl_ms,
-        style: ExecutionStyle::Taker,
-        tif: OrderTimeInForce::Fak,
-        max_slippage_bps: maker_cfg.taker_max_slippage_bps,
+        style: execution_style.clone(),
+        tif: if execution_style == ExecutionStyle::Maker {
+            OrderTimeInForce::PostOnly
+        } else {
+            OrderTimeInForce::Fak
+        },
+        max_slippage_bps: if execution_style == ExecutionStyle::Maker {
+            0.0
+        } else {
+            maker_cfg.taker_max_slippage_bps
+        },
         fee_rate_bps: opp.fee_bps,
         expected_edge_net_bps: opp.edge_net_bps,
         client_order_id: Some(new_id()),
@@ -1233,6 +1486,7 @@ pub(super) async fn predator_execute_opportunity(
                 shared.clone(),
                 bus.clone(),
                 execution.clone(),
+                shadow.clone(),
                 ack_v2.order_id.clone(),
                 intent.market_id.clone(),
                 opp.symbol.clone(),
@@ -1280,7 +1534,66 @@ pub(super) async fn predator_execute_opportunity(
                 ts_ms: ack_v2.ts_ms,
             };
             publish_if_telemetry_subscribers(bus, EngineEvent::OrderAck(ack.clone()));
-            shadow.register_order(&ack, intent.clone());
+            shadow.register_order(
+                &ack,
+                intent.clone(),
+                execution_style.clone(),
+                mid_for_side(&book, &intent.side).max(0.0),
+            );
+            if execution_style == ExecutionStyle::Maker && apply_force_taker_for_phase {
+                spawn_force_taker_fallback_for_maker(
+                    shared.clone(),
+                    execution.clone(),
+                    shadow.clone(),
+                    intent.market_id.clone(),
+                    token_id.clone(),
+                    intent.side.clone(),
+                    intent.size,
+                    intent.ttl_ms,
+                    ack.order_id.clone(),
+                    opp.fee_bps,
+                    opp.edge_net_bps,
+                    opp.timeframe.clone(),
+                    predator_cfg.v52.execution.late_force_taker_remaining_ms,
+                    predator_cfg.v52.execution.maker_wait_ms_before_force,
+                    maker_cfg.taker_max_slippage_bps,
+                );
+            }
+            if let Some(paper) = global_paper_runtime() {
+                let momentum_overlay = matches!(time_phase, TimePhase::Maturity)
+                    && direction_signal.velocity_bps_per_sec.abs()
+                        >= predator_cfg.direction_detector.min_velocity_bps_per_sec;
+                let stage = stage_for_phase(time_phase, momentum_overlay);
+                let (prob_fast, prob_settle) = shared
+                    .predator_latest_probability
+                    .read()
+                    .await
+                    .get(intent.market_id.as_str())
+                    .map(|p| (p.p_fast, p.p_settle))
+                    .unwrap_or((0.5, 0.5));
+                paper
+                    .register_order_intent(
+                        &ack,
+                        PaperIntentCtx {
+                            market_id: intent.market_id.clone(),
+                            symbol: opp.symbol.clone(),
+                            timeframe: opp.timeframe.to_string(),
+                            stage,
+                            direction: direction_signal.direction.clone(),
+                            velocity_bps_per_sec: direction_signal.velocity_bps_per_sec,
+                            edge_bps: opp.edge_net_bps,
+                            prob_fast,
+                            prob_settle,
+                            confidence: opp.confidence,
+                            action: PaperAction::Enter,
+                            intent: execution_style.clone(),
+                            requested_size_usdc: (intent.price * intent.size).max(0.0),
+                            requested_size_contracts: intent.size,
+                            entry_price: intent.price,
+                        },
+                    )
+                    .await;
+            }
 
             for delay_ms in [5_u64, 10_u64, 25_u64] {
                 let shot = ShadowShot {
@@ -1288,7 +1601,7 @@ pub(super) async fn predator_execute_opportunity(
                     market_id: intent.market_id.clone(),
                     symbol: opp.symbol.clone(),
                     side: intent.side.clone(),
-                    execution_style: ExecutionStyle::Taker,
+                    execution_style: execution_style.clone(),
                     book_top_lag_ms,
                     ack_only_ms,
                     tick_to_ack_ms,
@@ -1299,7 +1612,11 @@ pub(super) async fn predator_execute_opportunity(
                     edge_gross_bps: opp.edge_gross_bps,
                     edge_net_bps: opp.edge_net_bps,
                     fee_paid_bps: opp.fee_bps,
-                    rebate_est_bps: 0.0,
+                    rebate_est_bps: if execution_style == ExecutionStyle::Maker {
+                        get_rebate_bps_cached(shared, &intent.market_id, opp.fee_bps).await
+                    } else {
+                        0.0
+                    },
                     delay_ms,
                     t0_ns: now_ns(),
                     min_edge_bps: predator_cfg.taker_sniper.min_edge_net_bps,

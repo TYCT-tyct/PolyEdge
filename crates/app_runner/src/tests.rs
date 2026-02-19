@@ -7,6 +7,7 @@ use chrono::Utc;
 use core_types::{
     new_id, BookTop, ControlCommand, Direction, DirectionSignal, EngineEvent, ExecutionStyle,
     ExecutionVenue, OrderIntentV2, OrderSide, OrderTimeInForce, QuoteIntent, RefTick, Regime,
+    Stage,
     Signal, SourceHealth, TimeframeClass, ToxicDecision, ToxicRegime,
 };
 use dashmap::DashMap;
@@ -15,6 +16,7 @@ use exit_manager::{ExitManager, PositionLifecycle};
 use fair_value::BasisMrConfig;
 use execution_clob::{wss_user_feed::WssFillEvent, ClobExecution, ExecutionMode};
 use infra_bus::RingBus;
+use paper_executor::ShadowExecutor;
 use probability_engine::ProbabilityEngine;
 use reqwest::Client;
 use risk_engine::{DefaultRiskManager, RiskLimits};
@@ -38,13 +40,17 @@ use crate::fusion_engine::{
 use crate::state::{
     to_exit_manager_config, EdgeModelConfig, EngineShared, ExitConfig, FusionConfig,
     MarketToxicState, PredatorCConfig, PredatorRegimeConfig, SettlementConfig, ShadowStats,
-    SignalCacheEntry, SourceHealthConfig, ToxicityConfig,
+    SignalCacheEntry, SourceHealthConfig, ToxicityConfig, V52DualArbConfig,
+    V52ExecutionConfig, V52TimePhaseConfig,
 };
 use crate::stats_utils::{now_ns, percentile, policy_block_ratio, quote_block_ratio, robust_filter_iqr};
 use crate::strategy_policy::{
     adaptive_min_edge_bps, is_market_in_top_n, should_force_taker, should_observe_only_symbol,
 };
-use crate::strategy_runtime::classify_predator_regime;
+use crate::strategy_runtime::{
+    allow_dual_side_arb, classify_predator_regime, classify_time_phase, should_force_taker_fallback,
+    stage_for_phase, timeframe_total_ms, TimePhase,
+};
 use crate::engine_loop::build_reversal_reentry_order;
 
 fn test_engine_shared_with_wss() -> (
@@ -319,6 +325,7 @@ async fn reversal_taker_to_opposite_maker_reentry_end_to_end_records_report() {
         ExecutionMode::Paper,
         "http://127.0.0.1:0".to_string(),
     ));
+    let shadow = Arc::new(ShadowExecutor::default());
     let market_id = "m_reversal".to_string();
     let symbol = "BTCUSDT".to_string();
     let now_ms = Utc::now().timestamp_millis();
@@ -342,7 +349,7 @@ async fn reversal_taker_to_opposite_maker_reentry_end_to_end_records_report() {
         SignalCacheEntry {
             signal: Signal {
                 market_id: market_id.clone(),
-                fair_yes: 0.74,
+                fair_yes: 0.20,
                 edge_bps_bid: 12.0,
                 edge_bps_ask: -12.0,
                 confidence: 0.92,
@@ -424,6 +431,7 @@ async fn reversal_taker_to_opposite_maker_reentry_end_to_end_records_report() {
         shared.clone(),
         bus.clone(),
         execution.clone(),
+        shadow,
         entry_ack.order_id.clone(),
         market_id.clone(),
         symbol.clone(),
@@ -963,4 +971,43 @@ fn compute_coalesce_policy_uses_drain_mode_for_very_deep_queue() {
     let p = compute_coalesce_policy(200, Some(60.0), 256, 4, 120);
     assert_eq!(p.max_events, 200);
     assert_eq!(p.budget_us, 800);
+}
+
+#[test]
+fn v52_time_phase_boundaries_for_5m_and_15m() {
+    let cfg = V52TimePhaseConfig::default();
+    let tf_5m_total = timeframe_total_ms(TimeframeClass::Tf5m).expect("5m total");
+    let tf_15m_total = timeframe_total_ms(TimeframeClass::Tf15m).expect("15m total");
+    assert_eq!(tf_5m_total, 300_000);
+    assert_eq!(tf_15m_total, 900_000);
+
+    assert_eq!(classify_time_phase(0.56, &cfg), TimePhase::Early);
+    assert_eq!(classify_time_phase(0.55, &cfg), TimePhase::Maturity);
+    assert_eq!(classify_time_phase(0.11, &cfg), TimePhase::Maturity);
+    assert_eq!(classify_time_phase(0.10, &cfg), TimePhase::Late);
+    assert_eq!(classify_time_phase(0.01, &cfg), TimePhase::Late);
+}
+
+#[test]
+fn v52_momentum_overlay_only_in_maturity() {
+    assert_eq!(stage_for_phase(TimePhase::Early, true), Stage::Early);
+    assert_eq!(stage_for_phase(TimePhase::Late, true), Stage::Late);
+    assert_eq!(stage_for_phase(TimePhase::Maturity, false), Stage::Maturity);
+    assert_eq!(stage_for_phase(TimePhase::Maturity, true), Stage::Momentum);
+}
+
+#[test]
+fn v52_force_taker_rule_applies_to_maturity_and_late() {
+    let cfg = V52ExecutionConfig::default();
+    assert!(!should_force_taker_fallback(TimePhase::Early, 29_000, &cfg));
+    assert!(should_force_taker_fallback(TimePhase::Maturity, 29_000, &cfg));
+    assert!(should_force_taker_fallback(TimePhase::Late, 29_000, &cfg));
+    assert!(!should_force_taker_fallback(TimePhase::Maturity, 31_000, &cfg));
+}
+
+#[test]
+fn v52_dual_arb_threshold_formula() {
+    let cfg = V52DualArbConfig::default();
+    assert!(allow_dual_side_arb(0.40, 0.40, 2.0, &cfg));
+    assert!(!allow_dual_side_arb(0.50, 0.49, 2.0, &cfg));
 }

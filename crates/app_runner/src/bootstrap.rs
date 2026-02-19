@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use dashmap::DashMap;
 use direction_detector::DirectionDetector;
 use execution_clob::{ClobExecution, ExecutionMode};
@@ -27,6 +27,7 @@ use crate::config_loader::{
     load_universe_config,
 };
 use crate::feed_runtime::{spawn_market_feed, spawn_reference_feed, spawn_settlement_feed};
+use crate::paper_runtime::{set_global_paper_runtime, PaperRuntimeHandle};
 use crate::report_io::{ensure_dataset_dirs, init_jsonl_writer};
 use crate::seat_runtime::SeatRuntimeHandle;
 use crate::state::{
@@ -53,6 +54,7 @@ pub(super) async fn async_main() -> Result<()> {
         .ok()
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(8080);
+    tracing::info!(control_port, "resolved control port");
     std::env::set_var("POLYEDGE_CONTROL_PORT", control_port.to_string());
     let mut seat_cfg = load_seat_config();
     if seat_cfg.control_base_url.trim().is_empty() {
@@ -60,6 +62,31 @@ pub(super) async fn async_main() -> Result<()> {
     }
     let seat = SeatRuntimeHandle::spawn(seat_cfg);
     let seat_fill_counter = seat.live_fill_counter();
+    let paper_enabled = std::env::var("POLYEDGE_PAPER_ENABLED")
+        .ok()
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+        .unwrap_or(true);
+    let paper_initial_capital = std::env::var("POLYEDGE_PAPER_INITIAL_CAPITAL")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(100.0)
+        .max(1.0);
+    let paper_run_id = std::env::var("POLYEDGE_PAPER_RUN_ID")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| format!("paper-{}", chrono::Utc::now().format("%Y%m%d%H%M%S")));
+    let paper_sqlite_enabled = std::env::var("POLYEDGE_PAPER_SQLITE_ENABLED")
+        .ok()
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+        .unwrap_or(true);
+    let paper = PaperRuntimeHandle::new(
+        paper_enabled,
+        paper_run_id,
+        paper_initial_capital,
+        paper_sqlite_enabled,
+        seat.clone(),
+    );
+    set_global_paper_runtime(paper.clone());
 
     let execution_cfg = load_execution_config();
     let universe_cfg = load_universe_config();
@@ -252,12 +279,14 @@ pub(super) async fn async_main() -> Result<()> {
                     .await;
                 });
                 let mut fill_rx = tx.subscribe();
+                let execution_for_fill = execution.clone();
                 spawn_detached("seat_live_fill_counter", false, async move {
                     loop {
                         match fill_rx.recv().await {
                             Ok(event) => {
                                 if event.event_type == "trade" {
                                     fill_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    execution_for_fill.mark_order_closed_local(&event.order_id);
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -296,6 +325,7 @@ pub(super) async fn async_main() -> Result<()> {
         perf_profile: perf_profile.clone(),
         shared: shared.clone(),
         seat: seat.clone(),
+        paper: paper.clone(),
     };
 
     spawn_reference_feed(
@@ -340,7 +370,10 @@ pub(super) async fn async_main() -> Result<()> {
 
     let addr: SocketAddr = format!("0.0.0.0:{control_port}").parse()?;
     tracing::info!(%addr, "control api started");
-    axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind control api listener at {addr}"))?;
+    axum::serve(listener, app).await?;
     Ok(())
 }
 

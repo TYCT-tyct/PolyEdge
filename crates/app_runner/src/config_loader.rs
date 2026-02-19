@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use fair_value::BasisMrConfig;
 use risk_engine::RiskLimits;
@@ -12,8 +12,16 @@ use crate::state::{
     PredatorCPriority, SettlementConfig, SourceHealthConfig,
 };
 
+fn strategy_config_path() -> PathBuf {
+    std::env::var("POLYEDGE_STRATEGY_CONFIG_PATH")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("configs/strategy.toml"))
+}
+
 pub(super) fn load_fair_value_config() -> BasisMrConfig {
-    let path = Path::new("configs/strategy.toml");
+    let path = strategy_config_path();
     let Ok(raw) = fs::read_to_string(path) else {
         return BasisMrConfig::default();
     };
@@ -139,20 +147,19 @@ fn parse_toml_array_of_strings(val: &str) -> Vec<String> {
 
 #[cfg(test)]
 pub(crate) fn parse_toml_array_for_key(raw: &str, key: &str) -> Option<Vec<String>> {
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((k, v)) = line.split_once('=') else {
-            continue;
-        };
-        if k.trim() != key {
-            continue;
-        }
-        return Some(parse_toml_array_of_strings(v.trim()));
+    let Ok(value) = toml::from_str::<toml::Value>(raw) else {
+        return None;
+    };
+    let arr = value.get(key)?.as_array()?;
+    let parsed = arr
+        .iter()
+        .filter_map(|v| v.as_str().map(ToString::to_string))
+        .collect::<Vec<_>>();
+    if parsed.is_empty() {
+        None
+    } else {
+        Some(parsed)
     }
-    None
 }
 
 fn parse_gatling_symbol_section(section: &str) -> Option<String> {
@@ -170,7 +177,7 @@ fn parse_gatling_symbol_section(section: &str) -> Option<String> {
 }
 
 pub(super) fn load_strategy_config() -> MakerConfig {
-    let path = Path::new("configs/strategy.toml");
+    let path = strategy_config_path();
     let Ok(raw) = fs::read_to_string(path) else {
         return MakerConfig::default();
     };
@@ -275,7 +282,7 @@ pub(super) fn load_strategy_config() -> MakerConfig {
 }
 
 pub(super) fn load_fusion_config() -> FusionConfig {
-    let path = Path::new("configs/strategy.toml");
+    let path = strategy_config_path();
     let Ok(raw) = fs::read_to_string(path) else {
         let cfg = FusionConfig::default();
         std::env::set_var(
@@ -450,6 +457,11 @@ pub(super) fn load_fusion_config() -> FusionConfig {
         cfg.fallback_arm_duration_ms = cfg.fallback_arm_duration_ms.max(8_000);
         cfg.fallback_cooldown_sec = cfg.fallback_cooldown_sec.max(300);
     }
+    if let Ok(raw) = std::env::var("POLYEDGE_UDP_PORT") {
+        if let Ok(parsed) = raw.parse::<u16>() {
+            cfg.udp_port = parsed.max(1);
+        }
+    }
     if saw_fusion && saw_transport {
         tracing::warn!(
             "both [fusion] and [transport] are present; [transport] now takes precedence"
@@ -463,7 +475,7 @@ pub(super) fn load_fusion_config() -> FusionConfig {
 }
 
 pub(super) fn load_source_health_config() -> SourceHealthConfig {
-    let path = Path::new("configs/strategy.toml");
+    let path = strategy_config_path();
     let Ok(raw) = fs::read_to_string(path) else {
         return SourceHealthConfig::default();
     };
@@ -524,7 +536,7 @@ pub(super) fn load_source_health_config() -> SourceHealthConfig {
 }
 
 pub(super) fn load_edge_model_config() -> EdgeModelConfig {
-    let path = Path::new("configs/strategy.toml");
+    let path = strategy_config_path();
     let Ok(raw) = fs::read_to_string(path) else {
         return EdgeModelConfig::default();
     };
@@ -578,7 +590,7 @@ pub(super) fn load_edge_model_config() -> EdgeModelConfig {
 }
 
 pub(super) fn load_exit_config() -> ExitConfig {
-    let path = Path::new("configs/strategy.toml");
+    let path = strategy_config_path();
     let Ok(raw) = fs::read_to_string(path) else {
         return ExitConfig::default();
     };
@@ -684,7 +696,7 @@ pub(super) fn load_exit_config() -> ExitConfig {
 }
 
 pub(super) fn load_predator_c_config() -> PredatorCConfig {
-    let path = Path::new("configs/strategy.toml");
+    let path = strategy_config_path();
     let Ok(raw) = fs::read_to_string(path) else {
         return PredatorCConfig::default();
     };
@@ -701,6 +713,10 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
     let mut in_cross = false;
     let mut in_router = false;
     let mut in_compounder = false;
+    let mut in_v52_time_phase = false;
+    let mut in_v52_execution = false;
+    let mut in_v52_dual_arb = false;
+    let mut in_v52_reversal = false;
     let mut gatling_symbol_section: Option<String> = None;
 
     for line in raw.lines() {
@@ -720,6 +736,10 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
             in_cross = line == "[predator_c.cross_symbol]";
             in_router = line == "[predator_c.router]";
             in_compounder = line == "[predator_c.compounder]";
+            in_v52_time_phase = line == "[v52.time_phase]" || line == "[predator_c.v52.time_phase]";
+            in_v52_execution = line == "[v52.execution]" || line == "[predator_c.v52.execution]";
+            in_v52_dual_arb = line == "[v52.dual_arb]" || line == "[predator_c.v52.dual_arb]";
+            in_v52_reversal = line == "[v52.reversal]" || line == "[predator_c.v52.reversal]";
             continue;
         }
         if !(in_root
@@ -732,6 +752,10 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
             || in_cross
             || in_router
             || in_compounder
+            || in_v52_time_phase
+            || in_v52_execution
+            || in_v52_dual_arb
+            || in_v52_reversal
             || gatling_symbol_section.is_some())
         {
             continue;
@@ -1230,13 +1254,130 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
             }
             continue;
         }
+
+        if in_v52_time_phase {
+            match key {
+                "early_min_ratio" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.v52.time_phase.early_min_ratio = parsed;
+                    }
+                }
+                "late_max_ratio" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.v52.time_phase.late_max_ratio = parsed;
+                    }
+                }
+                "allow_timeframes" => {
+                    let parsed = parse_toml_array_of_strings(v.trim())
+                        .into_iter()
+                        .map(|s| s.to_ascii_lowercase())
+                        .collect::<Vec<_>>();
+                    if !parsed.is_empty() {
+                        cfg.v52.time_phase.allow_timeframes = parsed;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if in_v52_execution {
+            match key {
+                "late_force_taker_remaining_ms" => {
+                    if let Ok(parsed) = val.parse::<u64>() {
+                        cfg.v52.execution.late_force_taker_remaining_ms = parsed;
+                    }
+                }
+                "maker_wait_ms_before_force" => {
+                    if let Ok(parsed) = val.parse::<u64>() {
+                        cfg.v52.execution.maker_wait_ms_before_force = parsed;
+                    }
+                }
+                "apply_force_taker_in_maturity" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.v52.execution.apply_force_taker_in_maturity = parsed;
+                    }
+                }
+                "apply_force_taker_in_late" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.v52.execution.apply_force_taker_in_late = parsed;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if in_v52_dual_arb {
+            match key {
+                "enabled" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.v52.dual_arb.enabled = parsed;
+                    }
+                }
+                "safety_margin_bps" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.v52.dual_arb.safety_margin_bps = parsed;
+                    }
+                }
+                "threshold" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.v52.dual_arb.threshold = parsed;
+                    }
+                }
+                "fee_buffer_mode" => {
+                    cfg.v52.dual_arb.fee_buffer_mode = val.trim().to_ascii_lowercase();
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if in_v52_reversal {
+            match key {
+                "same_market_opposite_first" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.v52.reversal.same_market_opposite_first = parsed;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+    }
+
+    cfg.v52.time_phase.early_min_ratio = cfg.v52.time_phase.early_min_ratio.clamp(0.11, 0.99);
+    cfg.v52.time_phase.late_max_ratio = cfg.v52.time_phase.late_max_ratio.clamp(0.01, 0.54);
+    if cfg.v52.time_phase.late_max_ratio >= cfg.v52.time_phase.early_min_ratio {
+        cfg.v52.time_phase.late_max_ratio = 0.10;
+        cfg.v52.time_phase.early_min_ratio = 0.55;
+    }
+    cfg.v52.time_phase.allow_timeframes = cfg
+        .v52
+        .time_phase
+        .allow_timeframes
+        .iter()
+        .map(|s| s.to_ascii_lowercase())
+        .filter(|s| s == "5m" || s == "15m")
+        .collect::<Vec<_>>();
+    if cfg.v52.time_phase.allow_timeframes.is_empty() {
+        cfg.v52.time_phase.allow_timeframes = vec!["5m".to_string(), "15m".to_string()];
+    }
+    cfg.v52.execution.late_force_taker_remaining_ms =
+        cfg.v52.execution.late_force_taker_remaining_ms.clamp(1_000, 60_000);
+    cfg.v52.execution.maker_wait_ms_before_force =
+        cfg.v52.execution.maker_wait_ms_before_force.clamp(50, 10_000);
+    cfg.v52.dual_arb.safety_margin_bps = cfg.v52.dual_arb.safety_margin_bps.clamp(0.0, 100.0);
+    cfg.v52.dual_arb.threshold = cfg.v52.dual_arb.threshold.clamp(0.50, 1.10);
+    if cfg.v52.dual_arb.fee_buffer_mode != "conservative_taker" {
+        cfg.v52.dual_arb.fee_buffer_mode = "conservative_taker".to_string();
     }
 
     cfg
 }
 
 pub(super) fn load_risk_limits_config() -> RiskLimits {
-    let path = Path::new("configs/strategy.toml");
+    let path = strategy_config_path();
     let Ok(raw) = fs::read_to_string(path) else {
         println!("Warn: strategy.toml not found for risk config, using defaults");
         return RiskLimits::default();
