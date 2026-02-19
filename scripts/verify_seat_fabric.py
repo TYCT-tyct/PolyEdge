@@ -35,16 +35,28 @@ def percentile(values: List[float], p: float) -> float:
     return float(data[i])
 
 
-def probe_url(url: str, samples: int, timeout_sec: float, interval_ms: int) -> Dict[str, float]:
+def probe_url(
+    url: str,
+    samples: int,
+    timeout_sec: float,
+    interval_ms: int,
+    accepted_statuses: Optional[set[int]] = None,
+) -> Dict[str, float]:
     latencies: List[float] = []
     errors = 0
+    status_counts: Dict[str, int] = {}
     session = requests.Session()
+    accepted_statuses = accepted_statuses or {200}
     for _ in range(max(1, samples)):
         t0 = time.perf_counter()
         try:
             r = session.get(url, timeout=timeout_sec)
-            r.raise_for_status()
-            latencies.append((time.perf_counter() - t0) * 1000.0)
+            code = int(r.status_code)
+            status_counts[str(code)] = status_counts.get(str(code), 0) + 1
+            if code in accepted_statuses:
+                latencies.append((time.perf_counter() - t0) * 1000.0)
+            else:
+                errors += 1
         except Exception:
             errors += 1
         if interval_ms > 0:
@@ -56,6 +68,7 @@ def probe_url(url: str, samples: int, timeout_sec: float, interval_ms: int) -> D
         "p90_ms": percentile(latencies, 0.90),
         "p99_ms": percentile(latencies, 0.99),
         "mean_ms": mean(latencies) if latencies else 0.0,
+        "status_counts": status_counts,
     }
 
 
@@ -217,13 +230,27 @@ def check_paths(
         targets["privatelink"] = pl_url.rstrip("/") + "/health/latency"
 
     for name, url in targets.items():
-        result = probe_url(url, samples=samples, timeout_sec=timeout_sec, interval_ms=interval_ms)
+        accepted = {200}
+        if name == "privatelink":
+            # API Gateway PrivateLink endpoints often return 403 without API-id stage path;
+            # treat 403 as reachable network path.
+            accepted = {200, 403}
+        result = probe_url(
+            url,
+            samples=samples,
+            timeout_sec=timeout_sec,
+            interval_ms=interval_ms,
+            accepted_statuses=accepted,
+        )
         ok = result["errors"] == 0 and result["samples"] > 0
         checks.append(
             CheckResult(
                 name=f"path_{name}",
                 ok=ok,
-                detail=f"url={url}, errors={int(result['errors'])}, p99_ms={result['p99_ms']:.3f}",
+                detail=(
+                    f"url={url}, accepted={sorted(accepted)}, "
+                    f"errors={int(result['errors'])}, p99_ms={result['p99_ms']:.3f}"
+                ),
                 extra=result,
             )
         )
