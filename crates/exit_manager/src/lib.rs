@@ -119,6 +119,14 @@ impl ExitManager {
     }
 
     pub fn register(&mut self, position: PositionLifecycle) {
+        // Keep one active position per market to avoid stale entries that can never be selected.
+        if let Some(existing_id) = self
+            .open
+            .iter()
+            .find_map(|(id, p)| (p.market_id == position.market_id).then(|| id.clone()))
+        {
+            self.open.remove(&existing_id);
+        }
         self.open.insert(position.position_id.clone(), position);
     }
 
@@ -199,6 +207,7 @@ impl ExitManager {
             }
         }
 
+        // Default t15_min_unrealized_usdc=0.0 means any positive PnL exits at T+15s.
         if elapsed_ms >= 15_000 && input.unrealized_pnl_usdc > self.cfg.t15_min_unrealized_usdc {
             return Some(ExitReason::TakeProfit15s);
         }
@@ -372,6 +381,24 @@ mod tests {
             panic!("expected action");
         };
         assert_eq!(action.position_id, "new");
+    }
+
+    #[test]
+    fn register_enforces_single_position_per_market() {
+        let mut manager = ExitManager::new(ExitManagerConfig::default());
+        manager.register(PositionLifecycle {
+            position_id: "old".to_string(),
+            opened_at_ms: 1_000,
+            ..sample_position(1_000)
+        });
+        manager.register(PositionLifecycle {
+            position_id: "new".to_string(),
+            opened_at_ms: 2_000,
+            ..sample_position(2_000)
+        });
+        assert_eq!(manager.open_count(), 1);
+        let action = manager.evaluate_market("m1", eval(6_000, 1.0, 0.9, 600_000));
+        assert_eq!(action.map(|a| a.position_id), Some("new".to_string()));
     }
 
     #[test]

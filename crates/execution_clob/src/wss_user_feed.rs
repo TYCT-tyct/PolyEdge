@@ -1,15 +1,4 @@
-// =============================================================================
-// WSS User Channel — Polymarket 实时 Fill 通知
-// =============================================================================
-// 职责：连接 Polymarket WSS user channel，接收 trade/order 事件，
-//       通过 broadcast channel 广播给 predator_exit_lifecycle 等消费者。
-//
-// 设计原则：
-// - 单一职责：只做 WSS 连接 + 事件解析 + 广播，不做业务决策
-// - 零分配热路径：事件解析后直接广播 WssFillEvent，不堆积
-// - 自动重连：指数退避，最大 30s，永不退出
-// =============================================================================
-
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,7 +25,7 @@ pub struct WssFillEvent {
     /// 成交数量
     pub size: f64,
     /// 事件类型: "trade" | "order"
-    pub event_type: String,
+    pub event_type: &'static str,
     /// 服务端时间戳 ms
     pub ts_ms: i64,
 }
@@ -90,6 +79,7 @@ pub async fn run_wss_loop_with_sender(
         match connect_and_stream(&tx, &wss_url, &api_key).await {
             Ok(()) => {
                 tracing::info!("wss_user_feed: connection closed, reconnecting");
+                backoff_ms = 500;
             }
             Err(err) => {
                 tracing::warn!(
@@ -97,10 +87,10 @@ pub async fn run_wss_loop_with_sender(
                     backoff_ms,
                     "wss_user_feed: connection error, retrying"
                 );
+                backoff_ms = (backoff_ms * 2).min(30_000);
             }
         }
         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-        backoff_ms = (backoff_ms * 2).min(30_000);
     }
 }
 
@@ -147,7 +137,8 @@ async fn connect_and_stream(
 
 fn parse_and_broadcast(tx: &Arc<broadcast::Sender<WssFillEvent>>, envelope: WssEnvelope) {
     let event_type = match envelope.event_type.as_deref() {
-        Some(t @ ("trade" | "order")) => t.to_string(),
+        Some("trade") => "trade",
+        Some("order") => "order",
         _ => return, // 忽略非 fill 事件（heartbeat 等）
     };
 
@@ -167,8 +158,14 @@ fn parse_and_broadcast(tx: &Arc<broadcast::Sender<WssFillEvent>>, envelope: WssE
             data.market_id.clone()
         };
 
-        let price = data.price.parse::<f64>().unwrap_or(0.0);
-        let size = data.size.parse::<f64>().unwrap_or(0.0);
+        let Ok(price) = data.price.parse::<f64>() else {
+            record_parse_error("price");
+            continue;
+        };
+        let Ok(size) = data.size.parse::<f64>() else {
+            record_parse_error("size");
+            continue;
+        };
         let ts_ms = data
             .timestamp
             .parse::<i64>()
@@ -179,11 +176,24 @@ fn parse_and_broadcast(tx: &Arc<broadcast::Sender<WssFillEvent>>, envelope: WssE
             market_id,
             price,
             size,
-            event_type: event_type.clone(),
+            event_type,
             ts_ms,
         };
 
         // 忽略 lagged receiver 错误（消费者太慢时丢弃旧事件）
         let _ = tx.send(event);
+    }
+}
+
+static PARSE_ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn record_parse_error(field: &'static str) {
+    let count = PARSE_ERROR_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_power_of_two() {
+        tracing::warn!(
+            field,
+            count,
+            "wss_user_feed: dropping malformed fill event field"
+        );
     }
 }

@@ -35,6 +35,7 @@ pub struct SettlementCompounder {
     initial_usdc: f64,
     total_pnl: f64,
     daily_pnl: f64,
+    daily_epoch_day: i64,
     win_count: u64,
     loss_count: u64,
     halted: bool,
@@ -43,12 +44,14 @@ pub struct SettlementCompounder {
 impl SettlementCompounder {
     pub fn new(cfg: CompounderConfig) -> Self {
         let initial = cfg.initial_capital_usdc.max(0.0);
+        let now = now_ms();
         Self {
             cfg,
             available_usdc: initial,
             initial_usdc: initial,
             total_pnl: 0.0,
             daily_pnl: 0.0,
+            daily_epoch_day: epoch_day_from_ms(now),
             win_count: 0,
             loss_count: 0,
             halted: false,
@@ -106,6 +109,11 @@ impl SettlementCompounder {
 
     pub fn on_markout(&mut self, pnl_usdc: f64) -> CapitalUpdate {
         let ts_ms = now_ms();
+        self.on_markout_at(pnl_usdc, ts_ms)
+    }
+
+    fn on_markout_at(&mut self, pnl_usdc: f64, ts_ms: i64) -> CapitalUpdate {
+        self.rollover_day_if_needed(ts_ms);
         if !self.cfg.enabled {
             return CapitalUpdate {
                 available_usdc: self.available_usdc,
@@ -143,6 +151,16 @@ impl SettlementCompounder {
     pub fn reset_daily(&mut self) {
         self.daily_pnl = 0.0;
         self.halted = false;
+        self.daily_epoch_day = epoch_day_from_ms(now_ms());
+    }
+
+    fn rollover_day_if_needed(&mut self, ts_ms: i64) {
+        let day = epoch_day_from_ms(ts_ms);
+        if day != self.daily_epoch_day {
+            self.daily_pnl = 0.0;
+            self.halted = false;
+            self.daily_epoch_day = day;
+        }
     }
 }
 
@@ -153,6 +171,11 @@ fn now_ms() -> i64 {
         .ok()
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[inline]
+fn epoch_day_from_ms(ts_ms: i64) -> i64 {
+    ts_ms.div_euclid(86_400_000)
 }
 
 #[cfg(test)]
@@ -226,5 +249,26 @@ mod tests {
         });
         c.on_markout(-20.0);
         assert!(c.available() >= 0.0);
+    }
+
+    #[test]
+    fn daily_halt_auto_recovers_after_day_rollover() {
+        let mut c = SettlementCompounder::new(CompounderConfig {
+            enabled: true,
+            initial_capital_usdc: 100.0,
+            compound_ratio: 1.0,
+            position_fraction: 0.15,
+            min_quote_size: 1.0,
+            daily_loss_cap_usdc: 10.0,
+        });
+
+        // Day 0: trigger halt.
+        let _ = c.on_markout_at(-11.0, 1_000);
+        assert!(c.halted());
+
+        // Day 1: a new markout should roll daily state and clear halt.
+        let _ = c.on_markout_at(1.0, 86_400_000 + 2_000);
+        assert!(!c.halted());
+        assert!(c.daily_pnl() > 0.0);
     }
 }

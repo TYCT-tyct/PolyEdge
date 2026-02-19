@@ -440,7 +440,7 @@ async fn reversal_taker_to_opposite_maker_reentry_end_to_end_records_report() {
         market_id: market_id.clone(),
         price: 0.45,
         size: 2.0,
-        event_type: "trade".to_string(),
+        event_type: "trade",
         ts_ms: Utc::now().timestamp_millis(),
     });
     sleep(Duration::from_millis(900)).await;

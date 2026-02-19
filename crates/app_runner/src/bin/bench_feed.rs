@@ -7,9 +7,10 @@ use poly_wire::{
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
+use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
@@ -26,6 +27,12 @@ fn now_micros() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_micros() as u64
+}
+
+#[inline]
+fn percentile(sorted: &[f64], q: f64) -> f64 {
+    let idx = (((sorted.len() - 1) as f64) * q.clamp(0.0, 1.0)).round() as usize;
+    sorted[idx]
 }
 
 #[tokio::main]
@@ -91,10 +98,9 @@ async fn main() -> Result<()> {
     let (tx_log, rx_log) = std::sync::mpsc::channel::<LogEntry>();
     let tx_log_udp = tx_log.clone();
     let tx_log_ws = tx_log.clone();
-
-    // Stats Shared
-    let stats = Arc::new(Mutex::new(Vec::new()));
-    let stats_clone = stats.clone();
+    let (tx_delta, rx_delta) = std::sync::mpsc::channel::<f64>();
+    let tx_delta_udp = tx_delta.clone();
+    let tx_delta_ws = tx_delta.clone();
 
     // Spawn Writer Thread
     std::thread::spawn(move || {
@@ -109,11 +115,6 @@ async fn main() -> Result<()> {
                 entry.id, entry.udp, entry.ws, entry.delta, entry.faster
             )
             .unwrap();
-            stats_clone.lock().unwrap().push(entry.delta);
-
-            // Only log extreme lag or periodic sample to avoid console spam?
-            // Actually, we disable per-tick INFO log to keep console clean.
-            // info!("MATCH id={} | Delta: {:.3} ms", entry.id, entry.delta);
         }
     });
 
@@ -147,7 +148,7 @@ async fn main() -> Result<()> {
                             );
                         }
                         last_event_ts_ms = event_ts_ms;
-                        let mut map = tracker_udp.lock().unwrap();
+                        let mut map = tracker_udp.lock().await;
                         let entry = map.entry(event_ts_ms).or_insert((None, None));
                         entry.1 = Some(recv_ts);
 
@@ -156,22 +157,19 @@ async fn main() -> Result<()> {
 
                         if let Some(ws_ts) = match_found {
                             map.remove(&event_ts_ms);
-                            // Release lock immediately
-                            // drop(map); // Removed as per instruction
 
                             let delta = (recv_ts as i64) - (ws_ts as i64);
                             let ms = delta as f64 / 1000.0;
                             let faster = if ms < 0.0 { "UDP" } else { "WS" };
 
-                            tx_log_udp
-                                .send(LogEntry {
-                                    id: event_ts_ms,
-                                    udp: recv_ts,
-                                    ws: ws_ts,
-                                    delta: ms,
-                                    faster,
-                                })
-                                .unwrap();
+                            let _ = tx_log_udp.send(LogEntry {
+                                id: event_ts_ms,
+                                udp: recv_ts,
+                                ws: ws_ts,
+                                delta: ms,
+                                faster,
+                            });
+                            let _ = tx_delta_udp.send(ms);
                         }
 
                         // Prune (Optimized: Check size less often?)
@@ -187,6 +185,7 @@ async fn main() -> Result<()> {
 
     // 5. WS Loop
     let mut last_stat_time = std::time::Instant::now();
+    let mut stats_window: Vec<f64> = Vec::with_capacity(16_384);
 
     while let Some(msg) = read.next().await {
         match msg {
@@ -196,7 +195,7 @@ async fn main() -> Result<()> {
                     if ticker.event_time_ms == 0 {
                         continue;
                     }
-                    let mut map = tracker_ws.lock().unwrap();
+                    let mut map = tracker_ws.lock().await;
                     let entry = map.entry(ticker.event_time_ms).or_insert((None, None));
                     entry.0 = Some(recv_ts);
 
@@ -209,15 +208,18 @@ async fn main() -> Result<()> {
                         let ms = delta as f64 / 1000.0;
                         let faster = if ms < 0.0 { "UDP" } else { "WS" };
 
-                        tx_log_ws
-                            .send(LogEntry {
-                                id: ticker.event_time_ms,
-                                udp: udp_ts,
-                                ws: recv_ts,
-                                delta: ms,
-                                faster,
-                            })
-                            .unwrap();
+                        let _ = tx_log_ws.send(LogEntry {
+                            id: ticker.event_time_ms,
+                            udp: udp_ts,
+                            ws: recv_ts,
+                            delta: ms,
+                            faster,
+                        });
+                        let _ = tx_delta_ws.send(ms);
+                    }
+
+                    if map.len() > 5000 {
+                        map.retain(|k, _| *k > ticker.event_time_ms.saturating_sub(10_000));
                     }
                 }
             }
@@ -227,14 +229,16 @@ async fn main() -> Result<()> {
 
         // Periodic Stats Log (Every 10s)
         if last_stat_time.elapsed().as_secs() >= 10 {
-            let mut s = stats.lock().unwrap();
-            if !s.is_empty() {
-                s.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let len = s.len();
-                let p50 = s[len / 2];
-                let p90 = s[(len as f64 * 0.9) as usize];
-                let p99 = s[(len as f64 * 0.99) as usize];
-                let udp_fast_count = s.iter().filter(|&&x| x < 0.0).count();
+            while let Ok(delta) = rx_delta.try_recv() {
+                stats_window.push(delta);
+            }
+            if !stats_window.is_empty() {
+                stats_window.sort_by(|a, b| a.total_cmp(b));
+                let len = stats_window.len();
+                let p50 = percentile(&stats_window, 0.50);
+                let p90 = percentile(&stats_window, 0.90);
+                let p99 = percentile(&stats_window, 0.99);
+                let udp_fast_count = stats_window.iter().filter(|&&x| x < 0.0).count();
 
                 info!(
                     "📊 STATS (Last 10s): Count={} | P50={:.3}ms | P90={:.3}ms | P99={:.3}ms | UDP Faster: {}/{} ({:.1}%)",
@@ -247,7 +251,7 @@ async fn main() -> Result<()> {
                     (udp_fast_count as f64 / len as f64) * 100.0
                 );
 
-                s.clear();
+                stats_window.clear();
             }
             last_stat_time = std::time::Instant::now();
         }
