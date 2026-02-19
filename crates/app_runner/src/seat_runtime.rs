@@ -546,6 +546,15 @@ impl SeatRuntimeHandle {
         if let Some(v) = current.position_fraction {
             out.position_fraction = Some(if tighten { v * 0.97 } else { v * 1.01 });
         }
+        if let Some(v) = current.early_size_scale {
+            out.early_size_scale = Some(if tighten { v * 0.98 } else { v * 1.02 });
+        }
+        if let Some(v) = current.maturity_size_scale {
+            out.maturity_size_scale = Some(if tighten { v * 0.99 } else { v * 1.01 });
+        }
+        if let Some(v) = current.late_size_scale {
+            out.late_size_scale = Some(if tighten { v * 0.98 } else { v * 1.02 });
+        }
         if let Some(v) = current.min_edge_net_bps {
             out.min_edge_net_bps = Some(if tighten { v * 1.03 } else { v * 0.99 });
         }
@@ -1069,6 +1078,9 @@ impl SeatRuntimeHandle {
             return Ok(());
         }
         if params.position_fraction.is_some()
+            || params.early_size_scale.is_some()
+            || params.maturity_size_scale.is_some()
+            || params.late_size_scale.is_some()
             || params.min_edge_net_bps.is_some()
             || params.min_velocity_bps_per_sec.is_some()
         {
@@ -1077,6 +1089,19 @@ impl SeatRuntimeHandle {
                 body.insert(
                     "compounder".to_string(),
                     serde_json::json!({"position_fraction": params.position_fraction}),
+                );
+            }
+            if params.early_size_scale.is_some()
+                || params.maturity_size_scale.is_some()
+                || params.late_size_scale.is_some()
+            {
+                body.insert(
+                    "v52_time_phase".to_string(),
+                    serde_json::json!({
+                        "early_size_scale": params.early_size_scale,
+                        "maturity_size_scale": params.maturity_size_scale,
+                        "late_size_scale": params.late_size_scale
+                    }),
                 );
             }
             if params.min_edge_net_bps.is_some() {
@@ -1172,6 +1197,7 @@ impl SeatRuntimeHandle {
         struct StrategyResp {
             maker: serde_json::Value,
             fair_value: serde_json::Value,
+            v52: serde_json::Value,
         }
 
         let predator = self
@@ -1225,6 +1251,21 @@ impl SeatRuntimeHandle {
                 .predator_c
                 .get("compounder")
                 .and_then(|v| v.get("position_fraction"))
+                .and_then(|v| v.as_f64()),
+            early_size_scale: strategy
+                .v52
+                .get("time_phase")
+                .and_then(|v| v.get("early_size_scale"))
+                .and_then(|v| v.as_f64()),
+            maturity_size_scale: strategy
+                .v52
+                .get("time_phase")
+                .and_then(|v| v.get("maturity_size_scale"))
+                .and_then(|v| v.as_f64()),
+            late_size_scale: strategy
+                .v52
+                .get("time_phase")
+                .and_then(|v| v.get("late_size_scale"))
                 .and_then(|v| v.as_f64()),
             min_edge_net_bps: predator
                 .predator_c

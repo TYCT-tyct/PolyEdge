@@ -328,7 +328,7 @@ impl PaperRuntimeHandle {
             rollback_triggered: intent.rollback_triggered,
             shadow_pnl_comparison: intent.shadow_pnl_comparison,
         };
-        s.fee_total_usdc += fill.fee.max(0.0);
+        s.fee_total_usdc += fill.fee;
         s.open_lots.entry(key).or_default().push_back(lot);
     }
 
@@ -382,7 +382,7 @@ impl PaperRuntimeHandle {
             } else {
                 s.losses = s.losses.saturating_add(1);
             }
-            s.fee_total_usdc += exit_fee.max(0.0);
+            s.fee_total_usdc += exit_fee;
             s.pnl_total_usdc += pnl;
             let close_action = match intent.action {
                 PaperAction::ReversalExit | PaperAction::LateHeavy | PaperAction::DoubleSide => {
@@ -710,7 +710,7 @@ fn update_daily(s: &mut PaperRuntimeState, record: &PaperTradeRecord) {
         entry.wins = entry.wins.saturating_add(1);
     }
     entry.ending_bankroll = record.bankroll_after;
-    entry.fee_total_usdc += record.fee_usdc.max(0.0);
+    entry.fee_total_usdc += record.fee_usdc;
     entry.pnl_total_usdc += record.realized_pnl_usdc;
     entry
         .durations_ms

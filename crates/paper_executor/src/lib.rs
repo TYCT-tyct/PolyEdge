@@ -10,6 +10,7 @@ pub struct ShadowOrder {
     pub intent: QuoteIntent,
     pub style: ExecutionStyle,
     pub reference_mid: f64,
+    pub fee_rate_bps: f64,
 }
 
 #[derive(Default)]
@@ -24,6 +25,7 @@ impl ShadowExecutor {
         intent: QuoteIntent,
         style: ExecutionStyle,
         reference_mid: f64,
+        fee_rate_bps: f64,
     ) {
         self.orders.write().insert(
             ack.order_id.clone(),
@@ -32,6 +34,7 @@ impl ShadowExecutor {
                 intent,
                 style,
                 reference_mid,
+                fee_rate_bps,
             },
         );
     }
@@ -65,15 +68,19 @@ impl ShadowExecutor {
                         None
                     };
                     let executed_size_usdc = (px * order.intent.size).max(0.0);
-                    let fee = match order.style {
-                        ExecutionStyle::Maker => 0.0,
-                        ExecutionStyle::Taker | ExecutionStyle::Arb => {
-                            let taker_fee_rate = if !(0.02..=0.98).contains(&px) {
-                                0.001
-                            } else {
-                                0.01
-                            };
-                            executed_size_usdc * taker_fee_rate
+                    let fee = if order.fee_rate_bps.is_finite() && order.fee_rate_bps != 0.0 {
+                        executed_size_usdc * (order.fee_rate_bps / 10_000.0)
+                    } else {
+                        match order.style {
+                            ExecutionStyle::Maker => 0.0,
+                            ExecutionStyle::Taker | ExecutionStyle::Arb => {
+                                let taker_fee_rate = if !(0.02..=0.98).contains(&px) {
+                                    0.001
+                                } else {
+                                    0.01
+                                };
+                                executed_size_usdc * taker_fee_rate
+                            }
                         }
                     };
                     fills.push(FillEvent {
@@ -137,6 +144,7 @@ mod tests {
             },
             ExecutionStyle::Maker,
             0.52,
+            -2.0,
         );
         let fills = shadow.on_book(&BookTop {
             market_id: "m1".to_string(),
@@ -150,7 +158,7 @@ mod tests {
             recv_ts_local_ns: 2_000_000,
         });
         assert_eq!(fills.len(), 1);
-        assert_eq!(fills[0].fee, 0.0);
+        assert!(fills[0].fee < 0.0);
     }
 
     #[test]
@@ -193,6 +201,7 @@ mod tests {
                 },
                 ExecutionStyle::Taker,
                 px,
+                expected_rate * 10_000.0,
             );
             let mut book_local = book.clone();
             book_local.ask_yes = px;
@@ -245,6 +254,7 @@ mod tests {
                 },
                 ExecutionStyle::Taker,
                 0.5,
+                0.0,
             );
             let fills = shadow.on_book(&book);
             assert_eq!(fills.len(), 1);

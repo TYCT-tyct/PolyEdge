@@ -350,6 +350,14 @@ pub(super) fn persist_final_report_files(report: &ShadowFinalReport) {
         report.live.ack_only_p99_ms
     ));
     md.push_str(&format!(
+        "- alpha_window_p99_ms: {:.4}\n",
+        report.live.alpha_window_p99_ms
+    ));
+    md.push_str(&format!(
+        "- alpha_window_hit_ratio: {:.4}\n",
+        report.live.alpha_window_hit_ratio
+    ));
+    md.push_str(&format!(
         "- decision_queue_wait_p99_ms: {:.4}\n",
         report.gate.decision_queue_wait_p99_ms
     ));
@@ -487,6 +495,12 @@ pub(super) fn persist_final_report_files(report: &ShadowFinalReport) {
         report.live.latency.tick_to_ack_p50_ms,
         report.live.latency.tick_to_ack_p90_ms,
         report.live.latency.tick_to_ack_p99_ms
+    ));
+    latency_rows.push_str(&format!(
+        "alpha_window,{:.6},{:.6},{:.6},ms\n",
+        report.live.latency.alpha_window_p50_ms,
+        report.live.latency.alpha_window_p90_ms,
+        report.live.latency.alpha_window_p99_ms
     ));
     latency_rows.push_str(&format!(
         "parse,{:.6},{:.6},{:.6},us\n",

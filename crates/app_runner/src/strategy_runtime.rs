@@ -72,6 +72,15 @@ pub(crate) fn classify_time_phase(remaining_ratio: f64, cfg: &V52TimePhaseConfig
     }
 }
 
+pub(crate) fn time_phase_size_scale(phase: TimePhase, cfg: &V52TimePhaseConfig) -> f64 {
+    let scale = match phase {
+        TimePhase::Early => cfg.early_size_scale,
+        TimePhase::Maturity => cfg.maturity_size_scale,
+        TimePhase::Late => cfg.late_size_scale,
+    };
+    scale.clamp(0.10, 5.0)
+}
+
 pub(crate) fn stage_for_phase(phase: TimePhase, momentum: bool) -> Stage {
     match phase {
         TimePhase::Early => Stage::Early,
@@ -215,9 +224,62 @@ fn spawn_force_taker_fallback_for_maker(
                     },
                     ExecutionStyle::Taker,
                     ((book.bid_yes + book.ask_yes) * 0.5).max(0.0),
+                    fee_rate_bps.max(0.0),
                 );
             }
             _ => {}
+        }
+    });
+}
+
+fn spawn_alpha_window_probe(
+    shared: Arc<EngineShared>,
+    market_id: String,
+    side: OrderSide,
+    anchor_price: f64,
+    move_bps: f64,
+    poll_ms: u64,
+    max_wait_ms: u64,
+) {
+    if !anchor_price.is_finite() || anchor_price <= 0.0 {
+        return;
+    }
+    let move_abs = (anchor_price * (move_bps.max(0.0) / 10_000.0)).max(1e-6);
+    let poll_ms = poll_ms.clamp(1, 200);
+    let max_wait_ms = max_wait_ms.clamp(50, 5_000);
+
+    spawn_detached("v52_alpha_window_probe", false, async move {
+        let started = Instant::now();
+        loop {
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let current_price = shared
+                .latest_books
+                .read()
+                .await
+                .get(&market_id)
+                .map(|book| aggressive_price_for_side(book, &side))
+                .unwrap_or(0.0);
+            if current_price.is_finite() && current_price > 0.0 {
+                let delta = (current_price - anchor_price).abs();
+                if delta >= move_abs {
+                    shared
+                        .shadow_stats
+                        .push_alpha_window_sample(elapsed_ms, true)
+                        .await;
+                    metrics::histogram!("latency.alpha_window_ms").record(elapsed_ms);
+                    return;
+                }
+            }
+            if elapsed_ms >= max_wait_ms as f64 {
+                let capped = max_wait_ms as f64;
+                shared
+                    .shadow_stats
+                    .push_alpha_window_sample(capped, false)
+                    .await;
+                metrics::histogram!("latency.alpha_window_ms").record(capped);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(poll_ms)).await;
         }
     });
 }
@@ -324,6 +386,20 @@ pub(super) async fn run_predator_c_for_symbol(
         .shadow_stats
         .set_predator_enabled(predator_cfg.enabled);
     if !predator_cfg.enabled {
+        return PredatorExecResult::default();
+    }
+    let live_armed = std::env::var("POLYEDGE_LIVE_ARMED")
+        .ok()
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
+    if live_armed
+        && predator_cfg.v52.execution.require_compounder_when_live
+        && !predator_cfg.compounder.enabled
+    {
+        shared
+            .shadow_stats
+            .mark_blocked_with_reason("compounder_required_when_live")
+            .await;
         return PredatorExecResult::default();
     }
     let source_health_cfg = shared.source_health_cfg.read().await.clone();
@@ -465,11 +541,17 @@ pub(super) async fn run_predator_c_for_symbol(
         ),
     ]);
 
+    let static_quote_notional_usdc = (predator_cfg.compounder.initial_capital_usdc.max(0.0)
+        * predator_cfg.compounder.position_fraction.clamp(0.0, 1.0))
+    .max(predator_cfg.compounder.min_quote_size.max(0.01));
     let (quote_notional_usdc, total_capital_usdc) = if predator_cfg.compounder.enabled {
         let c = shared.predator_compounder.read().await;
         (c.recommended_quote_notional_usdc(), c.available())
     } else {
-        (0.0, predator_cfg.compounder.initial_capital_usdc.max(0.0))
+        (
+            static_quote_notional_usdc,
+            predator_cfg.compounder.initial_capital_usdc.max(0.0),
+        )
     };
 
     #[derive(Debug, Clone)]
@@ -593,14 +675,10 @@ pub(super) async fn run_predator_c_for_symbol(
         if tf_weight <= 0.0 {
             continue;
         }
-        let phase_size_scale = match time_phase {
-            TimePhase::Early => 0.8,
-            TimePhase::Maturity => 1.0,
-            TimePhase::Late => 1.25,
-        };
+        let phase_size_scale = time_phase_size_scale(time_phase, &predator_cfg.v52.time_phase);
         let side_size_scale = (tf_weight * phase_size_scale).max(0.0);
         let mk_size = |entry_price: f64| {
-            let base_size = if predator_cfg.compounder.enabled {
+            let base_size = if quote_notional_usdc > 0.0 {
                 (quote_notional_usdc / entry_price.max(1e-6)).max(0.01)
             } else {
                 maker_cfg.base_quote_size.max(0.01)
@@ -1733,12 +1811,32 @@ pub(super) async fn predator_execute_opportunity(
                 ts_ms: ack_v2.ts_ms,
             };
             publish_if_telemetry_subscribers(bus, EngineEvent::OrderAck(ack.clone()));
+            let effective_fee_bps = if execution_style == ExecutionStyle::Maker {
+                -get_rebate_bps_cached(shared, &intent.market_id, opp.fee_bps)
+                    .await
+                    .max(0.0)
+            } else {
+                opp.fee_bps.max(0.0)
+            };
             shadow.register_order(
                 &ack,
                 intent.clone(),
                 execution_style.clone(),
                 mid_for_side(&book, &intent.side).max(0.0),
+                effective_fee_bps,
             );
+            if predator_cfg.v52.execution.alpha_window_enabled {
+                let anchor_price = aggressive_price_for_side(&book, &intent.side);
+                spawn_alpha_window_probe(
+                    shared.clone(),
+                    intent.market_id.clone(),
+                    intent.side.clone(),
+                    anchor_price,
+                    predator_cfg.v52.execution.alpha_window_move_bps,
+                    predator_cfg.v52.execution.alpha_window_poll_ms,
+                    predator_cfg.v52.execution.alpha_window_max_wait_ms,
+                );
+            }
             if execution_style == ExecutionStyle::Maker && apply_force_taker_for_phase {
                 spawn_force_taker_fallback_for_maker(
                     shared.clone(),

@@ -354,6 +354,9 @@ struct PredatorCReloadResp {
 fn normalize_v52_config(v52: &mut V52Config) {
     v52.time_phase.early_min_ratio = v52.time_phase.early_min_ratio.clamp(0.11, 0.99);
     v52.time_phase.late_max_ratio = v52.time_phase.late_max_ratio.clamp(0.01, 0.54);
+    v52.time_phase.early_size_scale = v52.time_phase.early_size_scale.clamp(0.10, 5.0);
+    v52.time_phase.maturity_size_scale = v52.time_phase.maturity_size_scale.clamp(0.10, 5.0);
+    v52.time_phase.late_size_scale = v52.time_phase.late_size_scale.clamp(0.10, 5.0);
     if v52.time_phase.late_max_ratio >= v52.time_phase.early_min_ratio {
         v52.time_phase.late_max_ratio = 0.10;
         v52.time_phase.early_min_ratio = 0.55;
@@ -372,6 +375,10 @@ fn normalize_v52_config(v52: &mut V52Config) {
         v52.execution.late_force_taker_remaining_ms.clamp(1_000, 60_000);
     v52.execution.maker_wait_ms_before_force =
         v52.execution.maker_wait_ms_before_force.clamp(50, 10_000);
+    v52.execution.alpha_window_move_bps = v52.execution.alpha_window_move_bps.clamp(0.1, 50.0);
+    v52.execution.alpha_window_poll_ms = v52.execution.alpha_window_poll_ms.clamp(1, 200);
+    v52.execution.alpha_window_max_wait_ms =
+        v52.execution.alpha_window_max_wait_ms.clamp(50, 5_000);
     v52.dual_arb.safety_margin_bps = v52.dual_arb.safety_margin_bps.clamp(0.0, 100.0);
     v52.dual_arb.threshold = v52.dual_arb.threshold.clamp(0.50, 1.10);
     v52.dual_arb.fee_buffer_mode = "conservative_taker".to_string();

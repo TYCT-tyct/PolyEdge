@@ -158,6 +158,9 @@ impl Default for V52Config {
 pub(crate) struct V52TimePhaseConfig {
     pub(crate) early_min_ratio: f64,
     pub(crate) late_max_ratio: f64,
+    pub(crate) early_size_scale: f64,
+    pub(crate) maturity_size_scale: f64,
+    pub(crate) late_size_scale: f64,
     pub(crate) allow_timeframes: Vec<String>,
 }
 
@@ -166,6 +169,9 @@ impl Default for V52TimePhaseConfig {
         Self {
             early_min_ratio: 0.55,
             late_max_ratio: 0.10,
+            early_size_scale: 0.80,
+            maturity_size_scale: 1.00,
+            late_size_scale: 1.25,
             allow_timeframes: vec!["5m".to_string(), "15m".to_string()],
         }
     }
@@ -177,6 +183,11 @@ pub(crate) struct V52ExecutionConfig {
     pub(crate) maker_wait_ms_before_force: u64,
     pub(crate) apply_force_taker_in_maturity: bool,
     pub(crate) apply_force_taker_in_late: bool,
+    pub(crate) alpha_window_enabled: bool,
+    pub(crate) alpha_window_move_bps: f64,
+    pub(crate) alpha_window_poll_ms: u64,
+    pub(crate) alpha_window_max_wait_ms: u64,
+    pub(crate) require_compounder_when_live: bool,
 }
 
 impl Default for V52ExecutionConfig {
@@ -186,6 +197,11 @@ impl Default for V52ExecutionConfig {
             maker_wait_ms_before_force: 800,
             apply_force_taker_in_maturity: true,
             apply_force_taker_in_late: true,
+            alpha_window_enabled: true,
+            alpha_window_move_bps: 3.0,
+            alpha_window_poll_ms: 10,
+            alpha_window_max_wait_ms: 1_000,
+            require_compounder_when_live: true,
         }
     }
 }
@@ -1024,6 +1040,11 @@ pub(crate) struct LatencyBreakdown {
     pub(crate) capturable_window_p75_ms: f64,
     pub(crate) capturable_window_p90_ms: f64,
     pub(crate) capturable_window_p99_ms: f64,
+    pub(crate) alpha_window_p50_ms: f64,
+    pub(crate) alpha_window_p90_ms: f64,
+    pub(crate) alpha_window_p99_ms: f64,
+    pub(crate) alpha_window_hit_ratio: f64,
+    pub(crate) alpha_window_n: u64,
     /// Ratio of samples where capturable_window_ms > 0.0.
     pub(crate) profitable_window_ratio: f64,
     /// Number of capturable window samples included in the distribution.
@@ -1113,6 +1134,11 @@ pub(crate) struct ShadowLiveReport {
     pub(crate) ack_only_p50_ms: f64,
     pub(crate) ack_only_p90_ms: f64,
     pub(crate) ack_only_p99_ms: f64,
+    pub(crate) alpha_window_p50_ms: f64,
+    pub(crate) alpha_window_p90_ms: f64,
+    pub(crate) alpha_window_p99_ms: f64,
+    pub(crate) alpha_window_hit_ratio: f64,
+    pub(crate) alpha_window_n: u64,
     pub(crate) strategy_uptime_pct: f64,
     pub(crate) tick_to_ack_p99_ms: f64,
     pub(crate) ref_ticks_total: u64,
@@ -1310,6 +1336,8 @@ pub(crate) struct ShadowSamples {
     pub(crate) ack_only_ms: Vec<f64>,
     pub(crate) tick_to_ack_ms: Vec<f64>,
     pub(crate) capturable_window_ms: Vec<f64>,
+    pub(crate) alpha_window_ms: Vec<f64>,
+    pub(crate) alpha_window_hit: Vec<f64>,
     pub(crate) feed_in_ms: Vec<f64>,
     pub(crate) source_latency_ms: Vec<f64>,
     pub(crate) exchange_lag_ms: Vec<f64>,
@@ -1584,6 +1612,16 @@ impl ShadowStats {
     pub(crate) async fn push_capturable_window_ms(&self, ms: f64) {
         let mut s = self.samples.write().await;
         push_capped(&mut s.capturable_window_ms, ms, Self::SAMPLE_CAP);
+    }
+
+    pub(crate) async fn push_alpha_window_sample(&self, ms: f64, hit: bool) {
+        let mut s = self.samples.write().await;
+        push_capped(&mut s.alpha_window_ms, ms.max(0.0), Self::SAMPLE_CAP);
+        push_capped(
+            &mut s.alpha_window_hit,
+            if hit { 1.0 } else { 0.0 },
+            Self::SAMPLE_CAP,
+        );
     }
 
     pub(crate) async fn push_book_top_lag_ms(&self, symbol: &str, ms: f64) {
@@ -1875,6 +1913,8 @@ impl ShadowStats {
             ack_only_ms,
             tick_to_ack_ms,
             capturable_window_ms,
+            alpha_window_ms,
+            alpha_window_hit,
             feed_in_ms,
             source_latency_ms,
             exchange_lag_ms,
@@ -2193,6 +2233,15 @@ impl ShadowStats {
             capturable_window_p75_ms: percentile(&capturable_window_ms, 0.75).unwrap_or(0.0),
             capturable_window_p90_ms: percentile(&capturable_window_ms, 0.90).unwrap_or(0.0),
             capturable_window_p99_ms: percentile(&capturable_window_ms, 0.99).unwrap_or(0.0),
+            alpha_window_p50_ms: percentile(&alpha_window_ms, 0.50).unwrap_or(0.0),
+            alpha_window_p90_ms: percentile(&alpha_window_ms, 0.90).unwrap_or(0.0),
+            alpha_window_p99_ms: percentile(&alpha_window_ms, 0.99).unwrap_or(0.0),
+            alpha_window_hit_ratio: if alpha_window_hit.is_empty() {
+                0.0
+            } else {
+                alpha_window_hit.iter().sum::<f64>() / alpha_window_hit.len() as f64
+            },
+            alpha_window_n: alpha_window_ms.len() as u64,
             profitable_window_ratio: if capturable_window_ms.is_empty() {
                 0.0
             } else {
@@ -2308,6 +2357,11 @@ impl ShadowStats {
             ack_only_p50_ms: latency.ack_only_p50_ms,
             ack_only_p90_ms: latency.ack_only_p90_ms,
             ack_only_p99_ms: latency.ack_only_p99_ms,
+            alpha_window_p50_ms: latency.alpha_window_p50_ms,
+            alpha_window_p90_ms: latency.alpha_window_p90_ms,
+            alpha_window_p99_ms: latency.alpha_window_p99_ms,
+            alpha_window_hit_ratio: latency.alpha_window_hit_ratio,
+            alpha_window_n: latency.alpha_window_n,
             strategy_uptime_pct: uptime_pct,
             tick_to_ack_p99_ms: tick_to_ack_p99,
             ref_ticks_total,

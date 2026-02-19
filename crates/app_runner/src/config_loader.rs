@@ -1267,6 +1267,21 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
                         cfg.v52.time_phase.late_max_ratio = parsed;
                     }
                 }
+                "early_size_scale" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.v52.time_phase.early_size_scale = parsed;
+                    }
+                }
+                "maturity_size_scale" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.v52.time_phase.maturity_size_scale = parsed;
+                    }
+                }
+                "late_size_scale" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.v52.time_phase.late_size_scale = parsed;
+                    }
+                }
                 "allow_timeframes" => {
                     let parsed = parse_toml_array_of_strings(v.trim())
                         .into_iter()
@@ -1301,6 +1316,31 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
                 "apply_force_taker_in_late" => {
                     if let Ok(parsed) = val.parse::<bool>() {
                         cfg.v52.execution.apply_force_taker_in_late = parsed;
+                    }
+                }
+                "alpha_window_enabled" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.v52.execution.alpha_window_enabled = parsed;
+                    }
+                }
+                "alpha_window_move_bps" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.v52.execution.alpha_window_move_bps = parsed;
+                    }
+                }
+                "alpha_window_poll_ms" => {
+                    if let Ok(parsed) = val.parse::<u64>() {
+                        cfg.v52.execution.alpha_window_poll_ms = parsed;
+                    }
+                }
+                "alpha_window_max_wait_ms" => {
+                    if let Ok(parsed) = val.parse::<u64>() {
+                        cfg.v52.execution.alpha_window_max_wait_ms = parsed;
+                    }
+                }
+                "require_compounder_when_live" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.v52.execution.require_compounder_when_live = parsed;
                     }
                 }
                 _ => {}
@@ -1348,6 +1388,10 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
 
     cfg.v52.time_phase.early_min_ratio = cfg.v52.time_phase.early_min_ratio.clamp(0.11, 0.99);
     cfg.v52.time_phase.late_max_ratio = cfg.v52.time_phase.late_max_ratio.clamp(0.01, 0.54);
+    cfg.v52.time_phase.early_size_scale = cfg.v52.time_phase.early_size_scale.clamp(0.10, 5.0);
+    cfg.v52.time_phase.maturity_size_scale =
+        cfg.v52.time_phase.maturity_size_scale.clamp(0.10, 5.0);
+    cfg.v52.time_phase.late_size_scale = cfg.v52.time_phase.late_size_scale.clamp(0.10, 5.0);
     if cfg.v52.time_phase.late_max_ratio >= cfg.v52.time_phase.early_min_ratio {
         cfg.v52.time_phase.late_max_ratio = 0.10;
         cfg.v52.time_phase.early_min_ratio = 0.55;
@@ -1367,6 +1411,11 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
         cfg.v52.execution.late_force_taker_remaining_ms.clamp(1_000, 60_000);
     cfg.v52.execution.maker_wait_ms_before_force =
         cfg.v52.execution.maker_wait_ms_before_force.clamp(50, 10_000);
+    cfg.v52.execution.alpha_window_move_bps =
+        cfg.v52.execution.alpha_window_move_bps.clamp(0.1, 50.0);
+    cfg.v52.execution.alpha_window_poll_ms = cfg.v52.execution.alpha_window_poll_ms.clamp(1, 200);
+    cfg.v52.execution.alpha_window_max_wait_ms =
+        cfg.v52.execution.alpha_window_max_wait_ms.clamp(50, 5_000);
     cfg.v52.dual_arb.safety_margin_bps = cfg.v52.dual_arb.safety_margin_bps.clamp(0.0, 100.0);
     cfg.v52.dual_arb.threshold = cfg.v52.dual_arb.threshold.clamp(0.50, 1.10);
     if cfg.v52.dual_arb.fee_buffer_mode != "conservative_taker" {

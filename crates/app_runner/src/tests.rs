@@ -47,7 +47,7 @@ use crate::stats_utils::{now_ns, percentile, policy_block_ratio, quote_block_rat
 use crate::strategy_policy::{is_market_in_top_n, should_observe_only_symbol};
 use crate::strategy_runtime::{
     allow_dual_side_arb, classify_predator_regime, classify_time_phase, should_force_taker_fallback,
-    stage_for_phase, timeframe_total_ms, TimePhase,
+    stage_for_phase, time_phase_size_scale, timeframe_total_ms, TimePhase,
 };
 use crate::engine_loop::build_reversal_reentry_order;
 
@@ -911,6 +911,17 @@ fn v52_momentum_overlay_only_in_maturity() {
     assert_eq!(stage_for_phase(TimePhase::Late, true), Stage::Late);
     assert_eq!(stage_for_phase(TimePhase::Maturity, false), Stage::Maturity);
     assert_eq!(stage_for_phase(TimePhase::Maturity, true), Stage::Momentum);
+}
+
+#[test]
+fn v52_phase_size_scale_is_configurable() {
+    let mut cfg = V52TimePhaseConfig::default();
+    cfg.early_size_scale = 0.7;
+    cfg.maturity_size_scale = 1.1;
+    cfg.late_size_scale = 1.4;
+    assert!((time_phase_size_scale(TimePhase::Early, &cfg) - 0.7).abs() < 1e-9);
+    assert!((time_phase_size_scale(TimePhase::Maturity, &cfg) - 1.1).abs() < 1e-9);
+    assert!((time_phase_size_scale(TimePhase::Late, &cfg) - 1.4).abs() < 1e-9);
 }
 
 #[test]

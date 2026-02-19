@@ -1120,6 +1120,7 @@ pub(crate) fn spawn_predator_exit_lifecycle(
                     }
 
                     if let Some((reentry_order, book, target_market_id)) = selected {
+                        let reentry_fee_ref_bps = reentry_order.fee_rate_bps;
                         let quote_intent = QuoteIntent {
                             market_id: reentry_order.market_id.clone(),
                             side: reentry_order.side.clone(),
@@ -1216,6 +1217,13 @@ pub(crate) fn spawn_predator_exit_lifecycle(
                                     quote_intent.clone(),
                                     ExecutionStyle::Maker,
                                     ((book.bid_yes + book.ask_yes) * 0.5).max(0.0),
+                                    -get_rebate_bps_cached(
+                                        &shared,
+                                        &target_market_id,
+                                        reentry_fee_ref_bps,
+                                    )
+                                    .await
+                                    .max(0.0),
                                 );
                             }
                             Ok(_) => {}

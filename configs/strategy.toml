@@ -176,6 +176,9 @@ daily_loss_cap_usdc = 1.0
 [v52.time_phase]
 early_min_ratio = 0.55
 late_max_ratio = 0.10
+early_size_scale = 0.80
+maturity_size_scale = 1.00
+late_size_scale = 1.25
 allow_timeframes = ["5m", "15m"]
 
 [v52.execution]
@@ -183,6 +186,11 @@ late_force_taker_remaining_ms = 30000
 maker_wait_ms_before_force = 800
 apply_force_taker_in_maturity = true
 apply_force_taker_in_late = true
+alpha_window_enabled = true
+alpha_window_move_bps = 3.0
+alpha_window_poll_ms = 10
+alpha_window_max_wait_ms = 1000
+require_compounder_when_live = true
 
 [v52.dual_arb]
 enabled = true

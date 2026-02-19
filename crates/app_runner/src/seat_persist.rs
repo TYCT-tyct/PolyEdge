@@ -235,6 +235,9 @@ pub(crate) fn write_tune_report(record: &SeatDecisionRecord, state: &SeatRuntime
 
     let param_delta = json!({
         "position_fraction": numeric_delta(record.previous.position_fraction, record.candidate.position_fraction),
+        "early_size_scale": numeric_delta(record.previous.early_size_scale, record.candidate.early_size_scale),
+        "maturity_size_scale": numeric_delta(record.previous.maturity_size_scale, record.candidate.maturity_size_scale),
+        "late_size_scale": numeric_delta(record.previous.late_size_scale, record.candidate.late_size_scale),
         "min_edge_net_bps": numeric_delta(record.previous.min_edge_net_bps, record.candidate.min_edge_net_bps),
         "convergence_exit_ratio": numeric_delta(record.previous.convergence_exit_ratio, record.candidate.convergence_exit_ratio),
         "min_velocity_bps_per_sec": numeric_delta(record.previous.min_velocity_bps_per_sec, record.candidate.min_velocity_bps_per_sec),

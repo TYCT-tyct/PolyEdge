@@ -93,6 +93,9 @@ impl Default for SeatConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub(crate) struct SeatParameterSet {
     pub(crate) position_fraction: Option<f64>,
+    pub(crate) early_size_scale: Option<f64>,
+    pub(crate) maturity_size_scale: Option<f64>,
+    pub(crate) late_size_scale: Option<f64>,
     pub(crate) min_edge_net_bps: Option<f64>,
     pub(crate) convergence_exit_ratio: Option<f64>,
     pub(crate) min_velocity_bps_per_sec: Option<f64>,
@@ -122,6 +125,9 @@ impl SeatParameterSet {
             };
         }
         merge_field!(position_fraction);
+        merge_field!(early_size_scale);
+        merge_field!(maturity_size_scale);
+        merge_field!(late_size_scale);
         merge_field!(min_edge_net_bps);
         merge_field!(convergence_exit_ratio);
         merge_field!(min_velocity_bps_per_sec);
@@ -156,6 +162,21 @@ impl SeatParameterSet {
             position_fraction: clamp_opt(
                 self.position_fraction,
                 current.position_fraction,
+                max_step_pct,
+            ),
+            early_size_scale: clamp_opt(
+                self.early_size_scale,
+                current.early_size_scale,
+                max_step_pct,
+            ),
+            maturity_size_scale: clamp_opt(
+                self.maturity_size_scale,
+                current.maturity_size_scale,
+                max_step_pct,
+            ),
+            late_size_scale: clamp_opt(
+                self.late_size_scale,
+                current.late_size_scale,
                 max_step_pct,
             ),
             min_edge_net_bps: clamp_opt(
@@ -223,6 +244,10 @@ impl SeatParameterSet {
             }
         }
         self.position_fraction = blend(self.position_fraction, target.position_fraction, alpha);
+        self.early_size_scale = blend(self.early_size_scale, target.early_size_scale, alpha);
+        self.maturity_size_scale =
+            blend(self.maturity_size_scale, target.maturity_size_scale, alpha);
+        self.late_size_scale = blend(self.late_size_scale, target.late_size_scale, alpha);
         self.min_edge_net_bps = blend(self.min_edge_net_bps, target.min_edge_net_bps, alpha);
         self.convergence_exit_ratio = blend(
             self.convergence_exit_ratio,
