@@ -395,10 +395,139 @@ pub struct FillEvent {
     pub order_id: String,
     pub market_id: String,
     pub side: OrderSide,
+    #[serde(default = "default_execution_style")]
+    pub style: ExecutionStyle,
     pub price: f64,
     pub size: f64,
     pub fee: f64,
+    #[serde(default)]
+    pub mid_price: Option<f64>,
+    #[serde(default)]
+    pub slippage_bps: Option<f64>,
     pub ts_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum PaperAction {
+    Enter,
+    Add,
+    ReversalExit,
+    LateHeavy,
+    DoubleSide,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PaperIntent {
+    pub ts_ms: i64,
+    pub order_id: String,
+    pub market_id: String,
+    pub symbol: String,
+    pub timeframe: String,
+    pub stage: Stage,
+    pub direction: Direction,
+    pub velocity_bps_per_sec: f64,
+    pub edge_bps: f64,
+    pub prob_fast: f64,
+    pub prob_settle: f64,
+    pub confidence: f64,
+    pub action: PaperAction,
+    pub intent: ExecutionStyle,
+    pub requested_size_usdc: f64,
+    pub requested_size_contracts: f64,
+    pub entry_price: f64,
+    pub seat_layer: Option<String>,
+    pub tuned_params_before: Option<serde_json::Value>,
+    pub tuned_params_after: Option<serde_json::Value>,
+    pub rollback_triggered: Option<String>,
+    pub shadow_pnl_comparison: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PaperFill {
+    pub ts_ms: i64,
+    pub order_id: String,
+    pub market_id: String,
+    pub side: OrderSide,
+    pub style: ExecutionStyle,
+    pub requested_size_usdc: f64,
+    pub executed_size_usdc: f64,
+    pub entry_price: f64,
+    pub fill_price: f64,
+    pub mid_price: f64,
+    pub slippage_bps: f64,
+    pub fee_usdc: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PaperTradeRecord {
+    pub ts_ms: i64,
+    pub paper_mode: String,
+    pub market_id: String,
+    pub symbol: String,
+    pub timeframe: String,
+    pub stage: Stage,
+    pub direction: Direction,
+    pub velocity_bps_per_sec: f64,
+    pub edge_bps: f64,
+    pub prob_fast: f64,
+    pub prob_settle: f64,
+    pub confidence: f64,
+    pub action: PaperAction,
+    pub intent: ExecutionStyle,
+    pub requested_size_usdc: f64,
+    pub executed_size_usdc: f64,
+    pub entry_price: f64,
+    pub fill_price: f64,
+    pub slippage_bps: f64,
+    pub fee_usdc: f64,
+    pub realized_pnl_usdc: f64,
+    pub bankroll_before: f64,
+    pub bankroll_after: f64,
+    pub settlement_price: f64,
+    pub settlement_source: String,
+    pub forced_settlement: bool,
+    pub trade_duration_ms: i64,
+    pub seat_layer: Option<String>,
+    pub tuned_params_before: Option<serde_json::Value>,
+    pub tuned_params_after: Option<serde_json::Value>,
+    pub rollback_triggered: Option<String>,
+    pub shadow_pnl_comparison: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PaperDailySummary {
+    pub utc_day: String,
+    pub starting_bankroll: f64,
+    pub ending_bankroll: f64,
+    pub daily_roi_pct: f64,
+    pub trades: u64,
+    pub win_rate: f64,
+    pub fee_total_usdc: f64,
+    pub pnl_total_usdc: f64,
+    pub avg_trade_duration_ms: f64,
+    pub median_trade_duration_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PaperLiveReport {
+    pub ts_ms: i64,
+    pub run_id: String,
+    pub initial_capital: f64,
+    pub bankroll: f64,
+    pub trades: u64,
+    pub wins: u64,
+    pub losses: u64,
+    pub win_rate: f64,
+    pub roi_pct: f64,
+    pub max_drawdown_pct: f64,
+    pub fee_total_usdc: f64,
+    pub pnl_total_usdc: f64,
+    pub fee_ratio: f64,
+    pub avg_trade_duration_ms: f64,
+    pub median_trade_duration_ms: f64,
+    pub trade_count_source: String,
+    pub open_positions_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

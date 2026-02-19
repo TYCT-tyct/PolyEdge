@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 
 use chrono::Utc;
-use core_types::{BookTop, FillEvent, OrderAck, OrderSide, QuoteIntent};
+use core_types::{BookTop, ExecutionStyle, FillEvent, OrderAck, OrderSide, QuoteIntent};
 use parking_lot::RwLock;
 
 #[derive(Debug, Clone)]
 pub struct ShadowOrder {
     pub order_id: String,
     pub intent: QuoteIntent,
+    pub style: ExecutionStyle,
+    pub reference_mid: f64,
 }
 
 #[derive(Default)]
@@ -16,12 +18,20 @@ pub struct ShadowExecutor {
 }
 
 impl ShadowExecutor {
-    pub fn register_order(&self, ack: &OrderAck, intent: QuoteIntent) {
+    pub fn register_order(
+        &self,
+        ack: &OrderAck,
+        intent: QuoteIntent,
+        style: ExecutionStyle,
+        reference_mid: f64,
+    ) {
         self.orders.write().insert(
             ack.order_id.clone(),
             ShadowOrder {
                 order_id: ack.order_id.clone(),
                 intent,
+                style,
+                reference_mid,
             },
         );
     }
@@ -48,13 +58,34 @@ impl ShadowExecutor {
                     _ => None,
                 };
                 maybe_fill_price.map(|px| {
+                    let mid_price = mid_for_side(book, &order.intent.side);
+                    let slippage_bps = if mid_price > 0.0 {
+                        Some(((px - mid_price) / mid_price) * 10_000.0)
+                    } else {
+                        None
+                    };
+                    let executed_size_usdc = (px * order.intent.size).max(0.0);
+                    let fee = match order.style {
+                        ExecutionStyle::Maker => 0.0,
+                        ExecutionStyle::Taker | ExecutionStyle::Arb => {
+                            let taker_fee_rate = if !(0.02..=0.98).contains(&px) {
+                                0.001
+                            } else {
+                                0.01
+                            };
+                            executed_size_usdc * taker_fee_rate
+                        }
+                    };
                     fills.push(FillEvent {
                         order_id: id.clone(),
                         market_id: order.intent.market_id.clone(),
                         side: order.intent.side.clone(),
+                        style: order.style.clone(),
                         price: px,
                         size: order.intent.size,
-                        fee: 0.0,
+                        fee,
+                        mid_price: Some(mid_price.max(0.0)),
+                        slippage_bps,
                         ts_ms: Utc::now().timestamp_millis(),
                     });
                     id.clone()
@@ -72,6 +103,13 @@ impl ShadowExecutor {
 
     pub fn open_orders(&self) -> usize {
         self.orders.read().len()
+    }
+}
+
+fn mid_for_side(book: &BookTop, side: &OrderSide) -> f64 {
+    match side {
+        OrderSide::BuyYes | OrderSide::SellYes => (book.bid_yes + book.ask_yes) * 0.5,
+        OrderSide::BuyNo | OrderSide::SellNo => (book.bid_no + book.ask_no) * 0.5,
     }
 }
 
@@ -97,6 +135,8 @@ mod tests {
                 size: 1.0,
                 ttl_ms: 1_000,
             },
+            ExecutionStyle::Maker,
+            0.52,
         );
         let fills = shadow.on_book(&BookTop {
             market_id: "m1".to_string(),
@@ -110,5 +150,105 @@ mod tests {
             recv_ts_local_ns: 2_000_000,
         });
         assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].fee, 0.0);
+    }
+
+    #[test]
+    fn taker_fee_curve_boundaries() {
+        let shadow = ShadowExecutor::default();
+        let book = BookTop {
+            market_id: "m1".to_string(),
+            token_id_yes: "y".to_string(),
+            token_id_no: "n".to_string(),
+            bid_yes: 0.50,
+            ask_yes: 0.50,
+            bid_no: 0.49,
+            ask_no: 0.51,
+            ts_ms: 2,
+            recv_ts_local_ns: 2_000_000,
+        };
+
+        for (idx, px, expected_rate) in [
+            (0, 0.0199, 0.001),
+            (1, 0.02, 0.01),
+            (2, 0.98, 0.01),
+            (3, 0.9801, 0.001),
+        ] {
+            let order_id = format!("o{idx}");
+            let ack = OrderAck {
+                order_id: order_id.clone(),
+                market_id: "m1".to_string(),
+                accepted: true,
+                ts_ms: 1,
+            };
+            let side = OrderSide::BuyYes;
+            shadow.register_order(
+                &ack,
+                QuoteIntent {
+                    market_id: "m1".to_string(),
+                    side,
+                    price: px,
+                    size: 10.0,
+                    ttl_ms: 1000,
+                },
+                ExecutionStyle::Taker,
+                px,
+            );
+            let mut book_local = book.clone();
+            book_local.ask_yes = px;
+            book_local.bid_yes = px;
+            let fills = shadow.on_book(&book_local);
+            assert_eq!(fills.len(), 1);
+            let expected = px * 10.0 * expected_rate;
+            assert!((fills[0].fee - expected).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn slippage_bps_sign_and_side_formula() {
+        let shadow = ShadowExecutor::default();
+        let book = BookTop {
+            market_id: "m1".to_string(),
+            token_id_yes: "y".to_string(),
+            token_id_no: "n".to_string(),
+            bid_yes: 0.48,
+            ask_yes: 0.52,
+            bid_no: 0.47,
+            ask_no: 0.53,
+            ts_ms: 2,
+            recv_ts_local_ns: 2_000_000,
+        };
+
+        let cases = [
+            ("by", OrderSide::BuyYes, 0.52, 400.0),
+            ("sy", OrderSide::SellYes, 0.48, -400.0),
+            ("bn", OrderSide::BuyNo, 0.53, 600.0),
+            ("sn", OrderSide::SellNo, 0.47, -600.0),
+        ];
+
+        for (suffix, side, px, expected_slippage) in cases {
+            let order_id = format!("o-{suffix}");
+            let ack = OrderAck {
+                order_id: order_id.clone(),
+                market_id: "m1".to_string(),
+                accepted: true,
+                ts_ms: 1,
+            };
+            shadow.register_order(
+                &ack,
+                QuoteIntent {
+                    market_id: "m1".to_string(),
+                    side,
+                    price: px,
+                    size: 1.0,
+                    ttl_ms: 1000,
+                },
+                ExecutionStyle::Taker,
+                0.5,
+            );
+            let fills = shadow.on_book(&book);
+            assert_eq!(fills.len(), 1);
+            assert!((fills[0].slippage_bps.unwrap_or_default() - expected_slippage).abs() < 1e-9);
+        }
     }
 }
