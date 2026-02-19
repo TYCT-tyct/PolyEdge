@@ -1,4 +1,4 @@
-use super::*;
+use crate::state::ShadowLiveReport;
 
 pub(super) fn compute_gate_fail_reasons(
     live: &ShadowLiveReport,

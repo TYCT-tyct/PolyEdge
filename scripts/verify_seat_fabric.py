@@ -161,6 +161,7 @@ def check_static_configs(strategy_toml: Path, execution_toml: Path) -> List[Chec
     try:
         strat = parse_simple_toml(strategy_toml)
         transport = strat.get("transport", {})
+        aws_flags = strat.get("aws", {})
         mode = transport.get("mode")
         udp_local_only = transport.get("udp_local_only", "").lower() == "true"
         cap = float(transport.get("udp_share_cap", "0") or 0)
@@ -177,6 +178,21 @@ def check_static_configs(strategy_toml: Path, execution_toml: Path) -> List[Chec
                 name="transport_websocket_primary_profile",
                 ok=(mode == "websocket_primary" and udp_local_only and cap <= 0.35 and cap > 0),
                 detail=f"mode={mode},udp_local_only={udp_local_only},udp_share_cap={cap}",
+            )
+        )
+        ga_enabled = aws_flags.get("global_accelerator_enabled", "").lower() == "true"
+        cpg_enabled = aws_flags.get("cpg_enabled", "").lower() == "true"
+        pl_enabled = aws_flags.get("private_link_enabled", "").lower() == "true"
+        checks.append(
+            CheckResult(
+                name="aws_transport_flags",
+                ok=bool(aws_flags) and ga_enabled and cpg_enabled and not pl_enabled,
+                detail=(
+                    f"ga={ga_enabled},cpg={cpg_enabled},private_link={pl_enabled}"
+                    if aws_flags
+                    else "missing [aws] section"
+                ),
+                extra=aws_flags if aws_flags else None,
             )
         )
     except Exception as err:
@@ -218,6 +234,7 @@ def check_paths(
     base_url: str,
     ga_url: Optional[str],
     pl_url: Optional[str],
+    require_privatelink: bool,
     samples: int,
     timeout_sec: float,
     interval_ms: int,
@@ -243,6 +260,8 @@ def check_paths(
             accepted_statuses=accepted,
         )
         ok = result["errors"] == 0 and result["samples"] > 0
+        if name == "privatelink" and not require_privatelink:
+            ok = True
         checks.append(
             CheckResult(
                 name=f"path_{name}",
@@ -264,6 +283,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--privatelink-url", default=None)
     p.add_argument("--strategy-toml", default="configs/strategy.toml")
     p.add_argument("--execution-toml", default="configs/execution.toml")
+    p.add_argument(
+        "--require-privatelink",
+        action="store_true",
+        help="treat PrivateLink path reachability as hard requirement",
+    )
     p.add_argument("--samples", type=int, default=30)
     p.add_argument("--timeout-sec", type=float, default=2.0)
     p.add_argument("--interval-ms", type=int, default=50)
@@ -287,6 +311,7 @@ def main() -> int:
             base_url=args.base_url,
             ga_url=args.ga_url,
             pl_url=args.privatelink_url,
+            require_privatelink=args.require_privatelink,
             samples=args.samples,
             timeout_sec=args.timeout_sec,
             interval_ms=args.interval_ms,

@@ -1,0 +1,1562 @@
+use std::fs;
+use std::path::Path;
+
+use fair_value::BasisMrConfig;
+use risk_engine::RiskLimits;
+use serde::{Deserialize, Serialize};
+use strategy_maker::MakerConfig;
+
+use crate::state::{
+    EdgeModelConfig, ExecutionConfig, ExitConfig, FusionConfig, PerfProfile, PredatorCConfig,
+    PredatorCPriority, SettlementConfig, SourceHealthConfig,
+};
+
+pub(super) fn load_fair_value_config() -> BasisMrConfig {
+    let path = Path::new("configs/strategy.toml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return BasisMrConfig::default();
+    };
+
+    let mut cfg = BasisMrConfig::default();
+    let mut in_section = false;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_section = line == "[fair_value.basis_mr]";
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim().trim_matches('"');
+        match key {
+            "enabled" => {
+                if let Ok(parsed) = val.parse::<bool>() {
+                    cfg.enabled = parsed;
+                }
+            }
+            "alpha_mean" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.alpha_mean = parsed.clamp(0.0, 1.0);
+                }
+            }
+            "alpha_var" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.alpha_var = parsed.clamp(0.0, 1.0);
+                }
+            }
+            "alpha_ret" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.alpha_ret = parsed.clamp(0.0, 1.0);
+                }
+            }
+            "alpha_vol" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.alpha_vol = parsed.clamp(0.0, 1.0);
+                }
+            }
+            "k_revert" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.k_revert = parsed.clamp(0.0, 5.0);
+                }
+            }
+            "z_cap" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.z_cap = parsed.clamp(0.5, 8.0);
+                }
+            }
+            "min_confidence" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.min_confidence = parsed.clamp(0.0, 1.0);
+                }
+            }
+            "warmup_ticks" => {
+                if let Ok(parsed) = val.parse::<usize>() {
+                    cfg.warmup_ticks = parsed.max(1);
+                }
+            }
+            _ => {}
+        }
+    }
+    cfg
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct UniverseConfig {
+    pub(super) assets: Vec<String>,
+    pub(super) market_types: Vec<String>,
+    pub(super) timeframes: Vec<String>,
+    pub(super) tier_whitelist: Vec<String>,
+    pub(super) tier_blacklist: Vec<String>,
+}
+
+impl Default for UniverseConfig {
+    fn default() -> Self {
+        Self {
+            assets: vec![
+                "BTCUSDT".to_string(),
+                "ETHUSDT".to_string(),
+                "SOLUSDT".to_string(),
+                "XRPUSDT".to_string(),
+            ],
+            market_types: vec![
+                "updown".to_string(),
+                "above_below".to_string(),
+                "range".to_string(),
+            ],
+            timeframes: vec![
+                "5m".to_string(),
+                "15m".to_string(),
+                "1h".to_string(),
+                "1d".to_string(),
+            ],
+            tier_whitelist: Vec::new(),
+            tier_blacklist: Vec::new(),
+        }
+    }
+}
+
+fn parse_toml_array_of_strings(val: &str) -> Vec<String> {
+    let trimmed = val.trim();
+    if !(trimmed.starts_with('[') && trimmed.ends_with(']')) {
+        return Vec::new();
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    inner
+        .split(',')
+        .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+}
+
+fn parse_gatling_symbol_section(section: &str) -> Option<String> {
+    const PREFIX: &str = "[predator_c.gatling_symbols.";
+    if !(section.starts_with(PREFIX) && section.ends_with(']')) {
+        return None;
+    }
+    let inner = &section[PREFIX.len()..section.len() - 1];
+    let symbol = inner.trim();
+    if symbol.is_empty() {
+        None
+    } else {
+        Some(symbol.to_string())
+    }
+}
+
+pub(super) fn parse_toml_array_for_key(raw: &str, key: &str) -> Option<Vec<String>> {
+    let mut collecting = false;
+    let mut buf = String::new();
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        if !collecting {
+            let Some((k, v)) = trimmed.split_once('=') else {
+                continue;
+            };
+            if k.trim() != key {
+                continue;
+            }
+            let value = v.trim();
+            buf.push_str(value);
+            collecting = !(value.starts_with('[') && value.ends_with(']'));
+            if !collecting {
+                break;
+            }
+            continue;
+        }
+
+        // Keep concatenating multiline array items until closing ']'.
+        buf.push_str(trimmed);
+        if trimmed.ends_with(']') {
+            break;
+        }
+    }
+
+    if buf.is_empty() {
+        return None;
+    }
+    let parsed = parse_toml_array_of_strings(&buf);
+    if parsed.is_empty() {
+        None
+    } else {
+        Some(parsed)
+    }
+}
+
+pub(super) fn load_strategy_config() -> MakerConfig {
+    let path = Path::new("configs/strategy.toml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return MakerConfig::default();
+    };
+    let mut cfg = MakerConfig::default();
+    let mut in_maker = false;
+    let mut in_taker = false;
+    let mut in_online = false;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_maker = line == "[maker]";
+            in_taker = line == "[taker]";
+            in_online = line == "[online_calibration]";
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim().trim_matches('"');
+        if in_maker {
+            match key {
+                "base_quote_size" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.base_quote_size = parsed.max(0.01);
+                    }
+                }
+                "min_edge_bps" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.min_edge_bps = parsed.max(0.0);
+                    }
+                }
+                "inventory_skew" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.inventory_skew = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "max_spread" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.max_spread = parsed.max(0.0001);
+                    }
+                }
+                "ttl_ms" => {
+                    if let Ok(parsed) = val.parse::<u64>() {
+                        cfg.ttl_ms = parsed.max(50);
+                    }
+                }
+                _ => {}
+            }
+        } else if in_taker {
+            match key {
+                "trigger_bps" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.taker_trigger_bps = parsed.max(0.0);
+                    }
+                }
+                "max_slippage_bps" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.taker_max_slippage_bps = parsed.max(0.0);
+                    }
+                }
+                "stale_tick_filter_ms" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.stale_tick_filter_ms = parsed.clamp(50.0, 5_000.0);
+                    }
+                }
+                "market_tier_profile" => {
+                    cfg.market_tier_profile = val.to_string();
+                }
+                _ => {}
+            }
+        } else if in_online {
+            match key {
+                "capital_fraction_kelly" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.capital_fraction_kelly = parsed.clamp(0.01, 1.0);
+                    }
+                }
+                "variance_penalty_lambda" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.variance_penalty_lambda = parsed.clamp(0.0, 5.0);
+                    }
+                }
+                "min_eval_notional_usdc" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.min_eval_notional_usdc = parsed.max(0.0);
+                    }
+                }
+                "min_expected_edge_usdc" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.min_expected_edge_usdc = parsed.max(0.0);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    cfg
+}
+
+pub(super) fn load_fusion_config() -> FusionConfig {
+    let path = Path::new("configs/strategy.toml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        let cfg = FusionConfig::default();
+        std::env::set_var(
+            "POLYEDGE_UDP_LOCAL_ONLY",
+            if cfg.udp_local_only { "true" } else { "false" },
+        );
+        return cfg;
+    };
+
+    #[derive(Default)]
+    struct FusionPatch {
+        enable_udp: Option<bool>,
+        mode: Option<String>,
+        udp_port: Option<u16>,
+        dedupe_window_ms: Option<i64>,
+        dedupe_price_bps: Option<f64>,
+        udp_share_cap: Option<f64>,
+        jitter_threshold_ms: Option<f64>,
+        fallback_arm_duration_ms: Option<u64>,
+        fallback_cooldown_sec: Option<u64>,
+        udp_local_only: Option<bool>,
+    }
+
+    impl FusionPatch {
+        fn apply_to(self, cfg: &mut FusionConfig) {
+            if let Some(v) = self.enable_udp {
+                cfg.enable_udp = v;
+            }
+            if let Some(v) = self.mode {
+                cfg.mode = v;
+            }
+            if let Some(v) = self.udp_port {
+                cfg.udp_port = v.max(1);
+            }
+            if let Some(v) = self.dedupe_window_ms {
+                cfg.dedupe_window_ms = v.clamp(0, 2_000);
+            }
+            if let Some(v) = self.dedupe_price_bps {
+                cfg.dedupe_price_bps = v.clamp(0.0, 50.0);
+            }
+            if let Some(v) = self.udp_share_cap {
+                cfg.udp_share_cap = v.clamp(0.05, 0.95);
+            }
+            if let Some(v) = self.jitter_threshold_ms {
+                cfg.jitter_threshold_ms = v.clamp(1.0, 2_000.0);
+            }
+            if let Some(v) = self.fallback_arm_duration_ms {
+                cfg.fallback_arm_duration_ms = v.clamp(200, 15_000);
+            }
+            if let Some(v) = self.fallback_cooldown_sec {
+                cfg.fallback_cooldown_sec = v.clamp(0, 3_600);
+            }
+            if let Some(v) = self.udp_local_only {
+                cfg.udp_local_only = v;
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Section {
+        None,
+        Fusion,
+        Transport,
+    }
+
+    let mut cfg = FusionConfig::default();
+    let mut fusion_patch = FusionPatch::default();
+    let mut transport_patch = FusionPatch::default();
+    let mut section = Section::None;
+    let mut saw_fusion = false;
+    let mut saw_transport = false;
+
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            section = match line {
+                "[fusion]" => {
+                    saw_fusion = true;
+                    Section::Fusion
+                }
+                "[transport]" => {
+                    saw_transport = true;
+                    Section::Transport
+                }
+                _ => Section::None,
+            };
+            continue;
+        }
+        if section == Section::None {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim().trim_matches('"');
+        let target = if section == Section::Transport {
+            &mut transport_patch
+        } else {
+            &mut fusion_patch
+        };
+        match key {
+            "enable_udp" => {
+                if let Ok(parsed) = val.parse::<bool>() {
+                    target.enable_udp = Some(parsed);
+                }
+            }
+            "mode" => {
+                let norm = val.to_ascii_lowercase();
+                if matches!(
+                    norm.as_str(),
+                    "active_active" | "direct_only" | "udp_only" | "websocket_primary"
+                ) {
+                    target.mode = Some(norm);
+                }
+            }
+            "udp_port" => {
+                if let Ok(parsed) = val.parse::<u16>() {
+                    target.udp_port = Some(parsed.max(1));
+                }
+            }
+            "dedupe_window_ms" => {
+                if let Ok(parsed) = val.parse::<i64>() {
+                    target.dedupe_window_ms = Some(parsed.clamp(0, 2_000));
+                }
+            }
+            "dedupe_price_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    target.dedupe_price_bps = Some(parsed.clamp(0.0, 50.0));
+                }
+            }
+            "udp_share_cap" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    target.udp_share_cap = Some(parsed.clamp(0.05, 0.95));
+                }
+            }
+            "jitter_threshold_ms" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    target.jitter_threshold_ms = Some(parsed.clamp(1.0, 2_000.0));
+                }
+            }
+            "fallback_arm_duration_ms" => {
+                if let Ok(parsed) = val.parse::<u64>() {
+                    target.fallback_arm_duration_ms = Some(parsed.clamp(200, 15_000));
+                }
+            }
+            "fallback_cooldown_sec" => {
+                if let Ok(parsed) = val.parse::<u64>() {
+                    target.fallback_cooldown_sec = Some(parsed.clamp(0, 3_600));
+                }
+            }
+            "udp_local_only" => {
+                if let Ok(parsed) = val.parse::<bool>() {
+                    target.udp_local_only = Some(parsed);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fusion_patch.apply_to(&mut cfg);
+    if saw_transport {
+        transport_patch.apply_to(&mut cfg);
+    }
+    if cfg.mode == "websocket_primary" {
+        cfg.udp_local_only = true;
+        cfg.udp_share_cap = cfg.udp_share_cap.clamp(0.05, 0.35);
+        cfg.jitter_threshold_ms = cfg.jitter_threshold_ms.max(25.0);
+        cfg.fallback_arm_duration_ms = cfg.fallback_arm_duration_ms.max(8_000);
+        cfg.fallback_cooldown_sec = cfg.fallback_cooldown_sec.max(300);
+    }
+    if saw_fusion && saw_transport {
+        tracing::warn!(
+            "both [fusion] and [transport] are present; [transport] now takes precedence"
+        );
+    }
+    std::env::set_var(
+        "POLYEDGE_UDP_LOCAL_ONLY",
+        if cfg.udp_local_only { "true" } else { "false" },
+    );
+    cfg
+}
+
+pub(super) fn load_source_health_config() -> SourceHealthConfig {
+    let path = Path::new("configs/strategy.toml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return SourceHealthConfig::default();
+    };
+    let mut cfg = SourceHealthConfig::default();
+    let mut in_section = false;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_section = line == "[source_health]";
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim().trim_matches('"');
+        match key {
+            "min_samples" => {
+                if let Ok(parsed) = val.parse::<u64>() {
+                    cfg.min_samples = parsed.max(1);
+                }
+            }
+            "gap_window_ms" => {
+                if let Ok(parsed) = val.parse::<i64>() {
+                    cfg.gap_window_ms = parsed.clamp(50, 60_000);
+                }
+            }
+            "jitter_limit_ms" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.jitter_limit_ms = parsed.clamp(0.1, 2_000.0);
+                }
+            }
+            "deviation_limit_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.deviation_limit_bps = parsed.clamp(0.1, 10_000.0);
+                }
+            }
+            "freshness_limit_ms" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.freshness_limit_ms = parsed.clamp(50.0, 60_000.0);
+                }
+            }
+            "min_score_for_trading" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.min_score_for_trading = parsed.clamp(0.0, 1.0);
+                }
+            }
+            _ => {}
+        }
+    }
+    cfg
+}
+
+pub(super) fn load_edge_model_config() -> EdgeModelConfig {
+    let path = Path::new("configs/strategy.toml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return EdgeModelConfig::default();
+    };
+    let mut cfg = EdgeModelConfig::default();
+    let mut in_section = false;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_section = line == "[edge_model]";
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim().trim_matches('"');
+        match key {
+            "model" => cfg.model = val.to_string(),
+            "gate_mode" => cfg.gate_mode = val.to_string(),
+            "version" => cfg.version = val.to_string(),
+            "base_gate_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.base_gate_bps = parsed.max(0.0);
+                }
+            }
+            "congestion_penalty_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.congestion_penalty_bps = parsed.max(0.0);
+                }
+            }
+            "latency_penalty_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.latency_penalty_bps = parsed.max(0.0);
+                }
+            }
+            "fail_cost_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.fail_cost_bps = parsed.max(0.0);
+                }
+            }
+            _ => {}
+        }
+    }
+    cfg
+}
+
+pub(super) fn load_exit_config() -> ExitConfig {
+    let path = Path::new("configs/strategy.toml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return ExitConfig::default();
+    };
+    let mut cfg = ExitConfig::default();
+    let mut in_section = false;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_section = line == "[exit]" || line == "[predator_c.exit]";
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim().trim_matches('"');
+        match key {
+            "enabled" => {
+                if let Ok(parsed) = val.parse::<bool>() {
+                    cfg.enabled = parsed;
+                }
+            }
+            "t300ms_reversal_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.t300ms_reversal_bps = parsed;
+                }
+            }
+            "t100ms_reversal_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.t100ms_reversal_bps = parsed;
+                }
+            }
+            "convergence_exit_ratio" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.convergence_exit_ratio = parsed.clamp(0.0, 1.0);
+                }
+            }
+            "time_stop_ms" => {
+                if let Ok(parsed) = val.parse::<u64>() {
+                    cfg.time_stop_ms = parsed.clamp(50, 600_000);
+                }
+            }
+            "edge_decay_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.edge_decay_bps = parsed;
+                }
+            }
+            "adverse_move_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.adverse_move_bps = parsed;
+                }
+            }
+            "flatten_on_trigger" => {
+                if let Ok(parsed) = val.parse::<bool>() {
+                    cfg.flatten_on_trigger = parsed;
+                }
+            }
+            "t3_take_ratio" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.t3_take_ratio = parsed.clamp(0.0, 5.0);
+                }
+            }
+            "t15_min_unrealized_usdc" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.t15_min_unrealized_usdc = parsed;
+                }
+            }
+            "t60_true_prob_floor" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.t60_true_prob_floor = parsed.clamp(0.0, 1.0);
+                }
+            }
+            "t300_force_exit_ms" => {
+                if let Ok(parsed) = val.parse::<u64>() {
+                    cfg.t300_force_exit_ms = parsed.clamp(1_000, 1_800_000);
+                }
+            }
+            "t300_hold_prob_threshold" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.t300_hold_prob_threshold = parsed.clamp(0.0, 1.0);
+                }
+            }
+            "t300_hold_time_to_expiry_ms" => {
+                if let Ok(parsed) = val.parse::<u64>() {
+                    cfg.t300_hold_time_to_expiry_ms = parsed.clamp(1_000, 1_800_000);
+                }
+            }
+            "max_single_trade_loss_usdc" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.max_single_trade_loss_usdc = parsed.max(0.0);
+                }
+            }
+            _ => {}
+        }
+    }
+    cfg
+}
+
+pub(super) fn load_predator_c_config() -> PredatorCConfig {
+    let path = Path::new("configs/strategy.toml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return PredatorCConfig::default();
+    };
+
+    let mut cfg = PredatorCConfig::default();
+
+    let mut in_root = false;
+    let mut in_dir = false;
+    let mut in_prob = false;
+    let mut in_sniper = false;
+    let mut in_gatling = false;
+    let mut in_strategy_d = false;
+    let mut in_regime = false;
+    let mut in_cross = false;
+    let mut in_router = false;
+    let mut in_compounder = false;
+    let mut gatling_symbol_section: Option<String> = None;
+
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            gatling_symbol_section = parse_gatling_symbol_section(line);
+            in_root = line == "[predator_c]";
+            in_dir = line == "[predator_c.direction_detector]";
+            in_prob = line == "[predator_c.probability_engine]";
+            in_sniper = line == "[predator_c.taker_sniper]";
+            in_gatling = line == "[predator_c.gatling]";
+            in_strategy_d = line == "[predator_c.strategy_d]";
+            in_regime = line == "[predator_c.regime]";
+            in_cross = line == "[predator_c.cross_symbol]";
+            in_router = line == "[predator_c.router]";
+            in_compounder = line == "[predator_c.compounder]";
+            continue;
+        }
+        if !(in_root
+            || in_dir
+            || in_prob
+            || in_sniper
+            || in_gatling
+            || in_strategy_d
+            || in_regime
+            || in_cross
+            || in_router
+            || in_compounder
+            || gatling_symbol_section.is_some())
+        {
+            continue;
+        }
+
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim().trim_matches('"');
+
+        if in_root {
+            match key {
+                "enabled" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.enabled = parsed;
+                    }
+                }
+                "priority" => {
+                    let norm = val.trim().to_ascii_lowercase();
+                    cfg.priority = match norm.as_str() {
+                        "maker_first" => PredatorCPriority::MakerFirst,
+                        "taker_first" => PredatorCPriority::TakerFirst,
+                        "taker_only" => PredatorCPriority::TakerOnly,
+                        _ => cfg.priority.clone(),
+                    };
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if in_dir {
+            match key {
+                "window_max_sec" => {
+                    if let Ok(parsed) = val.parse::<u64>() {
+                        cfg.direction_detector.window_max_sec = parsed.max(10);
+                    }
+                }
+                "threshold_5m_pct" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.direction_detector.threshold_5m_pct = parsed.max(0.0);
+                    }
+                }
+                "threshold_15m_pct" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.direction_detector.threshold_15m_pct = parsed.max(0.0);
+                    }
+                }
+                "threshold_1h_pct" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.direction_detector.threshold_1h_pct = parsed.max(0.0);
+                    }
+                }
+                "threshold_1d_pct" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.direction_detector.threshold_1d_pct = parsed.max(0.0);
+                    }
+                }
+                "lookback_short_sec" => {
+                    if let Ok(parsed) = val.parse::<u64>() {
+                        cfg.direction_detector.lookback_short_sec = parsed.max(1);
+                    }
+                }
+                "lookback_long_sec" => {
+                    if let Ok(parsed) = val.parse::<u64>() {
+                        cfg.direction_detector.lookback_long_sec = parsed.max(1);
+                    }
+                }
+                "min_sources_for_high_confidence" => {
+                    if let Ok(parsed) = val.parse::<usize>() {
+                        cfg.direction_detector.min_sources_for_high_confidence = parsed.max(1);
+                    }
+                }
+                "min_ticks_for_signal" => {
+                    if let Ok(parsed) = val.parse::<usize>() {
+                        cfg.direction_detector.min_ticks_for_signal = parsed.max(1);
+                    }
+                }
+                "min_consecutive_ticks" => {
+                    if let Ok(parsed) = val.parse::<u8>() {
+                        cfg.direction_detector.min_consecutive_ticks = parsed.max(1);
+                    }
+                }
+                "min_velocity_bps_per_sec" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.direction_detector.min_velocity_bps_per_sec = parsed.max(0.0);
+                    }
+                }
+                "min_acceleration" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.direction_detector.min_acceleration = parsed.max(0.0);
+                    }
+                }
+                "momentum_spike_multiplier" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.direction_detector.momentum_spike_multiplier = parsed.max(1.0);
+                    }
+                }
+                "min_tick_rate_spike_ratio" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.direction_detector.min_tick_rate_spike_ratio = parsed.max(1.0);
+                    }
+                }
+                "tick_rate_short_ms" => {
+                    if let Ok(parsed) = val.parse::<i64>() {
+                        cfg.direction_detector.tick_rate_short_ms = parsed.clamp(50, 10_000);
+                    }
+                }
+                "tick_rate_long_ms" => {
+                    if let Ok(parsed) = val.parse::<i64>() {
+                        cfg.direction_detector.tick_rate_long_ms = parsed.clamp(100, 60_000);
+                    }
+                }
+                "enable_source_vote_gate" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.direction_detector.enable_source_vote_gate = parsed;
+                    }
+                }
+                "require_secondary_confirmation" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.direction_detector.require_secondary_confirmation = parsed;
+                    }
+                }
+                "source_vote_max_age_ms" => {
+                    if let Ok(parsed) = val.parse::<i64>() {
+                        cfg.direction_detector.source_vote_max_age_ms = parsed.clamp(50, 60_000);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if in_prob {
+            match key {
+                "momentum_gain" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.probability_engine.momentum_gain = parsed.clamp(0.0, 20.0);
+                    }
+                }
+                "lag_penalty_per_ms" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.probability_engine.lag_penalty_per_ms = parsed.clamp(0.0, 0.1);
+                    }
+                }
+                "confidence_floor" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.probability_engine.confidence_floor = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "sigma_annual" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.probability_engine.sigma_annual = parsed.clamp(0.05, 5.0);
+                    }
+                }
+                "horizon_sec" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.probability_engine.horizon_sec = parsed.clamp(1.0, 900.0);
+                    }
+                }
+                "drift_annual" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.probability_engine.drift_annual = parsed.clamp(-10.0, 10.0);
+                    }
+                }
+                "velocity_drift_gain" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.probability_engine.velocity_drift_gain = parsed.clamp(0.0, 5.0);
+                    }
+                }
+                "acceleration_drift_gain" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.probability_engine.acceleration_drift_gain = parsed.clamp(0.0, 5.0);
+                    }
+                }
+                "fair_blend_weight" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.probability_engine.fair_blend_weight = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if in_sniper || in_gatling {
+            match key {
+                "enabled" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.taker_sniper.gatling_enabled = parsed;
+                    }
+                }
+                "min_direction_confidence" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.taker_sniper.min_direction_confidence = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "min_edge_net_bps" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.taker_sniper.min_edge_net_bps = parsed.max(0.0);
+                    }
+                }
+                "max_spread" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.taker_sniper.max_spread = parsed.max(0.0001);
+                    }
+                }
+                "cooldown_ms_per_market" => {
+                    if let Ok(parsed) = val.parse::<u64>() {
+                        cfg.taker_sniper.cooldown_ms_per_market = parsed;
+                    }
+                }
+                "gatling_enabled" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.taker_sniper.gatling_enabled = parsed;
+                    }
+                }
+                "chunk_notional_usdc" | "gatling_chunk_notional_usdc" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.taker_sniper.gatling_chunk_notional_usdc = parsed.max(0.1);
+                    }
+                }
+                "min_chunks" | "gatling_min_chunks" => {
+                    if let Ok(parsed) = val.parse::<usize>() {
+                        cfg.taker_sniper.gatling_min_chunks = parsed.max(1);
+                    }
+                }
+                "max_chunks" | "gatling_max_chunks" => {
+                    if let Ok(parsed) = val.parse::<usize>() {
+                        cfg.taker_sniper.gatling_max_chunks = parsed.max(1);
+                    }
+                }
+                "spacing_ms" | "gatling_spacing_ms" => {
+                    if let Ok(parsed) = val.parse::<u64>() {
+                        cfg.taker_sniper.gatling_spacing_ms = parsed.min(250);
+                    }
+                }
+                "stop_on_reject" | "gatling_stop_on_reject" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.taker_sniper.gatling_stop_on_reject = parsed;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if in_strategy_d {
+            match key {
+                "enabled" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.strategy_d.enabled = parsed;
+                    }
+                }
+                "min_gap_bps" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.strategy_d.min_gap_bps = parsed.max(0.0);
+                    }
+                }
+                "min_edge_net_bps" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.strategy_d.min_edge_net_bps = parsed.max(0.0);
+                    }
+                }
+                "min_confidence" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.strategy_d.min_confidence = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "max_notional_usdc" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.strategy_d.max_notional_usdc = parsed.max(0.0);
+                    }
+                }
+                "cooldown_ms_per_market" => {
+                    if let Ok(parsed) = val.parse::<u64>() {
+                        cfg.strategy_d.cooldown_ms_per_market = parsed;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if let Some(symbol) = gatling_symbol_section.as_deref() {
+            let entry = cfg
+                .taker_sniper
+                .gatling_by_symbol
+                .entry(symbol.to_ascii_uppercase())
+                .or_default();
+            match key {
+                "enabled" | "gatling_enabled" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        entry.enabled = Some(parsed);
+                    }
+                }
+                "chunk_notional_usdc" | "gatling_chunk_notional_usdc" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        entry.chunk_notional_usdc = Some(parsed.max(0.01));
+                    }
+                }
+                "min_chunks" | "gatling_min_chunks" => {
+                    if let Ok(parsed) = val.parse::<usize>() {
+                        entry.min_chunks = Some(parsed.max(1));
+                    }
+                }
+                "max_chunks" | "gatling_max_chunks" => {
+                    if let Ok(parsed) = val.parse::<usize>() {
+                        entry.max_chunks = Some(parsed.max(1));
+                    }
+                }
+                "spacing_ms" | "gatling_spacing_ms" => {
+                    if let Ok(parsed) = val.parse::<u64>() {
+                        entry.spacing_ms = Some(parsed.min(1_000));
+                    }
+                }
+                "stop_on_reject" | "gatling_stop_on_reject" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        entry.stop_on_reject = Some(parsed);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if in_regime {
+            match key {
+                "enabled" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.regime.enabled = parsed;
+                    }
+                }
+                "active_min_confidence" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.regime.active_min_confidence = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "active_min_magnitude_pct" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.regime.active_min_magnitude_pct = parsed.max(0.0);
+                    }
+                }
+                "defend_tox_score" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.regime.defend_tox_score = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "defend_on_toxic_danger" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.regime.defend_on_toxic_danger = parsed;
+                    }
+                }
+                "defend_min_source_health" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.regime.defend_min_source_health = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "quiet_min_edge_multiplier" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.regime.quiet_min_edge_multiplier = parsed.clamp(1.0, 10.0);
+                    }
+                }
+                "quiet_chunk_scale" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.regime.quiet_chunk_scale = parsed.clamp(0.05, 1.0);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if in_cross {
+            match key {
+                "enabled" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.cross_symbol.enabled = parsed;
+                    }
+                }
+                "leader_symbol" => {
+                    cfg.cross_symbol.leader_symbol = val.trim().to_string();
+                }
+                "follower_symbols" => {
+                    let parsed = parse_toml_array_of_strings(v.trim());
+                    if !parsed.is_empty() {
+                        cfg.cross_symbol.follower_symbols = parsed;
+                    }
+                }
+                "min_leader_confidence" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.cross_symbol.min_leader_confidence = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "min_leader_magnitude_pct" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.cross_symbol.min_leader_magnitude_pct = parsed.max(0.0);
+                    }
+                }
+                "follower_stale_confidence_max" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.cross_symbol.follower_stale_confidence_max = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "max_correlated_positions" => {
+                    if let Ok(parsed) = val.parse::<usize>() {
+                        cfg.cross_symbol.max_correlated_positions = parsed.max(1);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if in_router {
+            match key {
+                "max_locked_pct_5m" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.router.max_locked_pct_5m = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "max_locked_pct_15m" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.router.max_locked_pct_15m = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "max_locked_pct_1h" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.router.max_locked_pct_1h = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "max_locked_pct_1d" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.router.max_locked_pct_1d = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "max_concurrent_positions" => {
+                    if let Ok(parsed) = val.parse::<usize>() {
+                        cfg.router.max_concurrent_positions = parsed.max(1);
+                    }
+                }
+                "liquidity_reserve_pct" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.router.liquidity_reserve_pct = parsed.clamp(0.0, 0.95);
+                    }
+                }
+                "max_order_notional_usdc" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.router.max_order_notional_usdc = parsed.max(0.0);
+                    }
+                }
+                "max_total_notional_usdc" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.router.max_total_notional_usdc = parsed.max(0.0);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if in_compounder {
+            match key {
+                "enabled" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.compounder.enabled = parsed;
+                    }
+                }
+                "initial_capital_usdc" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.compounder.initial_capital_usdc = parsed.max(0.0);
+                    }
+                }
+                "compound_ratio" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.compounder.compound_ratio = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "position_fraction" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.compounder.position_fraction = parsed.clamp(0.0, 1.0);
+                    }
+                }
+                "min_quote_size" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.compounder.min_quote_size = parsed.max(0.0);
+                    }
+                }
+                "daily_loss_cap_usdc" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.compounder.daily_loss_cap_usdc = parsed.max(0.0);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+    }
+
+    cfg
+}
+
+pub(super) fn load_risk_limits_config() -> RiskLimits {
+    let path = Path::new("configs/strategy.toml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        println!("Warn: strategy.toml not found for risk config, using defaults");
+        return RiskLimits::default();
+    };
+
+    // 文件解析失败时的安全回退值——比 Default 更保守
+    // 使用 struct update syntax 一次性初始化，避免二次赋值
+    let mut cfg = RiskLimits {
+        max_drawdown_pct: 0.20,
+        max_asset_notional: 50.0,
+        max_market_notional: 10.0,
+        ..RiskLimits::default()
+    };
+
+    let mut section = "";
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line;
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim().trim_matches('"');
+
+        match section {
+            "[risk_controls.exposure_limits]" => match key {
+                "max_total_exposure_usdc" => {
+                    if let Ok(p) = val.parse::<f64>() {
+                        cfg.max_asset_notional = p.max(0.0);
+                    }
+                }
+                "max_per_market_exposure_usdc" => {
+                    if let Ok(p) = val.parse::<f64>() {
+                        cfg.max_market_notional = p.max(0.0);
+                    }
+                }
+                "max_concurrent_positions" => {
+                    if let Ok(p) = val.parse::<usize>() {
+                        cfg.max_open_orders = p.max(1);
+                    }
+                }
+                _ => {}
+            },
+            "[risk_controls.kill_switch]" => match key {
+                "max_drawdown_pct" => {
+                    if let Ok(p) = val.parse::<f64>() {
+                        cfg.max_drawdown_pct = p.clamp(0.001, 1.0);
+                    }
+                }
+                "max_loss_streak" => {
+                    if let Ok(p) = val.parse::<u32>() {
+                        cfg.max_loss_streak = p.max(1);
+                    }
+                }
+                "cooldown_sec" => {
+                    if let Ok(p) = val.parse::<u64>() {
+                        cfg.cooldown_sec = p.max(1);
+                    }
+                }
+                _ => {}
+            },
+            "[risk_controls.progressive_limits]" => match key {
+                "enabled" => {
+                    if let Ok(p) = val.parse::<bool>() {
+                        cfg.progressive_enabled = p;
+                    }
+                }
+                "drawdown_tier1_ratio" => {
+                    if let Ok(p) = val.parse::<f64>() {
+                        cfg.drawdown_tier1_ratio = p.clamp(0.05, 0.99);
+                    }
+                }
+                "drawdown_tier2_ratio" => {
+                    if let Ok(p) = val.parse::<f64>() {
+                        cfg.drawdown_tier2_ratio = p.clamp(cfg.drawdown_tier1_ratio, 0.999);
+                    }
+                }
+                "tier1_size_scale" => {
+                    if let Ok(p) = val.parse::<f64>() {
+                        cfg.tier1_size_scale = p.clamp(0.01, 1.0);
+                    }
+                }
+                "tier2_size_scale" => {
+                    if let Ok(p) = val.parse::<f64>() {
+                        cfg.tier2_size_scale = p.clamp(0.01, 1.0);
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    cfg
+}
+
+pub(super) fn load_execution_config() -> ExecutionConfig {
+    let path = Path::new("configs/execution.toml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return ExecutionConfig::default();
+    };
+    let mut cfg = ExecutionConfig::default();
+    let mut in_execution = false;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_execution = line == "[execution]";
+            continue;
+        }
+        if !in_execution {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim().trim_matches('"');
+        match key {
+            "mode" => cfg.mode = val.to_string(),
+            "rate_limit_rps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.rate_limit_rps = parsed.max(0.1);
+                }
+            }
+            "http_timeout_ms" => {
+                if let Ok(parsed) = val.parse::<u64>() {
+                    cfg.http_timeout_ms = parsed.max(100);
+                }
+            }
+            "clob_endpoint" => cfg.clob_endpoint = val.to_string(),
+            "order_endpoint" => {
+                let v = val.to_string();
+                if v.is_empty() {
+                    cfg.order_endpoint = None;
+                } else {
+                    cfg.order_endpoint = Some(v);
+                }
+            }
+            "order_backup_endpoint" => {
+                let v = val.to_string();
+                if v.is_empty() {
+                    cfg.order_backup_endpoint = None;
+                } else {
+                    cfg.order_backup_endpoint = Some(v);
+                }
+            }
+            "order_failover_timeout_ms" => {
+                if let Ok(parsed) = val.parse::<u64>() {
+                    cfg.order_failover_timeout_ms = parsed.clamp(10, 5_000);
+                }
+            }
+            _ => {}
+        }
+    }
+    cfg
+}
+
+pub(super) fn load_settlement_config() -> SettlementConfig {
+    let path = Path::new("configs/settlement.toml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return SettlementConfig::default();
+    };
+    let mut cfg = SettlementConfig::default();
+    let mut in_section = false;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_section = line == "[settlement]";
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim().trim_matches('"');
+        match key {
+            "enabled" => {
+                if let Ok(parsed) = val.parse::<bool>() {
+                    cfg.enabled = parsed;
+                }
+            }
+            "endpoint" => cfg.endpoint = val.to_string(),
+            "required_for_live" => {
+                if let Ok(parsed) = val.parse::<bool>() {
+                    cfg.required_for_live = parsed;
+                }
+            }
+            "poll_interval_ms" => {
+                if let Ok(parsed) = val.parse::<u64>() {
+                    cfg.poll_interval_ms = parsed.clamp(250, 10_000);
+                }
+            }
+            "timeout_ms" => {
+                if let Ok(parsed) = val.parse::<u64>() {
+                    cfg.timeout_ms = parsed.clamp(100, 5_000);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(symbols) = parse_toml_array_for_key(&raw, "symbols") {
+        cfg.symbols = symbols;
+    }
+    cfg
+}
+
+pub(super) fn load_universe_config() -> UniverseConfig {
+    let path = Path::new("configs/universe.toml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return UniverseConfig::default();
+    };
+    let mut cfg = UniverseConfig::default();
+    if let Some(parsed) = parse_toml_array_for_key(&raw, "assets") {
+        cfg.assets = parsed;
+    }
+    if let Some(parsed) = parse_toml_array_for_key(&raw, "market_types") {
+        cfg.market_types = parsed;
+    }
+    if let Some(parsed) = parse_toml_array_for_key(&raw, "timeframes") {
+        cfg.timeframes = parsed;
+    }
+    if let Some(parsed) = parse_toml_array_for_key(&raw, "tier_whitelist") {
+        cfg.tier_whitelist = parsed;
+    }
+    if let Some(parsed) = parse_toml_array_for_key(&raw, "tier_blacklist") {
+        cfg.tier_blacklist = parsed;
+    }
+    cfg
+}
+
+pub(super) fn load_perf_profile_config() -> PerfProfile {
+    let path = Path::new("configs/latency.toml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return PerfProfile::default();
+    };
+
+    let mut cfg = PerfProfile::default();
+    let mut in_runtime = false;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_runtime = line == "[runtime]";
+            continue;
+        }
+        if !in_runtime {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim().trim_matches('"');
+        match key {
+            "tail_guard" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.tail_guard = parsed.clamp(0.50, 0.9999);
+                }
+            }
+            "io_flush_batch" => {
+                if let Ok(parsed) = val.parse::<usize>() {
+                    cfg.io_flush_batch = parsed.clamp(1, 4096);
+                }
+            }
+            "io_queue_capacity" => {
+                if let Ok(parsed) = val.parse::<usize>() {
+                    cfg.io_queue_capacity = parsed.clamp(256, 262_144);
+                }
+            }
+            "json_mode" => {
+                cfg.json_mode = val.to_string();
+            }
+            "io_drop_on_full" => {
+                if let Ok(parsed) = val.parse::<bool>() {
+                    cfg.io_drop_on_full = parsed;
+                }
+            }
+            _ => {}
+        }
+    }
+    cfg
+}

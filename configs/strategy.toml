@@ -183,6 +183,11 @@ jitter_threshold_ms = 25
 fallback_arm_duration_ms = 8000
 fallback_cooldown_sec = 300
 
+[aws]
+global_accelerator_enabled = true
+cpg_enabled = true
+private_link_enabled = false
+
 [fusion]
 enable_udp = true
 # SEAT Latency Fabric v1.0: WebSocket 为主通道，UDP 仅紧急 fallback

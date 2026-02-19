@@ -1,4 +1,4 @@
-use super::*;
+use core_types::{BookTop, ExecutionStyle, OrderSide};
 
 pub(super) fn is_quote_reject_reason(reason: &str) -> bool {
     reason.starts_with("execution_") || reason.starts_with("exchange_reject")
@@ -96,7 +96,7 @@ pub(super) fn classify_execution_error_reason(err: &anyhow::Error) -> &'static s
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{is_gate_block_reason, is_policy_block_reason};
 
     #[test]
     fn policy_block_reason_only_counts_hard_risk() {
