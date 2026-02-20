@@ -138,7 +138,10 @@ def build_fusion_payload(
     fallback_cooldown_sec: Optional[int],
     udp_local_only: Optional[bool],
 ) -> dict:
-    if mode == "direct_only":
+    norm = mode.strip().lower()
+    if norm in {"udp_only", "websocket_primary"}:
+        norm = "hyper_mesh"
+    if norm == "direct_only":
         payload: dict = {
             "enable_udp": False,
             "mode": "direct_only",
@@ -147,7 +150,7 @@ def build_fusion_payload(
     else:
         payload = {
             "enable_udp": True,
-            "mode": mode,
+            "mode": norm,
             "dedupe_window_ms": int(dedupe_window_ms),
         }
     if udp_share_cap is not None:
@@ -182,8 +185,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--baseline-mode", default="direct_only", choices=["direct_only"])
     p.add_argument(
         "--candidate-mode",
-        default="websocket_primary",
-        choices=["websocket_primary", "active_active", "udp_only"],
+        default="hyper_mesh",
+        choices=["hyper_mesh", "active_active"],
     )
     p.add_argument("--dedupe-window-ms", type=int, default=8)
     p.add_argument("--storm-duration-sec", type=int, default=60)

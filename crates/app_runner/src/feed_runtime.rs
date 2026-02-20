@@ -38,6 +38,13 @@ pub(super) fn spawn_reference_feed(
         Direct,
         Udp,
     }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FusionFallbackState {
+        WsPrimary = 0,
+        Armed = 1,
+        UdpFallback = 2,
+        Cooldown = 3,
+    }
     const TS_INVERSION_TOLERANCE_MS: i64 = 250;
     const TS_BACKJUMP_RESET_MS: i64 = 5_000;
     spawn_detached("reference_feed_orchestrator", true, async move {
@@ -138,6 +145,10 @@ pub(super) fn spawn_reference_feed(
         let mut local_fast_ticks: HashMap<String, RefTick> = HashMap::new();
         let mut local_anchor_ticks: HashMap<String, RefTick> = HashMap::new();
         let mut accepted_fast_mix_total: (u64, u64) = (0, 0);
+        let mut fallback_state = FusionFallbackState::WsPrimary;
+        let mut fallback_armed_at: Option<Instant> = None;
+        let mut fallback_cooldown_until: Option<Instant> = None;
+        stats.set_fallback_state(fallback_state as u64);
 
         // Core Pinning Configuration (Optional via ENV)
         let core_id = std::env::var("POLYEDGE_CORE_FEED")
@@ -149,7 +160,11 @@ pub(super) fn spawn_reference_feed(
                     core_affinity::set_for_current(core_ids[id]);
                     tracing::info!("📌 Feed Runtime pinned to CPU Core {}", id);
                 } else {
-                    tracing::warn!("⚠️ Invalid POLYEDGE_CORE_FEED={}. Available cores: {}", id, core_ids.len());
+                    tracing::warn!(
+                        "⚠️ Invalid POLYEDGE_CORE_FEED={}. Available cores: {}",
+                        id,
+                        core_ids.len()
+                    );
                 }
             }
         }
@@ -179,6 +194,10 @@ pub(super) fn spawn_reference_feed(
                         if next_fusion.mode != last_fusion_mode {
                             accepted_fast_mix_by_symbol.clear();
                             accepted_fast_mix_total = (0, 0);
+                            fallback_state = FusionFallbackState::WsPrimary;
+                            fallback_armed_at = None;
+                            fallback_cooldown_until = None;
+                            stats.set_fallback_state(fallback_state as u64);
                             stats
                                 .record_issue("fusion_mode_switch_fast_cache_reset")
                                 .await;
@@ -288,6 +307,96 @@ pub(super) fn spawn_reference_feed(
                         map.insert(source_key.to_string(), source_health.clone());
                     }
 
+                    if fusion.mode == "hyper_mesh" {
+                        let health_min_samples = source_health_cfg.min_samples.clamp(8, 128);
+                        let ws_jitter_bad = source_runtime
+                            .get("binance_ws")
+                            .filter(|row| row.sample_count >= health_min_samples)
+                            .map(|row| runtime_jitter_ms(row) > fusion.jitter_threshold_ms)
+                            .unwrap_or(false);
+                        let udp_jitter_ok = source_runtime
+                            .get("binance_udp")
+                            .filter(|row| row.sample_count >= health_min_samples)
+                            .map(|row| runtime_jitter_ms(row) <= fusion.jitter_threshold_ms)
+                            .unwrap_or(false);
+                        let now = Instant::now();
+                        match fallback_state {
+                            FusionFallbackState::WsPrimary => {
+                                if ws_jitter_bad && udp_jitter_ok {
+                                    fallback_state = FusionFallbackState::Armed;
+                                    fallback_armed_at = Some(now);
+                                    stats.set_fallback_state(fallback_state as u64);
+                                    stats
+                                        .record_fallback_trigger_reason("ws_jitter_breach_arm")
+                                        .await;
+                                }
+                            }
+                            FusionFallbackState::Armed => {
+                                if !(ws_jitter_bad && udp_jitter_ok) {
+                                    fallback_state = FusionFallbackState::WsPrimary;
+                                    fallback_armed_at = None;
+                                    stats.set_fallback_state(fallback_state as u64);
+                                } else if let Some(armed_at) = fallback_armed_at {
+                                    if now.duration_since(armed_at)
+                                        >= Duration::from_millis(fusion.fallback_arm_duration_ms)
+                                    {
+                                        fallback_state = FusionFallbackState::UdpFallback;
+                                        fallback_armed_at = None;
+                                        fallback_cooldown_until = None;
+                                        stats.set_fallback_state(fallback_state as u64);
+                                        stats
+                                            .record_fallback_trigger_reason(
+                                                "ws_jitter_breach_promote_udp_fallback",
+                                            )
+                                            .await;
+                                    }
+                                } else {
+                                    fallback_armed_at = Some(now);
+                                }
+                            }
+                            FusionFallbackState::UdpFallback => {
+                                if !ws_jitter_bad {
+                                    fallback_state = FusionFallbackState::Cooldown;
+                                    fallback_cooldown_until = Some(
+                                        now + Duration::from_secs(fusion.fallback_cooldown_sec),
+                                    );
+                                    stats.set_fallback_state(fallback_state as u64);
+                                    stats
+                                        .record_fallback_trigger_reason(
+                                            "ws_recovered_enter_cooldown",
+                                        )
+                                        .await;
+                                }
+                            }
+                            FusionFallbackState::Cooldown => {
+                                if ws_jitter_bad && udp_jitter_ok {
+                                    fallback_state = FusionFallbackState::UdpFallback;
+                                    fallback_cooldown_until = None;
+                                    stats.set_fallback_state(fallback_state as u64);
+                                    stats
+                                        .record_fallback_trigger_reason(
+                                            "ws_rebreak_return_udp_fallback",
+                                        )
+                                        .await;
+                                } else if let Some(until) = fallback_cooldown_until {
+                                    if now >= until {
+                                        fallback_state = FusionFallbackState::WsPrimary;
+                                        fallback_cooldown_until = None;
+                                        stats.set_fallback_state(fallback_state as u64);
+                                    }
+                                } else {
+                                    fallback_state = FusionFallbackState::WsPrimary;
+                                    stats.set_fallback_state(fallback_state as u64);
+                                }
+                            }
+                        }
+                    } else if fallback_state != FusionFallbackState::WsPrimary {
+                        fallback_state = FusionFallbackState::WsPrimary;
+                        fallback_armed_at = None;
+                        fallback_cooldown_until = None;
+                        stats.set_fallback_state(fallback_state as u64);
+                    }
+
                     if should_log_ref_tick(ingest_seq) {
                         let tick_json =
                             serde_json::to_string(&tick).unwrap_or_else(|_| "{}".to_string());
@@ -304,6 +413,23 @@ pub(super) fn spawn_reference_feed(
                     if !valid {
                         stats.record_issue("invalid_ref_tick").await;
                         continue;
+                    }
+                    if source_key == "binance_udp"
+                        && matches!(fusion.mode.as_str(), "active_active" | "hyper_mesh")
+                        && fallback_state != FusionFallbackState::UdpFallback
+                    {
+                        let total_fast = accepted_fast_mix_total
+                            .0
+                            .saturating_add(accepted_fast_mix_total.1);
+                        if total_fast >= 32 {
+                            let projected_udp = accepted_fast_mix_total.0.saturating_add(1);
+                            let projected_share =
+                                projected_udp as f64 / total_fast.saturating_add(1) as f64;
+                            if projected_share > fusion.udp_share_cap {
+                                stats.mark_share_cap_drop();
+                                continue;
+                            }
+                        }
                     }
                     stats.mark_ref_tick(tick.source.as_str(), tick.recv_ts_ms);
                     if source_key == "binance_udp" || source_key == "binance_ws" {
@@ -502,6 +628,14 @@ pub(super) struct SourceRuntimeStats {
     pub(super) last_event_ts_ms: i64,
     pub(super) last_recv_ts_ms: i64,
     pub(super) deviation_ema_bps: f64,
+}
+
+#[inline]
+fn runtime_jitter_ms(stats: &SourceRuntimeStats) -> f64 {
+    let n = stats.sample_count.max(1) as f64;
+    let latency_ms = (stats.latency_sum_ms / n).max(0.0);
+    let variance = (stats.latency_sq_sum_ms / n) - (latency_ms * latency_ms);
+    variance.max(0.0).sqrt()
 }
 
 pub(super) fn median_price(values: &[f64]) -> Option<f64> {

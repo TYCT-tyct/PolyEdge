@@ -206,6 +206,16 @@ pub(super) fn load_fusion_config() -> FusionConfig {
         return cfg;
     };
 
+    fn normalize_fusion_mode(raw_mode: &str) -> Option<&'static str> {
+        match raw_mode {
+            "direct_only" => Some("direct_only"),
+            "active_active" => Some("active_active"),
+            "hyper_mesh" => Some("hyper_mesh"),
+            "udp_only" | "websocket_primary" => Some("hyper_mesh"),
+            _ => None,
+        }
+    }
+
     #[derive(Default)]
     struct FusionPatch {
         enable_udp: Option<bool>,
@@ -321,11 +331,15 @@ pub(super) fn load_fusion_config() -> FusionConfig {
             }
             "mode" => {
                 let norm = val.to_ascii_lowercase();
-                if matches!(
-                    norm.as_str(),
-                    "active_active" | "direct_only" | "hyper_mesh"
-                ) {
-                    target.mode = Some(norm);
+                if let Some(mapped) = normalize_fusion_mode(norm.as_str()) {
+                    if mapped != norm {
+                        tracing::warn!(
+                            requested_mode = %norm,
+                            normalized_mode = %mapped,
+                            "legacy fusion mode alias normalized in config"
+                        );
+                    }
+                    target.mode = Some(mapped.to_string());
                 }
             }
             "udp_port" => {
@@ -386,7 +400,7 @@ pub(super) fn load_fusion_config() -> FusionConfig {
     }
 
     fusion_patch.apply_to(&mut cfg);
-    if saw_transport {
+    if saw_transport && !saw_fusion {
         transport_patch.apply_to(&mut cfg);
     }
 
@@ -402,7 +416,11 @@ pub(super) fn load_fusion_config() -> FusionConfig {
     }
     if saw_fusion && saw_transport {
         tracing::warn!(
-            "both [fusion] and [transport] are present; [transport] now takes precedence"
+            "both [fusion] and legacy [transport] are present; [fusion] takes precedence"
+        );
+    } else if saw_transport {
+        tracing::warn!(
+            "legacy [transport] section detected; please migrate to [fusion]"
         );
     }
     std::env::set_var(
@@ -1282,6 +1300,23 @@ pub(super) fn load_risk_limits_config() -> RiskLimits {
     };
 
     let mut section = "";
+    let mut warned_unknown_fields = Vec::<String>::new();
+    let mut warned_unsupported_sections = Vec::<String>::new();
+    let mut warn_unknown = |section: &str, key: &str| {
+        let sig = format!("{section}:{key}");
+        if warned_unknown_fields.iter().any(|v| v == &sig) {
+            return;
+        }
+        warned_unknown_fields.push(sig);
+        tracing::warn!(section, key, "unknown risk_controls key ignored");
+    };
+    let mut warn_unsupported_section = |section: &str| {
+        if warned_unsupported_sections.iter().any(|v| v == section) {
+            return;
+        }
+        warned_unsupported_sections.push(section.to_string());
+        tracing::warn!(section, "unsupported risk_controls section ignored");
+    };
     for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -1314,7 +1349,7 @@ pub(super) fn load_risk_limits_config() -> RiskLimits {
                         cfg.max_open_orders = p.max(1);
                     }
                 }
-                _ => {}
+                _ => warn_unknown(section, key),
             },
             "[risk_controls.kill_switch]" => match key {
                 "max_drawdown_pct" => {
@@ -1332,7 +1367,7 @@ pub(super) fn load_risk_limits_config() -> RiskLimits {
                         cfg.cooldown_sec = p.max(1);
                     }
                 }
-                _ => {}
+                _ => warn_unknown(section, key),
             },
             "[risk_controls.progressive_limits]" => match key {
                 "enabled" => {
@@ -1360,8 +1395,9 @@ pub(super) fn load_risk_limits_config() -> RiskLimits {
                         cfg.tier2_size_scale = p.clamp(0.01, 1.0);
                     }
                 }
-                _ => {}
+                _ => warn_unknown(section, key),
             },
+            "[risk_controls.market_quality]" => warn_unsupported_section(section),
             _ => {}
         }
     }

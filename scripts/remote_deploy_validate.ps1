@@ -5,7 +5,7 @@ param(
     [string]$KeyPath = "C:\Users\Shini\Documents\test.pem",
     [string]$RepoUrl = "https://github.com/TYCT-tyct/PolyEdge.git",
     [string]$RepoDir = "~/PolyEdge",
-    [string]$Branch = "main",
+    [string]$Branch = "feat/p1-wire-dual",
     [int]$BenchSeconds = 180,
     [int]$RegressionSeconds = 1800,
     [string]$Symbol = "BTCUSDT"

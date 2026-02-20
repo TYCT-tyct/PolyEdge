@@ -568,7 +568,6 @@ pub(super) async fn run_predator_c_for_symbol(
         side: OrderSide,
         entry_price: f64,
         spread: f64,
-        fee_bps: f64,
         edge_gross_bps: f64,
         edge_net_bps: f64,
         size: f64,
@@ -703,23 +702,22 @@ pub(super) async fn run_predator_c_for_symbol(
             };
             (base_size * side_size_scale).max(0.01)
         };
-        let mut push_candidate = |bucket: &mut Vec<PredatorCandIn>,
-                                  side: OrderSide,
-                                  entry_price: f64,
-                                  target_l2_size: f64,
-                                  spread: f64,
-                                  edge_gross_bps: f64,
-                                  edge_net_bps: f64,
-                                  dual_pair: bool,
-                                  fee_applied: f64,
-                                  rebate_bps: f64| {
+        let push_candidate = |bucket: &mut Vec<PredatorCandIn>,
+                              side: OrderSide,
+                              entry_price: f64,
+                              target_l2_size: f64,
+                              spread: f64,
+                              edge_gross_bps: f64,
+                              edge_net_bps: f64,
+                              dual_pair: bool,
+                              fee_applied: f64,
+                              rebate_bps: f64| {
             bucket.push(PredatorCandIn {
                 market_id: market_id.clone(),
                 timeframe: timeframe.clone(),
                 side,
                 entry_price,
                 spread,
-                fee_bps,
                 edge_gross_bps,
                 edge_net_bps,
                 size: mk_size(entry_price),

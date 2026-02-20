@@ -18,7 +18,7 @@ use risk_engine::DefaultRiskManager;
 use settlement_compounder::SettlementCompounder;
 use taker_sniper::TakerSniper;
 use timeframe_router::TimeframeRouter;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 
 use crate::config_loader::{
     load_edge_model_config, load_execution_config, load_exit_config, load_fair_value_config,

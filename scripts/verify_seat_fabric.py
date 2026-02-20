@@ -147,21 +147,38 @@ def check_static_configs(strategy_toml: Path, execution_toml: Path) -> List[Chec
     try:
         strat = parse_simple_toml(strategy_toml)
         transport = strat.get("transport", {})
-        mode = transport.get("mode")
-        udp_local_only = transport.get("udp_local_only", "").lower() == "true"
-        cap = float(transport.get("udp_share_cap", "0") or 0)
+        fusion = strat.get("fusion", {})
+        mode = str(fusion.get("mode", "")).lower()
+        udp_local_only = (
+            str(
+                fusion.get(
+                    "udp_local_only",
+                    "true",
+                )
+            ).lower()
+            == "true"
+        )
+        cap = float(fusion.get("udp_share_cap", "0") or 0)
         checks.append(
             CheckResult(
-                name="strategy_transport_section",
-                ok=bool(transport),
-                detail="present" if transport else "missing [transport] section",
-                extra=transport,
+                name="legacy_transport_section_absent",
+                ok=not bool(transport),
+                detail="missing [transport]" if not transport else "legacy [transport] should be removed",
+                extra=transport if transport else None,
             )
         )
         checks.append(
             CheckResult(
-                name="transport_direct_only_profile",
-                ok=(mode == "direct_only" and udp_local_only and cap <= 0.35 and cap > 0),
+                name="strategy_fusion_section",
+                ok=bool(fusion),
+                detail="present [fusion]" if fusion else "missing [fusion] section",
+                extra=fusion,
+            )
+        )
+        checks.append(
+            CheckResult(
+                name="transport_hyper_mesh_profile",
+                ok=(mode == "hyper_mesh" and udp_local_only and cap <= 0.95 and cap > 0),
                 detail=f"mode={mode},udp_local_only={udp_local_only},udp_share_cap={cap}",
             )
         )

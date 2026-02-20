@@ -134,7 +134,7 @@ Events flow through `RingBus<EngineEvent>` - the central event bus connecting al
 ### Configuration
 
 - `configs/strategy.toml` - Maker strategy parameters
-- `configs/risk.toml` - Risk limits
+- `configs/strategy.toml` (`[risk_controls]`) - Risk limits
 - `configs/execution.toml` - Execution settings
 - `configs/latency.toml` - Runtime performance tuning
 - `configs/universe.toml` - Market universe (symbols, timeframes)

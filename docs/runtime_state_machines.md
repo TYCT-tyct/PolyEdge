@@ -32,8 +32,7 @@ Managed by `/control/reload_fusion` and evaluated in `crates/app_runner/src/feed
 
 - `direct_only`
 - `active_active`
-- `udp_only`
-- `websocket_primary`
+- `hyper_mesh`
 
 ### Common Guards
 
@@ -43,9 +42,9 @@ Managed by `/control/reload_fusion` and evaluated in `crates/app_runner/src/feed
 - `fallback_cooldown_sec`
 - `udp_local_only`
 
-### WebSocket-Primary Fallback Lifecycle
+### Hyper-Mesh Fallback Lifecycle
 
-This applies only when `mode == websocket_primary`.
+This applies when `mode == hyper_mesh`.
 
 1. **ws_primary**: default state while WS freshness is healthy.
 2. **armed**: WS freshness breach started but persistence window not met yet.

@@ -222,18 +222,15 @@ def summary_from_samples(samples: List[dict]) -> dict:
 
 
 def mode_payload(mode: str) -> dict:
-    if mode == "direct_only":
+    norm = mode.strip().lower()
+    if norm in {"udp_only", "websocket_primary"}:
+        norm = "hyper_mesh"
+    if norm == "direct_only":
         return {"enable_udp": False, "mode": "direct_only", "dedupe_window_ms": 30}
-    if mode == "udp_only":
-        return {"enable_udp": True, "mode": "udp_only", "dedupe_window_ms": 30}
-    if mode == "active_active":
+    if norm == "active_active":
         return {"enable_udp": True, "mode": "active_active", "dedupe_window_ms": 30}
-    if mode == "websocket_primary":
-        return {
-            "enable_udp": True,
-            "mode": "websocket_primary",
-            "dedupe_window_ms": 30,
-        }
+    if norm == "hyper_mesh":
+        return {"enable_udp": True, "mode": "hyper_mesh", "dedupe_window_ms": 30}
     raise ValueError(f"unsupported mode: {mode}")
 
 
@@ -318,7 +315,7 @@ def main() -> int:
     args = parse_args()
     out_dir = Path(args.out_root) / utc_day() / "runs" / args.run_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    modes = ["direct_only", "udp_only", "active_active", "websocket_primary"]
+    modes = ["direct_only", "active_active", "hyper_mesh"]
 
     session = requests.Session()
     atexit.register(session.close)

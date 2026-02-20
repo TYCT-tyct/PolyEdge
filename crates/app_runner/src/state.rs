@@ -601,7 +601,7 @@ impl Default for FusionConfig {
     fn default() -> Self {
         Self {
             enable_udp: true,
-            mode: "direct_only".to_string(),
+            mode: "hyper_mesh".to_string(),
             udp_port: 6666,
             dedupe_window_ms: 120,
             dedupe_price_bps: 0.2,
@@ -1793,6 +1793,19 @@ impl ShadowStats {
         self.ref_dedupe_dropped.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn mark_share_cap_drop(&self) {
+        self.share_cap_drop_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_fallback_state(&self, state_code: u64) {
+        self.fallback_state_code
+            .store(state_code, Ordering::Relaxed);
+    }
+
+    pub(crate) async fn record_fallback_trigger_reason(&self, reason: &str) {
+        let mut reasons = self.fallback_trigger_reasons.write().await;
+        *reasons.entry(reason.to_string()).or_insert(0) += 1;
+    }
 
     pub(crate) fn mark_book_tick(&self, ts_ms: i64) {
         self.book_ticks_total.fetch_add(1, Ordering::Relaxed);
@@ -1860,10 +1873,6 @@ impl ShadowStats {
                 self.predator_dir_neutral.fetch_add(1, Ordering::Relaxed);
             }
         }
-    }
-
-    pub(crate) fn mark_probability_degraded(&self) {
-        self.probability_degraded.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn mark_death_box_pin_risk(&self) {

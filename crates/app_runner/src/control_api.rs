@@ -418,6 +418,16 @@ fn normalize_v52_config(v52: &mut V52Config) {
     v52.dual_arb.fee_buffer_mode = "conservative_taker".to_string();
 }
 
+fn normalize_fusion_mode(raw_mode: &str) -> Option<&'static str> {
+    match raw_mode {
+        "direct_only" => Some("direct_only"),
+        "active_active" => Some("active_active"),
+        "hyper_mesh" => Some("hyper_mesh"),
+        "udp_only" | "websocket_primary" => Some("hyper_mesh"),
+        _ => None,
+    }
+}
+
 async fn reload_predator_c(
     State(state): State<AppState>,
     Json(req): Json<PredatorCReloadReq>,
@@ -523,12 +533,18 @@ async fn reload_fusion(
         cfg.enable_udp = v;
     }
     if let Some(v) = req.mode {
-        let norm = v.to_ascii_lowercase();
-        if matches!(
-            norm.as_str(),
-            "active_active" | "direct_only" | "hyper_mesh"
-        ) {
-            cfg.mode = norm;
+        let raw = v.to_ascii_lowercase();
+        if let Some(norm) = normalize_fusion_mode(raw.as_str()) {
+            if norm != raw {
+                tracing::warn!(
+                    requested_mode = %raw,
+                    normalized_mode = %norm,
+                    "legacy fusion mode alias normalized"
+                );
+            }
+            cfg.mode = norm.to_string();
+        } else {
+            tracing::warn!(requested_mode = %raw, "invalid fusion mode ignored");
         }
     }
     if let Some(v) = req.udp_port {

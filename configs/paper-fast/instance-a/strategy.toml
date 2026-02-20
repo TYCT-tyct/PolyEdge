@@ -144,6 +144,9 @@ enabled = true
 t100ms_reversal_bps = -3.0
 t300ms_reversal_bps = -2.0
 convergence_exit_ratio = 0.80
+time_stop_ms = 300000
+edge_decay_bps = -2.0
+adverse_move_bps = -8.0
 t3_take_ratio = 0.50
 t15_min_unrealized_usdc = 0.0
 t60_true_prob_floor = 0.70
@@ -201,21 +204,16 @@ fee_buffer_mode = "conservative_taker"
 [v52.reversal]
 same_market_opposite_first = true
 
-[transport]
-# Production baseline: direct-only transport.
-mode = "direct_only"
-udp_local_only = true
-udp_share_cap = 0.35
-dedupe_window_ms = 8
-jitter_threshold_ms = 25
-fallback_arm_duration_ms = 8000
-fallback_cooldown_sec = 300
-
 [fusion]
 enable_udp = true
 # SEAT Latency Fabric v1.0: WebSocket 为主通道，UDP 仅紧急 fallback
-# 可选: "direct_only"(WS优先) / "active_active"(双路) / "udp_only"(仅UDP)
-mode = "direct_only"
+# 可选: "direct_only"(仅直连WS) / "active_active"(双路并行) / "hyper_mesh"(主模式, 自适应融合)
+mode = "hyper_mesh"
+udp_local_only = true
+udp_share_cap = 0.35
+jitter_threshold_ms = 25
+fallback_arm_duration_ms = 8000
+fallback_cooldown_sec = 300
 udp_port = 6666
 # 更激进去重窗口
 dedupe_window_ms = 8
@@ -238,47 +236,21 @@ congestion_penalty_bps = 2.0
 latency_penalty_bps = 2.0
 fail_cost_bps = 1.0
 
-[exit]
-enabled = true
-t100ms_reversal_bps = -3.0
-t300ms_reversal_bps = -2.0
-convergence_exit_ratio = 0.85
-time_stop_ms = 300000
-edge_decay_bps = -2.0
-adverse_move_bps = -8.0
-flatten_on_trigger = true
-t3_take_ratio = 0.60
-t15_min_unrealized_usdc = 0.0
-t60_true_prob_floor = 0.70
-t300_force_exit_ms = 300000
-t300_hold_prob_threshold = 0.95
-t300_hold_time_to_expiry_ms = 300000
-max_single_trade_loss_usdc = 1.0
 
 # ===== Risk Controls (P2) =====
 
 [risk_controls]
 enabled = true
 
-[risk_controls.market_quality]
-# Filter out low-quality markets
-max_spread_bps = 150                  # Skip if spread > 1.5%
-min_survival_rate = 0.80              # Skip if market survival < 80%
-min_liquidity_usdc = 50.0             # Skip if best bid/ask < $50
-
 [risk_controls.exposure_limits]
-# Position size caps
-max_total_exposure_usdc = 2.0        # Total across all positions
-max_per_market_exposure_usdc = 2.0    # Per market ID
-max_per_symbol_exposure_usdc = 2.0   # Per underlying symbol
-max_concurrent_positions = 8          # Already in predator_c.router
+max_total_exposure_usdc = 2.0
+max_per_market_exposure_usdc = 2.0
+max_concurrent_positions = 8
 
 [risk_controls.kill_switch]
-# Automatic pause conditions
-max_daily_loss_usdc = 5.0             # Pause if daily loss > $5
-max_drawdown_pct = 0.20               # Pause if drawdown > 20%
-max_latency_p99_ms = 100.0            # Pause if p99 latency > 100ms
-min_execution_success_rate = 0.50     # Pause if success rate < 50%
+max_drawdown_pct = 0.20
+max_loss_streak = 5
+cooldown_sec = 60
 
 [risk_controls.progressive_limits]
 enabled = true

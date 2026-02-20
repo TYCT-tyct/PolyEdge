@@ -51,32 +51,16 @@ def fusion_payload(
     fallback_cooldown_sec: int | None = None,
     udp_local_only: bool | None = None,
 ) -> dict:
-    if mode == "direct_only":
-        payload = {
-            "enable_udp": False,
-            "mode": "direct_only",
-            "dedupe_window_ms": int(dedupe_window_ms),
-        }
-    elif mode == "udp_only":
-        payload = {
-            "enable_udp": True,
-            "mode": "udp_only",
-            "dedupe_window_ms": int(dedupe_window_ms),
-        }
-    elif mode == "active_active":
-        payload = {
-            "enable_udp": True,
-            "mode": "active_active",
-            "dedupe_window_ms": int(dedupe_window_ms),
-        }
-    elif mode == "websocket_primary":
-        payload = {
-            "enable_udp": True,
-            "mode": "websocket_primary",
-            "dedupe_window_ms": int(dedupe_window_ms),
-        }
-    else:
+    norm = mode.strip().lower()
+    if norm in {"udp_only", "websocket_primary"}:
+        norm = "hyper_mesh"
+    if norm not in {"direct_only", "active_active", "hyper_mesh"}:
         raise ValueError(f"unsupported fusion mode: {mode}")
+    payload = {
+        "enable_udp": norm != "direct_only",
+        "mode": norm,
+        "dedupe_window_ms": int(dedupe_window_ms),
+    }
 
     if udp_share_cap is not None:
         payload["udp_share_cap"] = float(udp_share_cap)
@@ -254,7 +238,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-ws", action="store_true", help="skip CEX websocket latency probe (engine metrics only)")
     p.add_argument(
         "--fusion-mode",
-        choices=["direct_only", "udp_only", "active_active", "websocket_primary"],
+        choices=["direct_only", "active_active", "hyper_mesh"],
         default=None,
         help="optionally force fusion mode before sampling",
     )

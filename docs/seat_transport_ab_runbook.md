@@ -2,7 +2,7 @@
 
 ## Scope
 - Guard rollback is runtime config rollback (`/control/reload_fusion`), not git rollback.
-- A/B baseline is `direct_only`, candidate is `websocket_primary`.
+- A/B baseline is `direct_only`, candidate is `hyper_mesh`.
 
 ## Reboot Safety (must-have)
 Install a persistent service so reboot does not leave `127.0.0.1:8080` down:

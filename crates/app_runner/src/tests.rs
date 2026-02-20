@@ -34,8 +34,8 @@ use crate::feed_runtime::{
     blend_settlement_probability, build_source_health_snapshot, SourceRuntimeStats,
 };
 use crate::fusion_engine::{
-    compute_coalesce_policy, estimate_feed_latency, fast_tick_allowed_in_fusion_mode,
-    is_ref_tick_duplicate, reset_path_lag_calib_for_tests, should_replace_ref_tick, upsert_latest_tick_slot,
+    compute_coalesce_policy, estimate_feed_latency, is_ref_tick_duplicate,
+    reset_path_lag_calib_for_tests, should_replace_ref_tick, upsert_latest_tick_slot_local,
 };
 use crate::spawn_predator_exit_lifecycle;
 use crate::state::{
@@ -97,6 +97,7 @@ fn test_engine_shared_with_wss() -> (
     let wss_tx = Arc::new(wss_tx);
 
     let shared = Arc::new(EngineShared {
+        draining: Arc::new(RwLock::new(false)),
         latest_books: Arc::new(RwLock::new(HashMap::new())),
         latest_signals: Arc::new(DashMap::new()),
         market_to_symbol: Arc::new(RwLock::new(HashMap::new())),
@@ -137,6 +138,7 @@ fn test_engine_shared_with_wss() -> (
         predator_compounder,
         predator_exit_manager,
         wss_fill_tx: Some(wss_tx.clone()),
+        presign_cache: Arc::new(RwLock::new(HashMap::new())),
     });
 
     (shared, wss_tx)
@@ -178,11 +180,10 @@ fn ref_tick_dedupe_uses_relative_bps_and_window() {
     assert!(!is_ref_tick_duplicate(1_000, 100.005, 980, 100.0, &cfg));
 }
 
-
 #[test]
 fn fusion_default_stays_safe_baseline() {
     let cfg = FusionConfig::default();
-    assert_eq!(cfg.mode, "direct_only");
+    assert_eq!(cfg.mode, "hyper_mesh");
     assert!(cfg.enable_udp);
     assert!(cfg.udp_share_cap > 0.0 && cfg.udp_share_cap <= 1.0);
     assert!(cfg.jitter_threshold_ms >= 1.0);
@@ -198,6 +199,10 @@ fn reversal_taker_flatten_then_opposite_maker_reentry_order_shape() {
         ask_yes: 0.52,
         bid_no: 0.47,
         ask_no: 0.53,
+        bid_size_yes: 0.0,
+        ask_size_yes: 0.0,
+        bid_size_no: 0.0,
+        ask_size_no: 0.0,
         ts_ms: 1,
         recv_ts_local_ns: 1_000_000,
     };
@@ -234,6 +239,10 @@ async fn reversal_taker_to_opposite_maker_reentry_end_to_end_records_report() {
             ask_yes: 0.46,
             bid_no: 0.54,
             ask_no: 0.55,
+            bid_size_yes: 0.0,
+            ask_size_yes: 0.0,
+            bid_size_no: 0.0,
+            ask_size_no: 0.0,
             ts_ms: now_ms,
             recv_ts_local_ns: now_ns(),
         },
@@ -304,6 +313,7 @@ async fn reversal_taker_to_opposite_maker_reentry_end_to_end_records_report() {
             client_order_id: Some(new_id()),
             hold_to_resolution: false,
             prebuilt_payload: None,
+            prebuilt_auth: None,
         })
         .await
         .expect("paper entry ack");
@@ -379,7 +389,6 @@ fn normalize_reject_code_sanitizes_non_alnum() {
 
 #[test]
 fn estimate_feed_latency_separates_source_and_backlog() {
-    reset_path_lag_calib_for_tests();
     let now = now_ns();
     let now_ms = now / 1_000_000;
     let tick = RefTick {
@@ -402,6 +411,10 @@ fn estimate_feed_latency_separates_source_and_backlog() {
         ask_yes: 0.51,
         bid_no: 0.49,
         ask_no: 0.51,
+        bid_size_yes: 0.0,
+        ask_size_yes: 0.0,
+        bid_size_no: 0.0,
+        ask_size_no: 0.0,
         ts_ms: now_ms - 40,
         recv_ts_local_ns: now - 20_000_000,
     };
@@ -429,6 +442,10 @@ fn estimate_feed_latency_calibrates_path_lag_with_clock_offset() {
         ask_yes: 0.51,
         bid_no: 0.49,
         ask_no: 0.51,
+        bid_size_yes: 0.0,
+        ask_size_yes: 0.0,
+        bid_size_no: 0.0,
+        ask_size_no: 0.0,
         ts_ms: now_ms - 10,
         recv_ts_local_ns: now - 5_000_000,
     };
@@ -485,7 +502,7 @@ fn should_replace_ref_tick_respects_staleness_budget_for_same_event() {
 
 #[test]
 fn upsert_latest_tick_slot_reports_source_switch_delta() {
-    let ticks = DashMap::<String, RefTick>::new();
+    let mut ticks = HashMap::<String, RefTick>::new();
     let first = RefTick {
         source: "binance_ws".to_string().into(),
         symbol: "BTCUSDT".to_string(),
@@ -505,9 +522,9 @@ fn upsert_latest_tick_slot_reports_source_switch_delta() {
     second.recv_ts_local_ns += 400_000;
     second.price = 100.2;
 
-    let first_delta = upsert_latest_tick_slot(&ticks, first, should_replace_ref_tick);
+    let first_delta = upsert_latest_tick_slot_local(&mut ticks, first, should_replace_ref_tick);
     assert!(first_delta.is_none());
-    let second_delta = upsert_latest_tick_slot(&ticks, second, should_replace_ref_tick);
+    let second_delta = upsert_latest_tick_slot_local(&mut ticks, second, should_replace_ref_tick);
     assert_eq!(second_delta, Some(400_000));
 }
 
@@ -789,6 +806,7 @@ fn prebuild_order_payload_uses_intent_tif_and_style() {
         expected_edge_net_bps: 8.0,
         hold_to_resolution: false,
         prebuilt_payload: None,
+        prebuilt_auth: None,
     };
     let bytes = prebuild_order_payload(&intent).expect("payload");
     let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
