@@ -19,6 +19,13 @@ const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// WebSocket read timeout - prevents hanging on stale connections
 const WS_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const REF_TICK_QUEUE_DEFAULT: usize = 16_384;
+const CHAINLINK_BACKOFF_BASE_MS_DEFAULT: u64 = 2_000;
+const CHAINLINK_BACKOFF_MAX_MS_DEFAULT: u64 = 180_000;
+const CHAINLINK_429_COOLDOWN_SEC_DEFAULT: u64 = 60;
+const CHAINLINK_429_BREAKER_WINDOW_SEC_DEFAULT: u64 = 120;
+const CHAINLINK_429_BREAKER_THRESHOLD_DEFAULT: u32 = 8;
+const CHAINLINK_429_BREAKER_OPEN_SEC_DEFAULT: u64 = 900;
+const CHAINLINK_WARN_INTERVAL_SEC_DEFAULT: u64 = 30;
 
 /// Validates that a price value is finite and positive
 fn validate_price(price: f64) -> bool {
@@ -29,6 +36,20 @@ fn env_flag(key: &str, default: bool) -> bool {
     std::env::var(key)
         .ok()
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(default)
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
         .unwrap_or(default)
 }
 
@@ -82,12 +103,78 @@ impl RefPriceWsFeed for MultiSourceRefFeed {
         if enable_chainlink_anchor {
             let anchor_symbols = symbols.clone();
             let tx_anchor = tx.clone();
+            let chainlink_policy = ChainlinkReconnectPolicy::from_env();
             tokio::spawn(async move {
+                let mut attempts: u32 = 0;
+                let mut breaker_until: Option<Instant> = None;
+                let mut rate_limit_hits: u32 = 0;
+                let mut rate_limit_window_started_at = Instant::now();
+                let mut last_rate_limit_log_at: Option<Instant> = None;
+                let mut last_breaker_log_at: Option<Instant> = None;
                 loop {
-                    if let Err(err) = run_chainlink_rtds_stream(&anchor_symbols, &tx_anchor).await {
-                        tracing::warn!(?err, "chainlink rtds stream failed; reconnecting");
+                    if let Some(until) = breaker_until {
+                        let now = Instant::now();
+                        if now < until {
+                            tokio::time::sleep(until.saturating_duration_since(now)).await;
+                            continue;
+                        }
+                        breaker_until = None;
+                        rate_limit_hits = 0;
+                        rate_limit_window_started_at = now;
                     }
-                    sleep_with_jitter(backoff).await;
+
+                    if let Err(err) = run_chainlink_rtds_stream(&anchor_symbols, &tx_anchor).await {
+                        let now = Instant::now();
+                        let is_429 = is_rate_limited_error(&err);
+                        if is_429 {
+                            if now.duration_since(rate_limit_window_started_at)
+                                > chainlink_policy.breaker_window
+                            {
+                                rate_limit_window_started_at = now;
+                                rate_limit_hits = 0;
+                            }
+                            rate_limit_hits = rate_limit_hits.saturating_add(1);
+                            if should_emit_limited_log(
+                                now,
+                                last_rate_limit_log_at,
+                                chainlink_policy.warn_interval,
+                            ) {
+                                tracing::warn!(
+                                    ?err,
+                                    rate_limit_hits,
+                                    "chainlink rtds rate-limited (429); applying cooldown"
+                                );
+                                last_rate_limit_log_at = Some(now);
+                            }
+                            if rate_limit_hits >= chainlink_policy.breaker_threshold {
+                                breaker_until = Some(now + chainlink_policy.breaker_open);
+                                if should_emit_limited_log(
+                                    now,
+                                    last_breaker_log_at,
+                                    chainlink_policy.warn_interval,
+                                ) {
+                                    tracing::warn!(
+                                        breaker_open_sec = chainlink_policy.breaker_open.as_secs(),
+                                        breaker_threshold = chainlink_policy.breaker_threshold,
+                                        "chainlink rtds breaker opened due to repeated 429"
+                                    );
+                                    last_breaker_log_at = Some(now);
+                                }
+                            }
+                        } else {
+                            rate_limit_hits = 0;
+                            rate_limit_window_started_at = now;
+                            tracing::warn!(?err, "chainlink rtds stream failed; reconnecting");
+                        }
+                        let delay = chainlink_policy.next_backoff(attempts, is_429);
+                        attempts = attempts.saturating_add(1);
+                        sleep_with_jitter(delay).await;
+                    } else {
+                        // Normal stream close should still reconnect, but without a retry storm.
+                        let delay = chainlink_policy.next_backoff(attempts, false);
+                        attempts = attempts.saturating_add(1);
+                        sleep_with_jitter(delay).await;
+                    }
                 }
             });
         }
@@ -97,6 +184,107 @@ impl RefPriceWsFeed for MultiSourceRefFeed {
         let stream = ReceiverStream::new(rx).map(Ok);
         Ok(Box::pin(stream))
     }
+}
+
+#[derive(Debug, Clone)]
+struct ChainlinkReconnectPolicy {
+    base_backoff: Duration,
+    max_backoff: Duration,
+    rate_limit_cooldown: Duration,
+    breaker_window: Duration,
+    breaker_threshold: u32,
+    breaker_open: Duration,
+    warn_interval: Duration,
+}
+
+impl ChainlinkReconnectPolicy {
+    fn from_env() -> Self {
+        let base_backoff_ms = env_u64(
+            "POLYEDGE_CHAINLINK_BACKOFF_BASE_MS",
+            CHAINLINK_BACKOFF_BASE_MS_DEFAULT,
+        )
+        .clamp(250, 60_000);
+        let max_backoff_ms = env_u64(
+            "POLYEDGE_CHAINLINK_BACKOFF_MAX_MS",
+            CHAINLINK_BACKOFF_MAX_MS_DEFAULT,
+        )
+        .max(base_backoff_ms)
+        .clamp(base_backoff_ms, 900_000);
+        let rate_limit_cooldown = Duration::from_secs(
+            env_u64(
+                "POLYEDGE_CHAINLINK_429_COOLDOWN_SEC",
+                CHAINLINK_429_COOLDOWN_SEC_DEFAULT,
+            )
+            .clamp(1, 3_600),
+        );
+        let breaker_window = Duration::from_secs(
+            env_u64(
+                "POLYEDGE_CHAINLINK_429_BREAKER_WINDOW_SEC",
+                CHAINLINK_429_BREAKER_WINDOW_SEC_DEFAULT,
+            )
+            .clamp(10, 3_600),
+        );
+        let breaker_threshold = env_u32(
+            "POLYEDGE_CHAINLINK_429_BREAKER_THRESHOLD",
+            CHAINLINK_429_BREAKER_THRESHOLD_DEFAULT,
+        )
+        .clamp(2, 120);
+        let breaker_open = Duration::from_secs(
+            env_u64(
+                "POLYEDGE_CHAINLINK_429_BREAKER_OPEN_SEC",
+                CHAINLINK_429_BREAKER_OPEN_SEC_DEFAULT,
+            )
+            .clamp(10, 86_400),
+        );
+        let warn_interval = Duration::from_secs(
+            env_u64(
+                "POLYEDGE_CHAINLINK_WARN_INTERVAL_SEC",
+                CHAINLINK_WARN_INTERVAL_SEC_DEFAULT,
+            )
+            .clamp(1, 600),
+        );
+        Self {
+            base_backoff: Duration::from_millis(base_backoff_ms),
+            max_backoff: Duration::from_millis(max_backoff_ms),
+            rate_limit_cooldown,
+            breaker_window,
+            breaker_threshold,
+            breaker_open,
+            warn_interval,
+        }
+    }
+
+    fn next_backoff(&self, attempts: u32, is_rate_limited: bool) -> Duration {
+        if is_rate_limited {
+            return self.rate_limit_cooldown;
+        }
+        let base_ms = self.base_backoff.as_millis() as u128;
+        let max_ms = self.max_backoff.as_millis() as u128;
+        let shift = attempts.min(16);
+        let exp_ms = base_ms.saturating_mul(1_u128 << shift).min(max_ms);
+        Duration::from_millis(exp_ms as u64)
+    }
+}
+
+fn should_emit_limited_log(
+    now: Instant,
+    last: Option<Instant>,
+    min_interval: Duration,
+) -> bool {
+    last.map(|t| now.duration_since(t) >= min_interval)
+        .unwrap_or(true)
+}
+
+fn is_rate_limited_error(err: &anyhow::Error) -> bool {
+    let mut cur = Some(err.as_ref() as &(dyn std::error::Error + 'static));
+    while let Some(e) = cur {
+        let msg = e.to_string();
+        if msg.contains("429") || msg.to_ascii_lowercase().contains("too many requests") {
+            return true;
+        }
+        cur = e.source();
+    }
+    false
 }
 
 async fn sleep_with_jitter(base: Duration) {
@@ -380,8 +568,9 @@ async fn run_chainlink_rtds_stream(symbols: &[String], tx: &mpsc::Sender<RefTick
 
     let endpoint = std::env::var("POLYEDGE_RTDS_WS")
         .unwrap_or_else(|_| "wss://ws-live-data.polymarket.com".to_string());
-    let (mut ws, _) = connect_async(&endpoint)
+    let (mut ws, _) = timeout(WS_CONNECT_TIMEOUT, connect_async(&endpoint))
         .await
+        .with_context(|| format!("connect polymarket rtds ws timeout: {endpoint}"))?
         .with_context(|| format!("connect polymarket rtds ws: {endpoint}"))?;
 
     let sub = serde_json::json!({
@@ -541,5 +730,32 @@ mod tests {
             chainlink_to_internal_symbol("eth-usd").as_deref(),
             Some("ETHUSDT")
         );
+    }
+
+    #[test]
+    fn chainlink_policy_backoff_respects_bounds() {
+        let policy = ChainlinkReconnectPolicy {
+            base_backoff: Duration::from_millis(2_000),
+            max_backoff: Duration::from_millis(180_000),
+            rate_limit_cooldown: Duration::from_secs(60),
+            breaker_window: Duration::from_secs(120),
+            breaker_threshold: 8,
+            breaker_open: Duration::from_secs(900),
+            warn_interval: Duration::from_secs(30),
+        };
+        assert_eq!(policy.next_backoff(0, false), Duration::from_millis(2_000));
+        assert_eq!(policy.next_backoff(1, false), Duration::from_millis(4_000));
+        assert_eq!(policy.next_backoff(7, false), Duration::from_millis(180_000));
+        assert_eq!(policy.next_backoff(30, false), Duration::from_millis(180_000));
+        assert_eq!(policy.next_backoff(3, true), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn detects_429_from_error_chain() {
+        let err = anyhow::anyhow!("connect polymarket rtds ws")
+            .context("HTTP error: 429 Too Many Requests");
+        assert!(is_rate_limited_error(&err));
+        let err_non_429 = anyhow::anyhow!("connection reset by peer");
+        assert!(!is_rate_limited_error(&err_non_429));
     }
 }
