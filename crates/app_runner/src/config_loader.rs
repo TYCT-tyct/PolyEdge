@@ -395,6 +395,11 @@ pub(super) fn load_fusion_config() -> FusionConfig {
             cfg.udp_port = parsed.max(1);
         }
     }
+    if let Ok(raw) = std::env::var("POLYEDGE_UDP_TRIGGER_PORT") {
+        if let Ok(parsed) = raw.parse::<u16>() {
+            cfg.udp_trigger_port = parsed.max(1);
+        }
+    }
     if saw_fusion && saw_transport {
         tracing::warn!(
             "both [fusion] and [transport] are present; [transport] now takes precedence"
