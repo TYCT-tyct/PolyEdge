@@ -29,14 +29,14 @@ source "$HOME/.cargo/env" || true
 echo "🛠️ Building Release Binaries..."
 
 if [ "$ROLE" == "sender" ]; then
-    cargo build --release --bin feeder_tokyo
+    cargo build --release -p feeder_tokyo --bin sender
     echo "✅ Sender Built."
 
     echo "🏃 Starting Feeder (Tokyo)..."
     export TARGET="${TARGET_IP}:6666"
     export SYMBOL="$SYMBOL"
-    pkill -f feeder_tokyo || true
-    nohup ./target/release/feeder_tokyo > feeder.log 2>&1 &
+    pkill -f sender || true
+    nohup ./target/release/sender > feeder.log 2>&1 &
     echo "🔥 Sender running! PID: $!"
     echo "See logs: tail -f PolyEdge/feeder.log"
 
