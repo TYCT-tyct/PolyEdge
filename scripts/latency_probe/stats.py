@@ -36,8 +36,8 @@ def print_stat_block(name: str, stat: Dict[str, float], unit: str) -> None:
         return
     print(
         f"{name:<18} n={int(stat['n']):4d} "
-        f"avg={stat['avg']:.3f}{unit} p50={stat['p50']:.3f}{unit} "
-        f"p90={stat['p90']:.3f}{unit} p99={stat['p99']:.3f}{unit} "
-        f"min={stat['min']:.3f}{unit} max={stat['max']:.3f}{unit}"
+        f"avg={stat['avg']:.6f}{unit} p50={stat['p50']:.6f}{unit} "
+        f"p90={stat['p90']:.6f}{unit} p99={stat['p99']:.6f}{unit} "
+        f"min={stat['min']:.6f}{unit} max={stat['max']:.6f}{unit}"
     )
 

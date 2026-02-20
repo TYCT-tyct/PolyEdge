@@ -254,9 +254,9 @@ def write_markdown(out_md: Path, payload: dict) -> None:
         s = payload["modes"][mode]["summary"]
         lines.append(
             "| "
-            + f"{mode} | {s['tick_to_ack_p99_ms']['p50']:.3f} | {s['tick_to_decision_p99_ms']['p50']:.3f} | "
-            + f"{s['feed_in_p99_ms']['p50']:.3f} | {s['decision_compute_p99_ms']['p50']:.3f} | "
-            + f"{s['data_valid_ratio']['p50']:.5f} | {s['gate_ready_ratio_effective']:.3f} |"
+            + f"{mode} | {s['tick_to_ack_p99_ms']['p50']:.6f} | {s['tick_to_decision_p99_ms']['p50']:.6f} | "
+            + f"{s['feed_in_p99_ms']['p50']:.6f} | {s['decision_compute_p99_ms']['p50']:.6f} | "
+            + f"{s['data_valid_ratio']['p50']:.5f} | {s['gate_ready_ratio_effective']:.6f} |"
         )
     lines.append("")
     lines.append("## End-to-End Flow")
@@ -285,14 +285,14 @@ def write_markdown(out_md: Path, payload: dict) -> None:
         lines.append(f"### {mode}")
         lines.append("")
         lines.append(f"- samples: {s['samples']}")
-        lines.append(f"- tick_to_ack_p99_ms p50/p90/p99: {s['tick_to_ack_p99_ms']['p50']:.3f}/{s['tick_to_ack_p99_ms']['p90']:.3f}/{s['tick_to_ack_p99_ms']['p99']:.3f}")
-        lines.append(f"- tick_to_decision_p99_ms p50/p90/p99: {s['tick_to_decision_p99_ms']['p50']:.3f}/{s['tick_to_decision_p99_ms']['p90']:.3f}/{s['tick_to_decision_p99_ms']['p99']:.3f}")
-        lines.append(f"- source_latency_p99_ms p50/p90: {s['source_latency_p99_ms']['p50']:.3f}/{s['source_latency_p99_ms']['p90']:.3f}")
-        lines.append(f"- local_backlog_p99_ms p50/p90: {s['local_backlog_p99_ms']['p50']:.3f}/{s['local_backlog_p99_ms']['p90']:.3f}")
-        lines.append(f"- feed_in_p99_ms p50/p90: {s['feed_in_p99_ms']['p50']:.3f}/{s['feed_in_p99_ms']['p90']:.3f}")
-        lines.append(f"- decision_queue_wait_p99_ms p50/p90: {s['decision_queue_wait_p99_ms']['p50']:.3f}/{s['decision_queue_wait_p99_ms']['p90']:.3f}")
-        lines.append(f"- decision_compute_p99_ms p50/p90/p99: {s['decision_compute_p99_ms']['p50']:.3f}/{s['decision_compute_p99_ms']['p90']:.3f}/{s['decision_compute_p99_ms']['p99']:.3f}")
-        lines.append(f"- lag_half_life_ms p50/p90: {s['lag_half_life_ms']['p50']:.3f}/{s['lag_half_life_ms']['p90']:.3f}")
+        lines.append(f"- tick_to_ack_p99_ms p50/p90/p99: {s['tick_to_ack_p99_ms']['p50']:.6f}/{s['tick_to_ack_p99_ms']['p90']:.6f}/{s['tick_to_ack_p99_ms']['p99']:.6f}")
+        lines.append(f"- tick_to_decision_p99_ms p50/p90/p99: {s['tick_to_decision_p99_ms']['p50']:.6f}/{s['tick_to_decision_p99_ms']['p90']:.6f}/{s['tick_to_decision_p99_ms']['p99']:.6f}")
+        lines.append(f"- source_latency_p99_ms p50/p90: {s['source_latency_p99_ms']['p50']:.6f}/{s['source_latency_p99_ms']['p90']:.6f}")
+        lines.append(f"- local_backlog_p99_ms p50/p90: {s['local_backlog_p99_ms']['p50']:.6f}/{s['local_backlog_p99_ms']['p90']:.6f}")
+        lines.append(f"- feed_in_p99_ms p50/p90: {s['feed_in_p99_ms']['p50']:.6f}/{s['feed_in_p99_ms']['p90']:.6f}")
+        lines.append(f"- decision_queue_wait_p99_ms p50/p90: {s['decision_queue_wait_p99_ms']['p50']:.6f}/{s['decision_queue_wait_p99_ms']['p90']:.6f}")
+        lines.append(f"- decision_compute_p99_ms p50/p90/p99: {s['decision_compute_p99_ms']['p50']:.6f}/{s['decision_compute_p99_ms']['p90']:.6f}/{s['decision_compute_p99_ms']['p99']:.6f}")
+        lines.append(f"- lag_half_life_ms p50/p90: {s['lag_half_life_ms']['p50']:.6f}/{s['lag_half_life_ms']['p90']:.6f}")
         lines.append(f"- quote_block_ratio p50/p90: {s['quote_block_ratio']['p50']:.4f}/{s['quote_block_ratio']['p90']:.4f}")
         lines.append(f"- policy_block_ratio p50/p90: {s['policy_block_ratio']['p50']:.4f}/{s['policy_block_ratio']['p90']:.4f}")
         lines.append(f"- eligible_count p50/p90: {s['eligible_count']['p50']:.3f}/{s['eligible_count']['p90']:.3f}")
