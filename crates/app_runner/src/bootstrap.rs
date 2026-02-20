@@ -28,7 +28,7 @@ use crate::config_loader::{
 };
 use crate::feed_runtime::{spawn_market_feed, spawn_reference_feed, spawn_settlement_feed};
 use crate::paper_runtime::{set_global_paper_runtime, PaperRuntimeHandle};
-use crate::report_io::{ensure_dataset_dirs, init_jsonl_writer};
+use crate::report_io::{ensure_dataset_dirs, init_jsonl_writer, init_storage_gc_worker};
 use crate::seat_runtime::SeatRuntimeHandle;
 use crate::state::{
     settlement_live_gate_status, to_exit_manager_config, AllocatorConfig, AppState, EngineShared,
@@ -191,6 +191,7 @@ pub(super) async fn async_main() -> Result<()> {
     let universe_market_types = Arc::new(universe_cfg.market_types.clone());
     let universe_timeframes = Arc::new(universe_cfg.timeframes.clone());
     init_jsonl_writer(perf_profile.clone()).await;
+    init_storage_gc_worker();
 
     let risk_manager = Arc::new(DefaultRiskManager::new(risk_limits.clone()));
     let predator_cfg = Arc::new(RwLock::new(load_predator_c_config()));

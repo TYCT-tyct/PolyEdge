@@ -1,12 +1,16 @@
 use std::collections::HashMap;
+#[cfg(target_family = "unix")]
+use std::ffi::CString;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+#[cfg(target_family = "unix")]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, NaiveDate, Utc};
 use core_types::{ShadowOutcome, ShadowShot};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, RwLock};
@@ -23,6 +27,7 @@ pub(super) fn ensure_dataset_dirs() {
         let path = dataset_dir(bucket);
         let _ = fs::create_dir_all(path);
     }
+    run_storage_gc_once();
 }
 
 pub(super) fn dataset_date() -> String {
@@ -30,16 +35,296 @@ pub(super) fn dataset_date() -> String {
 }
 
 pub(super) fn dataset_dir(kind: &str) -> PathBuf {
-    let root = std::env::var("POLYEDGE_DATASET_ROOT")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("datasets"));
+    let root = dataset_root();
     root.join(kind).join(dataset_date())
 }
 
 pub(super) fn dataset_path(kind: &str, filename: &str) -> PathBuf {
     dataset_dir(kind).join(filename)
+}
+
+fn dataset_root() -> PathBuf {
+    std::env::var("POLYEDGE_DATASET_ROOT")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("datasets"))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StorageGcConfig {
+    max_used_pct: f64,
+    interval_sec: u64,
+    keep_raw_days: i64,
+    keep_normalized_days: i64,
+    keep_reports_days: i64,
+}
+
+impl StorageGcConfig {
+    fn from_env() -> Self {
+        fn parse_u64(key: &str, default: u64, min: u64, max: u64) -> u64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(default)
+                .clamp(min, max)
+        }
+        fn parse_i64(key: &str, default: i64, min: i64, max: i64) -> i64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .unwrap_or(default)
+                .clamp(min, max)
+        }
+        fn parse_f64(key: &str, default: f64, min: f64, max: f64) -> f64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .unwrap_or(default)
+                .clamp(min, max)
+        }
+        Self {
+            max_used_pct: parse_f64("POLYEDGE_STORAGE_MAX_USED_PCT", 90.0, 60.0, 99.0),
+            interval_sec: parse_u64("POLYEDGE_STORAGE_GC_INTERVAL_SEC", 300, 30, 3_600),
+            keep_raw_days: parse_i64("POLYEDGE_STORAGE_KEEP_RAW_DAYS", 1, 0, 30),
+            keep_normalized_days: parse_i64("POLYEDGE_STORAGE_KEEP_NORMALIZED_DAYS", 2, 0, 30),
+            keep_reports_days: parse_i64("POLYEDGE_STORAGE_KEEP_REPORTS_DAYS", 7, 1, 180),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct StorageGcSummary {
+    before_used_pct: Option<f64>,
+    after_used_pct: Option<f64>,
+    removed_dirs: u64,
+    removed_bytes: u64,
+}
+
+static STORAGE_GC_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn init_storage_gc_worker() {
+    if STORAGE_GC_WORKER_STARTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let cfg = StorageGcConfig::from_env();
+    spawn_detached("storage_gc_worker", false, async move {
+        loop {
+            run_storage_gc_with_config(cfg);
+            tokio::time::sleep(Duration::from_secs(cfg.interval_sec)).await;
+        }
+    });
+}
+
+pub(super) fn run_storage_gc_once() {
+    run_storage_gc_with_config(StorageGcConfig::from_env());
+}
+
+fn run_storage_gc_with_config(cfg: StorageGcConfig) {
+    let root = dataset_root();
+    let today = Utc::now().date_naive();
+    let mut summary = StorageGcSummary {
+        before_used_pct: fs_used_pct(&root),
+        ..StorageGcSummary::default()
+    };
+
+    cleanup_bucket_by_retention(&root, "raw", cfg.keep_raw_days, today, &mut summary);
+    cleanup_bucket_by_retention(
+        &root,
+        "normalized",
+        cfg.keep_normalized_days,
+        today,
+        &mut summary,
+    );
+    cleanup_bucket_by_retention(&root, "reports", cfg.keep_reports_days, today, &mut summary);
+
+    let mut pressure_rounds = 0_u8;
+    while let Some(used_pct) = fs_used_pct(&root) {
+        if used_pct <= cfg.max_used_pct || pressure_rounds >= 32 {
+            break;
+        }
+        let mut removed_any = false;
+        for bucket in ["raw", "normalized", "reports"] {
+            if let Some(path) = oldest_dated_dir(&root.join(bucket), today) {
+                let bytes = remove_dir_with_size(&path);
+                if bytes > 0 {
+                    summary.removed_dirs = summary.removed_dirs.saturating_add(1);
+                    summary.removed_bytes = summary.removed_bytes.saturating_add(bytes);
+                    removed_any = true;
+                }
+                break;
+            }
+        }
+        if !removed_any {
+            break;
+        }
+        pressure_rounds = pressure_rounds.saturating_add(1);
+    }
+    summary.after_used_pct = fs_used_pct(&root);
+
+    let emit_log = summary.removed_dirs > 0
+        || summary
+            .after_used_pct
+            .map(|v| v >= cfg.max_used_pct)
+            .unwrap_or(false);
+    if emit_log {
+        tracing::warn!(
+            dataset_root = %root.display(),
+            before_used_pct = ?summary.before_used_pct,
+            after_used_pct = ?summary.after_used_pct,
+            removed_dirs = summary.removed_dirs,
+            removed_bytes = summary.removed_bytes,
+            max_used_pct = cfg.max_used_pct,
+            "storage gc executed"
+        );
+        append_jsonl(
+            &dataset_path("reports", "storage_gc.jsonl"),
+            &serde_json::json!({
+                "ts_ms": Utc::now().timestamp_millis(),
+                "before_used_pct": summary.before_used_pct,
+                "after_used_pct": summary.after_used_pct,
+                "removed_dirs": summary.removed_dirs,
+                "removed_bytes": summary.removed_bytes,
+                "max_used_pct": cfg.max_used_pct,
+                "keep_days": {
+                    "raw": cfg.keep_raw_days,
+                    "normalized": cfg.keep_normalized_days,
+                    "reports": cfg.keep_reports_days,
+                }
+            }),
+        );
+    }
+}
+
+fn cleanup_bucket_by_retention(
+    root: &Path,
+    bucket: &str,
+    keep_days: i64,
+    today: NaiveDate,
+    summary: &mut StorageGcSummary,
+) {
+    let threshold = today - ChronoDuration::days(keep_days.max(0));
+    let dir = root.join(bucket);
+    for path in dated_dirs_older_than(&dir, threshold) {
+        let bytes = remove_dir_with_size(&path);
+        if bytes == 0 {
+            continue;
+        }
+        summary.removed_dirs = summary.removed_dirs.saturating_add(1);
+        summary.removed_bytes = summary.removed_bytes.saturating_add(bytes);
+    }
+}
+
+fn dated_dirs_older_than(root: &Path, threshold: NaiveDate) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Ok(date) = NaiveDate::parse_from_str(name, "%Y-%m-%d") else {
+            continue;
+        };
+        if date < threshold {
+            out.push(path);
+        }
+    }
+    out
+}
+
+fn oldest_dated_dir(root: &Path, today: NaiveDate) -> Option<PathBuf> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return None;
+    };
+    let mut dated = Vec::<(NaiveDate, PathBuf)>::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Ok(date) = NaiveDate::parse_from_str(name, "%Y-%m-%d") else {
+            continue;
+        };
+        if date < today {
+            dated.push((date, path));
+        }
+    }
+    dated.sort_by_key(|(date, _)| *date);
+    dated.into_iter().next().map(|(_, path)| path)
+}
+
+fn remove_dir_with_size(path: &Path) -> u64 {
+    let bytes = estimate_tree_size(path);
+    if fs::remove_dir_all(path).is_ok() {
+        return bytes;
+    }
+    0
+}
+
+fn estimate_tree_size(path: &Path) -> u64 {
+    let mut total = 0_u64;
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if meta.is_file() {
+        return meta.len();
+    }
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let Ok(m) = fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if m.is_file() {
+                total = total.saturating_add(m.len());
+            } else if m.is_dir() {
+                stack.push(p);
+            }
+        }
+    }
+    total
+}
+
+#[cfg(target_family = "unix")]
+fn fs_used_pct(path: &Path) -> Option<f64> {
+    let cpath = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(cpath.as_ptr(), &mut stat as *mut libc::statvfs) };
+    if rc != 0 {
+        return None;
+    }
+    if stat.f_blocks == 0 {
+        return Some(0.0);
+    }
+    let frsize = if stat.f_frsize > 0 {
+        stat.f_frsize
+    } else {
+        stat.f_bsize
+    } as f64;
+    let total = stat.f_blocks as f64 * frsize;
+    let available = stat.f_bavail as f64 * frsize;
+    if total <= 0.0 {
+        return None;
+    }
+    Some(((total - available) / total * 100.0).clamp(0.0, 100.0))
+}
+
+#[cfg(not(target_family = "unix"))]
+fn fs_used_pct(_path: &Path) -> Option<f64> {
+    None
 }
 
 pub(super) fn sha256_hex(input: &str) -> String {
