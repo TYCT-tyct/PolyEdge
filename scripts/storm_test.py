@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import requests
 
@@ -52,7 +52,7 @@ def request_json(
     method: str,
     url: str,
     timeout_sec: float,
-    payload: Optional[Dict[str, Any]] = None,
+    payload: Optional[dict] = None,
 ) -> ProbeResult:
     started = time.perf_counter()
     try:
@@ -65,11 +65,8 @@ def request_json(
             return ProbeResult(False, latency_ms, resp.status_code, url, resp.text[:240])
         _ = resp.json()
         return ProbeResult(True, latency_ms, resp.status_code, url)
-    except Exception as exc:  # noqa: BLE001
-        latency_ms = (time.perf_counter() - started) * 1000.0
-        return ProbeResult(False, latency_ms, 0, url, str(exc))
-
-
+    except Exception:
+        raise  # Linus: Fail loudly and explicitly
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="PolyEdge storm test harness (bounded, non-recursive)")
     p.add_argument("--base-url", default="http://127.0.0.1:8080")
@@ -121,7 +118,7 @@ def maybe_control_churn(
         "max_loss_streak": 4,
         "cooldown_sec": 120,
     }
-    ops: List[tuple[str, str, Dict[str, Any]]] = [
+    ops: List[tuple[str, str, dict]] = [
         ("POST", f"{base_url}/control/reload_strategy", maker_payload),
         ("POST", f"{base_url}/control/reload_taker", maker_payload),
         ("POST", f"{base_url}/control/reload_allocator", alloc_payload),
@@ -140,7 +137,7 @@ def maybe_control_churn(
     return out
 
 
-def write_summary(path: Path, payload: Dict[str, Any]) -> None:
+def write_summary(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
 
@@ -249,7 +246,7 @@ def main() -> int:
 
     lat_ok = [s.latency_ms for s in samples if s.ok]
     lat_fail = [s.latency_ms for s in samples if not s.ok]
-    summary: Dict[str, Any] = {
+    summary: dict = {
         "ts_ms": now_ms(),
         "run_id": args.run_id,
         "use_run_dir": bool(args.use_run_dir),

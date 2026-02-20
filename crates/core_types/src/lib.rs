@@ -926,8 +926,8 @@ mod tests {
     #[test]
     fn engine_event_json_roundtrip() {
         let tick = EngineEvent::RefTick(RefTick {
-            source: "binance".to_string(),
-            symbol: "BTCUSDT".to_string(),
+            source: "binance".into(),
+            symbol: "BTCUSDT".into(),
             event_ts_ms: 1,
             recv_ts_ms: 2,
             source_seq: 0,

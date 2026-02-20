@@ -11,7 +11,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Dict, List, Tuple
 
 import requests
 
@@ -25,7 +25,7 @@ def default_run_id() -> str:
     return f"long-reg-{ts}-{os.getpid()}"
 
 
-PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
+PROFILE_DEFAULTS: Dict[str, dict] = {
     "quick": {
         "cycles": 2,
         "max_cycles": 2,
@@ -94,9 +94,9 @@ def apply_profile_defaults(args: argparse.Namespace) -> argparse.Namespace:
 def post_json(
     session: requests.Session,
     url: str,
-    payload: Dict[str, Any],
+    payload: dict,
     timeout_sec: float = 8.0,
-) -> Dict[str, Any]:
+) -> dict:
     resp = session.post(url, json=payload, timeout=timeout_sec)
     resp.raise_for_status()
     return resp.json()
@@ -105,9 +105,9 @@ def post_json(
 def post_json_optional(
     session: requests.Session,
     url: str,
-    payload: Dict[str, Any],
+    payload: dict,
     timeout_sec: float = 8.0,
-) -> Dict[str, Any]:
+) -> dict:
     try:
         return post_json(session, url, payload, timeout_sec)
     except requests.HTTPError as exc:
@@ -117,13 +117,13 @@ def post_json_optional(
         raise
 
 
-def get_json(session: requests.Session, url: str, timeout_sec: float = 8.0) -> Dict[str, Any]:
+def get_json(session: requests.Session, url: str, timeout_sec: float = 8.0) -> dict:
     resp = session.get(url, timeout=timeout_sec)
     resp.raise_for_status()
     return resp.json()
 
 
-def gate_pass(live: Dict[str, Any], min_outcomes: int) -> bool:
+def gate_pass(live: dict, min_outcomes: int) -> bool:
     if "gate_fail_reasons" in live:
         reasons = live.get("gate_fail_reasons") or []
         return isinstance(reasons, list) and len(reasons) == 0 and bool(live.get("gate_ready", False))
@@ -183,7 +183,7 @@ def run_param_regression(args: argparse.Namespace, trial_run_id: str, budget_sec
     subprocess.run(cmd, check=True, timeout=timeout_sec)
 
 
-def read_best_trial(out_root: Path, trial_run_id: str) -> Dict[str, Any] | None:
+def read_best_trial(out_root: Path, trial_run_id: str) -> dict | None:
     candidates = sorted(
         out_root.glob(f"*/runs/{trial_run_id}/regression_summary.json"),
         key=lambda p: p.stat().st_mtime,
@@ -199,7 +199,7 @@ def read_best_trial(out_root: Path, trial_run_id: str) -> Dict[str, Any] | None:
     return trials[0] if trials else None
 
 
-def load_champion_state(state_file: Path) -> Tuple[Dict[str, Any] | None, Dict[str, Any] | None]:
+def load_champion_state(state_file: Path) -> Tuple[dict | None, dict | None]:
     if not state_file.exists():
         return None, None
     data = json.loads(state_file.read_text(encoding="utf-8"))
@@ -215,8 +215,8 @@ def save_champion_state(
     run_id: str,
     cycle: int,
     decision: str,
-    bundle: Dict[str, Any],
-    snapshot: Dict[str, Any],
+    bundle: dict,
+    snapshot: dict,
 ) -> None:
     state_file.parent.mkdir(parents=True, exist_ok=True)
     state_file.write_text(
@@ -236,7 +236,7 @@ def save_champion_state(
     )
 
 
-def to_bundle(trial: Dict[str, Any]) -> Dict[str, Any]:
+def to_bundle(trial: dict) -> dict:
     if "reload_strategy" in trial:
         return {
             "reload_strategy": dict(trial.get("reload_strategy") or {}),
@@ -276,7 +276,7 @@ def to_bundle(trial: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def apply_bundle(session: requests.Session, base_url: str, bundle: Dict[str, Any]) -> None:
+def apply_bundle(session: requests.Session, base_url: str, bundle: dict) -> None:
     base = base_url.rstrip("/")
     post_json(session, f"{base}/control/reload_strategy", bundle.get("reload_strategy") or {})
     post_json_optional(session, f"{base}/control/reload_taker", bundle.get("reload_taker") or {})
@@ -296,9 +296,9 @@ def collect_live_window(
     poll_interval_sec: float,
     timeout_sec: float,
     max_read_failures: int,
-) -> List[Dict[str, Any]]:
+) -> List[dict]:
     base = base_url.rstrip("/")
-    samples: List[Dict[str, Any]] = []
+    samples: List[dict] = []
     consecutive_failures = 0
     deadline = time.monotonic() + max(1, eval_window_sec)
     while time.monotonic() < deadline:
@@ -340,7 +340,7 @@ def collect_live_window(
     return samples
 
 
-def pick_gate_snapshot(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
+def pick_gate_snapshot(samples: List[dict]) -> dict:
     return max(
         samples,
         key=lambda item: int(item.get("window_outcomes", item.get("total_outcomes", 0)) or 0),
@@ -356,8 +356,8 @@ def stddev(values: List[float]) -> float:
 
 
 def ev_penalty_objective(
-    live: Dict[str, Any],
-    samples: List[Dict[str, Any]],
+    live: dict,
+    samples: List[dict],
     min_outcomes: int,
     args: argparse.Namespace,
 ) -> Tuple[float, float, Dict[str, float]]:
@@ -407,10 +407,10 @@ def _step_towards(current: float, target: float, max_step: float) -> float:
 
 
 def drift_bundle(
-    champion: Dict[str, Any],
-    challenger: Dict[str, Any],
+    champion: dict,
+    challenger: dict,
     args: argparse.Namespace,
-) -> Dict[str, Any]:
+) -> dict:
     out = json.loads(json.dumps(challenger))
     cst = champion.get("reload_strategy") or {}
     dst = out.get("reload_strategy") or {}
@@ -479,10 +479,10 @@ def drift_bundle(
 def evaluate_bundle(
     session: requests.Session,
     base_url: str,
-    bundle: Dict[str, Any],
+    bundle: dict,
     args: argparse.Namespace,
     role: str,
-) -> Dict[str, Any]:
+) -> dict:
     apply_bundle(session, base_url, bundle)
     reset_shadow(session, base_url)
     time.sleep(max(5, args.cooldown_sec))
@@ -713,7 +713,7 @@ def main() -> int:
         if champion_bundle is not None and not args.disable_drift:
             challenger_bundle = drift_bundle(champion_bundle, challenger_bundle, args)
 
-        champion_eval: Dict[str, Any] | None = None
+        champion_eval: dict | None = None
         if champion_bundle is not None:
             champion_eval = evaluate_bundle(session, args.base_url, champion_bundle, args, "champion")
 

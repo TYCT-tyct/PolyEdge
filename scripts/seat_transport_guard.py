@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import requests
 
@@ -36,43 +36,37 @@ def run(cmd: List[str]) -> None:
         raise RuntimeError(f"command failed (exit={proc.returncode}): {' '.join(cmd)}")
 
 
-def latest_sweep(run_dir: Path) -> Dict[str, Any]:
+def latest_sweep(run_dir: Path) -> dict:
     files = sorted(run_dir.glob("full_latency_sweep_*.json"))
     if not files:
         raise FileNotFoundError(f"no full_latency_sweep_*.json under {run_dir}")
     return json.loads(files[-1].read_text(encoding="utf-8"))
 
 
-def storm_summary(run_dir: Path) -> Dict[str, Any]:
+def storm_summary(run_dir: Path) -> dict:
     path = run_dir / "storm_test_summary.json"
     if not path.exists():
         return {}
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def metric(sweep: Dict[str, Any], key: str, stat: str) -> Optional[float]:
+def metric(sweep: dict, key: str, stat: str) -> Optional[float]:
     try:
         v = sweep["engine"]["stats"][key][stat]
         return float(v)
     except Exception:
-        return None
-
-
-def udp_share(sweep: Dict[str, Any]) -> float:
+        raise  # Linus: Fail loudly and explicitly
+def udp_share(sweep: dict) -> float:
     try:
         mix = sweep["engine"]["last"]["source_mix_ratio"]
         return float(mix.get("binance_udp", 0.0))
     except Exception:
-        return 0.0
-
-
-def storm_p99(summary: Dict[str, Any]) -> Optional[float]:
+        raise  # Linus: Fail loudly and explicitly
+def storm_p99(summary: dict) -> Optional[float]:
     try:
         return float(summary["latency_ms"]["p99"])
     except Exception:
-        return None
-
-
+        raise  # Linus: Fail loudly and explicitly
 @dataclass
 class Check:
     key: str
@@ -83,11 +77,11 @@ class Check:
 
 
 def check_regression(
-    baseline: Dict[str, Any],
-    candidate: Dict[str, Any],
+    baseline: dict,
+    candidate: dict,
     checks: List[Check],
-) -> Dict[str, Any]:
-    rows: List[Dict[str, Any]] = []
+) -> dict:
+    rows: List[dict] = []
     regressed = False
     for spec in checks:
         b = metric(baseline, spec.key, spec.stat)
@@ -143,9 +137,9 @@ def build_fusion_payload(
     fallback_arm_duration_ms: Optional[int],
     fallback_cooldown_sec: Optional[int],
     udp_local_only: Optional[bool],
-) -> Dict[str, Any]:
+) -> dict:
     if mode == "direct_only":
-        payload: Dict[str, Any] = {
+        payload: dict = {
             "enable_udp": False,
             "mode": "direct_only",
             "dedupe_window_ms": int(dedupe_window_ms),
@@ -169,7 +163,7 @@ def build_fusion_payload(
     return payload
 
 
-def post_json(base_url: str, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def post_json(base_url: str, path: str, payload: dict) -> dict:
     resp = requests.post(f"{base_url.rstrip('/')}{path}", json=payload, timeout=8)
     resp.raise_for_status()
     return resp.json()
@@ -325,7 +319,7 @@ def main() -> int:
 
     regressed = regression["regressed"] or cap_regressed or storm_regressed
     rollback_applied = False
-    rollback_resp: Dict[str, Any] | None = None
+    rollback_resp: dict | None = None
 
     if regressed and not args.no_rollback:
         log("regression detected; applying rollback to direct_only")

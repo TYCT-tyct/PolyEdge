@@ -9,7 +9,7 @@ import time
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import requests
 
@@ -17,7 +17,7 @@ from .models import SYMBOL_TO_NAME, StageSample
 from .stats import summarize
 
 
-def discover_market(session: requests.Session, symbol: str) -> Dict[str, Any]:
+def discover_market(session: requests.Session, symbol: str) -> dict:
     name = SYMBOL_TO_NAME.get(symbol, "Bitcoin")
     aliases = {
         "BTCUSDT": ["bitcoin", "btc"],
@@ -35,7 +35,7 @@ def discover_market(session: requests.Session, symbol: str) -> Dict[str, Any]:
         try:
             parsed = json.loads(raw)
         except Exception:
-            return None
+            raise  # Linus: Fail loudly and explicitly
         if not isinstance(parsed, list) or len(parsed) < 2:
             return None
         return [str(parsed[0]), str(parsed[1])]
@@ -43,7 +43,7 @@ def discover_market(session: requests.Session, symbol: str) -> Dict[str, Any]:
     # Candidate priority:
     # 1) up/down style
     # 2) any market for the same asset
-    candidate_groups: List[List[Dict[str, Any]]] = [[], []]
+    candidate_groups: List[List[dict]] = [[], []]
     for market in markets:
         if not _is_market_tradeable(market, now):
             continue
@@ -80,8 +80,7 @@ def discover_market(session: requests.Session, symbol: str) -> Dict[str, Any]:
                 )
                 return candidate
             except Exception:
-                continue
-
+                raise  # Linus: Fail loudly and explicitly
     # Fallback: pick any active market with a reachable orderbook so the
     # end-to-end latency harness can still run when asset-specific windows are closed.
     for market in markets:
@@ -107,12 +106,11 @@ def discover_market(session: requests.Session, symbol: str) -> Dict[str, Any]:
             )
             return candidate
         except Exception:
-            continue
-
+            raise  # Linus: Fail loudly and explicitly
     raise RuntimeError(f"No active market found for {symbol}")
 
 
-def _is_market_tradeable(market: Dict[str, Any], now_utc: datetime) -> bool:
+def _is_market_tradeable(market: dict, now_utc: datetime) -> bool:
     if not market.get("active", True):
         return False
     if market.get("closed", False):
@@ -127,21 +125,21 @@ def _is_market_tradeable(market: Dict[str, Any], now_utc: datetime) -> bool:
     return True
 
 
-def _parse_iso8601_utc(raw: Any) -> Optional[datetime]:
+def _parse_iso8601_utc(raw: object) -> Optional[datetime]:
     if raw is None:
         return None
     try:
         text = str(raw).replace("Z", "+00:00")
         dt = datetime.fromisoformat(text)
     except Exception:
-        return None
+        raise  # Linus: Fail loudly and explicitly
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
 
-def _fetch_markets_pages(session: requests.Session) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
+def _fetch_markets_pages(session: requests.Session) -> List[dict]:
+    out: List[dict] = []
     limit = 1000
     for offset in (0, 1000, 2000, 3000):
         resp = session.get(
@@ -231,10 +229,10 @@ def evaluate_signal(ref_price: float, book: Dict[str, float]) -> Dict[str, float
     }
 
 
-def build_quotes(market_id: str, signal: Dict[str, float], base_size: float = 2.0) -> List[Dict[str, Any]]:
+def build_quotes(market_id: str, signal: Dict[str, float], base_size: float = 2.0) -> List[dict]:
     if signal["confidence"] <= 0.05:
         return []
-    intents: List[Dict[str, Any]] = []
+    intents: List[dict] = []
     bid_price = max(0.001, min(0.999, signal["fair_yes"] - 0.01))
     ask_price = max(0.001, min(0.999, signal["fair_yes"] + 0.01))
     if signal["edge_bps_bid"] >= 3.0:
@@ -260,8 +258,8 @@ def build_quotes(market_id: str, signal: Dict[str, float], base_size: float = 2.
     return intents
 
 
-def risk_check(intents: List[Dict[str, Any]], max_market_notional: float = 50.0) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
+def risk_check(intents: List[dict], max_market_notional: float = 50.0) -> List[dict]:
+    out: List[dict] = []
     for intent in intents:
         capped = min(intent["size"], max_market_notional)
         if capped <= 0:
@@ -272,7 +270,7 @@ def risk_check(intents: List[Dict[str, Any]], max_market_notional: float = 50.0)
     return out
 
 
-def simulate_execution(intents: List[Dict[str, Any]]) -> List[str]:
+def simulate_execution(intents: List[dict]) -> List[str]:
     out = []
     for intent in intents:
         _ = json.dumps(intent, separators=(",", ":"))
@@ -280,7 +278,7 @@ def simulate_execution(intents: List[Dict[str, Any]]) -> List[str]:
     return out
 
 
-def run_rest_pipeline(iterations: int, symbol: str) -> Dict[str, Any]:
+def run_rest_pipeline(iterations: int, symbol: str) -> dict:
     session = requests.Session()
     atexit.register(session.close)
     market = discover_market(session, symbol)
@@ -335,10 +333,8 @@ def run_rest_pipeline(iterations: int, symbol: str) -> Dict[str, Any]:
                     intents=len(safe_intents),
                 )
             )
-        except Exception as exc:
-            failures += 1
-            failure_reasons[_classify_error(exc)] += 1
-
+        except Exception:
+            raise  # Linus: Fail loudly and explicitly
     return {
         "market": market,
         "n": len(samples),

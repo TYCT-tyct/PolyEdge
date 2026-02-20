@@ -74,11 +74,7 @@ impl Default for DirectionConfig {
     }
 }
 
-// ============================================================
-// SymbolWindow — 每个 symbol 的滑动窗口状态
-// 设计原则: on_tick 时增量维护，evaluate 时 O(1) 读取缓存
-// 消除 evaluate 路径上的所有 O(n) 扫描
-// ============================================================
+
 #[derive(Debug, Default)]
 struct SymbolWindow {
     // (recv_ts_ms, price) — 按时间戳升序
@@ -87,10 +83,7 @@ struct SymbolWindow {
     latest_by_source: HashMap<String, f64>,
     latest_ts_by_source: HashMap<String, i64>,
 
-    // --------------------------------------------------------
-    // 增量维护的滑动窗口计数器 (on_tick O(1) 更新)
-    // 消除 evaluate 里两次 O(n) 全量扫描
-    // --------------------------------------------------------
+
     /// 最近 tick_rate_short_ms 内的 tick 数
     short_window_count: u32,
     /// 最近 tick_rate_long_ms 内的 tick 数
@@ -100,9 +93,7 @@ struct SymbolWindow {
     /// 最后一个 tick 的方向符号: -1/0/1
     last_dir_sign: i8,
 
-    // --------------------------------------------------------
-    // 源类型缓存 — 避免每次 is_binance/chainlink 分配 String
-    // --------------------------------------------------------
+
     /// 已见过的 Binance 源 key (第一次见到时缓存)
     binance_source_key: Option<String>,
     /// 已见过的 Chainlink 源 key (第一次见到时缓存)
@@ -146,12 +137,11 @@ impl DirectionDetector {
     }
 
     pub fn on_tick(&mut self, tick: &RefTick) {
-        let w = self.windows.entry(tick.symbol.clone()).or_default();
+        if !self.windows.contains_key(&tick.symbol) {
+            self.windows.insert(tick.symbol.clone(), Default::default());
+        }
+        let w = self.windows.get_mut(&tick.symbol).unwrap();
 
-        // --------------------------------------------------------
-        // 源类型缓存: 第一次见到 binance/chainlink 源时记录 key
-        // 后续 source_vote 直接比较 key，不再 to_ascii_lowercase()
-        // --------------------------------------------------------
         if w.binance_source_key.is_none() && is_binance_source(&tick.source) {
             w.binance_source_key = Some(tick.source.to_string());
         }
@@ -159,15 +149,19 @@ impl DirectionDetector {
             w.chainlink_source_key = Some(tick.source.to_string());
         }
 
-        w.latest_by_source
-            .insert(tick.source.to_string(), tick.price);
-        w.latest_ts_by_source
-            .insert(tick.source.to_string(), tick.recv_ts_ms);
+        if let Some(price_ref) = w.latest_by_source.get_mut(tick.source.as_str()) {
+            *price_ref = tick.price;
+        } else {
+            w.latest_by_source.insert(tick.source.to_string(), tick.price);
+        }
 
-        // --------------------------------------------------------
-        // 增量维护连续方向计数
-        // 只看最新 tick 与上一个 tick 的方向关系，O(1)
-        // --------------------------------------------------------
+        if let Some(ts_ref) = w.latest_ts_by_source.get_mut(tick.source.as_str()) {
+            *ts_ref = tick.recv_ts_ms;
+        } else {
+            w.latest_ts_by_source.insert(tick.source.to_string(), tick.recv_ts_ms);
+        }
+
+
         if let Some(&(_, prev_price)) = w.ticks.back() {
             if prev_price > 0.0 && tick.price > 0.0 {
                 let delta = tick.price - prev_price;
@@ -192,11 +186,7 @@ impl DirectionDetector {
 
         w.ticks.push_back((tick.recv_ts_ms, tick.price));
 
-        // --------------------------------------------------------
-        // 增量维护滑动窗口计数器
-        // 新 tick 进来时: short/long count +1
-        // 过期 tick 弹出时: 相应 count -1
-        // --------------------------------------------------------
+
         let short_ms = self.cfg_tick_rate_short_ms;
         let long_ms = self.cfg_tick_rate_long_ms;
         let now = tick.recv_ts_ms;
@@ -285,10 +275,7 @@ impl DirectionDetector {
         let momentum_spike = velocity_abs
             >= self.cfg.min_velocity_bps_per_sec.max(0.0)
                 * self.cfg.momentum_spike_multiplier.max(1.0);
-        // --------------------------------------------------------
-        // volume_spike: 直接用缓存的滑动窗口计数器，O(1) 读取
-        // 替代原来的 tick_rate_spike_ratio() O(2n) 全量扫描
-        // --------------------------------------------------------
+
         let short_ms = self.cfg_tick_rate_short_ms.clamp(50, 10_000);
         let long_ms = self
             .cfg_tick_rate_long_ms
@@ -298,12 +285,7 @@ impl DirectionDetector {
         let long_rate = (w.long_window_count as f64 / (long_ms as f64 / 1_000.0)).max(1e-6);
         let tick_rate_ratio = short_rate / long_rate;
         let volume_spike = tick_rate_ratio >= self.cfg.min_tick_rate_spike_ratio.max(1.0);
-        // --------------------------------------------------------
-        // 速度分级快速确认:
-        //   极强动量 (velocity > fast_confirm_threshold) → 单 Tick 即可触发
-        //   普通动量 → 需要 min_consecutive_ticks 个同向 Tick
-        // 设计哲学: 极强动量本身是高置信度，等待第 2 个 Tick 会损失套利窗口
-        // --------------------------------------------------------
+
         let required_ticks = if velocity_abs >= self.cfg.fast_confirm_velocity_bps_per_sec.max(1.0)
         {
             1u8
@@ -374,10 +356,7 @@ struct SourceVote {
     secondary_confirms: bool,
 }
 
-// ============================================================
-// source_vote_cached — 利用缓存的源 key 避免热路径 String 分配
-// 替代原来的 source_vote() 里每次 is_binance/chainlink_source() 的 alloc
-// ============================================================
+
 fn source_vote_cached(
     latest_by_source: &HashMap<String, f64>,
     latest_ts_by_source: &HashMap<String, i64>,
@@ -426,11 +405,7 @@ fn source_vote_cached(
     out
 }
 
-// ============================================================
-// is_binance/chainlink_source — 无分配版本
-// 原来的 to_ascii_lowercase() 每次分配新 String
-// 现在用 bytes 比较，零分配
-// ============================================================
+
 #[inline]
 fn is_binance_source(source: &str) -> bool {
     let b = source.as_bytes();
@@ -443,11 +418,7 @@ fn is_chainlink_source(source: &str) -> bool {
     b.windows(9).any(|w| w.eq_ignore_ascii_case(b"chainlink"))
 }
 
-// ============================================================
-// kinematics_from_ticks — 计算速度和加速度
-// 注意: tick_consistency 现在由 SymbolWindow 增量维护
-// 这里只返回 (velocity, acceleration)，不再调用 consecutive_direction_count()
-// ============================================================
+
 fn kinematics_from_ticks(ticks: &VecDeque<(i64, f64)>) -> (f64, f64) {
     if ticks.len() < 3 {
         return (0.0, 0.0);
@@ -563,8 +534,8 @@ mod tests {
 
     fn tick(source: &str, symbol: &str, recv_ts_ms: i64, price: f64) -> RefTick {
         RefTick {
-            source: source.to_string(),
-            symbol: symbol.to_string(),
+            source: source.into(),
+            symbol: symbol.into(),
             event_ts_ms: recv_ts_ms,
             recv_ts_ms,
             source_seq: 0,

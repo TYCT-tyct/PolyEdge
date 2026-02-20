@@ -15,7 +15,7 @@ import math
 import os
 import threading
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from fastapi import Body, FastAPI
 from fastapi.responses import JSONResponse
@@ -148,7 +148,7 @@ def _startup() -> None:
             try:
                 derived = client.derive_api_key()
             except Exception:
-                derived = None
+                raise  # Linus: Fail loudly and explicitly
             if derived is None:
                 derived = client.create_api_key()
             if derived is None:
@@ -158,23 +158,17 @@ def _startup() -> None:
         STATE.client = client
         STATE.ready = True
         STATE.ready_error = ""
-    except Exception as exc:  # noqa: BLE001
-        # Keep the process up so /health is useful, but mark as not-ready.
-        # (systemd can still restart-loop if you prefer; set Restart=always)
-        STATE.client = None
-        STATE.ready = False
-        STATE.ready_error = _safe_reject_code(exc)
-
-
+    except Exception:
+        raise  # Linus: Fail loudly and explicitly
 @app.get("/health")
-def health() -> Dict[str, Any]:
+def health() -> dict:
     client = STATE.client
     addr = None
     if client is not None:
         try:
             addr = client.get_address()
         except Exception:
-            addr = None
+            raise  # Linus: Fail loudly and explicitly
     return {
         "status": "ok",
         "ready": bool(STATE.ready and client is not None),
@@ -185,7 +179,7 @@ def health() -> Dict[str, Any]:
 
 
 @app.post("/orders")
-def post_order(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
+def post_order(payload: dict = Body(...)) -> JSONResponse:
     started = time.perf_counter()
 
     def respond(
@@ -193,10 +187,10 @@ def post_order(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
         order_id: str = "",
         accepted_size: float = 0.0,
         reject_code: Optional[str] = None,
-        extra: Optional[Dict[str, Any]] = None,
+        extra: Optional[dict] = None,
     ) -> JSONResponse:
         exchange_latency_ms = (time.perf_counter() - started) * 1000.0
-        body: Dict[str, Any] = {
+        body: dict = {
             "accepted": bool(accepted),
             "order_id": order_id,
             "accepted_size": float(accepted_size),
@@ -225,8 +219,7 @@ def post_order(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
         price = float(payload.get("price"))
         size = float(payload.get("size"))
     except Exception:
-        return respond(False, reject_code="invalid_price_or_size")
-
+        raise  # Linus: Fail loudly and explicitly
     if not (MIN_PRICE <= price <= MAX_PRICE):
         return respond(False, reject_code="price_out_of_range")
     if not (size > 0.0):
@@ -242,7 +235,7 @@ def post_order(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
     try:
         max_slippage_bps = float(payload.get("max_slippage_bps") or 0.0)
     except Exception:
-        max_slippage_bps = 0.0
+        raise  # Linus: Fail loudly and explicitly
     max_slippage_bps = max(0.0, max_slippage_bps)
     if max_slippage_bps > 0:
         slip = max_slippage_bps / 10_000.0
@@ -254,7 +247,7 @@ def post_order(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
     try:
         fee_rate_bps = float(payload.get("fee_rate_bps") or 0.0)
     except Exception:
-        fee_rate_bps = 0.0
+        raise  # Linus: Fail loudly and explicitly
     fee_rate_bps_i = int(round(max(0.0, fee_rate_bps)))
 
     expiration_s = _coarse_expiration_s(ttl_ms)
@@ -277,9 +270,8 @@ def post_order(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
                 )
             )
             res = client.post_order(signed, orderType=order_type)
-    except Exception as exc:  # noqa: BLE001
-        return respond(False, reject_code=_safe_reject_code(exc))
-
+    except Exception:
+        raise  # Linus: Fail loudly and explicitly
     # Best-effort parsing; different gateways/clients sometimes vary the field names.
     order_id = ""
     try:
@@ -288,8 +280,7 @@ def post_order(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
                 (res.get("order_id") or res.get("id") or res.get("orderID") or res.get("orderId") or "")
             )
     except Exception:
-        order_id = ""
-
+        raise  # Linus: Fail loudly and explicitly
     # Some responses include a filled size; if absent assume requested (engine will cap later anyway).
     accepted_size = None
     if isinstance(res, dict):
@@ -300,7 +291,7 @@ def post_order(payload: Dict[str, Any] = Body(...)) -> JSONResponse:
                     accepted_size = float(v)
                     break
             except Exception:
-                continue
+                raise  # Linus: Fail loudly and explicitly
         # Some responses include explicit error/success.
         if res.get("error") or res.get("errors"):
             return respond(False, order_id=order_id or "", accepted_size=0.0, reject_code=str(res.get("error") or "exchange_error")[:160])
@@ -329,10 +320,8 @@ def cancel_order(order_id: str) -> JSONResponse:
         with STATE.tracked_lock:
             STATE.tracked_orders.discard(order_id)
         return JSONResponse(status_code=200, content={"ok": True})
-    except Exception as exc:  # noqa: BLE001
-        return JSONResponse(status_code=500, content={"ok": False, "error": _safe_reject_code(exc)})
-
-
+    except Exception:
+        raise  # Linus: Fail loudly and explicitly
 @app.post("/flatten")
 def flatten() -> JSONResponse:
     client = STATE.client
@@ -345,10 +334,8 @@ def flatten() -> JSONResponse:
         with STATE.tracked_lock:
             STATE.tracked_orders.clear()
         return JSONResponse(status_code=200, content={"ok": True})
-    except Exception as exc:  # noqa: BLE001
-        return JSONResponse(status_code=500, content={"ok": False, "error": _safe_reject_code(exc)})
-
-
+    except Exception:
+        raise  # Linus: Fail loudly and explicitly
 def _main() -> int:
     import argparse
 

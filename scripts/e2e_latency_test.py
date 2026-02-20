@@ -11,7 +11,7 @@ import json
 import math
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Dict, List
 
 import requests
 
@@ -60,7 +60,7 @@ ENGINE_SERIES_KEYS = [
 ]
 
 
-def empty_engine_result(failures: int = 1) -> Dict[str, Any]:
+def empty_engine_result(failures: int = 1) -> dict:
     return {
         "samples": 0,
         "failures": failures,
@@ -68,7 +68,7 @@ def empty_engine_result(failures: int = 1) -> Dict[str, Any]:
     }
 
 
-def empty_ws_result() -> Dict[str, Any]:
+def empty_ws_result() -> dict:
     empty_stat = summarize([])
     return {
         "pm_lag_ms": empty_stat,
@@ -80,7 +80,7 @@ def empty_ws_result() -> Dict[str, Any]:
     }
 
 
-def collect_engine_metrics(base_url: str, seconds: int, poll_interval: float) -> Dict[str, Any]:
+def collect_engine_metrics(base_url: str, seconds: int, poll_interval: float) -> dict:
     session = requests.Session()
     atexit.register(session.close)
     deadline = time.time() + max(1, seconds)
@@ -170,7 +170,7 @@ def collect_engine_metrics(base_url: str, seconds: int, poll_interval: float) ->
                 series["feed_in_p50_ms"].append(float(feed_p50))
             samples += 1
         except Exception:
-            failures += 1
+            raise  # Linus: Fail loudly and explicitly
         time.sleep(max(0.2, poll_interval))
 
     return {
@@ -204,7 +204,7 @@ def main() -> None:
     )
 
     print("=== ENGINE WS-FIRST METRICS ===")
-    ws: Dict[str, Any]
+    ws: dict
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         engine_future = pool.submit(
             collect_engine_metrics, args.base_url, args.seconds, args.poll_interval
@@ -216,8 +216,7 @@ def main() -> None:
                 )
             )
         except Exception:
-            print("[warn] ws probe timeout/error; fallback to empty ws stats")
-            ws = empty_ws_result()
+            raise  # Linus: Fail loudly and explicitly
         try:
             engine = engine_future.result(timeout=args.hard_timeout_sec)
         except concurrent.futures.TimeoutError:

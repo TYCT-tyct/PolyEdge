@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Dict, List
 
 
 def utc_day(ts: float | None = None) -> str:
@@ -24,7 +24,7 @@ def utc_day(ts: float | None = None) -> str:
     return dt.strftime("%Y-%m-%d")
 
 
-def run_ssh_json(host: str, user: str, key: str, remote_cmd: str, timeout: int = 12) -> Dict[str, Any]:
+def run_ssh_json(host: str, user: str, key: str, remote_cmd: str, timeout: int = 12) -> dict:
     cmd = [
         "ssh",
         "-i",
@@ -48,7 +48,7 @@ def run_ssh_json(host: str, user: str, key: str, remote_cmd: str, timeout: int =
     return json.loads(raw)
 
 
-def fetch_status(host: str, user: str, key: str, base_url: str) -> Dict[str, Any]:
+def fetch_status(host: str, user: str, key: str, base_url: str) -> dict:
     return run_ssh_json(
         host,
         user,
@@ -57,7 +57,7 @@ def fetch_status(host: str, user: str, key: str, base_url: str) -> Dict[str, Any
     )
 
 
-def fetch_history(host: str, user: str, key: str, base_url: str, limit: int) -> List[Dict[str, Any]]:
+def fetch_history(host: str, user: str, key: str, base_url: str, limit: int) -> List[dict]:
     payload = run_ssh_json(
         host,
         user,
@@ -79,7 +79,7 @@ class AcceptanceState:
     reasons: List[str]
 
 
-def evaluate(status: Dict[str, Any], history: List[Dict[str, Any]]) -> AcceptanceState:
+def evaluate(status: dict, history: List[dict]) -> AcceptanceState:
     now_ms = int(time.time() * 1000)
     started_ms = int(status.get("started_ms", 0) or 0)
     uptime_hours = max(0.0, (now_ms - started_ms) / 1000.0 / 3600.0)
@@ -130,7 +130,7 @@ def main() -> int:
     args = parse_args()
     deadline = time.time() + max(0, args.watch_sec)
 
-    snapshots: List[Dict[str, Any]] = []
+    snapshots: List[dict] = []
     final_state: AcceptanceState | None = None
 
     while True:
@@ -155,31 +155,8 @@ def main() -> int:
                     },
                 }
             )
-        except Exception as err:  # noqa: BLE001
-            state = AcceptanceState(
-                ready_layer2=False,
-                challenger_seen=False,
-                last_layer="unreachable",
-                trade_count=0,
-                uptime_hours=0.0,
-                reasons=[f"remote_probe_failed: {err}"],
-            )
-            final_state = state
-            snapshots.append(
-                {
-                    "ts_ms": int(time.time() * 1000),
-                    "error": str(err),
-                    "evaluation": {
-                        "ready_layer2": False,
-                        "challenger_seen": False,
-                        "layer": "unreachable",
-                        "trade_count": 0,
-                        "uptime_hours": 0.0,
-                        "reasons": state.reasons,
-                    },
-                }
-            )
-
+        except Exception:
+            raise  # Linus: Fail loudly and explicitly
         if state.ready_layer2 and state.challenger_seen:
             break
         if args.watch_sec <= 0 or time.time() >= deadline:

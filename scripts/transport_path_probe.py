@@ -39,7 +39,7 @@ def probe_url(url: str, samples: int, timeout_sec: float, interval_ms: int) -> D
             r.raise_for_status()
             latencies.append((time.perf_counter() - t0) * 1000.0)
         except Exception:
-            errors += 1
+            raise  # Linus: Fail loudly and explicitly
         if interval_ms > 0:
             time.sleep(interval_ms / 1000.0)
     return {

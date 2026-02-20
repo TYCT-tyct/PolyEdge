@@ -11,7 +11,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Dict, List
 
 import requests
 
@@ -48,13 +48,13 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def post_json(session: requests.Session, base_url: str, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def post_json(session: requests.Session, base_url: str, path: str, payload: dict) -> dict:
     resp = session.post(f"{base_url.rstrip('/')}{path}", json=payload, timeout=8)
     resp.raise_for_status()
     return resp.json()
 
 
-def get_json(session: requests.Session, base_url: str, path: str) -> Dict[str, Any]:
+def get_json(session: requests.Session, base_url: str, path: str) -> dict:
     resp = session.get(f"{base_url.rstrip('/')}{path}", timeout=8)
     resp.raise_for_status()
     return resp.json()
@@ -64,11 +64,11 @@ def run_cmd(cmd: List[str]) -> None:
     subprocess.run(cmd, check=True)
 
 
-def read_json(path: Path) -> Dict[str, Any]:
+def read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def e2e_summary(e2e_payload: Dict[str, Any]) -> Dict[str, Any]:
+def e2e_summary(e2e_payload: dict) -> dict:
     stats = (e2e_payload.get("engine") or {}).get("stats") or {}
 
     def pick(name: str) -> Dict[str, float]:
@@ -97,8 +97,8 @@ def collect_live_samples(
     base_url: str,
     seconds: int,
     poll_interval: float,
-) -> List[Dict[str, Any]]:
-    samples: List[Dict[str, Any]] = []
+) -> List[dict]:
+    samples: List[dict] = []
     deadline = time.time() + max(1, seconds)
     while time.time() < deadline:
         try:
@@ -111,7 +111,7 @@ def collect_live_samples(
     return samples
 
 
-def summary_from_samples(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
+def summary_from_samples(samples: List[dict]) -> dict:
     def col(name: str) -> List[float]:
         out: List[float] = []
         for row in samples:
@@ -119,7 +119,7 @@ def summary_from_samples(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
                 try:
                     out.append(float(row[name]))
                 except Exception:
-                    continue
+                    raise  # Linus: Fail loudly and explicitly
         return out
 
     def col_lat(name: str) -> List[float]:
@@ -130,7 +130,7 @@ def summary_from_samples(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
                 try:
                     out.append(float(lat[name]))
                 except Exception:
-                    continue
+                    raise  # Linus: Fail loudly and explicitly
         return out
 
     def p(vals: List[float], q: float) -> float:
@@ -183,7 +183,7 @@ def summary_from_samples(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
                 try:
                     exit_reason_top[str(k)] = int(v)
                 except Exception:
-                    continue
+                    raise  # Linus: Fail loudly and explicitly
         elif isinstance(exit_reason_row, list):
             for item in exit_reason_row:
                 if isinstance(item, list) and len(item) == 2:
@@ -221,7 +221,7 @@ def summary_from_samples(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def mode_payload(mode: str) -> Dict[str, Any]:
+def mode_payload(mode: str) -> dict:
     if mode == "direct_only":
         return {"enable_udp": False, "mode": "direct_only", "dedupe_window_ms": 30}
     if mode == "udp_only":
@@ -237,7 +237,7 @@ def mode_payload(mode: str) -> Dict[str, Any]:
     raise ValueError(f"unsupported mode: {mode}")
 
 
-def write_markdown(out_md: Path, payload: Dict[str, Any]) -> None:
+def write_markdown(out_md: Path, payload: dict) -> None:
     lines: List[str] = []
     lines.append("# Full Pipeline Latency Audit")
     lines.append("")
@@ -322,7 +322,7 @@ def main() -> int:
 
     session = requests.Session()
     atexit.register(session.close)
-    payload: Dict[str, Any] = {
+    payload: dict = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "run_id": args.run_id,
         "base_url": args.base_url,
@@ -340,7 +340,7 @@ def main() -> int:
         post_json(session, args.base_url, "/control/resume", {})
         time.sleep(max(1, args.warmup_sec))
 
-        mode_result: Dict[str, Any] = {
+        mode_result: dict = {
             "fusion_applied": fusion_resp,
             "live_samples_file": str(mode_dir / "live_samples.json"),
         }

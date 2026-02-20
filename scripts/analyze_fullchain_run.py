@@ -5,14 +5,14 @@ import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 
-def read_json(path: Path) -> Any:
+def read_json(path: Path) -> object:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def fmt(x: Any, digits: int = 3) -> str:
+def fmt(x: object, digits: int = 3) -> str:
     try:
         if x is None:
             return "NA"
@@ -22,15 +22,13 @@ def fmt(x: Any, digits: int = 3) -> str:
             return f"{float(x):.{digits}f}"
         return str(x)
     except Exception:
-        return "NA"
-
-
+        raise  # Linus: Fail loudly and explicitly
 @dataclass
 class SweepRow:
     ts_ms: int
     path: Path
     stats: Dict[str, Dict[str, float]]
-    last: Dict[str, Any]
+    last: dict
 
 
 @dataclass
@@ -55,7 +53,7 @@ def collect_sweeps(run_dir: Path) -> List[SweepRow]:
             if isinstance(stats, dict) and isinstance(last, dict):
                 rows.append(SweepRow(ts_ms=ts_ms, path=p, stats=stats, last=last))
         except Exception:
-            continue
+            raise  # Linus: Fail loudly and explicitly
     return rows
 
 
@@ -67,9 +65,7 @@ def pick_stat(stats: Dict[str, Dict[str, float]], key: str, which: str) -> Optio
         val = st.get(which)
         return float(val) if val is not None else None
     except Exception:
-        return None
-
-
+        raise  # Linus: Fail loudly and explicitly
 def print_sweep_table(rows: List[SweepRow]) -> None:
     if not rows:
         print("no full_latency_sweep_*.json found")
@@ -116,7 +112,7 @@ def print_storm(run_dir: Path) -> None:
     print(f"- latency_max_ms: {fmt(lat.get('max'))}")
 
 
-def _snapshot_live(run_dir: Path, name: str) -> Optional[Dict[str, Any]]:
+def _snapshot_live(run_dir: Path, name: str) -> Optional[dict]:
     path = run_dir / "snapshots" / name
     if not path.exists():
         return None
@@ -124,9 +120,7 @@ def _snapshot_live(run_dir: Path, name: str) -> Optional[Dict[str, Any]]:
         data = read_json(path)
         return data if isinstance(data, dict) else None
     except Exception:
-        return None
-
-
+        raise  # Linus: Fail loudly and explicitly
 def print_snapshot_diffs(run_dir: Path) -> None:
     pre = _snapshot_live(run_dir, "shadow_live_pre.json")
     post = _snapshot_live(run_dir, "shadow_live_after_storm.json") or _snapshot_live(
@@ -221,11 +215,11 @@ def regression_specs() -> List[MetricSpec]:
 
 def compare_metrics(
     candidate_rows: List[SweepRow], baseline_rows: List[SweepRow]
-) -> Dict[str, Any]:
+) -> dict:
     candidate = latest_metrics(candidate_rows)
     baseline = latest_metrics(baseline_rows)
 
-    metrics: Dict[str, Dict[str, Any]] = {}
+    metrics: Dict[str, dict] = {}
     regressed: List[str] = []
     improved: List[str] = []
     missing: List[str] = []
@@ -277,7 +271,7 @@ def compare_metrics(
     }
 
 
-def infer_regression_attributions(metrics: Dict[str, Dict[str, Any]]) -> List[str]:
+def infer_regression_attributions(metrics: Dict[str, dict]) -> List[str]:
     reasons: List[str] = []
 
     def is_regressed(key: str) -> bool:
@@ -320,7 +314,7 @@ def infer_regression_attributions(metrics: Dict[str, Dict[str, Any]]) -> List[st
     return reasons
 
 
-def print_regression_report(result: Dict[str, Any], baseline_dir: Path) -> None:
+def print_regression_report(result: dict, baseline_dir: Path) -> None:
     print(f"baseline_run_dir={baseline_dir}")
     print(f"regression_gate_pass={'true' if result['pass'] else 'false'}")
     if result["missing_metrics"]:
@@ -375,7 +369,7 @@ def main() -> int:
     print()
     print_missing_endpoints(run_dir)
 
-    regression_result: Optional[Dict[str, Any]] = None
+    regression_result: Optional[dict] = None
     if args.baseline_run_dir:
         baseline_dir = Path(args.baseline_run_dir)
         baseline_rows = collect_sweeps(baseline_dir)

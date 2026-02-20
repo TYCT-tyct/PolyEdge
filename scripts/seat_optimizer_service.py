@@ -9,7 +9,7 @@ import statistics
 import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 L1_FIELDS: Tuple[str, ...] = (
@@ -51,7 +51,7 @@ FIELD_BOUNDS: Dict[str, Tuple[float, float]] = {
     "basis_z_cap": (0.5, 8.0),
 }
 
-STYLE_STORE: Dict[str, Dict[str, Any]] = {}
+STYLE_STORE: Dict[str, dict] = {}
 RL_TABLE: Dict[str, Dict[str, float]] = {}
 
 
@@ -80,18 +80,18 @@ def percentile(values: Sequence[float], p: float) -> float:
     return float(data[idx])
 
 
-def get_float(data: Dict[str, Any], key: str, default: float) -> float:
+def get_float(data: dict, key: str, default: float) -> float:
     value = data.get(key, default)
     try:
         out = float(value)
         if math.isfinite(out):
             return out
     except Exception:
-        pass
+        raise  # Linus: Fail loudly and explicitly
     return float(default)
 
 
-def parse_param_set(raw: Dict[str, Any]) -> Dict[str, float]:
+def parse_param_set(raw: dict) -> Dict[str, float]:
     out: Dict[str, float] = {}
     for k, v in raw.items():
         if v is None:
@@ -101,7 +101,7 @@ def parse_param_set(raw: Dict[str, Any]) -> Dict[str, float]:
             if math.isfinite(fv):
                 out[k] = fv
         except Exception:
-            continue
+            raise  # Linus: Fail loudly and explicitly
     return out
 
 
@@ -165,13 +165,13 @@ def weighted_median(values: List[Tuple[float, float]]) -> float:
 def knn_warm_start(
     current: Dict[str, float],
     current_style: Dict[str, float],
-    style_memory: List[Dict[str, Any]],
+    style_memory: List[dict],
     fields: Tuple[str, ...],
 ) -> Tuple[Dict[str, float], float, int, str]:
     if len(style_memory) < 8:
         return dict(current), 0.0, 0, "fallback_layer2_bo"
 
-    scored: List[Tuple[float, Dict[str, Any]]] = []
+    scored: List[Tuple[float, dict]] = []
     for entry in style_memory:
         vector = entry.get("vector") or {}
         params = entry.get("params") or {}
@@ -373,7 +373,7 @@ def compute_walk_forward(
     layer: str,
     baseline: Dict[str, float],
     candidate_eval: CandidateEval,
-    objective_history: List[Dict[str, Any]],
+    objective_history: List[dict],
 ) -> Tuple[bool, int, float]:
     required = 6 if layer == "layer1" else 12 if layer == "layer2" else 20
     values = [
@@ -463,7 +463,7 @@ def run_monte_carlo(
     return passed, ev_delta_p50, dd_p95
 
 
-def optimize_payload(layer: str, data: Dict[str, Any]) -> Dict[str, Any]:
+def optimize_payload(layer: str, data: dict) -> dict:
     baseline = data.get("baseline") or {}
     current = parse_param_set(data.get("current_params") or {})
     if not current:
@@ -589,7 +589,7 @@ def optimize_payload(layer: str, data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def run_shadow_compare(data: Dict[str, Any]) -> Dict[str, Any]:
+def run_shadow_compare(data: dict) -> dict:
     ev_new = get_float(data, "ev_new", 0.0)
     ev_old = get_float(data, "ev_old", 0.0)
     dd_new = max(0.0, get_float(data, "dd_new", 0.0))
@@ -612,7 +612,7 @@ def run_shadow_compare(data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def run_monitor_60m(data: Dict[str, Any]) -> Dict[str, Any]:
+def run_monitor_60m(data: dict) -> dict:
     ev_new = get_float(data, "ev_new", 0.0)
     ev_old = get_float(data, "ev_old", 0.0)
     dd_new = max(0.0, get_float(data, "dd_new", 0.0))
@@ -622,7 +622,7 @@ def run_monitor_60m(data: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": True, "rollback": rollback}
 
 
-def update_style_memory(data: Dict[str, Any]) -> Dict[str, Any]:
+def update_style_memory(data: dict) -> dict:
     entry = data.get("entry") or {}
     style_id = str(entry.get("style_id") or infer_style_id(parse_param_set(entry.get("vector") or {})))
     reward = get_float(data, "reward", get_float(data, "objective", 0.0))
@@ -650,7 +650,7 @@ def update_style_memory(data: Dict[str, Any]) -> Dict[str, Any]:
 class Handler(BaseHTTPRequestHandler):
     server_version = "seat-opt/2.3"
 
-    def _send(self, code: int, payload: Dict[str, Any]) -> None:
+    def _send(self, code: int, payload: dict) -> None:
         body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
         self.send_response(code)
         self.send_header("content-type", "application/json")
@@ -658,11 +658,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _read_json(self) -> Dict[str, Any]:
+    def _read_json(self) -> dict:
         try:
             size = int(self.headers.get("content-length", "0"))
         except Exception:
-            size = 0
+            raise  # Linus: Fail loudly and explicitly
         if size <= 0:
             return {}
         raw = self.rfile.read(size)
@@ -670,8 +670,7 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(raw.decode("utf-8"))
             return data if isinstance(data, dict) else {}
         except Exception:
-            return {}
-
+            raise  # Linus: Fail loudly and explicitly
     def do_GET(self) -> None:
         if self.path == "/health":
             self._send(200, {"ok": True, "ts_ms": now_ms(), "style_memory_size": len(STYLE_STORE)})
@@ -703,7 +702,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send(404, {"ok": False, "error": "not_found"})
 
-    def log_message(self, fmt: str, *args: Any) -> None:
+    def log_message(self, fmt: str, *args: object) -> None:
         return
 
 

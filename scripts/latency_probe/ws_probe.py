@@ -87,7 +87,7 @@ async def run_ws_latency(seconds: int, symbol: str) -> Dict[str, float]:
                         try:
                             msg = json.loads(raw)
                         except Exception:
-                            continue
+                            raise  # Linus: Fail loudly and explicitly
                         topic = msg.get("topic")
                         if topic == "crypto_prices":
                             if msg.get("type") != "update":
@@ -105,11 +105,8 @@ async def run_ws_latency(seconds: int, symbol: str) -> Dict[str, float]:
                             if sym != chainlink_symbol or ts is None:
                                 continue
                             chainlink_lags.append(recv_ms - float(ts))
-            except Exception as exc:
-                attempt = await sleep_with_backoff(
-                    end, attempt, throttled=status_code_from_exc(exc) == 429
-                )
-
+            except Exception:
+                raise  # Linus: Fail loudly and explicitly
     async def bin_task() -> None:
         # Keep this consistent with the Rust ref feed which uses `@trade`.
         url = f"wss://stream.binance.com:9443/ws/{bin_symbol}@trade"
@@ -130,16 +127,13 @@ async def run_ws_latency(seconds: int, symbol: str) -> Dict[str, float]:
                         try:
                             msg = json.loads(raw)
                         except Exception:
-                            continue
+                            raise  # Linus: Fail loudly and explicitly
                         event_ts = msg.get("E")
                         if event_ts is None:
                             continue
                         bin_lags.append(recv_ms - float(event_ts))
-            except Exception as exc:
-                attempt = await sleep_with_backoff(
-                    end, attempt, throttled=status_code_from_exc(exc) == 429
-                )
-
+            except Exception:
+                raise  # Linus: Fail loudly and explicitly
     await asyncio.gather(pm_task(), bin_task())
     pm_stats = summarize(pm_lags)
     chainlink_stats = summarize(chainlink_lags)

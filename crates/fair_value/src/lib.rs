@@ -76,10 +76,11 @@ impl FairValueModel for BasisMrFairValue {
         let spread = (book.ask_yes - book.bid_yes).max(0.0001);
         // Fix DESIGN-2: Key by symbol only (e.g. "BTCUSDT") to share specific fair value state
         // across all markets (e.g. daily, 15m) for that asset. This prevents warmup reset on rollover.
-        let key = tick.symbol.clone();
-
         let mut map = self.state.lock();
-        let st = map.entry(key).or_default();
+        if !map.contains_key(&tick.symbol) {
+            map.insert(tick.symbol.clone(), Default::default());
+        }
+        let st = map.get_mut(&tick.symbol).unwrap();
 
         let ret = if st.last_ref_px > 0.0 {
             (tick.price / st.last_ref_px).ln()
@@ -133,8 +134,8 @@ mod tests {
 
     fn tick(px: f64, ts: i64) -> RefTick {
         RefTick {
-            source: "binance".to_string(),
-            symbol: "BTCUSDT".to_string(),
+            source: "binance".into(),
+            symbol: "BTCUSDT".into(),
             event_ts_ms: ts,
             recv_ts_ms: ts,
             source_seq: ts.max(0) as u64,

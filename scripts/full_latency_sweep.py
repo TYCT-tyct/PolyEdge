@@ -14,7 +14,7 @@ import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Dict, List
 
 import requests
 
@@ -30,13 +30,13 @@ PROFILE_DEFAULTS: Dict[str, Dict[str, float]] = {
 }
 
 
-def post_json(base_url: str, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def post_json(base_url: str, path: str, payload: dict) -> dict:
     resp = requests.post(f"{base_url.rstrip('/')}{path}", json=payload, timeout=8)
     resp.raise_for_status()
     return resp.json()
 
 
-def get_json(base_url: str, path: str) -> Dict[str, Any]:
+def get_json(base_url: str, path: str) -> dict:
     resp = requests.get(f"{base_url.rstrip('/')}{path}", timeout=8)
     resp.raise_for_status()
     return resp.json()
@@ -50,7 +50,7 @@ def fusion_payload(
     fallback_arm_duration_ms: int | None = None,
     fallback_cooldown_sec: int | None = None,
     udp_local_only: bool | None = None,
-) -> Dict[str, Any]:
+) -> dict:
     if mode == "direct_only":
         payload = {
             "enable_udp": False,
@@ -101,7 +101,7 @@ def collect_engine_series(
     seconds: int,
     poll_interval: float,
     progress_sec: int,
-) -> Dict[str, Any]:
+) -> dict:
     session = requests.Session()
     atexit.register(session.close)
     started = time.time()
@@ -109,7 +109,7 @@ def collect_engine_series(
     next_progress = started + max(1, progress_sec)
     samples = 0
     failures = 0
-    last_live: Dict[str, Any] | None = None
+    last_live: dict | None = None
 
     series: Dict[str, List[float]] = {
         "tick_to_ack_p99_ms": [],
@@ -153,7 +153,7 @@ def collect_engine_series(
             last_live = live
             latency = live.get("latency") or {}
 
-            def push(key: str, value: Any) -> None:
+            def push(key: str, value: object) -> None:
                 if isinstance(value, (int, float)):
                     series[key].append(float(value))
 
@@ -192,7 +192,7 @@ def collect_engine_series(
 
             samples += 1
         except Exception:
-            failures += 1
+            raise  # Linus: Fail loudly and explicitly
         now = time.time()
         if progress_sec > 0 and now >= next_progress:
             elapsed = int(now - started)
@@ -231,7 +231,7 @@ def collect_engine_series(
     }
 
 
-async def collect_ws_all(seconds: int, symbols: List[str]) -> Dict[str, Any]:
+async def collect_ws_all(seconds: int, symbols: List[str]) -> dict:
     results = await asyncio.gather(*(run_ws_latency(seconds, s) for s in symbols))
     return {sym: res for sym, res in zip(symbols, results)}
 
@@ -327,7 +327,7 @@ def main() -> int:
     symbols = [s.strip().upper() for s in str(args.symbols).split(",") if s.strip()]
 
     started_ms = int(time.time() * 1000)
-    control: Dict[str, Any] = {}
+    control: dict = {}
     if args.fusion_mode:
         control["fusion_applied"] = post_json(
             args.base_url,
@@ -354,7 +354,7 @@ def main() -> int:
     try:
         control["pre_live"] = get_json(args.base_url, "/report/shadow/live")
     except Exception:
-        control["pre_live"] = None
+        raise  # Linus: Fail loudly and explicitly
     pre_live = control.get("pre_live") or {}
     pre_live_paused = bool(pre_live.get("paused", False))
     pre_live_observe_only = bool(pre_live.get("observe_only", False))
@@ -375,7 +375,7 @@ def main() -> int:
         flush=True,
     )
 
-    async def run_all() -> tuple[Dict[str, Any], Dict[str, Any]]:
+    async def run_all() -> tuple[dict, dict]:
         engine_task = asyncio.to_thread(
             collect_engine_series,
             args.base_url,
@@ -392,7 +392,7 @@ def main() -> int:
 
     engine, ws = asyncio.run(run_all())
 
-    payload: Dict[str, Any] = {
+    payload: dict = {
         "meta": {
             "profile": args.profile,
             "base_url": args.base_url,

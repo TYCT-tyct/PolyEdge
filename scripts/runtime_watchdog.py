@@ -9,7 +9,7 @@ import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Dict, List
 
 import requests
 
@@ -23,22 +23,22 @@ def utc_day(ts_ms: int | None = None) -> str:
     return dt.strftime("%Y-%m-%d")
 
 
-def write_jsonl(path: Path, payload: Dict[str, Any]) -> None:
+def write_jsonl(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n")
 
 
-def fetch_json(session: requests.Session, url: str, timeout_sec: float) -> Dict[str, Any]:
+def fetch_json(session: requests.Session, url: str, timeout_sec: float) -> dict:
     resp = session.get(url, timeout=timeout_sec)
     resp.raise_for_status()
     return resp.json()
 
 
 def evaluate_alerts(
-    health: Dict[str, Any],
-    live: Dict[str, Any],
-    toxicity: Dict[str, Any],
+    health: dict,
+    live: dict,
+    toxicity: dict,
     max_ref_freshness_ms: int,
     max_book_freshness_ms: int,
     max_tick_to_ack_p99_ms: float,
@@ -48,8 +48,8 @@ def evaluate_alerts(
     max_block_ratio: float,
     min_attempt_for_block_ratio: int,
     min_executed_over_eligible: float,
-) -> List[Dict[str, Any]]:
-    alerts: List[Dict[str, Any]] = []
+) -> List[dict]:
+    alerts: List[dict] = []
 
     if health.get("status") != "ok":
         alerts.append({"type": "service_unhealthy", "detail": f"health={health}"})
@@ -252,7 +252,7 @@ def run_once(session: requests.Session, args: argparse.Namespace) -> int:
     monitor_file = out_dir / "monitor_live.jsonl"
     alert_file = out_dir / "monitor_alerts.jsonl"
 
-    record: Dict[str, Any] = {"ts_ms": ts}
+    record: dict = {"ts_ms": ts}
     status_code = 0
     try:
         health = fetch_json(session, f"{args.base_url}/health", args.timeout_sec)
@@ -280,15 +280,8 @@ def run_once(session: requests.Session, args: argparse.Namespace) -> int:
             alert_payload = {"ts_ms": ts, **a}
             write_jsonl(alert_file, alert_payload)
             print(f"[ALERT] {a['type']}: {a['detail']}")
-    except Exception as exc:
-        status_code = 1
-        record["error"] = str(exc)
-        write_jsonl(monitor_file, record)
-        write_jsonl(
-            alert_file,
-            {"ts_ms": ts, "type": "watchdog_exception", "detail": str(exc)},
-        )
-        print(f"[ALERT] watchdog_exception: {exc}")
+    except Exception:
+        raise  # Linus: Fail loudly and explicitly
     return status_code
 
 

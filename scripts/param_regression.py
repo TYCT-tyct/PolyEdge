@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Dict, Iterable, List
 
 import requests
 
@@ -43,7 +43,7 @@ def parse_int_grid(raw: str) -> List[int]:
         out.append(int(token))
     return out
 
-PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
+PROFILE_DEFAULTS: Dict[str, dict] = {
     "quick": {
         # 5-hour sprint default: fewer trials, longer per-trial window, bounded runtime.
         "window_sec": 300,
@@ -383,7 +383,7 @@ def aggregate_walkforward_results(
     )
 
 
-def build_consensus_params(rows: List[TrialResult], top_k: int) -> Dict[str, Any]:
+def build_consensus_params(rows: List[TrialResult], top_k: int) -> dict:
     if not rows:
         return {}
 
@@ -442,7 +442,7 @@ def write_auto_tuned_thresholds(
     path: Path,
     rows: List[TrialResult],
     top_k: int,
-) -> Dict[str, Any]:
+) -> dict:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -460,7 +460,7 @@ def fetch_json(
     timeout: float = 15.0,
     retries: int = 3,
     backoff_sec: float = 0.5,
-) -> Dict[str, Any]:
+) -> dict:
     last_exc: Exception | None = None
     for attempt in range(max(1, retries)):
         try:
@@ -477,11 +477,11 @@ def fetch_json(
 def post_json(
     session: requests.Session,
     url: str,
-    payload: Dict[str, Any],
+    payload: dict,
     timeout: float = 10.0,
     retries: int = 3,
     backoff_sec: float = 0.5,
-) -> Dict[str, Any]:
+) -> dict:
     last_exc: Exception | None = None
     for attempt in range(max(1, retries)):
         try:
@@ -496,8 +496,8 @@ def post_json(
 
 
 def post_json_optional(
-    session: requests.Session, url: str, payload: Dict[str, Any], timeout: float = 5.0
-) -> Dict[str, Any]:
+    session: requests.Session, url: str, payload: dict, timeout: float = 5.0
+) -> dict:
     try:
         return post_json(session, url, payload, timeout=timeout)
     except requests.HTTPError as exc:
@@ -608,7 +608,7 @@ def run_trial(
     gate_fail_reasons: List[str] = []
     observed_window_id = reset_window_id
     next_heartbeat = time.time() + max(1.0, heartbeat_sec)
-    last_live: Dict[str, Any] | None = None
+    last_live: dict | None = None
 
     deadline = time.time() + min(window_sec, eval_window_sec)
     while time.time() < deadline:
@@ -987,7 +987,7 @@ def main() -> int:
     caution_grid = parse_float_grid(args.caution_threshold_grid)
 
     # For small max_trials, prefer a deterministic OFAT-style set instead of a huge cartesian product.
-    def pick_default(seq: List[Any], prefer_last: bool = False) -> Any:
+    def pick_default(seq: List[object], prefer_last: bool = False) -> object:
         if not seq:
             raise ValueError("empty grid")
         return seq[-1] if prefer_last else seq[0]
@@ -1009,7 +1009,7 @@ def main() -> int:
         "caution": pick_default(caution_grid, prefer_last=False),
     }
 
-    combos: List[tuple[Any, ...]] = []
+    combos: List[tuple[object, ...]] = []
     combos.append(
         (
             base["edge"],
@@ -1027,7 +1027,7 @@ def main() -> int:
         )
     )
 
-    def add_variants(key: str, grid: List[Any]) -> None:
+    def add_variants(key: str, grid: List[object]) -> None:
         for v in grid:
             if len(combos) >= max(1, args.max_trials):
                 return

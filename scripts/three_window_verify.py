@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
@@ -30,7 +30,7 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def write_json(path: Path, payload: Any) -> None:
+def write_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
 
@@ -40,7 +40,7 @@ def write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def top_items(d: Any, n: int = 5) -> List[Tuple[str, int]]:
+def top_items(d: object, n: int = 5) -> List[Tuple[str, int]]:
     if not isinstance(d, dict):
         return []
     items: List[Tuple[str, int]] = []
@@ -48,7 +48,7 @@ def top_items(d: Any, n: int = 5) -> List[Tuple[str, int]]:
         try:
             items.append((str(k), int(v)))
         except Exception:
-            continue
+            raise  # Linus: Fail loudly and explicitly
     items.sort(key=lambda kv: kv[1], reverse=True)
     return items[:n]
 
@@ -58,8 +58,8 @@ def request_json(
     method: str,
     url: str,
     timeout_sec: float,
-    payload: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    payload: Optional[dict] = None,
+) -> dict:
     if method.upper() == "GET":
         resp = session.get(url, timeout=timeout_sec)
     else:
@@ -77,8 +77,8 @@ def set_predator_mode(
     timeout_sec: float,
     enabled: bool,
     priority: str,
-) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {"enabled": enabled}
+) -> dict:
+    payload: dict = {"enabled": enabled}
     if enabled:
         payload["priority"] = priority
     return request_json(session, "POST", f"{base_url.rstrip('/')}/control/reload_predator_c", timeout_sec, payload)
@@ -90,9 +90,7 @@ def resume_and_reset(session: requests.Session, base_url: str, timeout_sec: floa
     try:
         return int(res.get("window_id") or 0)
     except Exception:
-        return 0
-
-
+        raise  # Linus: Fail loudly and explicitly
 def poll_until_outcomes(
     session: requests.Session,
     base_url: str,
@@ -100,9 +98,9 @@ def poll_until_outcomes(
     min_outcomes: int,
     window_timeout_sec: int,
     poll_interval: float,
-) -> Dict[str, Any]:
+) -> dict:
     deadline = time.monotonic() + max(1, window_timeout_sec)
-    last: Dict[str, Any] = {}
+    last: dict = {}
     while time.monotonic() < deadline:
         try:
             last = request_json(
@@ -115,13 +113,12 @@ def poll_until_outcomes(
             if outcomes >= min_outcomes:
                 return last
         except Exception:
-            # keep polling; the runtime might be restarting
-            pass
+            raise  # Linus: Fail loudly and explicitly
         time.sleep(max(0.2, poll_interval))
     return last
 
 
-def compute_fixlist(live: Dict[str, Any]) -> List[str]:
+def compute_fixlist(live: dict) -> List[str]:
     reasons = live.get("blocked_reason_counts") or {}
     top = [k for k, _ in top_items(reasons, n=10)]
     out: List[str] = []
@@ -153,12 +150,12 @@ def compute_fixlist(live: Dict[str, Any]) -> List[str]:
 class WindowResult:
     idx: int
     window_id: int
-    live: Dict[str, Any]
-    pnl_by_engine: Dict[str, Any]
+    live: dict
+    pnl_by_engine: dict
 
 
-def summarize_windows(results: List[WindowResult], min_outcomes: int) -> Dict[str, Any]:
-    rows: List[Dict[str, Any]] = []
+def summarize_windows(results: List[WindowResult], min_outcomes: int) -> dict:
+    rows: List[dict] = []
     for r in results:
         live = r.live
         rows.append(
@@ -220,7 +217,7 @@ def summarize_windows(results: List[WindowResult], min_outcomes: int) -> Dict[st
     }
 
 
-def render_md(mode_name: str, summary: Dict[str, Any]) -> str:
+def render_md(mode_name: str, summary: dict) -> str:
     avg = summary.get("avg") or {}
     lines: List[str] = []
     lines.append(f"# Three-Window Summary ({mode_name})")
@@ -247,7 +244,7 @@ def render_md(mode_name: str, summary: Dict[str, Any]) -> str:
         try:
             v = float(avg.get(k) or 0.0)
         except Exception:
-            v = 0.0
+            raise  # Linus: Fail loudly and explicitly
         lines.append(f"| `{k}` | `{v:.6g}` |")
 
     lines.append("")
@@ -293,7 +290,7 @@ def run_one_mode(
     poll_interval: float,
     out_dir: Path,
     continue_on_timeout: bool,
-) -> Dict[str, Any]:
+) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     _ = set_predator_mode(session, base_url, timeout_sec, predator_enabled, predator_priority)
@@ -318,7 +315,7 @@ def run_one_mode(
                     session, "GET", f"{base_url.rstrip('/')}/report/pnl/by_engine", timeout_sec
                 )
             except Exception:
-                pnl_by_engine = {}
+                raise  # Linus: Fail loudly and explicitly
             write_json(out_dir / f"window{i:02d}_shadow_live.json", live)
             write_json(out_dir / f"window{i:02d}_pnl_by_engine.json", pnl_by_engine)
 
@@ -348,7 +345,7 @@ def run_one_mode(
     return summary
 
 
-def render_compare_md(base: Dict[str, Any], pred: Dict[str, Any]) -> str:
+def render_compare_md(base: dict, pred: dict) -> str:
     lines: List[str] = []
     lines.append("# Three-Window A/B Compare")
     lines.append("")
@@ -473,12 +470,7 @@ def main() -> int:
         write_text(root / "three_window_compare.md", compare_md)
         print(f"wrote_dir={root}")
         return 0
-    except Exception as exc:  # noqa: BLE001
-        # Fail-fast: persist a short error marker and exit non-zero.
-        write_text(root / "FAILED.txt", f"{exc}\n")
-        print(f"failed: {exc}")
-        return 2
-
-
+    except Exception:
+        raise  # Linus: Fail loudly and explicitly
 if __name__ == "__main__":
     raise SystemExit(main())

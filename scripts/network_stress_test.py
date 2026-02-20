@@ -144,9 +144,8 @@ async def test_latency_udp(target: str, port: int, duration_sec: int = 30,
                 except socket.timeout:
                     errors += 1
 
-            except Exception as e:
-                errors += 1
-
+            except Exception:
+                raise  # Linus: Fail loudly and explicitly
             # 速率控制
             elapsed = time.perf_counter() - loop_start
             sleep_time = packet_interval - elapsed
@@ -215,9 +214,8 @@ async def test_throughput_udp(target: str, port: int, duration_sec: int = 10,
                 total_bytes += len(packet)
                 total_msgs += 1
 
-            except Exception as e:
-                pass
-
+            except Exception:
+                raise  # Linus: Fail loudly and explicitly
             # 速率控制
             elapsed = time.perf_counter() - loop_start
             sleep_time = packet_interval - elapsed
@@ -289,9 +287,8 @@ async def test_packet_loss_udp(target: str, port: int, duration_sec: int = 30,
                 except socket.timeout:
                     pass
 
-            except Exception as e:
-                pass
-
+            except Exception:
+                raise  # Linus: Fail loudly and explicitly
             elapsed = time.perf_counter() - loop_start
             sleep_time = packet_interval - elapsed
             if sleep_time > 0:

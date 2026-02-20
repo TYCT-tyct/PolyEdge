@@ -7,7 +7,7 @@ import json
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Dict, List
 
 
 def default_day() -> str:
@@ -15,16 +15,14 @@ def default_day() -> str:
     return dt.strftime("%Y-%m-%d")
 
 
-def read_json_file(path: Path) -> Dict[str, Any]:
+def read_json_file(path: Path) -> dict:
     if not path.exists():
         return {}
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return {}
-
-
-def read_jsonl(path: Path) -> List[Dict[str, Any]]:
+        raise  # Linus: Fail loudly and explicitly
+def read_jsonl(path: Path) -> List[dict]:
     if not path.exists():
         return []
     out = []
@@ -36,7 +34,7 @@ def read_jsonl(path: Path) -> List[Dict[str, Any]]:
             try:
                 out.append(json.loads(line))
             except Exception:
-                continue
+                raise  # Linus: Fail loudly and explicitly
     return out
 
 
@@ -53,21 +51,21 @@ def read_latency_csv(path: Path) -> Dict[str, Dict[str, str]]:
     return out
 
 
-def top_blocked_reasons(live: Dict[str, Any], limit: int = 8) -> List[tuple[str, int]]:
+def top_blocked_reasons(live: dict, limit: int = 8) -> List[tuple[str, int]]:
     raw = live.get("blocked_reason_counts", {}) or {}
     rows = [(str(k), int(v)) for k, v in raw.items()]
     rows.sort(key=lambda x: x[1], reverse=True)
     return rows[:limit]
 
 
-def summarize_alerts(alerts: List[Dict[str, Any]]) -> Counter[str]:
+def summarize_alerts(alerts: List[dict]) -> Counter[str]:
     c: Counter[str] = Counter()
     for a in alerts:
         c[str(a.get("type", "unknown"))] += 1
     return c
 
 
-def build_recommendations(live: Dict[str, Any], alert_count: Counter[str]) -> List[str]:
+def build_recommendations(live: dict, alert_count: Counter[str]) -> List[str]:
     recs: List[str] = []
     if not live:
         return ["No live snapshot found. Check service and watchdog process."]
@@ -103,7 +101,7 @@ def build_recommendations(live: Dict[str, Any], alert_count: Counter[str]) -> Li
     return recs
 
 
-def build_toxicity_recommendations(tox: Dict[str, Any]) -> List[str]:
+def build_toxicity_recommendations(tox: dict) -> List[str]:
     recs: List[str] = []
     if not tox:
         return recs
@@ -124,8 +122,8 @@ def write_report(
     out_md: Path,
     out_json: Path,
     day: str,
-    live: Dict[str, Any],
-    toxicity: Dict[str, Any],
+    live: dict,
+    toxicity: dict,
     latency: Dict[str, Dict[str, str]],
     alert_count: Counter[str],
     recommendations: List[str],

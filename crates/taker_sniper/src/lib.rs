@@ -213,11 +213,7 @@ impl TakerSniper {
     }
 }
 
-// ============================================================
-// skip 辅助函数 — 两个版本消除不必要的堆分配
-//   skip_static: 固定原因，零分配（热路径专用）
-//   skip_dynamic: 动态原因，只在必要时分配
-// ============================================================
+
 #[inline]
 fn skip_static(reason: &'static str) -> TakerDecision {
     TakerDecision {
@@ -236,16 +232,11 @@ fn skip_dynamic(reason: String) -> TakerDecision {
     }
 }
 
-// ============================================================
-// 胜率评分系统 (0-100分)
-// 三个维度分别评估信号、市场、时序质量
-// 只有总分 ≥ min_win_rate_score 才触发，其余跳过
-// ============================================================
+
 fn compute_win_rate_score(ctx: &EvaluateCtx<'_>) -> f64 {
     let sig = ctx.direction_signal;
 
-    // --- 信号质量 (0-40分) ---
-    // velocity: 动量越强，信号越可靠
+
     let velocity_score = match sig.velocity_bps_per_sec.abs() {
         v if v >= 100.0 => 20.0,
         v if v >= 50.0 => 14.0,
@@ -264,8 +255,7 @@ fn compute_win_rate_score(ctx: &EvaluateCtx<'_>) -> f64 {
     };
     let signal_quality = velocity_score + accel_score + tick_score;
 
-    // --- 市场质量 (0-35分) ---
-    // price_zone: 极端价格区 Gamma 最高，费率最低，最容易盈利
+
     let p = ctx.entry_price.clamp(0.0, 1.0);
     let dist = (p - 0.5).abs(); // 0=中间, 0.5=极端
     let zone_score = match dist {
@@ -285,8 +275,7 @@ fn compute_win_rate_score(ctx: &EvaluateCtx<'_>) -> f64 {
     let confirm_score = if sig.triple_confirm { 5.0 } else { 0.0 };
     let market_quality = zone_score + spread_score + confirm_score;
 
-    // --- 时序质量 (0-25分) ---
-    // momentum_spike: 动量突刺是最强的入场信号
+
     let spike_score = if sig.momentum_spike { 15.0 } else { 0.0 };
     // edge: 预期盈利越高，时序价值越大
     let edge_score = match ctx.edge_net_bps {

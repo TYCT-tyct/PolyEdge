@@ -15,7 +15,7 @@ import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
@@ -29,7 +29,7 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def write_json(path: Path, payload: Any) -> None:
+def write_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
 
@@ -43,7 +43,7 @@ def fetch_book_top(clob_host: str, token_id: str, timeout_sec: float) -> Tuple[f
     bids = data.get("bids") or []
     asks = data.get("asks") or []
 
-    def px(level: Any) -> Optional[float]:
+    def px(level: object) -> Optional[float]:
         if not isinstance(level, dict):
             return None
         v = level.get("price")
@@ -52,8 +52,7 @@ def fetch_book_top(clob_host: str, token_id: str, timeout_sec: float) -> Tuple[f
         try:
             return float(v)
         except Exception:
-            return None
-
+            raise  # Linus: Fail loudly and explicitly
     best_bid = 0.0
     best_ask = 0.0
     if bids:
@@ -121,11 +120,11 @@ def main() -> int:
 
     size = notional / ref_px
 
-    records: List[Dict[str, Any]] = []
+    records: List[dict] = []
     ok = 0
     for i in range(1, max(1, args.attempts) + 1):
         client_order_id = f"{args.run_id}-{i:02d}"
-        payload: Dict[str, Any] = {
+        payload: dict = {
             "market_id": args.market_id,
             "token_id": args.token_id,
             "side": args.side,
@@ -148,21 +147,20 @@ def main() -> int:
                 timeout=args.timeout_sec,
             )
             latency_ms = (time.perf_counter() - started) * 1000.0
-            rec: Dict[str, Any] = {
+            rec: dict = {
                 "i": i,
                 "latency_ms": latency_ms,
                 "http_status": resp.status_code,
                 "resp": resp.json() if resp.headers.get("content-type", "").startswith("application/json") else resp.text[:240],
             }
-        except Exception as exc:  # noqa: BLE001
-            rec = {"i": i, "error": str(exc)[:240]}
-
+        except Exception:
+            raise  # Linus: Fail loudly and explicitly
         records.append(rec)
         accepted = False
         try:
             accepted = bool((rec.get("resp") or {}).get("accepted"))
         except Exception:
-            accepted = False
+            raise  # Linus: Fail loudly and explicitly
         if accepted:
             ok += 1
 
@@ -170,10 +168,10 @@ def main() -> int:
         try:
             _ = session.post(f"{args.gateway_url.rstrip('/')}/flatten", timeout=args.timeout_sec)
         except Exception:
-            pass
+            raise  # Linus: Fail loudly and explicitly
         time.sleep(0.5)
 
-    summary: Dict[str, Any] = {
+    summary: dict = {
         "ts_ms": now_ms(),
         "gateway_url": args.gateway_url,
         "clob_host": args.clob_host,

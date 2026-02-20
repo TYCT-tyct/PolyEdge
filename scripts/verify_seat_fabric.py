@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import requests
 
@@ -58,7 +58,7 @@ def probe_url(
             else:
                 errors += 1
         except Exception:
-            errors += 1
+            raise  # Linus: Fail loudly and explicitly
         if interval_ms > 0:
             time.sleep(interval_ms / 1000.0)
     return {
@@ -77,7 +77,7 @@ class CheckResult:
     name: str
     ok: bool
     detail: str
-    extra: Optional[Dict[str, Any]] = None
+    extra: Optional[dict] = None
 
 
 def parse_simple_toml(path: Path) -> Dict[str, Dict[str, str]]:
@@ -113,16 +113,8 @@ def check_runtime(base_url: str) -> List[CheckResult]:
                 extra=payload,
             )
         )
-    except Exception as err:
-        checks.append(
-            CheckResult(
-                name="runtime_health",
-                ok=False,
-                detail=f"request_failed: {err}",
-            )
-        )
-        return checks
-
+    except Exception:
+        raise  # Linus: Fail loudly and explicitly
     try:
         live = requests.get(f"{base_url.rstrip('/')}/report/shadow/live", timeout=6)
         live.raise_for_status()
@@ -145,14 +137,8 @@ def check_runtime(base_url: str) -> List[CheckResult]:
                 extra={k: row.get(k) for k in required},
             )
         )
-    except Exception as err:
-        checks.append(
-            CheckResult(
-                name="live_report_fields",
-                ok=False,
-                detail=f"request_failed: {err}",
-            )
-        )
+    except Exception:
+        raise  # Linus: Fail loudly and explicitly
     return checks
 
 
@@ -179,15 +165,8 @@ def check_static_configs(strategy_toml: Path, execution_toml: Path) -> List[Chec
                 detail=f"mode={mode},udp_local_only={udp_local_only},udp_share_cap={cap}",
             )
         )
-    except Exception as err:
-        checks.append(
-            CheckResult(
-                name="strategy_transport_section",
-                ok=False,
-                detail=f"parse_failed: {err}",
-            )
-        )
-
+    except Exception:
+        raise  # Linus: Fail loudly and explicitly
     try:
         exe = parse_simple_toml(execution_toml)
         ecfg = exe.get("execution", {})
@@ -203,14 +182,8 @@ def check_static_configs(strategy_toml: Path, execution_toml: Path) -> List[Chec
                 extra={"clob_endpoint": clob_endpoint},
             )
         )
-    except Exception as err:
-        checks.append(
-            CheckResult(
-                name="execution_dual_order_endpoint",
-                ok=False,
-                detail=f"parse_failed: {err}",
-            )
-        )
+    except Exception:
+        raise  # Linus: Fail loudly and explicitly
     return checks
 
 

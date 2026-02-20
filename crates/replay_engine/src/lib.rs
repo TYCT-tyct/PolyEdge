@@ -95,8 +95,8 @@ mod tests {
             .write(&ReplayRecord {
                 ts_ms: 1,
                 event: EngineEvent::RefTick(RefTick {
-                    source: "x".to_string(),
-                    symbol: "BTCUSDT".to_string(),
+                    source: "x".into(),
+                    symbol: "BTCUSDT".into(),
                     event_ts_ms: 1,
                     recv_ts_ms: 1,
                     source_seq: 0,

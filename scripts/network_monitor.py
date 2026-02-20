@@ -181,9 +181,7 @@ async def ping_target(target: str, port: int) -> Optional[float]:
         return (recv_ts - send_ts) / 1e6  # ms
 
     except Exception:
-        return None
-
-
+        raise  # Linus: Fail loudly and explicitly
 async def monitor_loop(target: str, port: int, interval: int, detail: bool):
     """监控循环"""
     monitor = NetworkMonitor(target, port)

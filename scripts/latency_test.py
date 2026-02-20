@@ -101,10 +101,8 @@ class LatencyTester:
             print(f"[{datetime.now()}] ℹ️  完整路径: Binance -> 东京({tokyo_host}) -> VPC -> 爱尔兰")
             print(f"[{datetime.now()}] ℹ️  预估延迟: ~7ms (5ms + 1ms + 1ms)")
 
-        except Exception as e:
-            print(f"[{datetime.now()}] ❌ VPC 连接失败: {e}")
-            print(f"[{datetime.now()}] 请确保东京服务器已启动 relay")
-
+        except Exception:
+            raise  # Linus: Fail loudly and explicitly
     async def run_relay(self, ireland_ip: str = "10.0.3.123"):
         """在东京运行 relay (需要部署到东京服务器)"""
         print(f"[{datetime.now()}] ℹ️  此模式需要在东京服务器运行 relay")
@@ -175,9 +173,8 @@ async def run_tcp_latency_test(target: str, port: int, duration_sec: int = 30):
 
             sock.close()
 
-        except Exception as e:
-            print(f"错误: {e}")
-
+        except Exception:
+            raise  # Linus: Fail loudly and explicitly
         await asyncio.sleep(0.1)
 
     if latencies:

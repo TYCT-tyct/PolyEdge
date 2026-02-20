@@ -9,7 +9,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TextIO
+from typing import Dict, List, Optional, TextIO
 
 import requests
 
@@ -36,15 +36,13 @@ def bool_env(v: bool) -> str:
     return "true" if v else "false"
 
 
-def get_json(base_url: str, path: str, timeout: float = 5.0) -> Optional[Dict[str, Any]]:
+def get_json(base_url: str, path: str, timeout: float = 5.0) -> Optional[dict]:
     try:
         resp = requests.get(f"{base_url.rstrip('/')}{path}", timeout=timeout)
         resp.raise_for_status()
         return resp.json()
     except Exception:
-        return None
-
-
+        raise  # Linus: Fail loudly and explicitly
 @dataclass
 class InstanceRun:
     idx: int
@@ -142,13 +140,12 @@ def stop_instance(inst: InstanceRun) -> None:
                 inst.proc.terminate()
                 inst.proc.wait(timeout=8)
             except Exception:
-                inst.proc.kill()
-                inst.proc.wait(timeout=3)
+                raise  # Linus: Fail loudly and explicitly
     finally:
         inst.log_file.close()
 
 
-def read_summary_from_files(dataset_root: Path) -> Optional[Dict[str, Any]]:
+def read_summary_from_files(dataset_root: Path) -> Optional[dict]:
     day = time.strftime("%Y-%m-%d", time.gmtime())
     summary = dataset_root / "reports" / day / "paper_summary_latest.json"
     if not summary.exists():
@@ -156,10 +153,8 @@ def read_summary_from_files(dataset_root: Path) -> Optional[Dict[str, Any]]:
     try:
         return json.loads(summary.read_text(encoding="utf-8"))
     except Exception:
-        return None
-
-
-def collect_final_summary(inst: InstanceRun) -> Dict[str, Any]:
+        raise  # Linus: Fail loudly and explicitly
+def collect_final_summary(inst: InstanceRun) -> dict:
     api = get_json(inst.base_url, "/report/paper/summary", timeout=3.0)
     if api:
         return api
@@ -179,7 +174,7 @@ def collect_final_summary(inst: InstanceRun) -> Dict[str, Any]:
     }
 
 
-def write_parallel_compare(run_dir: Path, rows: List[Dict[str, Any]]) -> Path:
+def write_parallel_compare(run_dir: Path, rows: List[dict]) -> Path:
     out = run_dir / "paper_parallel_compare.csv"
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", newline="", encoding="utf-8") as f:
@@ -278,7 +273,7 @@ def run(args: argparse.Namespace) -> int:
                 )
             time.sleep(float(args.poll_sec))
 
-        rows: List[Dict[str, Any]] = []
+        rows: List[dict] = []
         for inst in runners:
             summary = collect_final_summary(inst)
             row = {

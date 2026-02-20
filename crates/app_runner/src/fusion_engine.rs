@@ -417,15 +417,12 @@ pub(super) fn should_replace_anchor_tick(current: &RefTick, next: &RefTick) -> b
 }
 
 pub(super) fn insert_latest_tick(latest_ticks: &mut HashMap<String, RefTick>, tick: RefTick) {
-    match latest_ticks.get(tick.symbol.as_str()) {
-        Some(current) => {
-            if should_replace_ref_tick(current, &tick) {
-                latest_ticks.insert(tick.symbol.clone(), tick);
-            }
+    if let Some(current) = latest_ticks.get_mut(tick.symbol.as_str()) {
+        if should_replace_ref_tick(current, &tick) {
+            *current = tick;
         }
-        None => {
-            latest_ticks.insert(tick.symbol.clone(), tick);
-        }
+    } else {
+        latest_ticks.insert(tick.symbol.clone(), tick);
     }
 }
 
@@ -433,15 +430,12 @@ pub(super) fn insert_latest_anchor_tick(
     latest_ticks: &mut HashMap<String, RefTick>,
     tick: RefTick,
 ) {
-    match latest_ticks.get(tick.symbol.as_str()) {
-        Some(current) => {
-            if should_replace_anchor_tick(current, &tick) {
-                latest_ticks.insert(tick.symbol.clone(), tick);
-            }
+    if let Some(current) = latest_ticks.get_mut(tick.symbol.as_str()) {
+        if should_replace_anchor_tick(current, &tick) {
+            *current = tick;
         }
-        None => {
-            latest_ticks.insert(tick.symbol.clone(), tick);
-        }
+    } else {
+        latest_ticks.insert(tick.symbol.clone(), tick);
     }
 }
 
@@ -450,29 +444,23 @@ pub(super) fn upsert_latest_tick_slot(
     tick: RefTick,
     should_replace: fn(&RefTick, &RefTick) -> bool,
 ) -> Option<i64> {
-    use dashmap::mapref::entry::Entry;
-    match latest_ticks.entry(tick.symbol.clone()) {
-        Entry::Occupied(mut entry) => {
-            let current = entry.get();
-            if !should_replace(current, &tick) {
-                return None;
-            }
-            let delta_ns = if current.source != tick.source
-                && current.recv_ts_local_ns > 0
-                && tick.recv_ts_local_ns > 0
-            {
-                Some((tick.recv_ts_local_ns - current.recv_ts_local_ns).unsigned_abs() as i64)
-            } else {
-                None
-            };
-            entry.insert(tick);
-            delta_ns
+    if let Some(mut current) = latest_ticks.get_mut(&tick.symbol) {
+        if !should_replace(current.value(), &tick) {
+            return None;
         }
-        Entry::Vacant(entry) => {
-            entry.insert(tick);
+        let delta_ns = if current.source != tick.source
+            && current.recv_ts_local_ns > 0
+            && tick.recv_ts_local_ns > 0
+        {
+            Some((tick.recv_ts_local_ns - current.recv_ts_local_ns).unsigned_abs() as i64)
+        } else {
             None
-        }
+        };
+        *current.value_mut() = tick;
+        return delta_ns;
     }
+    latest_ticks.insert(tick.symbol.clone(), tick);
+    None
 }
 
 pub(super) fn insert_latest_ref_tick(

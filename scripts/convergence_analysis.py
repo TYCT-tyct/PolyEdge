@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from collections import deque
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import requests
 import websockets
@@ -48,7 +48,7 @@ class SharedState:
         self.binance: Dict[str, PricePoint] = {}
         self.pm: Dict[str, PricePoint] = {}
         self.last_trigger_ms: Dict[str, int] = {s: 0 for s in symbols}
-        self.events: List[Dict[str, Any]] = []
+        self.events: List[dict] = []
         self.lock = asyncio.Lock()
         self.trigger_count: int = 0
         self.trigger_skip_no_pm: int = 0
@@ -97,9 +97,7 @@ async def run_binance_feed(state: SharedState, end_ts: float) -> None:
                             binance_change_bps=ret * 10_000.0,
                         )
         except Exception:
-            await asyncio.sleep(0.5)
-
-
+            raise  # Linus: Fail loudly and explicitly
 async def run_pm_feed(state: SharedState, end_ts: float) -> None:
     url = "wss://ws-live-data.polymarket.com"
     subscriptions = [
@@ -132,9 +130,7 @@ async def run_pm_feed(state: SharedState, end_ts: float) -> None:
                     async with state.lock:
                         state.pm[symbol] = PricePoint(ts_ms=recv_ms, px=px)
         except Exception:
-            await asyncio.sleep(0.5)
-
-
+            raise  # Linus: Fail loudly and explicitly
 def fetch_token_symbol_map(symbols: List[str]) -> Dict[Tuple[str, str], str]:
     symbols = [normalize_symbol(s) for s in symbols]
     allowed = set(symbols)
@@ -159,7 +155,7 @@ def fetch_token_symbol_map(symbols: List[str]) -> Dict[Tuple[str, str], str]:
             resp.raise_for_status()
             rows = resp.json()
         except Exception:
-            continue
+            raise  # Linus: Fail loudly and explicitly
         if not isinstance(rows, list) or not rows:
             break
         for m in rows:
@@ -180,7 +176,7 @@ def fetch_token_symbol_map(symbols: List[str]) -> Dict[Tuple[str, str], str]:
             try:
                 token_ids = json.loads(token_raw)
             except Exception:
-                continue
+                raise  # Linus: Fail loudly and explicitly
             if not isinstance(token_ids, list) or len(token_ids) < 2:
                 continue
             yes = str(token_ids[0])
@@ -234,9 +230,7 @@ async def run_pm_file_feed(
                 async with state.lock:
                     state.pm[symbol] = PricePoint(ts_ms=recv_ms, px=px)
             except Exception:
-                continue
-
-
+                raise  # Linus: Fail loudly and explicitly
 def bootstrap_latest_pm(state: SharedState, book_file: Path, token_map: Dict[Tuple[str, str], str]) -> None:
     latest: Dict[str, PricePoint] = {}
     try:
@@ -260,9 +254,9 @@ def bootstrap_latest_pm(state: SharedState, book_file: Path, token_map: Dict[Tup
                 recv_ms = recv_ns // 1_000_000 if recv_ns > 0 else int(time.time() * 1000)
                 latest[symbol] = PricePoint(ts_ms=recv_ms, px=px)
             except Exception:
-                continue
+                raise  # Linus: Fail loudly and explicitly
     except Exception:
-        return
+        raise  # Linus: Fail loudly and explicitly
     if latest:
         state.pm.update(latest)
 
@@ -285,7 +279,7 @@ async def maybe_trigger_event(
             state.trigger_skip_no_pm += 1
             return
         state.last_trigger_ms[symbol] = t0_ms
-    event: Dict[str, Any] = {
+    event: dict = {
         "symbol": symbol,
         "t0_ms": t0_ms,
         "velocity_bps_per_sec": velocity_bps_per_sec,
@@ -303,7 +297,7 @@ async def read_pm_price(state: SharedState, symbol: str) -> Optional[float]:
         return None if point is None else point.px
 
 
-async def capture_event_samples(state: SharedState, event: Dict[str, Any]) -> None:
+async def capture_event_samples(state: SharedState, event: dict) -> None:
     symbol = str(event["symbol"])
     t_start = time.time()
     schedule_ms = {
@@ -326,7 +320,7 @@ async def capture_event_samples(state: SharedState, event: Dict[str, Any]) -> No
     finalize_event_metrics(event)
 
 
-def finalize_event_metrics(event: Dict[str, Any]) -> None:
+def finalize_event_metrics(event: dict) -> None:
     t0 = float(event.get("pm_book_mid_at_t0") or 0.0)
     p20 = event.get("pm_book_mid_at_t0_plus_20ms")
     p50 = event.get("pm_book_mid_at_t0_plus_50ms")
@@ -388,14 +382,14 @@ def finalize_event_metrics(event: Dict[str, Any]) -> None:
     event["profit_at_3s_bps"] = profit_3s
 
 
-def build_summary(events: List[Dict[str, Any]]) -> Dict[str, Any]:
+def build_summary(events: List[dict]) -> dict:
     convergence_vals = [float(e["convergence_time_ms"]) for e in events if isinstance(e.get("convergence_time_ms"), (int, float))]
     gap_vals = [float(e["price_gap_at_t1_bps"]) for e in events if isinstance(e.get("price_gap_at_t1_bps"), (int, float))]
     max_profit_vals = [float(e["max_profit_bps"]) for e in events if isinstance(e.get("max_profit_bps"), (int, float))]
     profit_3s_vals = [float(e["profit_at_3s_bps"]) for e in events if isinstance(e.get("profit_at_3s_bps"), (int, float))]
     best_time_vals = [float(e["max_profit_time_ms"]) for e in events if isinstance(e.get("max_profit_time_ms"), (int, float))]
 
-    by_symbol: Dict[str, Dict[str, Any]] = {}
+    by_symbol: Dict[str, dict] = {}
     for symbol in sorted(set(str(e["symbol"]) for e in events)):
         rows = [e for e in events if e["symbol"] == symbol]
         conv = [float(e["convergence_time_ms"]) for e in rows if isinstance(e.get("convergence_time_ms"), (int, float))]
@@ -445,7 +439,7 @@ def build_summary(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-async def run_measurement(symbols: List[str], duration_sec: int, pm_source: str, raw_root: str) -> Dict[str, Any]:
+async def run_measurement(symbols: List[str], duration_sec: int, pm_source: str, raw_root: str) -> dict:
     symbols = [normalize_symbol(s) for s in symbols]
     state = SharedState(symbols)
     end_ts = time.time() + duration_sec

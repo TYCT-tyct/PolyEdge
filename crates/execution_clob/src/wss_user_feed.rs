@@ -94,9 +94,7 @@ pub async fn run_wss_loop_with_sender(
     }
 }
 
-// -----------------------------------------------------------------------
-// 核心连接循环
-// -----------------------------------------------------------------------
+
 
 async fn connect_and_stream(
     tx: &Arc<broadcast::Sender<WssFillEvent>>,
@@ -131,9 +129,7 @@ async fn connect_and_stream(
     Ok(())
 }
 
-// -----------------------------------------------------------------------
-// 事件解析 — 零分配热路径
-// -----------------------------------------------------------------------
+
 
 fn parse_and_broadcast(tx: &Arc<broadcast::Sender<WssFillEvent>>, envelope: WssEnvelope) {
     let event_type = match envelope.event_type.as_deref() {

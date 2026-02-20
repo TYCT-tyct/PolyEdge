@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Dict, List
 
 import requests
 
@@ -97,11 +97,7 @@ def collect(
             )
             consecutive_errors = 0
         except Exception:
-            consecutive_errors += 1
-            if fail_fast_threshold > 0 and consecutive_errors >= fail_fast_threshold:
-                raise RuntimeError(
-                    f"{name}: fail-fast threshold reached ({consecutive_errors}) while collecting"
-                )
+            raise  # Linus: Fail loudly and explicitly
         now = time.time()
         if now >= next_heartbeat:
             print(
@@ -173,7 +169,7 @@ def main() -> int:
     out_json = day_dir / "region_ab_compare.json"
     out_md = day_dir / "region_ab_compare.md"
 
-    payload: Dict[str, Any] = {
+    payload: dict = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "run_id": args.run_id,
         "seconds": seconds,
