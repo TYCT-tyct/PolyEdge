@@ -413,6 +413,14 @@ impl ExecutionVenue for ClobExecution {
                             .post(format!("{endpoint}/orders"))
                             .header("content-type", "application/json")
                             .body(body_bytes.clone());
+                        if let Some(ref auth) = intent.prebuilt_auth {
+                            req = req
+                                .header("poly-address", &auth.address)
+                                .header("poly-signature", &auth.hmac_signature)
+                                .header("poly-timestamp", &auth.timestamp_sec)
+                                .header("poly-api-key", &auth.api_key)
+                                .header("poly-passphrase", &auth.passphrase);
+                        }
                         if primary_leg && self.order_failover_timeout > Duration::from_millis(0) {
                             req = req.timeout(self.order_failover_timeout);
                         }

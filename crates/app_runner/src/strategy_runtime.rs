@@ -207,6 +207,7 @@ fn spawn_force_taker_fallback_for_maker(
             client_order_id: Some(new_id()),
             hold_to_resolution: false,
             prebuilt_payload: None,
+            prebuilt_auth: None,
         };
         match execution.place_order_v2(order).await {
             Ok(ack) if ack.accepted => {
@@ -1735,10 +1736,46 @@ pub(super) async fn predator_execute_opportunity(
         client_order_id: Some(new_id()),
         hold_to_resolution: false,
         prebuilt_payload: None,
+        prebuilt_auth: None,
     };
     let mut v2_intent = v2_intent;
     if execution.is_live() {
-        v2_intent.prebuilt_payload = prebuild_order_payload(&v2_intent);
+        let is_taker = execution_style == ExecutionStyle::Taker;
+        let mut cache_hit = false;
+        if is_taker {
+            let side_str = match intent.side {
+                OrderSide::BuyYes => "buy_yes",
+                OrderSide::BuyNo => "buy_no",
+                OrderSide::SellYes => "sell_yes",
+                OrderSide::SellNo => "sell_no",
+            };
+            let key = format!("{}:{}", intent.market_id, side_str);
+            if let Some(mut cached) = shared.presign_cache.write().await.remove(&key) {
+                let age = cached.fetched_at.elapsed();
+                // 45s is safely within the 60s time_window
+                if age < std::time::Duration::from_secs(45) {
+                    v2_intent.price = cached.price;
+                    v2_intent.size = cached.size;
+                    v2_intent.prebuilt_payload = Some(cached.payload_bytes.clone());
+
+                    let t_sec = chrono::Utc::now().timestamp().to_string();
+                    if let Some(hmac) = cached.hmac_signatures.remove(&t_sec) {
+                        cached.auth.timestamp_sec = t_sec;
+                        cached.auth.hmac_signature = hmac;
+                        v2_intent.prebuilt_auth = Some(cached.auth);
+                        cache_hit = true;
+                        tracing::info!(
+                            "🚀 OMEGA-R3 PHASE 2: Cache Hit! Pre-signed EIP712 & HMAC ripped from memory for {} latency bypass.",
+                            key
+                        );
+                    }
+                }
+            }
+        }
+
+        if !cache_hit {
+            v2_intent.prebuilt_payload = prebuild_order_payload(&v2_intent);
+        }
     }
     let order_build_ms = order_build_start.elapsed().as_secs_f64() * 1_000.0;
     let place_start = Instant::now();

@@ -327,6 +327,15 @@ pub struct OrderAck {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PrebuiltAuth {
+    pub api_key: String,
+    pub passphrase: String,
+    pub address: String,
+    pub timestamp_sec: String,
+    pub hmac_signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OrderIntentV2 {
     pub market_id: String,
     pub side: OrderSide,
@@ -354,6 +363,9 @@ pub struct OrderIntentV2 {
     /// `None` 时回退到原始序列化路径，保证向后兼容。
     #[serde(skip)]
     pub prebuilt_payload: Option<Vec<u8>>,
+    /// Omega-R3: Phase 2 L2 Pre-auth
+    #[serde(skip)]
+    pub prebuilt_auth: Option<PrebuiltAuth>,
 }
 
 impl From<QuoteIntent> for OrderIntentV2 {
@@ -373,6 +385,7 @@ impl From<QuoteIntent> for OrderIntentV2 {
             expected_edge_net_bps: 0.0,
             hold_to_resolution: false,
             prebuilt_payload: None,
+            prebuilt_auth: None,
         }
     }
 }

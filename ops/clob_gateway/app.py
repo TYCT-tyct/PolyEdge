@@ -20,9 +20,11 @@ from typing import Dict, Optional, Tuple
 from fastapi import Body, FastAPI
 from fastapi.responses import JSONResponse
 
-from py_clob_client.client import ClobClient
+from py_clob_client.client import ClobClient, POST_ORDER
 from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client.headers.headers import build_hmac_signature
+import json
 
 
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
@@ -303,10 +305,124 @@ def post_order(payload: dict = Body(...)) -> JSONResponse:
         with STATE.tracked_lock:
             STATE.tracked_orders.add(str(order_id))
 
-    # If the venue returns 0 fill for taker orders, treat as reject so the engine can account for it.
     accepted = accepted_size > 0.0
     reject_code = None if accepted else "zero_fill"
     return respond(accepted, order_id=order_id or "", accepted_size=accepted_size, reject_code=reject_code)
+
+
+@app.post("/prebuild_order")
+def prebuild_order(payload: dict = Body(...)) -> JSONResponse:
+    client = STATE.client
+    if client is None or not STATE.ready:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "gateway_not_ready"})
+
+    token_id = str(payload.get("token_id") or "").strip()
+    if not token_id:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "missing_token_id"})
+
+    side_raw = payload.get("side")
+    side, side_err = _map_side(str(side_raw or ""))
+    if side_err:
+        return JSONResponse(status_code=400, content={"ok": False, "error": side_err})
+
+    try:
+        price = float(payload.get("price"))
+        size = float(payload.get("size"))
+    except Exception as exc:
+        return JSONResponse(status_code=400, content={"ok": False, "error": _safe_reject_code(exc)})
+
+    if not (MIN_PRICE <= price <= MAX_PRICE):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "price_out_of_range"})
+    if not (size > 0.0):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "size_non_positive"})
+
+    ttl_ms = int(payload.get("ttl_ms") or 0)
+    tif_raw = str(payload.get("tif") or "").strip()
+    order_type, tif_err = _map_tif_to_order_type(tif_raw, ttl_ms)
+    if tif_err:
+        return JSONResponse(status_code=400, content={"ok": False, "error": tif_err})
+
+    try:
+        max_slippage_bps = float(payload.get("max_slippage_bps") or 0.0)
+    except Exception:
+        max_slippage_bps = 0.0
+
+    max_slippage_bps = max(0.0, max_slippage_bps)
+    if max_slippage_bps > 0:
+        slip = max_slippage_bps / 10_000.0
+        if side == BUY:
+            price = _clamp(price * (1.0 + slip), MIN_PRICE, MAX_PRICE)
+        else:
+            price = _clamp(price * (1.0 - slip), MIN_PRICE, MAX_PRICE)
+
+    try:
+        fee_rate_bps = float(payload.get("fee_rate_bps") or 0.0)
+    except Exception:
+        fee_rate_bps = 0.0
+    fee_rate_bps_i = int(round(max(0.0, fee_rate_bps)))
+
+    expiration_s = _coarse_expiration_s(ttl_ms)
+
+    # For pre-built, allow the caller to override the nonce; otherwise generate one.
+    nonce = payload.get("nonce")
+    if nonce is None:
+        nonce = time.time_ns()
+    else:
+        nonce = int(nonce)
+
+    try:
+        with STATE.client_lock:
+            # 1. Generate EIP-712 Signature (CPU heavy)
+            signed = client.create_order(
+                OrderArgs(
+                    token_id=token_id,
+                    price=price,
+                    size=size,
+                    side=side,
+                    fee_rate_bps=fee_rate_bps_i,
+                    nonce=nonce,
+                    expiration=expiration_s,
+                    taker=ZERO_ADDRESS,
+                )
+            )
+
+        # 2. Serialize according to ClobClient.post_order exactly
+        order_type_str = order_type.value if hasattr(order_type, "value") else order_type
+        body = {
+            "order": signed.dict(),
+            "owner": client.creds.api_key,
+            "orderType": order_type_str
+        }
+        serialized_body = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+
+        # 3. Pre-compute HMAC signatures for a time window array
+        time_window_sec = int(payload.get("time_window_sec") or 60)
+        time_window_sec = max(5, min(time_window_sec, 300))
+
+        current_ts = int(time.time())
+        hmac_headers = {}
+
+        for t in range(current_ts, current_ts + time_window_sec + 1):
+            hmac_sig = build_hmac_signature(
+                client.creds.api_secret,
+                t,
+                "POST",
+                POST_ORDER,
+                serialized_body,
+            )
+            hmac_headers[str(t)] = hmac_sig
+
+        return JSONResponse(status_code=200, content={
+            "ok": True,
+            "body": serialized_body, # The stringified JSON payload with EIP712 Sig
+            "api_key": client.creds.api_key,
+            "api_passphrase": client.creds.api_passphrase,
+            "address": client.signer.address(),
+            "hmac_signatures": hmac_headers, # Dict[timestamp_sec, L2_Signature]
+        })
+
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"ok": False, "error": _safe_reject_code(exc)})
 
 
 @app.delete("/orders/{order_id}")

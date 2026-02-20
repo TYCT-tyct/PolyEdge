@@ -298,6 +298,7 @@ pub(super) async fn async_main() -> Result<()> {
                 None
             }
         },
+        presign_cache: Arc::new(RwLock::new(HashMap::new())),
     });
     let strategy_input_queue_cap = std::env::var("POLYEDGE_STRATEGY_INPUT_QUEUE_CAP")
         .ok()
@@ -353,6 +354,7 @@ pub(super) async fn async_main() -> Result<()> {
         shared.clone(),
         strategy_ingress_rx,
     );
+    crate::engine_loop::spawn_presign_worker(shared.clone());
     orchestration::spawn_periodic_report_persistor(
         shared.shadow_stats.clone(),
         shared.tox_state.clone(),

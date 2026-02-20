@@ -47,6 +47,79 @@ use crate::strategy_runtime::{
 };
 use crate::toxicity_runtime::update_toxic_state_from_outcome;
 use crate::{publish_if_telemetry_subscribers, spawn_detached};
+use crate::state::CachedPrebuild;
+use core_types::PrebuiltAuth;
+
+pub(crate) fn spawn_presign_worker(shared: Arc<EngineShared>) {
+    spawn_detached("presign_worker", false, async move {
+        // HFT Cache-line predictive pre-signer
+        // Every 500ms, pre-build 10 USDC taker bullets for tight markets
+        let mut interval = tokio::time::interval(Duration::from_millis(500));
+        let client = reqwest::Client::new();
+        let gateway = "http://127.0.0.1:9001";
+        loop {
+            interval.tick().await;
+
+            let markets: Vec<_> = {
+                let books = shared.latest_books.read().await;
+                books.iter()
+                    .filter(|(_, b)| b.ask_yes > 0.0 && b.bid_yes > 0.0)
+                    .map(|(k, b)| (k.clone(), b.clone()))
+                    .take(5) // Only top 5 to avoid overwhelming gateway
+                    .collect()
+            };
+
+            for (market_id, book) in markets {
+                // Pre-build Buy Yes Taker
+                let price = (book.ask_yes * 1.02).clamp(0.01, 0.99); // 2% slippage default
+                let req_payload = serde_json::json!({
+                    "token_id": book.token_id_yes,
+                    "side": "BUY",
+                    "price": price,
+                    "size": 10.0,
+                    "ttl_ms": 30000,
+                    "tif": "FAK",
+                    "fee_rate_bps": 0.0,
+                    "time_window_sec": 60,
+                });
+
+                if let Ok(res) = client.post(format!("{}/prebuild_order", gateway))
+                    .json(&req_payload)
+                    .send().await
+                {
+                    if let Ok(json) = res.json::<serde_json::Value>().await {
+                        if json["ok"].as_bool().unwrap_or(false) {
+                            let payload_str = json["body"].as_str().unwrap_or("");
+                            let hmacs = json["hmac_signatures"].as_object().unwrap();
+                            let hmac_map: HashMap<String, String> = hmacs.iter()
+                                .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
+                                .collect();
+
+                            let prebuild = CachedPrebuild {
+                                price,
+                                size: 10.0,
+                                payload_bytes: payload_str.as_bytes().to_vec(),
+                                auth: PrebuiltAuth {
+                                    api_key: json["api_key"].as_str().unwrap().to_string(),
+                                    passphrase: json["api_passphrase"].as_str().unwrap().to_string(),
+                                    address: json["address"].as_str().unwrap().to_string(),
+                                    timestamp_sec: "".to_string(), // Populated at execution
+                                    hmac_signature: "".to_string(), // Populated at execution
+                                },
+                                hmac_signatures: hmac_map,
+                                fetched_at: Instant::now(),
+                            };
+
+                            // Insert into cache
+                            let key = format!("{}:{}", market_id, "buy_yes");
+                            shared.presign_cache.write().await.insert(key, prebuild);
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
 
 pub(crate) fn spawn_strategy_engine(
     bus: RingBus<EngineEvent>,
@@ -908,6 +981,7 @@ pub(crate) fn build_reversal_reentry_order(
         client_order_id: Some(new_id()),
         hold_to_resolution: false,
         prebuilt_payload: None,
+        prebuilt_auth: None,
     })
 }
 

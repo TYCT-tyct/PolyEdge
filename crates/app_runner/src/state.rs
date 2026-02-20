@@ -313,6 +313,16 @@ impl Default for PredatorCrossSymbolConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct CachedPrebuild {
+    pub(crate) price: f64,
+    pub(crate) size: f64,
+    pub(crate) payload_bytes: Vec<u8>,
+    pub(crate) auth: core_types::PrebuiltAuth,
+    pub(crate) hmac_signatures: std::collections::HashMap<String, String>,
+    pub(crate) fetched_at: std::time::Instant,
+}
+
 #[derive(Clone)]
 pub(crate) struct EngineShared {
     pub(crate) latest_books: Arc<RwLock<HashMap<String, BookTop>>>,
@@ -357,6 +367,8 @@ pub(crate) struct EngineShared {
     /// WSS User Channel fill broadcaster — None in paper mode
     pub(crate) wss_fill_tx:
         Option<Arc<tokio::sync::broadcast::Sender<execution_clob::wss_user_feed::WssFillEvent>>>,
+    /// Omega-R3: Phase 2 L2 Pre-auth Cache
+    pub(crate) presign_cache: Arc<RwLock<HashMap<String, CachedPrebuild>>>,
 }
 
 #[derive(Serialize)]
