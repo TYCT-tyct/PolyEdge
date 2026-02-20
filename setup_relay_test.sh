@@ -15,13 +15,13 @@ if [ -d "PolyEdge" ]; then
     echo "📂 Updating PolyEdge..."
     cd PolyEdge
     git fetch origin
-    git checkout codex/fullchain-20260216
-    git pull origin codex/fullchain-20260216
+    git checkout feat/p1-wire-dual
+    git pull origin feat/p1-wire-dual
 else
     echo "📂 Cloning PolyEdge..."
     git clone https://github.com/TYCT-tyct/PolyEdge.git
     cd PolyEdge
-    git checkout codex/fullchain-20260216
+    git checkout feat/p1-wire-dual
 fi
 
 # 2. Build Rust Binaries
