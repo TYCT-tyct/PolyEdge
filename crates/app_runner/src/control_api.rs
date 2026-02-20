@@ -60,6 +60,8 @@ pub(super) fn build_router(state: AppState) -> Router {
         .route("/report/paper/summary", get(report_paper_summary))
         .route("/control/pause", post(pause))
         .route("/control/resume", post(resume))
+        .route("/control/drain/enable", post(drain_enable))
+        .route("/control/drain/disable", post(drain_disable))
         .route("/control/flatten", post(flatten))
         .route("/control/arm_live", post(arm_live))
         .route("/control/seat/pause", post(seat_pause))
@@ -143,6 +145,16 @@ async fn resume(State(state): State<AppState>) -> impl IntoResponse {
         .bus
         .publish(EngineEvent::Control(ControlCommand::Resume));
     Json(serde_json::json!({"ok": true, "paused": false}))
+}
+
+async fn drain_enable(State(state): State<AppState>) -> impl IntoResponse {
+    *state.draining.write().await = true;
+    Json(serde_json::json!({"ok": true, "draining": true}))
+}
+
+async fn drain_disable(State(state): State<AppState>) -> impl IntoResponse {
+    *state.draining.write().await = false;
+    Json(serde_json::json!({"ok": true, "draining": false}))
 }
 
 async fn flatten(State(state): State<AppState>) -> impl IntoResponse {

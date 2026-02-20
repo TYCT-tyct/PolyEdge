@@ -216,7 +216,9 @@ pub(super) async fn async_main() -> Result<()> {
     let predator_exit_manager = Arc::new(RwLock::new(ExitManager::new(to_exit_manager_config(
         &exit_cfg0,
     ))));
+    let draining = Arc::new(RwLock::new(false));
     let shared = Arc::new(EngineShared {
+        draining: draining.clone(),
         latest_books: Arc::new(RwLock::new(HashMap::new())),
         latest_signals: Arc::new(DashMap::new()),
         market_to_symbol: Arc::new(RwLock::new(HashMap::new())),
@@ -310,6 +312,7 @@ pub(super) async fn async_main() -> Result<()> {
 
     let state = AppState {
         paused: paused.clone(),
+        draining: draining.clone(),
         bus: bus.clone(),
         portfolio: portfolio.clone(),
         execution: execution.clone(),

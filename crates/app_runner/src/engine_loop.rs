@@ -175,6 +175,10 @@ pub(crate) fn spawn_udp_ghost_receiver(
 
                 if exec_price <= 0.0 || exec_price >= 1.0 || target_l2 <= 0.0 { continue; }
 
+                if *shared.draining.read().await {
+                    continue; // Operation Silence: Do not accept new ghost gatling orders
+                }
+
                 let tf = TimeframeClass::Tf5m;
                 let fee_bps = crate::execution_eval::get_fee_rate_bps_cached(&shared, &book.token_id_yes).await;
                 let mut sniper = shared.predator_taker_sniper.write().await;
@@ -1016,6 +1020,14 @@ pub(crate) fn spawn_strategy_engine(
 
                     let predator_cfg = shared.predator_cfg.read().await.clone();
                     if predator_cfg.enabled {
+                        if *shared.draining.read().await {
+                            shared
+                                .shadow_stats
+                                .mark_blocked_with_reason("operation_silence_draining")
+                                .await;
+                            continue; // Operation Silence: Reject all new entries, let exits drain.
+                        }
+
                         let now_ms = Utc::now().timestamp_millis();
                         let _ = evaluate_and_route_v52(
                             &shared,

@@ -43,6 +43,7 @@ use crate::stats_utils::{
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) paused: Arc<RwLock<bool>>,
+    pub(crate) draining: Arc<RwLock<bool>>,
     pub(crate) bus: RingBus<EngineEvent>,
     pub(crate) portfolio: Arc<PortfolioBook>,
     pub(crate) execution: Arc<ClobExecution>,
@@ -325,6 +326,7 @@ pub(crate) struct CachedPrebuild {
 
 #[derive(Clone)]
 pub(crate) struct EngineShared {
+    pub(crate) draining: Arc<RwLock<bool>>,
     pub(crate) latest_books: Arc<RwLock<HashMap<String, BookTop>>>,
     pub(crate) latest_signals: Arc<DashMap<String, SignalCacheEntry>>,
     pub(crate) market_to_symbol: Arc<RwLock<HashMap<String, String>>>,
