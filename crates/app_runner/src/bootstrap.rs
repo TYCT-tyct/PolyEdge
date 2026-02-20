@@ -64,7 +64,12 @@ pub(super) async fn async_main() -> Result<()> {
     let seat_fill_counter = seat.live_fill_counter();
     let paper_enabled = std::env::var("POLYEDGE_PAPER_ENABLED")
         .ok()
-        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
         .unwrap_or(true);
     let paper_initial_capital = std::env::var("POLYEDGE_PAPER_INITIAL_CAPITAL")
         .ok()
@@ -77,7 +82,12 @@ pub(super) async fn async_main() -> Result<()> {
         .unwrap_or_else(|| format!("paper-{}", chrono::Utc::now().format("%Y%m%d%H%M%S")));
     let paper_sqlite_enabled = std::env::var("POLYEDGE_PAPER_SQLITE_ENABLED")
         .ok()
-        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
         .unwrap_or(true);
     let paper = PaperRuntimeHandle::new(
         paper_enabled,
@@ -209,8 +219,6 @@ pub(super) async fn async_main() -> Result<()> {
     let shared = Arc::new(EngineShared {
         latest_books: Arc::new(RwLock::new(HashMap::new())),
         latest_signals: Arc::new(DashMap::new()),
-        latest_fast_ticks: Arc::new(DashMap::new()),
-        latest_anchor_ticks: Arc::new(DashMap::new()),
         market_to_symbol: Arc::new(RwLock::new(HashMap::new())),
         token_to_symbol: Arc::new(RwLock::new(HashMap::new())),
         market_to_timeframe: Arc::new(RwLock::new(HashMap::new())),

@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
     .expect("setting default subscriber failed");
 
     let symbol = std::env::var("SYMBOL").unwrap_or_else(|_| "btcusdt".to_string());
-    let udp_port = 6666;
+    let udp_port = 7777;
 
     info!("🚀 Starting Feed Benchmark (Symbol: {})", symbol);
     info!("   - Direct: Binance WS (Ireland)");
@@ -74,7 +74,7 @@ async fn main() -> Result<()> {
 
     // 2. Setup WS Listener
     let ws_url = format!(
-        "wss://stream.binance.com:9443/ws/{}@bookTicker",
+        "wss://fstream.binance.com/ws/{}@bookTicker",
         symbol.to_lowercase()
     );
     let (ws_stream, _) = connect_async(&ws_url).await?;

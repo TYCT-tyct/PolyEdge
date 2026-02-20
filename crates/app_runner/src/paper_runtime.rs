@@ -5,8 +5,8 @@ use std::sync::OnceLock;
 
 use chrono::{TimeZone, Utc};
 use core_types::{
-    BookTop, Direction, ExecutionStyle, FillEvent, OrderAck, OrderSide, PaperAction, PaperDailySummary,
-    PaperFill, PaperIntent, PaperLiveReport, PaperTradeRecord, Stage,
+    BookTop, Direction, ExecutionStyle, FillEvent, OrderAck, OrderSide, PaperAction,
+    PaperDailySummary, PaperFill, PaperIntent, PaperLiveReport, PaperTradeRecord, Stage,
 };
 use tokio::sync::RwLock;
 
@@ -170,7 +170,11 @@ impl PaperRuntimeHandle {
         let mut s = self.state.write().await;
         let ts_ms = fill.ts_ms.max(Utc::now().timestamp_millis());
         let mut intent = s.intents.remove(fill.order_id.as_str()).unwrap_or_else(|| {
-            fallback_intent(fill, ts_ms, self.seat.history(1).into_iter().next().as_ref())
+            fallback_intent(
+                fill,
+                ts_ms,
+                self.seat.history(1).into_iter().next().as_ref(),
+            )
         });
         intent.requested_size_contracts = intent.requested_size_contracts.max(fill.size);
         intent.requested_size_usdc = intent
@@ -214,7 +218,8 @@ impl PaperRuntimeHandle {
         let now_ms = book.ts_ms.max(Utc::now().timestamp_millis());
         if let Some(price) = chainlink_settlement_price {
             if price.is_finite() && price > 0.0 {
-                s.chainlink_aux_by_market.insert(book.market_id.clone(), price);
+                s.chainlink_aux_by_market
+                    .insert(book.market_id.clone(), price);
             }
         }
         let mid_yes = (book.bid_yes + book.ask_yes) * 0.5;
@@ -296,7 +301,11 @@ impl PaperRuntimeHandle {
         ts_ms: i64,
     ) {
         let key = lot_key(fill.market_id.as_str(), &fill.side);
-        let has_existing = s.open_lots.get(&key).map(|v| !v.is_empty()).unwrap_or(false);
+        let has_existing = s
+            .open_lots
+            .get(&key)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
         if matches!(intent.action, PaperAction::Enter | PaperAction::Add) {
             intent.action = if has_existing {
                 PaperAction::Add
@@ -320,7 +329,11 @@ impl PaperRuntimeHandle {
             requested_size_usdc: intent.requested_size_usdc,
             entry_price: fill.price,
             remaining_size: fill.size.max(0.0),
-            entry_fee_per_contract: if fill.size > 0.0 { fill.fee / fill.size } else { 0.0 },
+            entry_fee_per_contract: if fill.size > 0.0 {
+                fill.fee / fill.size
+            } else {
+                0.0
+            },
             opened_ts_ms: ts_ms,
             seat_layer: intent.seat_layer,
             tuned_params_before: intent.tuned_params_before,
@@ -357,7 +370,11 @@ impl PaperRuntimeHandle {
             }
             return;
         }
-        let exit_fee_per_contract = if fill.size > 0.0 { fill.fee / fill.size } else { 0.0 };
+        let exit_fee_per_contract = if fill.size > 0.0 {
+            fill.fee / fill.size
+        } else {
+            0.0
+        };
         while remaining > 1e-12 {
             let Some(front) = lots.front_mut() else {
                 break;
@@ -613,9 +630,18 @@ impl PaperRuntimeHandle {
         });
         let daily = build_daily_summaries(s);
         write_json_file(dataset_path("reports", "paper_live_latest.json"), &live);
-        write_json_file(dataset_path("reports", "paper_summary_latest.json"), &summary);
-        write_json_file(dataset_path("reports", "paper_diagnosis_latest.json"), &diagnosis);
-        write_daily_csv(dataset_path("reports", "daily_compound_summary.csv"), &daily);
+        write_json_file(
+            dataset_path("reports", "paper_summary_latest.json"),
+            &summary,
+        );
+        write_json_file(
+            dataset_path("reports", "paper_diagnosis_latest.json"),
+            &diagnosis,
+        );
+        write_daily_csv(
+            dataset_path("reports", "daily_compound_summary.csv"),
+            &daily,
+        );
         for day in &daily {
             self.sqlite.push_daily(day);
         }
@@ -631,7 +657,11 @@ pub(crate) fn global_paper_runtime() -> Option<Arc<PaperRuntimeHandle>> {
     GLOBAL_PAPER_RUNTIME.get().cloned()
 }
 
-fn fallback_intent(fill: &FillEvent, ts_ms: i64, decision: Option<&SeatDecisionRecord>) -> PaperIntent {
+fn fallback_intent(
+    fill: &FillEvent,
+    ts_ms: i64,
+    decision: Option<&SeatDecisionRecord>,
+) -> PaperIntent {
     let (tuned_before, tuned_after, rollback_triggered, shadow_pnl_comparison) =
         extract_last_decision(decision);
     PaperIntent {
@@ -828,11 +858,19 @@ fn build_analytics(records: &VecDeque<PaperTradeRecord>) -> PaperAnalytics {
     let mut shadow_pnl_cnt = 0_u64;
 
     for r in records {
-        *out.stage_distribution.entry(enum_text(&r.stage)).or_default() += 1;
-        *out.action_distribution.entry(enum_text(&r.action)).or_default() += 1;
-        *out.timeframe_distribution.entry(r.timeframe.clone()).or_default() += 1;
+        *out.stage_distribution
+            .entry(enum_text(&r.stage))
+            .or_default() += 1;
+        *out.action_distribution
+            .entry(enum_text(&r.action))
+            .or_default() += 1;
+        *out.timeframe_distribution
+            .entry(r.timeframe.clone())
+            .or_default() += 1;
         if let Some(layer) = &r.seat_layer {
-            *out.seat_layer_distribution.entry(layer.clone()).or_default() += 1;
+            *out.seat_layer_distribution
+                .entry(layer.clone())
+                .or_default() += 1;
         }
         if r.rollback_triggered.is_some() {
             out.seat_rollback_count = out.seat_rollback_count.saturating_add(1);
@@ -923,10 +961,12 @@ fn build_root_causes(live: &PaperLiveReport, analytics: &PaperAnalytics) -> Vec<
         causes.push("taker_slippage_excessive_consider_maker_bias_or_spread_filter".to_string());
     }
     if analytics.reversal_loss_rate > 0.60 && analytics.reversal_count >= 10 {
-        causes.push("reversal_exit_rule_quality_low_check_velocity_and_edge_thresholds".to_string());
+        causes
+            .push("reversal_exit_rule_quality_low_check_velocity_and_edge_thresholds".to_string());
     }
     if live.max_drawdown_pct > 20.0 {
-        causes.push("risk_controls_too_loose_reduce_position_fraction_or_drawdown_limit".to_string());
+        causes
+            .push("risk_controls_too_loose_reduce_position_fraction_or_drawdown_limit".to_string());
     }
     if causes.is_empty() {
         causes.push("no_critical_issue_detected".to_string());

@@ -28,8 +28,8 @@ use timeframe_router::{RouterConfig, TimeframeRouter};
 use tokio::sync::RwLock;
 
 use crate::engine_core::{is_gate_block_reason, is_policy_block_reason, is_quote_reject_reason};
-use crate::paper_runtime::PaperRuntimeHandle;
 use crate::gate_eval;
+use crate::paper_runtime::PaperRuntimeHandle;
 use crate::report_io::{
     append_jsonl, build_market_scorecard, dataset_path, fillability_ratio,
     next_normalized_ingest_seq, survival_ratio,
@@ -317,8 +317,6 @@ impl Default for PredatorCrossSymbolConfig {
 pub(crate) struct EngineShared {
     pub(crate) latest_books: Arc<RwLock<HashMap<String, BookTop>>>,
     pub(crate) latest_signals: Arc<DashMap<String, SignalCacheEntry>>,
-    pub(crate) latest_fast_ticks: Arc<DashMap<String, RefTick>>,
-    pub(crate) latest_anchor_ticks: Arc<DashMap<String, RefTick>>,
     pub(crate) market_to_symbol: Arc<RwLock<HashMap<String, String>>>,
     pub(crate) token_to_symbol: Arc<RwLock<HashMap<String, String>>>,
     pub(crate) market_to_timeframe: Arc<RwLock<HashMap<String, TimeframeClass>>>,
@@ -1759,25 +1757,6 @@ impl ShadowStats {
         self.ref_dedupe_dropped.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn mark_share_cap_drop(&self) {
-        self.share_cap_drop_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(crate) async fn mark_fallback_trigger_reason(&self, reason: &str) {
-        let mut reasons = self.fallback_trigger_reasons.write().await;
-        *reasons.entry(reason.to_string()).or_insert(0) += 1;
-    }
-
-    pub(crate) fn set_fallback_state(&self, state: &str) {
-        let code = match state {
-            "ws_primary" => 0,
-            "armed" => 1,
-            "udp_fallback" => 2,
-            "cooldown" => 3,
-            _ => 0,
-        };
-        self.fallback_state_code.store(code, Ordering::Relaxed);
-    }
 
     pub(crate) fn mark_book_tick(&self, ts_ms: i64) {
         self.book_ticks_total.fetch_add(1, Ordering::Relaxed);

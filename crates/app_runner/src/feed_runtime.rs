@@ -14,12 +14,14 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::fusion_engine::{
     is_anchor_ref_source, is_ref_tick_duplicate, max_book_top_diff_bps, ref_event_ts_ms,
-    should_arm_ws_primary_fallback, should_enforce_udp_share_cap, should_log_ref_tick,
-    should_replace_anchor_tick, should_replace_ref_tick, udp_downweight_keep_every,
-    udp_min_freshness_score, upsert_latest_tick_slot, ws_primary_fallback_gap_ns,
+    should_log_ref_tick, should_replace_anchor_tick, should_replace_ref_tick,
+    upsert_latest_tick_slot_local,
 };
 use crate::report_io::{append_jsonl_line, dataset_path, sha256_hex};
-use crate::state::{EngineShared, FusionConfig, ShadowStats, SourceHealthConfig, StrategyIngress, StrategyIngressMsg};
+use crate::state::{
+    EngineShared, FusionConfig, ShadowStats, SourceHealthConfig, StrategyIngress,
+    StrategyIngressMsg,
+};
 use crate::stats_utils::{now_ns, value_to_f64};
 use crate::{publish_if_telemetry_subscribers, spawn_detached};
 
@@ -132,11 +134,9 @@ pub(super) fn spawn_reference_feed(
         let mut source_runtime: HashMap<SmolStr, SourceRuntimeStats> = HashMap::new();
         let mut latest_price_by_symbol_source: HashMap<String, HashMap<SmolStr, f64>> =
             HashMap::new();
-        let mut latest_ws_recv_ns_global: i64 = 0;
-        let mut ws_primary_fallback_until_ns: i64 = 0;
-        let mut ws_primary_ready_seen = false;
-        let mut ws_cap_breach_started_ns: i64 = 0;
         let mut accepted_fast_mix_by_symbol: HashMap<String, (u64, u64)> = HashMap::new();
+        let mut local_fast_ticks: HashMap<String, RefTick> = HashMap::new();
+        let mut local_anchor_ticks: HashMap<String, RefTick> = HashMap::new();
         let mut accepted_fast_mix_total: (u64, u64) = (0, 0);
         let mut fusion = fusion_cfg.read().await.clone();
         let mut last_fusion_mode = fusion.mode.clone();
@@ -163,19 +163,16 @@ pub(super) fn spawn_reference_feed(
                         if next_fusion.mode != last_fusion_mode {
                             accepted_fast_mix_by_symbol.clear();
                             accepted_fast_mix_total = (0, 0);
-                            ws_primary_ready_seen = false;
-                            ws_primary_fallback_until_ns = 0;
-                            ws_cap_breach_started_ns = 0;
-                            stats.record_issue("fusion_mode_switch_fast_cache_reset").await;
+                            stats
+                                .record_issue("fusion_mode_switch_fast_cache_reset")
+                                .await;
                             last_fusion_mode = next_fusion.mode.clone();
                         }
                         fusion = next_fusion;
                         fusion_cfg_refresh_at = Instant::now();
                     }
                     let is_anchor = is_anchor_ref_source(tick.source.as_str());
-                    if fusion.mode == "udp_only" && !matches!(lane, RefLane::Udp) && !is_anchor {
-                        continue;
-                    }
+
                     if fusion.mode == "direct_only"
                         && !matches!(lane, RefLane::Direct)
                         && !is_anchor
@@ -218,12 +215,11 @@ pub(super) fn spawn_reference_feed(
                     let symbol_key = tick.symbol.clone();
                     let recv_ts_ms = tick.recv_ts_ms;
                     if source_key == "binance_ws" {
-                        let recv_ns = if tick.recv_ts_local_ns > 0 {
+                        let _recv_ns = if tick.recv_ts_local_ns > 0 {
                             tick.recv_ts_local_ns
                         } else {
                             now_ns()
                         };
-                        latest_ws_recv_ns_global = latest_ws_recv_ns_global.max(recv_ns);
                     }
                     let latency_ms = recv_ts_ms.saturating_sub(source_ts).max(0) as f64;
                     let runtime = source_runtime.entry(source_key.clone()).or_default();
@@ -275,135 +271,7 @@ pub(super) fn spawn_reference_feed(
                         let mut map = shared.source_health_latest.write().await;
                         map.insert(source_key.to_string(), source_health.clone());
                     }
-                    if tick.source == "binance_udp" {
-                        let (udp_samples, ws_samples) = accepted_fast_mix_total;
-                        let fast_total = udp_samples.saturating_add(ws_samples);
-                        let udp_share = if fast_total > 0 {
-                            udp_samples as f64 / fast_total as f64
-                        } else {
-                            0.0
-                        };
-                        let (sym_udp_samples, sym_ws_samples) = accepted_fast_mix_by_symbol
-                            .get(tick.symbol.as_str())
-                            .copied()
-                            .unwrap_or((0, 0));
-                        let sym_fast_total = sym_udp_samples.saturating_add(sym_ws_samples);
-                        let udp_share_symbol = if sym_fast_total > 0 {
-                            sym_udp_samples as f64 / sym_fast_total as f64
-                        } else {
-                            udp_share
-                        };
-                        let effective_udp_share = if sym_fast_total >= 32 {
-                            udp_share_symbol
-                        } else {
-                            udp_share
-                        };
-                        let jitter_high =
-                            source_health.jitter_ms > fusion.jitter_threshold_ms.max(1.0);
-                        let freshness_low =
-                            source_health.freshness_score < udp_min_freshness_score();
-                        let now_recv_ns = if tick.recv_ts_local_ns > 0 {
-                            tick.recv_ts_local_ns
-                        } else {
-                            now_ns()
-                        };
-                        let ws_gap_ns = if latest_ws_recv_ns_global > 0 {
-                            now_recv_ns.saturating_sub(latest_ws_recv_ns_global)
-                        } else {
-                            i64::MAX
-                        };
-                        let ws_cap_ready = ws_gap_ns <= ws_primary_fallback_gap_ns();
-                        if ws_cap_ready {
-                            ws_primary_ready_seen = true;
-                            ws_cap_breach_started_ns = 0;
-                        } else if ws_primary_ready_seen && ws_cap_breach_started_ns == 0 {
-                            ws_cap_breach_started_ns = now_recv_ns;
-                        }
-                        let ws_breach_persisted = ws_cap_breach_started_ns > 0
-                            && now_recv_ns.saturating_sub(ws_cap_breach_started_ns)
-                                >= (fusion.fallback_arm_duration_ms as i64)
-                                    .saturating_mul(1_000_000);
-                        let fallback_active_now = fusion.mode == "websocket_primary"
-                            && now_recv_ns < ws_primary_fallback_until_ns;
-                        if should_arm_ws_primary_fallback(
-                            fusion.mode.as_str(),
-                            ws_cap_ready,
-                            ws_breach_persisted,
-                            fallback_active_now,
-                        ) {
-                            let cooldown_ns =
-                                (fusion.fallback_cooldown_sec as i64).saturating_mul(1_000_000_000);
-                            ws_primary_fallback_until_ns =
-                                now_recv_ns.saturating_add(cooldown_ns.max(0));
-                            metrics::counter!("fusion.ws_primary_fallback_arm").increment(1);
-                            stats.mark_fallback_trigger_reason("ws_gap_persisted").await;
-                        }
 
-                        let fallback_active = fusion.mode == "websocket_primary"
-                            && now_recv_ns < ws_primary_fallback_until_ns;
-                        if fallback_active {
-                            metrics::counter!("fusion.ws_primary_fallback_active").increment(1);
-                        }
-                        let fallback_state = if fallback_active {
-                            if ws_cap_ready {
-                                "cooldown"
-                            } else {
-                                "udp_fallback"
-                            }
-                        } else if ws_cap_breach_started_ns > 0 {
-                            "armed"
-                        } else {
-                            "ws_primary"
-                        };
-                        stats.set_fallback_state(fallback_state);
-
-                        let target_share = fusion.udp_share_cap.clamp(0.05, 0.95);
-                        let projected_udp_share = if fast_total > 0 {
-                            (udp_samples.saturating_add(1) as f64)
-                                / (fast_total.saturating_add(1) as f64)
-                        } else {
-                            1.0
-                        };
-                        let projected_share_violation = projected_udp_share > target_share;
-                        // In websocket_primary / active_active we hard-enforce the UDP share cap
-                        // outside explicit fallback windows. If WS is unhealthy, fallback state
-                        // should arm and take over; until then we still constrain UDP dominance.
-                        let enforce_ws_primary = should_enforce_udp_share_cap(
-                            fusion.mode.as_str(),
-                            fallback_active,
-                            projected_share_violation,
-                        );
-
-                        if enforce_ws_primary {
-                            metrics::counter!("fusion.udp_downweight_drop").increment(1);
-                            metrics::counter!("fusion.udp_share_cap_drop").increment(1);
-                            stats.mark_share_cap_drop();
-                            continue;
-                        }
-
-                        if ws_cap_ready && (jitter_high || freshness_low) {
-                            let share_ratio = (effective_udp_share / target_share).max(1.0);
-                            let base_keep_every = udp_downweight_keep_every().max(2);
-                            let dynamic_keep = share_ratio.ceil() as usize;
-                            let jitter_boost = if jitter_high { 2 } else { 1 };
-                            let freshness_boost = if freshness_low { 2 } else { 1 };
-                            let keep_every = base_keep_every
-                                .max(dynamic_keep)
-                                .max(base_keep_every.saturating_mul(jitter_boost))
-                                .max(base_keep_every.saturating_mul(freshness_boost))
-                                .clamp(2, 16);
-                            if (ingest_seq % keep_every as u64) != 0 {
-                                metrics::counter!("fusion.udp_downweight_drop").increment(1);
-                                if jitter_high {
-                                    metrics::counter!("fusion.udp_jitter_drop").increment(1);
-                                }
-                                if freshness_low {
-                                    metrics::counter!("fusion.udp_freshness_drop").increment(1);
-                                }
-                                continue;
-                            }
-                        }
-                    }
                     if should_log_ref_tick(ingest_seq) {
                         let tick_json =
                             serde_json::to_string(&tick).unwrap_or_else(|_| "{}".to_string());
@@ -448,13 +316,13 @@ pub(super) fn spawn_reference_feed(
                     }
 
                     if is_anchor {
-                        let _ = upsert_latest_tick_slot(
-                            &shared.latest_anchor_ticks,
+                        let _ = upsert_latest_tick_slot_local(
+                            &mut local_anchor_ticks,
                             tick.clone(),
                             should_replace_anchor_tick,
                         );
-                    } else if let Some(delta_ns) = upsert_latest_tick_slot(
-                        &shared.latest_fast_ticks,
+                    } else if let Some(delta_ns) = upsert_latest_tick_slot_local(
+                        &mut local_fast_ticks,
                         tick.clone(),
                         should_replace_ref_tick,
                     ) {
@@ -560,13 +428,13 @@ pub(super) async fn settlement_prob_yes_for_symbol(
     shared: &Arc<EngineShared>,
     symbol: &str,
     p_fast_yes: f64,
+    latest_fast_ticks: &std::collections::HashMap<String, RefTick>,
+    latest_anchor_ticks: &std::collections::HashMap<String, RefTick>,
     now_ms: i64,
 ) -> Option<f64> {
     let settle_price = {
-        let anchor = shared
-            .latest_anchor_ticks
+        let anchor = latest_anchor_ticks
             .get(symbol)
-            .map(|tick| tick.value().clone())
             .filter(|tick| {
                 is_anchor_ref_source(tick.source.as_str())
                     && now_ms.saturating_sub(ref_event_ts_ms(tick)) <= 5_000
@@ -581,7 +449,7 @@ pub(super) async fn settlement_prob_yes_for_symbol(
     if settle_price <= 0.0 {
         return None;
     }
-    let fast_price = shared.latest_fast_ticks.get(symbol).map(|t| t.price)?;
+    let fast_price = latest_fast_ticks.get(symbol).map(|t| t.price)?;
     if fast_price <= 0.0 {
         return None;
     }

@@ -215,7 +215,10 @@ fn numeric_delta(prev: Option<f64>, next: Option<f64>) -> Option<f64> {
     }
 }
 
-pub(crate) fn write_tune_report(record: &SeatDecisionRecord, state: &SeatRuntimeState) -> Result<()> {
+pub(crate) fn write_tune_report(
+    record: &SeatDecisionRecord,
+    state: &SeatRuntimeState,
+) -> Result<()> {
     ensure_seat_dir()?;
     fs::create_dir_all(seat_reports_dir()).context("create seat reports dir")?;
 
@@ -317,7 +320,10 @@ pub(crate) fn write_tune_report(record: &SeatDecisionRecord, state: &SeatRuntime
     md.push_str(&format!("- layer: {}\n", record.layer.as_str()));
     md.push_str(&format!("- decision: {}\n", record.decision));
     md.push_str(&format!("- rollback: {}\n", record.rollback));
-    md.push_str(&format!("- trade_count_source: {}\n", record.trade_count_source));
+    md.push_str(&format!(
+        "- trade_count_source: {}\n",
+        record.trade_count_source
+    ));
     md.push_str(&format!(
         "- baseline_ev_usdc_p50: {:.6}\n",
         record.baseline.ev_usdc_p50

@@ -46,4 +46,6 @@ tokio-tungstenite.workspace = true
 tracing-subscriber.workspace = true
 socket2 = "0.6.2"
 flate2 = "1.0"
+crossbeam-queue = "0.3"
+crossbeam-utils = "0.8"
 rusqlite = { version = "0.31", features = ["bundled"] }

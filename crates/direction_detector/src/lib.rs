@@ -74,7 +74,6 @@ impl Default for DirectionConfig {
     }
 }
 
-
 #[derive(Debug, Default)]
 struct SymbolWindow {
     // (recv_ts_ms, price) — 按时间戳升序
@@ -82,7 +81,6 @@ struct SymbolWindow {
     // 各数据源最新价格和时间戳
     latest_by_source: HashMap<String, f64>,
     latest_ts_by_source: HashMap<String, i64>,
-
 
     /// 最近 tick_rate_short_ms 内的 tick 数
     short_window_count: u32,
@@ -92,7 +90,6 @@ struct SymbolWindow {
     consecutive_dir_count: u8,
     /// 最后一个 tick 的方向符号: -1/0/1
     last_dir_sign: i8,
-
 
     /// 已见过的 Binance 源 key (第一次见到时缓存)
     binance_source_key: Option<String>,
@@ -152,15 +149,16 @@ impl DirectionDetector {
         if let Some(price_ref) = w.latest_by_source.get_mut(tick.source.as_str()) {
             *price_ref = tick.price;
         } else {
-            w.latest_by_source.insert(tick.source.to_string(), tick.price);
+            w.latest_by_source
+                .insert(tick.source.to_string(), tick.price);
         }
 
         if let Some(ts_ref) = w.latest_ts_by_source.get_mut(tick.source.as_str()) {
             *ts_ref = tick.recv_ts_ms;
         } else {
-            w.latest_ts_by_source.insert(tick.source.to_string(), tick.recv_ts_ms);
+            w.latest_ts_by_source
+                .insert(tick.source.to_string(), tick.recv_ts_ms);
         }
-
 
         if let Some(&(_, prev_price)) = w.ticks.back() {
             if prev_price > 0.0 && tick.price > 0.0 {
@@ -185,7 +183,6 @@ impl DirectionDetector {
         }
 
         w.ticks.push_back((tick.recv_ts_ms, tick.price));
-
 
         let short_ms = self.cfg_tick_rate_short_ms;
         let long_ms = self.cfg_tick_rate_long_ms;
@@ -356,7 +353,6 @@ struct SourceVote {
     secondary_confirms: bool,
 }
 
-
 fn source_vote_cached(
     latest_by_source: &HashMap<String, f64>,
     latest_ts_by_source: &HashMap<String, i64>,
@@ -405,7 +401,6 @@ fn source_vote_cached(
     out
 }
 
-
 #[inline]
 fn is_binance_source(source: &str) -> bool {
     let b = source.as_bytes();
@@ -417,7 +412,6 @@ fn is_chainlink_source(source: &str) -> bool {
     let b = source.as_bytes();
     b.windows(9).any(|w| w.eq_ignore_ascii_case(b"chainlink"))
 }
-
 
 fn kinematics_from_ticks(ticks: &VecDeque<(i64, f64)>) -> (f64, f64) {
     if ticks.len() < 3 {

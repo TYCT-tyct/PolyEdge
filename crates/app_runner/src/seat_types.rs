@@ -174,11 +174,7 @@ impl SeatParameterSet {
                 current.maturity_size_scale,
                 max_step_pct,
             ),
-            late_size_scale: clamp_opt(
-                self.late_size_scale,
-                current.late_size_scale,
-                max_step_pct,
-            ),
+            late_size_scale: clamp_opt(self.late_size_scale, current.late_size_scale, max_step_pct),
             min_edge_net_bps: clamp_opt(
                 self.min_edge_net_bps,
                 current.min_edge_net_bps,

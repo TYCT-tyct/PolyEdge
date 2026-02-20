@@ -213,7 +213,6 @@ impl TakerSniper {
     }
 }
 
-
 #[inline]
 fn skip_static(reason: &'static str) -> TakerDecision {
     TakerDecision {
@@ -232,10 +231,8 @@ fn skip_dynamic(reason: String) -> TakerDecision {
     }
 }
 
-
 fn compute_win_rate_score(ctx: &EvaluateCtx<'_>) -> f64 {
     let sig = ctx.direction_signal;
-
 
     let velocity_score = match sig.velocity_bps_per_sec.abs() {
         v if v >= 100.0 => 20.0,
@@ -255,7 +252,6 @@ fn compute_win_rate_score(ctx: &EvaluateCtx<'_>) -> f64 {
     };
     let signal_quality = velocity_score + accel_score + tick_score;
 
-
     let p = ctx.entry_price.clamp(0.0, 1.0);
     let dist = (p - 0.5).abs(); // 0=中间, 0.5=极端
     let zone_score = match dist {
@@ -274,7 +270,6 @@ fn compute_win_rate_score(ctx: &EvaluateCtx<'_>) -> f64 {
     // triple_confirm: 三重确认通过是高质量信号的标志
     let confirm_score = if sig.triple_confirm { 5.0 } else { 0.0 };
     let market_quality = zone_score + spread_score + confirm_score;
-
 
     let spike_score = if sig.momentum_spike { 15.0 } else { 0.0 };
     // edge: 预期盈利越高，时序价值越大

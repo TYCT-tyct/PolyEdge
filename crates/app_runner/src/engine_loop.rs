@@ -5,10 +5,10 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use core_types::{
-    new_id, BookTop, ControlCommand, Direction, EdgeAttribution, EngineEvent,
-    ExecutionStyle, ExecutionVenue, FairValueModel, InventoryState, MarketHealth, OrderAck,
-    OrderIntentV2, OrderSide, OrderTimeInForce, PaperAction, QuoteEval, QuoteIntent, RefTick,
-    ShadowOutcome, ShadowShot, Stage, TimeframeClass, ToxicRegime,
+    new_id, BookTop, ControlCommand, Direction, EdgeAttribution, EngineEvent, ExecutionStyle,
+    ExecutionVenue, FairValueModel, InventoryState, MarketHealth, OrderAck, OrderIntentV2,
+    OrderSide, OrderTimeInForce, PaperAction, QuoteEval, QuoteIntent, RefTick, ShadowOutcome,
+    ShadowShot, Stage, TimeframeClass, ToxicRegime,
 };
 use execution_clob::ClobExecution;
 use exit_manager::{ExitReason, MarketEvalInput};
@@ -19,7 +19,6 @@ use paper_executor::ShadowExecutor;
 use portfolio::PortfolioBook;
 use tokio::sync::{mpsc, RwLock};
 
-use crate::paper_runtime::{global_paper_runtime, PaperIntentCtx};
 use crate::execution_eval::{
     aggressive_price_for_side, classify_filled_outcome, classify_unfilled_outcome, edge_for_intent,
     evaluate_fillable, evaluate_survival, get_fee_rate_bps_cached, get_rebate_bps_cached,
@@ -29,6 +28,7 @@ use crate::fusion_engine::{
     compute_coalesce_policy, estimate_feed_latency, fast_tick_allowed_in_fusion_mode,
     insert_latest_ref_tick, is_anchor_ref_source, pick_latest_tick, ref_event_ts_ms, TokenBucket,
 };
+use crate::paper_runtime::{global_paper_runtime, PaperIntentCtx};
 use crate::report_io::{
     append_jsonl, current_jsonl_queue_depth, dataset_path, next_normalized_ingest_seq,
 };
@@ -148,9 +148,6 @@ pub(crate) fn spawn_strategy_engine(
             let current_fusion_mode = shared.fusion_cfg.read().await.mode.clone();
             if current_fusion_mode != last_fusion_mode {
                 latest_fast_ticks.retain(|_, tick| {
-                    fast_tick_allowed_in_fusion_mode(tick.source.as_str(), &current_fusion_mode)
-                });
-                shared.latest_fast_ticks.retain(|_, tick| {
                     fast_tick_allowed_in_fusion_mode(tick.source.as_str(), &current_fusion_mode)
                 });
                 last_fusion_mode = current_fusion_mode.clone();
@@ -344,24 +341,17 @@ pub(crate) fn spawn_strategy_engine(
                         }
                         continue;
                     };
-                    let tick_fast_owned = shared
-                        .latest_fast_ticks
-                        .get(symbol.as_str())
-                        .map(|entry| entry.value().clone())
-                        .and_then(|tick| {
-                            if fast_tick_allowed_in_fusion_mode(
-                                tick.source.as_str(),
-                                &current_fusion_mode,
-                            ) {
-                                Some(tick)
-                            } else {
-                                None
-                            }
-                        });
-                    let tick_fast = tick_fast_owned
-                        .as_ref()
-                        .or_else(|| pick_latest_tick(&latest_fast_ticks, &symbol));
-                    let Some(tick_fast) = tick_fast else {
+                    let tick_fast_filtered = pick_latest_tick(&latest_fast_ticks, &symbol).and_then(|tick| {
+                        if fast_tick_allowed_in_fusion_mode(
+                            tick.source.as_str(),
+                            &current_fusion_mode,
+                        ) {
+                            Some(tick)
+                        } else {
+                            None
+                        }
+                    });
+                    let Some(tick_fast) = tick_fast_filtered else {
                         shared.shadow_stats.record_issue("tick_missing").await;
                         continue;
                     };
@@ -376,13 +366,7 @@ pub(crate) fn spawn_strategy_engine(
                             .await;
                         continue;
                     }
-                    let tick_anchor_owned = shared
-                        .latest_anchor_ticks
-                        .get(symbol.as_str())
-                        .map(|entry| entry.value().clone());
-                    let tick_anchor = tick_anchor_owned
-                        .as_ref()
-                        .or_else(|| pick_latest_tick(&latest_anchor_ticks, &symbol));
+                    let tick_anchor = pick_latest_tick(&latest_anchor_ticks, &symbol);
                     if let Some(anchor) = tick_anchor {
                         let now_ms = Utc::now().timestamp_millis();
                         let age_ms = now_ms - ref_event_ts_ms(anchor);
@@ -686,9 +670,16 @@ pub(crate) fn spawn_strategy_engine(
                     };
 
                     let decision_compute_ms = signal_start.elapsed().as_secs_f64() * 1_000.0;
-                    shared.shadow_stats.push_decision_compute_ms(decision_compute_ms).await;
-                    let tick_to_decision_ms = ((now_ns() - tick_fast.recv_ts_local_ns).max(0) as f64) / 1_000_000.0;
-                    shared.shadow_stats.push_tick_to_decision_ms(tick_to_decision_ms).await;
+                    shared
+                        .shadow_stats
+                        .push_decision_compute_ms(decision_compute_ms)
+                        .await;
+                    let tick_to_decision_ms =
+                        ((now_ns() - tick_fast.recv_ts_local_ns).max(0) as f64) / 1_000_000.0;
+                    shared
+                        .shadow_stats
+                        .push_tick_to_decision_ms(tick_to_decision_ms)
+                        .await;
 
                     let spread_yes = (book.ask_yes - book.bid_yes).max(0.0);
                     let effective_max_spread = adaptive_max_spread(
@@ -814,8 +805,9 @@ pub(crate) fn spawn_strategy_engine(
                             &mut global_rate_budget,
                             &predator_cfg,
                             &symbol,
-                            tick_fast.recv_ts_ms,
-                            tick_fast.recv_ts_local_ns,
+                            tick_fast,
+                            &latest_fast_ticks,
+                            &latest_anchor_ticks,
                             now_ms,
                             None,
                         )
@@ -907,7 +899,12 @@ async fn reentry_candidate_for_market(
     maker_min_edge_bps: f64,
     fail_cost_bps: f64,
 ) -> Option<(OrderIntentV2, BookTop)> {
-    let book = shared.latest_books.read().await.get(target_market_id).cloned()?;
+    let book = shared
+        .latest_books
+        .read()
+        .await
+        .get(target_market_id)
+        .cloned()?;
     let fee_rate_bps = get_fee_rate_bps_cached(shared, target_market_id).await;
     let mut order = build_reversal_reentry_order(
         target_market_id,
@@ -1168,9 +1165,12 @@ pub(crate) fn spawn_predator_exit_lifecycle(
                                                 (total_ms - now_ms.rem_euclid(total_ms)).max(0);
                                             let rem_ratio =
                                                 (rem_ms as f64 / total_ms as f64).clamp(0.0, 1.0);
-                                            let predator_cfg = shared.predator_cfg.read().await.clone();
-                                            let phase =
-                                                classify_time_phase(rem_ratio, &predator_cfg.v52.time_phase);
+                                            let predator_cfg =
+                                                shared.predator_cfg.read().await.clone();
+                                            let phase = classify_time_phase(
+                                                rem_ratio,
+                                                &predator_cfg.v52.time_phase,
+                                            );
                                             stage_for_phase(phase, true)
                                         } else {
                                             Stage::Maturity
@@ -1649,4 +1649,3 @@ async fn market_is_tracked(shared: &EngineShared, book: &BookTop) -> bool {
     let token_map = shared.token_to_symbol.read().await;
     token_map.contains_key(&book.token_id_yes) || token_map.contains_key(&book.token_id_no)
 }
-

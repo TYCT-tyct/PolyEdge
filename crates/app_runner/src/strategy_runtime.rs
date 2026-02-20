@@ -17,14 +17,15 @@ use risk_engine::RiskLimits;
 use strategy_maker::MakerConfig;
 use taker_sniper::{FirePlan, TakerAction};
 
+use core_types::RefTick;
 use crate::engine_core::{classify_execution_error_reason, normalize_reject_code};
-use crate::paper_runtime::{global_paper_runtime, PaperIntentCtx};
 use crate::execution_eval::{
     aggressive_price_for_side, edge_gross_bps_for_side, get_fee_rate_bps_cached,
     get_rebate_bps_cached, mid_for_side, prebuild_order_payload, spread_for_side,
 };
 use crate::feed_runtime::settlement_prob_yes_for_symbol;
 use crate::fusion_engine::TokenBucket;
+use crate::paper_runtime::{global_paper_runtime, PaperIntentCtx};
 use crate::state::{
     EngineShared, PredatorCConfig, PredatorCPriority, PredatorRegimeConfig, SourceHealthConfig,
     V52DualArbConfig, V52ExecutionConfig, V52TimePhaseConfig,
@@ -34,7 +35,7 @@ use crate::strategy_policy::{
     adaptive_size_scale, edge_gate_bps, inventory_for_market, timeframe_weight,
 };
 use crate::{
-    publish_if_telemetry_subscribers, spawn_predator_exit_lifecycle, spawn_detached,
+    publish_if_telemetry_subscribers, spawn_detached, spawn_predator_exit_lifecycle,
     spawn_shadow_outcome_task, PredatorExecResult,
 };
 
@@ -175,7 +176,11 @@ fn spawn_force_taker_fallback_for_maker(
         if !execution.has_open_order(&maker_order_id) {
             return;
         }
-        if execution.cancel_order(&maker_order_id, &market_id).await.is_err() {
+        if execution
+            .cancel_order(&maker_order_id, &market_id)
+            .await
+            .is_err()
+        {
             return;
         }
         shadow.cancel(&maker_order_id);
@@ -294,8 +299,9 @@ pub(super) async fn evaluate_and_route_v52(
     global_rate_budget: &mut TokenBucket,
     predator_cfg: &PredatorCConfig,
     symbol: &str,
-    tick_fast_recv_ts_ms: i64,
-    tick_fast_recv_ts_local_ns: i64,
+    tick_fast: &RefTick,
+    latest_fast_ticks: &std::collections::HashMap<String, RefTick>,
+    latest_anchor_ticks: &std::collections::HashMap<String, RefTick>,
     now_ms: i64,
     direction_override: Option<DirectionSignal>,
 ) -> PredatorExecResult {
@@ -309,8 +315,9 @@ pub(super) async fn evaluate_and_route_v52(
         global_rate_budget,
         predator_cfg,
         symbol,
-        tick_fast_recv_ts_ms,
-        tick_fast_recv_ts_local_ns,
+        tick_fast,
+        latest_fast_ticks,
+        latest_anchor_ticks,
         now_ms,
         direction_override.clone(),
     )
@@ -337,8 +344,8 @@ pub(super) async fn evaluate_and_route_v52(
             global_rate_budget,
             predator_cfg,
             &leader_direction,
-            tick_fast_recv_ts_ms,
-            tick_fast_recv_ts_local_ns,
+            latest_fast_ticks,
+            latest_anchor_ticks,
             now_ms,
         )
         .await;
@@ -356,8 +363,9 @@ pub(super) async fn evaluate_and_route_v52(
             global_rate_budget,
             predator_cfg,
             symbol,
-            tick_fast_recv_ts_ms,
-            tick_fast_recv_ts_local_ns,
+            tick_fast,
+            latest_fast_ticks,
+            latest_anchor_ticks,
             now_ms,
         )
         .await;
@@ -377,8 +385,9 @@ pub(super) async fn run_predator_c_for_symbol(
     global_rate_budget: &mut TokenBucket,
     predator_cfg: &PredatorCConfig,
     symbol: &str,
-    tick_fast_recv_ts_ms: i64,
-    tick_fast_recv_ts_local_ns: i64,
+    tick_fast: &RefTick,
+    latest_fast_ticks: &std::collections::HashMap<String, RefTick>,
+    latest_anchor_ticks: &std::collections::HashMap<String, RefTick>,
     now_ms: i64,
     direction_override: Option<DirectionSignal>,
 ) -> PredatorExecResult {
@@ -403,10 +412,7 @@ pub(super) async fn run_predator_c_for_symbol(
         return PredatorExecResult::default();
     }
     let source_health_cfg = shared.source_health_cfg.read().await.clone();
-    let primary_fast_source = shared
-        .latest_fast_ticks
-        .get(symbol)
-        .map(|tick| tick.source.clone());
+    let primary_fast_source = Some(tick_fast.source.clone());
     let primary_source_health = {
         let map = shared.source_health_latest.read().await;
         let from_fast = primary_fast_source
@@ -631,14 +637,15 @@ pub(super) async fn run_predator_c_for_symbol(
         let rebate_est_bps = get_rebate_bps_cached(shared, &market_id, fee_bps).await;
         let yes_price = aggressive_price_for_side(&book, &OrderSide::BuyYes);
         let no_price = aggressive_price_for_side(&book, &OrderSide::BuyNo);
-        let dual_arb_ok = allow_dual_side_arb(yes_price, no_price, fee_bps, &predator_cfg.v52.dual_arb);
-        let book_top_lag_ms = if tick_fast_recv_ts_local_ns > 0 && book.recv_ts_local_ns > 0 {
-            ((book.recv_ts_local_ns - tick_fast_recv_ts_local_ns).max(0) as f64) / 1_000_000.0
+        let dual_arb_ok =
+            allow_dual_side_arb(yes_price, no_price, fee_bps, &predator_cfg.v52.dual_arb);
+        let book_top_lag_ms = if tick_fast.recv_ts_local_ns > 0 && book.recv_ts_local_ns > 0 {
+            ((book.recv_ts_local_ns - tick_fast.recv_ts_local_ns).max(0) as f64) / 1_000_000.0
         } else {
             0.0
         };
         let settlement_prob_yes =
-            settlement_prob_yes_for_symbol(shared, symbol, sig_entry.signal.fair_yes, now_ms).await;
+            settlement_prob_yes_for_symbol(shared, symbol, sig_entry.signal.fair_yes, latest_fast_ticks, latest_anchor_ticks, now_ms).await;
         let probability = {
             let engine = shared.predator_probability_engine.read().await;
             engine.estimate(
@@ -657,8 +664,10 @@ pub(super) async fn run_predator_c_for_symbol(
             .shadow_stats
             .push_probability_sample(&probability)
             .await;
-        let yes_edge_gross = edge_gross_bps_for_side(probability.p_settle, &OrderSide::BuyYes, yes_price);
-        let no_edge_gross = edge_gross_bps_for_side(probability.p_settle, &OrderSide::BuyNo, no_price);
+        let yes_edge_gross =
+            edge_gross_bps_for_side(probability.p_settle, &OrderSide::BuyYes, yes_price);
+        let no_edge_gross =
+            edge_gross_bps_for_side(probability.p_settle, &OrderSide::BuyNo, no_price);
         let yes_edge_net = yes_edge_gross - fee_bps + rebate_est_bps - edge_model_cfg.fail_cost_bps;
         let no_edge_net = no_edge_gross - fee_bps + rebate_est_bps - edge_model_cfg.fail_cost_bps;
         if yes_edge_net > 0.0 && no_edge_net > 0.0 && !dual_arb_ok {
@@ -757,23 +766,22 @@ pub(super) async fn run_predator_c_for_symbol(
             plan.opportunity.ts_ms = now_ms;
             plan
         };
-        let evaluate = |sn: &mut taker_sniper::TakerSniper,
-                        cin: &PredatorCandIn,
-                        sig: &DirectionSignal| {
-            sn.evaluate(&taker_sniper::EvaluateCtx {
-                market_id: &cin.market_id,
-                symbol,
-                timeframe: cin.timeframe.clone(),
-                direction_signal: sig,
-                entry_price: cin.entry_price,
-                spread: cin.spread,
-                fee_bps: cin.fee_bps,
-                edge_gross_bps: cin.edge_gross_bps,
-                edge_net_bps: cin.edge_net_bps,
-                size: cin.size,
-                now_ms,
-            })
-        };
+        let evaluate =
+            |sn: &mut taker_sniper::TakerSniper, cin: &PredatorCandIn, sig: &DirectionSignal| {
+                sn.evaluate(&taker_sniper::EvaluateCtx {
+                    market_id: &cin.market_id,
+                    symbol,
+                    timeframe: cin.timeframe.clone(),
+                    direction_signal: sig,
+                    entry_price: cin.entry_price,
+                    spread: cin.spread,
+                    fee_bps: cin.fee_bps,
+                    edge_gross_bps: cin.edge_gross_bps,
+                    edge_net_bps: cin.edge_net_bps,
+                    size: cin.size,
+                    now_ms,
+                })
+            };
         for (_, mut cands) in cand_inputs_by_market {
             if cands.is_empty() {
                 continue;
@@ -853,7 +861,8 @@ pub(super) async fn run_predator_c_for_symbol(
             * predator_cfg.regime.quiet_min_edge_multiplier.max(1.0);
         fire_plans_by_market.retain(|_, plan| plan.opportunity.edge_net_bps >= quiet_min_edge);
         dual_fire_pairs.retain(|(a, b)| {
-            a.opportunity.edge_net_bps >= quiet_min_edge && b.opportunity.edge_net_bps >= quiet_min_edge
+            a.opportunity.edge_net_bps >= quiet_min_edge
+                && b.opportunity.edge_net_bps >= quiet_min_edge
         });
         let chunk_scale = predator_cfg.regime.quiet_chunk_scale.clamp(0.05, 1.0);
         for plan in fire_plans_by_market.values_mut() {
@@ -910,12 +919,14 @@ pub(super) async fn run_predator_c_for_symbol(
             }
         }
         for (plan_a, plan_b) in dual_fire_pairs {
-            let notional = (plan_a.opportunity.entry_price.max(0.0) * plan_a.opportunity.size.max(0.0))
+            let notional = (plan_a.opportunity.entry_price.max(0.0)
+                * plan_a.opportunity.size.max(0.0))
                 + (plan_b.opportunity.entry_price.max(0.0) * plan_b.opportunity.size.max(0.0));
             if notional <= 0.0 {
                 continue;
             }
-            let mut lock_opp = if plan_a.opportunity.edge_net_bps >= plan_b.opportunity.edge_net_bps {
+            let mut lock_opp = if plan_a.opportunity.edge_net_bps >= plan_b.opportunity.edge_net_bps
+            {
                 plan_a.opportunity.clone()
             } else {
                 plan_b.opportunity.clone()
@@ -956,7 +967,8 @@ pub(super) async fn run_predator_c_for_symbol(
             let execution = execution.clone();
             let shadow = shadow.clone();
             let maker_cfg = maker_cfg.clone();
-            let direction_signal = direction_signal_for_side(&direction_signal, &plan.opportunity.side);
+            let direction_signal =
+                direction_signal_for_side(&direction_signal, &plan.opportunity.side);
             let mut market_rate_budget_local = market_rate_budget.clone();
             let mut global_rate_budget_local = global_rate_budget.clone();
             async move {
@@ -972,8 +984,7 @@ pub(super) async fn run_predator_c_for_symbol(
                     predator_cfg,
                     &direction_signal,
                     &plan,
-                    tick_fast_recv_ts_ms,
-                    tick_fast_recv_ts_local_ns,
+                    tick_fast,
                     now_ms,
                 )
                 .await
@@ -1015,8 +1026,7 @@ pub(super) async fn run_predator_c_for_symbol(
                     predator_cfg,
                     &dir_a,
                     &plan_a,
-                    tick_fast_recv_ts_ms,
-                    tick_fast_recv_ts_local_ns,
+                    tick_fast,
                     now_ms,
                 );
                 let leg_b = execute_fire_plan(
@@ -1031,8 +1041,7 @@ pub(super) async fn run_predator_c_for_symbol(
                     predator_cfg,
                     &dir_b,
                     &plan_b,
-                    tick_fast_recv_ts_ms,
-                    tick_fast_recv_ts_local_ns,
+                    tick_fast,
                     now_ms,
                 );
                 let (res_a, res_b) = tokio::join!(leg_a, leg_b);
@@ -1064,8 +1073,7 @@ async fn execute_fire_plan(
     predator_cfg: &PredatorCConfig,
     direction_signal: &DirectionSignal,
     plan: &FirePlan,
-    tick_fast_recv_ts_ms: i64,
-    tick_fast_recv_ts_local_ns: i64,
+    tick_fast: &RefTick,
     now_ms: i64,
 ) -> PredatorExecResult {
     let mut plan_result = PredatorExecResult::default();
@@ -1091,8 +1099,7 @@ async fn execute_fire_plan(
             direction_signal,
             opp,
             chunk.size,
-            tick_fast_recv_ts_ms,
-            tick_fast_recv_ts_local_ns,
+            tick_fast,
             now_ms,
         )
         .await;
@@ -1115,8 +1122,9 @@ pub(super) async fn run_predator_d_for_symbol(
     global_rate_budget: &mut TokenBucket,
     predator_cfg: &PredatorCConfig,
     symbol: &str,
-    tick_fast_recv_ts_ms: i64,
-    tick_fast_recv_ts_local_ns: i64,
+    tick_fast: &RefTick,
+    latest_fast_ticks: &std::collections::HashMap<String, RefTick>,
+    latest_anchor_ticks: &std::collections::HashMap<String, RefTick>,
     now_ms: i64,
 ) -> PredatorExecResult {
     let d_cfg = &predator_cfg.strategy_d;
@@ -1212,13 +1220,13 @@ pub(super) async fn run_predator_d_for_symbol(
             continue;
         }
 
-        let book_top_lag_ms = if tick_fast_recv_ts_local_ns > 0 && book.recv_ts_local_ns > 0 {
-            ((book.recv_ts_local_ns - tick_fast_recv_ts_local_ns).max(0) as f64) / 1_000_000.0
+        let book_top_lag_ms = if tick_fast.recv_ts_local_ns > 0 && book.recv_ts_local_ns > 0 {
+            ((book.recv_ts_local_ns - tick_fast.recv_ts_local_ns).max(0) as f64) / 1_000_000.0
         } else {
             0.0
         };
         let settlement_prob_yes =
-            settlement_prob_yes_for_symbol(shared, symbol, sig_entry.signal.fair_yes, now_ms).await;
+            settlement_prob_yes_for_symbol(shared, symbol, sig_entry.signal.fair_yes, latest_fast_ticks, latest_anchor_ticks, now_ms).await;
         let probability = {
             let engine = shared.predator_probability_engine.read().await;
             engine.estimate(
@@ -1291,8 +1299,7 @@ pub(super) async fn run_predator_d_for_symbol(
             &direction_signal,
             &opp,
             size,
-            tick_fast_recv_ts_ms,
-            tick_fast_recv_ts_local_ns,
+            tick_fast,
             now_ms,
         )
         .await;
@@ -1319,8 +1326,8 @@ pub(super) async fn run_predator_c_cross_symbol(
     global_rate_budget: &mut TokenBucket,
     predator_cfg: &PredatorCConfig,
     leader_direction: &DirectionSignal,
-    tick_fast_recv_ts_ms: i64,
-    tick_fast_recv_ts_local_ns: i64,
+    latest_fast_ticks: &std::collections::HashMap<String, RefTick>,
+    latest_anchor_ticks: &std::collections::HashMap<String, RefTick>,
     now_ms: i64,
 ) -> PredatorExecResult {
     let cross_cfg = &predator_cfg.cross_symbol;
@@ -1378,6 +1385,9 @@ pub(super) async fn run_predator_c_cross_symbol(
 
         let mut forced = leader_direction.clone();
         forced.symbol = follower.clone();
+        let Some(follower_tick) = latest_fast_ticks.get(&follower) else {
+            continue;
+        };
         let res = run_predator_c_for_symbol(
             shared,
             bus,
@@ -1388,8 +1398,9 @@ pub(super) async fn run_predator_c_cross_symbol(
             global_rate_budget,
             predator_cfg,
             &follower,
-            tick_fast_recv_ts_ms,
-            tick_fast_recv_ts_local_ns,
+            follower_tick,
+            latest_fast_ticks,
+            latest_anchor_ticks,
             now_ms,
             Some(forced),
         )
@@ -1518,8 +1529,7 @@ pub(super) async fn predator_execute_opportunity(
     direction_signal: &DirectionSignal,
     opp: &TimeframeOpp,
     chunk_size: f64,
-    tick_fast_recv_ts_ms: i64,
-    tick_fast_recv_ts_local_ns: i64,
+    tick_fast: &RefTick,
     now_ms: i64,
 ) -> PredatorExecResult {
     let mut intent = QuoteIntent {
@@ -1567,10 +1577,10 @@ pub(super) async fn predator_execute_opportunity(
     // Same interpretation as the maker path: positive means our fast ref tick arrived earlier
     // than the Polymarket book update. For Predator, the ref tick is per-symbol while the book
     // is per-market, so this is still a useful (if approximate) window estimate.
-    let tick_age_ms = freshness_ms(now_ms, tick_fast_recv_ts_ms);
+    let tick_age_ms = freshness_ms(now_ms, tick_fast.recv_ts_ms);
     let book_top_lag_ms =
-        if tick_age_ms <= 1_500 && tick_fast_recv_ts_local_ns > 0 && book.recv_ts_local_ns > 0 {
-            ((book.recv_ts_local_ns - tick_fast_recv_ts_local_ns).max(0) as f64) / 1_000_000.0
+        if tick_age_ms <= 1_500 && tick_fast.recv_ts_local_ns > 0 && book.recv_ts_local_ns > 0 {
+            ((book.recv_ts_local_ns - tick_fast.recv_ts_local_ns).max(0) as f64) / 1_000_000.0
         } else {
             0.0
         };

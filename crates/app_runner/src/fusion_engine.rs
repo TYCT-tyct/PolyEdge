@@ -209,35 +209,16 @@ pub(super) fn is_anchor_ref_source(source: &str) -> bool {
     source == "chainlink_rtds"
 }
 
-#[inline]
 pub(super) fn fast_tick_allowed_in_fusion_mode(source: &str, mode: &str) -> bool {
     match mode {
-        "udp_only" => source == "binance_udp",
         "direct_only" => source != "binance_udp" && !is_anchor_ref_source(source),
-        "active_active" | "websocket_primary" => true,
+        "active_active" | "hyper_mesh" => true,
         // Unknown future modes: keep permissive to avoid accidental data blackout.
         _ => true,
     }
 }
 
-#[inline]
-pub(super) fn should_arm_ws_primary_fallback(
-    mode: &str,
-    ws_cap_ready: bool,
-    ws_breach_persisted: bool,
-    fallback_active: bool,
-) -> bool {
-    mode == "websocket_primary" && ws_breach_persisted && !ws_cap_ready && !fallback_active
-}
 
-#[inline]
-pub(super) fn should_enforce_udp_share_cap(
-    mode: &str,
-    fallback_active: bool,
-    share_high: bool,
-) -> bool {
-    matches!(mode, "active_active" | "websocket_primary") && !fallback_active && share_high
-}
 
 pub(super) fn ref_event_ts_ms(tick: &RefTick) -> i64 {
     tick.event_ts_exchange_ms.max(tick.event_ts_ms)
@@ -326,31 +307,6 @@ pub(super) fn fusion_staleness_budget_us_for_source(next_source: &str) -> i64 {
     })
 }
 
-pub(super) fn udp_min_freshness_score() -> f64 {
-    static UDP_MIN_FRESHNESS_SCORE: OnceLock<f64> = OnceLock::new();
-    *UDP_MIN_FRESHNESS_SCORE.get_or_init(|| {
-        std::env::var("POLYEDGE_UDP_MIN_FRESHNESS_SCORE")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.55)
-            .clamp(0.0, 1.0)
-    })
-}
-
-pub(super) fn ws_primary_fallback_gap_ns() -> i64 {
-    3_000 * 1_000_000
-}
-
-pub(super) fn udp_downweight_keep_every() -> usize {
-    static UDP_KEEP_EVERY: OnceLock<usize> = OnceLock::new();
-    *UDP_KEEP_EVERY.get_or_init(|| {
-        std::env::var("POLYEDGE_UDP_DOWNWEIGHT_KEEP_EVERY")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(3)
-            .clamp(2, 32)
-    })
-}
 
 #[inline]
 pub(super) fn should_log_ref_tick(ingest_seq: u64) -> bool {
@@ -439,13 +395,13 @@ pub(super) fn insert_latest_anchor_tick(
     }
 }
 
-pub(super) fn upsert_latest_tick_slot(
-    latest_ticks: &DashMap<String, RefTick>,
+pub(super) fn upsert_latest_tick_slot_local(
+    latest_ticks: &mut HashMap<String, RefTick>,
     tick: RefTick,
     should_replace: fn(&RefTick, &RefTick) -> bool,
 ) -> Option<i64> {
-    if let Some(mut current) = latest_ticks.get_mut(&tick.symbol) {
-        if !should_replace(current.value(), &tick) {
+    if let Some(current) = latest_ticks.get_mut(&tick.symbol) {
+        if !should_replace(current, &tick) {
             return None;
         }
         let delta_ns = if current.source != tick.source
@@ -456,7 +412,7 @@ pub(super) fn upsert_latest_tick_slot(
         } else {
             None
         };
-        *current.value_mut() = tick;
+        *current = tick;
         return delta_ns;
     }
     latest_ticks.insert(tick.symbol.clone(), tick);

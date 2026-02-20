@@ -17,8 +17,8 @@ use crate::seat_persist::{
 use crate::seat_types::{
     SeatConfig, SeatDecisionRecord, SeatForceLayerReq, SeatLayer, SeatLockState,
     SeatManualOverrideReq, SeatMonitorState, SeatObjectivePoint, SeatObjectiveSnapshot,
-    SeatOptimizerProposal, SeatParameterSet, SeatRuntimeState, SeatSmoothingState, SeatStatusReport,
-    SeatStyleMemoryEntry, SeatStyleVector,
+    SeatOptimizerProposal, SeatParameterSet, SeatRuntimeState, SeatSmoothingState,
+    SeatStatusReport, SeatStyleMemoryEntry, SeatStyleVector,
 };
 use crate::spawn_detached;
 
@@ -90,7 +90,8 @@ pub(crate) struct SeatRuntimeHandle {
 impl SeatRuntimeHandle {
     pub(crate) fn spawn(mut cfg: SeatConfig) -> Arc<Self> {
         if let Ok(value) = std::env::var("POLYEDGE_SEAT_ENABLED") {
-            cfg.enabled = env_flag_enabled("POLYEDGE_SEAT_ENABLED") || value.eq_ignore_ascii_case("true");
+            cfg.enabled =
+                env_flag_enabled("POLYEDGE_SEAT_ENABLED") || value.eq_ignore_ascii_case("true");
         }
         if cfg.control_base_url.trim().is_empty() {
             let port = std::env::var("POLYEDGE_CONTROL_PORT")
@@ -151,11 +152,15 @@ impl SeatRuntimeHandle {
         self.status().await
     }
 
-    pub(crate) async fn manual_override(&self, req: SeatManualOverrideReq) -> Result<SeatStatusReport> {
+    pub(crate) async fn manual_override(
+        &self,
+        req: SeatManualOverrideReq,
+    ) -> Result<SeatStatusReport> {
         if req.params.is_empty() {
             return Err(anyhow!("manual override params is empty"));
         }
-        self.apply_params(&req.params, &self.cfg.control_base_url).await?;
+        self.apply_params(&req.params, &self.cfg.control_base_url)
+            .await?;
         let mut state = self.state.write().await;
         state.manual_override = Some(req.params);
         state.last_decision_ts_ms = now_ms();
@@ -203,7 +208,8 @@ impl SeatRuntimeHandle {
     }
 
     async fn run(self: Arc<Self>) {
-        let mut ticker = tokio::time::interval(Duration::from_secs(self.cfg.runtime_tick_sec.max(5)));
+        let mut ticker =
+            tokio::time::interval(Duration::from_secs(self.cfg.runtime_tick_sec.max(5)));
         loop {
             ticker.tick().await;
             if let Err(err) = self.tick_once().await {
@@ -256,7 +262,9 @@ impl SeatRuntimeHandle {
                 write_state_atomic(&state)?;
                 return Ok(());
             }
-            if now.saturating_sub(state.last_activation_check_ms) >= (self.cfg.activation_check_sec as i64) * 1_000 {
+            if now.saturating_sub(state.last_activation_check_ms)
+                >= (self.cfg.activation_check_sec as i64) * 1_000
+            {
                 state.last_activation_check_ms = now;
                 let target = self.target_layer(&state, now);
                 if target != state.current_layer {
@@ -296,10 +304,13 @@ impl SeatRuntimeHandle {
         if trade_count < self.cfg.layer1_min_trades || uptime_sec < 48 * 3_600 {
             SeatLayer::Layer0
         } else if trade_count >= self.cfg.layer3_min_trades
-            || (uptime_sec >= self.cfg.layer3_min_uptime_sec && trade_count >= self.cfg.layer2_min_trades)
+            || (uptime_sec >= self.cfg.layer3_min_uptime_sec
+                && trade_count >= self.cfg.layer2_min_trades)
         {
             SeatLayer::Layer3
-        } else if trade_count >= self.cfg.layer2_min_trades && uptime_sec >= self.cfg.layer2_min_uptime_sec {
+        } else if trade_count >= self.cfg.layer2_min_trades
+            && uptime_sec >= self.cfg.layer2_min_uptime_sec
+        {
             SeatLayer::Layer2
         } else {
             SeatLayer::Layer1
@@ -339,7 +350,10 @@ impl SeatRuntimeHandle {
         let source_health_min = if live.source_health.is_empty() {
             1.0
         } else {
-            live.source_health.iter().map(|row| row.score).fold(1.0_f64, f64::min)
+            live.source_health
+                .iter()
+                .map(|row| row.score)
+                .fold(1.0_f64, f64::min)
         };
         let objective = live.ev_net_usdc_p50
             + live.roi_notional_10s_bps_p50 * 0.01
@@ -358,7 +372,11 @@ impl SeatRuntimeHandle {
 
     fn refresh_trade_counter(&self, state: &mut SeatRuntimeState, live: &ShadowLiveLite) {
         let live_seen = self.live_fill_counter.load(Ordering::Relaxed);
-        let live_delta = if live_seen >= state.live_fill_seen { live_seen - state.live_fill_seen } else { live_seen };
+        let live_delta = if live_seen >= state.live_fill_seen {
+            live_seen - state.live_fill_seen
+        } else {
+            live_seen
+        };
         state.live_fill_total = state.live_fill_total.saturating_add(live_delta);
         state.live_fill_seen = live_seen;
 
@@ -369,7 +387,8 @@ impl SeatRuntimeHandle {
         };
         state.proxy_trade_total = state.proxy_trade_total.saturating_add(proxy_delta);
         state.proxy_trade_seen = live.executed_count;
-        let live_expected = !env_flag_enabled("POLYEDGE_FORCE_PAPER") && env_flag_enabled("POLYEDGE_LIVE_ARMED");
+        let live_expected =
+            !env_flag_enabled("POLYEDGE_FORCE_PAPER") && env_flag_enabled("POLYEDGE_LIVE_ARMED");
         state.trade_count_source = if live_expected && state.live_fill_total > 0 {
             "live_fill".to_string()
         } else {
@@ -377,23 +396,42 @@ impl SeatRuntimeHandle {
         };
     }
 
-    fn push_history(&self, state: &mut SeatRuntimeState, ts_ms: i64, objective: &SeatObjectiveSnapshot) {
-        state.objective_history.push(SeatObjectivePoint { ts_ms, objective: objective.objective });
-        state.volatility_history.push(SeatObjectivePoint { ts_ms, objective: objective.volatility_proxy });
+    fn push_history(
+        &self,
+        state: &mut SeatRuntimeState,
+        ts_ms: i64,
+        objective: &SeatObjectiveSnapshot,
+    ) {
+        state.objective_history.push(SeatObjectivePoint {
+            ts_ms,
+            objective: objective.objective,
+        });
+        state.volatility_history.push(SeatObjectivePoint {
+            ts_ms,
+            objective: objective.volatility_proxy,
+        });
         let keep_after = ts_ms.saturating_sub(8 * 24 * 3_600 * 1_000);
         state.objective_history.retain(|p| p.ts_ms >= keep_after);
         state.volatility_history.retain(|p| p.ts_ms >= keep_after);
     }
 
     async fn fetch_runtime_metrics(&self) -> Result<Option<(ShadowLiveLite, PnlLite)>> {
-        let live_resp = match self.http.get(format!("{}/report/shadow/live", self.cfg.control_base_url)).send().await {
+        let live_resp = match self
+            .http
+            .get(format!("{}/report/shadow/live", self.cfg.control_base_url))
+            .send()
+            .await
+        {
             Ok(v) => v,
             Err(_) => return Ok(None),
         };
         if !live_resp.status().is_success() {
             return Ok(None);
         }
-        let live = live_resp.json::<ShadowLiveLite>().await.context("parse shadow live")?;
+        let live = live_resp
+            .json::<ShadowLiveLite>()
+            .await
+            .context("parse shadow live")?;
         let pnl_resp = self
             .http
             .get(format!("{}/state/pnl", self.cfg.control_base_url))
@@ -403,7 +441,10 @@ impl SeatRuntimeHandle {
         if !pnl_resp.status().is_success() {
             return Ok(None);
         }
-        let pnl = pnl_resp.json::<PnlLite>().await.context("parse state pnl")?;
+        let pnl = pnl_resp
+            .json::<PnlLite>()
+            .await
+            .context("parse state pnl")?;
         Ok(Some((live, pnl)))
     }
 
@@ -424,7 +465,8 @@ impl SeatRuntimeHandle {
             .get(idx.min(vols.len().saturating_sub(1)))
             .copied()
             .unwrap_or(0.0);
-        Ok(objective.volatility_proxy > p95 || objective.source_health_min < self.cfg.source_health_floor)
+        Ok(objective.volatility_proxy > p95
+            || objective.source_health_min < self.cfg.source_health_floor)
     }
 
     async fn force_layer0_lock(&self, reason: &str) -> Result<()> {
@@ -450,7 +492,12 @@ impl SeatRuntimeHandle {
         Ok(())
     }
 
-    async fn run_tune_cycle(&self, layer: SeatLayer, baseline: SeatObjectiveSnapshot, now: i64) -> Result<()> {
+    async fn run_tune_cycle(
+        &self,
+        layer: SeatLayer,
+        baseline: SeatObjectiveSnapshot,
+        now: i64,
+    ) -> Result<()> {
         let current = match self.capture_current_params().await {
             Ok(v) => v,
             Err(_) => self.state.read().await.last_params.clone(),
@@ -472,7 +519,10 @@ impl SeatRuntimeHandle {
                     "style_match_score={:.6}",
                     proposal.meta.style_match_score
                 ));
-                notes.push(format!("style_match_count={}", proposal.meta.style_match_count));
+                notes.push(format!(
+                    "style_match_count={}",
+                    proposal.meta.style_match_count
+                ));
                 notes.push(format!("top_k_size={}", proposal.meta.top_k_size));
                 notes.push(format!(
                     "walk_forward_windows={}",
@@ -540,7 +590,11 @@ impl SeatRuntimeHandle {
         Ok(())
     }
 
-    fn layer0_candidate(&self, current: &SeatParameterSet, baseline: &SeatObjectiveSnapshot) -> SeatParameterSet {
+    fn layer0_candidate(
+        &self,
+        current: &SeatParameterSet,
+        baseline: &SeatObjectiveSnapshot,
+    ) -> SeatParameterSet {
         let mut out = current.clone();
         let tighten = baseline.ev_usdc_p50 < 0.0 || baseline.max_drawdown_pct > 0.05;
         if let Some(v) = current.position_fraction {
@@ -633,7 +687,10 @@ impl SeatRuntimeHandle {
         });
         let resp = self
             .http
-            .post(format!("{}/v1/seat/{endpoint}/optimize", self.cfg.optimizer_url))
+            .post(format!(
+                "{}/v1/seat/{endpoint}/optimize",
+                self.cfg.optimizer_url
+            ))
             .json(&payload)
             .send()
             .await
@@ -677,7 +734,9 @@ impl SeatRuntimeHandle {
         mut notes: Vec<String>,
     ) -> Result<()> {
         let mut state = self.state.write().await;
-        let pre_switch = self.mean_objective_24h_locked(&state, now).unwrap_or(baseline.objective);
+        let pre_switch = self
+            .mean_objective_24h_locked(&state, now)
+            .unwrap_or(baseline.objective);
         state.pre_switch_objective_24h = Some(pre_switch);
         state.smoothing = Some(SeatSmoothingState {
             layer,
@@ -731,7 +790,9 @@ impl SeatRuntimeHandle {
                 ));
                 state.smoothing = None;
             } else {
-                smooth.current_params.exp_blend_towards(&smooth.target_params, 0.7);
+                smooth
+                    .current_params
+                    .exp_blend_towards(&smooth.target_params, 0.7);
                 self.apply_params(&smooth.current_params, &self.cfg.control_base_url)
                     .await?;
                 smooth.next_step_ms = smooth.next_step_ms.saturating_add(5 * 60 * 1_000);
@@ -806,7 +867,8 @@ impl SeatRuntimeHandle {
             state.post_switch_start_ms = now;
             state.post_switch_baseline_24h = Some(monitor.pre_switch_objective_24h);
             state.post_switch_layer = Some(monitor.layer);
-            let entry = self.update_style_memory_locked(&mut state, objective, &monitor.new_params, now);
+            let entry =
+                self.update_style_memory_locked(&mut state, objective, &monitor.new_params, now);
             self.record_decision_locked(
                 &mut state,
                 monitor.layer,
@@ -879,13 +941,15 @@ impl SeatRuntimeHandle {
         reason: &str,
         now: i64,
     ) -> Result<()> {
-        self.apply_params(&old_params, &self.cfg.control_base_url).await?;
+        self.apply_params(&old_params, &self.cfg.control_base_url)
+            .await?;
         let mut state = self.state.write().await;
         state.smoothing = None;
         state.monitor = None;
-        state
-            .layer_pause_until_ms
-            .insert(layer.as_str().to_string(), now + (self.cfg.rollback_pause_sec as i64) * 1_000);
+        state.layer_pause_until_ms.insert(
+            layer.as_str().to_string(),
+            now + (self.cfg.rollback_pause_sec as i64) * 1_000,
+        );
         state.rollback_streak = state.rollback_streak.saturating_add(1);
         if state.rollback_streak >= 2 {
             state.global_pause_until_ms = now + (self.cfg.global_pause_sec as i64) * 1_000;
@@ -905,16 +969,22 @@ impl SeatRuntimeHandle {
         Ok(())
     }
 
-    fn downgrade_locked(&self, state: &mut SeatRuntimeState, from_layer: SeatLayer, reason: String) -> Result<()> {
+    fn downgrade_locked(
+        &self,
+        state: &mut SeatRuntimeState,
+        from_layer: SeatLayer,
+        reason: String,
+    ) -> Result<()> {
         let next = match from_layer {
             SeatLayer::Layer3 => SeatLayer::Layer2,
             SeatLayer::Layer2 => SeatLayer::Layer1,
             SeatLayer::Layer1 | SeatLayer::Layer0 => SeatLayer::Layer0,
         };
         state.current_layer = next;
-        state
-            .layer_pause_until_ms
-            .insert(from_layer.as_str().to_string(), now_ms() + (self.cfg.rollback_pause_sec as i64) * 1_000);
+        state.layer_pause_until_ms.insert(
+            from_layer.as_str().to_string(),
+            now_ms() + (self.cfg.rollback_pause_sec as i64) * 1_000,
+        );
         state.degrade_streak = state.degrade_streak.saturating_add(1);
         if state.degrade_streak >= 2 {
             state.current_layer = SeatLayer::Layer0;
@@ -964,7 +1034,11 @@ impl SeatRuntimeHandle {
             win_rate: objective.win_rate,
         };
         let style_id = self.style_id(&vector);
-        if let Some(entry) = state.style_memory.iter_mut().find(|entry| entry.style_id == style_id) {
+        if let Some(entry) = state
+            .style_memory
+            .iter_mut()
+            .find(|entry| entry.style_id == style_id)
+        {
             entry.vector = vector;
             entry.params = params.clone();
             entry.objective = objective.objective;
@@ -986,7 +1060,11 @@ impl SeatRuntimeHandle {
             .style_memory
             .iter()
             .enumerate()
-            .min_by(|(_, a), (_, b)| a.objective.partial_cmp(&b.objective).unwrap_or(std::cmp::Ordering::Equal))
+            .min_by(|(_, a), (_, b)| {
+                a.objective
+                    .partial_cmp(&b.objective)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         {
             let entry = SeatStyleMemoryEntry {
                 style_id,
@@ -1008,9 +1086,21 @@ impl SeatRuntimeHandle {
     }
 
     fn style_id(&self, vector: &SeatStyleVector) -> String {
-        let vol = if vector.volatility_proxy > 8.0 { "hv" } else { "lv" };
-        let health = if vector.source_health_min > 0.6 { "hh" } else { "lh" };
-        let drift = if vector.roi_notional_10s_bps_p50 > 0.0 { "pr" } else { "ng" };
+        let vol = if vector.volatility_proxy > 8.0 {
+            "hv"
+        } else {
+            "lv"
+        };
+        let health = if vector.source_health_min > 0.6 {
+            "hh"
+        } else {
+            "lh"
+        };
+        let drift = if vector.roi_notional_10s_bps_p50 > 0.0 {
+            "pr"
+        } else {
+            "ng"
+        };
         format!("{vol}_{health}_{drift}")
     }
 
@@ -1022,7 +1112,10 @@ impl SeatRuntimeHandle {
     ) -> Result<()> {
         let resp = self
             .http
-            .post(format!("{}/v1/seat/style_memory/update", self.cfg.optimizer_url))
+            .post(format!(
+                "{}/v1/seat/style_memory/update",
+                self.cfg.optimizer_url
+            ))
             .json(&serde_json::json!({
                 "layer": layer.as_str(),
                 "entry": entry,
@@ -1032,7 +1125,10 @@ impl SeatRuntimeHandle {
             .send()
             .await?;
         if !resp.status().is_success() {
-            return Err(anyhow!("style memory update failed status={}", resp.status()));
+            return Err(anyhow!(
+                "style memory update failed status={}",
+                resp.status()
+            ));
         }
         Ok(())
     }
@@ -1161,7 +1257,10 @@ impl SeatRuntimeHandle {
                 .await?
                 .error_for_status()?;
         }
-        if params.maker_min_edge_bps.is_some() || params.basis_k_revert.is_some() || params.basis_z_cap.is_some() {
+        if params.maker_min_edge_bps.is_some()
+            || params.basis_k_revert.is_some()
+            || params.basis_z_cap.is_some()
+        {
             self.http
                 .post(format!("{base_url}/control/reload_strategy"))
                 .json(&serde_json::json!({
@@ -1202,7 +1301,10 @@ impl SeatRuntimeHandle {
 
         let predator = self
             .http
-            .post(format!("{}/control/reload_predator_c", self.cfg.control_base_url))
+            .post(format!(
+                "{}/control/reload_predator_c",
+                self.cfg.control_base_url
+            ))
             .json(&serde_json::json!({}))
             .send()
             .await?
@@ -1220,7 +1322,10 @@ impl SeatRuntimeHandle {
             .await?;
         let allocator = self
             .http
-            .post(format!("{}/control/reload_allocator", self.cfg.control_base_url))
+            .post(format!(
+                "{}/control/reload_allocator",
+                self.cfg.control_base_url
+            ))
             .json(&serde_json::json!({}))
             .send()
             .await?
@@ -1238,7 +1343,10 @@ impl SeatRuntimeHandle {
             .await?;
         let strategy = self
             .http
-            .post(format!("{}/control/reload_strategy", self.cfg.control_base_url))
+            .post(format!(
+                "{}/control/reload_strategy",
+                self.cfg.control_base_url
+            ))
             .json(&serde_json::json!({}))
             .send()
             .await?
@@ -1297,22 +1405,13 @@ impl SeatRuntimeHandle {
                 .exit
                 .get("max_single_trade_loss_usdc")
                 .and_then(|v| v.as_f64()),
-            risk_max_drawdown_pct: risk
-                .risk
-                .get("max_drawdown_pct")
-                .and_then(|v| v.as_f64()),
+            risk_max_drawdown_pct: risk.risk.get("max_drawdown_pct").and_then(|v| v.as_f64()),
             risk_max_market_notional: risk
                 .risk
                 .get("max_market_notional")
                 .and_then(|v| v.as_f64()),
-            maker_min_edge_bps: strategy
-                .maker
-                .get("min_edge_bps")
-                .and_then(|v| v.as_f64()),
-            basis_k_revert: strategy
-                .fair_value
-                .get("k_revert")
-                .and_then(|v| v.as_f64()),
+            maker_min_edge_bps: strategy.maker.get("min_edge_bps").and_then(|v| v.as_f64()),
+            basis_k_revert: strategy.fair_value.get("k_revert").and_then(|v| v.as_f64()),
             basis_z_cap: strategy.fair_value.get("z_cap").and_then(|v| v.as_f64()),
         })
     }
@@ -1387,8 +1486,11 @@ impl SeatRuntimeHandle {
             *guard = Some(challenger);
             return Ok(());
         }
-        let compare = self.fetch_shadow_and_pnl_from_base(&challenger.control_base_url).await;
-        let observed_cycles = ((now.saturating_sub(challenger.started_ms)) / (5 * 60 * 1_000)) as u32;
+        let compare = self
+            .fetch_shadow_and_pnl_from_base(&challenger.control_base_url)
+            .await;
+        let observed_cycles =
+            ((now.saturating_sub(challenger.started_ms)) / (5 * 60 * 1_000)) as u32;
         let (pass, shadow_notes) = match compare {
             Ok((live, pnl)) => {
                 let obj = self.build_objective(&live, &pnl);
@@ -1423,10 +1525,7 @@ impl SeatRuntimeHandle {
                     local_pass && remote_pass,
                     vec![
                         format!("shadow_ev_usdc_p50={:.6}", obj.ev_usdc_p50),
-                        format!(
-                            "shadow_max_drawdown_pct={:.6}",
-                            obj.max_drawdown_pct
-                        ),
+                        format!("shadow_max_drawdown_pct={:.6}", obj.max_drawdown_pct),
                     ],
                 )
             }
@@ -1450,8 +1549,8 @@ impl SeatRuntimeHandle {
                     let mut notes = challenger.proposal_notes;
                     notes.extend(shadow_notes);
                     notes.extend([
-                    format!("shadow_cycles_observed={observed_cycles}"),
-                    format!("shadow_cycles_required={}", challenger.required_cycles),
+                        format!("shadow_cycles_observed={observed_cycles}"),
+                        format!("shadow_cycles_required={}", challenger.required_cycles),
                     ]);
                     notes
                 },
@@ -1471,8 +1570,8 @@ impl SeatRuntimeHandle {
                     let mut notes = vec!["shadow_compare_failed".to_string()];
                     notes.extend(shadow_notes);
                     notes.extend([
-                    format!("shadow_cycles_observed={observed_cycles}"),
-                    format!("shadow_cycles_required={}", challenger.required_cycles),
+                        format!("shadow_cycles_observed={observed_cycles}"),
+                        format!("shadow_cycles_required={}", challenger.required_cycles),
                     ]);
                     notes
                 },
@@ -1482,7 +1581,10 @@ impl SeatRuntimeHandle {
         Ok(())
     }
 
-    async fn fetch_shadow_and_pnl_from_base(&self, base_url: &str) -> Result<(ShadowLiveLite, PnlLite)> {
+    async fn fetch_shadow_and_pnl_from_base(
+        &self,
+        base_url: &str,
+    ) -> Result<(ShadowLiveLite, PnlLite)> {
         let live = self
             .http
             .get(format!("{base_url}/report/shadow/live"))

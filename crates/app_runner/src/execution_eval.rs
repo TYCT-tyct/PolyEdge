@@ -4,10 +4,10 @@ use core_types::{BookTop, EdgeAttribution, OrderIntentV2, OrderSide, QuoteIntent
 use reqwest::Client;
 use serde::Serialize;
 
+use crate::spawn_detached;
 use crate::state::{EngineShared, FeeRateEntry};
 use crate::stats_utils::value_to_f64;
 use crate::strategy_policy::estimate_queue_fill_prob;
-use crate::spawn_detached;
 
 pub(super) async fn get_fee_rate_bps_cached(shared: &EngineShared, market_id: &str) -> f64 {
     const DEFAULT_FEE_BPS: f64 = 2.0;

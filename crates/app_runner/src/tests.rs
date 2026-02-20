@@ -6,15 +6,14 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use core_types::{
     new_id, BookTop, ControlCommand, Direction, DirectionSignal, EngineEvent, ExecutionStyle,
-    ExecutionVenue, OrderIntentV2, OrderSide, OrderTimeInForce, RefTick, Regime,
-    Stage,
-    Signal, SourceHealth, TimeframeClass, ToxicDecision, ToxicRegime,
+    ExecutionVenue, OrderIntentV2, OrderSide, OrderTimeInForce, RefTick, Regime, Signal,
+    SourceHealth, Stage, TimeframeClass, ToxicDecision, ToxicRegime,
 };
 use dashmap::DashMap;
 use direction_detector::DirectionDetector;
+use execution_clob::{wss_user_feed::WssFillEvent, ClobExecution, ExecutionMode};
 use exit_manager::{ExitManager, PositionLifecycle};
 use fair_value::BasisMrConfig;
-use execution_clob::{wss_user_feed::WssFillEvent, ClobExecution, ExecutionMode};
 use infra_bus::RingBus;
 use paper_executor::ShadowExecutor;
 use probability_engine::ProbabilityEngine;
@@ -29,27 +28,31 @@ use tokio::time::{sleep, timeout};
 
 use crate::config_loader::parse_toml_array_for_key;
 use crate::engine_core::normalize_reject_code;
+use crate::engine_loop::build_reversal_reentry_order;
 use crate::execution_eval::prebuild_order_payload;
-use crate::spawn_predator_exit_lifecycle;
-use crate::feed_runtime::{blend_settlement_probability, build_source_health_snapshot, SourceRuntimeStats};
+use crate::feed_runtime::{
+    blend_settlement_probability, build_source_health_snapshot, SourceRuntimeStats,
+};
 use crate::fusion_engine::{
     compute_coalesce_policy, estimate_feed_latency, fast_tick_allowed_in_fusion_mode,
-    is_ref_tick_duplicate, reset_path_lag_calib_for_tests, should_arm_ws_primary_fallback,
-    should_enforce_udp_share_cap, should_replace_ref_tick, upsert_latest_tick_slot,
+    is_ref_tick_duplicate, reset_path_lag_calib_for_tests, should_replace_ref_tick, upsert_latest_tick_slot,
 };
+use crate::spawn_predator_exit_lifecycle;
 use crate::state::{
     to_exit_manager_config, EdgeModelConfig, EngineShared, ExitConfig, FusionConfig,
     MarketToxicState, PredatorCConfig, PredatorRegimeConfig, SettlementConfig, ShadowStats,
-    SignalCacheEntry, SourceHealthConfig, ToxicityConfig, V52DualArbConfig,
-    V52ExecutionConfig, V52TimePhaseConfig,
+    SignalCacheEntry, SourceHealthConfig, ToxicityConfig, V52DualArbConfig, V52ExecutionConfig,
+    V52TimePhaseConfig,
 };
-use crate::stats_utils::{now_ns, percentile, policy_block_ratio, quote_block_ratio, robust_filter_iqr};
+use crate::stats_utils::{
+    now_ns, percentile, policy_block_ratio, quote_block_ratio, robust_filter_iqr,
+};
 use crate::strategy_policy::{is_market_in_top_n, should_observe_only_symbol};
 use crate::strategy_runtime::{
-    allow_dual_side_arb, classify_predator_regime, classify_time_phase, should_force_taker_fallback,
-    stage_for_phase, time_phase_size_scale, timeframe_total_ms, TimePhase,
+    allow_dual_side_arb, classify_predator_regime, classify_time_phase,
+    should_force_taker_fallback, stage_for_phase, time_phase_size_scale, timeframe_total_ms,
+    TimePhase,
 };
-use crate::engine_loop::build_reversal_reentry_order;
 
 fn test_engine_shared_with_wss() -> (
     Arc<EngineShared>,
@@ -96,8 +99,6 @@ fn test_engine_shared_with_wss() -> (
     let shared = Arc::new(EngineShared {
         latest_books: Arc::new(RwLock::new(HashMap::new())),
         latest_signals: Arc::new(DashMap::new()),
-        latest_fast_ticks: Arc::new(DashMap::new()),
-        latest_anchor_ticks: Arc::new(DashMap::new()),
         market_to_symbol: Arc::new(RwLock::new(HashMap::new())),
         token_to_symbol: Arc::new(RwLock::new(HashMap::new())),
         market_to_timeframe: Arc::new(RwLock::new(HashMap::new())),
@@ -177,75 +178,6 @@ fn ref_tick_dedupe_uses_relative_bps_and_window() {
     assert!(!is_ref_tick_duplicate(1_000, 100.005, 980, 100.0, &cfg));
 }
 
-#[test]
-fn websocket_primary_mode_keeps_dual_fast_sources() {
-    assert!(fast_tick_allowed_in_fusion_mode(
-        "binance_ws",
-        "websocket_primary"
-    ));
-    assert!(fast_tick_allowed_in_fusion_mode(
-        "binance_udp",
-        "websocket_primary"
-    ));
-    assert!(!fast_tick_allowed_in_fusion_mode(
-        "binance_udp",
-        "direct_only"
-    ));
-}
-
-#[test]
-fn websocket_primary_fallback_arms_only_when_ws_unavailable() {
-    assert!(should_arm_ws_primary_fallback(
-        "websocket_primary",
-        false,
-        true,
-        false
-    ));
-    assert!(!should_arm_ws_primary_fallback(
-        "websocket_primary",
-        true,
-        true,
-        false
-    ));
-    assert!(!should_arm_ws_primary_fallback(
-        "websocket_primary",
-        false,
-        true,
-        true
-    ));
-    assert!(!should_arm_ws_primary_fallback(
-        "active_active",
-        false,
-        true,
-        false
-    ));
-    assert!(!should_arm_ws_primary_fallback(
-        "websocket_primary",
-        false,
-        false,
-        false
-    ));
-}
-
-#[test]
-fn udp_share_cap_enforced_when_not_in_fallback() {
-    assert!(should_enforce_udp_share_cap(
-        "websocket_primary",
-        false,
-        true
-    ));
-    assert!(should_enforce_udp_share_cap("active_active", false, true));
-    assert!(!should_enforce_udp_share_cap(
-        "websocket_primary",
-        true,
-        true
-    ));
-    assert!(!should_enforce_udp_share_cap(
-        "websocket_primary",
-        false,
-        false
-    ));
-}
 
 #[test]
 fn fusion_default_stays_safe_baseline() {
@@ -928,9 +860,17 @@ fn v52_phase_size_scale_is_configurable() {
 fn v52_force_taker_rule_applies_to_maturity_and_late() {
     let cfg = V52ExecutionConfig::default();
     assert!(!should_force_taker_fallback(TimePhase::Early, 29_000, &cfg));
-    assert!(should_force_taker_fallback(TimePhase::Maturity, 29_000, &cfg));
+    assert!(should_force_taker_fallback(
+        TimePhase::Maturity,
+        29_000,
+        &cfg
+    ));
     assert!(should_force_taker_fallback(TimePhase::Late, 29_000, &cfg));
-    assert!(!should_force_taker_fallback(TimePhase::Maturity, 31_000, &cfg));
+    assert!(!should_force_taker_fallback(
+        TimePhase::Maturity,
+        31_000,
+        &cfg
+    ));
 }
 
 #[test]

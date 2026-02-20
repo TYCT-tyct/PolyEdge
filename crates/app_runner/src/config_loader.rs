@@ -397,7 +397,7 @@ pub(super) fn load_fusion_config() -> FusionConfig {
                 let norm = val.to_ascii_lowercase();
                 if matches!(
                     norm.as_str(),
-                    "active_active" | "direct_only" | "udp_only" | "websocket_primary"
+                    "active_active" | "direct_only" | "hyper_mesh"
                 ) {
                     target.mode = Some(norm);
                 }
@@ -450,13 +450,7 @@ pub(super) fn load_fusion_config() -> FusionConfig {
     if saw_transport {
         transport_patch.apply_to(&mut cfg);
     }
-    if cfg.mode == "websocket_primary" {
-        cfg.udp_local_only = true;
-        cfg.udp_share_cap = cfg.udp_share_cap.clamp(0.05, 0.35);
-        cfg.jitter_threshold_ms = cfg.jitter_threshold_ms.max(25.0);
-        cfg.fallback_arm_duration_ms = cfg.fallback_arm_duration_ms.max(8_000);
-        cfg.fallback_cooldown_sec = cfg.fallback_cooldown_sec.max(300);
-    }
+
     if let Ok(raw) = std::env::var("POLYEDGE_UDP_PORT") {
         if let Ok(parsed) = raw.parse::<u16>() {
             cfg.udp_port = parsed.max(1);
@@ -1407,10 +1401,16 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
     if cfg.v52.time_phase.allow_timeframes.is_empty() {
         cfg.v52.time_phase.allow_timeframes = vec!["5m".to_string(), "15m".to_string()];
     }
-    cfg.v52.execution.late_force_taker_remaining_ms =
-        cfg.v52.execution.late_force_taker_remaining_ms.clamp(1_000, 60_000);
-    cfg.v52.execution.maker_wait_ms_before_force =
-        cfg.v52.execution.maker_wait_ms_before_force.clamp(50, 10_000);
+    cfg.v52.execution.late_force_taker_remaining_ms = cfg
+        .v52
+        .execution
+        .late_force_taker_remaining_ms
+        .clamp(1_000, 60_000);
+    cfg.v52.execution.maker_wait_ms_before_force = cfg
+        .v52
+        .execution
+        .maker_wait_ms_before_force
+        .clamp(50, 10_000);
     cfg.v52.execution.alpha_window_move_bps =
         cfg.v52.execution.alpha_window_move_bps.clamp(0.1, 50.0);
     cfg.v52.execution.alpha_window_poll_ms = cfg.v52.execution.alpha_window_poll_ms.clamp(1, 200);

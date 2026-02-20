@@ -94,8 +94,6 @@ pub async fn run_wss_loop_with_sender(
     }
 }
 
-
-
 async fn connect_and_stream(
     tx: &Arc<broadcast::Sender<WssFillEvent>>,
     wss_url: &str,
@@ -128,8 +126,6 @@ async fn connect_and_stream(
     }
     Ok(())
 }
-
-
 
 fn parse_and_broadcast(tx: &Arc<broadcast::Sender<WssFillEvent>>, envelope: WssEnvelope) {
     let event_type = match envelope.event_type.as_deref() {

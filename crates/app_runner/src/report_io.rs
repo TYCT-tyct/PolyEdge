@@ -11,12 +11,12 @@ use core_types::{ShadowOutcome, ShadowShot};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, RwLock};
 
+use crate::spawn_detached;
 use crate::state::{
     EnginePnlReport, MarketScoreRow, PerfProfile, ShadowFinalReport, ShadowLiveReport,
     ToxicityLiveReport,
 };
 use crate::stats_utils::percentile;
-use crate::spawn_detached;
 
 pub(super) fn ensure_dataset_dirs() {
     for bucket in ["raw", "normalized", "reports"] {

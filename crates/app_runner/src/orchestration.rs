@@ -15,9 +15,9 @@ use crate::report_io::{
     append_jsonl, dataset_path, persist_engine_pnl_report, persist_final_report_files,
     persist_live_report_files, persist_toxicity_report_files,
 };
+use crate::spawn_detached;
 use crate::state::{MarketToxicState, ShadowStats, ToxicityConfig};
 use crate::toxicity_report::build_toxicity_live_report;
-use crate::spawn_detached;
 
 #[derive(Debug, Clone, Default)]
 struct JsonlTailCounter {

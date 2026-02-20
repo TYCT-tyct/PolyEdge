@@ -345,7 +345,8 @@ async fn run_route(route: &Route, tuning: SenderTuning) -> Result<()> {
     let mut last_log = std::time::Instant::now();
 
     loop {
-        let endpoint_candidates = pick_best_fstream_ws_endpoint(fstream_ws_endpoints(&route.symbol)).await;
+        let endpoint_candidates =
+            pick_best_fstream_ws_endpoint(fstream_ws_endpoints(&route.symbol)).await;
         let mut ws_stream = None;
         let mut last_err: Option<String> = None;
         for endpoint in endpoint_candidates {

@@ -7,7 +7,9 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
-use core_types::{ControlCommand, EngineEvent, ExecutionVenue, PaperDailySummary, PaperTradeRecord, ToxicRegime};
+use core_types::{
+    ControlCommand, EngineEvent, ExecutionVenue, PaperDailySummary, PaperTradeRecord, ToxicRegime,
+};
 use direction_detector::DirectionConfig;
 use fair_value::BasisMrConfig;
 use probability_engine::ProbabilityEngineConfig;
@@ -20,6 +22,7 @@ use crate::report_io::{
     append_jsonl, dataset_path, persist_engine_pnl_report, persist_final_report_files,
     persist_live_report_files, persist_toxicity_report_files, JSONL_DROP_ON_FULL,
 };
+use crate::seat_types::{SeatForceLayerReq, SeatManualOverrideReq};
 use crate::state::{
     settlement_live_gate_status, to_exit_manager_config, AllocatorConfig, AllocatorReloadReq,
     AllocatorReloadResp, AppState, EdgeModelConfig, EdgeModelReloadReq, EnginePnlReport,
@@ -28,10 +31,9 @@ use crate::state::{
     PredatorDConfig, PredatorRegimeConfig, ProbabilityReloadReq, RiskReloadReq, RiskReloadResp,
     ShadowFinalReport, ShadowLiveReport, SourceHealthConfig, SourceHealthReloadReq,
     StrategyReloadReq, StrategyReloadResp, TakerReloadReq, TakerReloadResp, ToxicityConfig,
-    ToxicityFinalReport, ToxicityLiveReport, ToxicityReloadReq,
-    V52Config, V52DualArbConfig, V52ExecutionConfig, V52ReversalConfig, V52TimePhaseConfig,
+    ToxicityFinalReport, ToxicityLiveReport, ToxicityReloadReq, V52Config, V52DualArbConfig,
+    V52ExecutionConfig, V52ReversalConfig, V52TimePhaseConfig,
 };
-use crate::seat_types::{SeatForceLayerReq, SeatManualOverrideReq};
 use crate::stats_utils::percentile;
 use crate::toxicity_report::build_toxicity_live_report;
 
@@ -371,8 +373,10 @@ fn normalize_v52_config(v52: &mut V52Config) {
     if v52.time_phase.allow_timeframes.is_empty() {
         v52.time_phase.allow_timeframes = vec!["5m".to_string(), "15m".to_string()];
     }
-    v52.execution.late_force_taker_remaining_ms =
-        v52.execution.late_force_taker_remaining_ms.clamp(1_000, 60_000);
+    v52.execution.late_force_taker_remaining_ms = v52
+        .execution
+        .late_force_taker_remaining_ms
+        .clamp(1_000, 60_000);
     v52.execution.maker_wait_ms_before_force =
         v52.execution.maker_wait_ms_before_force.clamp(50, 10_000);
     v52.execution.alpha_window_move_bps = v52.execution.alpha_window_move_bps.clamp(0.1, 50.0);
@@ -492,7 +496,7 @@ async fn reload_fusion(
         let norm = v.to_ascii_lowercase();
         if matches!(
             norm.as_str(),
-            "active_active" | "direct_only" | "udp_only" | "websocket_primary"
+            "active_active" | "direct_only" | "hyper_mesh"
         ) {
             cfg.mode = norm;
         }
@@ -521,13 +525,7 @@ async fn reload_fusion(
     if let Some(v) = req.udp_local_only {
         cfg.udp_local_only = v;
     }
-    if cfg.mode == "websocket_primary" {
-        cfg.udp_local_only = true;
-        cfg.udp_share_cap = cfg.udp_share_cap.clamp(0.05, 0.35);
-        cfg.jitter_threshold_ms = cfg.jitter_threshold_ms.max(25.0);
-        cfg.fallback_arm_duration_ms = cfg.fallback_arm_duration_ms.max(8_000);
-        cfg.fallback_cooldown_sec = cfg.fallback_cooldown_sec.max(300);
-    }
+
     let snapshot = cfg.clone();
     std::env::set_var(
         "POLYEDGE_UDP_LOCAL_ONLY",

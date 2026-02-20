@@ -1,9 +1,7 @@
 use std::future::Future;
-use std::panic::AssertUnwindSafe;
 
 use anyhow::Result;
 use core_types::EngineEvent;
-use futures::FutureExt;
 use infra_bus::RingBus;
 
 #[global_allocator]
@@ -54,23 +52,9 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     tokio::spawn(async move {
-        match AssertUnwindSafe(fut).catch_unwind().await {
-            Ok(()) => {
-                if report_normal_exit {
-                    tracing::warn!(task = task_name, "detached task exited");
-                }
-            }
-            Err(payload) => {
-                let panic_msg = if let Some(msg) = payload.downcast_ref::<&str>() {
-                    (*msg).to_string()
-                } else if let Some(msg) = payload.downcast_ref::<String>() {
-                    msg.clone()
-                } else {
-                    "unknown panic payload".to_string()
-                };
-                tracing::error!(task = task_name, panic = %panic_msg, "detached task panicked");
-                metrics::counter!("runtime.detached_task_panic").increment(1);
-            }
+        fut.await;
+        if report_normal_exit {
+            tracing::warn!(task = task_name, "detached task exited");
         }
     });
 }
