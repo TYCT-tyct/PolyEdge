@@ -204,11 +204,11 @@ pub(crate) fn spawn_strategy_engine(
             while let Ok(ctrl) = control_rx.try_recv() {
                 match ctrl {
                     EngineEvent::Control(ControlCommand::Pause) => {
-                        *paused.blocking_write() = true;
+                        *paused.write().await = true;
                         shared.shadow_stats.set_paused(true);
                     }
                     EngineEvent::Control(ControlCommand::Resume) => {
-                        *paused.blocking_write() = false;
+                        *paused.write().await = false;
                         shared.shadow_stats.set_paused(false);
                     }
                     EngineEvent::Control(ControlCommand::Flatten) => {
