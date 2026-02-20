@@ -328,9 +328,8 @@ def prebuild_order(payload: dict = Body(...)) -> JSONResponse:
     try:
         price = float(payload.get("price"))
         size = float(payload.get("size"))
-    except Exception as exc:
-        return JSONResponse(status_code=400, content={"ok": False, "error": _safe_reject_code(exc)})
-
+    except Exception:
+        raise  # Linus: Fail loudly and explicitly
     if not (MIN_PRICE <= price <= MAX_PRICE):
         return JSONResponse(status_code=400, content={"ok": False, "error": "price_out_of_range"})
     if not (size > 0.0):
@@ -345,8 +344,7 @@ def prebuild_order(payload: dict = Body(...)) -> JSONResponse:
     try:
         max_slippage_bps = float(payload.get("max_slippage_bps") or 0.0)
     except Exception:
-        max_slippage_bps = 0.0
-
+        raise  # Linus: Fail loudly and explicitly
     max_slippage_bps = max(0.0, max_slippage_bps)
     if max_slippage_bps > 0:
         slip = max_slippage_bps / 10_000.0
@@ -358,7 +356,7 @@ def prebuild_order(payload: dict = Body(...)) -> JSONResponse:
     try:
         fee_rate_bps = float(payload.get("fee_rate_bps") or 0.0)
     except Exception:
-        fee_rate_bps = 0.0
+        raise  # Linus: Fail loudly and explicitly
     fee_rate_bps_i = int(round(max(0.0, fee_rate_bps)))
 
     expiration_s = _coarse_expiration_s(ttl_ms)
@@ -421,10 +419,8 @@ def prebuild_order(payload: dict = Body(...)) -> JSONResponse:
             "hmac_signatures": hmac_headers, # Dict[timestamp_sec, L2_Signature]
         })
 
-    except Exception as exc:
-        return JSONResponse(status_code=500, content={"ok": False, "error": _safe_reject_code(exc)})
-
-
+    except Exception:
+        raise  # Linus: Fail loudly and explicitly
 @app.delete("/orders/{order_id}")
 def cancel_order(order_id: str) -> JSONResponse:
     client = STATE.client

@@ -384,18 +384,7 @@ impl ExecutionVenue for ClobExecution {
                         ts_ms: Utc::now().timestamp_millis(),
                     });
                 }
-                // Validate price is finite and within valid range before sending
-                if !intent.price.is_finite() || intent.price <= 0.0 || intent.price >= 1.0 {
-                    return Ok(OrderAckV2 {
-                        order_id: new_id(),
-                        market_id: intent.market_id,
-                        accepted: false,
-                        accepted_size: 0.0,
-                        reject_code: Some("invalid_price".to_string()),
-                        exchange_latency_ms: 0.0,
-                        ts_ms: Utc::now().timestamp_millis(),
-                    });
-                }
+
 
                 let body_bytes: Vec<u8> = if let Some(ref prebuilt) = intent.prebuilt_payload {
                     prebuilt.clone()

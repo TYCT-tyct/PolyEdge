@@ -46,51 +46,15 @@ pub(super) fn load_fair_value_config() -> BasisMrConfig {
         let key = k.trim();
         let val = v.trim().trim_matches('"');
         match key {
-            "enabled" => {
-                if let Ok(parsed) = val.parse::<bool>() {
-                    cfg.enabled = parsed;
-                }
-            }
-            "alpha_mean" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.alpha_mean = parsed.clamp(0.0, 1.0);
-                }
-            }
-            "alpha_var" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.alpha_var = parsed.clamp(0.0, 1.0);
-                }
-            }
-            "alpha_ret" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.alpha_ret = parsed.clamp(0.0, 1.0);
-                }
-            }
-            "alpha_vol" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.alpha_vol = parsed.clamp(0.0, 1.0);
-                }
-            }
-            "k_revert" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.k_revert = parsed.clamp(0.0, 5.0);
-                }
-            }
-            "z_cap" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.z_cap = parsed.clamp(0.5, 8.0);
-                }
-            }
-            "min_confidence" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.min_confidence = parsed.clamp(0.0, 1.0);
-                }
-            }
-            "warmup_ticks" => {
-                if let Ok(parsed) = val.parse::<usize>() {
-                    cfg.warmup_ticks = parsed.max(1);
-                }
-            }
+            "enabled" => cfg.enabled = val.parse().unwrap(),
+            "alpha_mean" => cfg.alpha_mean = val.parse::<f64>().unwrap().max(0.0),
+            "alpha_var" => cfg.alpha_var = val.parse::<f64>().unwrap().max(0.0),
+            "alpha_ret" => cfg.alpha_ret = val.parse::<f64>().unwrap().max(0.0),
+            "alpha_vol" => cfg.alpha_vol = val.parse::<f64>().unwrap().max(0.0),
+            "k_revert" => cfg.k_revert = val.parse::<f64>().unwrap().max(0.0),
+            "z_cap" => cfg.z_cap = val.parse::<f64>().unwrap().max(0.5),
+            "min_confidence" => cfg.min_confidence = val.parse::<f64>().unwrap().max(0.0),
+            "warmup_ticks" => cfg.warmup_ticks = val.parse::<usize>().unwrap().max(1),
             _ => {}
         }
     }
@@ -203,77 +167,27 @@ pub(super) fn load_strategy_config() -> MakerConfig {
         let val = v.trim().trim_matches('"');
         if in_maker {
             match key {
-                "base_quote_size" => {
-                    if let Ok(parsed) = val.parse::<f64>() {
-                        cfg.base_quote_size = parsed.max(0.01);
-                    }
-                }
-                "min_edge_bps" => {
-                    if let Ok(parsed) = val.parse::<f64>() {
-                        cfg.min_edge_bps = parsed.max(0.0);
-                    }
-                }
-                "inventory_skew" => {
-                    if let Ok(parsed) = val.parse::<f64>() {
-                        cfg.inventory_skew = parsed.clamp(0.0, 1.0);
-                    }
-                }
-                "max_spread" => {
-                    if let Ok(parsed) = val.parse::<f64>() {
-                        cfg.max_spread = parsed.max(0.0001);
-                    }
-                }
-                "ttl_ms" => {
-                    if let Ok(parsed) = val.parse::<u64>() {
-                        cfg.ttl_ms = parsed.max(50);
-                    }
-                }
+                "base_quote_size" => cfg.base_quote_size = val.parse::<f64>().unwrap().max(0.01),
+                "min_edge_bps" => cfg.min_edge_bps = val.parse::<f64>().unwrap().max(0.0),
+                "inventory_skew" => cfg.inventory_skew = val.parse::<f64>().unwrap().clamp(0.0, 1.0),
+                "max_spread" => cfg.max_spread = val.parse::<f64>().unwrap().max(0.0001),
+                "ttl_ms" => cfg.ttl_ms = val.parse::<u64>().unwrap().max(50),
                 _ => {}
             }
         } else if in_taker {
             match key {
-                "trigger_bps" => {
-                    if let Ok(parsed) = val.parse::<f64>() {
-                        cfg.taker_trigger_bps = parsed.max(0.0);
-                    }
-                }
-                "max_slippage_bps" => {
-                    if let Ok(parsed) = val.parse::<f64>() {
-                        cfg.taker_max_slippage_bps = parsed.max(0.0);
-                    }
-                }
-                "stale_tick_filter_ms" => {
-                    if let Ok(parsed) = val.parse::<f64>() {
-                        cfg.stale_tick_filter_ms = parsed.clamp(50.0, 5_000.0);
-                    }
-                }
-                "market_tier_profile" => {
-                    cfg.market_tier_profile = val.to_string();
-                }
+                "trigger_bps" => cfg.taker_trigger_bps = val.parse::<f64>().unwrap().max(0.0),
+                "max_slippage_bps" => cfg.taker_max_slippage_bps = val.parse::<f64>().unwrap().max(0.0),
+                "stale_tick_filter_ms" => cfg.stale_tick_filter_ms = val.parse::<f64>().unwrap().clamp(50.0, 5_000.0),
+                "market_tier_profile" => cfg.market_tier_profile = val.to_string(),
                 _ => {}
             }
         } else if in_online {
             match key {
-                "capital_fraction_kelly" => {
-                    if let Ok(parsed) = val.parse::<f64>() {
-                        cfg.capital_fraction_kelly = parsed.clamp(0.01, 1.0);
-                    }
-                }
-                "variance_penalty_lambda" => {
-                    if let Ok(parsed) = val.parse::<f64>() {
-                        cfg.variance_penalty_lambda = parsed.clamp(0.0, 5.0);
-                    }
-                }
-                "min_eval_notional_usdc" => {
-                    if let Ok(parsed) = val.parse::<f64>() {
-                        cfg.min_eval_notional_usdc = parsed.max(0.0);
-                    }
-                }
-                "min_expected_edge_usdc" => {
-                    if let Ok(parsed) = val.parse::<f64>() {
-                        cfg.min_expected_edge_usdc = parsed.max(0.0);
-                    }
-                }
+                "capital_fraction_kelly" => cfg.capital_fraction_kelly = val.parse::<f64>().unwrap().clamp(0.01, 1.0),
+                "variance_penalty_lambda" => cfg.variance_penalty_lambda = val.parse::<f64>().unwrap().clamp(0.0, 5.0),
+                "min_eval_notional_usdc" => cfg.min_eval_notional_usdc = val.parse::<f64>().unwrap().max(0.0),
+                "min_expected_edge_usdc" => cfg.min_expected_edge_usdc = val.parse::<f64>().unwrap().max(0.0),
                 _ => {}
             }
         }
@@ -493,36 +407,12 @@ pub(super) fn load_source_health_config() -> SourceHealthConfig {
         let key = k.trim();
         let val = v.trim().trim_matches('"');
         match key {
-            "min_samples" => {
-                if let Ok(parsed) = val.parse::<u64>() {
-                    cfg.min_samples = parsed.max(1);
-                }
-            }
-            "gap_window_ms" => {
-                if let Ok(parsed) = val.parse::<i64>() {
-                    cfg.gap_window_ms = parsed.clamp(50, 60_000);
-                }
-            }
-            "jitter_limit_ms" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.jitter_limit_ms = parsed.clamp(0.1, 2_000.0);
-                }
-            }
-            "deviation_limit_bps" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.deviation_limit_bps = parsed.clamp(0.1, 10_000.0);
-                }
-            }
-            "freshness_limit_ms" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.freshness_limit_ms = parsed.clamp(50.0, 60_000.0);
-                }
-            }
-            "min_score_for_trading" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.min_score_for_trading = parsed.clamp(0.0, 1.0);
-                }
-            }
+            "min_samples" => cfg.min_samples = val.parse::<u64>().unwrap().max(1),
+            "gap_window_ms" => cfg.gap_window_ms = val.parse::<i64>().unwrap().clamp(50, 60_000),
+            "jitter_limit_ms" => cfg.jitter_limit_ms = val.parse::<f64>().unwrap().clamp(0.1, 2_000.0),
+            "deviation_limit_bps" => cfg.deviation_limit_bps = val.parse::<f64>().unwrap().clamp(0.1, 10_000.0),
+            "freshness_limit_ms" => cfg.freshness_limit_ms = val.parse::<f64>().unwrap().clamp(50.0, 60_000.0),
+            "min_score_for_trading" => cfg.min_score_for_trading = val.parse::<f64>().unwrap().clamp(0.0, 1.0),
             _ => {}
         }
     }
@@ -557,26 +447,10 @@ pub(super) fn load_edge_model_config() -> EdgeModelConfig {
             "model" => cfg.model = val.to_string(),
             "gate_mode" => cfg.gate_mode = val.to_string(),
             "version" => cfg.version = val.to_string(),
-            "base_gate_bps" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.base_gate_bps = parsed.max(0.0);
-                }
-            }
-            "congestion_penalty_bps" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.congestion_penalty_bps = parsed.max(0.0);
-                }
-            }
-            "latency_penalty_bps" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.latency_penalty_bps = parsed.max(0.0);
-                }
-            }
-            "fail_cost_bps" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.fail_cost_bps = parsed.max(0.0);
-                }
-            }
+            "base_gate_bps" => cfg.base_gate_bps = val.parse::<f64>().unwrap().max(0.0),
+            "congestion_penalty_bps" => cfg.congestion_penalty_bps = val.parse::<f64>().unwrap().max(0.0),
+            "latency_penalty_bps" => cfg.latency_penalty_bps = val.parse::<f64>().unwrap().max(0.0),
+            "fail_cost_bps" => cfg.fail_cost_bps = val.parse::<f64>().unwrap().max(0.0),
             _ => {}
         }
     }
@@ -608,81 +482,21 @@ pub(super) fn load_exit_config() -> ExitConfig {
         let key = k.trim();
         let val = v.trim().trim_matches('"');
         match key {
-            "enabled" => {
-                if let Ok(parsed) = val.parse::<bool>() {
-                    cfg.enabled = parsed;
-                }
-            }
-            "t300ms_reversal_bps" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.t300ms_reversal_bps = parsed;
-                }
-            }
-            "t100ms_reversal_bps" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.t100ms_reversal_bps = parsed;
-                }
-            }
-            "convergence_exit_ratio" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.convergence_exit_ratio = parsed.clamp(0.0, 1.0);
-                }
-            }
-            "time_stop_ms" => {
-                if let Ok(parsed) = val.parse::<u64>() {
-                    cfg.time_stop_ms = parsed.clamp(50, 600_000);
-                }
-            }
-            "edge_decay_bps" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.edge_decay_bps = parsed;
-                }
-            }
-            "adverse_move_bps" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.adverse_move_bps = parsed;
-                }
-            }
-            "flatten_on_trigger" => {
-                if let Ok(parsed) = val.parse::<bool>() {
-                    cfg.flatten_on_trigger = parsed;
-                }
-            }
-            "t3_take_ratio" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.t3_take_ratio = parsed.clamp(0.0, 5.0);
-                }
-            }
-            "t15_min_unrealized_usdc" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.t15_min_unrealized_usdc = parsed;
-                }
-            }
-            "t60_true_prob_floor" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.t60_true_prob_floor = parsed.clamp(0.0, 1.0);
-                }
-            }
-            "t300_force_exit_ms" => {
-                if let Ok(parsed) = val.parse::<u64>() {
-                    cfg.t300_force_exit_ms = parsed.clamp(1_000, 1_800_000);
-                }
-            }
-            "t300_hold_prob_threshold" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.t300_hold_prob_threshold = parsed.clamp(0.0, 1.0);
-                }
-            }
-            "t300_hold_time_to_expiry_ms" => {
-                if let Ok(parsed) = val.parse::<u64>() {
-                    cfg.t300_hold_time_to_expiry_ms = parsed.clamp(1_000, 1_800_000);
-                }
-            }
-            "max_single_trade_loss_usdc" => {
-                if let Ok(parsed) = val.parse::<f64>() {
-                    cfg.max_single_trade_loss_usdc = parsed.max(0.0);
-                }
-            }
+            "enabled" => cfg.enabled = val.parse::<bool>().unwrap(),
+            "t300ms_reversal_bps" => cfg.t300ms_reversal_bps = val.parse::<f64>().unwrap(),
+            "t100ms_reversal_bps" => cfg.t100ms_reversal_bps = val.parse::<f64>().unwrap(),
+            "convergence_exit_ratio" => cfg.convergence_exit_ratio = val.parse::<f64>().unwrap().clamp(0.0, 1.0),
+            "time_stop_ms" => cfg.time_stop_ms = val.parse::<u64>().unwrap().clamp(50, 600_000),
+            "edge_decay_bps" => cfg.edge_decay_bps = val.parse::<f64>().unwrap(),
+            "adverse_move_bps" => cfg.adverse_move_bps = val.parse::<f64>().unwrap(),
+            "flatten_on_trigger" => cfg.flatten_on_trigger = val.parse::<bool>().unwrap(),
+            "t3_take_ratio" => cfg.t3_take_ratio = val.parse::<f64>().unwrap().clamp(0.0, 5.0),
+            "t15_min_unrealized_usdc" => cfg.t15_min_unrealized_usdc = val.parse::<f64>().unwrap(),
+            "t60_true_prob_floor" => cfg.t60_true_prob_floor = val.parse::<f64>().unwrap().clamp(0.0, 1.0),
+            "t300_force_exit_ms" => cfg.t300_force_exit_ms = val.parse::<u64>().unwrap().clamp(1_000, 1_800_000),
+            "t300_hold_prob_threshold" => cfg.t300_hold_prob_threshold = val.parse::<f64>().unwrap().clamp(0.0, 1.0),
+            "t300_hold_time_to_expiry_ms" => cfg.t300_hold_time_to_expiry_ms = val.parse::<u64>().unwrap().clamp(1_000, 1_800_000),
+            "max_single_trade_loss_usdc" => cfg.max_single_trade_loss_usdc = val.parse::<f64>().unwrap().max(0.0),
             _ => {}
         }
     }
@@ -763,11 +577,7 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
 
         if in_root {
             match key {
-                "enabled" => {
-                    if let Ok(parsed) = val.parse::<bool>() {
-                        cfg.enabled = parsed;
-                    }
-                }
+                "enabled" => cfg.enabled = val.parse::<bool>().unwrap(),
                 "priority" => {
                     let norm = val.trim().to_ascii_lowercase();
                     cfg.priority = match norm.as_str() {
