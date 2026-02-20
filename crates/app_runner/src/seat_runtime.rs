@@ -1,7 +1,9 @@
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use tokio::time::Duration;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
@@ -75,6 +77,8 @@ struct ChallengerProcess {
     old_params: SeatParameterSet,
     baseline: SeatObjectiveSnapshot,
     proposal_notes: Vec<String>,
+    // Used to nullify EMA warmups. T+5mins after start, we snapshot the EV as the true 0-point.
+    pub burn_in_baseline: Option<SeatObjectiveSnapshot>,
     child: Child,
 }
 
@@ -924,8 +928,15 @@ impl SeatRuntimeHandle {
         state.post_switch_eval_due_ms = 0;
         state.post_switch_baseline_24h = None;
         state.post_switch_layer = None;
-        if post_mean < baseline {
-            self.downgrade_locked(&mut state, layer, format!("{post_mean:.6}<{baseline:.6}"))?;
+
+        // Fix 1: Regime Shift Resilience.
+        // The market is non-stationary. An absolute drop in PnL/EV between D-1 and D-0
+        // might just mean the market went sideways. We apply a 20% margin buffer (baseline * 0.8)
+        // to prevent unfairly punishing the new parameters purely for a macro regime shift.
+        let accepted_baseline = if baseline > 0.0 { baseline * 0.8 } else { baseline * 1.2 };
+
+        if post_mean < accepted_baseline {
+            self.downgrade_locked(&mut state, layer, format!("RelativeDrop:{post_mean:.6}<{accepted_baseline:.6}"))?;
         } else {
             state.degrade_streak = 0;
         }
@@ -1442,6 +1453,18 @@ impl SeatRuntimeHandle {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+
+        // Fix 2: Ubuntu/Linux Zombification Preventer.
+        // We use PR_SET_PDEATHSIG. If the parent (this app_runner) panics, is killed by OOM, or SIGINTed,
+        // the kernel instantly sends SIGKILL to the child. Bloodline termination.
+        #[cfg(unix)]
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                Ok(())
+            });
+        }
+
         let child = cmd.spawn().context("spawn challenger app_runner")?;
         let base_url = format!("http://127.0.0.1:{port}");
         self.wait_control_ready(&base_url).await?;
@@ -1457,6 +1480,7 @@ impl SeatRuntimeHandle {
             old_params,
             baseline: baseline.clone(),
             proposal_notes,
+            burn_in_baseline: None,
             child,
         });
         drop(guard);
@@ -1489,11 +1513,40 @@ impl SeatRuntimeHandle {
         let compare = self
             .fetch_shadow_and_pnl_from_base(&challenger.control_base_url)
             .await;
-        let observed_cycles =
-            ((now.saturating_sub(challenger.started_ms)) / (5 * 60 * 1_000)) as u32;
+
+        // Fix 3: Mathematical Burn-In (Amnesia Immunity)
+        // First 5 minutes of Sandbox are poisoned by empty EMAs and zero momentum.
+        let elapsed_ms = now.saturating_sub(challenger.started_ms);
+        let burn_in_period_ms = 5 * 60 * 1_000;
+
+        if elapsed_ms >= burn_in_period_ms && challenger.burn_in_baseline.is_none() {
+            if let Ok((live_burn, pnl_burn)) = &compare {
+                challenger.burn_in_baseline = Some(self.build_objective(live_burn, pnl_burn));
+            } else {
+                // Wait another tick if API is just lagging
+                *guard = Some(challenger);
+                return Ok(());
+            }
+        }
+
+        if now < challenger.end_ms {
+            *guard = Some(challenger);
+            return Ok(());
+        }
+
+        let observed_cycles = ((elapsed_ms) / (5 * 60 * 1_000)) as u32;
         let (pass, shadow_notes) = match compare {
             Ok((live, pnl)) => {
-                let obj = self.build_objective(&live, &pnl);
+                let mut obj = self.build_objective(&live, &pnl);
+
+                // Diff the raw objective against the burn-in epoch.
+                if let Some(burn_in) = &challenger.burn_in_baseline {
+                    obj.ev_usdc_p50 -= burn_in.ev_usdc_p50;
+                    // Max drawdown is cumulative, so taking the max minus what it already hit during burn-in
+                    // is a reasonable hack to isolate the "post burn-in drawdown".
+                    obj.max_drawdown_pct = (obj.max_drawdown_pct - burn_in.max_drawdown_pct).max(0.0);
+                }
+
                 let local_pass = obj.ev_usdc_p50 >= challenger.baseline.ev_usdc_p50 * 1.05
                     && obj.max_drawdown_pct <= challenger.baseline.max_drawdown_pct * 1.12
                     && observed_cycles >= challenger.required_cycles;

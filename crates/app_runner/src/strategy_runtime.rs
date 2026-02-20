@@ -20,8 +20,8 @@ use taker_sniper::{FirePlan, TakerAction};
 use core_types::RefTick;
 use crate::engine_core::{classify_execution_error_reason, normalize_reject_code};
 use crate::execution_eval::{
-    aggressive_price_for_side, edge_gross_bps_for_side, get_fee_rate_bps_cached,
-    get_rebate_bps_cached, mid_for_side, prebuild_order_payload, spread_for_side,
+    aggressive_price_for_side, calculate_dynamic_taker_fee_bps, edge_gross_bps_for_side,
+    get_fee_rate_bps_cached, get_rebate_bps_cached, mid_for_side, prebuild_order_payload, spread_for_side,
 };
 use crate::feed_runtime::settlement_prob_yes_for_symbol;
 use crate::fusion_engine::TokenBucket;
@@ -572,7 +572,10 @@ pub(super) async fn run_predator_c_for_symbol(
         edge_gross_bps: f64,
         edge_net_bps: f64,
         size: f64,
+        target_l2_size: f64,
         dual_pair: bool,
+        fee_applied: f64,
+        rebate_est_bps: f64,
     }
 
     let market_ids = market_ids.into_iter().take(32).collect::<Vec<_>>();
@@ -669,8 +672,13 @@ pub(super) async fn run_predator_c_for_symbol(
             edge_gross_bps_for_side(probability.p_settle, &OrderSide::BuyYes, yes_price);
         let no_edge_gross =
             edge_gross_bps_for_side(probability.p_settle, &OrderSide::BuyNo, no_price);
-        let yes_edge_net = yes_edge_gross - fee_bps + rebate_est_bps - edge_model_cfg.fail_cost_bps;
-        let no_edge_net = no_edge_gross - fee_bps + rebate_est_bps - edge_model_cfg.fail_cost_bps;
+
+        // Polymarket V5.3 Hyper-Gatling: Dynamic Taker Fee Models based on execution price
+        let yes_fee_taker_bps = calculate_dynamic_taker_fee_bps(&OrderSide::BuyYes, yes_price);
+        let no_fee_taker_bps = calculate_dynamic_taker_fee_bps(&OrderSide::BuyNo, no_price);
+
+        let yes_edge_net = yes_edge_gross - yes_fee_taker_bps + rebate_est_bps - edge_model_cfg.fail_cost_bps;
+        let no_edge_net = no_edge_gross - no_fee_taker_bps + rebate_est_bps - edge_model_cfg.fail_cost_bps;
         if yes_edge_net > 0.0 && no_edge_net > 0.0 && !dual_arb_ok {
             shared
                 .shadow_stats
@@ -695,13 +703,16 @@ pub(super) async fn run_predator_c_for_symbol(
             };
             (base_size * side_size_scale).max(0.01)
         };
-        let push_candidate = |bucket: &mut Vec<PredatorCandIn>,
-                              side: OrderSide,
-                              entry_price: f64,
-                              spread: f64,
-                              edge_gross_bps: f64,
-                              edge_net_bps: f64,
-                              dual_pair: bool| {
+        let mut push_candidate = |bucket: &mut Vec<PredatorCandIn>,
+                                  side: OrderSide,
+                                  entry_price: f64,
+                                  target_l2_size: f64,
+                                  spread: f64,
+                                  edge_gross_bps: f64,
+                                  edge_net_bps: f64,
+                                  dual_pair: bool,
+                                  fee_applied: f64,
+                                  rebate_bps: f64| {
             bucket.push(PredatorCandIn {
                 market_id: market_id.clone(),
                 timeframe: timeframe.clone(),
@@ -712,43 +723,65 @@ pub(super) async fn run_predator_c_for_symbol(
                 edge_gross_bps,
                 edge_net_bps,
                 size: mk_size(entry_price),
+                target_l2_size,
                 dual_pair,
+                fee_applied,
+                rebate_est_bps: rebate_bps,
             });
         };
         let bucket = cand_inputs_by_market.entry(market_id.clone()).or_default();
+
+        let target_l2_size_for_side = |book: &BookTop, side: &OrderSide| -> f64 {
+            match side {
+                OrderSide::BuyYes => book.ask_size_yes,
+                OrderSide::SellYes => book.bid_size_yes,
+                OrderSide::BuyNo => book.ask_size_no,
+                OrderSide::SellNo => book.bid_size_no,
+            }
+        };
+
         if dual_arb_ok && yes_edge_net > 0.0 && no_edge_net > 0.0 {
             push_candidate(
                 bucket,
                 OrderSide::BuyYes,
                 yes_price,
+                target_l2_size_for_side(&book, &OrderSide::BuyYes),
                 spread_for_side(&book, &OrderSide::BuyYes),
                 yes_edge_gross,
                 yes_edge_net,
                 true,
+                yes_fee_taker_bps,
+                rebate_est_bps,
             );
             push_candidate(
                 bucket,
                 OrderSide::BuyNo,
                 no_price,
+                target_l2_size_for_side(&book, &OrderSide::BuyNo),
                 spread_for_side(&book, &OrderSide::BuyNo),
                 no_edge_gross,
                 no_edge_net,
                 true,
+                no_fee_taker_bps,
+                rebate_est_bps,
             );
         } else {
-            let (side, entry_price, edge_gross_bps, edge_net_bps) = if no_edge_net > yes_edge_net {
-                (OrderSide::BuyNo, no_price, no_edge_gross, no_edge_net)
+            let (side, entry_price, edge_gross_bps, edge_net_bps, fee_applied) = if no_edge_net > yes_edge_net {
+                (OrderSide::BuyNo, no_price, no_edge_gross, no_edge_net, no_fee_taker_bps)
             } else {
-                (OrderSide::BuyYes, yes_price, yes_edge_gross, yes_edge_net)
+                (OrderSide::BuyYes, yes_price, yes_edge_gross, yes_edge_net, yes_fee_taker_bps)
             };
             push_candidate(
                 bucket,
                 side.clone(),
                 entry_price,
+                target_l2_size_for_side(&book, &side),
                 spread_for_side(&book, &side),
                 edge_gross_bps,
                 edge_net_bps,
                 false,
+                fee_applied,
+                rebate_est_bps,
             );
         }
     }
@@ -776,10 +809,12 @@ pub(super) async fn run_predator_c_for_symbol(
                     direction_signal: sig,
                     entry_price: cin.entry_price,
                     spread: cin.spread,
-                    fee_bps: cin.fee_bps,
+                    fee_bps: cin.fee_applied, // use dynamic taker fee
                     edge_gross_bps: cin.edge_gross_bps,
                     edge_net_bps: cin.edge_net_bps,
+                    rebate_est_bps: cin.rebate_est_bps,
                     size: cin.size,
+                    target_l2_size: cin.target_l2_size,
                     now_ms,
                 })
             };
@@ -1278,6 +1313,7 @@ pub(super) async fn run_predator_d_for_symbol(
             side: side.clone(),
             entry_price,
             size,
+            target_l2_size: 0.0, // Used as fallback so target sizing defaults to unbounded Gatling.
             edge_gross_bps,
             edge_net_bps,
             edge_net_usdc,

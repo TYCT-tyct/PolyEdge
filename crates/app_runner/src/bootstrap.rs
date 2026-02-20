@@ -162,7 +162,7 @@ pub(super) async fn async_main() -> Result<()> {
             });
         }
     }
-    let shadow = Arc::new(ShadowExecutor::default());
+    let shadow = Arc::new(ShadowExecutor::new());
     let strategy_cfg = Arc::new(RwLock::new(Arc::new(load_strategy_config())));
     let settlement_cfg = Arc::new(RwLock::new(settlement_cfg_boot));
     let fusion_cfg = Arc::new(RwLock::new(load_fusion_config()));
@@ -354,6 +354,9 @@ pub(super) async fn async_main() -> Result<()> {
         shared.clone(),
         strategy_ingress_rx,
     );
+    if shared.fusion_cfg.read().await.udp_trigger_enabled {
+        crate::engine_loop::spawn_udp_ghost_receiver(execution.clone(), shared.clone());
+    }
     crate::engine_loop::spawn_presign_worker(shared.clone());
     orchestration::spawn_periodic_report_persistor(
         shared.shadow_stats.clone(),

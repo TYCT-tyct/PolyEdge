@@ -75,6 +75,7 @@ pub(super) fn build_router(state: AppState) -> Router {
         .route("/control/reload_toxicity", post(reload_toxicity))
         .route("/control/reload_risk", post(reload_risk))
         .route("/control/reload_predator_c", post(reload_predator_c))
+        .route("/predator/sync-balance", post(sync_predator_balance))
         .route("/control/reload_fusion", post(reload_fusion))
         .route("/control/reload_edge_model", post(reload_edge_model))
         .route("/control/reload_probability", post(reload_probability))
@@ -353,6 +354,23 @@ struct PredatorCReloadResp {
     predator_c: PredatorCConfig,
 }
 
+#[derive(Debug, Deserialize)]
+struct PredatorSyncBalanceReq {
+    usdc_balance: f64,
+}
+
+async fn sync_predator_balance(
+    State(state): State<AppState>,
+    Json(req): Json<PredatorSyncBalanceReq>,
+) -> Json<serde_json::Value> {
+    let mut compounder = state.shared.predator_compounder.write().await;
+    compounder.sync_balance(req.usdc_balance);
+    Json(serde_json::json!({
+        "ok": true,
+        "synced_usdc_balance": compounder.available()
+    }))
+}
+
 fn normalize_v52_config(v52: &mut V52Config) {
     v52.time_phase.early_min_ratio = v52.time_phase.early_min_ratio.clamp(0.11, 0.99);
     v52.time_phase.late_max_ratio = v52.time_phase.late_max_ratio.clamp(0.01, 0.54);
@@ -524,6 +542,15 @@ async fn reload_fusion(
     }
     if let Some(v) = req.udp_local_only {
         cfg.udp_local_only = v;
+    }
+    if let Some(v) = req.udp_trigger_enabled {
+        cfg.udp_trigger_enabled = v;
+    }
+    if let Some(v) = req.udp_trigger_port {
+        cfg.udp_trigger_port = v.max(1);
+    }
+    if let Some(ref v) = req.udp_trigger_target {
+        cfg.udp_trigger_target = v.clone();
     }
 
     let snapshot = cfg.clone();

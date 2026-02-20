@@ -1,0 +1,120 @@
+warning: unused import: `std::collections::HashMap`
+ --> crates\feeder_tokyo\src\bin\brain.rs:6:5
+  |
+6 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `feeder_tokyo` (bin "brain") generated 1 warning (run `cargo fix --bin "brain" -p feeder_tokyo` to apply 1 suggestion)
+    Checking app_runner v0.1.0 (E:\Projects\test\crates\app_runner)
+error[E0425]: cannot find function `side_to_direction` in crate `core_types`
+   --> crates\app_runner\src\engine_loop.rs:185:44
+    |
+185 |                     direction: core_types::side_to_direction(&target_side),
+    |                                            ^^^^^^^^^^^^^^^^^ not found in `core_types`
+    |
+note: function `crate::strategy_runtime::side_to_direction` exists but is inaccessible
+   --> crates\app_runner\src\strategy_runtime.rs:113:1
+    |
+113 | fn side_to_direction(side: &OrderSide) -> Direction {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not accessible
+
+warning: unused import: `mpsc`
+  --> crates\app_runner\src\bootstrap.rs:21:19
+   |
+21 | use tokio::sync::{mpsc, RwLock};
+   |                   ^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> crates\app_runner\src\strategy_runtime.rs:706:13
+    |
+706 |         let mut push_candidate = |bucket: &mut Vec<PredatorCandIn>,
+    |             ----^^^^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+error[E0599]: no variant or associated item named `M1` found for enum `TimeframeClass` in the current scope
+   --> crates\app_runner\src\engine_loop.rs:178:42
+    |
+178 |                 let tf = TimeframeClass::M1;
+    |                                          ^^ variant or associated item not found in `TimeframeClass`
+
+error[E0560]: struct `ExecutionIntent` has no field named `timeframe`
+   --> crates\app_runner\src\engine_loop.rs:221:33
+    |
+221 | ...                   timeframe: tf.clone(),
+    |                       ^^^^^^^^^ `ExecutionIntent` does not have this field
+    |
+    = note: available fields are: `symbol`, `style`, `stage`, `edge_net_bps`, `confidence`, `ts_ms`
+
+error[E0560]: struct `ExecutionIntent` has no field named `price`
+   --> crates\app_runner\src\engine_loop.rs:223:33
+    |
+223 | ...                   price: exec_price,
+    |                       ^^^^^ `ExecutionIntent` does not have this field
+    |
+    = note: available fields are: `symbol`, `style`, `stage`, `edge_net_bps`, `confidence`, `ts_ms`
+
+error[E0560]: struct `ExecutionIntent` has no field named `size`
+   --> crates\app_runner\src\engine_loop.rs:224:33
+    |
+224 | ...                   size: chunk.size,
+    |                       ^^^^ `ExecutionIntent` does not have this field
+    |
+    = note: available fields are: `symbol`, `style`, `stage`, `edge_net_bps`, `confidence`, `ts_ms`
+
+error[E0560]: struct `ExecutionIntent` has no field named `time_in_force`
+   --> crates\app_runner\src\engine_loop.rs:225:33
+    |
+225 | ...                   time_in_force: core_types::OrderTimeInForce::Fak,
+    |                       ^^^^^^^^^^^^^ `ExecutionIntent` does not have this field
+    |
+    = note: available fields are: `symbol`, `style`, `stage`, `edge_net_bps`, `confidence`, `ts_ms`
+
+error[E0560]: struct `ExecutionIntent` has no field named `post_only`
+   --> crates\app_runner\src\engine_loop.rs:226:33
+    |
+226 | ...                   post_only: false,
+    |                       ^^^^^^^^^ `ExecutionIntent` does not have this field
+    |
+    = note: available fields are: `symbol`, `style`, `stage`, `edge_net_bps`, `confidence`, `ts_ms`
+
+error[E0560]: struct `ExecutionIntent` has no field named `source`
+   --> crates\app_runner\src\engine_loop.rs:227:33
+    |
+227 | ...                   source: "omega_r3_udp".to_string(),
+    |                       ^^^^^^ `ExecutionIntent` does not have this field
+    |
+    = note: available fields are: `symbol`, `style`, `stage`, `edge_net_bps`, `confidence`, `ts_ms`
+
+error[E0560]: struct `ExecutionIntent` has no field named `trigger_ts_ms`
+   --> crates\app_runner\src\engine_loop.rs:228:33
+    |
+228 | ...                   trigger_ts_ms: eval_ctx.now_ms,
+    |                       ^^^^^^^^^^^^^ `ExecutionIntent` does not have this field
+    |
+    = note: available fields are: `symbol`, `style`, `stage`, `edge_net_bps`, `confidence`, `ts_ms`
+
+error[E0560]: struct `ExecutionIntent` has no field named `expected_edge_bps`
+   --> crates\app_runner\src\engine_loop.rs:229:33
+    |
+229 | ...                   expected_edge_bps: 200.0,
+    |                       ^^^^^^^^^^^^^^^^^ `ExecutionIntent` does not have this field
+    |
+    = note: available fields are: `symbol`, `style`, `stage`, `edge_net_bps`, `confidence`, `ts_ms`
+
+error[E0599]: no method named `push_taker_intent` found for struct `Arc<ClobExecution>` in the current scope
+   --> crates\app_runner\src\engine_loop.rs:231:39
+    |
+231 | ...                   execution.push_taker_intent(intent).await;
+    |                                 ^^^^^^^^^^^^^^^^^ method not found in `Arc<ClobExecution>`
+
+Some errors have detailed explanations: E0425, E0560, E0599.
+For more information about an error, try `rustc --explain E0425`.
+warning: `app_runner` (bin "app_runner") generated 2 warnings
+error: could not compile `app_runner` (bin "app_runner") due to 11 previous errors; 2 warnings emitted

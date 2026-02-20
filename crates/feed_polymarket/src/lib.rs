@@ -140,12 +140,16 @@ impl PolymarketFeed {
                     yes: AssetTop {
                         bid: bid_yes,
                         ask: ask_yes,
+                        bid_size: 0.0,
+                        ask_size: 0.0,
                         ts_exchange_ms: ts_ms,
                         recv_ts_local_ns: now_ns(),
                     },
                     no: AssetTop {
                         bid: bid_no,
                         ask: ask_no,
+                        bid_size: 0.0,
+                        ask_size: 0.0,
                         ts_exchange_ms: ts_ms,
                         recv_ts_local_ns: now_ns(),
                     },
@@ -344,6 +348,12 @@ impl PolymarketFeed {
                                 } else {
                                     tracing::warn!(price = v, "invalid ask price, skipping");
                                 }
+                            }
+                            if let Some(v) = update.best_bid_size {
+                                target.bid_size = v;
+                            }
+                            if let Some(v) = update.best_ask_size {
+                                target.ask_size = v;
                             }
                             target.ts_exchange_ms = update.ts_exchange_ms;
                             target.recv_ts_local_ns = update.recv_ts_local_ns;
@@ -659,20 +669,20 @@ fn parse_asset_updates(payload: &WsEvent) -> Vec<AssetUpdate> {
 fn parse_single_asset_update(payload: &WsEvent) -> Option<AssetUpdate> {
     let asset_id = payload.asset_id.clone()?;
 
-    let best_bid = payload
-        .best_bid
-        .or_else(|| top_level_price(payload.bids.as_ref()))
-        .or_else(|| top_level_price(payload.buys.as_ref()));
+    let (bid_top_price, bid_top_size) = top_level_price_and_size(payload.bids.as_ref().or(payload.buys.as_ref()));
+    let best_bid = payload.best_bid.or(bid_top_price);
+    let best_bid_size = bid_top_size;
 
-    let best_ask = payload
-        .best_ask
-        .or_else(|| top_level_price(payload.asks.as_ref()))
-        .or_else(|| top_level_price(payload.sells.as_ref()));
+    let (ask_top_price, ask_top_size) = top_level_price_and_size(payload.asks.as_ref().or(payload.sells.as_ref()));
+    let best_ask = payload.best_ask.or(ask_top_price);
+    let best_ask_size = ask_top_size;
 
     Some(AssetUpdate {
         asset_id,
         best_bid,
+        best_bid_size,
         best_ask,
+        best_ask_size,
         ts_exchange_ms: payload.timestamp.unwrap_or_else(now_ms),
         recv_ts_local_ns: now_ns(),
     })
@@ -773,8 +783,9 @@ fn parse_levels(value: Option<&Vec<WsLevel>>) -> Vec<BookLevel> {
     out
 }
 
-fn top_level_price(value: Option<&Vec<WsLevel>>) -> Option<f64> {
-    value?.first()?.price
+fn top_level_price_and_size(value: Option<&Vec<WsLevel>>) -> (Option<f64>, Option<f64>) {
+    let first = value.and_then(|v| v.first());
+    (first.and_then(|l| l.price), first.and_then(|l| l.size))
 }
 
 /// Fast timestamp using SystemTime (more efficient than chrono::Utc::now())
@@ -904,6 +915,8 @@ where
 struct AssetTop {
     bid: f64,
     ask: f64,
+    bid_size: f64,
+    ask_size: f64,
     ts_exchange_ms: i64,
     recv_ts_local_ns: i64,
 }
@@ -927,6 +940,10 @@ impl MarketState {
             ask_yes: self.yes.ask,
             bid_no: self.no.bid,
             ask_no: self.no.ask,
+            bid_size_yes: self.yes.bid_size,
+            ask_size_yes: self.yes.ask_size,
+            bid_size_no: self.no.bid_size,
+            ask_size_no: self.no.ask_size,
             ts_ms: self.yes.ts_exchange_ms.max(self.no.ts_exchange_ms),
             recv_ts_local_ns: self.yes.recv_ts_local_ns.max(self.no.recv_ts_local_ns),
         }
@@ -937,7 +954,9 @@ impl MarketState {
 struct AssetUpdate {
     asset_id: String,
     best_bid: Option<f64>,
+    best_bid_size: Option<f64>,
     best_ask: Option<f64>,
+    best_ask_size: Option<f64>,
     ts_exchange_ms: i64,
     recv_ts_local_ns: i64,
 }

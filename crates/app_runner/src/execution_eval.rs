@@ -32,6 +32,21 @@ pub(super) async fn get_fee_rate_bps_cached(shared: &EngineShared, market_id: &s
     cached_fee
 }
 
+/// Computes the dynamic Taker Fee for Polymarket.
+/// Polymarket Taker Fees scale with the size and odds of the trade:
+/// Buy Yes Fee  = p * max_fee_rate
+/// Sell Yes Fee = (1 - p) * max_fee_rate
+/// Buy No Fee   = (1 - p) * max_fee_rate
+/// Sell No Fee  = p * max_fee_rate
+/// Current Polymarket max Taker fee rate is dynamically ~ 3.5% (350 bps)
+pub(super) fn calculate_dynamic_taker_fee_bps(side: &OrderSide, price: f64) -> f64 {
+    const MAX_TAKER_FEE_BPS: f64 = 350.0;
+    match side {
+        OrderSide::BuyYes | OrderSide::SellNo => price * MAX_TAKER_FEE_BPS,
+        OrderSide::SellYes | OrderSide::BuyNo => (1.0 - price) * MAX_TAKER_FEE_BPS,
+    }
+}
+
 pub(super) async fn get_rebate_bps_cached(
     shared: &EngineShared,
     market_id: &str,

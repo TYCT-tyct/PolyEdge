@@ -13,12 +13,22 @@ pub struct ShadowOrder {
     pub fee_rate_bps: f64,
 }
 
-#[derive(Default)]
 pub struct ShadowExecutor {
     orders: RwLock<HashMap<String, ShadowOrder>>,
 }
 
+impl Default for ShadowExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ShadowExecutor {
+    pub fn new() -> Self {
+        Self {
+            orders: RwLock::new(HashMap::new()),
+        }
+    }
     pub fn register_order(
         &self,
         ack: &OrderAck,
@@ -100,9 +110,13 @@ impl ShadowExecutor {
             })
             .collect();
 
+        let mut to_remove_intents = HashMap::new();
+
         // Remove filled orders within same write lock
         for id in to_remove {
-            orders.remove(&id);
+            if let Some(order) = orders.remove(&id) {
+                to_remove_intents.insert(id, order.intent);
+            }
         }
 
         fills

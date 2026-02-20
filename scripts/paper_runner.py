@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import time
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, TextIO
@@ -53,6 +54,7 @@ class InstanceRun:
     strategy_config: Optional[str]
     log_path: Path
     log_file: TextIO
+    initial_capital: float
 
 
 def spawn_instance(
@@ -104,6 +106,7 @@ def spawn_instance(
         strategy_config=strategy_config,
         log_path=log_path,
         log_file=log_file,
+        initial_capital=initial_capital,
     )
 
 
@@ -145,20 +148,45 @@ def stop_instance(inst: InstanceRun) -> None:
         inst.log_file.close()
 
 
-def read_summary_from_files(dataset_root: Path) -> Optional[dict]:
-    day = time.strftime("%Y-%m-%d", time.gmtime())
-    summary = dataset_root / "reports" / day / "paper_summary_latest.json"
-    if not summary.exists():
+def read_summary_from_sqlite(inst: InstanceRun) -> Optional[dict]:
+    db_path = inst.dataset_root / "reports" / "paper_summary.sqlite"
+    if not db_path.exists():
         return None
     try:
-        return json.loads(summary.read_text(encoding="utf-8"))
-    except Exception:
-        raise  # Linus: Fail loudly and explicitly
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            try:
+                cursor.execute("SELECT * FROM paper_run_summary ORDER BY ts_ms DESC LIMIT 1")
+                row = cursor.fetchone()
+                if not row:
+                    return None
+
+                return {
+                    "run_id": row["run_id"],
+                    "roi_pct": row["roi_pct"],
+                    "win_rate": row["win_rate"],
+                    "fee_ratio": row["fee_ratio"],
+                    "trades": row["trades"],
+                    "pnl_total_usdc": row["pnl_total_usdc"],
+                    "avg_trade_duration_ms": row["avg_trade_duration_ms"],
+                    "median_trade_duration_ms": row["median_trade_duration_ms"],
+                    "bankroll": row["bankroll"],
+                }
+            except sqlite3.OperationalError:
+                # Table might not exist yet if Rust hasn't flushed
+                return None
+
+    except Exception as e:
+        print(f"[warning] Failed to read sqlite reports for {inst.run_id}: {e}")
+        return None
+
 def collect_final_summary(inst: InstanceRun) -> dict:
     api = get_json(inst.base_url, "/report/paper/summary", timeout=3.0)
     if api:
         return api
-    file_payload = read_summary_from_files(inst.dataset_root)
+    file_payload = read_summary_from_sqlite(inst)
     if file_payload:
         return file_payload
     return {
@@ -170,7 +198,7 @@ def collect_final_summary(inst: InstanceRun) -> dict:
         "pnl_total_usdc": 0.0,
         "avg_trade_duration_ms": 0.0,
         "median_trade_duration_ms": 0.0,
-        "bankroll": 0.0,
+        "bankroll": inst.initial_capital,
     }
 
 

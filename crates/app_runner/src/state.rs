@@ -414,6 +414,9 @@ pub(crate) struct FusionReloadReq {
     pub(crate) fallback_arm_duration_ms: Option<u64>,
     pub(crate) fallback_cooldown_sec: Option<u64>,
     pub(crate) udp_local_only: Option<bool>,
+    pub(crate) udp_trigger_enabled: Option<bool>,
+    pub(crate) udp_trigger_port: Option<u16>,
+    pub(crate) udp_trigger_target: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -587,6 +590,9 @@ pub(crate) struct FusionConfig {
     pub(crate) fallback_arm_duration_ms: u64,
     pub(crate) fallback_cooldown_sec: u64,
     pub(crate) udp_local_only: bool,
+    pub(crate) udp_trigger_enabled: bool,
+    pub(crate) udp_trigger_port: u16,
+    pub(crate) udp_trigger_target: String,
 }
 
 impl Default for FusionConfig {
@@ -602,6 +608,9 @@ impl Default for FusionConfig {
             fallback_arm_duration_ms: 8_000,
             fallback_cooldown_sec: 300,
             udp_local_only: true,
+            udp_trigger_enabled: false,
+            udp_trigger_port: 6667,
+            udp_trigger_target: "127.0.0.1:6667".to_string(),
         }
     }
 }
@@ -1137,6 +1146,10 @@ pub(crate) struct ShadowLiveReport {
     pub(crate) local_backlog_p99_ms: f64,
     pub(crate) lag_half_life_ms: f64,
     pub(crate) probability_total: u64,
+    pub(crate) probability_degraded: u64,
+    pub(crate) death_box_pin_risk: u64,
+    pub(crate) death_box_toxic_reversal: u64,
+    pub(crate) death_box_fee_bleed: u64,
     pub(crate) settlement_source_degraded_ratio: f64,
     pub(crate) settle_fast_delta_p50_bps: f64,
     pub(crate) settle_fast_delta_p90_bps: f64,
@@ -1336,6 +1349,9 @@ pub(crate) struct ShadowStats {
     pub(crate) predator_capital_halt: AtomicBool,
     pub(crate) probability_total: AtomicU64,
     pub(crate) probability_degraded: AtomicU64,
+    pub(crate) death_box_pin_risk: AtomicU64,
+    pub(crate) death_box_toxic_reversal: AtomicU64,
+    pub(crate) death_box_fee_bleed: AtomicU64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1436,6 +1452,9 @@ impl ShadowStats {
             predator_capital_halt: AtomicBool::new(false),
             probability_total: AtomicU64::new(0),
             probability_degraded: AtomicU64::new(0),
+            death_box_pin_risk: AtomicU64::new(0),
+            death_box_toxic_reversal: AtomicU64::new(0),
+            death_box_fee_bleed: AtomicU64::new(0),
         }
     }
 
@@ -1504,6 +1523,9 @@ impl ShadowStats {
         self.predator_capital_halt.store(false, Ordering::Relaxed);
         self.probability_total.store(0, Ordering::Relaxed);
         self.probability_degraded.store(0, Ordering::Relaxed);
+        self.death_box_pin_risk.store(0, Ordering::Relaxed);
+        self.death_box_toxic_reversal.store(0, Ordering::Relaxed);
+        self.death_box_fee_bleed.store(0, Ordering::Relaxed);
         window_id
     }
 
@@ -1836,6 +1858,22 @@ impl ShadowStats {
                 self.predator_dir_neutral.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    pub(crate) fn mark_probability_degraded(&self) {
+        self.probability_degraded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn mark_death_box_pin_risk(&self) {
+        self.death_box_pin_risk.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn mark_death_box_toxic_reversal(&self) {
+        self.death_box_toxic_reversal.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn mark_death_box_fee_bleed(&self) {
+        self.death_box_fee_bleed.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn mark_predator_taker_fired(&self) {
@@ -2405,6 +2443,10 @@ impl ShadowStats {
             capital_available_usdc: capital.available_usdc,
             capital_base_quote_size: capital.base_quote_size,
             capital_halt,
+            death_box_pin_risk: self.death_box_pin_risk.load(Ordering::Relaxed),
+            death_box_toxic_reversal: self.death_box_toxic_reversal.load(Ordering::Relaxed),
+            death_box_fee_bleed: self.death_box_fee_bleed.load(Ordering::Relaxed),
+            probability_degraded,
         };
         live.gate_fail_reasons =
             gate_eval::compute_gate_fail_reasons(&live, Self::GATE_MIN_OUTCOMES);

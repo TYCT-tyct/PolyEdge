@@ -11,3 +11,5 @@ anyhow = { workspace = true }
 poly_wire = { path = "../poly_wire" }
 rustls = { workspace = true }
 libc = "0.2"
+core_types = { path = "../core_types" }
+direction_detector = { path = "../direction_detector" }

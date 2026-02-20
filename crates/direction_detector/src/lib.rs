@@ -76,19 +76,23 @@ impl Default for DirectionConfig {
 
 #[derive(Debug, Default)]
 struct SymbolWindow {
-    // (recv_ts_ms, price) — 按时间戳升序
-    ticks: VecDeque<(i64, f64)>,
+    // (recv_ts_ms, price) — 按时间戳升序，仅含 Binance tick
+    binance_ticks: VecDeque<(i64, f64)>,
+    // (recv_ts_ms, price) — 按时间戳升序，仅含 Chainlink tick
+    chainlink_ticks: VecDeque<(i64, f64)>,
+
     // 各数据源最新价格和时间戳
     latest_by_source: HashMap<String, f64>,
     latest_ts_by_source: HashMap<String, i64>,
 
-    /// 最近 tick_rate_short_ms 内的 tick 数
+    /// 最近 tick_rate_short_ms 内的 Binance tick 数
     short_window_count: u32,
-    /// 最近 tick_rate_long_ms 内的 tick 数
+    /// 最近 tick_rate_long_ms 内的 Binance tick 数
     long_window_count: u32,
-    /// 连续同向 tick 计数 (增量维护)
+
+    /// 连续同向 tick 计数 (增量维护，仅作用于 Binance)
     consecutive_dir_count: u8,
-    /// 最后一个 tick 的方向符号: -1/0/1
+    /// 最后一个 Binance tick 的方向符号: -1/0/1
     last_dir_sign: i8,
 
     /// 已见过的 Binance 源 key (第一次见到时缓存)
@@ -160,35 +164,44 @@ impl DirectionDetector {
                 .insert(tick.source.to_string(), tick.recv_ts_ms);
         }
 
-        if let Some(&(_, prev_price)) = w.ticks.back() {
-            if prev_price > 0.0 && tick.price > 0.0 {
-                let delta = tick.price - prev_price;
-                let sign: i8 = if delta > 0.0 {
-                    1
-                } else if delta < 0.0 {
-                    -1
-                } else {
-                    0
-                };
-                if sign == 0 {
-                    w.consecutive_dir_count = 0;
-                    w.last_dir_sign = 0;
-                } else if sign == w.last_dir_sign {
-                    w.consecutive_dir_count = w.consecutive_dir_count.saturating_add(1);
-                } else {
-                    w.consecutive_dir_count = 1;
-                    w.last_dir_sign = sign;
+        let is_binance = is_binance_source(&tick.source);
+        let is_chainlink = is_chainlink_source(&tick.source);
+
+        if is_binance {
+            // 只在 Binance tick 上计算连涨/连跌 (动量指示器核心)
+            if let Some(&(_, prev_price)) = w.binance_ticks.back() {
+                if prev_price > 0.0 && tick.price > 0.0 {
+                    let delta = tick.price - prev_price;
+                    let sign: i8 = if delta > 0.0 {
+                        1
+                    } else if delta < 0.0 {
+                        -1
+                    } else {
+                        0
+                    };
+                    if sign == 0 {
+                        w.consecutive_dir_count = 0;
+                        w.last_dir_sign = 0;
+                    } else if sign == w.last_dir_sign {
+                        w.consecutive_dir_count = w.consecutive_dir_count.saturating_add(1);
+                    } else {
+                        w.consecutive_dir_count = 1;
+                        w.last_dir_sign = sign;
+                    }
                 }
             }
-        }
+            w.binance_ticks.push_back((tick.recv_ts_ms, tick.price));
 
-        w.ticks.push_back((tick.recv_ts_ms, tick.price));
+            // 只有 Binance ticker 参与交易速率计算 (Volume Proxy)
+            w.short_window_count += 1;
+            w.long_window_count += 1;
+        } else if is_chainlink {
+            w.chainlink_ticks.push_back((tick.recv_ts_ms, tick.price));
+        }
 
         let short_ms = self.cfg_tick_rate_short_ms;
         let long_ms = self.cfg_tick_rate_long_ms;
         let now = tick.recv_ts_ms;
-        w.short_window_count += 1;
-        w.long_window_count += 1;
 
         // 懒惰剪枝: 每 100 ticks 清理过期数据，同时修正计数器
         self.tick_counter += 1;
@@ -198,25 +211,32 @@ impl DirectionDetector {
                 now.saturating_sub((self.cfg.window_max_sec as i64).saturating_mul(1_000));
             let short_cutoff = now.saturating_sub(short_ms);
             let long_cutoff = now.saturating_sub(long_ms);
-            // 重新精确计算计数器（每 100 ticks 一次，分摊成本）
+            // 重新精确计算 Binance 计数器
             w.short_window_count =
-                w.ticks.iter().filter(|(ts, _)| *ts >= short_cutoff).count() as u32;
+                w.binance_ticks.iter().filter(|(ts, _)| *ts >= short_cutoff).count() as u32;
             w.long_window_count =
-                w.ticks.iter().filter(|(ts, _)| *ts >= long_cutoff).count() as u32;
-            while matches!(w.ticks.front(), Some((ts, _)) if *ts < window_cutoff) {
-                w.ticks.pop_front();
+                w.binance_ticks.iter().filter(|(ts, _)| *ts >= long_cutoff).count() as u32;
+
+            while matches!(w.binance_ticks.front(), Some((ts, _)) if *ts < window_cutoff) {
+                w.binance_ticks.pop_front();
+            }
+            while matches!(w.chainlink_ticks.front(), Some((ts, _)) if *ts < window_cutoff) {
+                w.chainlink_ticks.pop_front();
             }
         }
     }
 
     pub fn evaluate(&self, symbol: &str, now_ms: i64) -> Option<DirectionSignal> {
         let w = self.windows.get(symbol)?;
-        if w.ticks.len() < self.cfg.min_ticks_for_signal {
+
+        // 我们只用 Binance 队列的深度来判断冷启动
+        if w.binance_ticks.len() < self.cfg.min_ticks_for_signal {
             return None;
         }
 
-        let latest = w.ticks.back().map(|(_, px)| *px)?;
-        if latest <= 0.0 {
+        // 所有动量计算的基石必须是 Binance
+        let latest_binance = w.binance_ticks.back().map(|(_, px)| *px)?;
+        if latest_binance <= 0.0 {
             return None;
         }
 
@@ -224,18 +244,20 @@ impl DirectionDetector {
             now_ms.saturating_sub((self.cfg.lookback_short_sec as i64).saturating_mul(1_000));
         let anchor_long_ms =
             now_ms.saturating_sub((self.cfg.lookback_long_sec as i64).saturating_mul(1_000));
-        let anchor_short = find_anchor_price(&w.ticks, anchor_short_ms)?;
-        let anchor_long = find_anchor_price(&w.ticks, anchor_long_ms)?;
-        if anchor_short <= 0.0 || anchor_long <= 0.0 {
+
+        // 提取 Binance 针对于特定历史时间的锚点
+        let anchor_short_binance = find_anchor_price(&w.binance_ticks, anchor_short_ms)?;
+        let anchor_long_binance = find_anchor_price(&w.binance_ticks, anchor_long_ms)?;
+        if anchor_short_binance <= 0.0 || anchor_long_binance <= 0.0 {
             return None;
         }
 
-        let ret_short = (latest - anchor_short) / anchor_short;
-        let ret_long = (latest - anchor_long) / anchor_long;
+        let ret_short = (latest_binance - anchor_short_binance) / anchor_short_binance;
+        let ret_long = (latest_binance - anchor_long_binance) / anchor_long_binance;
         let magnitude_pct = (ret_short * 0.7 + ret_long * 0.3) * 100.0;
-        // kinematics_from_ticks \u73b0\u5728\u53ea\u8fd4\u56de (velocity, acceleration)
-        // tick_consistency \u7531 SymbolWindow \u589e\u91cf\u7ef4\u62a4\uff0cO(1) \u8bfb\u53d6
-        let (velocity_bps_per_sec, acceleration) = kinematics_from_ticks(&w.ticks);
+
+        // 加速度与速度的提取只针对 Binance (清洗了 Chainlink 的异物)
+        let (velocity_bps_per_sec, acceleration) = kinematics_from_ticks(&w.binance_ticks);
         let tick_consistency = w.consecutive_dir_count;
 
         let mut raw_direction = if magnitude_pct > self.cfg.threshold_15m_pct {
@@ -302,7 +324,9 @@ impl DirectionDetector {
             &w.latest_ts_by_source,
             w.binance_source_key.as_deref(),
             w.chainlink_source_key.as_deref(),
-            anchor_short,
+            anchor_short_binance,
+            &w.chainlink_ticks, // 传入 chainlink_ticks 用于查找自身的锚点
+            anchor_short_ms,     // 传入短锚点时间戳
             &raw_direction,
             now_ms,
             self.cfg.source_vote_max_age_ms,
@@ -325,7 +349,7 @@ impl DirectionDetector {
 
         let confidence = compute_confidence(
             &w.latest_by_source,
-            anchor_short,
+            anchor_short_binance,
             &direction,
             self.cfg.min_sources_for_high_confidence,
         );
@@ -358,12 +382,14 @@ fn source_vote_cached(
     latest_ts_by_source: &HashMap<String, i64>,
     binance_key: Option<&str>,
     chainlink_key: Option<&str>,
-    anchor_short: f64,
+    anchor_short_binance: f64,
+    chainlink_ticks: &VecDeque<(i64, f64)>,
+    anchor_short_ms: i64,
     direction: &Direction,
     now_ms: i64,
     max_age_ms: i64,
 ) -> SourceVote {
-    if anchor_short <= 0.0 || matches!(direction, Direction::Neutral) {
+    if anchor_short_binance <= 0.0 || matches!(direction, Direction::Neutral) {
         return SourceVote::default();
     }
     let mut out = SourceVote::default();
@@ -373,7 +399,7 @@ fn source_vote_cached(
     if let Some(key) = binance_key {
         if let (Some(&px), Some(&ts)) = (latest_by_source.get(key), latest_ts_by_source.get(key)) {
             if now_ms.saturating_sub(ts) <= max_age_ms {
-                let ret = (px - anchor_short) / anchor_short;
+                let ret = (px - anchor_short_binance) / anchor_short_binance;
                 out.binance_confirms = match direction {
                     Direction::Up => ret > 0.0,
                     Direction::Down => ret < 0.0,
@@ -383,17 +409,21 @@ fn source_vote_cached(
         }
     }
 
-    // 检查 Chainlink 源确认
+    // 检查 Chainlink 源确认: 注意这里不能用 Binance 的 Anchor，而要用 Chainlink 自己的 Anchor
     if let Some(key) = chainlink_key {
         if let (Some(&px), Some(&ts)) = (latest_by_source.get(key), latest_ts_by_source.get(key)) {
             out.secondary_available = true;
             if now_ms.saturating_sub(ts) <= max_age_ms {
-                let ret = (px - anchor_short) / anchor_short;
-                out.secondary_confirms = match direction {
-                    Direction::Up => ret > 0.0,
-                    Direction::Down => ret < 0.0,
-                    Direction::Neutral => false,
-                };
+                if let Some(anchor_short_chainlink) = find_anchor_price(chainlink_ticks, anchor_short_ms) {
+                    if anchor_short_chainlink > 0.0 {
+                        let ret = (px - anchor_short_chainlink) / anchor_short_chainlink;
+                        out.secondary_confirms = match direction {
+                            Direction::Up => ret > 0.0, // Chainlink 稍微有些反应也算同向
+                            Direction::Down => ret < 0.0,
+                            Direction::Neutral => false,
+                        };
+                    }
+                }
             }
         }
     }
@@ -596,6 +626,7 @@ mod tests {
         });
         let now = 1_000_000i64;
         det.on_tick(&tick("binance", "BTCUSDT", now - 60_000, 100.0));
+        det.on_tick(&tick("binance", "BTCUSDT", now - 30_000, 100.0)); // Add extra Binance tick
         det.on_tick(&tick("chainlink_rtds", "BTCUSDT", now - 15_000, 100.0));
         det.on_tick(&tick("binance", "BTCUSDT", now, 100.2));
         det.on_tick(&tick("chainlink_rtds", "BTCUSDT", now, 100.21));
@@ -654,6 +685,7 @@ mod tests {
         });
         let now = 1_000_000i64;
         det.on_tick(&tick("binance_ws", "BTCUSDT", now - 60_000, 100.0));
+        det.on_tick(&tick("binance_ws", "BTCUSDT", now - 30_000, 100.0)); // Extra binance tick
         det.on_tick(&tick("chainlink_rtds", "BTCUSDT", now - 60_000, 100.0));
         det.on_tick(&tick("binance_ws", "BTCUSDT", now - 1_000, 99.9));
         det.on_tick(&tick("chainlink_rtds", "BTCUSDT", now, 100.2));
@@ -673,6 +705,7 @@ mod tests {
         });
         let now = 1_000_000i64;
         det.on_tick(&tick("binance_ws", "BTCUSDT", now - 60_000, 100.0));
+        det.on_tick(&tick("binance_ws", "BTCUSDT", now - 30_000, 100.0)); // Extra binance tick
         det.on_tick(&tick("chainlink_rtds", "BTCUSDT", now - 60_000, 100.0));
         det.on_tick(&tick("binance_ws", "BTCUSDT", now - 1_000, 100.2));
         det.on_tick(&tick("chainlink_rtds", "BTCUSDT", now, 100.21));
@@ -692,6 +725,7 @@ mod tests {
         });
         let now = 1_000_000i64;
         det.on_tick(&tick("binance_udp", "BTCUSDT", now - 60_000, 100.0));
+        det.on_tick(&tick("binance_udp", "BTCUSDT", now - 30_000, 100.0)); // Extra binance tick
         det.on_tick(&tick("chainlink_rtds", "BTCUSDT", now - 60_000, 100.0));
         det.on_tick(&tick("binance_udp", "BTCUSDT", now - 1_000, 100.2));
         det.on_tick(&tick("chainlink_rtds", "BTCUSDT", now, 100.21));

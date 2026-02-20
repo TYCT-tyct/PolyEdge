@@ -67,6 +67,7 @@ dependencies = [
  "flate2",
  "futures",
  "infra_bus",
+ "libc",
  "market_discovery",
  "metrics",
  "metrics-exporter-prometheus",
@@ -95,6 +96,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "app_tokyo_brain"
+version = "0.1.0"
 
 [[package]]
 name = "async-trait"
@@ -639,6 +644,8 @@ name = "feeder_tokyo"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "core_types",
+ "direction_detector",
  "futures",
  "libc",
  "poly_wire",
@@ -1547,10 +1554,13 @@ dependencies = [
 name = "paper_executor"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "core_types",
  "parking_lot",
+ "rusqlite",
  "serde",
+ "tokio",
 ]
 
 [[package]]

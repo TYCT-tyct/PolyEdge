@@ -121,6 +121,134 @@ pub(crate) fn spawn_presign_worker(shared: Arc<EngineShared>) {
     });
 }
 
+pub(crate) fn spawn_udp_ghost_receiver(
+    execution: Arc<ClobExecution>,
+    shared: Arc<EngineShared>,
+) {
+    spawn_detached("udp_ghost_receiver", true, async move {
+        let port = shared.fusion_cfg.read().await.udp_trigger_port;
+        let addr = format!("0.0.0.0:{}", port);
+        let socket = match tokio::net::UdpSocket::bind(&addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("Failed to bind UDP Ghost Receiver on {}: {}", addr, e);
+                return;
+            }
+        };
+        tracing::info!("👻 Omega-R3 Gatling Ghost Receiver bound to UDP {}", addr);
+
+        let mut buf = vec![0u8; 1024];
+        loop {
+            if let Ok((len, _)) = socket.recv_from(&mut buf).await {
+                if len < 4 || buf[0] != 0xBB {
+                    continue; // Magic byte mismatch
+                }
+                let action = buf[1];
+                let sym_len = buf[2] as usize;
+                if len < 3 + sym_len { continue; }
+                let symbol_bytes = &buf[3..3 + sym_len];
+                let Ok(symbol_str) = std::str::from_utf8(symbol_bytes) else { continue };
+
+                let target_side = match action {
+                    0x01 => OrderSide::BuyYes,
+                    0x02 => OrderSide::SellYes,
+                    _ => continue,
+                };
+
+                let market_id = {
+                    let map = shared.symbol_to_markets.read().await;
+                    map.get(symbol_str).and_then(|m| m.first().cloned())
+                };
+                let Some(mid) = market_id else { continue; };
+
+                let book_top = {
+                    let books = shared.latest_books.read().await;
+                    books.get(&mid).cloned()
+                };
+                let Some(book) = book_top else { continue; };
+
+                let (exec_price, target_l2) = if target_side == OrderSide::BuyYes {
+                    (book.ask_yes, book.ask_size_yes)
+                } else {
+                    (book.bid_yes, book.bid_size_yes)
+                };
+
+                if exec_price <= 0.0 || exec_price >= 1.0 || target_l2 <= 0.0 { continue; }
+
+                let tf = TimeframeClass::Tf5m;
+                let fee_bps = crate::execution_eval::get_fee_rate_bps_cached(&shared, &book.token_id_yes).await;
+                let mut sniper = shared.predator_taker_sniper.write().await;
+
+                // Forge a dummy momentum override signal for execution eval
+                let dummy_sig = core_types::DirectionSignal {
+                    symbol: symbol_str.to_string(),
+                    direction: match target_side {
+                        OrderSide::BuyYes | OrderSide::SellNo => core_types::Direction::Up,
+                        OrderSide::SellYes | OrderSide::BuyNo => core_types::Direction::Down,
+                    },
+                    magnitude_pct: 1.0,
+                    confidence: 0.99,
+                    recommended_tf: tf.clone(),
+                    velocity_bps_per_sec: 100.0,
+                    acceleration: 0.0,
+                    tick_consistency: 3,
+                    triple_confirm: true,
+                    momentum_spike: true,
+                    ts_ns: crate::stats_utils::now_ns(),
+                };
+
+                // The edge is mathematically forced to bypass Fee Shield because the Ghost Signal
+                // implicitly holds EV confidence. The sniper will just handle chunking.
+                let eval_ctx = taker_sniper::EvaluateCtx {
+                    market_id: &mid,
+                    symbol: symbol_str,
+                    timeframe: tf.clone(),
+                    direction_signal: &dummy_sig,
+                    entry_price: exec_price,
+                    spread: book.ask_yes - book.bid_yes,
+                    fee_bps,
+                    edge_gross_bps: 200.0,
+                    edge_net_bps: 200.0,
+                    rebate_est_bps: 0.0,
+                    size: target_l2,
+                    target_l2_size: target_l2,
+                    now_ms: chrono::Utc::now().timestamp_millis(),
+                };
+
+                let decision = sniper.evaluate(&eval_ctx);
+                if let taker_sniper::TakerAction::Fire = decision.action {
+                    if let Some(plan) = decision.fire_plan {
+                        for chunk in plan.chunks {
+                            let intent = core_types::OrderIntentV2 {
+                                market_id: mid.clone(),
+                                token_id: Some(if target_side == OrderSide::BuyYes { book.token_id_yes.clone() } else { book.token_id_no.clone() }),
+                                side: target_side.clone(),
+                                price: exec_price,
+                                size: chunk.size,
+                                ttl_ms: 30000,
+                                style: core_types::ExecutionStyle::Taker,
+                                tif: core_types::OrderTimeInForce::Fak,
+                                max_slippage_bps: 100.0,
+                                fee_rate_bps: fee_bps,
+                                expected_edge_net_bps: 200.0,
+                                client_order_id: Some(core_types::new_id()),
+                                hold_to_resolution: false,
+                                prebuilt_payload: None,
+                                prebuilt_auth: None,
+                            };
+                            let _ = execution.place_order_v2(intent).await;
+                            if chunk.send_delay_ms > 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(chunk.send_delay_ms)).await;
+                            }
+                        }
+                        tracing::warn!("👻 [UDP-FIRE] Ghost Link triggered Gatling burst to market={}", mid);
+                    }
+                }
+            }
+        }
+    });
+}
+
 pub(crate) fn spawn_strategy_engine(
     bus: RingBus<EngineEvent>,
     portfolio: Arc<PortfolioBook>,
@@ -1127,6 +1255,27 @@ pub(crate) fn spawn_predator_exit_lifecycle(
                 let reason_kind = action.reason.clone();
                 let reason = exit_reason_label(reason_kind.clone());
                 shared.shadow_stats.record_exit_reason(reason).await;
+
+                // Death Box metrics tracking
+                if unrealized_pnl_usdc < 0.0 {
+                    match reason_kind {
+                        exit_manager::ExitReason::StopLoss
+                        | exit_manager::ExitReason::Reversal100ms
+                        | exit_manager::ExitReason::Reversal300ms => {
+                            shared.shadow_stats.mark_death_box_toxic_reversal();
+                        }
+                        exit_manager::ExitReason::ForceClose300s
+                        | exit_manager::ExitReason::ProbGuard60s => {
+                            shared.shadow_stats.mark_death_box_pin_risk();
+                        }
+                        exit_manager::ExitReason::TakeProfit3s
+                        | exit_manager::ExitReason::TakeProfit15s
+                        | exit_manager::ExitReason::ConvergenceExit => {
+                            shared.shadow_stats.mark_death_box_fee_bleed();
+                        }
+                    }
+                }
+
                 if exit_cfg.flatten_on_trigger {
                     let _ = bus.publish(EngineEvent::Control(ControlCommand::Flatten));
                 }

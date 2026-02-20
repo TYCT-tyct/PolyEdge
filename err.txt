@@ -1,0 +1,68 @@
+warning: unused import: `std::collections::HashMap`
+ --> crates\feeder_tokyo\src\bin\brain.rs:6:5
+  |
+6 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `feeder_tokyo` (bin "brain") generated 1 warning (run `cargo fix --bin "brain" -p feeder_tokyo` to apply 1 suggestion)
+    Checking app_runner v0.1.0 (E:\Projects\test\crates\app_runner)
+warning: unused import: `mpsc`
+  --> crates\app_runner\src\bootstrap.rs:21:19
+   |
+21 | use tokio::sync::{mpsc, RwLock};
+   |                   ^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0609]: no field `udp_trigger_enabled` on type `FusionReloadReq`
+   --> crates\app_runner\src\control_api.rs:546:26
+    |
+546 |     if let Some(v) = req.udp_trigger_enabled {
+    |                          ^^^^^^^^^^^^^^^^^^^ unknown field
+    |
+    = note: available fields are: `enable_udp`, `mode`, `udp_port`, `dedupe_window_ms`, `dedupe_price_bps` ... and 5 others
+
+error[E0609]: no field `udp_trigger_port` on type `FusionReloadReq`
+   --> crates\app_runner\src\control_api.rs:549:26
+    |
+549 |     if let Some(v) = req.udp_trigger_port {
+    |                          ^^^^^^^^^^^^^^^^ unknown field
+    |
+    = note: available fields are: `enable_udp`, `mode`, `udp_port`, `dedupe_window_ms`, `dedupe_price_bps` ... and 5 others
+
+error[E0282]: type annotations needed
+   --> crates\app_runner\src\control_api.rs:550:32
+    |
+550 |         cfg.udp_trigger_port = v.max(1);
+    |                                ^ cannot infer type
+
+error[E0609]: no field `udp_trigger_target` on type `FusionReloadReq`
+   --> crates\app_runner\src\control_api.rs:552:30
+    |
+552 |     if let Some(ref v) = req.udp_trigger_target {
+    |                              ^^^^^^^^^^^^^^^^^^ unknown field
+    |
+    = note: available fields are: `enable_udp`, `mode`, `udp_port`, `dedupe_window_ms`, `dedupe_price_bps` ... and 5 others
+
+error[E0282]: type annotations needed
+   --> crates\app_runner\src\control_api.rs:553:34
+    |
+553 |         cfg.udp_trigger_target = v.clone();
+    |                                  ^ cannot infer type
+
+warning: variable does not need to be mutable
+   --> crates\app_runner\src\strategy_runtime.rs:706:13
+    |
+706 |         let mut push_candidate = |bucket: &mut Vec<PredatorCandIn>,
+    |             ----^^^^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+Some errors have detailed explanations: E0282, E0609.
+For more information about an error, try `rustc --explain E0282`.
+warning: `app_runner` (bin "app_runner") generated 2 warnings
+error: could not compile `app_runner` (bin "app_runner") due to 5 previous errors; 2 warnings emitted

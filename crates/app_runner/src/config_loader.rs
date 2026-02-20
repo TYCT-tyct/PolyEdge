@@ -218,6 +218,9 @@ pub(super) fn load_fusion_config() -> FusionConfig {
         fallback_arm_duration_ms: Option<u64>,
         fallback_cooldown_sec: Option<u64>,
         udp_local_only: Option<bool>,
+        udp_trigger_enabled: Option<bool>,
+        udp_trigger_port: Option<u16>,
+        udp_trigger_target: Option<String>,
     }
 
     impl FusionPatch {
@@ -251,6 +254,15 @@ pub(super) fn load_fusion_config() -> FusionConfig {
             }
             if let Some(v) = self.udp_local_only {
                 cfg.udp_local_only = v;
+            }
+            if let Some(v) = self.udp_trigger_enabled {
+                cfg.udp_trigger_enabled = v;
+            }
+            if let Some(v) = self.udp_trigger_port {
+                cfg.udp_trigger_port = v;
+            }
+            if let Some(ref v) = self.udp_trigger_target {
+                cfg.udp_trigger_target = v.clone();
             }
         }
     }
@@ -355,6 +367,19 @@ pub(super) fn load_fusion_config() -> FusionConfig {
                 if let Ok(parsed) = val.parse::<bool>() {
                     target.udp_local_only = Some(parsed);
                 }
+            }
+            "udp_trigger_enabled" => {
+                if let Ok(parsed) = val.parse::<bool>() {
+                    target.udp_trigger_enabled = Some(parsed);
+                }
+            }
+            "udp_trigger_port" => {
+                if let Ok(parsed) = val.parse::<u16>() {
+                    target.udp_trigger_port = Some(parsed.max(1));
+                }
+            }
+            "udp_trigger_target" => {
+                target.udp_trigger_target = Some(val.to_string());
             }
             _ => {}
         }

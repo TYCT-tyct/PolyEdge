@@ -154,6 +154,11 @@ impl SettlementCompounder {
         self.daily_epoch_day = epoch_day_from_ms(now_ms());
     }
 
+    /// Syncs the available USDC with an external source of truth (e.g. Polymarket wallet balance)
+    pub fn sync_balance(&mut self, current_usdc: f64) {
+        self.available_usdc = current_usdc.max(0.0);
+    }
+
     fn rollover_day_if_needed(&mut self, ts_ms: i64) {
         let day = epoch_day_from_ms(ts_ms);
         if day != self.daily_epoch_day {

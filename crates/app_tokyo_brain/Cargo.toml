@@ -1,0 +1,8 @@
+[package]
+name = "app_tokyo_brain"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[dependencies]

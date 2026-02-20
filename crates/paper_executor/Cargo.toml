@@ -5,7 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 chrono.workspace = true
 core_types = { path = "../core_types" }
 parking_lot.workspace = true
 serde.workspace = true
+tokio.workspace = true
+rusqlite = { version = "0.31", features = ["bundled"] }

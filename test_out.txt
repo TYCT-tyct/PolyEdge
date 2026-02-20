@@ -1,0 +1,46 @@
+
+running 11 tests
+test tests::velocity_spike_overrides_magnitude_neutral ... ok
+test tests::source_vote_accepts_chainlink_as_secondary ... FAILED
+test tests::source_vote_passes_with_binance_plus_secondary ... FAILED
+test tests::multi_source_high_confidence_floor ... FAILED
+test tests::triple_confirm_blocks_single_tick_fakeout ... ok
+test tests::no_signal_when_cold_start ... ok
+test tests::triple_confirm_passes_consistent_move ... ok
+test tests::up_direction_when_move_exceeds_threshold ... ok
+test tests::recommended_timeframe_mapping ... ok
+test tests::source_vote_blocks_when_binance_unconfirmed ... FAILED
+test tests::volume_spike_passes_triple_confirm_even_with_low_acceleration ... ok
+
+failures:
+
+---- tests::source_vote_accepts_chainlink_as_secondary stdout ----
+
+thread 'tests::source_vote_accepts_chainlink_as_secondary' (29504) panicked at crates\direction_detector\src\lib.rs:728:48:
+called `Option::unwrap()` on a `None` value
+
+---- tests::source_vote_passes_with_binance_plus_secondary stdout ----
+
+thread 'tests::source_vote_passes_with_binance_plus_secondary' (43064) panicked at crates\direction_detector\src\lib.rs:709:48:
+called `Option::unwrap()` on a `None` value
+
+---- tests::multi_source_high_confidence_floor stdout ----
+
+thread 'tests::multi_source_high_confidence_floor' (2136) panicked at crates\direction_detector\src\lib.rs:632:48:
+called `Option::unwrap()` on a `None` value
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- tests::source_vote_blocks_when_binance_unconfirmed stdout ----
+
+thread 'tests::source_vote_blocks_when_binance_unconfirmed' (38344) panicked at crates\direction_detector\src\lib.rs:690:48:
+called `Option::unwrap()` on a `None` value
+
+
+failures:
+    tests::multi_source_high_confidence_floor
+    tests::source_vote_accepts_chainlink_as_secondary
+    tests::source_vote_blocks_when_binance_unconfirmed
+    tests::source_vote_passes_with_binance_plus_secondary
+
+test result: FAILED. 7 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

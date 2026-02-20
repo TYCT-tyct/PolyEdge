@@ -33,7 +33,7 @@ pub struct RefTick {
     pub price: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct BookTop {
     pub market_id: String,
     pub token_id_yes: String,
@@ -42,6 +42,14 @@ pub struct BookTop {
     pub ask_yes: f64,
     pub bid_no: f64,
     pub ask_no: f64,
+    #[serde(default)]
+    pub bid_size_yes: f64,
+    #[serde(default)]
+    pub ask_size_yes: f64,
+    #[serde(default)]
+    pub bid_size_no: f64,
+    #[serde(default)]
+    pub ask_size_no: f64,
     pub ts_ms: i64,
     #[serde(default)]
     pub recv_ts_local_ns: i64,
@@ -231,6 +239,8 @@ pub struct TimeframeOpp {
     pub side: OrderSide,
     pub entry_price: f64,
     pub size: f64,
+    #[serde(default)]
+    pub target_l2_size: f64,
     pub edge_gross_bps: f64,
     pub edge_net_bps: f64,
     pub edge_net_usdc: f64,
@@ -259,6 +269,64 @@ impl fmt::Display for OrderSide {
         };
         f.write_str(value)
     }
+}
+
+/// Omega-R3: V1.0 Paper Tester Bankroll State
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VirtualBankroll {
+    pub initial_capital: f64,
+    pub current_capital: f64,
+    pub realized_pnl: f64,
+    pub total_fees: f64,
+    pub total_trades: u64,
+    pub max_drawdown_usdc: f64,
+    pub max_drawdown_pct: f64,
+    pub ts_last_update_ms: i64,
+}
+
+impl VirtualBankroll {
+    pub fn new(initial: f64) -> Self {
+        Self {
+            initial_capital: initial,
+            current_capital: initial,
+            realized_pnl: 0.0,
+            total_fees: 0.0,
+            total_trades: 0,
+            max_drawdown_usdc: 0.0,
+            max_drawdown_pct: 0.0,
+            ts_last_update_ms: Utc::now().timestamp_millis(),
+        }
+    }
+}
+
+/// Omega-R3: Comprehensive V1.0 Paper Tester logging payload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TradeReport {
+    pub timestamp_ms: i64,
+    pub market_id: String,
+    pub symbol: String,
+    pub timeframe: String,
+    pub stage: String,
+    pub direction: String,
+    pub velocity_bps_per_sec: f64,
+    pub edge_bps: f64,
+    pub prob_fast: f64,
+    pub prob_settle: f64,
+    pub confidence: f64,
+    pub action: String,
+    pub intent: String,
+    pub requested_size_usdc: f64,
+    pub executed_size_usdc: f64,
+    pub entry_price: f64,
+    pub fill_price: f64,
+    pub slippage_bps: f64,
+    pub fee_usdc: f64,
+    pub realized_pnl_usdc: f64,
+    pub bankroll_before: f64,
+    pub bankroll_after: f64,
+    pub settlement_price: f64,
+    pub settlement_source: String,
+    pub forced_settlement: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

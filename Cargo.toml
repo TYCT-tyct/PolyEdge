@@ -24,7 +24,7 @@ members = [
   "crates/app_runner",
   "crates/poly_wire",
   "crates/feeder_tokyo",
-  "crates/feed_udp",
+  "crates/feed_udp", "crates/app_tokyo_brain",
 ]
 
 [workspace.package]

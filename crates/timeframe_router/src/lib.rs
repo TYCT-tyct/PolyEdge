@@ -233,6 +233,7 @@ mod tests {
             side: OrderSide::BuyYes,
             entry_price,
             size,
+            target_l2_size: 0.0,
             edge_gross_bps: 20.0,
             edge_net_bps: 10.0,
             edge_net_usdc: 0.1,

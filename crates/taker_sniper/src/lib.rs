@@ -111,7 +111,9 @@ pub struct EvaluateCtx<'a> {
     pub fee_bps: f64,
     pub edge_gross_bps: f64,
     pub edge_net_bps: f64,
+    pub rebate_est_bps: f64,
     pub size: f64,
+    pub target_l2_size: f64,
     pub now_ms: i64,
 }
 
@@ -150,12 +152,25 @@ impl TakerSniper {
         if ctx.spread > self.cfg.max_spread {
             return skip_static("spread_too_wide");
         }
+
+        let mut effective_edge_net = ctx.edge_net_bps;
+        // Micro-Taker Logic: If momentum is high, strip maker rebates from the edge calculation
+        // so we don't hold back waiting for a rebate that we'll never capture.
+        if ctx.direction_signal.momentum_spike || ctx.direction_signal.velocity_bps_per_sec.abs() >= 10.0 {
+            effective_edge_net -= ctx.rebate_est_bps;
+        }
+
         let dynamic_min_edge =
             dynamic_fee_gate_min_edge_bps(ctx.entry_price, ctx.direction_signal.confidence);
         let min_edge_required = self.cfg.min_edge_net_bps.max(dynamic_min_edge);
-        if ctx.edge_net_bps < min_edge_required {
-            return skip_static("fee_gate_too_expensive");
+
+        // V5.3 Profit Shield (Dynamic Fee Precognition)
+        // Ensure that Expected Profit strictly overrides Taker Fee + Margin.
+        // effective_edge_net is our theoretical alpha; we must structurally survive the fee
+        if (effective_edge_net - ctx.fee_bps) < min_edge_required {
+            return skip_static("fee_bleed_shield_active");
         }
+
         if ctx.size <= 0.0 {
             return skip_static("size_zero");
         }
@@ -178,7 +193,7 @@ impl TakerSniper {
 
         let lock_minutes = lock_minutes_for_timeframe(&ctx.timeframe);
         let notional_usdc = (ctx.entry_price.max(0.0) * ctx.size.max(0.0)).max(0.0);
-        let edge_net_usdc = (ctx.edge_net_bps / 10_000.0) * notional_usdc;
+        let edge_net_usdc = (effective_edge_net / 10_000.0) * notional_usdc;
         let density = if lock_minutes <= 0.0 {
             0.0
         } else {
@@ -192,8 +207,9 @@ impl TakerSniper {
             side: direction_to_side(&ctx.direction_signal.direction),
             entry_price: ctx.entry_price,
             size: ctx.size,
+            target_l2_size: ctx.target_l2_size,
             edge_gross_bps: ctx.edge_gross_bps,
-            edge_net_bps: ctx.edge_net_bps,
+            edge_net_bps: effective_edge_net,
             edge_net_usdc,
             fee_bps: ctx.fee_bps,
             lock_minutes,
@@ -285,19 +301,29 @@ fn compute_win_rate_score(ctx: &EvaluateCtx<'_>) -> f64 {
     signal_quality + market_quality + timing_quality
 }
 
-fn build_fire_plan(gatling: &GatlingResolved, opportunity: TimeframeOpp) -> FirePlan {
+fn build_fire_plan(gatling: &GatlingResolved, mut opportunity: TimeframeOpp) -> FirePlan {
+    let target_l2_size = opportunity.target_l2_size.max(0.0);
+
+    // Liquidity-Aware Sizing Slicer:
+    // Never shoot more than the available liquidity on the BBO to prevent phantom slippage.
+    if target_l2_size > 0.0 {
+        opportunity.size = opportunity.size.min(target_l2_size);
+        let notional_usdc = (opportunity.entry_price.max(0.0) * opportunity.size.max(0.0)).max(0.0);
+        opportunity.edge_net_usdc = (opportunity.edge_net_bps / 10_000.0) * notional_usdc;
+    }
+
     let total_size = opportunity.size.max(0.0);
     let notional = (opportunity.entry_price.max(0.0) * total_size).max(0.0);
     let min_chunks = gatling.min_chunks.max(1);
     let max_chunks = gatling.max_chunks.max(min_chunks);
-    let desired_chunks = if gatling.enabled && gatling.chunk_notional_usdc > 0.0 {
+    let desired_chunks = if gatling.enabled && gatling.chunk_notional_usdc > 0.0 && notional > 0.0 {
         ((notional / gatling.chunk_notional_usdc).ceil() as usize).clamp(min_chunks, max_chunks)
     } else {
         1
     };
 
     let mut chunks = Vec::with_capacity(desired_chunks);
-    if desired_chunks == 1 {
+    if desired_chunks <= 1 || total_size <= 0.001 {
         chunks.push(FireChunk {
             size: total_size,
             send_delay_ms: 0,
