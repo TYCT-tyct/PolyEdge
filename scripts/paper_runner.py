@@ -43,7 +43,7 @@ def get_json(base_url: str, path: str, timeout: float = 5.0) -> Optional[dict]:
         resp.raise_for_status()
         return resp.json()
     except Exception:
-        raise  # Linus: Fail loudly and explicitly
+        return None
 @dataclass
 class InstanceRun:
     idx: int
