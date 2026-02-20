@@ -9,6 +9,7 @@ use smol_str::SmolStr;
 use thiserror::Error;
 use uuid::Uuid;
 
+#[repr(align(64))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RefTick {
     pub source: SmolStr,

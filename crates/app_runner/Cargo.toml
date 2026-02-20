@@ -49,3 +49,5 @@ flate2 = "1.0"
 crossbeam-queue = "0.3"
 crossbeam-utils = "0.8"
 rusqlite = { version = "0.31", features = ["bundled"] }
+core_affinity = "0.8.3"
+crossbeam = "0.8.4"

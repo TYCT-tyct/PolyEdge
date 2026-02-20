@@ -1,0 +1,288 @@
+[maker]
+base_quote_size = 1.0
+min_edge_bps = 1.0
+inventory_skew = 0.15
+max_spread = 0.08
+ttl_ms = 500
+
+[taker]
+trigger_bps = 4.0
+max_slippage_bps = 30.0
+stale_tick_filter_ms = 120
+market_tier_profile = "balanced_sol_guard"
+
+[online_calibration]
+capital_fraction_kelly = 0.35
+variance_penalty_lambda = 0.25
+min_eval_notional_usdc = 0.01
+min_expected_edge_usdc = 0.0002
+
+[fair_value.basis_mr]
+enabled = true
+alpha_mean = 0.08
+alpha_var = 0.10
+alpha_ret = 0.15
+alpha_vol = 0.12
+k_revert = 0.85
+z_cap = 3.0
+min_confidence = 0.05
+warmup_ticks = 24
+
+[robust_stats]
+enabled = true
+outlier_method = "iqr"
+iqr_k = 1.5
+min_samples = 5
+
+# ===== Predator C+ (MVP) =====
+# Edge-confirmed: Direction only decides YES/NO side; EV thresholds are still enforced.
+
+[predator_c]
+enabled = true
+# "maker_first" | "taker_first" | "taker_only"
+priority = "maker_first"
+
+[predator_c.direction_detector]
+window_max_sec = 120
+threshold_5m_pct = 0.03
+threshold_15m_pct = 0.05
+threshold_1h_pct = 0.20
+threshold_1d_pct = 0.50
+lookback_short_sec = 15
+lookback_long_sec = 60
+min_sources_for_high_confidence = 2
+min_ticks_for_signal = 3
+min_consecutive_ticks = 1
+min_velocity_bps_per_sec = 3.0
+min_acceleration = 0.0
+momentum_spike_multiplier = 1.8
+min_tick_rate_spike_ratio = 1.8
+tick_rate_short_ms = 300
+tick_rate_long_ms = 3000
+enable_source_vote_gate = true
+require_secondary_confirmation = true
+source_vote_max_age_ms = 2000
+
+[predator_c.probability_engine]
+momentum_gain = 2.0
+lag_penalty_per_ms = 0.0002
+confidence_floor = 0.05
+sigma_annual = 0.90
+horizon_sec = 30
+drift_annual = 0.0
+velocity_drift_gain = 0.35
+acceleration_drift_gain = 0.02
+fair_blend_weight = 0.35
+
+[predator_c.taker_sniper]
+min_direction_confidence = 0.55
+min_edge_net_bps = 4.0
+max_spread = 0.08
+cooldown_ms_per_market = 400
+
+[predator_c.regime]
+enabled = true
+active_min_confidence = 0.65
+active_min_magnitude_pct = 0.04
+defend_tox_score = 0.90
+defend_on_toxic_danger = false
+defend_min_source_health = 0.15
+quiet_min_edge_multiplier = 1.05
+quiet_chunk_scale = 0.50
+
+[predator_c.cross_symbol]
+enabled = true
+leader_symbol = "BTCUSDT"
+follower_symbols = ["ETHUSDT", "SOLUSDT"]
+min_leader_confidence = 0.80
+min_leader_magnitude_pct = 0.12
+follower_stale_confidence_max = 0.65
+max_correlated_positions = 2
+
+[predator_c.gatling]
+enabled = true
+chunk_notional_usdc = 5.0
+min_chunks = 1
+max_chunks = 4
+spacing_ms = 12
+stop_on_reject = true
+
+[predator_c.gatling_symbols.BTCUSDT]
+chunk_notional_usdc = 8.0
+min_chunks = 1
+max_chunks = 4
+spacing_ms = 10
+
+[predator_c.gatling_symbols.ETHUSDT]
+chunk_notional_usdc = 5.0
+min_chunks = 1
+max_chunks = 4
+spacing_ms = 12
+
+[predator_c.gatling_symbols.SOLUSDT]
+chunk_notional_usdc = 3.0
+min_chunks = 1
+max_chunks = 5
+spacing_ms = 14
+
+[predator_c.gatling_symbols.XRPUSDT]
+chunk_notional_usdc = 2.0
+min_chunks = 1
+max_chunks = 6
+spacing_ms = 14
+
+[predator_c.strategy_d]
+enabled = false
+min_gap_bps = 25.0
+min_edge_net_bps = 12.75
+min_confidence = 0.65
+max_notional_usdc = 25.0
+cooldown_ms_per_market = 500
+
+[predator_c.exit]
+enabled = true
+t100ms_reversal_bps = -3.0
+t300ms_reversal_bps = -2.0
+convergence_exit_ratio = 0.80
+t3_take_ratio = 0.50
+t15_min_unrealized_usdc = 0.0
+t60_true_prob_floor = 0.70
+t300_force_exit_ms = 300000
+t300_hold_prob_threshold = 0.95
+t300_hold_time_to_expiry_ms = 300000
+max_single_trade_loss_usdc = 1.0
+flatten_on_trigger = true
+
+[predator_c.router]
+max_locked_pct_5m = 0.30
+max_locked_pct_15m = 0.40
+max_locked_pct_1h = 0.50
+max_locked_pct_1d = 0.30
+max_concurrent_positions = 8
+liquidity_reserve_pct = 0.20
+# Micro-live hard caps (keep permissive in paper/shadow; override when armed)
+max_order_notional_usdc = 1000000.0
+max_total_notional_usdc = 1000000.0
+
+[predator_c.compounder]
+enabled = false
+initial_capital_usdc = 100.0
+compound_ratio = 1.0
+position_fraction = 0.15
+min_quote_size = 1.0
+# For micro-live: loss <= -1U triggers pause+flatten (enforced only when live-armed).
+daily_loss_cap_usdc = 1.0
+
+[v52.time_phase]
+early_min_ratio = 0.55
+late_max_ratio = 0.10
+early_size_scale = 0.50
+maturity_size_scale = 0.70
+late_size_scale = 0.90
+allow_timeframes = ["5m", "15m"]
+
+[v52.execution]
+late_force_taker_remaining_ms = 30000
+maker_wait_ms_before_force = 800
+apply_force_taker_in_maturity = true
+apply_force_taker_in_late = true
+alpha_window_enabled = true
+alpha_window_move_bps = 3.0
+alpha_window_poll_ms = 10
+alpha_window_max_wait_ms = 1000
+require_compounder_when_live = true
+
+[v52.dual_arb]
+enabled = true
+safety_margin_bps = 3.0
+threshold = 0.99
+fee_buffer_mode = "conservative_taker"
+
+[v52.reversal]
+same_market_opposite_first = true
+
+[transport]
+# Production baseline: direct-only transport.
+mode = "direct_only"
+udp_local_only = true
+udp_share_cap = 0.35
+dedupe_window_ms = 8
+jitter_threshold_ms = 25
+fallback_arm_duration_ms = 8000
+fallback_cooldown_sec = 300
+
+[fusion]
+enable_udp = true
+# SEAT Latency Fabric v1.0: WebSocket 为主通道，UDP 仅紧急 fallback
+# 可选: "direct_only"(WS优先) / "active_active"(双路) / "udp_only"(仅UDP)
+mode = "direct_only"
+udp_port = 6666
+# 更激进去重窗口
+dedupe_window_ms = 8
+dedupe_price_bps = 0.2
+
+[source_health]
+min_samples = 64
+gap_window_ms = 2000
+jitter_limit_ms = 10.0
+deviation_limit_bps = 30.0
+freshness_limit_ms = 1500.0
+min_score_for_trading = 0.40
+
+[edge_model]
+model = "ev_net"
+gate_mode = "dynamic"
+version = "v2-ev-net"
+base_gate_bps = 0.5
+congestion_penalty_bps = 2.0
+latency_penalty_bps = 2.0
+fail_cost_bps = 1.0
+
+[exit]
+enabled = true
+t100ms_reversal_bps = -3.0
+t300ms_reversal_bps = -2.0
+convergence_exit_ratio = 0.85
+time_stop_ms = 300000
+edge_decay_bps = -2.0
+adverse_move_bps = -8.0
+flatten_on_trigger = true
+t3_take_ratio = 0.60
+t15_min_unrealized_usdc = 0.0
+t60_true_prob_floor = 0.70
+t300_force_exit_ms = 300000
+t300_hold_prob_threshold = 0.95
+t300_hold_time_to_expiry_ms = 300000
+max_single_trade_loss_usdc = 1.0
+
+# ===== Risk Controls (P2) =====
+
+[risk_controls]
+enabled = true
+
+[risk_controls.market_quality]
+# Filter out low-quality markets
+max_spread_bps = 150                  # Skip if spread > 1.5%
+min_survival_rate = 0.80              # Skip if market survival < 80%
+min_liquidity_usdc = 50.0             # Skip if best bid/ask < $50
+
+[risk_controls.exposure_limits]
+# Position size caps
+max_total_exposure_usdc = 2.0        # Total across all positions
+max_per_market_exposure_usdc = 2.0    # Per market ID
+max_per_symbol_exposure_usdc = 2.0   # Per underlying symbol
+max_concurrent_positions = 8          # Already in predator_c.router
+
+[risk_controls.kill_switch]
+# Automatic pause conditions
+max_daily_loss_usdc = 5.0             # Pause if daily loss > $5
+max_drawdown_pct = 0.20               # Pause if drawdown > 20%
+max_latency_p99_ms = 100.0            # Pause if p99 latency > 100ms
+min_execution_success_rate = 0.50     # Pause if success rate < 50%
+
+[risk_controls.progressive_limits]
+enabled = true
+drawdown_tier1_ratio = 0.50
+drawdown_tier2_ratio = 0.80
+tier1_size_scale = 0.70
+tier2_size_scale = 0.40

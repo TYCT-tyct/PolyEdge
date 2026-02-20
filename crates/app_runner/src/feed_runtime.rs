@@ -31,7 +31,7 @@ pub(super) fn spawn_reference_feed(
     symbols: Vec<String>,
     fusion_cfg: Arc<RwLock<FusionConfig>>,
     shared: Arc<EngineShared>,
-    strategy_tx: mpsc::Sender<StrategyIngressMsg>,
+    strategy_tx: crossbeam::channel::Sender<StrategyIngressMsg>,
 ) {
     #[derive(Clone, Copy)]
     enum RefLane {
@@ -138,6 +138,22 @@ pub(super) fn spawn_reference_feed(
         let mut local_fast_ticks: HashMap<String, RefTick> = HashMap::new();
         let mut local_anchor_ticks: HashMap<String, RefTick> = HashMap::new();
         let mut accepted_fast_mix_total: (u64, u64) = (0, 0);
+
+        // Core Pinning Configuration (Optional via ENV)
+        let core_id = std::env::var("POLYEDGE_CORE_FEED")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
+        if let Some(id) = core_id {
+            if let Some(core_ids) = core_affinity::get_core_ids() {
+                if id < core_ids.len() {
+                    core_affinity::set_for_current(core_ids[id]);
+                    tracing::info!("📌 Feed Runtime pinned to CPU Core {}", id);
+                } else {
+                    tracing::warn!("⚠️ Invalid POLYEDGE_CORE_FEED={}. Available cores: {}", id, core_ids.len());
+                }
+            }
+        }
+
         let mut fusion = fusion_cfg.read().await.clone();
         let mut last_fusion_mode = fusion.mode.clone();
         let fusion_cfg_refresh_interval_ms = std::env::var("POLYEDGE_FUSION_CFG_REFRESH_MS")
@@ -337,12 +353,12 @@ pub(super) fn spawn_reference_feed(
                         if strategy_ingress_drop_on_full {
                             match strategy_tx.try_send(ingress) {
                                 Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                Err(crossbeam::channel::TrySendError::Full(_)) => {
                                     metrics::counter!("strategy.ingress_ref_drop").increment(1);
                                 }
-                                Err(mpsc::error::TrySendError::Closed(_)) => break,
+                                Err(crossbeam::channel::TrySendError::Disconnected(_)) => break,
                             }
-                        } else if strategy_tx.send(ingress).await.is_err() {
+                        } else if strategy_tx.send(ingress).is_err() {
                             break;
                         }
                     }
@@ -557,7 +573,7 @@ pub(super) fn spawn_market_feed(
     symbols: Vec<String>,
     market_types: Vec<String>,
     timeframes: Vec<String>,
-    strategy_tx: mpsc::Sender<StrategyIngressMsg>,
+    strategy_tx: crossbeam::channel::Sender<StrategyIngressMsg>,
 ) {
     const TS_INVERSION_TOLERANCE_MS: i64 = 250;
     const TS_BACKJUMP_RESET_MS: i64 = 5_000;
@@ -741,12 +757,12 @@ pub(super) fn spawn_market_feed(
                         if strategy_ingress_drop_on_full {
                             match strategy_tx.try_send(ingress) {
                                 Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                Err(crossbeam::channel::TrySendError::Full(_)) => {
                                     metrics::counter!("strategy.ingress_book_drop").increment(1);
                                 }
-                                Err(mpsc::error::TrySendError::Closed(_)) => break,
+                                Err(crossbeam::channel::TrySendError::Disconnected(_)) => break,
                             }
-                        } else if strategy_tx.send(ingress).await.is_err() {
+                        } else if strategy_tx.try_send(ingress).is_err() {
                             break;
                         }
 

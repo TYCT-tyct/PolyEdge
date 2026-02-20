@@ -1,0 +1,368 @@
+[COMMENT] crates/app_runner/src/bin/bench_feed.rs: // 1. Setup UDP Listener (Optimized)
+[COMMENT] crates/app_runner/src/bin/bench_feed.rs: // 2. Setup WS Listener
+[COMMENT] crates/app_runner/src/bin/bench_feed.rs: // Map<event_ts_ms, (ws_recv_ts, udp_recv_ts)>
+[COMMENT] crates/app_runner/src/bin/bench_feed.rs: // Spawn Writer Thread
+[COMMENT] crates/app_runner/src/bin/bench_feed.rs: // Check match inside lock, but do NOT do I/O
+[MATCH_COMMENT] crates/app_runner/src/bin/bench_feed.rs: // Check match inside lock, but do NOT do I/O
+[COMMENT] crates/app_runner/src/bin/bench_feed.rs: // Prune (Optimized: Check size less often?)
+[COMMENT] crates/app_runner/src/bin/bench_feed.rs: // Periodic Stats Log (Every 10s)
+[COMMENT] crates/app_runner/src/bootstrap.rs: // Optional: prewarm the execution HTTP client pool to reduce first-ack latency spikes.
+[COMMENT] crates/app_runner/src/bootstrap.rs: // Uses the *same* reqwest client inside the execution layer (unlike ad-hoc curl probes).
+[COMMENT] crates/app_runner/src/bootstrap.rs: // WSS User Channel: live 模式下启动实时 fill 通知
+[COMMENT] crates/app_runner/src/bootstrap.rs: // paper 模式下 wss_fill_tx = None，exit lifecycle 回退到纯 timer 路径
+[COMMENT] crates/app_runner/src/config_loader.rs: // Conservative fallback values when parsing is partial or malformed.
+[COMMENT] crates/app_runner/src/config_loader.rs: // Keep defaults via struct update syntax to avoid piecemeal re-assignment.
+[COMMENT] crates/app_runner/src/control_api.rs: // P4: lightweight latency probe endpoint.
+[COMMENT] crates/app_runner/src/control_api.rs: // Used by storm_test to measure realistic HTTP RTT with minimal server-side work.
+[COMMENT] crates/app_runner/src/control_api.rs: // Keep this handler intentionally small and allocation-light.
+[COMMENT] crates/app_runner/src/engine_core.rs: // Metrics contract: policy_blocked only counts hard risk blocks.
+[COMMENT] crates/app_runner/src/engine_loop.rs: // Separate fast reference ticks (exchange WS) from anchor ticks (Chainlink RTDS).
+[COMMENT] crates/app_runner/src/engine_loop.rs: // Fast ticks drive stale filtering + fair value evaluation; anchor ticks are tracked for
+[COMMENT] crates/app_runner/src/engine_loop.rs: // auditing/diagnostics so the trigger stays latency-sensitive.
+[COMMENT] crates/app_runner/src/engine_loop.rs: // Keep only the freshest observable state under burst.
+[COMMENT] crates/app_runner/src/engine_loop.rs: // For latency-sensitive trading, evaluate fair value on the fastest observable
+[COMMENT] crates/app_runner/src/engine_loop.rs: // reference tick. The Chainlink anchor is tracked for correctness auditing and
+[COMMENT] crates/app_runner/src/engine_loop.rs: // can be used for future calibration, but should not slow down the trigger.
+[COMMENT] crates/app_runner/src/engine_loop.rs: // Positive value means: our fast reference tick arrived earlier than the
+[COMMENT] crates/app_runner/src/engine_loop.rs: // Polymarket book update (i.e. the exploitable lag window).
+[COMMENT] crates/app_runner/src/engine_loop.rs: // Guardrail: if the tick is already old, this is not a meaningful "lag window"
+[COMMENT] crates/app_runner/src/engine_loop.rs: // measurement and would inflate p50/p99. We only sample when the tick is fresh.
+[COMMENT] crates/app_runner/src/engine_loop.rs: // Stale tick filtering must be based on *local* staleness/age, not exchange
+[COMMENT] crates/app_runner/src/engine_loop.rs: // event timestamps (which can be skewed across venues).
+[COMMENT] crates/app_runner/src/engine_loop.rs: // "Orderless" survival probe: measure whether an observed top-of-book
+[COMMENT] crates/app_runner/src/engine_loop.rs: // price survives for +Δ ms, independent of order placement.
+[COMMENT] crates/app_runner/src/engine_loop.rs: // Step A: snapshot (read-lock) the state needed for computation.
+[COMMENT] crates/app_runner/src/engine_loop.rs: // Step B: compute without holding a write lock.
+[COMMENT] crates/app_runner/src/engine_loop.rs: // Note: cooldown is based on the pre-warmup regime, matching the old behavior.
+[COMMENT] crates/app_runner/src/engine_loop.rs: // Step C: short write-back only.
+[COMMENT] crates/app_runner/src/engine_loop.rs: // Step D: rank decision (read-lock, uses updated market_score).
+[COMMENT] crates/app_runner/src/engine_loop.rs: // Ensure stale lifecycle entries don't leak forever if no exit action is triggered.
+[COMMENT] crates/app_runner/src/execution_eval.rs: // Expected edge vs. intended entry price in bps of entry.
+[COMMENT] crates/app_runner/src/feed_runtime.rs: // In websocket_primary / active_active we hard-enforce the UDP share cap
+[COMMENT] crates/app_runner/src/feed_runtime.rs: // outside explicit fallback windows. If WS is unhealthy, fallback state
+[COMMENT] crates/app_runner/src/feed_runtime.rs: // should arm and take over; until then we still constrain UDP dominance.
+[COMMENT] crates/app_runner/src/feed_runtime.rs: // When fast and settlement feeds diverge, pull probability toward 0.5.
+[COMMENT] crates/app_runner/src/feed_runtime.rs: // This keeps execution conservative until settlement alignment recovers.
+[COMMENT] crates/app_runner/src/feed_runtime.rs: // If we see *no* market messages for this long, treat the WS stream as stuck and reconnect.
+[COMMENT] crates/app_runner/src/feed_runtime.rs: // Keep this comfortably above "normal quiet" to avoid hammering gamma discovery on reconnection.
+[COMMENT] crates/app_runner/src/feed_runtime.rs: // 5s is too aggressive for quiet windows and creates reconnect churn.
+[COMMENT] crates/app_runner/src/feed_runtime.rs: // Keep stale protection, but allow a calmer idle window to reduce needless reconnects.
+[COMMENT] crates/app_runner/src/feed_runtime.rs: // Only reset reconnect backoff once we observe actual book traffic (not just a successful
+[COMMENT] crates/app_runner/src/feed_runtime.rs: // handshake). This avoids a reconnect storm when discovery/WS is returning 200 but no
+[COMMENT] crates/app_runner/src/feed_runtime.rs: // updates are delivered.
+[COMMENT] crates/app_runner/src/feed_runtime.rs: // IMPORTANT: book freshness must be based on *local* receive time, not the
+[COMMENT] crates/app_runner/src/feed_runtime.rs: // exchange/server-provided ts_ms (which can be skewed/backjump).
+[COMMENT] crates/app_runner/src/fusion_engine.rs: // IMPORTANT: `source_latency_ms` is the external *reference* (CEX) tick latency proxy.
+[COMMENT] crates/app_runner/src/fusion_engine.rs: // Do not mix in Polymarket book timestamps here; track book latency separately.
+[COMMENT] crates/app_runner/src/fusion_engine.rs: // IMPORTANT: `feed_in_ms` is the *local* recv->ingest latency (decode + enqueue), intended
+[COMMENT] crates/app_runner/src/fusion_engine.rs: // to be <5ms and independent of exchange clock skew. Use source_latency_ms/local_backlog_ms
+[COMMENT] crates/app_runner/src/fusion_engine.rs: // separately for "how old is this data?" debugging/guardrails.
+[COMMENT] crates/app_runner/src/fusion_engine.rs: // For shallow queues, process immediately to minimize tail latency.
+[COMMENT] crates/app_runner/src/fusion_engine.rs: // If queue is already deep, prioritize drain speed to collapse backlog spikes quickly.
+[COMMENT] crates/app_runner/src/fusion_engine.rs: // Unknown future modes: keep permissive to avoid accidental data blackout.
+[COMMENT] crates/app_runner/src/fusion_engine.rs: // Guard: ignore ticks whose event timestamp is wildly in the future vs our local receive time.
+[COMMENT] crates/app_runner/src/fusion_engine.rs: // (This can happen under clock skew or malformed payloads and would break latency ranking.)
+[COMMENT] crates/app_runner/src/fusion_engine.rs: // Priority 1: Chainlink RTDS has <5ms latency, always prefer when timestamps are recent
+[COMMENT] crates/app_runner/src/fusion_engine.rs: // Goal: "fastest observable tick" for latency-sensitive triggers.
+[COMMENT] crates/app_runner/src/fusion_engine.rs: // Event timestamps across sources are not perfectly comparable, so we bias towards lower
+[COMMENT] crates/app_runner/src/fusion_engine.rs: // `recv_ts_ms - event_ts_ms` latency (i.e. faster wire path), with a small guard against
+[COMMENT] crates/app_runner/src/fusion_engine.rs: // extreme back-jumps in event time.
+[COMMENT] crates/app_runner/src/fusion_engine.rs: // Allow a big latency improvement to override moderate event-time skew.
+[COMMENT] crates/app_runner/src/fusion_engine.rs: // Within ~5ms latency tie: prefer the newer event time, otherwise keep first-arriving tick.
+[COMMENT] crates/app_runner/src/fusion_engine.rs: // Source-specific fusion staleness budgets:
+[COMMENT] crates/app_runner/src/fusion_engine.rs: // - UDP path (`binance_udp`) has sub-millisecond latency, so use a tighter 200us window.
+[COMMENT] crates/app_runner/src/fusion_engine.rs: // - Other sources (direct WS, Chainlink) keep a looser 600us default.
+[COMMENT] crates/app_runner/src/fusion_engine.rs: // UDP path: aggressive freshness window (default 200us).
+[COMMENT] crates/app_runner/src/fusion_engine.rs: // Other sources: default 600us window.
+[COMMENT] crates/app_runner/src/orchestration.rs: /// Current file path being tracked (bucketed by date).
+[COMMENT] crates/app_runner/src/orchestration.rs: /// Byte offset we have already scanned up to.
+[COMMENT] crates/app_runner/src/orchestration.rs: /// Cumulative line count observed since the current baseline/rotation.
+[COMMENT] crates/app_runner/src/orchestration.rs: // If the date rolled over (or path otherwise changed), reset baseline.
+[COMMENT] crates/app_runner/src/orchestration.rs: // Baseline: do not scan historical data on startup. We only care about deltas while the
+[COMMENT] crates/app_runner/src/orchestration.rs: // current process is running to detect drops/gaps in the JSONL writer.
+[COMMENT] crates/app_runner/src/orchestration.rs: // Handle truncation/rotation.
+[COMMENT] crates/app_runner/src/orchestration.rs: // The raw JSONL files are bucketed by date, while `ShadowStats` counters are reset on
+[COMMENT] crates/app_runner/src/orchestration.rs: // `/control/reset_shadow` (window reset). Comparing absolute totals would therefore
+[COMMENT] crates/app_runner/src/orchestration.rs: // generate false "gap" alarms after any reset. Track deltas between intervals and
+[COMMENT] crates/app_runner/src/orchestration.rs: // automatically re-baseline on resets/rotations.
+[COMMENT] crates/app_runner/src/orchestration.rs: // Counting lines in multi-GB JSONL files must never allocate the whole file.
+[COMMENT] crates/app_runner/src/orchestration.rs: // We do a tail-based, incremental newline count in a blocking thread.
+[COMMENT] crates/app_runner/src/orchestration.rs: // We avoid moving the live state into the blocking closure so we can keep the
+[COMMENT] crates/app_runner/src/orchestration.rs: // current values on failure (panic/cancel).
+[COMMENT] crates/app_runner/src/report_io.rs: // Throttle file persistence. /report/shadow/live can be polled at high frequency (storm tests)
+[COMMENT] crates/app_runner/src/report_io.rs: // and pretty-json serialization + fs::write per request is unnecessary and can destabilize the
+[COMMENT] crates/app_runner/src/report_io.rs: // process under load.
+[COMMENT] crates/app_runner/src/report_io.rs: // Single-pass aggregation to avoid O(N^2) cloning/filtering. This keeps /report/shadow/live
+[COMMENT] crates/app_runner/src/report_io.rs: // stable under stress polling.
+[MATCH_COMMENT] crates/app_runner/src/seat_types.rs: .unwrap_or_else(|_| "http://127.0.0.1:8091".to_string()),
+[COMMENT] crates/app_runner/src/state.rs: /// WSS User Channel fill broadcaster — None in paper mode
+[COMMENT] crates/app_runner/src/state.rs: // 价格收敛到公允价值 85%+，套利利润已吃满
+[COMMENT] crates/app_runner/src/state.rs: /// `book_top_lag_ms` distribution *for the same primary-delay executed shots* that have a
+[COMMENT] crates/app_runner/src/state.rs: /// measured `ack_only_ms` (i.e. same sample set as capturable_window).
+[COMMENT] crates/app_runner/src/state.rs: /// Ratio of samples where capturable_window_ms > 0.0.
+[COMMENT] crates/app_runner/src/state.rs: /// Number of capturable window samples included in the distribution.
+[COMMENT] crates/app_runner/src/state.rs: /// Number of ack_only_ms samples (only meaningful in live execution).
+[COMMENT] crates/app_runner/src/state.rs: /// Number of tick_to_ack_ms samples.
+[COMMENT] crates/app_runner/src/state.rs: // Backward-compatible strict gate bit used by existing risk/optimizer scripts.
+[COMMENT] crates/app_runner/src/state.rs: // Explicit strict/effective split to avoid semantic ambiguity in external audits.
+[COMMENT] crates/app_runner/src/state.rs: // Survival probe is an "orderless" latency-arb competitiveness metric:
+[COMMENT] crates/app_runner/src/state.rs: // at T0 we observe a crossable top-of-book price, then check at +Δ whether
+[COMMENT] crates/app_runner/src/state.rs: // it is still crossable. This intentionally does not depend on order acks.
+[COMMENT] crates/app_runner/src/state.rs: // 1ms tolerance for clock granularity and ordering jitter around reset.
+[COMMENT] crates/app_runner/src/state.rs: // Loss-streak only considers primary delay (10ms) *fillable* outcomes, so "no fills"
+[COMMENT] crates/app_runner/src/state.rs: // does not trip risk controls.
+[COMMENT] crates/app_runner/src/state.rs: // Avoid cloning large shot/outcome vectors per request. Under stress polling this can
+[COMMENT] crates/app_runner/src/state.rs: // cause massive allocation churn and even OOM kills (esp. when market_scorecard is large).
+[COMMENT] crates/app_runner/src/state.rs: // IMPORTANT: drop large read-guards before awaiting on other locks below.
+[COMMENT] crates/app_runner/src/stats_utils.rs: // Most recent samples are more relevant; take from the back.
+[COMMENT] crates/app_runner/src/strategy_policy.rs: // Keep SOL observe-only unless the local "ref lead vs book" lag is within a tight bound.
+[COMMENT] crates/app_runner/src/strategy_policy.rs: // This avoids letting one slow/volatile venue degrade the overall engine quality.
+[COMMENT] crates/app_runner/src/strategy_policy.rs: // P3: 调整 delay_pen 分母从 25 到 50，减少延迟惩罚权重
+[COMMENT] crates/app_runner/src/strategy_policy.rs: // O(n) rank check without heap allocations/sorting.
+[ANY] crates/app_runner/src/strategy_runtime.rs: .any(|v| v == timeframe_tag(timeframe.clone()))
+[COMMENT] crates/app_runner/src/strategy_runtime.rs: // Same interpretation as the maker path: positive means our fast ref tick arrived earlier
+[COMMENT] crates/app_runner/src/strategy_runtime.rs: // than the Polymarket book update. For Predator, the ref tick is per-symbol while the book
+[COMMENT] crates/app_runner/src/strategy_runtime.rs: // is per-market, so this is still a useful (if approximate) window estimate.
+[COMMENT] crates/app_runner/src/strategy_runtime.rs: // Keep latency visibility in non-live mode via local order path RTT.
+[ANY] crates/app_runner/src/tests.rs: let has_reversal_reason = report.exit_reason_top.iter().any(|(reason, count)| {
+[COMMENT] crates/app_runner/src/tests.rs: // First sample establishes floor with a negative raw delta (clock skew baseline).
+[COMMENT] crates/app_runner/src/tests.rs: // Second sample has larger delta and should show positive path lag after calibration.
+[COMMENT] crates/core_types/src/lib.rs: /// Local timestamp taken after decoding/parsing and right before enqueueing/publishing.
+[COMMENT] crates/core_types/src/lib.rs: /// This enables measuring pure local decode/ingest latency independent of exchange clocks.
+[COMMENT] crates/core_types/src/lib.rs: /// First-hop local timestamp recorded at Tokyo relay ingress.
+[COMMENT] crates/core_types/src/lib.rs: /// Used to split exchange-lag vs private-path-lag in reports.
+[COMMENT] crates/core_types/src/lib.rs: /// Price move magnitude in percentage points, e.g. 0.35 means +0.35%.
+[COMMENT] crates/core_types/src/lib.rs: /// Confidence in [0,1], derived from multi-source consistency.
+[COMMENT] crates/core_types/src/lib.rs: /// First derivative of price move in bps/s.
+[COMMENT] crates/core_types/src/lib.rs: /// Second derivative in (bps/s)/s.
+[COMMENT] crates/core_types/src/lib.rs: /// Count of consecutive same-direction ticks used by the triple-confirm gate.
+[COMMENT] crates/core_types/src/lib.rs: /// Whether the triple-confirm gate passed (velocity + acceleration/volume + consecutive ticks).
+[COMMENT] crates/core_types/src/lib.rs: /// Used by downstream scorers (e.g. WinRateScore) to assess signal quality.
+[COMMENT] crates/core_types/src/lib.rs: /// Whether the velocity exceeded the momentum-spike multiplier threshold.
+[COMMENT] crates/core_types/src/lib.rs: /// "Base quote size" used by Predator C+ sizing logic. Interpreted as USDC notional.
+[COMMENT] crates/core_types/src/lib.rs: /// B: 预序列化 JSON payload — 在信号确认后立即构建，跳过 place_order_v2 里的 serde 开销。
+[COMMENT] crates/core_types/src/lib.rs: /// 设置后 execution_clob 直接用此字节串作为 HTTP body，不再重新序列化。
+[COMMENT] crates/core_types/src/lib.rs: /// `None` 时回退到原始序列化路径，保证向后兼容。
+[COMMENT] crates/core_types/src/lib.rs: /// Positive means: our fast reference tick arrived earlier than the Polymarket book update.
+[COMMENT] crates/core_types/src/lib.rs: /// See docs/metrics_contract.md for the contract definition.
+[COMMENT] crates/core_types/src/lib.rs: /// Execution venue request/ack duration only (real in live mode).
+[COMMENT] crates/core_types/src/lib.rs: /// End-to-end decision+execution latency (see app_runner for definition).
+[COMMENT] crates/core_types/src/lib.rs: /// `book_top_lag_ms - tick_to_ack_ms`; positive means we likely had time to capture.
+[COMMENT] crates/direction_detector/src/lib.rs: /// Maximum window length for stored ticks (seconds).
+[COMMENT] crates/direction_detector/src/lib.rs: /// Thresholds in percent (e.g. 0.10 means 0.10%).
+[COMMENT] crates/direction_detector/src/lib.rs: /// Lookback windows (seconds).
+[COMMENT] crates/direction_detector/src/lib.rs: /// Multi-source consistency.
+[COMMENT] crates/direction_detector/src/lib.rs: /// Cold-start guard.
+[COMMENT] crates/direction_detector/src/lib.rs: /// Triple-confirm gate: minimum consecutive same-direction ticks.
+[COMMENT] crates/direction_detector/src/lib.rs: /// Triple-confirm gate: minimum absolute velocity in bps/s.
+[COMMENT] crates/direction_detector/src/lib.rs: /// Triple-confirm gate: minimum directional acceleration.
+[COMMENT] crates/direction_detector/src/lib.rs: /// If abs(velocity) is above this multiple of min_velocity, treat as momentum spike.
+[COMMENT] crates/direction_detector/src/lib.rs: /// Triple-confirm gate: minimum short/long tick-rate ratio treated as volume spike proxy.
+[COMMENT] crates/direction_detector/src/lib.rs: /// Window for short-horizon tick-rate in ms.
+[COMMENT] crates/direction_detector/src/lib.rs: /// Window for long-horizon tick-rate in ms.
+[COMMENT] crates/direction_detector/src/lib.rs: /// Enable source vote gate: Binance confirmation is mandatory.
+[COMMENT] crates/direction_detector/src/lib.rs: /// Require Chainlink secondary source confirmation when available.
+[COMMENT] crates/direction_detector/src/lib.rs: /// Ignore source snapshots older than this window when voting.
+[COMMENT] crates/direction_detector/src/lib.rs: /// 快速确认速度阈值 (bps/s)。
+[COMMENT] crates/direction_detector/src/lib.rs: /// 当 velocity 超过此值时，只需 1 个同向 Tick 即可触发（不等 min_consecutive_ticks）。
+[COMMENT] crates/direction_detector/src/lib.rs: /// 设计哲学: 极强动量本身就是高置信度信号，等待第 2 个 Tick 会损失 10-50ms 窗口。
+[COMMENT] crates/direction_detector/src/lib.rs: // 5min 市场波动更小，阈值更低才能捕获信号
+[COMMENT] crates/direction_detector/src/lib.rs: // 极强动量: velocity > 30 bps/s → 单 Tick 触发，不等第 2 个
+[COMMENT] crates/direction_detector/src/lib.rs: // (recv_ts_ms, price) — 按时间戳升序
+[COMMENT] crates/direction_detector/src/lib.rs: /// 最近 tick_rate_short_ms 内的 tick 数
+[COMMENT] crates/direction_detector/src/lib.rs: /// 最近 tick_rate_long_ms 内的 tick 数
+[COMMENT] crates/direction_detector/src/lib.rs: /// 连续同向 tick 计数 (增量维护)
+[COMMENT] crates/direction_detector/src/lib.rs: /// 最后一个 tick 的方向符号: -1/0/1
+[COMMENT] crates/direction_detector/src/lib.rs: /// 已见过的 Binance 源 key (第一次见到时缓存)
+[COMMENT] crates/direction_detector/src/lib.rs: /// 已见过的 Chainlink 源 key (第一次见到时缓存)
+[COMMENT] crates/direction_detector/src/lib.rs: /// Tick counter for lazy pruning - only prune every N ticks
+[COMMENT] crates/direction_detector/src/lib.rs: /// Cached tick_rate_short_ms as i64 for hot-path use
+[COMMENT] crates/direction_detector/src/lib.rs: /// Cached tick_rate_long_ms as i64 for hot-path use
+[COMMENT] crates/direction_detector/src/lib.rs: // Keep windows; pruning will happen on next tick/evaluate.
+[COMMENT] crates/direction_detector/src/lib.rs: // 懒惰剪枝: 每 100 ticks 清理过期数据，同时修正计数器
+[COMMENT] crates/direction_detector/src/lib.rs: // 重新精确计算计数器（每 100 ticks 一次，分摊成本）
+[COMMENT] crates/direction_detector/src/lib.rs: // kinematics_from_ticks \u73b0\u5728\u53ea\u8fd4\u56de (velocity, acceleration)
+[COMMENT] crates/direction_detector/src/lib.rs: // tick_consistency \u7531 SymbolWindow \u589e\u91cf\u7ef4\u62a4\uff0cO(1) \u8bfb\u53d6
+[COMMENT] crates/direction_detector/src/lib.rs: // 直接读缓存的 tick_consistency，不再调用 consecutive_direction_count()
+[COMMENT] crates/direction_detector/src/lib.rs: // 门控关闭 或 方向中性 → 直接放行；否则检查数据源确认
+[ANY] crates/direction_detector/src/lib.rs: b.windows(7).any(|w| w.eq_ignore_ascii_case(b"binance"))
+[ANY] crates/direction_detector/src/lib.rs: b.windows(9).any(|w| w.eq_ignore_ascii_case(b"chainlink"))
+[COMMENT] crates/direction_detector/src/lib.rs: // ============================================================
+[COMMENT] crates/direction_detector/src/lib.rs: // find_anchor_price — 二分查找 O(log n)
+[COMMENT] crates/direction_detector/src/lib.rs: // deque 按时间戳升序，partition_point 找到第一个 ts > target_ms 的位置
+[COMMENT] crates/direction_detector/src/lib.rs: // 取其前一个元素，即最新的 ts <= target_ms 的价格
+[COMMENT] crates/direction_detector/src/lib.rs: // ============================================================
+[COMMENT] crates/direction_detector/src/lib.rs: // partition_point: 返回第一个不满足条件的索引
+[COMMENT] crates/direction_detector/src/lib.rs: // 条件: ts <= target_ms，所以返回的是第一个 ts > target_ms 的位置
+[COMMENT] crates/direction_detector/src/lib.rs: // Use a small threshold for Neutral instead of exact equality
+[COMMENT] crates/direction_detector/src/lib.rs: // Floating-point exact equality is nearly impossible, so we use 0.1% threshold
+[COMMENT] crates/execution_clob/src/lib.rs: /// Minimum interval between order pruning to reduce lock contention
+[COMMENT] crates/execution_clob/src/lib.rs: // Keep the request budget bounded (engine must never hang on IO).
+[COMMENT] crates/execution_clob/src/lib.rs: // Connection pooling + keepalive to reduce RTT tail spikes.
+[COMMENT] crates/execution_clob/src/lib.rs: // Force HTTP/2 without negotiation (Polymarket CLOB supports it)
+[COMMENT] crates/execution_clob/src/lib.rs: // If the peer supports it (ALPN), this can cut head-of-line blocking.
+[COMMENT] crates/execution_clob/src/lib.rs: /// Best-effort warmup for the internal HTTP client pool. Intended to run on startup so the
+[COMMENT] crates/execution_clob/src/lib.rs: /// first order/ack path doesn't pay DNS+TLS handshake cost.
+[COMMENT] crates/execution_clob/src/lib.rs: /// Prune expired orders with lazy cleanup (only every 60 seconds)
+[COMMENT] crates/execution_clob/src/lib.rs: /// This reduces lock contention from O(n) per call to O(n) per minute
+[COMMENT] crates/execution_clob/src/lib.rs: // Check if enough time has passed since last prune
+[COMMENT] crates/execution_clob/src/lib.rs: // In paper mode, there is no real exchange RTT. Optionally probe a configured URL
+[COMMENT] crates/execution_clob/src/lib.rs: // at a low sampling rate to estimate ack_only_ms without placing orders.
+[COMMENT] crates/execution_clob/src/lib.rs: // Note: default is 0.0 unless probing is enabled.
+[COMMENT] crates/execution_clob/src/lib.rs: // Validate price is finite and within valid range before sending
+[COMMENT] crates/execution_clob/src/wss_user_feed.rs: // -----------------------------------------------------------------------
+[COMMENT] crates/execution_clob/src/wss_user_feed.rs: // -----------------------------------------------------------------------
+[COMMENT] crates/execution_clob/src/wss_user_feed.rs: /// 从 WSS user channel 解析出的 fill 事件（仅保留 exit lifecycle 关心的字段）
+[COMMENT] crates/execution_clob/src/wss_user_feed.rs: /// 订单 ID（对应 OrderAckV2.order_id）
+[COMMENT] crates/execution_clob/src/wss_user_feed.rs: /// 事件类型: "trade" | "order"
+[COMMENT] crates/execution_clob/src/wss_user_feed.rs: // -----------------------------------------------------------------------
+[COMMENT] crates/execution_clob/src/wss_user_feed.rs: // 内部 JSON 结构（Polymarket WSS user channel 格式）
+[COMMENT] crates/execution_clob/src/wss_user_feed.rs: // -----------------------------------------------------------------------
+[COMMENT] crates/execution_clob/src/wss_user_feed.rs: // -----------------------------------------------------------------------
+[COMMENT] crates/execution_clob/src/wss_user_feed.rs: // 公开入口：app_runner 可用自己的 broadcast::Sender 启动 WSS 循环
+[COMMENT] crates/execution_clob/src/wss_user_feed.rs: // -----------------------------------------------------------------------
+[COMMENT] crates/execution_clob/src/wss_user_feed.rs: /// 启动 WSS user channel 循环（自动重连，永不退出）
+[COMMENT] crates/execution_clob/src/wss_user_feed.rs: /// `tx`: 广播发送端（app_runner 持有 Arc<Sender>，此处共享）
+[COMMENT] crates/execution_clob/src/wss_user_feed.rs: /// `wss_url`: Polymarket user channel URL
+[COMMENT] crates/execution_clob/src/wss_user_feed.rs: /// `api_key`: CLOB API key（用于 subscribe 消息认证）
+[COMMENT] crates/execution_clob/src/wss_user_feed.rs: // 发送 subscribe 消息（Polymarket user channel 认证格式）
+[COMMENT] crates/execution_clob/src/wss_user_feed.rs: // tungstenite 0.24+ 自动响应 Ping，无需手动处理
+[COMMENT] crates/execution_clob/src/wss_user_feed.rs: // 忽略 lagged receiver 错误（消费者太慢时丢弃旧事件）
+[COMMENT] crates/exit_manager/src/lib.rs: /// Early reversal threshold (bps) for the 100ms..300ms window.
+[COMMENT] crates/exit_manager/src/lib.rs: /// Reversal threshold (bps) for the 300ms..3s window.
+[COMMENT] crates/exit_manager/src/lib.rs: /// Convergence ratio threshold. Exit once PM has closed enough of the fair-value gap.
+[COMMENT] crates/exit_manager/src/lib.rs: /// T+3s take-profit ratio against entry edge.
+[COMMENT] crates/exit_manager/src/lib.rs: /// Minimum unrealized PnL at T+15s.
+[COMMENT] crates/exit_manager/src/lib.rs: /// Probability guard floor at T+60s.
+[COMMENT] crates/exit_manager/src/lib.rs: /// Hard max holding time in ms.
+[COMMENT] crates/exit_manager/src/lib.rs: /// Allow-hold probability threshold near expiry.
+[COMMENT] crates/exit_manager/src/lib.rs: /// Allow-hold remaining-time threshold in ms.
+[COMMENT] crates/exit_manager/src/lib.rs: /// Max allowed loss per position in USDC.
+[COMMENT] crates/exit_manager/src/lib.rs: /// Current PM YES mid used for convergence checks.
+[COMMENT] crates/exit_manager/src/lib.rs: /// PM YES mid at entry.
+[COMMENT] crates/exit_manager/src/lib.rs: /// Fair YES value at entry.
+[COMMENT] crates/exit_manager/src/lib.rs: /// Hard stop on max per-trade loss.
+[COMMENT] crates/exit_manager/src/lib.rs: /// Sharp reversal in 100ms..300ms.
+[COMMENT] crates/exit_manager/src/lib.rs: /// Sustained reversal in 300ms..3s.
+[COMMENT] crates/exit_manager/src/lib.rs: /// PM price has converged enough to fair value.
+[COMMENT] crates/exit_manager/src/lib.rs: /// Profit target reached at/after T+3s.
+[COMMENT] crates/exit_manager/src/lib.rs: /// Any positive pnl at/after T+15s.
+[COMMENT] crates/exit_manager/src/lib.rs: /// Probability guard at/after T+60s.
+[COMMENT] crates/exit_manager/src/lib.rs: /// Hard close after max hold time.
+[COMMENT] crates/exit_manager/src/lib.rs: // Keep one active position per market to avoid stale entries that can never be selected.
+[COMMENT] crates/exit_manager/src/lib.rs: // Default t15_min_unrealized_usdc=0.0 means any positive PnL exits at T+15s.
+[COMMENT] crates/feed_polymarket/src/lib.rs: /// WebSocket connection timeout
+[COMMENT] crates/feed_polymarket/src/lib.rs: /// WebSocket read timeout - prevents hanging on stale connections
+[COMMENT] crates/feed_polymarket/src/lib.rs: /// Validates that a price value is finite and within valid range [0, 1]
+[COMMENT] crates/feed_polymarket/src/lib.rs: // NOTE: app_runner owns the reconnect lifecycle for market feed.
+[COMMENT] crates/feed_polymarket/src/lib.rs: // Keep this worker single-shot to avoid nested reconnect loops that
+[COMMENT] crates/feed_polymarket/src/lib.rs: // can fan out into discovery storms (and trigger Gamma 429s).
+[COMMENT] crates/feed_polymarket/src/lib.rs: // Many Polymarket markets (especially 5m/15m contracts) expire quickly. If the WS
+[COMMENT] crates/feed_polymarket/src/lib.rs: // connection stays up, we would otherwise keep subscribing to stale/closed assets and
+[COMMENT] crates/feed_polymarket/src/lib.rs: // stop seeing updates. Force a periodic re-discovery + resubscribe.
+[COMMENT] crates/feed_polymarket/src/lib.rs: // Validate price data before assignment
+[COMMENT] crates/feed_polymarket/src/lib.rs: // Validate snapshot price levels
+[COMMENT] crates/feed_polymarket/src/lib.rs: // Validate delta prices
+[COMMENT] crates/feed_polymarket/src/lib.rs: /// Fast timestamp using SystemTime (more efficient than chrono::Utc::now())
+[COMMENT] crates/feed_reference/src/lib.rs: /// WebSocket connection timeout
+[COMMENT] crates/feed_reference/src/lib.rs: /// WebSocket read timeout - prevents hanging on stale connections
+[COMMENT] crates/feed_reference/src/lib.rs: /// Validates that a price value is finite and positive
+[COMMENT] crates/feed_reference/src/lib.rs: // Capture local receive timestamp as close as possible to socket delivery.
+[COMMENT] crates/feed_reference/src/lib.rs: // Validate price before creating tick
+[COMMENT] crates/feed_reference/src/lib.rs: // Probe all candidates concurrently at startup and prefer the fastest handshake.
+[COMMENT] crates/feed_reference/src/lib.rs: // This matters because some Binance hosts/ports resolve to different regions and DNS can
+[COMMENT] crates/feed_reference/src/lib.rs: // change over time; we want a deterministic "fastest-first" order.
+[COMMENT] crates/feed_reference/src/lib.rs: // Return endpoints reordered: best first, then the rest in original order.
+[COMMENT] crates/feed_reference/src/lib.rs: // Keep the default host as a fallback, but do not prefer it.
+[COMMENT] crates/feed_reference/src/lib.rs: /// Fast timestamp using SystemTime (more efficient than chrono::Utc::now())
+[COMMENT] crates/feeder_tokyo/src/bin/receiver.rs: // Busy-wait for lowest wakeup latency.
+[COMMENT] crates/infra_clock/src/lib.rs: // Use SeqCst to ensure proper memory ordering for time synchronization
+[COMMENT] crates/infra_clock/src/lib.rs: // This guarantees that writes to offset_ns are visible to subsequent reads
+[COMMENT] crates/infra_clock/src/lib.rs: // Use SeqCst to ensure the offset is properly visible to all threads
+[ANY] crates/market_discovery/src/lib.rs: .any(|t| t.eq_ignore_ascii_case(tf))
+[COMMENT] crates/paper_executor/src/lib.rs: // Use write lock for entire operation to prevent race condition
+[COMMENT] crates/paper_executor/src/lib.rs: // between read (matching) and write (removing filled orders)
+[COMMENT] crates/paper_executor/src/lib.rs: // Remove filled orders within same write lock
+[COMMENT] crates/poly_wire/src/lib.rs: /// Tight 24-byte quote packet for pure UDP relay hot path.
+[COMMENT] crates/poly_wire/src/lib.rs: /// Layout (Little Endian):
+[COMMENT] crates/poly_wire/src/lib.rs: /// [ts_micros: u64][bid: f64][ask: f64]
+[COMMENT] crates/poly_wire/src/lib.rs: /// Momentum packet extension.
+[COMMENT] crates/poly_wire/src/lib.rs: /// Layout (Little Endian):
+[COMMENT] crates/poly_wire/src/lib.rs: /// [ts_micros: u64][bid: f64][ask: f64][velocity_bps_per_sec: f64]
+[COMMENT] crates/poly_wire/src/lib.rs: /// Relay packet extension (first-hop timestamp carried from Tokyo sender).
+[COMMENT] crates/poly_wire/src/lib.rs: /// Layout (Little Endian):
+[COMMENT] crates/poly_wire/src/lib.rs: /// [ts_micros: u64][bid: f64][ask: f64][velocity_bps_per_sec: f64][ts_first_hop_ms: i64]
+[COMMENT] crates/poly_wire/src/lib.rs: /// Explicit little-endian + fixed-width encoding for deterministic wire format.
+[COMMENT] crates/poly_wire/src/lib.rs: // Auto prefers the richer relay packet while receivers stay backward-compatible.
+[COMMENT] crates/poly_wire/src/lib.rs: /// Helper to get current micros
+[COMMENT] crates/portfolio/src/lib.rs: // Use min to prevent negative position: only close up to existing position
+[COMMENT] crates/portfolio/src/lib.rs: // Only reduce by actual closed amount, not full fill size
+[COMMENT] crates/portfolio/src/lib.rs: // Use min to prevent negative position: only close up to existing position
+[COMMENT] crates/portfolio/src/lib.rs: // Only reduce by actual closed amount, not full fill size
+[COMMENT] crates/portfolio/src/lib.rs: /// Calculate unrealized PnL based on current market prices
+[COMMENT] crates/portfolio/src/lib.rs: /// If no prices provided, unrealized is treated as 0
+[COMMENT] crates/portfolio/src/lib.rs: // Calculate unrealized PnL using current market prices
+[COMMENT] crates/portfolio/src/lib.rs: // Unrealized = (current_price - avg_price) * position_size
+[COMMENT] crates/portfolio/src/lib.rs: // For yes position: (current - avg_yes) * yes
+[COMMENT] crates/portfolio/src/lib.rs: // For no position: (current - (1-avg_no)) * no = (avg_no - (1-current)) * no
+[COMMENT] crates/portfolio/src/lib.rs: /// Legacy snapshot without price info (unrealized = 0)
+[COMMENT] crates/probability_engine/src/lib.rs: /// Black-Scholes/GBM annualized sigma.
+[COMMENT] crates/probability_engine/src/lib.rs: /// Horizon for near-term digital direction probability.
+[COMMENT] crates/probability_engine/src/lib.rs: /// Base annualized drift component.
+[COMMENT] crates/probability_engine/src/lib.rs: /// Scale from velocity (bps/s) to annualized drift component.
+[COMMENT] crates/probability_engine/src/lib.rs: /// Scale from acceleration ((bps/s)/s) to annualized drift component.
+[COMMENT] crates/probability_engine/src/lib.rs: /// Blend weight for fair-value prior (0..1). Remaining weight uses BS/GBM model.
+[COMMENT] crates/probability_engine/src/lib.rs: // Abramowitz and Stegun 7.1.26 approximation, sufficient for strategy gating.
+[COMMENT] crates/risk_engine/src/lib.rs: // Lock poisoned - fail closed for safety
+[COMMENT] crates/risk_engine/src/lib.rs: // Cooldown gate (e.g. after a loss streak trigger).
+[COMMENT] crates/risk_engine/src/lib.rs: // Hard drawdown stop - use abs to handle negative drawdown values
+[COMMENT] crates/risk_engine/src/lib.rs: // Start cooldown window from "now", not from previous value.
+[COMMENT] crates/risk_engine/src/lib.rs: // Normalize existing notional to handle potential negative values
+[COMMENT] crates/risk_engine/src/lib.rs: // Use epsilon to prevent division by zero
+[COMMENT] crates/risk_engine/src/lib.rs: // Should be blocked by cooldown at +59s.
+[COMMENT] crates/risk_engine/src/lib.rs: // Cooldown should end at +60s.
+[COMMENT] crates/risk_engine/src/lib.rs: // Remaining notional is 2.0 out of requested 4.0 => 50% size cap.
+[COMMENT] crates/settlement_compounder/src/lib.rs: /// Share of profits to compound (1.0 = 100%).
+[COMMENT] crates/settlement_compounder/src/lib.rs: /// Recommended per-order notional = available * position_fraction (bounded by min_quote_size).
+[COMMENT] crates/settlement_compounder/src/lib.rs: /// Minimum per-order notional in USDC.
+[COMMENT] crates/settlement_compounder/src/lib.rs: /// Hard-stop threshold (USDC). If daily_pnl <= -cap, compounder marks halted.
+[COMMENT] crates/settlement_compounder/src/lib.rs: // Validate and clamp config values to valid ranges
+[COMMENT] crates/settlement_compounder/src/lib.rs: // Day 0: trigger halt.
+[COMMENT] crates/settlement_compounder/src/lib.rs: // Day 1: a new markout should roll daily state and clear halt.
+[COMMENT] crates/strategy_maker/src/lib.rs: // SEAT Latency Fabric v1.0: 更激进的过期过滤
+[COMMENT] crates/taker_sniper/src/lib.rs: /// Minimum quality score (0..100) required to fire.
+[COMMENT] crates/taker_sniper/src/lib.rs: /// Score = signal (0..40) + market (0..35) + timing (0..25).
+[COMMENT] crates/taker_sniper/src/lib.rs: // Conservative default for taker path; config can override this.
+[COMMENT] crates/taker_sniper/src/lib.rs: // Inputs for a single taker decision.
+[COMMENT] crates/taker_sniper/src/lib.rs: // Quality gate: skip weak opportunities.
+[COMMENT] crates/taker_sniper/src/lib.rs: // acceleration: 趋势加强中，不是减速
+[COMMENT] crates/taker_sniper/src/lib.rs: // tick_consistency: 连续同向 Tick 越多，方向越确定
+[COMMENT] crates/taker_sniper/src/lib.rs: // triple_confirm: 三重确认通过是高质量信号的标志
+[COMMENT] crates/taker_sniper/src/lib.rs: // edge: 预期盈利越高，时序价值越大
+[COMMENT] crates/taker_sniper/src/lib.rs: /// Dynamic edge gate by entry price bucket.
+[COMMENT] crates/taker_sniper/src/lib.rs: /// Near 0.50 prices require much larger edge due fee drag and toxicity.
+[COMMENT] crates/taker_sniper/src/lib.rs: // Fee behavior is approximately symmetric around 0.50.
+[COMMENT] crates/taker_sniper/src/lib.rs: // Around 0.50, require a much larger edge.
+[COMMENT] crates/taker_sniper/src/lib.rs: // High confidence can relax at most 25%.
+[COMMENT] crates/taker_sniper/src/lib.rs: // 50¢ 区间需要 800 bps (置信度 0.9 放宽 25% → 600 bps)
+[COMMENT] crates/taker_sniper/src/lib.rs: // 传入 edge_net_bps=95 远低于 600 bps, 应该被拦截
+[COMMENT] crates/taker_sniper/src/lib.rs: // 即使 edge=500 bps, 50¢ 区间 (需要 ~600 bps) 也应被拦截
+[COMMENT] crates/taker_sniper/src/lib.rs: // 0.95 区间: 80 bps base * 0.84 (confidence=0.9 放宽) = 67.2 bps
+[COMMENT] crates/taker_sniper/src/lib.rs: // edge_net_bps=80 > 67.2, 应该 Fire
+[COMMENT] crates/taker_sniper/src/lib.rs: // 验证高置信度确实能放宽门槛 (在极端价格区间)
+[COMMENT] crates/taker_sniper/src/lib.rs: // 0.85 区间: 150 bps base
+[COMMENT] crates/taker_sniper/src/lib.rs: //   confidence=0.55: relax = 1 - (0.55-0.5)*0.4 = 0.98 → 需要 147 bps
+[COMMENT] crates/taker_sniper/src/lib.rs: //   confidence=0.95: relax = 1 - (0.95-0.5)*0.4 = 0.82 → 需要 123 bps
+[COMMENT] crates/taker_sniper/src/lib.rs: // 低置信度: edge=130 bps < 147 bps → Skip
+[COMMENT] crates/taker_sniper/src/lib.rs: // 高置信度: edge=130 bps > 123 bps → Fire
+[COMMENT] crates/timeframe_router/src/lib.rs: /// Hard caps for micro-live and safety. Defaults are permissive for paper/shadow.
+[COMMENT] crates/timeframe_router/src/lib.rs: // Highest density first.
+[COMMENT] crates/timeframe_router/src/lib.rs: // Pre-lock one market.
+[COMMENT] crates/timeframe_router/src/lib.rs: // total=10, reserve=2 => deployable=8; order notional=9 => should skip.
+[COMMENT] crates/timeframe_router/src/lib.rs: // 5m lock already 3 out of 10 => 30% cap reached.
+[CATCH] scripts/remote_fullchain_benchmark.ps1: try { Stop-Process -Id $tunnel.Id -Force } catch {}
+[ANY] scripts/seat_remote_acceptance.py: challenger_seen = any(dec.startswith("shadow_started") for dec in decisions) and any(
+[ANY] scripts/three_window_verify.py: if any("tiny_notional" in k for k in top):
+[ANY] scripts/three_window_verify.py: if any("market_untracked" in k for k in top):
+[ANY] scripts/three_window_verify.py: if any("edge_below" in k for k in top) or any("no_quote_spread" in k for k in top):
+[ANY] scripts/three_window_verify.py: if any("rate_budget" in k for k in top):

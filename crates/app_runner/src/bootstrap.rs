@@ -305,7 +305,7 @@ pub(super) async fn async_main() -> Result<()> {
         .unwrap_or(512)
         .clamp(128, 5_760);
     let (strategy_ingress_tx, strategy_ingress_rx) =
-        mpsc::channel::<StrategyIngressMsg>(strategy_input_queue_cap);
+        crossbeam::channel::bounded::<StrategyIngressMsg>(strategy_input_queue_cap);
 
     let state = AppState {
         paused: paused.clone(),

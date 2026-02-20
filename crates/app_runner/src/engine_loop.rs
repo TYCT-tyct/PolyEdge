@@ -17,7 +17,7 @@ use infra_bus::RingBus;
 use market_discovery::{DiscoveryConfig, MarketDiscovery};
 use paper_executor::ShadowExecutor;
 use portfolio::PortfolioBook;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 
 use crate::execution_eval::{
     aggressive_price_for_side, classify_filled_outcome, classify_unfilled_outcome, edge_for_intent,
@@ -55,9 +55,24 @@ pub(crate) fn spawn_strategy_engine(
     shadow: Arc<ShadowExecutor>,
     paused: Arc<RwLock<bool>>,
     shared: Arc<EngineShared>,
-    mut ingress_rx: mpsc::Receiver<StrategyIngressMsg>,
+    ingress_rx: crossbeam::channel::Receiver<StrategyIngressMsg>,
 ) {
     spawn_detached("strategy_engine", true, async move {
+        // Core Pinning Configuration for Strategy Engine
+        let core_id = std::env::var("POLYEDGE_CORE_ENGINE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
+        if let Some(id) = core_id {
+            if let Some(core_ids) = core_affinity::get_core_ids() {
+                if id < core_ids.len() {
+                    core_affinity::set_for_current(core_ids[id]);
+                    tracing::info!("📌 Strategy Engine pinned to CPU Core {}", id);
+                } else {
+                    tracing::warn!("⚠️ Invalid POLYEDGE_CORE_ENGINE={}. Available cores: {}", id, core_ids.len());
+                }
+            }
+        }
+
         let fair = BasisMrFairValue::new(shared.fair_value_cfg.clone());
         // Separate fast reference ticks (exchange WS) from anchor ticks (Chainlink RTDS).
         // Fast ticks drive stale filtering + fair value evaluation; anchor ticks are tracked for
@@ -112,33 +127,38 @@ pub(crate) fn spawn_strategy_engine(
                 last_discovery_refresh = Instant::now();
             }
 
-            let ingress_msg = tokio::select! {
-                ctrl = control_rx.recv() => {
-                    match ctrl {
-                        Ok(EngineEvent::Control(ControlCommand::Pause)) => {
-                            *paused.write().await = true;
-                            shared.shadow_stats.set_paused(true);
-                        }
-                        Ok(EngineEvent::Control(ControlCommand::Resume)) => {
-                            *paused.write().await = false;
-                            shared.shadow_stats.set_paused(false);
-                        }
-                        Ok(EngineEvent::Control(ControlCommand::Flatten)) => {
-                            if let Err(err) = execution.flatten_all().await {
-                                tracing::warn!(?err, "flatten from control event failed");
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(_) => {}
+            // Non-blocking drain of control commands from async bus
+            while let Ok(ctrl) = control_rx.try_recv() {
+                match ctrl {
+                    EngineEvent::Control(ControlCommand::Pause) => {
+                        *paused.blocking_write() = true;
+                        shared.shadow_stats.set_paused(true);
                     }
-                    continue;
+                    EngineEvent::Control(ControlCommand::Resume) => {
+                        *paused.blocking_write() = false;
+                        shared.shadow_stats.set_paused(false);
+                    }
+                    EngineEvent::Control(ControlCommand::Flatten) => {
+                        // Launch flatten async task in background to keep engine spinning
+                        let exec_clone = execution.clone();
+                        spawn_detached("engine_flatten_cmd", false, async move {
+                           let _ = exec_clone.flatten_all().await;
+                        });
+                    }
+                    _ => {}
                 }
-                maybe_ingress = ingress_rx.recv() => {
-                    let Some(event) = maybe_ingress else {
-                        shared.shadow_stats.record_issue("strategy_ingress_closed").await;
-                        break;
-                    };
-                    event
+            }
+
+            // Sync blocking recv on Crossbeam channel
+            let ingress_msg = match ingress_rx.recv() {
+                Ok(msg) => msg,
+                Err(crossbeam::channel::RecvError) => {
+                    // Record issue in background to avoid async await here
+                    let stats = shared.shadow_stats.clone();
+                    tokio::spawn(async move {
+                        stats.record_issue("strategy_ingress_closed").await;
+                    });
+                    break;
                 }
             };
             let mut ingress_enqueued_ns = ingress_msg.enqueued_ns;
@@ -225,12 +245,13 @@ pub(crate) fn spawn_strategy_engine(
                                 );
                                 coalesced += 1;
                             }
-                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                                shared
-                                    .shadow_stats
-                                    .record_issue("strategy_ingress_disconnected")
-                                    .await;
+                            Err(crossbeam::channel::TryRecvError::Empty) => break,
+                            Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                                // Background issue logging
+                                let stats_clone = shared.shadow_stats.clone();
+                                tokio::spawn(async move {
+                                    stats_clone.record_issue("strategy_ingress_disconnected").await;
+                                });
                                 break;
                             }
                         }
