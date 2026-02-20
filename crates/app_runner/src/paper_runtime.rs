@@ -111,7 +111,8 @@ impl PaperRuntimeHandle {
         sqlite_enabled: bool,
         seat: Arc<SeatRuntimeHandle>,
     ) -> Arc<Self> {
-        let sqlite_path = dataset_path("reports", "paper_summary.sqlite");
+        let sqlite_name = std::env::var("POLYEDGE_PAPER_SQLITE").unwrap_or_else(|_| "paper_summary.sqlite".to_string());
+        let sqlite_path = dataset_path("reports", &sqlite_name);
         let sqlite = PaperSqliteWriter::spawn(sqlite_path, sqlite_enabled && enabled);
         let mut state = PaperRuntimeState::default();
         state.bankroll = initial_capital;
