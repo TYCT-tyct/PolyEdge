@@ -75,8 +75,8 @@ acceleration_drift_gain = 0.02
 fair_blend_weight = 0.35
 
 [predator_c.taker_sniper]
-min_direction_confidence = 0.60
-min_edge_net_bps = 8.5
+min_direction_confidence = 0.99
+min_edge_net_bps = 9999.0
 max_spread = 0.08
 cooldown_ms_per_market = 800
 
