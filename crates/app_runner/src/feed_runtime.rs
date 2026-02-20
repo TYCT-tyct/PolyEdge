@@ -69,7 +69,9 @@ pub(super) fn spawn_reference_feed(
         let strategy_ref_ingress_enabled = std::env::var("POLYEDGE_STRATEGY_REF_INGRESS_ENABLED")
             .ok()
             .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
-            .unwrap_or(false);
+            // Strategy engine relies on RefTick ingress to maintain latest_fast_ticks.
+            // Defaulting to false silently starves decisioning and causes pervasive tick_missing.
+            .unwrap_or(true);
         let (tx, mut rx) = mpsc::channel::<(RefLane, Result<RefTick>)>(ref_merge_queue_cap);
 
         let tx_direct = tx.clone();
