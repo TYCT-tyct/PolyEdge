@@ -684,6 +684,12 @@ pub(crate) fn spawn_strategy_engine(
                             active_by_rank,
                         )
                     };
+
+                    let decision_compute_ms = signal_start.elapsed().as_secs_f64() * 1_000.0;
+                    shared.shadow_stats.push_decision_compute_ms(decision_compute_ms).await;
+                    let tick_to_decision_ms = ((now_ns() - tick_fast.recv_ts_local_ns).max(0) as f64) / 1_000_000.0;
+                    shared.shadow_stats.push_tick_to_decision_ms(tick_to_decision_ms).await;
+
                     let spread_yes = (book.ask_yes - book.bid_yes).max(0.0);
                     let effective_max_spread = adaptive_max_spread(
                         cfg.max_spread,

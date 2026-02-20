@@ -1599,6 +1599,16 @@ impl ShadowStats {
         push_capped(&mut s.decision_queue_wait_ms, ms, Self::SAMPLE_CAP);
     }
 
+    pub(crate) async fn push_decision_compute_ms(&self, ms: f64) {
+        let mut s = self.samples.write().await;
+        push_capped(&mut s.decision_compute_ms, ms, Self::SAMPLE_CAP);
+    }
+
+    pub(crate) async fn push_tick_to_decision_ms(&self, ms: f64) {
+        let mut s = self.samples.write().await;
+        push_capped(&mut s.tick_to_decision_ms, ms, Self::SAMPLE_CAP);
+    }
+
     pub(crate) async fn push_ack_only_ms(&self, ms: f64) {
         let mut s = self.samples.write().await;
         push_capped(&mut s.ack_only_ms, ms, Self::SAMPLE_CAP);
