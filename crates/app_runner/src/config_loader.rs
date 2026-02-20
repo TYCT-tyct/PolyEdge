@@ -9,7 +9,7 @@ use strategy_maker::MakerConfig;
 use crate::seat_types::SeatConfig;
 use crate::state::{
     EdgeModelConfig, ExecutionConfig, ExitConfig, FusionConfig, PerfProfile, PredatorCConfig,
-    PredatorCPriority, SettlementConfig, SourceHealthConfig,
+    PredatorCPriority, SettlementConfig, SourceHealthConfig, ToxicityConfig,
 };
 
 fn strategy_config_path() -> PathBuf {
@@ -697,6 +697,12 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
                         cfg.direction_detector.min_velocity_bps_per_sec = parsed.max(0.0);
                     }
                 }
+                "fast_confirm_velocity_bps_per_sec" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.direction_detector.fast_confirm_velocity_bps_per_sec =
+                            parsed.clamp(1.0, 5_000.0);
+                    }
+                }
                 "min_acceleration" => {
                     if let Ok(parsed) = val.parse::<f64>() {
                         cfg.direction_detector.min_acceleration = parsed.max(0.0);
@@ -808,7 +814,7 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
                 }
                 "min_edge_net_bps" => {
                     if let Ok(parsed) = val.parse::<f64>() {
-                        cfg.taker_sniper.min_edge_net_bps = parsed.max(0.0);
+                        cfg.taker_sniper.min_edge_net_bps = parsed.clamp(-10_000.0, 10_000.0);
                     }
                 }
                 "max_spread" => {
@@ -849,6 +855,27 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
                 "stop_on_reject" | "gatling_stop_on_reject" => {
                     if let Ok(parsed) = val.parse::<bool>() {
                         cfg.taker_sniper.gatling_stop_on_reject = parsed;
+                    }
+                }
+                "min_win_rate_score" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.taker_sniper.min_win_rate_score = parsed.clamp(0.0, 100.0);
+                    }
+                }
+                "dynamic_fee_gate_enabled" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.taker_sniper.dynamic_fee_gate_enabled = parsed;
+                    }
+                }
+                "dynamic_fee_gate_scale" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.taker_sniper.dynamic_fee_gate_scale = parsed.clamp(0.05, 5.0);
+                    }
+                }
+                "dynamic_fee_gate_max_confidence_relax" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.taker_sniper.dynamic_fee_gate_max_confidence_relax =
+                            parsed.clamp(0.0, 0.8);
                     }
                 }
                 _ => {}
@@ -1279,7 +1306,126 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
     if cfg.v52.dual_arb.fee_buffer_mode != "conservative_taker" {
         cfg.v52.dual_arb.fee_buffer_mode = "conservative_taker".to_string();
     }
+    cfg.taker_sniper.min_win_rate_score = cfg.taker_sniper.min_win_rate_score.clamp(0.0, 100.0);
+    cfg.taker_sniper.dynamic_fee_gate_scale =
+        cfg.taker_sniper.dynamic_fee_gate_scale.clamp(0.05, 5.0);
+    cfg.taker_sniper.dynamic_fee_gate_max_confidence_relax = cfg
+        .taker_sniper
+        .dynamic_fee_gate_max_confidence_relax
+        .clamp(0.0, 0.8);
 
+    cfg
+}
+
+pub(super) fn load_toxicity_config() -> ToxicityConfig {
+    let path = strategy_config_path();
+    let Ok(raw) = fs::read_to_string(path) else {
+        return ToxicityConfig::default();
+    };
+    let mut cfg = ToxicityConfig::default();
+    let mut in_section = false;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_section = line == "[toxicity]";
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim().trim_matches('"');
+        match key {
+            "safe_threshold" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.safe_threshold = parsed.clamp(0.0, 1.0);
+                }
+            }
+            "caution_threshold" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.caution_threshold = parsed.clamp(0.0, 1.0);
+                }
+            }
+            "cooldown_min_sec" => {
+                if let Ok(parsed) = val.parse::<u64>() {
+                    cfg.cooldown_min_sec = parsed.max(1);
+                }
+            }
+            "cooldown_max_sec" => {
+                if let Ok(parsed) = val.parse::<u64>() {
+                    cfg.cooldown_max_sec = parsed.max(cfg.cooldown_min_sec);
+                }
+            }
+            "min_market_score" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.min_market_score = parsed.clamp(0.0, 100.0);
+                }
+            }
+            "active_top_n_markets" => {
+                if let Ok(parsed) = val.parse::<usize>() {
+                    cfg.active_top_n_markets = parsed.clamp(1, 128);
+                }
+            }
+            "markout_1s_caution_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.markout_1s_caution_bps = parsed;
+                }
+            }
+            "markout_5s_caution_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.markout_5s_caution_bps = parsed;
+                }
+            }
+            "markout_10s_caution_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.markout_10s_caution_bps = parsed;
+                }
+            }
+            "markout_1s_danger_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.markout_1s_danger_bps = parsed;
+                }
+            }
+            "markout_5s_danger_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.markout_5s_danger_bps = parsed;
+                }
+            }
+            "markout_10s_danger_bps" => {
+                if let Ok(parsed) = val.parse::<f64>() {
+                    cfg.markout_10s_danger_bps = parsed;
+                }
+            }
+            _ => {}
+        }
+    }
+    if cfg.safe_threshold > cfg.caution_threshold {
+        std::mem::swap(&mut cfg.safe_threshold, &mut cfg.caution_threshold);
+    }
+    if cfg.markout_1s_caution_bps < cfg.markout_1s_danger_bps {
+        std::mem::swap(
+            &mut cfg.markout_1s_caution_bps,
+            &mut cfg.markout_1s_danger_bps,
+        );
+    }
+    if cfg.markout_5s_caution_bps < cfg.markout_5s_danger_bps {
+        std::mem::swap(
+            &mut cfg.markout_5s_caution_bps,
+            &mut cfg.markout_5s_danger_bps,
+        );
+    }
+    if cfg.markout_10s_caution_bps < cfg.markout_10s_danger_bps {
+        std::mem::swap(
+            &mut cfg.markout_10s_caution_bps,
+            &mut cfg.markout_10s_danger_bps,
+        );
+    }
     cfg
 }
 

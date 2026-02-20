@@ -299,28 +299,28 @@ pub(crate) fn spawn_strategy_engine(
         let mut last_fusion_mode = shared.fusion_cfg.read().await.mode.clone();
         let strategy_max_coalesce = std::env::var("POLYEDGE_STRATEGY_MAX_COALESCE")
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(256)
             .clamp(8, 1_024);
         let strategy_coalesce_min = std::env::var("POLYEDGE_STRATEGY_MIN_COALESCE")
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(4)
             .clamp(1, 128);
         let strategy_coalesce_budget_us = std::env::var("POLYEDGE_STRATEGY_COALESCE_BUDGET_US")
             .ok()
-            .and_then(|v| v.parse::<u64>().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(120)
             .clamp(20, 2_000);
         let strategy_drop_stale_book_ms = std::env::var("POLYEDGE_STRATEGY_DROP_STALE_BOOK_MS")
             .ok()
-            .and_then(|v| v.parse::<f64>().ok())
+            .and_then(|v| v.trim().parse::<f64>().ok())
             .unwrap_or(800.0)
             .clamp(50.0, 5_000.0);
         let strategy_max_decision_backlog_ms = std::env::var("POLYEDGE_MAX_DECISION_BACKLOG_MS")
             .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.90)
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(12.0)
             .clamp(0.10, 50.0);
         let mut stale_book_drops: u64 = 0;
         let symbol_refresh_inflight = Arc::new(AtomicBool::new(false));

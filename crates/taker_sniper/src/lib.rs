@@ -47,10 +47,45 @@ pub struct TakerSniperConfig {
     /// Score = signal (0..40) + market (0..35) + timing (0..25).
     #[serde(default = "default_min_win_rate_score")]
     pub min_win_rate_score: f64,
+    /// Enable dynamic fee bleed shield based on price bucket.
+    #[serde(default = "default_dynamic_fee_gate_enabled")]
+    pub dynamic_fee_gate_enabled: bool,
+    /// Global scale applied to dynamic fee gate buckets.
+    #[serde(default = "default_dynamic_fee_gate_scale")]
+    pub dynamic_fee_gate_scale: f64,
+    /// Max relaxation ratio granted at confidence=1.0.
+    #[serde(default = "default_dynamic_fee_gate_max_confidence_relax")]
+    pub dynamic_fee_gate_max_confidence_relax: f64,
 }
 
 fn default_min_win_rate_score() -> f64 {
     55.0
+}
+
+fn default_dynamic_fee_gate_enabled() -> bool {
+    true
+}
+
+fn default_dynamic_fee_gate_scale() -> f64 {
+    1.0
+}
+
+fn default_dynamic_fee_gate_max_confidence_relax() -> f64 {
+    0.25
+}
+
+fn normalize_cfg(mut cfg: TakerSniperConfig) -> TakerSniperConfig {
+    cfg.min_direction_confidence = cfg.min_direction_confidence.clamp(0.0, 1.0);
+    cfg.max_spread = cfg.max_spread.max(0.0001);
+    cfg.gatling_min_chunks = cfg.gatling_min_chunks.max(1);
+    cfg.gatling_max_chunks = cfg.gatling_max_chunks.max(cfg.gatling_min_chunks);
+    cfg.gatling_chunk_notional_usdc = cfg.gatling_chunk_notional_usdc.max(0.01);
+    cfg.gatling_spacing_ms = cfg.gatling_spacing_ms.min(1_000);
+    cfg.min_win_rate_score = cfg.min_win_rate_score.clamp(0.0, 100.0);
+    cfg.dynamic_fee_gate_scale = cfg.dynamic_fee_gate_scale.clamp(0.05, 5.0);
+    cfg.dynamic_fee_gate_max_confidence_relax =
+        cfg.dynamic_fee_gate_max_confidence_relax.clamp(0.0, 0.8);
+    cfg
 }
 
 impl Default for TakerSniperConfig {
@@ -69,6 +104,9 @@ impl Default for TakerSniperConfig {
             gatling_stop_on_reject: true,
             gatling_by_symbol: HashMap::new(),
             min_win_rate_score: 55.0,
+            dynamic_fee_gate_enabled: true,
+            dynamic_fee_gate_scale: 1.0,
+            dynamic_fee_gate_max_confidence_relax: 0.25,
         }
     }
 }
@@ -126,7 +164,7 @@ pub struct TakerSniper {
 impl TakerSniper {
     pub fn new(cfg: TakerSniperConfig) -> Self {
         Self {
-            cfg,
+            cfg: normalize_cfg(cfg),
             last_fire_ms_by_market: HashMap::new(),
         }
     }
@@ -136,7 +174,7 @@ impl TakerSniper {
     }
 
     pub fn set_cfg(&mut self, cfg: TakerSniperConfig) {
-        self.cfg = cfg;
+        self.cfg = normalize_cfg(cfg);
     }
 
     pub fn evaluate(&mut self, ctx: &EvaluateCtx<'_>) -> TakerDecision {
@@ -160,8 +198,16 @@ impl TakerSniper {
             effective_edge_net -= ctx.rebate_est_bps;
         }
 
-        let dynamic_min_edge =
-            dynamic_fee_gate_min_edge_bps(ctx.entry_price, ctx.direction_signal.confidence);
+        let dynamic_min_edge = if self.cfg.dynamic_fee_gate_enabled {
+            dynamic_fee_gate_min_edge_bps(
+                ctx.entry_price,
+                ctx.direction_signal.confidence,
+                self.cfg.dynamic_fee_gate_scale,
+                self.cfg.dynamic_fee_gate_max_confidence_relax,
+            )
+        } else {
+            0.0
+        };
         let min_edge_required = self.cfg.min_edge_net_bps.max(dynamic_min_edge);
 
         // V5.3 Profit Shield (Dynamic Fee Precognition)
@@ -410,8 +456,15 @@ fn direction_to_side(dir: &Direction) -> core_types::OrderSide {
 /// Dynamic edge gate by entry price bucket.
 /// Near 0.50 prices require much larger edge due fee drag and toxicity.
 #[inline]
-fn dynamic_fee_gate_min_edge_bps(entry_price: f64, confidence: f64) -> f64 {
+fn dynamic_fee_gate_min_edge_bps(
+    entry_price: f64,
+    confidence: f64,
+    gate_scale: f64,
+    max_confidence_relax: f64,
+) -> f64 {
     let p = entry_price.clamp(0.0, 1.0);
+    let scale = gate_scale.clamp(0.05, 5.0);
+    let relax_cap = max_confidence_relax.clamp(0.0, 0.8);
     // Fee behavior is approximately symmetric around 0.50.
     let base_gate = if p >= 0.92 || p <= 0.08 {
         80.0
@@ -425,10 +478,10 @@ fn dynamic_fee_gate_min_edge_bps(entry_price: f64, confidence: f64) -> f64 {
         // Around 0.50, require a much larger edge.
         1200.0
     };
-    // High confidence can relax at most 25%.
-    let confidence_relax =
-        (1.0 - (confidence.clamp(0.0, 1.0) - 0.5).max(0.0) * 0.4).clamp(0.75, 1.0);
-    base_gate * confidence_relax
+    // Confidence relaxes the dynamic gate. At confidence=1.0, relax by at most relax_cap.
+    let confidence_ratio = ((confidence.clamp(0.0, 1.0) - 0.5) / 0.5).clamp(0.0, 1.0);
+    let confidence_relax = 1.0 - confidence_ratio * relax_cap;
+    base_gate * scale * confidence_relax
 }
 
 #[cfg(test)]

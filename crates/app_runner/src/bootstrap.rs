@@ -24,7 +24,7 @@ use crate::config_loader::{
     load_edge_model_config, load_execution_config, load_exit_config, load_fair_value_config,
     load_fusion_config, load_perf_profile_config, load_predator_c_config, load_risk_limits_config,
     load_seat_config, load_settlement_config, load_source_health_config, load_strategy_config,
-    load_universe_config,
+    load_toxicity_config, load_universe_config,
 };
 use crate::feed_runtime::{spawn_market_feed, spawn_reference_feed, spawn_settlement_feed};
 use crate::paper_runtime::{set_global_paper_runtime, PaperRuntimeHandle};
@@ -32,7 +32,7 @@ use crate::report_io::{ensure_dataset_dirs, init_jsonl_writer, init_storage_gc_w
 use crate::seat_runtime::SeatRuntimeHandle;
 use crate::state::{
     settlement_live_gate_status, to_exit_manager_config, AllocatorConfig, AppState, EngineShared,
-    ShadowStats, StrategyIngressMsg, ToxicityConfig,
+    ShadowStats, StrategyIngressMsg,
 };
 use crate::{control_api, orchestration, spawn_detached, spawn_strategy_engine};
 
@@ -171,7 +171,7 @@ pub(super) async fn async_main() -> Result<()> {
     let exit_cfg = Arc::new(RwLock::new(load_exit_config()));
     let exit_cfg0 = exit_cfg.read().await.clone();
     let fair_value_cfg = Arc::new(StdRwLock::new(load_fair_value_config()));
-    let toxicity_cfg = Arc::new(RwLock::new(Arc::new(ToxicityConfig::default())));
+    let toxicity_cfg = Arc::new(RwLock::new(Arc::new(load_toxicity_config())));
     let risk_limits = Arc::new(StdRwLock::new(load_risk_limits_config()));
     let perf_profile = Arc::new(RwLock::new(load_perf_profile_config()));
     let allocator_cfg = {

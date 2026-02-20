@@ -3,7 +3,6 @@ use core_types::{Direction, RefTick};
 use direction_detector::{DirectionConfig, DirectionDetector};
 use futures::StreamExt;
 use poly_wire::now_micros;
-use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;

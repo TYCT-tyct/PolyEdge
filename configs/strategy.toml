@@ -59,6 +59,7 @@ momentum_spike_multiplier = 1.8
 min_tick_rate_spike_ratio = 1.8
 tick_rate_short_ms = 300
 tick_rate_long_ms = 3000
+fast_confirm_velocity_bps_per_sec = 30.0
 enable_source_vote_gate = true
 require_secondary_confirmation = true
 source_vote_max_age_ms = 2000
@@ -79,6 +80,10 @@ min_direction_confidence = 0.60
 min_edge_net_bps = 8.5
 max_spread = 0.08
 cooldown_ms_per_market = 800
+min_win_rate_score = 55.0
+dynamic_fee_gate_enabled = true
+dynamic_fee_gate_scale = 1.0
+dynamic_fee_gate_max_confidence_relax = 0.25
 
 [predator_c.regime]
 enabled = true
@@ -216,8 +221,8 @@ fallback_arm_duration_ms = 8000
 fallback_cooldown_sec = 300
 udp_port = 6666
 # 更激进去重窗口
-dedupe_window_ms = 8
-dedupe_price_bps = 0.2
+dedupe_window_ms = 2
+dedupe_price_bps = 0.02
 
 [source_health]
 min_samples = 64
@@ -226,6 +231,10 @@ jitter_limit_ms = 10.0
 deviation_limit_bps = 30.0
 freshness_limit_ms = 1500.0
 min_score_for_trading = 0.40
+
+[toxicity]
+min_market_score = 70.0
+active_top_n_markets = 24
 
 [edge_model]
 model = "ev_net"

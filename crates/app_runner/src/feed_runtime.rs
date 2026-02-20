@@ -139,7 +139,7 @@ pub(super) fn spawn_reference_feed(
 
         let mut ingest_seq: u64 = 0;
         let mut last_source_ts_by_stream: HashMap<String, i64> = HashMap::new();
-        let mut last_published_by_symbol: HashMap<String, (i64, f64)> = HashMap::new();
+        let mut last_published_by_stream: HashMap<String, (i64, f64)> = HashMap::new();
         let mut source_runtime: HashMap<SmolStr, SourceRuntimeStats> = HashMap::new();
         let mut latest_price_by_symbol_source: HashMap<String, HashMap<SmolStr, f64>> =
             HashMap::new();
@@ -235,15 +235,15 @@ pub(super) fn spawn_reference_feed(
                             }
                         }
                     }
-                    last_source_ts_by_stream.insert(stream_key, source_ts);
-                    if let Some((prev_ts, prev_px)) = last_published_by_symbol.get(&tick.symbol) {
+                    last_source_ts_by_stream.insert(stream_key.clone(), source_ts);
+                    if let Some((prev_ts, prev_px)) = last_published_by_stream.get(&stream_key) {
                         if is_ref_tick_duplicate(source_ts, tick.price, *prev_ts, *prev_px, &fusion)
                         {
                             stats.mark_ref_dedupe_dropped();
                             continue;
                         }
                     }
-                    last_published_by_symbol.insert(tick.symbol.clone(), (source_ts, tick.price));
+                    last_published_by_stream.insert(stream_key, (source_ts, tick.price));
                     if source_health_cfg_refresh_at.elapsed() >= Duration::from_millis(500) {
                         source_health_cfg = shared.source_health_cfg.read().await.clone();
                         source_health_cfg_refresh_at = Instant::now();
