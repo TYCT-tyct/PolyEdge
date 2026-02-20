@@ -52,7 +52,7 @@ pub(super) async fn async_main() -> Result<()> {
     ensure_dataset_dirs();
     let control_port = std::env::var("POLYEDGE_CONTROL_PORT")
         .ok()
-        .and_then(|v| v.parse::<u16>().ok())
+        .and_then(|v| v.trim().parse::<u16>().ok())
         .unwrap_or(8080);
     tracing::info!(control_port, "resolved control port");
     std::env::set_var("POLYEDGE_CONTROL_PORT", control_port.to_string());

@@ -391,12 +391,12 @@ pub(super) fn load_fusion_config() -> FusionConfig {
     }
 
     if let Ok(raw) = std::env::var("POLYEDGE_UDP_PORT") {
-        if let Ok(parsed) = raw.parse::<u16>() {
+        if let Ok(parsed) = raw.trim().parse::<u16>() {
             cfg.udp_port = parsed.max(1);
         }
     }
     if let Ok(raw) = std::env::var("POLYEDGE_UDP_TRIGGER_PORT") {
-        if let Ok(parsed) = raw.parse::<u16>() {
+        if let Ok(parsed) = raw.trim().parse::<u16>() {
             cfg.udp_trigger_port = parsed.max(1);
         }
     }
