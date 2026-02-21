@@ -46,7 +46,7 @@ use crate::state::{
 use crate::stats_utils::{
     now_ns, percentile, policy_block_ratio, quote_block_ratio, robust_filter_iqr,
 };
-use crate::strategy_policy::{is_market_in_top_n, should_observe_only_symbol};
+use crate::strategy_policy::{adaptive_max_spread, is_market_in_top_n, should_observe_only_symbol};
 use crate::strategy_runtime::{
     classify_predator_regime, classify_time_phase, should_force_taker_fallback, stage_for_phase,
     time_phase_size_scale, timeframe_total_ms, TimePhase,
@@ -556,6 +556,13 @@ fn sol_guard_observe_only_for_high_latency_or_spread() {
     assert!(!should_observe_only_symbol(
         "BTCUSDT", &cfg, &tox, 260.0, 0.03, 999.0
     ));
+}
+
+#[test]
+fn adaptive_max_spread_respects_configured_high_spread_in_warmup() {
+    let s = adaptive_max_spread(0.50, 0.1, 5);
+    assert!(s > 0.08, "adaptive spread should not be hard-clamped to 0.08");
+    assert!(s <= 0.95);
 }
 
 #[test]

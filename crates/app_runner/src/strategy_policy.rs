@@ -238,11 +238,13 @@ pub(super) fn adaptive_max_spread(
     markout_samples: usize,
 ) -> f64 {
     let relax_ratio = non_risk_gate_relax_ratio();
+    let base = base_max_spread.max(0.0005);
+    let hard_cap = (base * 1.8).clamp(0.01, 0.95);
     if markout_samples < 20 {
-        return (base_max_spread * (1.2 + (1.0 - relax_ratio) * 0.5)).clamp(0.003, 0.08);
+        return (base * (1.2 + (1.0 - relax_ratio) * 0.5)).clamp(0.003, hard_cap);
     }
-    (base_max_spread * (1.0 - tox_score * 0.35 + (1.0 - relax_ratio) * 0.2))
-        .clamp(0.002, base_max_spread * 1.15)
+    (base * (1.0 - tox_score * 0.35 + (1.0 - relax_ratio) * 0.2))
+        .clamp(0.002, (base * 1.35).clamp(0.01, hard_cap))
 }
 
 pub(super) async fn timeframe_weight(
@@ -311,7 +313,7 @@ pub(super) fn should_observe_only_symbol(
         return false;
     }
     let profile = cfg.market_tier_profile.to_ascii_lowercase();
-    if !(profile.contains("sol_guard") || profile.contains("balanced")) {
+    if !profile.contains("sol_guard") {
         return false;
     }
 
