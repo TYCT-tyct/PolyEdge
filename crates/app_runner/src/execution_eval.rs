@@ -10,7 +10,8 @@ use crate::stats_utils::value_to_f64;
 use crate::strategy_policy::estimate_queue_fill_prob;
 
 pub(super) async fn get_fee_rate_bps_cached(shared: &EngineShared, market_id: &str) -> f64 {
-    const DEFAULT_FEE_BPS: f64 = 2.0;
+    // Conservative fallback for max taker fee-rate when remote fee endpoint is unavailable.
+    const DEFAULT_FEE_BPS: f64 = 250.0;
     const TTL: Duration = Duration::from_secs(60);
     const REFRESH_BACKOFF: Duration = Duration::from_secs(3);
 
@@ -32,18 +33,18 @@ pub(super) async fn get_fee_rate_bps_cached(shared: &EngineShared, market_id: &s
     cached_fee
 }
 
-/// Computes the dynamic Taker Fee for Polymarket.
-/// Polymarket Taker Fees scale with the size and odds of the trade:
-/// Buy Yes Fee  = p * max_fee_rate
-/// Sell Yes Fee = (1 - p) * max_fee_rate
-/// Buy No Fee   = (1 - p) * max_fee_rate
-/// Sell No Fee  = p * max_fee_rate
-/// Current Polymarket max Taker fee rate is dynamically ~ 3.5% (350 bps)
-pub(super) fn calculate_dynamic_taker_fee_bps(side: &OrderSide, price: f64) -> f64 {
-    const MAX_TAKER_FEE_BPS: f64 = 350.0;
+/// Computes dynamic taker fee in bps using a per-market fee-rate ceiling from cache/API.
+/// The fee-rate ceiling is interpreted as max taker fee bps and applied by side/price.
+pub(super) fn calculate_dynamic_taker_fee_bps(
+    side: &OrderSide,
+    price: f64,
+    max_taker_fee_bps: f64,
+) -> f64 {
+    let max_fee_bps = max_taker_fee_bps.clamp(0.0, 1_000.0);
+    let p = price.clamp(0.0, 1.0);
     match side {
-        OrderSide::BuyYes | OrderSide::SellNo => price * MAX_TAKER_FEE_BPS,
-        OrderSide::SellYes | OrderSide::BuyNo => (1.0 - price) * MAX_TAKER_FEE_BPS,
+        OrderSide::BuyYes | OrderSide::SellNo => p * max_fee_bps,
+        OrderSide::SellYes | OrderSide::BuyNo => (1.0 - p) * max_fee_bps,
     }
 }
 
@@ -129,14 +130,47 @@ pub(super) async fn fetch_fee_rate_bps(
         let Ok(v) = resp.json::<serde_json::Value>().await else {
             continue;
         };
-        let candidate = v
-            .get("fee_rate_bps")
-            .and_then(value_to_f64)
-            .or_else(|| v.get("feeRateBps").and_then(value_to_f64))
-            .or_else(|| v.get("makerFeeRateBps").and_then(value_to_f64))
-            .or_else(|| v.get("maker_fee_rate_bps").and_then(value_to_f64));
+        let candidate = extract_fee_rate_bps(&v);
         if candidate.is_some() {
             return candidate;
+        }
+    }
+    None
+}
+
+fn extract_fee_rate_bps(v: &serde_json::Value) -> Option<f64> {
+    // Prefer explicit taker fields when present, then generic fields.
+    let bps_keys = [
+        "taker_fee_rate_bps",
+        "takerFeeRateBps",
+        "fee_rate_bps",
+        "feeRateBps",
+        "maker_fee_rate_bps",
+        "makerFeeRateBps",
+    ];
+    for key in bps_keys {
+        if let Some(raw) = v.get(key).and_then(value_to_f64) {
+            if raw.is_finite() && raw > 0.0 {
+                return Some(raw.clamp(0.0, 1_000.0));
+            }
+        }
+    }
+
+    // Non-bps fields: support ratios/percent values if APIs return them.
+    let rate_keys = ["taker_fee_rate", "takerFeeRate", "fee_rate", "feeRate"];
+    for key in rate_keys {
+        if let Some(raw) = v.get(key).and_then(value_to_f64) {
+            if !raw.is_finite() || raw <= 0.0 {
+                continue;
+            }
+            let bps = if raw <= 1.0 {
+                // ratio (e.g. 0.0025 == 25 bps)
+                raw * 10_000.0
+            } else {
+                // percent-like (e.g. 0.25 for 0.25% or 2.5 for 2.5%).
+                raw * 100.0
+            };
+            return Some(bps.clamp(0.0, 1_000.0));
         }
     }
     None
@@ -353,5 +387,38 @@ pub(super) fn edge_for_intent(fair_yes: f64, intent: &QuoteIntent) -> f64 {
         // Expected edge vs. intended entry price in bps of entry.
         OrderSide::BuyYes | OrderSide::BuyNo => ((fair - px) / px) * 10_000.0,
         OrderSide::SellYes | OrderSide::SellNo => ((px - fair) / px) * 10_000.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extract_fee_rate_prefers_taker_bps_fields() {
+        let payload = json!({
+            "maker_fee_rate_bps": 12.0,
+            "taker_fee_rate_bps": 250.0
+        });
+        let out = extract_fee_rate_bps(&payload).expect("fee must parse");
+        assert!((out - 250.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn extract_fee_rate_supports_ratio_fields() {
+        let payload = json!({
+            "feeRate": 0.0025
+        });
+        let out = extract_fee_rate_bps(&payload).expect("fee must parse");
+        assert!((out - 25.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dynamic_taker_fee_uses_cached_max_rate() {
+        let p50 = calculate_dynamic_taker_fee_bps(&OrderSide::BuyYes, 0.50, 250.0);
+        let p95 = calculate_dynamic_taker_fee_bps(&OrderSide::BuyYes, 0.95, 250.0);
+        assert!((p50 - 125.0).abs() < 1e-9);
+        assert!((p95 - 237.5).abs() < 1e-9);
     }
 }

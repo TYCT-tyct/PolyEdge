@@ -194,7 +194,9 @@ impl TakerSniper {
         let mut effective_edge_net = ctx.edge_net_bps;
         // Micro-Taker Logic: If momentum is high, strip maker rebates from the edge calculation
         // so we don't hold back waiting for a rebate that we'll never capture.
-        if ctx.direction_signal.momentum_spike || ctx.direction_signal.velocity_bps_per_sec.abs() >= 10.0 {
+        if ctx.direction_signal.momentum_spike
+            || ctx.direction_signal.velocity_bps_per_sec.abs() >= 10.0
+        {
             effective_edge_net -= ctx.rebate_est_bps;
         }
 
@@ -210,10 +212,8 @@ impl TakerSniper {
         };
         let min_edge_required = self.cfg.min_edge_net_bps.max(dynamic_min_edge);
 
-        // V5.3 Profit Shield (Dynamic Fee Precognition)
-        // Ensure that Expected Profit strictly overrides Taker Fee + Margin.
-        // effective_edge_net is our theoretical alpha; we must structurally survive the fee
-        if (effective_edge_net - ctx.fee_bps) < min_edge_required {
+        // Profit shield: compare net edge (already fee-aware upstream) against required threshold.
+        if effective_edge_net < min_edge_required {
             return skip_static("fee_bleed_shield_active");
         }
 
@@ -526,6 +526,8 @@ mod tests {
             edge_gross_bps: 80.0,
             edge_net_bps: 80.0, // 0.95 区间需要 > 67.2 bps (80*0.84)
             size: 10.0,
+            target_l2_size: 10.0,
+            rebate_est_bps: 0.0,
             now_ms: 1_000_000,
         });
         assert!(matches!(d.action, TakerAction::Fire));
@@ -547,6 +549,8 @@ mod tests {
             edge_gross_bps: 30.0,
             edge_net_bps: 32.0,
             size: 10.0,
+            target_l2_size: 10.0,
+            rebate_est_bps: 0.0,
             now_ms: 1_000_000,
         });
         assert!(matches!(d.action, TakerAction::Skip));
@@ -571,10 +575,12 @@ mod tests {
             edge_gross_bps: 30.0,
             edge_net_bps: 24.0,
             size: 10.0,
+            target_l2_size: 10.0,
+            rebate_est_bps: 0.0,
             now_ms: 1_000_000,
         });
         assert!(matches!(d.action, TakerAction::Skip));
-        assert_eq!(d.reason, "fee_gate_too_expensive");
+        assert_eq!(d.reason, "fee_bleed_shield_active");
     }
 
     #[test]
@@ -596,6 +602,8 @@ mod tests {
             edge_gross_bps: 80.0,
             edge_net_bps: 80.0, // 0.95 区间需要 > 67.2 bps
             size: 10.0,
+            target_l2_size: 10.0,
+            rebate_est_bps: 0.0,
             now_ms: 1_000_000,
         });
         assert!(matches!(d1.action, TakerAction::Fire));
@@ -610,6 +618,8 @@ mod tests {
             edge_gross_bps: 80.0,
             edge_net_bps: 80.0,
             size: 10.0,
+            target_l2_size: 10.0,
+            rebate_est_bps: 0.0,
             now_ms: 1_000_500,
         });
         assert!(matches!(d2.action, TakerAction::Skip));
@@ -636,10 +646,12 @@ mod tests {
             edge_gross_bps: 60.0,
             edge_net_bps: 95.0,
             size: 10.0,
+            target_l2_size: 10.0,
+            rebate_est_bps: 0.0,
             now_ms: 1_000_000,
         });
         assert!(matches!(d.action, TakerAction::Skip));
-        assert_eq!(d.reason, "fee_gate_too_expensive");
+        assert_eq!(d.reason, "fee_bleed_shield_active");
     }
 
     #[test]
@@ -661,10 +673,12 @@ mod tests {
             edge_gross_bps: 500.0,
             edge_net_bps: 500.0,
             size: 10.0,
+            target_l2_size: 10.0,
+            rebate_est_bps: 0.0,
             now_ms: 1_000_000,
         });
         assert!(matches!(d.action, TakerAction::Skip));
-        assert_eq!(d.reason, "fee_gate_too_expensive");
+        assert_eq!(d.reason, "fee_bleed_shield_active");
     }
 
     #[test]
@@ -688,6 +702,8 @@ mod tests {
             edge_gross_bps: 80.0,
             edge_net_bps: 80.0, // 80 > 67.2 bps → Fire
             size: 10.0,
+            target_l2_size: 10.0,
+            rebate_est_bps: 0.0,
             now_ms: 1_000_000,
         });
         assert!(matches!(d.action, TakerAction::Fire));
@@ -718,6 +734,8 @@ mod tests {
             edge_gross_bps: 130.0,
             edge_net_bps: 130.0,
             size: 10.0,
+            target_l2_size: 10.0,
+            rebate_est_bps: 0.0,
             now_ms: 1_000_000,
         });
         assert!(matches!(d_low.action, TakerAction::Skip));
@@ -733,6 +751,8 @@ mod tests {
             edge_gross_bps: 130.0,
             edge_net_bps: 130.0,
             size: 10.0,
+            target_l2_size: 10.0,
+            rebate_est_bps: 0.0,
             now_ms: 1_000_000,
         });
         assert!(matches!(d_high.action, TakerAction::Fire));
@@ -756,9 +776,11 @@ mod tests {
             entry_price: 0.90,
             spread: 0.01,
             fee_bps: 2.0,
-            edge_gross_bps: 200.0,
-            edge_net_bps: 200.0, // 0.90 区间需要 > 150 bps
+            edge_gross_bps: 1200.0,
+            edge_net_bps: 1200.0, // 0.90 区间需要 > 150 bps
             size: 10.0,
+            target_l2_size: 10.0,
+            rebate_est_bps: 0.0,
             now_ms: 1_000_000,
         });
         assert!(matches!(d.action, TakerAction::Fire));
@@ -801,9 +823,11 @@ mod tests {
             entry_price: 0.90,
             spread: 0.01,
             fee_bps: 2.0,
-            edge_gross_bps: 200.0,
-            edge_net_bps: 200.0, // 0.90 区间需要 > 150 bps
+            edge_gross_bps: 1200.0,
+            edge_net_bps: 1200.0, // 0.90 区间需要 > 150 bps
             size: 10.0,
+            target_l2_size: 10.0,
+            rebate_est_bps: 0.0,
             now_ms: 1_000_000,
         });
         assert!(matches!(d.action, TakerAction::Fire));

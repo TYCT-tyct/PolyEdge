@@ -17,11 +17,11 @@ use risk_engine::RiskLimits;
 use strategy_maker::MakerConfig;
 use taker_sniper::{FirePlan, TakerAction};
 
-use core_types::RefTick;
 use crate::engine_core::{classify_execution_error_reason, normalize_reject_code};
 use crate::execution_eval::{
     aggressive_price_for_side, calculate_dynamic_taker_fee_bps, edge_gross_bps_for_side,
-    get_fee_rate_bps_cached, get_rebate_bps_cached, mid_for_side, prebuild_order_payload, spread_for_side,
+    get_fee_rate_bps_cached, get_rebate_bps_cached, mid_for_side, prebuild_order_payload,
+    spread_for_side,
 };
 use crate::feed_runtime::settlement_prob_yes_for_symbol;
 use crate::fusion_engine::TokenBucket;
@@ -38,6 +38,7 @@ use crate::{
     publish_if_telemetry_subscribers, spawn_detached, spawn_predator_exit_lifecycle,
     spawn_shadow_outcome_task, PredatorExecResult,
 };
+use core_types::RefTick;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TimePhase {
@@ -647,8 +648,15 @@ pub(super) async fn run_predator_c_for_symbol(
         } else {
             0.0
         };
-        let settlement_prob_yes =
-            settlement_prob_yes_for_symbol(shared, symbol, sig_entry.signal.fair_yes, latest_fast_ticks, latest_anchor_ticks, now_ms).await;
+        let settlement_prob_yes = settlement_prob_yes_for_symbol(
+            shared,
+            symbol,
+            sig_entry.signal.fair_yes,
+            latest_fast_ticks,
+            latest_anchor_ticks,
+            now_ms,
+        )
+        .await;
         let probability = {
             let engine = shared.predator_probability_engine.read().await;
             engine.estimate(
@@ -672,12 +680,16 @@ pub(super) async fn run_predator_c_for_symbol(
         let no_edge_gross =
             edge_gross_bps_for_side(probability.p_settle, &OrderSide::BuyNo, no_price);
 
-        // Polymarket V5.3 Hyper-Gatling: Dynamic Taker Fee Models based on execution price
-        let yes_fee_taker_bps = calculate_dynamic_taker_fee_bps(&OrderSide::BuyYes, yes_price);
-        let no_fee_taker_bps = calculate_dynamic_taker_fee_bps(&OrderSide::BuyNo, no_price);
+        // Dynamic taker fee uses per-market fee-rate ceiling from cache/API.
+        let yes_fee_taker_bps =
+            calculate_dynamic_taker_fee_bps(&OrderSide::BuyYes, yes_price, fee_bps);
+        let no_fee_taker_bps =
+            calculate_dynamic_taker_fee_bps(&OrderSide::BuyNo, no_price, fee_bps);
 
-        let yes_edge_net = yes_edge_gross - yes_fee_taker_bps + rebate_est_bps - edge_model_cfg.fail_cost_bps;
-        let no_edge_net = no_edge_gross - no_fee_taker_bps + rebate_est_bps - edge_model_cfg.fail_cost_bps;
+        let yes_edge_net =
+            yes_edge_gross - yes_fee_taker_bps + rebate_est_bps - edge_model_cfg.fail_cost_bps;
+        let no_edge_net =
+            no_edge_gross - no_fee_taker_bps + rebate_est_bps - edge_model_cfg.fail_cost_bps;
         if yes_edge_net > 0.0 && no_edge_net > 0.0 && !dual_arb_ok {
             shared
                 .shadow_stats
@@ -764,11 +776,24 @@ pub(super) async fn run_predator_c_for_symbol(
                 rebate_est_bps,
             );
         } else {
-            let (side, entry_price, edge_gross_bps, edge_net_bps, fee_applied) = if no_edge_net > yes_edge_net {
-                (OrderSide::BuyNo, no_price, no_edge_gross, no_edge_net, no_fee_taker_bps)
-            } else {
-                (OrderSide::BuyYes, yes_price, yes_edge_gross, yes_edge_net, yes_fee_taker_bps)
-            };
+            let (side, entry_price, edge_gross_bps, edge_net_bps, fee_applied) =
+                if no_edge_net > yes_edge_net {
+                    (
+                        OrderSide::BuyNo,
+                        no_price,
+                        no_edge_gross,
+                        no_edge_net,
+                        no_fee_taker_bps,
+                    )
+                } else {
+                    (
+                        OrderSide::BuyYes,
+                        yes_price,
+                        yes_edge_gross,
+                        yes_edge_net,
+                        yes_fee_taker_bps,
+                    )
+                };
             push_candidate(
                 bucket,
                 side.clone(),
@@ -1259,8 +1284,15 @@ pub(super) async fn run_predator_d_for_symbol(
         } else {
             0.0
         };
-        let settlement_prob_yes =
-            settlement_prob_yes_for_symbol(shared, symbol, sig_entry.signal.fair_yes, latest_fast_ticks, latest_anchor_ticks, now_ms).await;
+        let settlement_prob_yes = settlement_prob_yes_for_symbol(
+            shared,
+            symbol,
+            sig_entry.signal.fair_yes,
+            latest_fast_ticks,
+            latest_anchor_ticks,
+            now_ms,
+        )
+        .await;
         let probability = {
             let engine = shared.predator_probability_engine.read().await;
             engine.estimate(
@@ -1275,9 +1307,11 @@ pub(super) async fn run_predator_d_for_symbol(
             continue;
         }
         let fee_bps = get_fee_rate_bps_cached(shared, &market_id).await;
+        let taker_fee_bps = calculate_dynamic_taker_fee_bps(&side, entry_price, fee_bps);
         let rebate_est_bps = get_rebate_bps_cached(shared, &market_id, fee_bps).await;
         let edge_gross_bps = edge_gross_bps_for_side(probability.p_settle, &side, entry_price);
-        let edge_net_bps = edge_gross_bps - fee_bps + rebate_est_bps - edge_model_cfg.fail_cost_bps;
+        let edge_net_bps =
+            edge_gross_bps - taker_fee_bps + rebate_est_bps - edge_model_cfg.fail_cost_bps;
         if edge_net_bps < d_cfg.min_edge_net_bps {
             continue;
         }
@@ -1315,7 +1349,7 @@ pub(super) async fn run_predator_d_for_symbol(
             edge_gross_bps,
             edge_net_bps,
             edge_net_usdc,
-            fee_bps,
+            fee_bps: taker_fee_bps,
             lock_minutes,
             density,
             confidence: probability.confidence,
