@@ -1249,6 +1249,16 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
                         tf.entry_end_remaining_ms = parsed;
                     }
                 }
+                "min_direction_confidence" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        tf.min_direction_confidence = parsed;
+                    }
+                }
+                "scale_stage_min_edge_net_bps" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        tf.scale_stage_min_edge_net_bps = parsed;
+                    }
+                }
                 "probe_add_pct_min" => {
                     if let Ok(parsed) = val.parse::<f64>() {
                         tf.probe_add_pct_min = parsed;
@@ -1309,6 +1319,11 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
                 "max_total_exposure_pct" => {
                     if let Ok(parsed) = val.parse::<f64>() {
                         cfg.roll_v1.risk.max_total_exposure_pct = parsed;
+                    }
+                }
+                "require_compounder_when_live" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.roll_v1.risk.require_compounder_when_live = parsed;
                     }
                 }
                 _ => {}
@@ -1545,6 +1560,13 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
         cfg.roll_v1.tf15m.entry_end_remaining_ms = 20_000;
     }
     cfg.roll_v1.tf5m.probe_add_pct_min = cfg.roll_v1.tf5m.probe_add_pct_min.clamp(0.0005, 0.02);
+    cfg.roll_v1.tf5m.min_direction_confidence =
+        cfg.roll_v1.tf5m.min_direction_confidence.clamp(0.0, 1.0);
+    cfg.roll_v1.tf5m.scale_stage_min_edge_net_bps = cfg
+        .roll_v1
+        .tf5m
+        .scale_stage_min_edge_net_bps
+        .clamp(-10_000.0, 10_000.0);
     cfg.roll_v1.tf5m.probe_add_pct_max = cfg
         .roll_v1
         .tf5m
@@ -1563,6 +1585,13 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
         .max_position_pct_per_market
         .clamp(0.005, 0.20);
     cfg.roll_v1.tf15m.probe_add_pct_min = cfg.roll_v1.tf15m.probe_add_pct_min.clamp(0.0005, 0.02);
+    cfg.roll_v1.tf15m.min_direction_confidence =
+        cfg.roll_v1.tf15m.min_direction_confidence.clamp(0.0, 1.0);
+    cfg.roll_v1.tf15m.scale_stage_min_edge_net_bps = cfg
+        .roll_v1
+        .tf15m
+        .scale_stage_min_edge_net_bps
+        .clamp(-10_000.0, 10_000.0);
     cfg.roll_v1.tf15m.probe_add_pct_max = cfg
         .roll_v1
         .tf15m
@@ -1598,6 +1627,12 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
         .clamp(-2000.0, -10.0);
     cfg.roll_v1.reverse.maker_first_ttl_ms =
         cfg.roll_v1.reverse.maker_first_ttl_ms.clamp(10, 5_000);
+
+    if matches!(cfg.strategy_engine.engine_mode, StrategyEngineMode::RollV1) {
+        // Keep legacy strategy branches inert while roll_v1 is active to avoid mixed gating.
+        cfg.strategy_d.enabled = false;
+    }
+
     cfg.taker_sniper.min_win_rate_score = cfg.taker_sniper.min_win_rate_score.clamp(0.0, 100.0);
     cfg.taker_sniper.dynamic_fee_gate_scale =
         cfg.taker_sniper.dynamic_fee_gate_scale.clamp(0.05, 5.0);

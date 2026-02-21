@@ -853,6 +853,10 @@ fn roll_cfg_for_timeframe<'a>(
     }
 }
 
+fn roll_scale_min_edge_for_timeframe(cfg: &PredatorCConfig, timeframe: &TimeframeClass) -> f64 {
+    roll_cfg_for_timeframe(cfg, timeframe).scale_stage_min_edge_net_bps
+}
+
 fn scale_size_by_roll_stage(
     stage: RollStage,
     edge_net_bps: f64,
@@ -910,7 +914,7 @@ pub(super) async fn evaluate_and_route_roll_v1(
         return PredatorExecResult::default();
     }
     if execution.is_live()
-        && predator_cfg.v52.execution.require_compounder_when_live
+        && predator_cfg.roll_v1.risk.require_compounder_when_live
         && !predator_cfg.compounder.enabled
     {
         shared
@@ -953,7 +957,7 @@ pub(super) async fn evaluate_and_route_roll_v1(
     if matches!(direction_signal.direction, Direction::Neutral) {
         shared
             .shadow_stats
-            .mark_blocked_with_reason_ctx("reverse_not_confirmed", Some(symbol), None)
+            .mark_blocked_with_reason_ctx("neutral_direction", Some(symbol), None)
             .await;
         return PredatorExecResult::default();
     }
@@ -1112,16 +1116,18 @@ pub(super) async fn evaluate_and_route_roll_v1(
         };
         let remaining_ms = (frame_total_ms - now_ms.rem_euclid(frame_total_ms)).max(0);
         let tf_cfg = roll_cfg_for_timeframe(predator_cfg, &timeframe);
-        let in_window = if tf_cfg.entry_start_remaining_ms <= 0 {
-            remaining_ms >= tf_cfg.entry_end_remaining_ms
-        } else {
-            remaining_ms <= tf_cfg.entry_start_remaining_ms
-                && remaining_ms >= tf_cfg.entry_end_remaining_ms
-        };
-        if !in_window {
+        let too_early = tf_cfg.entry_start_remaining_ms > 0
+            && remaining_ms > tf_cfg.entry_start_remaining_ms;
+        let too_late = remaining_ms < tf_cfg.entry_end_remaining_ms;
+        if too_early || too_late {
+            let reason = if too_early {
+                "before_entry_window"
+            } else {
+                "final_window_guard"
+            };
             shared
                 .shadow_stats
-                .mark_blocked_with_reason_ctx("wrong_window", Some(symbol), Some(tf_label))
+                .mark_blocked_with_reason_ctx(reason, Some(symbol), Some(tf_label))
                 .await;
             continue;
         }
@@ -1150,7 +1156,7 @@ pub(super) async fn evaluate_and_route_roll_v1(
             map.insert(market_id.clone(), probability.clone());
         }
 
-        if direction_signal.confidence < 0.10 {
+        if direction_signal.confidence < tf_cfg.min_direction_confidence {
             shared
                 .shadow_stats
                 .mark_blocked_with_reason_ctx("low_confidence", Some(symbol), Some(tf_label))
@@ -1213,7 +1219,7 @@ pub(super) async fn evaluate_and_route_roll_v1(
                 .abs()
         {
             RollStage::Defend
-        } else if edge_net_bps >= predator_cfg.taker_sniper.min_edge_net_bps {
+        } else if edge_net_bps >= tf_cfg.scale_stage_min_edge_net_bps {
             RollStage::Scale
         } else if edge_net_bps > 0.0 {
             RollStage::Probe
@@ -2901,7 +2907,14 @@ pub(super) async fn predator_execute_opportunity(
                     },
                     delay_ms,
                     t0_ns: now_ns(),
-                    min_edge_bps: predator_cfg.taker_sniper.min_edge_net_bps,
+                    min_edge_bps: if matches!(
+                        predator_cfg.strategy_engine.engine_mode,
+                        StrategyEngineMode::RollV1
+                    ) {
+                        roll_scale_min_edge_for_timeframe(predator_cfg, &opp.timeframe)
+                    } else {
+                        predator_cfg.taker_sniper.min_edge_net_bps
+                    },
                     tox_score: 0.0,
                     ttl_ms: intent.ttl_ms,
                 };

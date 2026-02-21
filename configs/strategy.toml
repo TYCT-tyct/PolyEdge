@@ -137,7 +137,7 @@ max_chunks = 6
 spacing_ms = 14
 
 [predator_c.strategy_d]
-enabled = true
+enabled = false
 min_gap_bps = 25.0
 min_edge_net_bps = 12.75
 min_confidence = 0.65
@@ -216,6 +216,8 @@ enabled = true
 scan_interval_ms = 40
 entry_start_remaining_ms = 0
 entry_end_remaining_ms = 12000
+min_direction_confidence = 0.10
+scale_stage_min_edge_net_bps = 2.0
 probe_add_pct_min = 0.003
 probe_add_pct_max = 0.005
 scale_add_pct_min = 0.004
@@ -230,6 +232,8 @@ reverse_drop_pct = 0.06
 scan_interval_ms = 40
 entry_start_remaining_ms = 0
 entry_end_remaining_ms = 20000
+min_direction_confidence = 0.10
+scale_stage_min_edge_net_bps = 2.0
 probe_add_pct_min = 0.003
 probe_add_pct_max = 0.005
 scale_add_pct_min = 0.004
@@ -243,6 +247,7 @@ reverse_drop_pct = 0.04
 [roll_v1.risk]
 daily_loss_stop_pct = 2.0
 max_total_exposure_pct = 18.0
+require_compounder_when_live = true
 
 [roll_v1.fee_model]
 mode = "official_formula"

@@ -179,6 +179,10 @@ pub(crate) struct RollV1TimeframeConfig {
     pub(crate) scan_interval_ms: u64,
     pub(crate) entry_start_remaining_ms: i64,
     pub(crate) entry_end_remaining_ms: i64,
+    #[serde(default = "default_roll_v1_min_direction_confidence")]
+    pub(crate) min_direction_confidence: f64,
+    #[serde(default = "default_roll_v1_scale_stage_min_edge_net_bps")]
+    pub(crate) scale_stage_min_edge_net_bps: f64,
     pub(crate) probe_add_pct_min: f64,
     pub(crate) probe_add_pct_max: f64,
     pub(crate) scale_add_pct_min: f64,
@@ -196,6 +200,8 @@ impl Default for RollV1TimeframeConfig {
             scan_interval_ms: 40,
             entry_start_remaining_ms: 0,
             entry_end_remaining_ms: 12_000,
+            min_direction_confidence: default_roll_v1_min_direction_confidence(),
+            scale_stage_min_edge_net_bps: default_roll_v1_scale_stage_min_edge_net_bps(),
             probe_add_pct_min: 0.003,
             probe_add_pct_max: 0.005,
             scale_add_pct_min: 0.004,
@@ -213,6 +219,8 @@ impl Default for RollV1TimeframeConfig {
 pub(crate) struct RollV1RiskConfig {
     pub(crate) daily_loss_stop_pct: f64,
     pub(crate) max_total_exposure_pct: f64,
+    #[serde(default = "default_roll_v1_require_compounder_when_live")]
+    pub(crate) require_compounder_when_live: bool,
 }
 
 impl Default for RollV1RiskConfig {
@@ -220,8 +228,21 @@ impl Default for RollV1RiskConfig {
         Self {
             daily_loss_stop_pct: 2.0,
             max_total_exposure_pct: 18.0,
+            require_compounder_when_live: default_roll_v1_require_compounder_when_live(),
         }
     }
+}
+
+fn default_roll_v1_min_direction_confidence() -> f64 {
+    0.10
+}
+
+fn default_roll_v1_scale_stage_min_edge_net_bps() -> f64 {
+    2.0
+}
+
+fn default_roll_v1_require_compounder_when_live() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
