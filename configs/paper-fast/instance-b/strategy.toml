@@ -195,14 +195,56 @@ alpha_window_poll_ms = 10
 alpha_window_max_wait_ms = 1000
 require_compounder_when_live = true
 
-[v52.dual_arb]
-enabled = true
-safety_margin_bps = 3.0
-threshold = 0.99
-fee_buffer_mode = "conservative_taker"
-
 [v52.reversal]
 same_market_opposite_first = true
+
+[strategy_engine]
+engine_mode = "roll_v1"
+enabled_symbols = ["BTC", "ETH", "SOL", "XRP"]
+enabled_timeframes = ["5m", "15m"]
+market_scope = "near_expiry_active_only"
+
+[roll_v1]
+enabled = true
+
+[roll_v1.5m]
+scan_interval_ms = 40
+entry_start_remaining_ms = 150000
+entry_end_remaining_ms = 12000
+probe_add_pct_min = 0.003
+probe_add_pct_max = 0.005
+scale_add_pct_min = 0.004
+scale_add_pct_max = 0.012
+final_add_pct = 0.018
+max_position_pct_per_market = 0.055
+reverse_velocity_bps_per_sec = -180.0
+reverse_persist_ms = 800
+reverse_drop_pct = 0.06
+
+[roll_v1.15m]
+scan_interval_ms = 40
+entry_start_remaining_ms = 420000
+entry_end_remaining_ms = 20000
+probe_add_pct_min = 0.003
+probe_add_pct_max = 0.005
+scale_add_pct_min = 0.004
+scale_add_pct_max = 0.012
+final_add_pct = 0.018
+max_position_pct_per_market = 0.055
+reverse_velocity_bps_per_sec = -120.0
+reverse_persist_ms = 1500
+reverse_drop_pct = 0.04
+
+[roll_v1.risk]
+daily_loss_stop_pct = 2.0
+max_total_exposure_pct = 18.0
+
+[roll_v1.fee_model]
+mode = "official_formula"
+
+[roll_v1.reverse]
+strong_reversal_velocity_bps_per_sec = -260.0
+maker_first_ttl_ms = 400
 
 [fusion]
 enable_udp = true
