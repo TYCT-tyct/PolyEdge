@@ -1,0 +1,19 @@
+[Unit]
+Description=PolyEdge Market Tape Recorder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/PolyEdge
+EnvironmentFile=-/etc/polyedge/recorder.env
+ExecStart=/home/ubuntu/PolyEdge/target/release/polyedge recorder run --dataset-root /home/ubuntu/PolyEdge/datasets/recorder
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+StandardOutput=append:/var/log/polyedge/recorder.log
+StandardError=append:/var/log/polyedge/recorder.err.log
+
+[Install]
+WantedBy=multi-user.target

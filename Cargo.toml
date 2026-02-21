@@ -25,6 +25,7 @@ members = [
   "crates/poly_wire",
   "crates/feeder_tokyo",
   "crates/feed_udp", "crates/app_tokyo_brain",
+  "crates/polyedge_cli",
 ]
 
 [workspace.package]
