@@ -103,6 +103,7 @@ fn test_engine_shared_with_wss() -> (
         market_to_type: Arc::new(RwLock::new(HashMap::new())),
         token_to_symbol: Arc::new(RwLock::new(HashMap::new())),
         market_to_timeframe: Arc::new(RwLock::new(HashMap::new())),
+        market_to_end_ts_ms: Arc::new(RwLock::new(HashMap::new())),
         symbol_to_markets: Arc::new(RwLock::new(HashMap::new())),
         fee_cache: Arc::new(RwLock::new(HashMap::new())),
         fee_refresh_inflight: Arc::new(RwLock::new(HashMap::new())),

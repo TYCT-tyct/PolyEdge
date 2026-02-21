@@ -569,9 +569,48 @@ pub(super) async fn evaluate_and_route_roll_v1(
             .filter_map(|id| map.get(id).cloned().map(|b| (id.clone(), b)))
             .collect::<HashMap<String, BookTop>>()
     };
+    let scoped_market_ids = if predator_cfg
+        .strategy_engine
+        .market_scope
+        .eq_ignore_ascii_case("near_expiry_active_only")
+    {
+        let end_map = shared.market_to_end_ts_ms.read().await;
+        let mut best_per_tf: HashMap<TimeframeClass, (String, i64)> = HashMap::new();
+        for market_id in &market_ids {
+            let Some(tf) = tf_by_market.get(market_id).cloned() else {
+                continue;
+            };
+            let Some(end_ms) = end_map.get(market_id).copied() else {
+                continue;
+            };
+            let remain_ms = end_ms.saturating_sub(now_ms);
+            if remain_ms < -5_000 {
+                continue;
+            }
+            match best_per_tf.get_mut(&tf) {
+                Some((best_id, best_remain_ms)) => {
+                    if remain_ms < *best_remain_ms {
+                        *best_id = market_id.clone();
+                        *best_remain_ms = remain_ms;
+                    }
+                }
+                None => {
+                    best_per_tf.insert(tf, (market_id.clone(), remain_ms));
+                }
+            }
+        }
+        let mut ids = best_per_tf
+            .into_values()
+            .map(|(market_id, _)| market_id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    } else {
+        market_ids.clone()
+    };
 
     let mut cands: Vec<RollCand> = Vec::new();
-    for market_id in market_ids.into_iter().take(32) {
+    for market_id in scoped_market_ids.into_iter().take(32) {
         let Some(timeframe) = tf_by_market.get(&market_id).cloned() else {
             continue;
         };

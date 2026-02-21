@@ -469,6 +469,7 @@ pub(crate) struct EngineShared {
     pub(crate) market_to_type: Arc<RwLock<HashMap<String, String>>>,
     pub(crate) token_to_symbol: Arc<RwLock<HashMap<String, String>>>,
     pub(crate) market_to_timeframe: Arc<RwLock<HashMap<String, TimeframeClass>>>,
+    pub(crate) market_to_end_ts_ms: Arc<RwLock<HashMap<String, i64>>>,
     pub(crate) symbol_to_markets: Arc<RwLock<HashMap<String, Vec<String>>>>,
     pub(crate) fee_cache: Arc<RwLock<HashMap<String, FeeRateEntry>>>,
     pub(crate) fee_refresh_inflight: Arc<RwLock<HashMap<String, Instant>>>,

@@ -1999,6 +1999,7 @@ async fn refresh_market_symbol_map(shared: &EngineShared) {
             let mut market_type_map = HashMap::new();
             let mut token_map = HashMap::new();
             let mut timeframe_map = HashMap::new();
+            let mut market_end_ts_map = HashMap::new();
             let mut symbol_to_markets = HashMap::<String, Vec<String>>::new();
             for m in markets {
                 market_map.insert(m.market_id.clone(), m.symbol.clone());
@@ -2016,6 +2017,9 @@ async fn refresh_market_symbol_map(shared: &EngineShared) {
                     .push(m.market_id.clone());
                 if let Some(tf) = m.timeframe.as_deref().and_then(parse_timeframe_class) {
                     timeframe_map.insert(m.market_id.clone(), tf);
+                }
+                if let Some(end_ms) = parse_end_date_ms(m.end_date.as_deref()) {
+                    market_end_ts_map.insert(m.market_id.clone(), end_ms);
                 }
                 if let Some(t) = m.token_id_yes {
                     token_map.insert(t, m.symbol.clone());
@@ -2047,6 +2051,10 @@ async fn refresh_market_symbol_map(shared: &EngineShared) {
             {
                 let mut map = shared.market_to_timeframe.write().await;
                 *map = timeframe_map;
+            }
+            {
+                let mut map = shared.market_to_end_ts_ms.write().await;
+                *map = market_end_ts_map;
             }
             {
                 let mut map = shared.symbol_to_markets.write().await;
@@ -2094,6 +2102,16 @@ fn parse_timeframe_class(tf: &str) -> Option<TimeframeClass> {
         "1d" | "tf1d" => Some(TimeframeClass::Tf1d),
         _ => None,
     }
+}
+
+fn parse_end_date_ms(raw: Option<&str>) -> Option<i64> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc).timestamp_millis())
 }
 
 async fn pick_market_symbol(shared: &EngineShared, book: &BookTop) -> Option<String> {
