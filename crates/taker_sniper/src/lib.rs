@@ -229,14 +229,6 @@ impl TakerSniper {
             }
         }
 
-        // Quality gate: skip weak opportunities.
-        if self.cfg.min_win_rate_score > 0.0 {
-            let score = compute_win_rate_score(ctx);
-            if score < self.cfg.min_win_rate_score {
-                return skip_dynamic(format!("win_rate_score_too_low:{score:.1}"));
-            }
-        }
-
         let lock_minutes = lock_minutes_for_timeframe(&ctx.timeframe);
         let notional_usdc = (ctx.entry_price.max(0.0) * ctx.size.max(0.0)).max(0.0);
         let edge_net_usdc = (effective_edge_net / 10_000.0) * notional_usdc;
@@ -282,69 +274,6 @@ fn skip_static(reason: &'static str) -> TakerDecision {
         fire_plan: None,
         reason: reason.to_string(),
     }
-}
-
-#[inline]
-fn skip_dynamic(reason: String) -> TakerDecision {
-    TakerDecision {
-        action: TakerAction::Skip,
-        fire_plan: None,
-        reason,
-    }
-}
-
-fn compute_win_rate_score(ctx: &EvaluateCtx<'_>) -> f64 {
-    let sig = ctx.direction_signal;
-
-    let velocity_score = match sig.velocity_bps_per_sec.abs() {
-        v if v >= 100.0 => 20.0,
-        v if v >= 50.0 => 14.0,
-        v if v >= 20.0 => 8.0,
-        v if v >= 5.0 => 3.0,
-        _ => 0.0,
-    };
-    // acceleration: 趋势加强中，不是减速
-    let accel_score = if sig.acceleration > 0.0 { 10.0 } else { 0.0 };
-    // tick_consistency: 连续同向 Tick 越多，方向越确定
-    let tick_score = match sig.tick_consistency {
-        t if t >= 3 => 10.0,
-        2 => 5.0,
-        1 => 2.0,
-        _ => 0.0,
-    };
-    let signal_quality = velocity_score + accel_score + tick_score;
-
-    let p = ctx.entry_price.clamp(0.0, 1.0);
-    let dist = (p - 0.5).abs(); // 0=中间, 0.5=极端
-    let zone_score = match dist {
-        d if d >= 0.42 => 20.0, // >0.92 或 <0.08: 最高 Gamma
-        d if d >= 0.35 => 13.0, // 0.85-0.92
-        d if d >= 0.25 => 6.0,  // 0.75-0.85
-        _ => 0.0,               // 中间区间: 费率太高
-    };
-    // spread: 盘口越紧，滑点越小
-    let spread_score = match ctx.spread {
-        s if s < 0.01 => 10.0,
-        s if s < 0.03 => 5.0,
-        s if s < 0.05 => 2.0,
-        _ => 0.0,
-    };
-    // triple_confirm: 三重确认通过是高质量信号的标志
-    let confirm_score = if sig.triple_confirm { 5.0 } else { 0.0 };
-    let market_quality = zone_score + spread_score + confirm_score;
-
-    let spike_score = if sig.momentum_spike { 15.0 } else { 0.0 };
-    // edge: 预期盈利越高，时序价值越大
-    let edge_score = match ctx.edge_net_bps {
-        e if e >= 200.0 => 10.0,
-        e if e >= 100.0 => 7.0,
-        e if e >= 50.0 => 4.0,
-        e if e >= 30.0 => 2.0,
-        _ => 0.0,
-    };
-    let timing_quality = spike_score + edge_score;
-
-    signal_quality + market_quality + timing_quality
 }
 
 fn build_fire_plan(gatling: &GatlingResolved, mut opportunity: TimeframeOpp) -> FirePlan {

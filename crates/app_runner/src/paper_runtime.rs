@@ -932,9 +932,6 @@ fn build_diagnosis_alerts(live: &PaperLiveReport, analytics: &PaperAnalytics) ->
     if live.trades == 0 {
         alerts.push("no_trades_recorded".to_string());
     }
-    if live.win_rate < 0.45 && live.trades >= 20 {
-        alerts.push("low_win_rate".to_string());
-    }
     if live.fee_ratio > 0.5 && live.trades > 0 {
         alerts.push("fee_ratio_high".to_string());
     }
