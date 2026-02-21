@@ -1,5 +1,3 @@
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
