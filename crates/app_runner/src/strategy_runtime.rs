@@ -16,7 +16,7 @@ use paper_executor::ShadowExecutor;
 use portfolio::PortfolioBook;
 use risk_engine::RiskLimits;
 use strategy_maker::MakerConfig;
-use taker_sniper::{FirePlan, TakerAction};
+use taker_sniper::{FireChunk, FirePlan, TakerAction};
 
 use crate::engine_core::{classify_execution_error_reason, normalize_reject_code};
 use crate::execution_eval::{
@@ -63,6 +63,15 @@ fn timeframe_tag(timeframe: TimeframeClass) -> &'static str {
         TimeframeClass::Tf15m => "15m",
         TimeframeClass::Tf1h => "1h",
         TimeframeClass::Tf1d => "1d",
+    }
+}
+
+fn lock_minutes_for_timeframe(timeframe: &TimeframeClass) -> f64 {
+    match timeframe {
+        TimeframeClass::Tf5m => 5.0,
+        TimeframeClass::Tf15m => 15.0,
+        TimeframeClass::Tf1h => 60.0,
+        TimeframeClass::Tf1d => 1_440.0,
     }
 }
 
@@ -446,7 +455,7 @@ async fn place_roll_v1_order_and_track(
     Some((ack, market_id.to_string()))
 }
 
-fn spawn_roll_v1_reverse_maker_fallback(
+fn spawn_roll_v1_maker_ttl_fallback(
     shared: Arc<EngineShared>,
     bus: RingBus<EngineEvent>,
     execution: Arc<ClobExecution>,
@@ -454,13 +463,14 @@ fn spawn_roll_v1_reverse_maker_fallback(
     market_id: String,
     symbol: String,
     maker_order_id: String,
-    reverse_side: OrderSide,
+    fallback_side: OrderSide,
     size: f64,
     fee_rate_bps: f64,
     ttl_ms: u64,
     taker_max_slippage_bps: f64,
+    paper_action: PaperAction,
 ) {
-    spawn_detached("roll_v1_reverse_maker_fallback", false, async move {
+    spawn_detached("roll_v1_maker_ttl_fallback", false, async move {
         tokio::time::sleep(Duration::from_millis(ttl_ms.max(10))).await;
         if !execution.has_open_order(&maker_order_id) {
             return;
@@ -483,14 +493,14 @@ fn spawn_roll_v1_reverse_maker_fallback(
             &shadow,
             &market_id,
             &symbol,
-            reverse_side,
+            fallback_side,
             size,
             ExecutionStyle::Taker,
             150,
             taker_max_slippage_bps,
             fee_rate_bps,
             0.0,
-            PaperAction::Add,
+            paper_action,
             prob_fast,
             prob_settle,
             confidence,
@@ -578,62 +588,34 @@ fn spawn_roll_v1_position_lifecycle(
                 .get(&market_id)
                 .map(|p| (p.p_fast, p.p_settle, p.confidence))
                 .unwrap_or((0.5, 0.5, 0.0));
-            let close_ack = place_roll_v1_order_and_track(
-                &shared,
-                &bus,
-                &execution,
-                &shadow,
-                &market_id,
-                &symbol,
-                close_side,
-                size,
-                ExecutionStyle::Taker,
-                150,
-                taker_max_slippage_bps,
-                fee_rate_bps,
-                0.0,
-                PaperAction::ReversalExit,
-                prob_fast,
-                prob_settle,
-                confidence,
-            )
-            .await;
-            if close_ack.is_none() {
-                shared
-                    .shadow_stats
-                    .mark_blocked_with_reason_ctx(
-                        "roll_v1_reverse_flatten_failed",
-                        Some(symbol.as_str()),
-                        Some(tf_label.as_str()),
-                    )
-                    .await;
-                break;
-            }
-
-            if strong {
-                let _ = place_roll_v1_order_and_track(
+            // Parallel dual-send: submit flatten and reverse legs at the same time.
+            let flatten_style = ExecutionStyle::Maker;
+            let reverse_style = if strong {
+                ExecutionStyle::Taker
+            } else {
+                ExecutionStyle::Maker
+            };
+            let (flatten_ack, reverse_ack) = tokio::join!(
+                place_roll_v1_order_and_track(
                     &shared,
                     &bus,
                     &execution,
                     &shadow,
                     &market_id,
                     &symbol,
-                    reverse_side,
+                    close_side.clone(),
                     size,
-                    ExecutionStyle::Taker,
-                    150,
-                    taker_max_slippage_bps,
+                    flatten_style,
+                    reverse_cfg.maker_first_ttl_ms,
+                    0.0,
                     fee_rate_bps,
                     0.0,
-                    PaperAction::Add,
+                    PaperAction::ReversalExit,
                     prob_fast,
                     prob_settle,
                     confidence,
-                )
-                .await;
-                shared.shadow_stats.record_exit_reason("roll_v1_reverse_strong").await;
-            } else {
-                let maker = place_roll_v1_order_and_track(
+                ),
+                place_roll_v1_order_and_track(
                     &shared,
                     &bus,
                     &execution,
@@ -642,9 +624,13 @@ fn spawn_roll_v1_position_lifecycle(
                     &symbol,
                     reverse_side.clone(),
                     size,
-                    ExecutionStyle::Maker,
-                    reverse_cfg.maker_first_ttl_ms,
-                    0.0,
+                    reverse_style.clone(),
+                    if reverse_style == ExecutionStyle::Maker {
+                        reverse_cfg.maker_first_ttl_ms
+                    } else {
+                        150
+                    },
+                    taker_max_slippage_bps,
                     fee_rate_bps,
                     0.0,
                     PaperAction::Add,
@@ -652,9 +638,61 @@ fn spawn_roll_v1_position_lifecycle(
                     prob_settle,
                     confidence,
                 )
+            );
+
+            if let Some((ack, _)) = flatten_ack {
+                spawn_roll_v1_maker_ttl_fallback(
+                    shared.clone(),
+                    bus.clone(),
+                    execution.clone(),
+                    shadow.clone(),
+                    market_id.clone(),
+                    symbol.clone(),
+                    ack.order_id,
+                    close_side,
+                    size,
+                    fee_rate_bps,
+                    reverse_cfg.maker_first_ttl_ms,
+                    taker_max_slippage_bps,
+                    PaperAction::ReversalExit,
+                );
+            } else {
+                let fallback = place_roll_v1_order_and_track(
+                    &shared,
+                    &bus,
+                    &execution,
+                    &shadow,
+                    &market_id,
+                    &symbol,
+                    close_side,
+                    size,
+                    ExecutionStyle::Taker,
+                    150,
+                    taker_max_slippage_bps,
+                    fee_rate_bps,
+                    0.0,
+                    PaperAction::ReversalExit,
+                    prob_fast,
+                    prob_settle,
+                    confidence,
+                )
                 .await;
-                if let Some((ack, _)) = maker {
-                    spawn_roll_v1_reverse_maker_fallback(
+                if fallback.is_none() {
+                    shared
+                        .shadow_stats
+                        .mark_blocked_with_reason_ctx(
+                            "roll_v1_reverse_flatten_failed",
+                            Some(symbol.as_str()),
+                            Some(tf_label.as_str()),
+                        )
+                        .await;
+                    break;
+                }
+            }
+
+            if reverse_style == ExecutionStyle::Maker {
+                if let Some((ack, _)) = reverse_ack {
+                    spawn_roll_v1_maker_ttl_fallback(
                         shared.clone(),
                         bus.clone(),
                         execution.clone(),
@@ -667,6 +705,7 @@ fn spawn_roll_v1_position_lifecycle(
                         fee_rate_bps,
                         reverse_cfg.maker_first_ttl_ms,
                         taker_max_slippage_bps,
+                        PaperAction::Add,
                     );
                 } else {
                     let _ = place_roll_v1_order_and_track(
@@ -691,6 +730,11 @@ fn spawn_roll_v1_position_lifecycle(
                     .await;
                 }
                 shared.shadow_stats.record_exit_reason("roll_v1_reverse_weak").await;
+            } else {
+                shared
+                    .shadow_stats
+                    .record_exit_reason("roll_v1_reverse_strong")
+                    .await;
             }
             break;
         }
@@ -971,13 +1015,11 @@ pub(super) async fn evaluate_and_route_roll_v1(
         timeframe: TimeframeClass,
         side: OrderSide,
         entry_price: f64,
-        spread: f64,
         edge_gross_bps: f64,
         edge_net_bps: f64,
         size: f64,
         target_l2_size: f64,
         fee_applied: f64,
-        rebate_est_bps: f64,
     }
 
     let tf_by_market = {
@@ -1070,9 +1112,13 @@ pub(super) async fn evaluate_and_route_roll_v1(
         };
         let remaining_ms = (frame_total_ms - now_ms.rem_euclid(frame_total_ms)).max(0);
         let tf_cfg = roll_cfg_for_timeframe(predator_cfg, &timeframe);
-        if remaining_ms > tf_cfg.entry_start_remaining_ms
-            || remaining_ms < tf_cfg.entry_end_remaining_ms
-        {
+        let in_window = if tf_cfg.entry_start_remaining_ms <= 0 {
+            remaining_ms >= tf_cfg.entry_end_remaining_ms
+        } else {
+            remaining_ms <= tf_cfg.entry_start_remaining_ms
+                && remaining_ms >= tf_cfg.entry_end_remaining_ms
+        };
+        if !in_window {
             shared
                 .shadow_stats
                 .mark_blocked_with_reason_ctx("wrong_window", Some(symbol), Some(tf_label))
@@ -1104,16 +1150,10 @@ pub(super) async fn evaluate_and_route_roll_v1(
             map.insert(market_id.clone(), probability.clone());
         }
 
-        let aligned_velocity = match direction_signal.direction {
-            Direction::Up => direction_signal.velocity_bps_per_sec,
-            Direction::Down => -direction_signal.velocity_bps_per_sec,
-            Direction::Neutral => 0.0,
-        };
-        let min_velocity = tf_cfg.reverse_velocity_bps_per_sec.abs() * 0.08;
-        if aligned_velocity < min_velocity || direction_signal.confidence < 0.55 {
+        if direction_signal.confidence < 0.10 {
             shared
                 .shadow_stats
-                .mark_blocked_with_reason_ctx("low_trend", Some(symbol), Some(tf_label))
+                .mark_blocked_with_reason_ctx("low_confidence", Some(symbol), Some(tf_label))
                 .await;
             continue;
         }
@@ -1202,19 +1242,16 @@ pub(super) async fn evaluate_and_route_roll_v1(
             OrderSide::SellYes => book.bid_size_yes,
             OrderSide::SellNo => book.bid_size_no,
         };
-        let spread = spread_for_side(&book, &side);
         cands.push(RollCand {
             market_id,
             timeframe,
             side,
             entry_price,
-            spread,
             edge_gross_bps,
             edge_net_bps,
             size,
             target_l2_size,
             fee_applied,
-            rebate_est_bps,
         });
     }
 
@@ -1222,54 +1259,35 @@ pub(super) async fn evaluate_and_route_roll_v1(
         return PredatorExecResult::default();
     }
 
-    let mut sniper_cfg = predator_cfg.taker_sniper.clone();
-    sniper_cfg.min_direction_confidence = sniper_cfg.min_direction_confidence.min(0.55);
-    sniper_cfg.min_win_rate_score = 0.0;
-    sniper_cfg.cooldown_ms_per_market = sniper_cfg.cooldown_ms_per_market.min(400);
-    let mut sniper = taker_sniper::TakerSniper::new(sniper_cfg);
-
     let mut fire_plans_by_market: HashMap<String, FirePlan> = HashMap::new();
     for cand in cands {
-        let sig = direction_signal_for_side(&direction_signal, &cand.side);
-        let decision = sniper.evaluate(&taker_sniper::EvaluateCtx {
-            market_id: &cand.market_id,
-            symbol,
-            timeframe: cand.timeframe.clone(),
-            direction_signal: &sig,
-            entry_price: cand.entry_price,
-            spread: cand.spread,
-            fee_bps: cand.fee_applied,
-            edge_gross_bps: cand.edge_gross_bps,
-            edge_net_bps: cand.edge_net_bps,
-            rebate_est_bps: cand.rebate_est_bps,
-            size: cand.size,
-            target_l2_size: cand.target_l2_size,
-            now_ms,
-        });
-        match decision.action {
-            TakerAction::Fire => {
-                if let Some(mut plan) = decision.fire_plan {
-                    plan.opportunity.side = cand.side.clone();
-                    plan.opportunity.direction = side_to_direction(&cand.side);
-                    plan.opportunity.entry_price = cand.entry_price;
-                    plan.opportunity.edge_gross_bps = cand.edge_gross_bps;
-                    plan.opportunity.edge_net_bps = cand.edge_net_bps;
-                    plan.opportunity.ts_ms = now_ms;
-                    fire_plans_by_market.insert(plan.opportunity.market_id.clone(), plan);
-                }
-            }
-            TakerAction::Skip => {
-                let reason = if decision.reason.starts_with("cooldown_active") {
-                    "cooldown"
-                } else {
-                    decision.reason.as_str()
-                };
-                shared
-                    .shadow_stats
-                    .mark_blocked_with_reason_ctx(reason, Some(symbol), None)
-                    .await;
-            }
-        }
+        let notional = (cand.entry_price.max(0.0) * cand.size.max(0.0)).max(0.0);
+        let plan = FirePlan {
+            opportunity: TimeframeOpp {
+                timeframe: cand.timeframe.clone(),
+                market_id: cand.market_id.clone(),
+                symbol: symbol.to_string(),
+                direction: side_to_direction(&cand.side),
+                side: cand.side.clone(),
+                entry_price: cand.entry_price,
+                size: cand.size,
+                target_l2_size: cand.target_l2_size,
+                edge_gross_bps: cand.edge_gross_bps,
+                edge_net_bps: cand.edge_net_bps,
+                edge_net_usdc: (cand.edge_net_bps / 10_000.0) * notional,
+                fee_bps: cand.fee_applied,
+                lock_minutes: lock_minutes_for_timeframe(&cand.timeframe),
+                density: 1.0,
+                confidence: direction_signal.confidence,
+                ts_ms: now_ms,
+            },
+            chunks: vec![FireChunk {
+                size: cand.size,
+                send_delay_ms: 0,
+            }],
+            stop_on_reject: true,
+        };
+        fire_plans_by_market.insert(cand.market_id, plan);
     }
 
     if fire_plans_by_market.is_empty() {

@@ -1521,28 +1521,26 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
     }
     cfg.roll_v1.tf5m.scan_interval_ms = cfg.roll_v1.tf5m.scan_interval_ms.clamp(10, 500);
     cfg.roll_v1.tf15m.scan_interval_ms = cfg.roll_v1.tf15m.scan_interval_ms.clamp(10, 500);
-    cfg.roll_v1.tf5m.entry_start_remaining_ms = cfg
-        .roll_v1
-        .tf5m
-        .entry_start_remaining_ms
-        .clamp(20_000, 290_000);
+    cfg.roll_v1.tf5m.entry_start_remaining_ms =
+        cfg.roll_v1.tf5m.entry_start_remaining_ms.clamp(0, 290_000);
     cfg.roll_v1.tf5m.entry_end_remaining_ms =
         cfg.roll_v1.tf5m.entry_end_remaining_ms.clamp(1_000, 60_000);
-    if cfg.roll_v1.tf5m.entry_end_remaining_ms >= cfg.roll_v1.tf5m.entry_start_remaining_ms {
+    if cfg.roll_v1.tf5m.entry_start_remaining_ms > 0
+        && cfg.roll_v1.tf5m.entry_end_remaining_ms >= cfg.roll_v1.tf5m.entry_start_remaining_ms
+    {
         cfg.roll_v1.tf5m.entry_start_remaining_ms = 150_000;
         cfg.roll_v1.tf5m.entry_end_remaining_ms = 12_000;
     }
-    cfg.roll_v1.tf15m.entry_start_remaining_ms = cfg
-        .roll_v1
-        .tf15m
-        .entry_start_remaining_ms
-        .clamp(60_000, 850_000);
+    cfg.roll_v1.tf15m.entry_start_remaining_ms =
+        cfg.roll_v1.tf15m.entry_start_remaining_ms.clamp(0, 850_000);
     cfg.roll_v1.tf15m.entry_end_remaining_ms = cfg
         .roll_v1
         .tf15m
         .entry_end_remaining_ms
         .clamp(1_000, 120_000);
-    if cfg.roll_v1.tf15m.entry_end_remaining_ms >= cfg.roll_v1.tf15m.entry_start_remaining_ms {
+    if cfg.roll_v1.tf15m.entry_start_remaining_ms > 0
+        && cfg.roll_v1.tf15m.entry_end_remaining_ms >= cfg.roll_v1.tf15m.entry_start_remaining_ms
+    {
         cfg.roll_v1.tf15m.entry_start_remaining_ms = 420_000;
         cfg.roll_v1.tf15m.entry_end_remaining_ms = 20_000;
     }

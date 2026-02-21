@@ -152,7 +152,7 @@ impl Default for RollV1Config {
         Self {
             enabled: true,
             tf5m: RollV1TimeframeConfig {
-                entry_start_remaining_ms: 150_000,
+                entry_start_remaining_ms: 0,
                 entry_end_remaining_ms: 12_000,
                 reverse_velocity_bps_per_sec: -180.0,
                 reverse_persist_ms: 800,
@@ -160,7 +160,7 @@ impl Default for RollV1Config {
                 ..RollV1TimeframeConfig::default()
             },
             tf15m: RollV1TimeframeConfig {
-                entry_start_remaining_ms: 420_000,
+                entry_start_remaining_ms: 0,
                 entry_end_remaining_ms: 20_000,
                 reverse_velocity_bps_per_sec: -120.0,
                 reverse_persist_ms: 1_500,
@@ -194,7 +194,7 @@ impl Default for RollV1TimeframeConfig {
     fn default() -> Self {
         Self {
             scan_interval_ms: 40,
-            entry_start_remaining_ms: 150_000,
+            entry_start_remaining_ms: 0,
             entry_end_remaining_ms: 12_000,
             probe_add_pct_min: 0.003,
             probe_add_pct_max: 0.005,

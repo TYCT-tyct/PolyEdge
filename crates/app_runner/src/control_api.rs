@@ -572,15 +572,19 @@ fn normalize_strategy_engine_config(cfg: &mut StrategyEngineConfig) {
 fn normalize_roll_v1(cfg: &mut RollV1Config) {
     cfg.tf5m.scan_interval_ms = cfg.tf5m.scan_interval_ms.clamp(10, 500);
     cfg.tf15m.scan_interval_ms = cfg.tf15m.scan_interval_ms.clamp(10, 500);
-    cfg.tf5m.entry_start_remaining_ms = cfg.tf5m.entry_start_remaining_ms.clamp(20_000, 290_000);
+    cfg.tf5m.entry_start_remaining_ms = cfg.tf5m.entry_start_remaining_ms.clamp(0, 290_000);
     cfg.tf5m.entry_end_remaining_ms = cfg.tf5m.entry_end_remaining_ms.clamp(1_000, 60_000);
-    if cfg.tf5m.entry_end_remaining_ms >= cfg.tf5m.entry_start_remaining_ms {
+    if cfg.tf5m.entry_start_remaining_ms > 0
+        && cfg.tf5m.entry_end_remaining_ms >= cfg.tf5m.entry_start_remaining_ms
+    {
         cfg.tf5m.entry_start_remaining_ms = 150_000;
         cfg.tf5m.entry_end_remaining_ms = 12_000;
     }
-    cfg.tf15m.entry_start_remaining_ms = cfg.tf15m.entry_start_remaining_ms.clamp(60_000, 850_000);
+    cfg.tf15m.entry_start_remaining_ms = cfg.tf15m.entry_start_remaining_ms.clamp(0, 850_000);
     cfg.tf15m.entry_end_remaining_ms = cfg.tf15m.entry_end_remaining_ms.clamp(1_000, 120_000);
-    if cfg.tf15m.entry_end_remaining_ms >= cfg.tf15m.entry_start_remaining_ms {
+    if cfg.tf15m.entry_start_remaining_ms > 0
+        && cfg.tf15m.entry_end_remaining_ms >= cfg.tf15m.entry_start_remaining_ms
+    {
         cfg.tf15m.entry_start_remaining_ms = 420_000;
         cfg.tf15m.entry_end_remaining_ms = 20_000;
     }

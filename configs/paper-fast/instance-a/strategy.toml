@@ -209,7 +209,7 @@ enabled = true
 
 [roll_v1.5m]
 scan_interval_ms = 40
-entry_start_remaining_ms = 150000
+entry_start_remaining_ms = 0
 entry_end_remaining_ms = 12000
 probe_add_pct_min = 0.003
 probe_add_pct_max = 0.005
@@ -223,7 +223,7 @@ reverse_drop_pct = 0.06
 
 [roll_v1.15m]
 scan_interval_ms = 40
-entry_start_remaining_ms = 420000
+entry_start_remaining_ms = 0
 entry_end_remaining_ms = 20000
 probe_add_pct_min = 0.003
 probe_add_pct_max = 0.005
