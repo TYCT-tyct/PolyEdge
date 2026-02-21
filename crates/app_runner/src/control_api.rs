@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
 use axum::extract::{Query, State};
@@ -363,11 +364,34 @@ async fn build_market_selection_snapshot(state: &AppState) -> serde_json::Value 
         market_types.join("/"),
         timeframes.join("/")
     );
+
+    let active_templates = markets
+        .iter()
+        .map(|m| format!("{}|{}|{}", m.symbol, m.market_type, m.timeframe))
+        .collect::<HashSet<_>>();
+    let mut expected_templates = HashSet::new();
+    for s in &symbols {
+        for mt in &market_types {
+            for tf in &timeframes {
+                expected_templates.insert(format!("{s}|{mt}|{tf}"));
+            }
+        }
+    }
+    let mut template_missing = expected_templates
+        .difference(&active_templates)
+        .cloned()
+        .collect::<Vec<_>>();
+    template_missing.sort();
+
     serde_json::json!({
         "title": title,
         "symbols": symbols,
         "market_types": market_types,
         "timeframes": timeframes,
+        "template_expected_count": expected_templates.len(),
+        "template_active_count": active_templates.len(),
+        "template_missing_count": template_missing.len(),
+        "template_missing": template_missing,
         "total_markets": markets.len(),
         "markets": markets,
         "generated_at_ms": Utc::now().timestamp_millis(),

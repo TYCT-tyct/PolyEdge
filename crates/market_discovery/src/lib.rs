@@ -66,6 +66,14 @@ pub struct MarketDiscovery {
     cfg: DiscoveryConfig,
 }
 
+#[derive(Clone, Copy)]
+struct ScanPlan {
+    order: &'static str,
+    ascending: &'static str,
+    limit: i64,
+    max_pages: usize,
+}
+
 impl MarketDiscovery {
     pub fn new(cfg: DiscoveryConfig) -> Self {
         Self {
@@ -78,112 +86,131 @@ impl MarketDiscovery {
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::<String>::new();
 
-        // Gamma is ordered by volume and paginated by offset; crypto up/down markets can fall
-        // outside the top 1k depending on the global market mix. Scan a few pages deterministically.
-        let limit: i64 = 1000;
-        for offset in [0_i64, 1000, 2000, 3000] {
-            let limit_s = limit.to_string();
-            let offset_s = offset.to_string();
-            let response = self
-                .http
-                .get(&self.cfg.endpoint)
-                .query(&[
-                    ("closed", "false"),
-                    ("archived", "false"),
-                    ("active", "true"),
-                    ("limit", limit_s.as_str()),
-                    ("offset", offset_s.as_str()),
-                    ("order", "volume"),
-                    ("ascending", "false"),
-                ])
-                .send()
-                .await;
-            let response = match response {
-                Ok(v) => v,
-                Err(err) => {
-                    if out.is_empty() {
-                        return Err(err).context("discovery request");
+        // Prefer time-window ordering first to avoid missing low-volume but currently tradable
+        // crypto windows (e.g. SOL 15m), then do a volume sweep as fallback enrichment.
+        let plans = [
+            ScanPlan {
+                order: "endDate",
+                ascending: "true",
+                limit: 200,
+                max_pages: 16,
+            },
+            ScanPlan {
+                order: "volume",
+                ascending: "false",
+                limit: 1000,
+                max_pages: 4,
+            },
+        ];
+
+        for plan in plans {
+            for page_idx in 0..plan.max_pages {
+                let offset = (page_idx as i64) * plan.limit;
+                let limit_s = plan.limit.to_string();
+                let offset_s = offset.to_string();
+                let response = self
+                    .http
+                    .get(&self.cfg.endpoint)
+                    .query(&[
+                        ("closed", "false"),
+                        ("archived", "false"),
+                        ("active", "true"),
+                        ("limit", limit_s.as_str()),
+                        ("offset", offset_s.as_str()),
+                        ("order", plan.order),
+                        ("ascending", plan.ascending),
+                    ])
+                    .send()
+                    .await;
+                let response = match response {
+                    Ok(v) => v,
+                    Err(err) => {
+                        if out.is_empty() {
+                            return Err(err).context("discovery request");
+                        }
+                        break;
                     }
+                };
+                let response = match response.error_for_status() {
+                    Ok(v) => v,
+                    Err(err) => {
+                        if out.is_empty() {
+                            return Err(err).context("discovery status");
+                        }
+                        break;
+                    }
+                };
+                let markets: Vec<GammaMarket> = match response.json().await {
+                    Ok(v) => v,
+                    Err(err) => {
+                        if out.is_empty() {
+                            return Err(err).context("discovery json");
+                        }
+                        break;
+                    }
+                };
+
+                if markets.is_empty() {
                     break;
                 }
-            };
-            let response = match response.error_for_status() {
-                Ok(v) => v,
-                Err(err) => {
-                    if out.is_empty() {
-                        return Err(err).context("discovery status");
-                    }
-                    break;
-                }
-            };
-            let markets: Vec<GammaMarket> = match response.json().await {
-                Ok(v) => v,
-                Err(err) => {
-                    if out.is_empty() {
-                        return Err(err).context("discovery json");
-                    }
-                    break;
-                }
-            };
 
-            if markets.is_empty() {
-                break;
-            }
-
-            for market in markets {
-                if !market.active || market.closed || !market.accepting_orders {
-                    continue;
-                }
-                if !seen.insert(market.id.clone()) {
-                    continue;
-                }
-
-                let text = format!(
-                    "{} {}",
-                    market.question.to_ascii_uppercase(),
-                    market.slug.clone().unwrap_or_default().to_ascii_uppercase()
-                );
-                let market_type = classify_market_type(&text);
-                if !self.cfg.market_types.is_empty()
-                    && !self
-                        .cfg
-                        .market_types
-                        .iter()
-                        .any(|t| t.eq_ignore_ascii_case(market_type))
-                {
-                    continue;
-                }
-                let timeframe = classify_timeframe(&text);
-                if !self.cfg.timeframes.is_empty() {
-                    let Some(tf) = timeframe else {
+                for market in markets {
+                    if !market.active || market.closed || !market.accepting_orders {
                         continue;
-                    };
-                    if !self
-                        .cfg
-                        .timeframes
-                        .iter()
-                        .any(|t| t.eq_ignore_ascii_case(tf))
+                    }
+                    if !seen.insert(market.id.clone()) {
+                        continue;
+                    }
+
+                    let text = format!(
+                        "{} {}",
+                        market.question.to_ascii_uppercase(),
+                        market.slug.clone().unwrap_or_default().to_ascii_uppercase()
+                    );
+                    let market_type = classify_market_type(&text);
+                    if !self.cfg.market_types.is_empty()
+                        && !self
+                            .cfg
+                            .market_types
+                            .iter()
+                            .any(|t| t.eq_ignore_ascii_case(market_type))
                     {
                         continue;
                     }
-                }
-                let Some(symbol) = detect_symbol(&text, &self.cfg.symbols) else {
-                    continue;
-                };
+                    let timeframe = classify_timeframe(&text);
+                    if !self.cfg.timeframes.is_empty() {
+                        let Some(tf) = timeframe else {
+                            continue;
+                        };
+                        if !self
+                            .cfg
+                            .timeframes
+                            .iter()
+                            .any(|t| t.eq_ignore_ascii_case(tf))
+                        {
+                            continue;
+                        }
+                    }
+                    let Some(symbol) = detect_symbol(&text, &self.cfg.symbols) else {
+                        continue;
+                    };
 
-                out.push(MarketDescriptor {
-                    market_id: market.id,
-                    question: market.question,
-                    symbol,
-                    token_id_yes: parse_token_pair(market.clob_token_ids.as_deref()).map(|x| x.0),
-                    token_id_no: parse_token_pair(market.clob_token_ids.as_deref()).map(|x| x.1),
-                    event_slug: market.event_slug,
-                    end_date: market.end_date,
-                    timeframe: timeframe.map(|v| v.to_string()),
-                    market_type: Some(market_type.to_string()),
-                    best_bid: market.best_bid,
-                    best_ask: market.best_ask,
-                });
+                    out.push(MarketDescriptor {
+                        market_id: market.id,
+                        question: market.question,
+                        symbol,
+                        token_id_yes: parse_token_pair(market.clob_token_ids.as_deref())
+                            .map(|x| x.0),
+                        token_id_no: parse_token_pair(market.clob_token_ids.as_deref())
+                            .map(|x| x.1),
+                        event_slug: market.event_slug,
+                        end_date: market.end_date,
+                        timeframe: timeframe.map(|v| v.to_string()),
+                        market_type: Some(market_type.to_string()),
+                        best_bid: market.best_bid,
+                        best_ask: market.best_ask,
+                    });
+                }
             }
         }
 
