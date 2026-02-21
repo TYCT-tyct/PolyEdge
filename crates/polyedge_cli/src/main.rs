@@ -178,6 +178,7 @@ struct RecorderStatus {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    install_rustls_provider();
     let cli = Cli::parse();
     let level = if cli.verbose { "debug" } else { "info" };
     let _ = tracing_subscriber::fmt().with_env_filter(level).try_init();
@@ -207,6 +208,10 @@ async fn main() -> Result<()> {
             RemoteCommand::LogsIreland(args) => run_logs_ireland(args),
         },
     }
+}
+
+fn install_rustls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 async fn run_recorder_once(args: RecorderOnce) -> Result<()> {
