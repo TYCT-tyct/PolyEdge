@@ -398,7 +398,7 @@ fn run_git_audit(json: bool) -> Result<()> {
 fn run_deploy_ireland(base: RemoteBase) -> Result<()> {
     ensure_key(&base.key)?;
     let target = format!("{}@{}", base.user, base.host);
-    run_ssh(&base, &target, &format!("set -euo pipefail; export PATH=\\\"$HOME/.cargo/bin:$PATH\\\"; cd {}; git fetch origin; git checkout {}; git pull --ff-only origin {}; cargo build -p app_runner -p polyedge_cli --release", base.repo, base.branch, base.branch))?;
+    run_ssh(&base, &target, &format!("set -euo pipefail; cd {}; git fetch origin; git checkout {}; git pull --ff-only origin {}; ~/.cargo/bin/cargo build -p app_runner -p polyedge_cli --release", base.repo, base.branch, base.branch))?;
     run_scp(&base, "scripts/setup_recorder_systemd.sh", &format!("{target}:/tmp/setup_recorder_systemd.sh"))?;
     run_scp(&base, "ops/systemd/polyedge-recorder.service", &format!("{target}:/tmp/polyedge-recorder.service"))?;
     run_ssh(&base, &target, &format!("chmod +x /tmp/setup_recorder_systemd.sh; POLYEDGE_REPO_DIR={} POLYEDGE_BIN_PATH={}/target/release/polyedge POLYEDGE_USER={} bash /tmp/setup_recorder_systemd.sh", base.repo, base.repo, base.user))?;
