@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use core_types::{
     new_id, BookTop, Direction, DirectionSignal, EngineEvent, ExecutionStyle, ExecutionVenue,
     OrderAck, OrderIntentV2, OrderSide, OrderTimeInForce, PaperAction, QuoteIntent, Regime,
@@ -27,8 +28,9 @@ use crate::feed_runtime::settlement_prob_yes_for_symbol;
 use crate::fusion_engine::TokenBucket;
 use crate::paper_runtime::{global_paper_runtime, PaperIntentCtx};
 use crate::state::{
-    EngineShared, PredatorCConfig, PredatorCPriority, PredatorRegimeConfig, RollV1TimeframeConfig,
-    SourceHealthConfig, StrategyEngineMode, V52ExecutionConfig, V52TimePhaseConfig,
+    EngineShared, PredatorCConfig, PredatorCPriority, PredatorRegimeConfig, RollV1ReverseConfig,
+    RollV1TimeframeConfig, SourceHealthConfig, StrategyEngineMode, V52ExecutionConfig,
+    V52TimePhaseConfig,
 };
 use crate::stats_utils::{freshness_ms, now_ns};
 use crate::strategy_policy::{
@@ -108,6 +110,52 @@ fn direction_signal_for_side(base: &DirectionSignal, side: &OrderSide) -> Direct
     let mut out = base.clone();
     out.direction = side_to_direction(side);
     out
+}
+
+fn flatten_side_for_entry(side: &OrderSide) -> OrderSide {
+    match side {
+        OrderSide::BuyYes => OrderSide::SellYes,
+        OrderSide::BuyNo => OrderSide::SellNo,
+        OrderSide::SellYes => OrderSide::BuyYes,
+        OrderSide::SellNo => OrderSide::BuyNo,
+    }
+}
+
+fn opposite_buy_side_for_entry(side: &OrderSide) -> OrderSide {
+    match side {
+        OrderSide::BuyYes | OrderSide::SellNo => OrderSide::BuyNo,
+        OrderSide::BuyNo | OrderSide::SellYes => OrderSide::BuyYes,
+    }
+}
+
+fn token_id_for_side(book: &BookTop, side: &OrderSide) -> String {
+    match side {
+        OrderSide::BuyYes | OrderSide::SellYes => book.token_id_yes.clone(),
+        OrderSide::BuyNo | OrderSide::SellNo => book.token_id_no.clone(),
+    }
+}
+
+fn maker_price_for_side(book: &BookTop, side: &OrderSide) -> f64 {
+    match side {
+        OrderSide::BuyYes => book.bid_yes,
+        OrderSide::BuyNo => book.bid_no,
+        OrderSide::SellYes => book.ask_yes,
+        OrderSide::SellNo => book.ask_no,
+    }
+}
+
+fn side_probability_from_mid_yes(mid_yes: f64, side: &OrderSide) -> f64 {
+    match side {
+        OrderSide::BuyYes | OrderSide::SellNo => mid_yes,
+        OrderSide::BuyNo | OrderSide::SellYes => 1.0 - mid_yes,
+    }
+}
+
+fn aligned_velocity_for_position_side(raw_velocity_bps_per_sec: f64, side: &OrderSide) -> f64 {
+    match side {
+        OrderSide::BuyYes | OrderSide::SellNo => raw_velocity_bps_per_sec,
+        OrderSide::BuyNo | OrderSide::SellYes => -raw_velocity_bps_per_sec,
+    }
 }
 
 pub(crate) fn should_force_taker_fallback(
@@ -274,6 +322,383 @@ fn spawn_alpha_window_probe(
             }
             tokio::time::sleep(Duration::from_millis(poll_ms)).await;
         }
+    });
+}
+
+async fn place_roll_v1_order_and_track(
+    shared: &Arc<EngineShared>,
+    bus: &RingBus<EngineEvent>,
+    execution: &Arc<ClobExecution>,
+    shadow: &Arc<ShadowExecutor>,
+    market_id: &str,
+    symbol: &str,
+    side: OrderSide,
+    size: f64,
+    style: ExecutionStyle,
+    ttl_ms: u64,
+    max_slippage_bps: f64,
+    fee_rate_bps: f64,
+    expected_edge_net_bps: f64,
+    paper_action: PaperAction,
+    prob_fast: f64,
+    prob_settle: f64,
+    confidence: f64,
+) -> Option<(OrderAck, String)> {
+    let book = shared.latest_books.read().await.get(market_id).cloned()?;
+    let price = if style == ExecutionStyle::Maker {
+        maker_price_for_side(&book, &side)
+    } else {
+        aggressive_price_for_side(&book, &side)
+    };
+    if !price.is_finite() || price <= 0.0 {
+        return None;
+    }
+    let timeframe = shared
+        .market_to_timeframe
+        .read()
+        .await
+        .get(market_id)
+        .cloned()
+        .unwrap_or(TimeframeClass::Tf5m);
+    let timeframe_label = timeframe_tag(timeframe.clone()).to_string();
+    let quote_intent = QuoteIntent {
+        market_id: market_id.to_string(),
+        side: side.clone(),
+        price,
+        size: size.max(0.01),
+        ttl_ms,
+    };
+    publish_if_telemetry_subscribers(bus, EngineEvent::QuoteIntent(quote_intent.clone()));
+    let intent = OrderIntentV2 {
+        market_id: market_id.to_string(),
+        token_id: Some(token_id_for_side(&book, &side)),
+        side: side.clone(),
+        price,
+        size: size.max(0.01),
+        ttl_ms,
+        style: style.clone(),
+        tif: if style == ExecutionStyle::Maker {
+            OrderTimeInForce::PostOnly
+        } else {
+            OrderTimeInForce::Fak
+        },
+        max_slippage_bps: if style == ExecutionStyle::Maker {
+            0.0
+        } else {
+            max_slippage_bps.max(0.0)
+        },
+        fee_rate_bps,
+        expected_edge_net_bps,
+        client_order_id: Some(new_id()),
+        hold_to_resolution: false,
+        prebuilt_payload: None,
+        prebuilt_auth: None,
+    };
+    let ack_v2 = execution.place_order_v2(intent).await.ok()?;
+    if !ack_v2.accepted {
+        return None;
+    }
+    let ack = OrderAck {
+        order_id: ack_v2.order_id,
+        market_id: ack_v2.market_id,
+        accepted: true,
+        ts_ms: ack_v2.ts_ms,
+    };
+    publish_if_telemetry_subscribers(bus, EngineEvent::OrderAck(ack.clone()));
+    let effective_fee_bps = if style == ExecutionStyle::Maker {
+        -get_rebate_bps_cached(shared, market_id, fee_rate_bps)
+            .await
+            .max(0.0)
+    } else {
+        calculate_dynamic_taker_fee_bps(&side, price, fee_rate_bps).max(0.0)
+    };
+    shadow.register_order(
+        &ack,
+        quote_intent.clone(),
+        style.clone(),
+        mid_for_side(&book, &side).max(0.0),
+        effective_fee_bps,
+    );
+    if let Some(paper) = global_paper_runtime() {
+        paper
+            .register_order_intent(
+                &ack,
+                PaperIntentCtx {
+                    market_id: market_id.to_string(),
+                    symbol: symbol.to_string(),
+                    timeframe: timeframe_label,
+                    stage: Stage::Momentum,
+                    direction: side_to_direction(&side),
+                    velocity_bps_per_sec: 0.0,
+                    edge_bps: expected_edge_net_bps,
+                    prob_fast,
+                    prob_settle,
+                    confidence,
+                    action: paper_action,
+                    intent: style,
+                    requested_size_usdc: (price * quote_intent.size).max(0.0),
+                    requested_size_contracts: quote_intent.size,
+                    entry_price: price,
+                },
+            )
+            .await;
+    }
+    Some((ack, market_id.to_string()))
+}
+
+fn spawn_roll_v1_reverse_maker_fallback(
+    shared: Arc<EngineShared>,
+    bus: RingBus<EngineEvent>,
+    execution: Arc<ClobExecution>,
+    shadow: Arc<ShadowExecutor>,
+    market_id: String,
+    symbol: String,
+    maker_order_id: String,
+    reverse_side: OrderSide,
+    size: f64,
+    fee_rate_bps: f64,
+    ttl_ms: u64,
+    taker_max_slippage_bps: f64,
+) {
+    spawn_detached("roll_v1_reverse_maker_fallback", false, async move {
+        tokio::time::sleep(Duration::from_millis(ttl_ms.max(10))).await;
+        if !execution.has_open_order(&maker_order_id) {
+            return;
+        }
+        if execution.cancel_order(&maker_order_id, &market_id).await.is_err() {
+            return;
+        }
+        shadow.cancel(&maker_order_id);
+        let (prob_fast, prob_settle, confidence) = shared
+            .predator_latest_probability
+            .read()
+            .await
+            .get(&market_id)
+            .map(|p| (p.p_fast, p.p_settle, p.confidence))
+            .unwrap_or((0.5, 0.5, 0.0));
+        let _ = place_roll_v1_order_and_track(
+            &shared,
+            &bus,
+            &execution,
+            &shadow,
+            &market_id,
+            &symbol,
+            reverse_side,
+            size,
+            ExecutionStyle::Taker,
+            150,
+            taker_max_slippage_bps,
+            fee_rate_bps,
+            0.0,
+            PaperAction::Add,
+            prob_fast,
+            prob_settle,
+            confidence,
+        )
+        .await;
+    });
+}
+
+fn spawn_roll_v1_position_lifecycle(
+    shared: Arc<EngineShared>,
+    bus: RingBus<EngineEvent>,
+    execution: Arc<ClobExecution>,
+    shadow: Arc<ShadowExecutor>,
+    position_id: String,
+    market_id: String,
+    symbol: String,
+    timeframe: TimeframeClass,
+    entry_side: OrderSide,
+    entry_price: f64,
+    size: f64,
+    fee_rate_bps: f64,
+    tf_cfg: RollV1TimeframeConfig,
+    reverse_cfg: RollV1ReverseConfig,
+    taker_max_slippage_bps: f64,
+) {
+    spawn_detached("roll_v1_position_lifecycle", false, async move {
+        let mut reverse_start_ms: Option<i64> = None;
+        let mut peak_prob = side_probability_from_mid_yes(entry_price.clamp(0.0, 1.0), &entry_side);
+        let scan_ms = tf_cfg.scan_interval_ms.clamp(20, 250);
+        let tf_label = timeframe_tag(timeframe.clone()).to_string();
+        loop {
+            tokio::time::sleep(Duration::from_millis(scan_ms)).await;
+            let now_ms = Utc::now().timestamp_millis();
+            let remaining_ms = if let Some(total_ms) = timeframe_total_ms(timeframe.clone()) {
+                (total_ms - now_ms.rem_euclid(total_ms)).max(0)
+            } else {
+                i64::MAX
+            };
+            if remaining_ms <= tf_cfg.entry_end_remaining_ms {
+                break;
+            }
+            let book = match shared.latest_books.read().await.get(&market_id).cloned() {
+                Some(v) => v,
+                None => continue,
+            };
+            let mid_yes = ((book.bid_yes + book.ask_yes) * 0.5).clamp(0.0, 1.0);
+            let side_prob = side_probability_from_mid_yes(mid_yes, &entry_side).clamp(0.0, 1.0);
+            if side_prob.is_finite() {
+                peak_prob = peak_prob.max(side_prob);
+            }
+            let drop_pct = if peak_prob > 1e-6 {
+                ((peak_prob - side_prob).max(0.0) / peak_prob).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let direction = shared
+                .predator_latest_direction
+                .read()
+                .await
+                .get(symbol.as_str())
+                .cloned();
+            let aligned_velocity_bps = direction
+                .as_ref()
+                .map(|s| aligned_velocity_for_position_side(s.velocity_bps_per_sec, &entry_side))
+                .unwrap_or(0.0);
+            let reversal_condition = aligned_velocity_bps <= tf_cfg.reverse_velocity_bps_per_sec
+                && drop_pct >= tf_cfg.reverse_drop_pct;
+            if reversal_condition {
+                let started = reverse_start_ms.get_or_insert(now_ms);
+                if now_ms.saturating_sub(*started) < tf_cfg.reverse_persist_ms as i64 {
+                    continue;
+                }
+            } else {
+                reverse_start_ms = None;
+                continue;
+            }
+
+            let strong = aligned_velocity_bps <= reverse_cfg.strong_reversal_velocity_bps_per_sec;
+            let close_side = flatten_side_for_entry(&entry_side);
+            let reverse_side = opposite_buy_side_for_entry(&entry_side);
+            let (prob_fast, prob_settle, confidence) = shared
+                .predator_latest_probability
+                .read()
+                .await
+                .get(&market_id)
+                .map(|p| (p.p_fast, p.p_settle, p.confidence))
+                .unwrap_or((0.5, 0.5, 0.0));
+            let close_ack = place_roll_v1_order_and_track(
+                &shared,
+                &bus,
+                &execution,
+                &shadow,
+                &market_id,
+                &symbol,
+                close_side,
+                size,
+                ExecutionStyle::Taker,
+                150,
+                taker_max_slippage_bps,
+                fee_rate_bps,
+                0.0,
+                PaperAction::ReversalExit,
+                prob_fast,
+                prob_settle,
+                confidence,
+            )
+            .await;
+            if close_ack.is_none() {
+                shared
+                    .shadow_stats
+                    .mark_blocked_with_reason_ctx(
+                        "roll_v1_reverse_flatten_failed",
+                        Some(symbol.as_str()),
+                        Some(tf_label.as_str()),
+                    )
+                    .await;
+                break;
+            }
+
+            if strong {
+                let _ = place_roll_v1_order_and_track(
+                    &shared,
+                    &bus,
+                    &execution,
+                    &shadow,
+                    &market_id,
+                    &symbol,
+                    reverse_side,
+                    size,
+                    ExecutionStyle::Taker,
+                    150,
+                    taker_max_slippage_bps,
+                    fee_rate_bps,
+                    0.0,
+                    PaperAction::Add,
+                    prob_fast,
+                    prob_settle,
+                    confidence,
+                )
+                .await;
+                shared.shadow_stats.record_exit_reason("roll_v1_reverse_strong").await;
+            } else {
+                let maker = place_roll_v1_order_and_track(
+                    &shared,
+                    &bus,
+                    &execution,
+                    &shadow,
+                    &market_id,
+                    &symbol,
+                    reverse_side.clone(),
+                    size,
+                    ExecutionStyle::Maker,
+                    reverse_cfg.maker_first_ttl_ms,
+                    0.0,
+                    fee_rate_bps,
+                    0.0,
+                    PaperAction::Add,
+                    prob_fast,
+                    prob_settle,
+                    confidence,
+                )
+                .await;
+                if let Some((ack, _)) = maker {
+                    spawn_roll_v1_reverse_maker_fallback(
+                        shared.clone(),
+                        bus.clone(),
+                        execution.clone(),
+                        shadow.clone(),
+                        market_id.clone(),
+                        symbol.clone(),
+                        ack.order_id,
+                        reverse_side,
+                        size,
+                        fee_rate_bps,
+                        reverse_cfg.maker_first_ttl_ms,
+                        taker_max_slippage_bps,
+                    );
+                } else {
+                    let _ = place_roll_v1_order_and_track(
+                        &shared,
+                        &bus,
+                        &execution,
+                        &shadow,
+                        &market_id,
+                        &symbol,
+                        reverse_side,
+                        size,
+                        ExecutionStyle::Taker,
+                        150,
+                        taker_max_slippage_bps,
+                        fee_rate_bps,
+                        0.0,
+                        PaperAction::Add,
+                        prob_fast,
+                        prob_settle,
+                        confidence,
+                    )
+                    .await;
+                }
+                shared.shadow_stats.record_exit_reason("roll_v1_reverse_weak").await;
+            }
+            break;
+        }
+        let _ = shared
+            .predator_exit_manager
+            .write()
+            .await
+            .close(&position_id);
     });
 }
 
@@ -2268,31 +2693,56 @@ pub(super) async fn predator_execute_opportunity(
             out.executed = out.executed.saturating_add(1);
             let accepted_notional_usdc = (intent.price.max(0.0) * intent.size.max(0.0)).max(0.0);
             let entry_edge_usdc = (opp.edge_net_bps / 10_000.0) * accepted_notional_usdc;
-            {
-                let mut exit_mgr = shared.predator_exit_manager.write().await;
-                exit_mgr.register(PositionLifecycle {
-                    position_id: ack_v2.order_id.clone(),
-                    market_id: intent.market_id.clone(),
-                    symbol: opp.symbol.clone(),
-                    opened_at_ms: now_ms,
-                    entry_edge_usdc,
-                    entry_notional_usdc: accepted_notional_usdc,
-                });
+            if matches!(
+                predator_cfg.strategy_engine.engine_mode,
+                StrategyEngineMode::RollV1
+            ) {
+                let tf_cfg = roll_cfg_for_timeframe(predator_cfg, &opp.timeframe).clone();
+                let reverse_cfg = predator_cfg.roll_v1.reverse.clone();
+                spawn_roll_v1_position_lifecycle(
+                    shared.clone(),
+                    bus.clone(),
+                    execution.clone(),
+                    shadow.clone(),
+                    ack_v2.order_id.clone(),
+                    intent.market_id.clone(),
+                    opp.symbol.clone(),
+                    opp.timeframe.clone(),
+                    intent.side.clone(),
+                    intent.price,
+                    intent.size,
+                    opp.fee_bps,
+                    tf_cfg,
+                    reverse_cfg,
+                    maker_cfg.taker_max_slippage_bps,
+                );
+            } else {
+                {
+                    let mut exit_mgr = shared.predator_exit_manager.write().await;
+                    exit_mgr.register(PositionLifecycle {
+                        position_id: ack_v2.order_id.clone(),
+                        market_id: intent.market_id.clone(),
+                        symbol: opp.symbol.clone(),
+                        opened_at_ms: now_ms,
+                        entry_edge_usdc,
+                        entry_notional_usdc: accepted_notional_usdc,
+                    });
+                }
+                spawn_predator_exit_lifecycle(
+                    shared.clone(),
+                    bus.clone(),
+                    execution.clone(),
+                    shadow.clone(),
+                    ack_v2.order_id.clone(),
+                    intent.market_id.clone(),
+                    opp.symbol.clone(),
+                    intent.side.clone(),
+                    intent.price,
+                    intent.size,
+                    maker_cfg.ttl_ms,
+                    intent.price + opp.edge_gross_bps / 10_000.0,
+                );
             }
-            spawn_predator_exit_lifecycle(
-                shared.clone(),
-                bus.clone(),
-                execution.clone(),
-                shadow.clone(),
-                ack_v2.order_id.clone(),
-                intent.market_id.clone(),
-                opp.symbol.clone(),
-                intent.side.clone(),
-                intent.price,
-                intent.size,
-                maker_cfg.ttl_ms,
-                intent.price + opp.edge_gross_bps / 10_000.0,
-            );
 
             let ack_only_ms = if ack_v2.exchange_latency_ms > 0.0 {
                 ack_v2.exchange_latency_ms
