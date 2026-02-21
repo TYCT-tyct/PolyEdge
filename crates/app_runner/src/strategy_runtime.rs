@@ -954,12 +954,12 @@ pub(super) async fn evaluate_and_route_roll_v1(
         };
         sig
     };
-    if matches!(direction_signal.direction, Direction::Neutral) {
+    let neutral_fallback = matches!(direction_signal.direction, Direction::Neutral);
+    if neutral_fallback {
         shared
             .shadow_stats
-            .mark_blocked_with_reason_ctx("neutral_direction", Some(symbol), None)
+            .mark_blocked_with_reason_ctx("neutral_direction_fallback", Some(symbol), None)
             .await;
-        return PredatorExecResult::default();
     }
 
     shared
@@ -1156,7 +1156,7 @@ pub(super) async fn evaluate_and_route_roll_v1(
             map.insert(market_id.clone(), probability.clone());
         }
 
-        if direction_signal.confidence < tf_cfg.min_direction_confidence {
+        if !neutral_fallback && direction_signal.confidence < tf_cfg.min_direction_confidence {
             shared
                 .shadow_stats
                 .mark_blocked_with_reason_ctx("low_confidence", Some(symbol), Some(tf_label))
@@ -1181,24 +1181,51 @@ pub(super) async fn evaluate_and_route_roll_v1(
         let no_edge_net =
             no_edge_gross - no_fee_taker_bps + rebate_est_bps - edge_model_cfg.fail_cost_bps;
 
-        let (side, entry_price, edge_gross_bps, edge_net_bps, fee_applied) =
-            match direction_signal.direction {
-                Direction::Up => (
-                    OrderSide::BuyYes,
-                    yes_price,
-                    yes_edge_gross,
-                    yes_edge_net,
-                    yes_fee_taker_bps,
-                ),
-                Direction::Down => (
-                    OrderSide::BuyNo,
-                    no_price,
-                    no_edge_gross,
-                    no_edge_net,
-                    no_fee_taker_bps,
-                ),
-                Direction::Neutral => continue,
-            };
+        if neutral_fallback && probability.confidence < tf_cfg.min_direction_confidence {
+            shared
+                .shadow_stats
+                .mark_blocked_with_reason_ctx("low_confidence_prob", Some(symbol), Some(tf_label))
+                .await;
+            continue;
+        }
+
+        let (side, entry_price, edge_gross_bps, edge_net_bps, fee_applied) = match direction_signal
+            .direction
+        {
+            Direction::Up => (
+                OrderSide::BuyYes,
+                yes_price,
+                yes_edge_gross,
+                yes_edge_net,
+                yes_fee_taker_bps,
+            ),
+            Direction::Down => (
+                OrderSide::BuyNo,
+                no_price,
+                no_edge_gross,
+                no_edge_net,
+                no_fee_taker_bps,
+            ),
+            Direction::Neutral => {
+                if yes_edge_net >= no_edge_net {
+                    (
+                        OrderSide::BuyYes,
+                        yes_price,
+                        yes_edge_gross,
+                        yes_edge_net,
+                        yes_fee_taker_bps,
+                    )
+                } else {
+                    (
+                        OrderSide::BuyNo,
+                        no_price,
+                        no_edge_gross,
+                        no_edge_net,
+                        no_fee_taker_bps,
+                    )
+                }
+            }
+        };
         if edge_net_bps <= 0.0 {
             shared
                 .shadow_stats
