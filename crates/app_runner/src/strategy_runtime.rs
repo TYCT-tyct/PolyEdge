@@ -409,7 +409,7 @@ pub(super) async fn run_predator_c_for_symbol(
     {
         shared
             .shadow_stats
-            .mark_blocked_with_reason("compounder_required_when_live")
+            .mark_blocked_with_reason_ctx("compounder_required_when_live", Some(symbol), None)
             .await;
         return PredatorExecResult::default();
     }
@@ -602,7 +602,11 @@ pub(super) async fn run_predator_c_for_symbol(
         let Some(frame_total_ms) = timeframe_total_ms(timeframe.clone()) else {
             shared
                 .shadow_stats
-                .mark_blocked_with_reason("v52_blocked_timeframe")
+                .mark_blocked_with_reason_ctx(
+                    "v52_blocked_timeframe",
+                    Some(symbol),
+                    Some(timeframe_tag(timeframe.clone())),
+                )
                 .await;
             continue;
         };
@@ -615,7 +619,11 @@ pub(super) async fn run_predator_c_for_symbol(
         {
             shared
                 .shadow_stats
-                .mark_blocked_with_reason("v52_timeframe_not_allowed")
+                .mark_blocked_with_reason_ctx(
+                    "v52_timeframe_not_allowed",
+                    Some(symbol),
+                    Some(timeframe_tag(timeframe.clone())),
+                )
                 .await;
             continue;
         }
@@ -693,7 +701,11 @@ pub(super) async fn run_predator_c_for_symbol(
         if yes_edge_net > 0.0 && no_edge_net > 0.0 && !dual_arb_ok {
             shared
                 .shadow_stats
-                .mark_blocked_with_reason("dual_arb_gate_blocked")
+                .mark_blocked_with_reason_ctx(
+                    "dual_arb_gate_blocked",
+                    Some(symbol),
+                    Some(timeframe_tag(timeframe.clone())),
+                )
                 .await;
         }
         let tf_weight = tf_weights
@@ -1625,7 +1637,11 @@ pub(super) async fn predator_execute_opportunity(
     let Some(frame_total_ms) = timeframe_total_ms(opp.timeframe.clone()) else {
         shared
             .shadow_stats
-            .mark_blocked_with_reason("v52_blocked_timeframe")
+            .mark_blocked_with_reason_ctx(
+                "v52_blocked_timeframe",
+                Some(opp.symbol.as_str()),
+                Some(timeframe_tag(opp.timeframe.clone())),
+            )
             .await;
         return PredatorExecResult::default();
     };
@@ -1668,7 +1684,11 @@ pub(super) async fn predator_execute_opportunity(
     if open_orders_now >= risk_open_orders_soft_cap.max(1) {
         shared
             .shadow_stats
-            .mark_blocked_with_reason("open_orders_pressure_precheck")
+            .mark_blocked_with_reason_ctx(
+                "open_orders_pressure_precheck",
+                Some(opp.symbol.as_str()),
+                Some(timeframe_tag(opp.timeframe.clone())),
+            )
             .await;
         return PredatorExecResult::default();
     }
@@ -1703,16 +1723,25 @@ pub(super) async fn predator_execute_opportunity(
     };
     let decision = shared.risk_manager.evaluate(&ctx);
     if !decision.allow {
+        let reason = format!("risk:{}", decision.reason);
         shared
             .shadow_stats
-            .mark_blocked_with_reason(&format!("risk:{}", decision.reason))
+            .mark_blocked_with_reason_ctx(
+                reason.as_str(),
+                Some(opp.symbol.as_str()),
+                Some(timeframe_tag(opp.timeframe.clone())),
+            )
             .await;
         return PredatorExecResult::default();
     }
     if decision.capped_size <= 0.0 {
         shared
             .shadow_stats
-            .mark_blocked_with_reason("risk_capped_zero")
+            .mark_blocked_with_reason_ctx(
+                "risk_capped_zero",
+                Some(opp.symbol.as_str()),
+                Some(timeframe_tag(opp.timeframe.clone())),
+            )
             .await;
         return PredatorExecResult::default();
     }
@@ -1722,7 +1751,11 @@ pub(super) async fn predator_execute_opportunity(
     if intended_notional_usdc < maker_cfg.min_eval_notional_usdc {
         shared
             .shadow_stats
-            .mark_blocked_with_reason("tiny_notional")
+            .mark_blocked_with_reason_ctx(
+                "tiny_notional",
+                Some(opp.symbol.as_str()),
+                Some(timeframe_tag(opp.timeframe.clone())),
+            )
             .await;
         return PredatorExecResult::default();
     }
@@ -1739,14 +1772,22 @@ pub(super) async fn predator_execute_opportunity(
     if opp.edge_net_bps < maker_cfg.min_edge_bps + dynamic_gate_bps {
         shared
             .shadow_stats
-            .mark_blocked_with_reason("edge_below_dynamic_gate")
+            .mark_blocked_with_reason_ctx(
+                "edge_below_dynamic_gate",
+                Some(opp.symbol.as_str()),
+                Some(timeframe_tag(opp.timeframe.clone())),
+            )
             .await;
         return PredatorExecResult::default();
     }
     if edge_net_usdc < maker_cfg.min_expected_edge_usdc {
         shared
             .shadow_stats
-            .mark_blocked_with_reason("edge_notional_too_small")
+            .mark_blocked_with_reason_ctx(
+                "edge_notional_too_small",
+                Some(opp.symbol.as_str()),
+                Some(timeframe_tag(opp.timeframe.clone())),
+            )
             .await;
         return PredatorExecResult::default();
     }
@@ -1758,14 +1799,22 @@ pub(super) async fn predator_execute_opportunity(
     if !global_rate_budget.try_take(1.0) {
         shared
             .shadow_stats
-            .mark_blocked_with_reason("rate_budget_global")
+            .mark_blocked_with_reason_ctx(
+                "rate_budget_global",
+                Some(opp.symbol.as_str()),
+                Some(timeframe_tag(opp.timeframe.clone())),
+            )
             .await;
         return PredatorExecResult::default();
     }
     if !market_bucket.try_take(1.0) {
         shared
             .shadow_stats
-            .mark_blocked_with_reason("rate_budget_market")
+            .mark_blocked_with_reason_ctx(
+                "rate_budget_market",
+                Some(opp.symbol.as_str()),
+                Some(timeframe_tag(opp.timeframe.clone())),
+            )
             .await;
         return PredatorExecResult::default();
     }
@@ -1857,7 +1906,11 @@ pub(super) async fn predator_execute_opportunity(
             if accepted_size <= 0.0 {
                 shared
                     .shadow_stats
-                    .mark_blocked_with_reason("exchange_reject_zero_size")
+                    .mark_blocked_with_reason_ctx(
+                        "exchange_reject_zero_size",
+                        Some(opp.symbol.as_str()),
+                        Some(timeframe_tag(opp.timeframe.clone())),
+                    )
                     .await;
                 return out;
             }
@@ -2046,16 +2099,28 @@ pub(super) async fn predator_execute_opportunity(
                 .as_deref()
                 .map(normalize_reject_code)
                 .unwrap_or_else(|| "unknown".to_string());
+            let reason = format!("exchange_reject_{reject_code}");
             shared
                 .shadow_stats
-                .mark_blocked_with_reason(&format!("exchange_reject_{reject_code}"))
+                .mark_blocked_with_reason_ctx(
+                    reason.as_str(),
+                    Some(opp.symbol.as_str()),
+                    Some(timeframe_tag(opp.timeframe.clone())),
+                )
                 .await;
             metrics::counter!("execution.place_rejected").increment(1);
             out.stop_firing = true;
         }
         Err(err) => {
             let reason = classify_execution_error_reason(&err);
-            shared.shadow_stats.mark_blocked_with_reason(reason).await;
+            shared
+                .shadow_stats
+                .mark_blocked_with_reason_ctx(
+                    reason,
+                    Some(opp.symbol.as_str()),
+                    Some(timeframe_tag(opp.timeframe.clone())),
+                )
+                .await;
             tracing::warn!(?err, "predator place_order failed");
             metrics::counter!("execution.place_error").increment(1);
         }

@@ -156,6 +156,10 @@ mod tests {
             ask_yes: ask,
             bid_no: 1.0 - ask,
             ask_no: 1.0 - bid,
+            bid_size_yes: 0.0,
+            ask_size_yes: 0.0,
+            bid_size_no: 0.0,
+            ask_size_no: 0.0,
             ts_ms: 1,
             recv_ts_local_ns: 1_000_000,
         }

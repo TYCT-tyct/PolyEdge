@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -23,10 +24,34 @@ pub struct DiscoveryConfig {
     pub market_types: Vec<String>,
     pub timeframes: Vec<String>,
     pub endpoint: String,
+    pub near_expiry_only: bool,
+    pub max_future_ms_5m: i64,
+    pub max_future_ms_15m: i64,
+    pub max_future_ms_1h: i64,
+    pub max_future_ms_1d: i64,
+    pub max_past_ms: i64,
 }
 
 impl Default for DiscoveryConfig {
     fn default() -> Self {
+        fn env_bool(key: &str, default: bool) -> bool {
+            std::env::var(key)
+                .ok()
+                .map(|v| {
+                    !matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "0" | "false" | "off" | "no"
+                    )
+                })
+                .unwrap_or(default)
+        }
+        fn env_i64_ms(key: &str, default: i64, min: i64, max: i64) -> i64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .unwrap_or(default)
+                .clamp(min, max)
+        }
         Self {
             symbols: vec![
                 "BTCUSDT".to_string(),
@@ -57,6 +82,39 @@ impl Default for DiscoveryConfig {
                 "1d".to_string(),
             ],
             endpoint: "https://gamma-api.polymarket.com/markets".to_string(),
+            // Keep discovery focused on currently tradable windows instead of scanning far-future
+            // active listings. This reduces stale/untracked churn in strategy loop.
+            near_expiry_only: env_bool("POLYEDGE_DISCOVERY_NEAR_EXPIRY_ONLY", true),
+            max_future_ms_5m: env_i64_ms(
+                "POLYEDGE_DISCOVERY_MAX_FUTURE_MS_5M",
+                25 * 60 * 1_000,
+                30_000,
+                24 * 60 * 60 * 1_000,
+            ),
+            max_future_ms_15m: env_i64_ms(
+                "POLYEDGE_DISCOVERY_MAX_FUTURE_MS_15M",
+                70 * 60 * 1_000,
+                30_000,
+                24 * 60 * 60 * 1_000,
+            ),
+            max_future_ms_1h: env_i64_ms(
+                "POLYEDGE_DISCOVERY_MAX_FUTURE_MS_1H",
+                4 * 60 * 60 * 1_000,
+                60_000,
+                48 * 60 * 60 * 1_000,
+            ),
+            max_future_ms_1d: env_i64_ms(
+                "POLYEDGE_DISCOVERY_MAX_FUTURE_MS_1D",
+                36 * 60 * 60 * 1_000,
+                60_000,
+                14 * 24 * 60 * 60 * 1_000,
+            ),
+            max_past_ms: env_i64_ms(
+                "POLYEDGE_DISCOVERY_MAX_PAST_MS",
+                2 * 60 * 1_000,
+                0,
+                30 * 60 * 1_000,
+            ),
         }
     }
 }
@@ -85,6 +143,7 @@ impl MarketDiscovery {
     pub async fn discover(&self) -> Result<Vec<MarketDescriptor>> {
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::<String>::new();
+        let now_ms = Utc::now().timestamp_millis();
 
         // Prefer time-window ordering first to avoid missing low-volume but currently tradable
         // crypto windows (e.g. SOL 15m), then do a volume sweep as fallback enrichment.
@@ -191,6 +250,16 @@ impl MarketDiscovery {
                             continue;
                         }
                     }
+                    if self.cfg.near_expiry_only
+                        && !is_within_discovery_window(
+                            market.end_date.as_deref(),
+                            timeframe,
+                            now_ms,
+                            &self.cfg,
+                        )
+                    {
+                        continue;
+                    }
                     let Some(symbol) = detect_symbol(&text, &self.cfg.symbols) else {
                         continue;
                     };
@@ -256,6 +325,39 @@ fn detect_symbol(text: &str, allowed_symbols: &[String]) -> Option<String> {
         }
     }
     None
+}
+
+fn parse_end_date_ms(raw: Option<&str>) -> Option<i64> {
+    let value = raw?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
+fn is_within_discovery_window(
+    end_date: Option<&str>,
+    timeframe: Option<&str>,
+    now_ms: i64,
+    cfg: &DiscoveryConfig,
+) -> bool {
+    let Some(end_ms) = parse_end_date_ms(end_date) else {
+        return false;
+    };
+    let delta_ms = end_ms.saturating_sub(now_ms);
+    if delta_ms < -cfg.max_past_ms {
+        return false;
+    }
+    let max_future_ms = match timeframe {
+        Some("5m") => cfg.max_future_ms_5m,
+        Some("15m") => cfg.max_future_ms_15m,
+        Some("1h") => cfg.max_future_ms_1h,
+        Some("1d") => cfg.max_future_ms_1d,
+        _ => cfg.max_future_ms_15m.max(cfg.max_future_ms_5m),
+    };
+    delta_ms <= max_future_ms
 }
 
 fn classify_market_type(text: &str) -> &'static str {
@@ -324,6 +426,7 @@ fn parse_token_pair(input: Option<&str>) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn default_symbols_include_all() {
@@ -371,5 +474,34 @@ mod tests {
         );
         assert_eq!(classify_timeframe("SOLANA UP OR DOWN - 1 HOUR"), Some("1h"));
         assert_eq!(classify_timeframe("XRP UP OR DOWN - 1 DAY"), Some("1d"));
+    }
+
+    #[test]
+    fn discovery_window_filters_far_future_markets() {
+        let cfg = DiscoveryConfig::default();
+        let now_ms = Utc::now().timestamp_millis();
+        let near_end = Utc
+            .timestamp_millis_opt(now_ms + 10 * 60 * 1_000)
+            .single()
+            .expect("valid ts")
+            .to_rfc3339();
+        let far_end = Utc
+            .timestamp_millis_opt(now_ms + 3 * 60 * 60 * 1_000)
+            .single()
+            .expect("valid ts")
+            .to_rfc3339();
+
+        assert!(is_within_discovery_window(
+            Some(near_end.as_str()),
+            Some("5m"),
+            now_ms,
+            &cfg
+        ));
+        assert!(!is_within_discovery_window(
+            Some(far_end.as_str()),
+            Some("5m"),
+            now_ms,
+            &cfg
+        ));
     }
 }

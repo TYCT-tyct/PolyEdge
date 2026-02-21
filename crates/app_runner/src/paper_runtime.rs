@@ -17,6 +17,8 @@ use crate::seat_types::SeatDecisionRecord;
 use crate::stats_utils::percentile;
 
 const HISTORY_CAP: usize = 20_000;
+const DEFAULT_BINARY_SETTLE_HIGH: f64 = 0.995;
+const DEFAULT_BINARY_SETTLE_LOW: f64 = 0.005;
 
 static GLOBAL_PAPER_RUNTIME: OnceLock<Arc<PaperRuntimeHandle>> = OnceLock::new();
 
@@ -111,7 +113,8 @@ impl PaperRuntimeHandle {
         sqlite_enabled: bool,
         seat: Arc<SeatRuntimeHandle>,
     ) -> Arc<Self> {
-        let sqlite_name = std::env::var("POLYEDGE_PAPER_SQLITE").unwrap_or_else(|_| "paper_summary.sqlite".to_string());
+        let sqlite_name = std::env::var("POLYEDGE_PAPER_SQLITE")
+            .unwrap_or_else(|_| "paper_summary.sqlite".to_string());
         let sqlite_path = dataset_path("reports", &sqlite_name);
         let sqlite = PaperSqliteWriter::spawn(sqlite_path, sqlite_enabled && enabled);
         let mut state = PaperRuntimeState::default();
@@ -474,10 +477,16 @@ impl PaperRuntimeHandle {
         mid_yes: f64,
         mid_no: f64,
     ) {
+        let binary_outcome = infer_binary_outcome(mid_yes, mid_no);
         let mut keys = Vec::new();
         keys.push(lot_key(market_id, &OrderSide::BuyYes));
         keys.push(lot_key(market_id, &OrderSide::BuyNo));
         for key in keys {
+            let Some(outcome) = binary_outcome else {
+                // Do not settle against PM midpoint while unresolved. Keep lots open until
+                // market converges to a binary outcome-like state (near 0/1).
+                continue;
+            };
             let Some(lots) = s.open_lots.get_mut(&key) else {
                 continue;
             };
@@ -495,9 +504,11 @@ impl PaperRuntimeHandle {
                 lots.pop_front();
             }
             for lot in settled {
-                let close_price = match lot.side {
-                    OrderSide::BuyYes | OrderSide::SellYes => mid_yes.max(0.0),
-                    OrderSide::BuyNo | OrderSide::SellNo => mid_no.max(0.0),
+                let close_price = match (outcome, &lot.side) {
+                    (BinaryOutcome::Yes, OrderSide::BuyYes | OrderSide::SellYes) => 1.0,
+                    (BinaryOutcome::Yes, OrderSide::BuyNo | OrderSide::SellNo) => 0.0,
+                    (BinaryOutcome::No, OrderSide::BuyYes | OrderSide::SellYes) => 0.0,
+                    (BinaryOutcome::No, OrderSide::BuyNo | OrderSide::SellNo) => 1.0,
                 };
                 let entry_fee = lot.entry_fee_per_contract * lot.remaining_size;
                 let pnl = (close_price - lot.entry_price) * lot.remaining_size - entry_fee;
@@ -541,7 +552,7 @@ impl PaperRuntimeHandle {
                     bankroll_after: s.bankroll,
                     settlement_price: close_price,
                     chainlink_settlement_price,
-                    settlement_source: "pm_mid".to_string(),
+                    settlement_source: binary_settlement_source(outcome).to_string(),
                     forced_settlement: true,
                     trade_duration_ms: now_ms.saturating_sub(lot.opened_ts_ms),
                     seat_layer: lot.seat_layer.clone(),
@@ -986,6 +997,46 @@ fn frame_ms(timeframe: &str) -> i64 {
         "1h" => 60 * 60 * 1_000,
         "1d" => 24 * 60 * 60 * 1_000,
         _ => i64::MAX,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BinaryOutcome {
+    Yes,
+    No,
+}
+
+fn binary_settlement_thresholds() -> (f64, f64) {
+    let high = std::env::var("POLYEDGE_PAPER_BINARY_SETTLE_HIGH")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(DEFAULT_BINARY_SETTLE_HIGH)
+        .clamp(0.50, 0.9999);
+    let low = std::env::var("POLYEDGE_PAPER_BINARY_SETTLE_LOW")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(DEFAULT_BINARY_SETTLE_LOW)
+        .clamp(0.0001, 0.50);
+    (high.max(low), low.min(high))
+}
+
+fn infer_binary_outcome(mid_yes: f64, mid_no: f64) -> Option<BinaryOutcome> {
+    let yes = mid_yes.clamp(0.0, 1.0);
+    let no = mid_no.clamp(0.0, 1.0);
+    let (high, low) = binary_settlement_thresholds();
+    if yes >= high || no <= low {
+        Some(BinaryOutcome::Yes)
+    } else if yes <= low || no >= high {
+        Some(BinaryOutcome::No)
+    } else {
+        None
+    }
+}
+
+fn binary_settlement_source(outcome: BinaryOutcome) -> &'static str {
+    match outcome {
+        BinaryOutcome::Yes => "binary_book_yes",
+        BinaryOutcome::No => "binary_book_no",
     }
 }
 

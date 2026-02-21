@@ -1179,6 +1179,7 @@ pub(crate) struct ShadowLiveReport {
     pub(crate) survival_10ms_by_symbol: HashMap<String, f64>,
     pub(crate) survival_probe_10ms_by_symbol: HashMap<String, f64>,
     pub(crate) blocked_reason_counts: HashMap<String, u64>,
+    pub(crate) blocked_reason_by_symbol_timeframe: HashMap<String, u64>,
     pub(crate) policy_block_reason_distribution: HashMap<String, u64>,
     pub(crate) gate_block_reason_distribution: HashMap<String, u64>,
     pub(crate) source_mix_ratio: HashMap<String, f64>,
@@ -1309,6 +1310,7 @@ pub(crate) struct ShadowStats {
     pub(crate) executed_count: AtomicU64,
     pub(crate) filled_count: AtomicU64,
     pub(crate) blocked_reasons: RwLock<HashMap<String, u64>>,
+    pub(crate) blocked_reasons_by_symbol_timeframe: RwLock<HashMap<String, u64>>,
     pub(crate) exit_reasons: RwLock<HashMap<String, u64>>,
     pub(crate) ref_ticks_total: AtomicU64,
     pub(crate) book_ticks_total: AtomicU64,
@@ -1408,6 +1410,7 @@ impl ShadowStats {
             executed_count: AtomicU64::new(0),
             filled_count: AtomicU64::new(0),
             blocked_reasons: RwLock::new(HashMap::new()),
+            blocked_reasons_by_symbol_timeframe: RwLock::new(HashMap::new()),
             exit_reasons: RwLock::new(HashMap::new()),
             ref_ticks_total: AtomicU64::new(0),
             book_ticks_total: AtomicU64::new(0),
@@ -1486,6 +1489,10 @@ impl ShadowStats {
         self.last_ref_tick_ms.store(0, Ordering::Relaxed);
         self.last_book_tick_ms.store(0, Ordering::Relaxed);
         self.blocked_reasons.write().await.clear();
+        self.blocked_reasons_by_symbol_timeframe
+            .write()
+            .await
+            .clear();
         self.exit_reasons.write().await.clear();
         self.ref_source_counts.clear();
         self.fallback_trigger_reasons.write().await.clear();
@@ -1766,7 +1773,12 @@ impl ShadowStats {
         self.policy_blocked.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) async fn mark_blocked_with_reason(&self, reason: &str) {
+    pub(crate) async fn mark_blocked_with_reason_ctx(
+        &self,
+        reason: &str,
+        symbol: Option<&str>,
+        timeframe: Option<&str>,
+    ) {
         if is_quote_reject_reason(reason) {
             self.mark_blocked();
         }
@@ -1775,6 +1787,23 @@ impl ShadowStats {
         }
         let mut reasons = self.blocked_reasons.write().await;
         *reasons.entry(reason.to_string()).or_insert(0) += 1;
+        drop(reasons);
+
+        let Some(sym) = symbol.map(|v| v.trim()).filter(|v| !v.is_empty()) else {
+            return;
+        };
+        let tf = timeframe
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .unwrap_or("unknown");
+        let key = format!(
+            "{}|{}|{}",
+            sym.to_ascii_uppercase(),
+            tf.to_ascii_lowercase(),
+            reason
+        );
+        let mut by_ctx = self.blocked_reasons_by_symbol_timeframe.write().await;
+        *by_ctx.entry(key).or_insert(0) += 1;
     }
 
     pub(crate) async fn record_issue(&self, reason: &str) {
@@ -1989,6 +2018,11 @@ impl ShadowStats {
         } = self.samples.read().await.clone();
         let book_top_lag_by_symbol_ms = self.book_top_lag_by_symbol_ms.read().await.clone();
         let mut blocked_reason_counts = self.blocked_reasons.read().await.clone();
+        let blocked_reason_by_symbol_timeframe = self
+            .blocked_reasons_by_symbol_timeframe
+            .read()
+            .await
+            .clone();
         let source_counts = self
             .ref_source_counts
             .iter()
@@ -2428,6 +2462,7 @@ impl ShadowStats {
             survival_10ms_by_symbol,
             survival_probe_10ms_by_symbol,
             blocked_reason_counts,
+            blocked_reason_by_symbol_timeframe,
             policy_block_reason_distribution,
             gate_block_reason_distribution,
             source_mix_ratio,

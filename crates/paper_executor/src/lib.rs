@@ -168,6 +168,10 @@ mod tests {
             ask_yes: 0.54,
             bid_no: 0.46,
             ask_no: 0.5,
+            bid_size_yes: 0.0,
+            ask_size_yes: 0.0,
+            bid_size_no: 0.0,
+            ask_size_no: 0.0,
             ts_ms: 2,
             recv_ts_local_ns: 2_000_000,
         });
@@ -186,6 +190,10 @@ mod tests {
             ask_yes: 0.50,
             bid_no: 0.49,
             ask_no: 0.51,
+            bid_size_yes: 0.0,
+            ask_size_yes: 0.0,
+            bid_size_no: 0.0,
+            ask_size_no: 0.0,
             ts_ms: 2,
             recv_ts_local_ns: 2_000_000,
         };
@@ -238,6 +246,10 @@ mod tests {
             ask_yes: 0.52,
             bid_no: 0.47,
             ask_no: 0.53,
+            bid_size_yes: 0.0,
+            ask_size_yes: 0.0,
+            bid_size_no: 0.0,
+            ask_size_no: 0.0,
             ts_ms: 2,
             recv_ts_local_ns: 2_000_000,
         };

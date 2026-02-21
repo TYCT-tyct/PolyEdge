@@ -113,6 +113,7 @@ impl PolymarketFeed {
             market_types: self.market_types.clone(),
             timeframes: self.timeframes.clone(),
             endpoint: self.endpoints.gamma_markets.clone(),
+            ..DiscoveryConfig::default()
         });
         let markets = discovery.discover().await?;
 
@@ -669,11 +670,13 @@ fn parse_asset_updates(payload: &WsEvent) -> Vec<AssetUpdate> {
 fn parse_single_asset_update(payload: &WsEvent) -> Option<AssetUpdate> {
     let asset_id = payload.asset_id.clone()?;
 
-    let (bid_top_price, bid_top_size) = top_level_price_and_size(payload.bids.as_ref().or(payload.buys.as_ref()));
+    let (bid_top_price, bid_top_size) =
+        top_level_price_and_size(payload.bids.as_ref().or(payload.buys.as_ref()));
     let best_bid = payload.best_bid.or(bid_top_price);
     let best_bid_size = bid_top_size;
 
-    let (ask_top_price, ask_top_size) = top_level_price_and_size(payload.asks.as_ref().or(payload.sells.as_ref()));
+    let (ask_top_price, ask_top_size) =
+        top_level_price_and_size(payload.asks.as_ref().or(payload.sells.as_ref()));
     let best_ask = payload.best_ask.or(ask_top_price);
     let best_ask_size = ask_top_size;
 

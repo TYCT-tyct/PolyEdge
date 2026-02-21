@@ -618,7 +618,9 @@ pub(crate) fn spawn_strategy_engine(
                         let now_ms = Utc::now().timestamp_millis();
                         let should_emit = last_price_tape_ms
                             .get(&book.market_id)
-                            .map(|last_ms| now_ms.saturating_sub(*last_ms) >= price_tape_interval_ms)
+                            .map(|last_ms| {
+                                now_ms.saturating_sub(*last_ms) >= price_tape_interval_ms
+                            })
                             .unwrap_or(true);
                         if should_emit {
                             let market_type = shared
@@ -793,10 +795,13 @@ pub(crate) fn spawn_strategy_engine(
                         continue;
                     }
                     if latency_sample.local_backlog_ms > strategy_max_decision_backlog_ms {
-                        shared
-                            .shadow_stats
-                            .mark_blocked_with_reason("decision_backlog_guard")
-                            .await;
+                        mark_blocked_for_market(
+                            &shared,
+                            &book.market_id,
+                            &symbol,
+                            "decision_backlog_guard",
+                        )
+                        .await;
                         metrics::counter!("strategy.decision_backlog_guard").increment(1);
                         continue;
                     }
@@ -1023,10 +1028,13 @@ pub(crate) fn spawn_strategy_engine(
                         spread_yes,
                         book_top_lag_ms,
                     ) {
-                        shared
-                            .shadow_stats
-                            .mark_blocked_with_reason("symbol_quality_guard")
-                            .await;
+                        mark_blocked_for_market(
+                            &shared,
+                            &book.market_id,
+                            &symbol,
+                            "symbol_quality_guard",
+                        )
+                        .await;
                         continue;
                     }
                     let queue_fill_proxy =
@@ -1040,7 +1048,16 @@ pub(crate) fn spawn_strategy_engine(
                         }
                         shared
                             .shadow_stats
-                            .mark_blocked_with_reason("no_quote_spread")
+                            .mark_blocked_with_reason_ctx(
+                                "no_quote_spread",
+                                Some(symbol.as_str()),
+                                shared
+                                    .market_to_timeframe
+                                    .read()
+                                    .await
+                                    .get(&book.market_id)
+                                    .map(timeframe_class_label),
+                            )
                             .await;
                         continue;
                     }
@@ -1052,7 +1069,16 @@ pub(crate) fn spawn_strategy_engine(
                         }
                         shared
                             .shadow_stats
-                            .mark_blocked_with_reason("no_quote_confidence")
+                            .mark_blocked_with_reason_ctx(
+                                "no_quote_confidence",
+                                Some(symbol.as_str()),
+                                shared
+                                    .market_to_timeframe
+                                    .read()
+                                    .await
+                                    .get(&book.market_id)
+                                    .map(timeframe_class_label),
+                            )
                             .await;
                         continue;
                     }
@@ -1106,27 +1132,36 @@ pub(crate) fn spawn_strategy_engine(
                     );
 
                     if market_score < tox_cfg.min_market_score {
-                        shared
-                            .shadow_stats
-                            .mark_blocked_with_reason("market_score_low")
-                            .await;
+                        mark_blocked_for_market(
+                            &shared,
+                            &book.market_id,
+                            &symbol,
+                            "market_score_low",
+                        )
+                        .await;
                         continue;
                     }
                     if !active_by_rank {
-                        shared
-                            .shadow_stats
-                            .mark_blocked_with_reason("market_rank_blocked")
-                            .await;
+                        mark_blocked_for_market(
+                            &shared,
+                            &book.market_id,
+                            &symbol,
+                            "market_rank_blocked",
+                        )
+                        .await;
                         continue;
                     }
 
                     let predator_cfg = shared.predator_cfg.read().await.clone();
                     if predator_cfg.enabled {
                         if *shared.draining.read().await {
-                            shared
-                                .shadow_stats
-                                .mark_blocked_with_reason("operation_silence_draining")
-                                .await;
+                            mark_blocked_for_market(
+                                &shared,
+                                &book.market_id,
+                                &symbol,
+                                "operation_silence_draining",
+                            )
+                            .await;
                             continue; // Operation Silence: Reject all new entries, let exits drain.
                         }
 
@@ -1157,7 +1192,16 @@ pub(crate) fn spawn_strategy_engine(
                     );
                     shared
                         .shadow_stats
-                        .mark_blocked_with_reason("predator_c_disabled")
+                        .mark_blocked_with_reason_ctx(
+                            "predator_c_disabled",
+                            Some(symbol.as_str()),
+                            shared
+                                .market_to_timeframe
+                                .read()
+                                .await
+                                .get(&book.market_id)
+                                .map(timeframe_class_label),
+                        )
                         .await;
                     continue;
                 }
@@ -1421,10 +1465,13 @@ pub(crate) fn spawn_predator_exit_lifecycle(
                         .await
                         .map(|(order, book)| (order, book, market_id.clone()));
                         if selected.is_none() {
-                            shared
-                                .shadow_stats
-                                .mark_blocked_with_reason("reversal_rebuild_same_market_no_edge")
-                                .await;
+                            mark_blocked_for_market(
+                                &shared,
+                                &market_id,
+                                symbol.as_str(),
+                                "reversal_rebuild_same_market_no_edge",
+                            )
+                            .await;
                         }
                     }
 
@@ -1473,10 +1520,13 @@ pub(crate) fn spawn_predator_exit_lifecycle(
                             }
                         }
                         if selected.is_none() {
-                            shared
-                                .shadow_stats
-                                .mark_blocked_with_reason("reversal_rebuild_cross_market_no_edge")
-                                .await;
+                            mark_blocked_for_market(
+                                &shared,
+                                &market_id,
+                                symbol.as_str(),
+                                "reversal_rebuild_cross_market_no_edge",
+                            )
+                            .await;
                         }
                     }
 
@@ -1984,6 +2034,24 @@ async fn refresh_market_symbol_map(shared: &EngineShared) {
             tracing::warn!(?err, "market discovery refresh failed");
         }
     }
+}
+
+async fn mark_blocked_for_market(
+    shared: &EngineShared,
+    market_id: &str,
+    symbol: &str,
+    reason: &str,
+) {
+    let timeframe = shared
+        .market_to_timeframe
+        .read()
+        .await
+        .get(market_id)
+        .map(timeframe_class_label);
+    shared
+        .shadow_stats
+        .mark_blocked_with_reason_ctx(reason, Some(symbol), timeframe)
+        .await;
 }
 
 fn timeframe_class_label(tf: &TimeframeClass) -> &'static str {

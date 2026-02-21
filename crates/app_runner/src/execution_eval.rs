@@ -1,3 +1,4 @@
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use core_types::{BookTop, EdgeAttribution, OrderIntentV2, OrderSide, QuoteIntent, ShadowShot};
@@ -8,6 +9,51 @@ use crate::spawn_detached;
 use crate::state::{EngineShared, FeeRateEntry};
 use crate::stats_utils::value_to_f64;
 use crate::strategy_policy::estimate_queue_fill_prob;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DynamicFeeModel {
+    LegacyLinear,
+    OfficialPolyFormula,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DynamicFeeConfig {
+    model: DynamicFeeModel,
+    exponent: f64,
+    rate_override: Option<f64>,
+}
+
+static DYNAMIC_FEE_CONFIG: OnceLock<DynamicFeeConfig> = OnceLock::new();
+
+fn dynamic_fee_config() -> DynamicFeeConfig {
+    *DYNAMIC_FEE_CONFIG.get_or_init(|| {
+        let model = std::env::var("POLYEDGE_FEE_MODEL")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .map(|v| match v.as_str() {
+                "official" | "official_poly_formula" | "official_poly_5m15m" => {
+                    DynamicFeeModel::OfficialPolyFormula
+                }
+                _ => DynamicFeeModel::LegacyLinear,
+            })
+            .unwrap_or(DynamicFeeModel::LegacyLinear);
+        let exponent = std::env::var("POLYEDGE_FEE_EXPONENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(2.0)
+            .clamp(0.5, 6.0);
+        let rate_override = std::env::var("POLYEDGE_FEE_RATE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|v| v.clamp(0.000001, 1.0));
+        DynamicFeeConfig {
+            model,
+            exponent,
+            rate_override,
+        }
+    })
+}
 
 pub(super) async fn get_fee_rate_bps_cached(shared: &EngineShared, market_id: &str) -> f64 {
     // Conservative fallback for max taker fee-rate when remote fee endpoint is unavailable.
@@ -40,11 +86,46 @@ pub(super) fn calculate_dynamic_taker_fee_bps(
     price: f64,
     max_taker_fee_bps: f64,
 ) -> f64 {
-    let max_fee_bps = max_taker_fee_bps.clamp(0.0, 1_000.0);
-    let p = price.clamp(0.0, 1.0);
-    match side {
-        OrderSide::BuyYes | OrderSide::SellNo => p * max_fee_bps,
-        OrderSide::SellYes | OrderSide::BuyNo => (1.0 - p) * max_fee_bps,
+    calculate_dynamic_taker_fee_bps_with_config(
+        side,
+        price,
+        max_taker_fee_bps,
+        dynamic_fee_config(),
+    )
+}
+
+fn calculate_dynamic_taker_fee_bps_with_config(
+    side: &OrderSide,
+    price: f64,
+    max_taker_fee_bps: f64,
+    cfg: DynamicFeeConfig,
+) -> f64 {
+    match cfg.model {
+        DynamicFeeModel::LegacyLinear => {
+            let max_fee_bps = max_taker_fee_bps.clamp(0.0, 1_000.0);
+            let p = price.clamp(0.0, 1.0);
+            match side {
+                OrderSide::BuyYes | OrderSide::SellNo => p * max_fee_bps,
+                OrderSide::SellYes | OrderSide::BuyNo => (1.0 - p) * max_fee_bps,
+            }
+        }
+        DynamicFeeModel::OfficialPolyFormula => {
+            // Official-style configurable formula:
+            // fee_rate_effective = fee_rate * (p * (1 - p))^exponent
+            // fee_bps = fee_rate_effective * 10_000
+            //
+            // - fee_rate: from API cache (`max_taker_fee_bps / 10_000`) or POLYEDGE_FEE_RATE override
+            // - exponent: POLYEDGE_FEE_EXPONENT (default 2.0)
+            let p = price.clamp(0.0001, 0.9999);
+            let fee_rate = cfg
+                .rate_override
+                .unwrap_or_else(|| (max_taker_fee_bps / 10_000.0).clamp(0.0, 1.0));
+            if fee_rate <= 0.0 {
+                return 0.0;
+            }
+            let scaled = (p * (1.0 - p)).powf(cfg.exponent.clamp(0.5, 6.0));
+            (fee_rate * scaled * 10_000.0).clamp(0.0, 1_000.0)
+        }
     }
 }
 
@@ -416,9 +497,27 @@ mod tests {
 
     #[test]
     fn dynamic_taker_fee_uses_cached_max_rate() {
-        let p50 = calculate_dynamic_taker_fee_bps(&OrderSide::BuyYes, 0.50, 250.0);
-        let p95 = calculate_dynamic_taker_fee_bps(&OrderSide::BuyYes, 0.95, 250.0);
+        let cfg = DynamicFeeConfig {
+            model: DynamicFeeModel::LegacyLinear,
+            exponent: 2.0,
+            rate_override: None,
+        };
+        let p50 = calculate_dynamic_taker_fee_bps_with_config(&OrderSide::BuyYes, 0.50, 250.0, cfg);
+        let p95 = calculate_dynamic_taker_fee_bps_with_config(&OrderSide::BuyYes, 0.95, 250.0, cfg);
         assert!((p50 - 125.0).abs() < 1e-9);
         assert!((p95 - 237.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn official_fee_formula_is_center_heavier_than_extremes() {
+        let cfg = DynamicFeeConfig {
+            model: DynamicFeeModel::OfficialPolyFormula,
+            exponent: 2.0,
+            rate_override: Some(0.25),
+        };
+        let p50 = calculate_dynamic_taker_fee_bps_with_config(&OrderSide::BuyYes, 0.50, 250.0, cfg);
+        let p95 = calculate_dynamic_taker_fee_bps_with_config(&OrderSide::BuyYes, 0.95, 250.0, cfg);
+        assert!(p50 > p95);
+        assert!(p95 > 0.0);
     }
 }

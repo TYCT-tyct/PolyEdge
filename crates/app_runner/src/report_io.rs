@@ -694,6 +694,20 @@ pub(super) fn persist_final_report_files(report: &ShadowFinalReport) {
             md.push_str(&format!("- {}: {}\n", reason, count));
         }
     }
+    if report.live.blocked_reason_by_symbol_timeframe.is_empty() {
+        md.push_str("\n## Blocked Reasons By Symbol+Timeframe\n- none\n");
+    } else {
+        md.push_str("\n## Blocked Reasons By Symbol+Timeframe\n");
+        let mut rows = report
+            .live
+            .blocked_reason_by_symbol_timeframe
+            .iter()
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| b.1.cmp(a.1));
+        for (key, count) in rows.into_iter().take(30) {
+            md.push_str(&format!("- {}: {}\n", key, count));
+        }
+    }
     if report.live.policy_block_reason_distribution.is_empty() {
         md.push_str("\n## Policy Block Reason Distribution\n- none\n");
     } else {
@@ -838,6 +852,24 @@ pub(super) fn persist_final_report_files(report: &ShadowFinalReport) {
         ));
     }
     let _ = fs::write(score_path, score_rows);
+
+    let blocked_ctx_csv = reports_dir.join("blocked_reason_by_symbol_timeframe.csv");
+    let mut blocked_ctx_rows = String::new();
+    blocked_ctx_rows.push_str("symbol,timeframe,reason,count\n");
+    let mut blocked_ctx_sorted = report
+        .live
+        .blocked_reason_by_symbol_timeframe
+        .iter()
+        .collect::<Vec<_>>();
+    blocked_ctx_sorted.sort_by(|a, b| b.1.cmp(a.1));
+    for (key, count) in blocked_ctx_sorted {
+        let mut parts = key.splitn(3, '|');
+        let symbol = parts.next().unwrap_or("unknown");
+        let timeframe = parts.next().unwrap_or("unknown");
+        let reason = parts.next().unwrap_or("unknown");
+        blocked_ctx_rows.push_str(&format!("{},{},{},{}\n", symbol, timeframe, reason, count));
+    }
+    let _ = fs::write(blocked_ctx_csv, blocked_ctx_rows);
 
     let fixlist_path = reports_dir.join("next_fixlist.md");
     let mut fixlist = String::new();
