@@ -1166,12 +1166,6 @@ pub(super) async fn evaluate_and_route_roll_v1(
 
         let fee_bps = get_fee_rate_bps_cached(shared, &market_id).await;
         let rebate_est_bps = get_rebate_bps_cached(shared, &market_id, fee_bps).await;
-        let yes_price = aggressive_price_for_side(&book, &OrderSide::BuyYes);
-        let no_price = aggressive_price_for_side(&book, &OrderSide::BuyNo);
-        let yes_edge_gross =
-            edge_gross_bps_for_side(probability.p_settle, &OrderSide::BuyYes, yes_price);
-        let no_edge_gross =
-            edge_gross_bps_for_side(probability.p_settle, &OrderSide::BuyNo, no_price);
         let Some(frame_total_ms) = timeframe_total_ms(timeframe.clone()) else {
             shared
                 .shadow_stats
@@ -1191,6 +1185,23 @@ pub(super) async fn evaluate_and_route_roll_v1(
             time_to_expiry_ms,
             &predator_cfg.v52.execution,
         );
+        // Keep EV model aligned with execution intent:
+        // - force-taker phases evaluate against aggressive price
+        // - maker-first phases evaluate against maker price level
+        let yes_price = if entry_force_taker {
+            aggressive_price_for_side(&book, &OrderSide::BuyYes)
+        } else {
+            maker_price_for_side(&book, &OrderSide::BuyYes)
+        };
+        let no_price = if entry_force_taker {
+            aggressive_price_for_side(&book, &OrderSide::BuyNo)
+        } else {
+            maker_price_for_side(&book, &OrderSide::BuyNo)
+        };
+        let yes_edge_gross =
+            edge_gross_bps_for_side(probability.p_settle, &OrderSide::BuyYes, yes_price);
+        let no_edge_gross =
+            edge_gross_bps_for_side(probability.p_settle, &OrderSide::BuyNo, no_price);
         let yes_fee_taker_bps =
             calculate_dynamic_taker_fee_bps(&OrderSide::BuyYes, yes_price, fee_bps);
         let no_fee_taker_bps =
