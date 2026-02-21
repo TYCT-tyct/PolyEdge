@@ -1739,6 +1739,7 @@ dependencies = [
  "futures",
  "libc",
  "market_discovery",
+ "reqwest",
  "rustls",
  "serde",
  "serde_json",

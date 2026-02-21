@@ -4,16 +4,17 @@ use std::io::Write;
 #[cfg(target_family = "unix")]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{Duration as ChronoDuration, NaiveDate, Utc};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use core_types::MarketFeed;
 use feed_polymarket::PolymarketFeed;
 use futures::StreamExt;
 use market_discovery::{DiscoveryConfig, MarketDiscovery};
+use reqwest::Client;
 use serde::Serialize;
 
 #[derive(Parser, Debug)]
@@ -27,10 +28,125 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    Strategy(StrategyArgs),
+    Markets(MarketsArgs),
+    Paper(PaperArgs),
+    Report(ReportArgs),
     Recorder(RecorderArgs),
     Storage(StorageArgs),
     Git(GitArgs),
     Remote(RemoteArgs),
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum EngineModeArg {
+    LegacyV52,
+    RollV1,
+}
+
+impl EngineModeArg {
+    fn as_mode_str(&self) -> &'static str {
+        match self {
+            Self::LegacyV52 => "legacy_v52",
+            Self::RollV1 => "roll_v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum PaperProfile {
+    Smoke10,
+    Stage20,
+    Stage30,
+}
+
+#[derive(Args, Debug)]
+struct StrategyArgs {
+    #[command(subcommand)]
+    command: StrategyCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum StrategyCommand {
+    ModeSet(StrategyModeSet),
+}
+
+#[derive(Args, Debug, Clone)]
+struct StrategyModeSet {
+    #[arg(long, value_enum)]
+    engine: EngineModeArg,
+    #[arg(long, default_value = "http://127.0.0.1:8080")]
+    base_url: String,
+}
+
+#[derive(Args, Debug)]
+struct MarketsArgs {
+    #[command(subcommand)]
+    command: MarketsCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum MarketsCommand {
+    Active(MarketsActive),
+}
+
+#[derive(Args, Debug, Clone)]
+struct MarketsActive {
+    #[arg(long, default_value = "BTC,ETH,SOL,XRP")]
+    symbols: String,
+    #[arg(long, default_value = "updown")]
+    market_types: String,
+    #[arg(long, default_value = "5m,15m")]
+    tfs: String,
+    #[arg(long, default_value_t = false)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct PaperArgs {
+    #[command(subcommand)]
+    command: PaperCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum PaperCommand {
+    Run(PaperRun),
+}
+
+#[derive(Args, Debug, Clone)]
+struct PaperRun {
+    #[arg(long, value_enum, default_value_t = PaperProfile::Smoke10)]
+    profile: PaperProfile,
+    #[arg(long, default_value_t = 1)]
+    instances: u32,
+    #[arg(long, default_value = "datasets/paper_runs/roll_v1")]
+    dataset_root: String,
+    #[arg(long, default_value_t = false)]
+    background: bool,
+}
+
+#[derive(Args, Debug)]
+struct ReportArgs {
+    #[command(subcommand)]
+    command: ReportCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum ReportCommand {
+    Gates(ReportGates),
+    Pnl(ReportPnl),
+}
+
+#[derive(Args, Debug, Clone)]
+struct ReportGates {
+    #[arg(long, default_value = "http://127.0.0.1:8080")]
+    base_url: String,
+}
+
+#[derive(Args, Debug, Clone)]
+struct ReportPnl {
+    #[arg(long, default_value = "http://127.0.0.1:8080")]
+    base_url: String,
 }
 
 #[derive(Args, Debug)]
@@ -47,19 +163,35 @@ enum RecorderCommand {
 
 #[derive(Args, Debug, Clone)]
 struct RecorderRun {
-    #[arg(long, env = "POLYEDGE_RECORDER_ROOT", default_value = "datasets/recorder")]
+    #[arg(
+        long,
+        env = "POLYEDGE_RECORDER_ROOT",
+        default_value = "datasets/recorder"
+    )]
     dataset_root: String,
-    #[arg(long, env = "POLYEDGE_RECORDER_SYMBOLS", default_value = "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT")]
+    #[arg(
+        long,
+        env = "POLYEDGE_RECORDER_SYMBOLS",
+        default_value = "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT"
+    )]
     symbols: String,
     #[arg(long, env = "POLYEDGE_RECORDER_MARKET_TYPES", default_value = "updown")]
     market_types: String,
     #[arg(long, env = "POLYEDGE_RECORDER_TIMEFRAMES", default_value = "5m,15m")]
     timeframes: String,
-    #[arg(long, env = "POLYEDGE_RECORDER_WRITE_THROTTLE_MS", default_value_t = 40)]
+    #[arg(
+        long,
+        env = "POLYEDGE_RECORDER_WRITE_THROTTLE_MS",
+        default_value_t = 40
+    )]
     write_throttle_ms: i64,
     #[arg(long, env = "POLYEDGE_RECORDER_META_REFRESH_SEC", default_value_t = 20)]
     meta_refresh_sec: u64,
-    #[arg(long, env = "POLYEDGE_RECORDER_STATUS_INTERVAL_SEC", default_value_t = 5)]
+    #[arg(
+        long,
+        env = "POLYEDGE_RECORDER_STATUS_INTERVAL_SEC",
+        default_value_t = 5
+    )]
     status_interval_sec: u64,
     #[arg(long, env = "POLYEDGE_STORAGE_MAX_USED_PCT", default_value_t = 90.0)]
     storage_max_used_pct: f64,
@@ -73,7 +205,11 @@ struct RecorderRun {
 
 #[derive(Args, Debug, Clone)]
 struct RecorderOnce {
-    #[arg(long, env = "POLYEDGE_RECORDER_SYMBOLS", default_value = "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT")]
+    #[arg(
+        long,
+        env = "POLYEDGE_RECORDER_SYMBOLS",
+        default_value = "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT"
+    )]
     symbols: String,
     #[arg(long, env = "POLYEDGE_RECORDER_MARKET_TYPES", default_value = "updown")]
     market_types: String,
@@ -183,6 +319,19 @@ async fn main() -> Result<()> {
     let level = if cli.verbose { "debug" } else { "info" };
     let _ = tracing_subscriber::fmt().with_env_filter(level).try_init();
     match cli.command {
+        Commands::Strategy(args) => match args.command {
+            StrategyCommand::ModeSet(req) => run_strategy_mode_set(req).await,
+        },
+        Commands::Markets(args) => match args.command {
+            MarketsCommand::Active(req) => run_markets_active(req).await,
+        },
+        Commands::Paper(args) => match args.command {
+            PaperCommand::Run(req) => run_paper_profile(req),
+        },
+        Commands::Report(args) => match args.command {
+            ReportCommand::Gates(req) => run_report_gates(req).await,
+            ReportCommand::Pnl(req) => run_report_pnl(req).await,
+        },
         Commands::Recorder(args) => match args.command {
             RecorderCommand::Run(run) => run_recorder(run).await,
             RecorderCommand::Once(once) => run_recorder_once(once).await,
@@ -212,6 +361,226 @@ async fn main() -> Result<()> {
 
 fn install_rustls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+fn repo_root() -> PathBuf {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn http_base(base_url: &str) -> String {
+    base_url.trim_end_matches('/').to_string()
+}
+
+async fn http_get_json(base_url: &str, path: &str) -> Result<serde_json::Value> {
+    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let url = format!("{}{}", http_base(base_url), path);
+    let resp = client.get(url).send().await?;
+    let resp = resp.error_for_status()?;
+    Ok(resp.json::<serde_json::Value>().await?)
+}
+
+async fn run_strategy_mode_set(req: StrategyModeSet) -> Result<()> {
+    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let url = format!("{}/control/switch_engine_mode", http_base(&req.base_url));
+    let payload = serde_json::json!({ "engine_mode": req.engine.as_mode_str() });
+    let resp = client.post(url).json(&payload).send().await?;
+    let resp = resp.error_for_status()?;
+    let body = resp.json::<serde_json::Value>().await?;
+    println!("{}", serde_json::to_string_pretty(&body)?);
+    Ok(())
+}
+
+async fn run_markets_active(req: MarketsActive) -> Result<()> {
+    let symbols = normalize_symbols(&req.symbols);
+    let market_types = parse_csv_lower(&req.market_types);
+    let timeframes = parse_csv_lower(&req.tfs);
+    let discovery = MarketDiscovery::new(DiscoveryConfig {
+        symbols: symbols.clone(),
+        market_types: market_types.clone(),
+        timeframes: timeframes.clone(),
+        ..DiscoveryConfig::default()
+    });
+    let markets = discovery.discover().await?;
+    let mut rows = markets
+        .into_iter()
+        .map(|m| {
+            serde_json::json!({
+                "market_id": m.market_id,
+                "symbol": m.symbol.trim_end_matches("USDT"),
+                "timeframe": m.timeframe.unwrap_or_else(|| "unknown".to_string()),
+                "market_type": m.market_type.unwrap_or_else(|| "unknown".to_string()),
+                "title": m.question,
+                "end_date": m.end_date.unwrap_or_default(),
+                "best_bid": m.best_bid,
+                "best_ask": m.best_ask
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| {
+        a["end_date"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["end_date"].as_str().unwrap_or_default())
+    });
+    let mut by_tpl = BTreeMap::<String, usize>::new();
+    for row in &rows {
+        let tpl = format!(
+            "{}|{}",
+            row["symbol"].as_str().unwrap_or("UNKNOWN"),
+            row["timeframe"].as_str().unwrap_or("unknown")
+        );
+        *by_tpl.entry(tpl).or_default() += 1;
+    }
+    if req.json {
+        let payload = serde_json::json!({
+            "ts_ms": Utc::now().timestamp_millis(),
+            "symbols": symbols.iter().map(|s| s.trim_end_matches("USDT")).collect::<Vec<_>>(),
+            "timeframes": timeframes,
+            "total_markets": rows.len(),
+            "by_symbol_timeframe": by_tpl,
+            "markets": rows
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!("ts_ms={}", Utc::now().timestamp_millis());
+        println!("total_markets={}", rows.len());
+        println!("by_symbol_timeframe={}", serde_json::to_string(&by_tpl)?);
+        for row in rows {
+            println!(
+                "{} | {} {} | {}",
+                row["market_id"].as_str().unwrap_or(""),
+                row["symbol"].as_str().unwrap_or(""),
+                row["timeframe"].as_str().unwrap_or(""),
+                row["title"].as_str().unwrap_or("")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn paper_profile_config(profile: &PaperProfile) -> (&'static str, u64) {
+    match profile {
+        PaperProfile::Smoke10 => ("configs/paper-fast/stage20_coverage.toml", 10 * 60),
+        PaperProfile::Stage20 => ("configs/paper-fast/stage20_balanced.toml", 20 * 60),
+        PaperProfile::Stage30 => ("configs/paper-fast/stage30_diagnostic.toml", 30 * 60),
+    }
+}
+
+fn python_program() -> String {
+    for cand in ["python", "python3"] {
+        let ok = Command::new(cand)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            return cand.to_string();
+        }
+    }
+    "python".to_string()
+}
+
+fn run_paper_profile(req: PaperRun) -> Result<()> {
+    let (config1, duration) = paper_profile_config(&req.profile);
+    let root = repo_root();
+    let script = root.join("scripts").join("paper_runner.py");
+    if !script.exists() {
+        return Err(anyhow!(
+            "paper runner script not found: {}",
+            script.display()
+        ));
+    }
+    let mut args = vec![
+        script.to_string_lossy().to_string(),
+        "--duration".to_string(),
+        duration.to_string(),
+        "--instances".to_string(),
+        req.instances.max(1).to_string(),
+        "--dataset-root".to_string(),
+        req.dataset_root.clone(),
+        "--config1".to_string(),
+        config1.to_string(),
+    ];
+    if req.instances >= 2 {
+        args.push("--config2".to_string());
+        args.push("configs/paper-fast/stage20_quality.toml".to_string());
+    }
+    if req.instances >= 3 {
+        args.push("--config3".to_string());
+        args.push("configs/paper-fast/stage20_coverage.toml".to_string());
+    }
+    let python = python_program();
+    if req.background {
+        let log_root = PathBuf::from(&req.dataset_root).join("background");
+        fs::create_dir_all(&log_root)?;
+        let log_path = log_root.join(format!(
+            "paper_{}_{}.log",
+            match req.profile {
+                PaperProfile::Smoke10 => "smoke10",
+                PaperProfile::Stage20 => "stage20",
+                PaperProfile::Stage30 => "stage30",
+            },
+            Utc::now().format("%Y%m%d_%H%M%S")
+        ));
+        let log_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        let stderr_file = log_file.try_clone()?;
+        let mut cmd = Command::new(&python);
+        cmd.args(&args)
+            .current_dir(root)
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(stderr_file));
+        let child = cmd
+            .spawn()
+            .with_context(|| "spawn paper runner in background")?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "started",
+                "pid": child.id(),
+                "profile": format!("{:?}", req.profile),
+                "duration_sec": duration,
+                "log_path": log_path
+            }))?
+        );
+        return Ok(());
+    }
+    run_cmd(&python, &args, false)
+}
+
+async fn run_report_gates(req: ReportGates) -> Result<()> {
+    let payload = http_get_json(&req.base_url, "/report/gates/drop_reasons").await?;
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
+}
+
+async fn run_report_pnl(req: ReportPnl) -> Result<()> {
+    let summary = http_get_json(&req.base_url, "/report/paper/summary")
+        .await
+        .unwrap_or_else(|_| serde_json::json!({"error":"unavailable"}));
+    let live = http_get_json(&req.base_url, "/report/paper/live")
+        .await
+        .unwrap_or_else(|_| serde_json::json!({"error":"unavailable"}));
+    let by_engine = http_get_json(&req.base_url, "/report/pnl/by_engine")
+        .await
+        .unwrap_or_else(|_| serde_json::json!({"error":"unavailable"}));
+    let payload = serde_json::json!({
+        "ts_ms": Utc::now().timestamp_millis(),
+        "paper_live": live,
+        "paper_summary": summary,
+        "pnl_by_engine": by_engine
+    });
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
 }
 
 async fn run_recorder_once(args: RecorderOnce) -> Result<()> {
@@ -248,8 +617,10 @@ async fn run_recorder(args: RecorderRun) -> Result<()> {
     let started = Instant::now();
 
     let mut meta_tick = tokio::time::interval(Duration::from_secs(args.meta_refresh_sec.max(5)));
-    let mut status_tick = tokio::time::interval(Duration::from_secs(args.status_interval_sec.max(2)));
-    let mut gc_tick = tokio::time::interval(Duration::from_secs(args.storage_gc_interval_sec.max(30)));
+    let mut status_tick =
+        tokio::time::interval(Duration::from_secs(args.status_interval_sec.max(2)));
+    let mut gc_tick =
+        tokio::time::interval(Duration::from_secs(args.storage_gc_interval_sec.max(30)));
 
     loop {
         let feed = PolymarketFeed::new_with_universe(
@@ -328,7 +699,11 @@ async fn run_recorder(args: RecorderRun) -> Result<()> {
     }
 }
 
-async fn discover_meta(symbols: &[String], market_types: &[String], timeframes: &[String]) -> Result<HashMap<String, MetaRow>> {
+async fn discover_meta(
+    symbols: &[String],
+    market_types: &[String],
+    timeframes: &[String],
+) -> Result<HashMap<String, MetaRow>> {
     let mut last_err = None;
     for attempt in 0..4 {
         let discovery = MarketDiscovery::new(DiscoveryConfig {
@@ -341,12 +716,15 @@ async fn discover_meta(symbols: &[String], market_types: &[String], timeframes: 
             Ok(markets) => {
                 let mut out = HashMap::new();
                 for m in markets {
-                    out.insert(m.market_id, MetaRow {
-                        symbol: m.symbol.trim_end_matches("USDT").to_string(),
-                        timeframe: m.timeframe.unwrap_or_else(|| "unknown".to_string()),
-                        market_type: m.market_type.unwrap_or_else(|| "unknown".to_string()),
-                        title: m.question,
-                    });
+                    out.insert(
+                        m.market_id,
+                        MetaRow {
+                            symbol: m.symbol.trim_end_matches("USDT").to_string(),
+                            timeframe: m.timeframe.unwrap_or_else(|| "unknown".to_string()),
+                            market_type: m.market_type.unwrap_or_else(|| "unknown".to_string()),
+                            title: m.question,
+                        },
+                    );
                 }
                 return Ok(out);
             }
@@ -361,7 +739,11 @@ async fn discover_meta(symbols: &[String], market_types: &[String], timeframes: 
     Err(last_err.unwrap_or_else(|| anyhow!("market discovery failed")))
 }
 
-fn expected_templates(symbols: &[String], market_types: &[String], timeframes: &[String]) -> HashSet<String> {
+fn expected_templates(
+    symbols: &[String],
+    market_types: &[String],
+    timeframes: &[String],
+) -> HashSet<String> {
     let mut out = HashSet::new();
     for s in symbols {
         for mt in market_types {
@@ -374,17 +756,26 @@ fn expected_templates(symbols: &[String], market_types: &[String], timeframes: &
 }
 
 fn discovered_templates(meta: &HashMap<String, MetaRow>) -> HashSet<String> {
-    meta.values().map(|m| format!("{}|{}|{}", m.symbol, m.market_type, m.timeframe)).collect()
+    meta.values()
+        .map(|m| format!("{}|{}|{}", m.symbol, m.market_type, m.timeframe))
+        .collect()
 }
 
 fn run_git_audit(json: bool) -> Result<()> {
-    let out = Command::new("git").args(["status", "--short"]).output().context("git status --short")?;
-    if !out.status.success() { return Err(anyhow!("git status failed")); }
+    let out = Command::new("git")
+        .args(["status", "--short"])
+        .output()
+        .context("git status --short")?;
+    if !out.status.success() {
+        return Err(anyhow!("git status failed"));
+    }
     let text = String::from_utf8_lossy(&out.stdout);
     let mut grouped = BTreeMap::<String, usize>::new();
     let mut rows = Vec::new();
     for line in text.lines() {
-        if line.trim().is_empty() { continue; }
+        if line.trim().is_empty() {
+            continue;
+        }
         let status = line.chars().take(2).collect::<String>().trim().to_string();
         let path = line.get(3..).unwrap_or_default().trim().to_string();
         let cat = classify_path(&path).to_string();
@@ -392,8 +783,9 @@ fn run_git_audit(json: bool) -> Result<()> {
         rows.push((status, cat, path));
     }
     let payload = serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "total": rows.len(), "groups": grouped, "rows": rows});
-    if json { println!("{}", serde_json::to_string_pretty(&payload)?); }
-    else {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
         println!("Dirty files: {}", payload["total"]);
         println!("{}", serde_json::to_string_pretty(&payload["groups"])?);
     }
@@ -404,8 +796,16 @@ fn run_deploy_ireland(base: RemoteBase) -> Result<()> {
     ensure_key(&base.key)?;
     let target = format!("{}@{}", base.user, base.host);
     run_ssh(&base, &target, &format!("set -euo pipefail; cd {}; git fetch origin; git checkout {}; git pull --ff-only origin {}; ~/.cargo/bin/cargo build -p app_runner -p polyedge_cli --release", base.repo, base.branch, base.branch))?;
-    run_scp(&base, "scripts/setup_recorder_systemd.sh", &format!("{target}:/tmp/setup_recorder_systemd.sh"))?;
-    run_scp(&base, "ops/systemd/polyedge-recorder.service", &format!("{target}:/tmp/polyedge-recorder.service"))?;
+    run_scp(
+        &base,
+        "scripts/setup_recorder_systemd.sh",
+        &format!("{target}:/tmp/setup_recorder_systemd.sh"),
+    )?;
+    run_scp(
+        &base,
+        "ops/systemd/polyedge-recorder.service",
+        &format!("{target}:/tmp/polyedge-recorder.service"),
+    )?;
     run_ssh(&base, &target, &format!("chmod +x /tmp/setup_recorder_systemd.sh; POLYEDGE_REPO_DIR={} POLYEDGE_BIN_PATH={}/target/release/polyedge POLYEDGE_USER={} bash /tmp/setup_recorder_systemd.sh", base.repo, base.repo, base.user))?;
     run_status_ireland(base)
 }
@@ -420,133 +820,261 @@ fn run_logs_ireland(args: RemoteLogs) -> Result<()> {
     let base = args.base;
     ensure_key(&base.key)?;
     let target = format!("{}@{}", base.user, base.host);
-    run_ssh(&base, &target, &format!("sudo journalctl -u polyedge-recorder.service -n {} --no-pager", args.lines.clamp(20, 5000)))
+    run_ssh(
+        &base,
+        &target,
+        &format!(
+            "sudo journalctl -u polyedge-recorder.service -n {} --no-pager",
+            args.lines.clamp(20, 5000)
+        ),
+    )
 }
 
 fn run_ssh(base: &RemoteBase, target: &str, remote_cmd: &str) -> Result<()> {
-    run_cmd("ssh", &[
-        "-i".into(), base.key.clone(),
-        "-o".into(), "StrictHostKeyChecking=accept-new".into(),
-        "-o".into(), "ServerAliveInterval=20".into(),
-        target.into(), remote_cmd.into()
-    ], base.dry_run)
+    run_cmd(
+        "ssh",
+        &[
+            "-i".into(),
+            base.key.clone(),
+            "-o".into(),
+            "StrictHostKeyChecking=accept-new".into(),
+            "-o".into(),
+            "ServerAliveInterval=20".into(),
+            target.into(),
+            remote_cmd.into(),
+        ],
+        base.dry_run,
+    )
 }
 
 fn run_scp(base: &RemoteBase, src: &str, dst: &str) -> Result<()> {
-    run_cmd("scp", &[
-        "-i".into(), base.key.clone(),
-        "-o".into(), "StrictHostKeyChecking=accept-new".into(),
-        src.into(), dst.into()
-    ], base.dry_run)
+    run_cmd(
+        "scp",
+        &[
+            "-i".into(),
+            base.key.clone(),
+            "-o".into(),
+            "StrictHostKeyChecking=accept-new".into(),
+            src.into(),
+            dst.into(),
+        ],
+        base.dry_run,
+    )
 }
 
 fn run_cmd(program: &str, args: &[String], dry_run: bool) -> Result<()> {
     let line = format!("{program} {}", args.join(" "));
     println!("{line}");
-    if dry_run { return Ok(()); }
-    let st = Command::new(program).args(args).status().with_context(|| line.clone())?;
-    if !st.success() { return Err(anyhow!("command failed: {line}")); }
+    if dry_run {
+        return Ok(());
+    }
+    let st = Command::new(program)
+        .args(args)
+        .status()
+        .with_context(|| line.clone())?;
+    if !st.success() {
+        return Err(anyhow!("command failed: {line}"));
+    }
     Ok(())
 }
 
 fn ensure_key(path: &str) -> Result<()> {
-    if !PathBuf::from(path).exists() { return Err(anyhow!("ssh key not found: {path}")); }
+    if !PathBuf::from(path).exists() {
+        return Err(anyhow!("ssh key not found: {path}"));
+    }
     Ok(())
 }
 
 fn normalize_symbols(s: &str) -> Vec<String> {
-    s.split(',').map(|v| v.trim().to_ascii_uppercase()).filter(|v| !v.is_empty()).map(|v| if v.ends_with("USDT") { v } else { format!("{v}USDT") }).collect()
+    s.split(',')
+        .map(|v| v.trim().to_ascii_uppercase())
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            if v.ends_with("USDT") {
+                v
+            } else {
+                format!("{v}USDT")
+            }
+        })
+        .collect()
 }
 
 fn parse_csv_lower(s: &str) -> Vec<String> {
-    s.split(',').map(|v| v.trim().to_ascii_lowercase()).filter(|v| !v.is_empty()).collect()
+    s.split(',')
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+        .collect()
 }
 
 fn classify_path(path: &str) -> &'static str {
-    if path.starts_with("configs/") { return "config"; }
-    if path.starts_with("crates/app_runner/") { return "app_runner"; }
-    if path.starts_with("crates/") { return "rust_core"; }
-    if path.starts_with("scripts/") || path.ends_with(".ps1") || path.ends_with(".sh") { return "ops_script"; }
-    if path.contains("ai_slop") || path.ends_with(".txt") { return "artifact"; }
+    if path.starts_with("configs/") {
+        return "config";
+    }
+    if path.starts_with("crates/app_runner/") {
+        return "app_runner";
+    }
+    if path.starts_with("crates/") {
+        return "rust_core";
+    }
+    if path.starts_with("scripts/") || path.ends_with(".ps1") || path.ends_with(".sh") {
+        return "ops_script";
+    }
+    if path.contains("ai_slop") || path.ends_with(".txt") {
+        return "artifact";
+    }
     "other"
 }
 
 fn dated_path(root: &Path, bucket: &str, file: &str) -> PathBuf {
-    root.join(bucket).join(Utc::now().format("%Y-%m-%d").to_string()).join(file)
+    root.join(bucket)
+        .join(Utc::now().format("%Y-%m-%d").to_string())
+        .join(file)
 }
 
 fn append_jsonl(path: &Path, line: &str) {
-    if let Some(parent) = path.parent() { fs::create_dir_all(parent).ok(); }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).ok();
+    }
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "{line}");
     }
 }
 
 #[derive(Debug, Serialize)]
-struct GcSummary { before_used_pct: Option<f64>, after_used_pct: Option<f64>, removed_dirs: u64, removed_bytes: u64 }
+struct GcSummary {
+    before_used_pct: Option<f64>,
+    after_used_pct: Option<f64>,
+    removed_dirs: u64,
+    removed_bytes: u64,
+}
 
-fn gc_once(root: &Path, max_used_pct: f64, keep_raw_days: i64, keep_reports_days: i64) -> GcSummary {
-    let mut out = GcSummary { before_used_pct: fs_used_pct(root), after_used_pct: None, removed_dirs: 0, removed_bytes: 0 };
+fn gc_once(
+    root: &Path,
+    max_used_pct: f64,
+    keep_raw_days: i64,
+    keep_reports_days: i64,
+) -> GcSummary {
+    let mut out = GcSummary {
+        before_used_pct: fs_used_pct(root),
+        after_used_pct: None,
+        removed_dirs: 0,
+        removed_bytes: 0,
+    };
     let today = Utc::now().date_naive();
-    clean_older_than(&root.join("raw"), today - ChronoDuration::days(keep_raw_days.max(0)), &mut out);
-    clean_older_than(&root.join("reports"), today - ChronoDuration::days(keep_reports_days.max(0)), &mut out);
+    clean_older_than(
+        &root.join("raw"),
+        today - ChronoDuration::days(keep_raw_days.max(0)),
+        &mut out,
+    );
+    clean_older_than(
+        &root.join("reports"),
+        today - ChronoDuration::days(keep_reports_days.max(0)),
+        &mut out,
+    );
     for _ in 0..24 {
         let Some(used) = fs_used_pct(root) else { break };
-        if used <= max_used_pct { break; }
-        if !remove_oldest(&root.join("raw"), today, &mut out) && !remove_oldest(&root.join("reports"), today, &mut out) { break; }
+        if used <= max_used_pct {
+            break;
+        }
+        if !remove_oldest(&root.join("raw"), today, &mut out)
+            && !remove_oldest(&root.join("reports"), today, &mut out)
+        {
+            break;
+        }
     }
     out.after_used_pct = fs_used_pct(root);
     out
 }
 
 fn clean_older_than(root: &Path, threshold: NaiveDate, out: &mut GcSummary) {
-    let Ok(entries) = fs::read_dir(root) else { return; };
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
     for e in entries.flatten() {
         let p = e.path();
-        if !p.is_dir() { continue; }
-        let Some(name) = p.file_name().and_then(|v| v.to_str()) else { continue; };
-        let Ok(date) = NaiveDate::parse_from_str(name, "%Y-%m-%d") else { continue; };
+        if !p.is_dir() {
+            continue;
+        }
+        let Some(name) = p.file_name().and_then(|v| v.to_str()) else {
+            continue;
+        };
+        let Ok(date) = NaiveDate::parse_from_str(name, "%Y-%m-%d") else {
+            continue;
+        };
         if date < threshold {
             let bytes = remove_dir_with_size(&p);
-            if bytes > 0 { out.removed_dirs += 1; out.removed_bytes += bytes; }
+            if bytes > 0 {
+                out.removed_dirs += 1;
+                out.removed_bytes += bytes;
+            }
         }
     }
 }
 
 fn remove_oldest(root: &Path, today: NaiveDate, out: &mut GcSummary) -> bool {
-    let Ok(entries) = fs::read_dir(root) else { return false; };
+    let Ok(entries) = fs::read_dir(root) else {
+        return false;
+    };
     let mut dirs = Vec::<(NaiveDate, PathBuf)>::new();
     for e in entries.flatten() {
         let p = e.path();
-        if !p.is_dir() { continue; }
-        let Some(name) = p.file_name().and_then(|v| v.to_str()) else { continue; };
-        let Ok(date) = NaiveDate::parse_from_str(name, "%Y-%m-%d") else { continue; };
-        if date < today { dirs.push((date, p)); }
+        if !p.is_dir() {
+            continue;
+        }
+        let Some(name) = p.file_name().and_then(|v| v.to_str()) else {
+            continue;
+        };
+        let Ok(date) = NaiveDate::parse_from_str(name, "%Y-%m-%d") else {
+            continue;
+        };
+        if date < today {
+            dirs.push((date, p));
+        }
     }
     dirs.sort_by_key(|x| x.0);
     if let Some((_, p)) = dirs.into_iter().next() {
         let bytes = remove_dir_with_size(&p);
-        if bytes > 0 { out.removed_dirs += 1; out.removed_bytes += bytes; return true; }
+        if bytes > 0 {
+            out.removed_dirs += 1;
+            out.removed_bytes += bytes;
+            return true;
+        }
     }
     false
 }
 
 fn remove_dir_with_size(path: &Path) -> u64 {
     let bytes = dir_size(path);
-    if fs::remove_dir_all(path).is_ok() { bytes } else { 0 }
+    if fs::remove_dir_all(path).is_ok() {
+        bytes
+    } else {
+        0
+    }
 }
 
 fn dir_size(path: &Path) -> u64 {
-    let Ok(meta) = fs::symlink_metadata(path) else { return 0; };
-    if meta.is_file() { return meta.len(); }
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if meta.is_file() {
+        return meta.len();
+    }
     let mut total = 0_u64;
     let mut stack = vec![path.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let Ok(entries) = fs::read_dir(d) else { continue; };
+        let Ok(entries) = fs::read_dir(d) else {
+            continue;
+        };
         for e in entries.flatten() {
             let p = e.path();
-            let Ok(m) = fs::symlink_metadata(&p) else { continue; };
-            if m.is_file() { total += m.len(); } else if m.is_dir() { stack.push(p); }
+            let Ok(m) = fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if m.is_file() {
+                total += m.len();
+            } else if m.is_dir() {
+                stack.push(p);
+            }
         }
     }
     total
@@ -557,13 +1085,25 @@ fn fs_used_pct(path: &Path) -> Option<f64> {
     use std::ffi::CString;
     let cpath = CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(cpath.as_ptr(), &mut st as *mut libc::statvfs) } != 0 || st.f_blocks == 0 { return None; }
-    let frsize = if st.f_frsize > 0 { st.f_frsize } else { st.f_bsize } as f64;
+    if unsafe { libc::statvfs(cpath.as_ptr(), &mut st as *mut libc::statvfs) } != 0
+        || st.f_blocks == 0
+    {
+        return None;
+    }
+    let frsize = if st.f_frsize > 0 {
+        st.f_frsize
+    } else {
+        st.f_bsize
+    } as f64;
     let total = st.f_blocks as f64 * frsize;
     let avail = st.f_bavail as f64 * frsize;
-    if total <= 0.0 { return None; }
+    if total <= 0.0 {
+        return None;
+    }
     Some(((total - avail) / total * 100.0).clamp(0.0, 100.0))
 }
 
 #[cfg(not(target_family = "unix"))]
-fn fs_used_pct(_path: &Path) -> Option<f64> { None }
+fn fs_used_pct(_path: &Path) -> Option<f64> {
+    None
+}
