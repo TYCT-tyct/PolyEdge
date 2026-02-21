@@ -385,7 +385,6 @@ impl ExecutionVenue for ClobExecution {
                     });
                 }
 
-
                 let body_bytes: Vec<u8> = if let Some(ref prebuilt) = intent.prebuilt_payload {
                     prebuilt.clone()
                 } else {

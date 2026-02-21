@@ -75,17 +75,29 @@ fn resolve_routes() -> Vec<Route> {
     let mut out = Vec::new();
     for token in raw.split(',') {
         let token = token.trim();
-        if token.is_empty() { continue; }
+        if token.is_empty() {
+            continue;
+        }
         let mut pair = token.split('=');
         let symbol = pair.next().unwrap_or_default().trim().to_ascii_lowercase();
         let target = pair.next().unwrap_or_default().trim().to_string();
-        if symbol.is_empty() || target.is_empty() { continue; }
-        out.push(Route { symbol, target, core_id: None });
+        if symbol.is_empty() || target.is_empty() {
+            continue;
+        }
+        out.push(Route {
+            symbol,
+            target,
+            core_id: None,
+        });
     }
     if out.is_empty() {
         let symbol = std::env::var("SYMBOL").unwrap_or_else(|_| "btcusdt".to_string());
         let target = std::env::var("TARGET").unwrap_or_else(|_| "10.0.3.123:6666".to_string());
-        out.push(Route { symbol: symbol.to_ascii_lowercase(), target, core_id: None });
+        out.push(Route {
+            symbol: symbol.to_ascii_lowercase(),
+            target,
+            core_id: None,
+        });
     }
     out
 }
@@ -107,7 +119,10 @@ async fn run_brain(route: &Route) -> Result<()> {
     apply_udp_sender_socket_tuning(&socket)?;
     socket.set_nonblocking(true)?;
 
-    eprintln!("brain: active target={} symbol={}", route.target, route.symbol);
+    eprintln!(
+        "brain: active target={} symbol={}",
+        route.target, route.symbol
+    );
 
     // Turn off source vote gate because the brain only sees Binance locally!
     let mut cfg = DirectionConfig::default();
@@ -121,10 +136,12 @@ async fn run_brain(route: &Route) -> Result<()> {
     let redundancy = 5; // Blast 5 times to bypass packet drops
 
     loop {
-        let endpoint_candidates = pick_best_fstream_ws_endpoint(fstream_ws_endpoints(&route.symbol)).await;
+        let endpoint_candidates =
+            pick_best_fstream_ws_endpoint(fstream_ws_endpoints(&route.symbol)).await;
         let mut ws_stream = None;
         for endpoint in endpoint_candidates {
-            if let Ok(Ok((ws, _))) = timeout(Duration::from_secs(3), connect_async(&endpoint)).await {
+            if let Ok(Ok((ws, _))) = timeout(Duration::from_secs(3), connect_async(&endpoint)).await
+            {
                 ws_stream = Some(ws);
                 break;
             }
@@ -135,7 +152,9 @@ async fn run_brain(route: &Route) -> Result<()> {
         };
 
         while let Some(frame) = ws_stream.next().await {
-            let Ok(Message::Text(text)) = frame else { continue; };
+            let Ok(Message::Text(text)) = frame else {
+                continue;
+            };
 
             let bytes = text.as_bytes();
             let bid = extract_quoted_f64(bytes, KEY_BID);
@@ -161,7 +180,9 @@ async fn run_brain(route: &Route) -> Result<()> {
                 detector.on_tick(&ref_tick);
 
                 if let Some(signal) = detector.evaluate(&route.symbol, ems) {
-                    if signal.direction != Direction::Neutral && last_trigger_time.elapsed() >= Duration::from_millis(500) {
+                    if signal.direction != Direction::Neutral
+                        && last_trigger_time.elapsed() >= Duration::from_millis(500)
+                    {
                         last_trigger_time = Instant::now();
 
                         let action_byte = match signal.direction {
@@ -181,7 +202,12 @@ async fn run_brain(route: &Route) -> Result<()> {
                             let _ = socket.send_to(&payload, target_addr);
                         }
 
-                        eprintln!("brain: [BLIND-BOX TRIGGER FIRED] symbol={} action={:?} payload_len={}", route.symbol, signal.direction, payload.len());
+                        eprintln!(
+                            "brain: [BLIND-BOX TRIGGER FIRED] symbol={} action={:?} payload_len={}",
+                            route.symbol,
+                            signal.direction,
+                            payload.len()
+                        );
                     }
                 }
             }
@@ -191,7 +217,9 @@ async fn run_brain(route: &Route) -> Result<()> {
 }
 
 async fn pick_best_fstream_ws_endpoint(endpoints: Vec<String>) -> Vec<String> {
-    if endpoints.len() <= 1 { return endpoints; }
+    if endpoints.len() <= 1 {
+        return endpoints;
+    }
     let mut join_set = tokio::task::JoinSet::new();
     for ep in endpoints.iter().cloned() {
         join_set.spawn(async move {
@@ -207,13 +235,21 @@ async fn pick_best_fstream_ws_endpoint(endpoints: Vec<String>) -> Vec<String> {
     }
     let mut results = Vec::new();
     while let Some(res) = join_set.join_next().await {
-        if let Ok(Some(v)) = res { results.push(v); }
+        if let Ok(Some(v)) = res {
+            results.push(v);
+        }
     }
-    if results.is_empty() { return endpoints; }
+    if results.is_empty() {
+        return endpoints;
+    }
     results.sort_by(|a, b| a.1.total_cmp(&b.1));
     let best = results[0].0.clone();
     let mut out = vec![best.clone()];
-    for ep in endpoints { if ep != best { out.push(ep); } }
+    for ep in endpoints {
+        if ep != best {
+            out.push(ep);
+        }
+    }
     out
 }
 
@@ -229,13 +265,21 @@ fn fstream_ws_endpoints(symbol: &str) -> Vec<String> {
 fn apply_udp_sender_socket_tuning(socket: &UdpSocket) -> Result<()> {
     let value: libc::c_int = 1048576;
     unsafe {
-        libc::setsockopt(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, (&value as *const libc::c_int).cast(), std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            (&value as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
     }
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn apply_udp_sender_socket_tuning(_socket: &UdpSocket) -> Result<()> { Ok(()) }
+fn apply_udp_sender_socket_tuning(_socket: &UdpSocket) -> Result<()> {
+    Ok(())
+}
 
 #[cfg(target_os = "linux")]
 fn pin_current_thread(core_id: usize) -> Result<()> {
@@ -243,20 +287,29 @@ fn pin_current_thread(core_id: usize) -> Result<()> {
     unsafe {
         libc::CPU_ZERO(&mut cpuset);
         libc::CPU_SET(core_id, &mut cpuset);
-        libc::pthread_setaffinity_np(libc::pthread_self(), std::mem::size_of::<libc::cpu_set_t>(), &cpuset);
+        libc::pthread_setaffinity_np(
+            libc::pthread_self(),
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &cpuset,
+        );
     }
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn pin_current_thread(_core_id: usize) -> Result<()> { Ok(()) }
+fn pin_current_thread(_core_id: usize) -> Result<()> {
+    Ok(())
+}
 
 #[inline]
 fn extract_quoted_f64(payload: &[u8], key_with_quote: &[u8]) -> Option<f64> {
     let start = find_subslice(payload, key_with_quote)? + key_with_quote.len();
     let end_rel = payload.get(start..)?.iter().position(|&b| b == b'"')?;
     let end = start + end_rel;
-    std::str::from_utf8(payload.get(start..end)?).ok()?.parse().ok()
+    std::str::from_utf8(payload.get(start..end)?)
+        .ok()?
+        .parse()
+        .ok()
 }
 
 #[inline]
@@ -264,13 +317,21 @@ fn extract_i64(payload: &[u8], key: &[u8]) -> Option<i64> {
     let start = find_subslice(payload, key)? + key.len();
     let tail = payload.get(start..)?;
     let mut end_rel = 0usize;
-    while end_rel < tail.len() && tail[end_rel].is_ascii_digit() { end_rel += 1; }
-    if end_rel == 0 { return None; }
+    while end_rel < tail.len() && tail[end_rel].is_ascii_digit() {
+        end_rel += 1;
+    }
+    if end_rel == 0 {
+        return None;
+    }
     std::str::from_utf8(&tail[..end_rel]).ok()?.parse().ok()
 }
 
 #[inline]
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() { return None; }
-    haystack.windows(needle.len()).position(|window| window == needle)
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }

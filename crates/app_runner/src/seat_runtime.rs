@@ -1,9 +1,9 @@
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::time::Duration;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
@@ -933,10 +933,18 @@ impl SeatRuntimeHandle {
         // The market is non-stationary. An absolute drop in PnL/EV between D-1 and D-0
         // might just mean the market went sideways. We apply a 20% margin buffer (baseline * 0.8)
         // to prevent unfairly punishing the new parameters purely for a macro regime shift.
-        let accepted_baseline = if baseline > 0.0 { baseline * 0.8 } else { baseline * 1.2 };
+        let accepted_baseline = if baseline > 0.0 {
+            baseline * 0.8
+        } else {
+            baseline * 1.2
+        };
 
         if post_mean < accepted_baseline {
-            self.downgrade_locked(&mut state, layer, format!("RelativeDrop:{post_mean:.6}<{accepted_baseline:.6}"))?;
+            self.downgrade_locked(
+                &mut state,
+                layer,
+                format!("RelativeDrop:{post_mean:.6}<{accepted_baseline:.6}"),
+            )?;
         } else {
             state.degrade_streak = 0;
         }
@@ -1544,7 +1552,8 @@ impl SeatRuntimeHandle {
                     obj.ev_usdc_p50 -= burn_in.ev_usdc_p50;
                     // Max drawdown is cumulative, so taking the max minus what it already hit during burn-in
                     // is a reasonable hack to isolate the "post burn-in drawdown".
-                    obj.max_drawdown_pct = (obj.max_drawdown_pct - burn_in.max_drawdown_pct).max(0.0);
+                    obj.max_drawdown_pct =
+                        (obj.max_drawdown_pct - burn_in.max_drawdown_pct).max(0.0);
                 }
 
                 let local_pass = obj.ev_usdc_p50 >= challenger.baseline.ev_usdc_p50 * 1.05

@@ -212,10 +212,16 @@ impl DirectionDetector {
             let short_cutoff = now.saturating_sub(short_ms);
             let long_cutoff = now.saturating_sub(long_ms);
             // 重新精确计算 Binance 计数器
-            w.short_window_count =
-                w.binance_ticks.iter().filter(|(ts, _)| *ts >= short_cutoff).count() as u32;
-            w.long_window_count =
-                w.binance_ticks.iter().filter(|(ts, _)| *ts >= long_cutoff).count() as u32;
+            w.short_window_count = w
+                .binance_ticks
+                .iter()
+                .filter(|(ts, _)| *ts >= short_cutoff)
+                .count() as u32;
+            w.long_window_count = w
+                .binance_ticks
+                .iter()
+                .filter(|(ts, _)| *ts >= long_cutoff)
+                .count() as u32;
 
             while matches!(w.binance_ticks.front(), Some((ts, _)) if *ts < window_cutoff) {
                 w.binance_ticks.pop_front();
@@ -326,7 +332,7 @@ impl DirectionDetector {
             w.chainlink_source_key.as_deref(),
             anchor_short_binance,
             &w.chainlink_ticks, // 传入 chainlink_ticks 用于查找自身的锚点
-            anchor_short_ms,     // 传入短锚点时间戳
+            anchor_short_ms,    // 传入短锚点时间戳
             &raw_direction,
             now_ms,
             self.cfg.source_vote_max_age_ms,
@@ -414,7 +420,9 @@ fn source_vote_cached(
         if let (Some(&px), Some(&ts)) = (latest_by_source.get(key), latest_ts_by_source.get(key)) {
             out.secondary_available = true;
             if now_ms.saturating_sub(ts) <= max_age_ms {
-                if let Some(anchor_short_chainlink) = find_anchor_price(chainlink_ticks, anchor_short_ms) {
+                if let Some(anchor_short_chainlink) =
+                    find_anchor_price(chainlink_ticks, anchor_short_ms)
+                {
                     if anchor_short_chainlink > 0.0 {
                         let ret = (px - anchor_short_chainlink) / anchor_short_chainlink;
                         out.secondary_confirms = match direction {

@@ -84,7 +84,11 @@ async def measure_binance_ws_lag(symbol: str, seconds: int) -> List[float]:
     return lags
 
 
-async def measure_pm_clob_ws_lag(asset_ids: List[str], seconds: int) -> List[float]:
+async def measure_pm_clob_ws_lag(
+    asset_ids: List[str],
+    seconds: int,
+    latest_pm_recv_ms_holder: Optional[Dict[str, float]] = None,
+) -> List[float]:
     url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     end_at = time.time() + seconds
     lags: List[float] = []
@@ -103,6 +107,8 @@ async def measure_pm_clob_ws_lag(asset_ids: List[str], seconds: int) -> List[flo
                     ts = first_timestamp_ms(msg)
                     if ts is None:
                         continue
+                    if latest_pm_recv_ms_holder is not None:
+                        latest_pm_recv_ms_holder["recv_ms"] = recv_ms
                     lags.append(recv_ms - ts)
         except Exception:
             await asyncio.sleep(0.3)
@@ -115,11 +121,14 @@ async def measure_midpoint_delta(symbol: str, token_id: str, seconds: int, poll_
     latest Binance tick event time -> /midpoint receive time.
     """
     latest_binance_event_ms: float = float("nan")
-    deltas: List[float] = []
+    latest_binance_recv_ms: float = float("nan")
+    deltas_event: List[float] = []
+    deltas_recv: List[float] = []
+    deltas_recv_fresh_500ms: List[float] = []
     done = False
 
     async def binance_task() -> None:
-        nonlocal latest_binance_event_ms, done
+        nonlocal latest_binance_event_ms, latest_binance_recv_ms, done
         url = f"wss://stream.binance.com:9443/ws/{symbol.lower()}@trade"
         while not done:
             try:
@@ -133,6 +142,7 @@ async def measure_midpoint_delta(symbol: str, token_id: str, seconds: int, poll_
                         event_ts = msg.get("E")
                         if event_ts is not None:
                             latest_binance_event_ms = float(event_ts)
+                        latest_binance_recv_ms = time.time() * 1000.0
             except Exception:
                 await asyncio.sleep(0.3)
 
@@ -147,7 +157,13 @@ async def measure_midpoint_delta(symbol: str, token_id: str, seconds: int, poll_
             _ = r.json()
             recv_ms = time.time() * 1000.0
             if not math.isnan(latest_binance_event_ms):
-                deltas.append(recv_ms - latest_binance_event_ms)
+                deltas_event.append(recv_ms - latest_binance_event_ms)
+            if not math.isnan(latest_binance_recv_ms):
+                # Same-clock delta: both are local receive timestamps on the same host/process.
+                d = recv_ms - latest_binance_recv_ms
+                deltas_recv.append(d)
+                if d <= 500.0:
+                    deltas_recv_fresh_500ms.append(d)
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             sleep_ms = max(0.0, poll_interval_ms - elapsed_ms)
             await asyncio.sleep(sleep_ms / 1000.0)
@@ -155,7 +171,11 @@ async def measure_midpoint_delta(symbol: str, token_id: str, seconds: int, poll_
 
     await asyncio.gather(binance_task(), midpoint_task())
     return {
-        "delta_midpoint_recv_minus_latest_binance_event_ms": summary(deltas),
+        "delta_midpoint_recv_minus_latest_binance_event_ms": summary(deltas_event),
+        "delta_midpoint_recv_minus_latest_binance_recv_ms_same_clock": summary(deltas_recv),
+        "delta_midpoint_recv_minus_latest_binance_recv_ms_same_clock_fresh_le_500ms": summary(
+            deltas_recv_fresh_500ms
+        ),
     }
 
 
@@ -244,8 +264,36 @@ async def main() -> int:
     token_yes = token_info["token_yes"]
     token_no = token_info["token_no"]
 
-    bin_task = asyncio.create_task(measure_binance_ws_lag(args.symbol, args.seconds))
-    pm_task = asyncio.create_task(measure_pm_clob_ws_lag([token_yes, token_no], args.seconds))
+    latest_pm_ws_recv_ms: Dict[str, float] = {}
+    latest_bin_ws_recv_ms: Dict[str, float] = {}
+
+    async def measure_binance_with_recv() -> List[float]:
+        url = f"wss://stream.binance.com:9443/ws/{args.symbol.lower()}@trade"
+        end_at = time.time() + args.seconds
+        lags: List[float] = []
+        while time.time() < end_at:
+            try:
+                async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_size=2**22) as ws:
+                    while time.time() < end_at:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=5)
+                        except TimeoutError:
+                            continue
+                        recv_ms = time.time() * 1000.0
+                        latest_bin_ws_recv_ms["recv_ms"] = recv_ms
+                        msg = json.loads(raw)
+                        event_ts = msg.get("E")
+                        if event_ts is None:
+                            continue
+                        lags.append(recv_ms - float(event_ts))
+            except Exception:
+                await asyncio.sleep(0.3)
+        return lags
+
+    bin_task = asyncio.create_task(measure_binance_with_recv())
+    pm_task = asyncio.create_task(
+        measure_pm_clob_ws_lag([token_yes, token_no], args.seconds, latest_pm_ws_recv_ms)
+    )
     midpoint_delta_task = asyncio.create_task(
         measure_midpoint_delta(
             args.symbol,
@@ -280,6 +328,10 @@ async def main() -> int:
             "p90_ms": percentile(pm_lags, 0.90) - percentile(bin_lags, 0.90),
             "p99_ms": percentile(pm_lags, 0.99) - percentile(bin_lags, 0.99),
         }
+    if latest_pm_ws_recv_ms.get("recv_ms") and latest_bin_ws_recv_ms.get("recv_ms"):
+        payload["delta"]["latest_pm_ws_recv_minus_latest_binance_ws_recv_ms_same_clock"] = (
+            latest_pm_ws_recv_ms["recv_ms"] - latest_bin_ws_recv_ms["recv_ms"]
+        )
 
     out_dir = Path(args.out_root) / utc_day()
     if run_id:

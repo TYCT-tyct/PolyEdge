@@ -266,11 +266,7 @@ impl ChainlinkReconnectPolicy {
     }
 }
 
-fn should_emit_limited_log(
-    now: Instant,
-    last: Option<Instant>,
-    min_interval: Duration,
-) -> bool {
+fn should_emit_limited_log(now: Instant, last: Option<Instant>, min_interval: Duration) -> bool {
     last.map(|t| now.duration_since(t) >= min_interval)
         .unwrap_or(true)
 }
@@ -745,8 +741,14 @@ mod tests {
         };
         assert_eq!(policy.next_backoff(0, false), Duration::from_millis(2_000));
         assert_eq!(policy.next_backoff(1, false), Duration::from_millis(4_000));
-        assert_eq!(policy.next_backoff(7, false), Duration::from_millis(180_000));
-        assert_eq!(policy.next_backoff(30, false), Duration::from_millis(180_000));
+        assert_eq!(
+            policy.next_backoff(7, false),
+            Duration::from_millis(180_000)
+        );
+        assert_eq!(
+            policy.next_backoff(30, false),
+            Duration::from_millis(180_000)
+        );
         assert_eq!(policy.next_backoff(3, true), Duration::from_secs(60));
     }
 

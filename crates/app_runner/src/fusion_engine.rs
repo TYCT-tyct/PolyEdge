@@ -218,8 +218,6 @@ pub(super) fn fast_tick_allowed_in_fusion_mode(source: &str, mode: &str) -> bool
     }
 }
 
-
-
 pub(super) fn ref_event_ts_ms(tick: &RefTick) -> i64 {
     tick.event_ts_exchange_ms.max(tick.event_ts_ms)
 }
@@ -306,7 +304,6 @@ pub(super) fn fusion_staleness_budget_us_for_source(next_source: &str) -> i64 {
             .clamp(50, 5_000)
     })
 }
-
 
 #[inline]
 pub(super) fn should_log_ref_tick(ingest_seq: u64) -> bool {
