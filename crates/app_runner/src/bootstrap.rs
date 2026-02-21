@@ -196,6 +196,17 @@ pub(super) async fn async_main() -> Result<()> {
     let risk_manager = Arc::new(DefaultRiskManager::new(risk_limits.clone()));
     let predator_cfg = Arc::new(RwLock::new(load_predator_c_config()));
     let predator_cfg0 = predator_cfg.read().await.clone();
+    if predator_cfg0
+        .roll_v1
+        .fee_model
+        .mode
+        .eq_ignore_ascii_case("official_formula")
+    {
+        std::env::set_var("POLYEDGE_FEE_MODEL", "official_poly_formula");
+    } else {
+        std::env::set_var("POLYEDGE_FEE_MODEL", "legacy_linear");
+    }
+    crate::execution_eval::reload_dynamic_fee_config_from_env();
     let predator_direction_detector = Arc::new(RwLock::new(DirectionDetector::new(
         predator_cfg0.direction_detector.clone(),
     )));

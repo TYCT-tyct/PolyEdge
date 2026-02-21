@@ -44,7 +44,8 @@ use crate::strategy_policy::{
     should_observe_only_symbol,
 };
 use crate::strategy_runtime::{
-    classify_time_phase, evaluate_and_route_v52, stage_for_phase, timeframe_total_ms,
+    classify_time_phase, evaluate_and_route_roll_v1, evaluate_and_route_v52, stage_for_phase,
+    timeframe_total_ms,
 };
 use crate::toxicity_runtime::update_toxic_state_from_outcome;
 use crate::{publish_if_telemetry_subscribers, spawn_detached};
@@ -1166,23 +1167,45 @@ pub(crate) fn spawn_strategy_engine(
                         }
 
                         let now_ms = Utc::now().timestamp_millis();
-                        let _ = evaluate_and_route_v52(
-                            &shared,
-                            &bus,
-                            &portfolio,
-                            &execution,
-                            &shadow,
-                            &mut market_rate_budget,
-                            &mut global_rate_budget,
-                            &predator_cfg,
-                            &symbol,
-                            tick_fast,
-                            &latest_fast_ticks,
-                            &latest_anchor_ticks,
-                            now_ms,
-                            None,
-                        )
-                        .await;
+                        let _ = match predator_cfg.strategy_engine.engine_mode {
+                            crate::state::StrategyEngineMode::RollV1 => {
+                                evaluate_and_route_roll_v1(
+                                    &shared,
+                                    &bus,
+                                    &portfolio,
+                                    &execution,
+                                    &shadow,
+                                    &mut market_rate_budget,
+                                    &mut global_rate_budget,
+                                    &predator_cfg,
+                                    &symbol,
+                                    tick_fast,
+                                    &latest_fast_ticks,
+                                    &latest_anchor_ticks,
+                                    now_ms,
+                                )
+                                .await
+                            }
+                            crate::state::StrategyEngineMode::LegacyV52 => {
+                                evaluate_and_route_v52(
+                                    &shared,
+                                    &bus,
+                                    &portfolio,
+                                    &execution,
+                                    &shadow,
+                                    &mut market_rate_budget,
+                                    &mut global_rate_budget,
+                                    &predator_cfg,
+                                    &symbol,
+                                    tick_fast,
+                                    &latest_fast_ticks,
+                                    &latest_anchor_ticks,
+                                    now_ms,
+                                    None,
+                                )
+                                .await
+                            }
+                        };
                         continue;
                     }
 

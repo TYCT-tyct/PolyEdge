@@ -226,9 +226,7 @@ impl PaperRuntimeHandle {
                     .insert(book.market_id.clone(), price);
             }
         }
-        let mid_yes = (book.bid_yes + book.ask_yes) * 0.5;
-        let mid_no = (book.bid_no + book.ask_no) * 0.5;
-        self.force_settle_expired_locked(&mut s, &book.market_id, now_ms, mid_yes, mid_no);
+        self.force_settle_expired_locked(&mut s, book, now_ms);
         self.persist_reports_locked(&mut s);
     }
 
@@ -469,15 +467,9 @@ impl PaperRuntimeHandle {
         }
     }
 
-    fn force_settle_expired_locked(
-        &self,
-        s: &mut PaperRuntimeState,
-        market_id: &str,
-        now_ms: i64,
-        mid_yes: f64,
-        mid_no: f64,
-    ) {
-        let binary_outcome = infer_binary_outcome(mid_yes, mid_no);
+    fn force_settle_expired_locked(&self, s: &mut PaperRuntimeState, book: &BookTop, now_ms: i64) {
+        let market_id = book.market_id.as_str();
+        let binary_outcome = infer_binary_outcome_from_book(book);
         let mut keys = Vec::new();
         keys.push(lot_key(market_id, &OrderSide::BuyYes));
         keys.push(lot_key(market_id, &OrderSide::BuyNo));
@@ -1020,13 +1012,15 @@ fn binary_settlement_thresholds() -> (f64, f64) {
     (high.max(low), low.min(high))
 }
 
-fn infer_binary_outcome(mid_yes: f64, mid_no: f64) -> Option<BinaryOutcome> {
-    let yes = mid_yes.clamp(0.0, 1.0);
-    let no = mid_no.clamp(0.0, 1.0);
+fn infer_binary_outcome_from_book(book: &BookTop) -> Option<BinaryOutcome> {
+    let bid_yes = book.bid_yes.clamp(0.0, 1.0);
+    let ask_yes = book.ask_yes.clamp(0.0, 1.0);
+    let bid_no = book.bid_no.clamp(0.0, 1.0);
+    let ask_no = book.ask_no.clamp(0.0, 1.0);
     let (high, low) = binary_settlement_thresholds();
-    if yes >= high || no <= low {
+    if bid_yes >= high || ask_no <= low {
         Some(BinaryOutcome::Yes)
-    } else if yes <= low || no >= high {
+    } else if ask_yes <= low || bid_no >= high {
         Some(BinaryOutcome::No)
     } else {
         None
@@ -1035,8 +1029,8 @@ fn infer_binary_outcome(mid_yes: f64, mid_no: f64) -> Option<BinaryOutcome> {
 
 fn binary_settlement_source(outcome: BinaryOutcome) -> &'static str {
     match outcome {
-        BinaryOutcome::Yes => "binary_book_yes",
-        BinaryOutcome::No => "binary_book_no",
+        BinaryOutcome::Yes => "binary_book_bbo_yes",
+        BinaryOutcome::No => "binary_book_bbo_no",
     }
 }
 

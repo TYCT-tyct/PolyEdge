@@ -41,17 +41,15 @@ use crate::spawn_predator_exit_lifecycle;
 use crate::state::{
     to_exit_manager_config, EdgeModelConfig, EngineShared, ExitConfig, FusionConfig,
     MarketToxicState, PredatorCConfig, PredatorRegimeConfig, SettlementConfig, ShadowStats,
-    SignalCacheEntry, SourceHealthConfig, ToxicityConfig, V52DualArbConfig, V52ExecutionConfig,
-    V52TimePhaseConfig,
+    SignalCacheEntry, SourceHealthConfig, ToxicityConfig, V52ExecutionConfig, V52TimePhaseConfig,
 };
 use crate::stats_utils::{
     now_ns, percentile, policy_block_ratio, quote_block_ratio, robust_filter_iqr,
 };
 use crate::strategy_policy::{is_market_in_top_n, should_observe_only_symbol};
 use crate::strategy_runtime::{
-    allow_dual_side_arb, classify_predator_regime, classify_time_phase,
-    should_force_taker_fallback, stage_for_phase, time_phase_size_scale, timeframe_total_ms,
-    TimePhase,
+    classify_predator_regime, classify_time_phase, should_force_taker_fallback, stage_for_phase,
+    time_phase_size_scale, timeframe_total_ms, TimePhase,
 };
 
 fn test_engine_shared_with_wss() -> (
@@ -891,11 +889,4 @@ fn v52_force_taker_rule_applies_to_maturity_and_late() {
         31_000,
         &cfg
     ));
-}
-
-#[test]
-fn v52_dual_arb_threshold_formula() {
-    let cfg = V52DualArbConfig::default();
-    assert!(allow_dual_side_arb(0.40, 0.40, 2.0, &cfg));
-    assert!(!allow_dual_side_arb(0.50, 0.49, 2.0, &cfg));
 }

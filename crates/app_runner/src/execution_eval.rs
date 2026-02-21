@@ -1,4 +1,4 @@
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use core_types::{BookTop, EdgeAttribution, OrderIntentV2, OrderSide, QuoteIntent, ShadowShot};
@@ -23,36 +23,52 @@ struct DynamicFeeConfig {
     rate_override: Option<f64>,
 }
 
-static DYNAMIC_FEE_CONFIG: OnceLock<DynamicFeeConfig> = OnceLock::new();
+static DYNAMIC_FEE_CONFIG: OnceLock<StdRwLock<DynamicFeeConfig>> = OnceLock::new();
+
+fn parse_dynamic_fee_config_from_env() -> DynamicFeeConfig {
+    let model = std::env::var("POLYEDGE_FEE_MODEL")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .map(|v| match v.as_str() {
+            "official" | "official_formula" | "official_poly_formula" | "official_poly_5m15m" => {
+                DynamicFeeModel::OfficialPolyFormula
+            }
+            _ => DynamicFeeModel::LegacyLinear,
+        })
+        .unwrap_or(DynamicFeeModel::LegacyLinear);
+    let exponent = std::env::var("POLYEDGE_FEE_EXPONENT")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(2.0)
+        .clamp(0.5, 6.0);
+    let rate_override = std::env::var("POLYEDGE_FEE_RATE")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| v.clamp(0.000001, 1.0));
+    DynamicFeeConfig {
+        model,
+        exponent,
+        rate_override,
+    }
+}
+
+fn dynamic_fee_lock() -> &'static StdRwLock<DynamicFeeConfig> {
+    DYNAMIC_FEE_CONFIG.get_or_init(|| StdRwLock::new(parse_dynamic_fee_config_from_env()))
+}
 
 fn dynamic_fee_config() -> DynamicFeeConfig {
-    *DYNAMIC_FEE_CONFIG.get_or_init(|| {
-        let model = std::env::var("POLYEDGE_FEE_MODEL")
-            .ok()
-            .map(|v| v.trim().to_ascii_lowercase())
-            .map(|v| match v.as_str() {
-                "official" | "official_poly_formula" | "official_poly_5m15m" => {
-                    DynamicFeeModel::OfficialPolyFormula
-                }
-                _ => DynamicFeeModel::LegacyLinear,
-            })
-            .unwrap_or(DynamicFeeModel::LegacyLinear);
-        let exponent = std::env::var("POLYEDGE_FEE_EXPONENT")
-            .ok()
-            .and_then(|v| v.trim().parse::<f64>().ok())
-            .unwrap_or(2.0)
-            .clamp(0.5, 6.0);
-        let rate_override = std::env::var("POLYEDGE_FEE_RATE")
-            .ok()
-            .and_then(|v| v.trim().parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .map(|v| v.clamp(0.000001, 1.0));
-        DynamicFeeConfig {
-            model,
-            exponent,
-            rate_override,
-        }
-    })
+    dynamic_fee_lock()
+        .read()
+        .map(|g| *g)
+        .unwrap_or_else(|_| parse_dynamic_fee_config_from_env())
+}
+
+pub(crate) fn reload_dynamic_fee_config_from_env() {
+    let cfg = parse_dynamic_fee_config_from_env();
+    if let Ok(mut guard) = dynamic_fee_lock().write() {
+        *guard = cfg;
+    }
 }
 
 pub(super) async fn get_fee_rate_bps_cached(shared: &EngineShared, market_id: &str) -> f64 {

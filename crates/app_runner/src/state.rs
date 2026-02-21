@@ -103,6 +103,156 @@ pub(crate) enum PredatorCPriority {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub(crate) enum StrategyEngineMode {
+    #[default]
+    LegacyV52,
+    RollV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct StrategyEngineConfig {
+    pub(crate) engine_mode: StrategyEngineMode,
+    pub(crate) enabled_symbols: Vec<String>,
+    pub(crate) enabled_timeframes: Vec<String>,
+    pub(crate) market_scope: String,
+}
+
+impl Default for StrategyEngineConfig {
+    fn default() -> Self {
+        Self {
+            engine_mode: StrategyEngineMode::LegacyV52,
+            enabled_symbols: vec![
+                "BTCUSDT".to_string(),
+                "ETHUSDT".to_string(),
+                "SOLUSDT".to_string(),
+                "XRPUSDT".to_string(),
+            ],
+            enabled_timeframes: vec!["5m".to_string(), "15m".to_string()],
+            market_scope: "near_expiry_active_only".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct RollV1Config {
+    pub(crate) enabled: bool,
+    #[serde(rename = "5m")]
+    pub(crate) tf5m: RollV1TimeframeConfig,
+    #[serde(rename = "15m")]
+    pub(crate) tf15m: RollV1TimeframeConfig,
+    pub(crate) risk: RollV1RiskConfig,
+    pub(crate) fee_model: RollV1FeeModelConfig,
+    pub(crate) reverse: RollV1ReverseConfig,
+}
+
+impl Default for RollV1Config {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tf5m: RollV1TimeframeConfig {
+                entry_start_remaining_ms: 150_000,
+                entry_end_remaining_ms: 12_000,
+                reverse_velocity_bps_per_sec: -180.0,
+                reverse_persist_ms: 800,
+                reverse_drop_pct: 0.06,
+                ..RollV1TimeframeConfig::default()
+            },
+            tf15m: RollV1TimeframeConfig {
+                entry_start_remaining_ms: 420_000,
+                entry_end_remaining_ms: 20_000,
+                reverse_velocity_bps_per_sec: -120.0,
+                reverse_persist_ms: 1_500,
+                reverse_drop_pct: 0.04,
+                ..RollV1TimeframeConfig::default()
+            },
+            risk: RollV1RiskConfig::default(),
+            fee_model: RollV1FeeModelConfig::default(),
+            reverse: RollV1ReverseConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct RollV1TimeframeConfig {
+    pub(crate) scan_interval_ms: u64,
+    pub(crate) entry_start_remaining_ms: i64,
+    pub(crate) entry_end_remaining_ms: i64,
+    pub(crate) probe_add_pct_min: f64,
+    pub(crate) probe_add_pct_max: f64,
+    pub(crate) scale_add_pct_min: f64,
+    pub(crate) scale_add_pct_max: f64,
+    pub(crate) final_add_pct: f64,
+    pub(crate) max_position_pct_per_market: f64,
+    pub(crate) reverse_velocity_bps_per_sec: f64,
+    pub(crate) reverse_persist_ms: u64,
+    pub(crate) reverse_drop_pct: f64,
+}
+
+impl Default for RollV1TimeframeConfig {
+    fn default() -> Self {
+        Self {
+            scan_interval_ms: 40,
+            entry_start_remaining_ms: 150_000,
+            entry_end_remaining_ms: 12_000,
+            probe_add_pct_min: 0.003,
+            probe_add_pct_max: 0.005,
+            scale_add_pct_min: 0.004,
+            scale_add_pct_max: 0.010,
+            final_add_pct: 0.012,
+            max_position_pct_per_market: 0.055,
+            reverse_velocity_bps_per_sec: -180.0,
+            reverse_persist_ms: 800,
+            reverse_drop_pct: 0.06,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct RollV1RiskConfig {
+    pub(crate) daily_loss_stop_pct: f64,
+    pub(crate) max_total_exposure_pct: f64,
+}
+
+impl Default for RollV1RiskConfig {
+    fn default() -> Self {
+        Self {
+            daily_loss_stop_pct: 2.0,
+            max_total_exposure_pct: 18.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct RollV1FeeModelConfig {
+    pub(crate) mode: String,
+}
+
+impl Default for RollV1FeeModelConfig {
+    fn default() -> Self {
+        Self {
+            mode: "official_formula".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct RollV1ReverseConfig {
+    pub(crate) strong_reversal_velocity_bps_per_sec: f64,
+    pub(crate) maker_first_ttl_ms: u64,
+}
+
+impl Default for RollV1ReverseConfig {
+    fn default() -> Self {
+        Self {
+            strong_reversal_velocity_bps_per_sec: -260.0,
+            maker_first_ttl_ms: 400,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct PredatorCConfig {
     pub(crate) enabled: bool,
     pub(crate) priority: PredatorCPriority,
@@ -114,6 +264,10 @@ pub(crate) struct PredatorCConfig {
     pub(crate) cross_symbol: PredatorCrossSymbolConfig,
     pub(crate) router: RouterConfig,
     pub(crate) compounder: CompounderConfig,
+    #[serde(default)]
+    pub(crate) strategy_engine: StrategyEngineConfig,
+    #[serde(default)]
+    pub(crate) roll_v1: RollV1Config,
     #[serde(default)]
     pub(crate) v52: V52Config,
 }
@@ -131,6 +285,8 @@ impl Default for PredatorCConfig {
             cross_symbol: PredatorCrossSymbolConfig::default(),
             router: RouterConfig::default(),
             compounder: CompounderConfig::default(),
+            strategy_engine: StrategyEngineConfig::default(),
+            roll_v1: RollV1Config::default(),
             v52: V52Config::default(),
         }
     }
@@ -140,7 +296,6 @@ impl Default for PredatorCConfig {
 pub(crate) struct V52Config {
     pub(crate) time_phase: V52TimePhaseConfig,
     pub(crate) execution: V52ExecutionConfig,
-    pub(crate) dual_arb: V52DualArbConfig,
     pub(crate) reversal: V52ReversalConfig,
 }
 
@@ -149,7 +304,6 @@ impl Default for V52Config {
         Self {
             time_phase: V52TimePhaseConfig::default(),
             execution: V52ExecutionConfig::default(),
-            dual_arb: V52DualArbConfig::default(),
             reversal: V52ReversalConfig::default(),
         }
     }
@@ -203,25 +357,6 @@ impl Default for V52ExecutionConfig {
             alpha_window_poll_ms: 10,
             alpha_window_max_wait_ms: 1_000,
             require_compounder_when_live: true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct V52DualArbConfig {
-    pub(crate) enabled: bool,
-    pub(crate) safety_margin_bps: f64,
-    pub(crate) threshold: f64,
-    pub(crate) fee_buffer_mode: String,
-}
-
-impl Default for V52DualArbConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            safety_margin_bps: 3.0,
-            threshold: 0.99,
-            fee_buffer_mode: "conservative_taker".to_string(),
         }
     }
 }
@@ -399,10 +534,11 @@ pub(crate) struct StrategyReloadReq {
     pub(crate) variance_penalty_lambda: Option<f64>,
     pub(crate) min_eval_notional_usdc: Option<f64>,
     pub(crate) min_expected_edge_usdc: Option<f64>,
+    pub(crate) strategy_engine: Option<StrategyEngineConfig>,
+    pub(crate) roll_v1: Option<RollV1Config>,
     pub(crate) v52: Option<V52Config>,
     pub(crate) v52_time_phase: Option<V52TimePhaseConfig>,
     pub(crate) v52_execution: Option<V52ExecutionConfig>,
-    pub(crate) v52_dual_arb: Option<V52DualArbConfig>,
     pub(crate) v52_reversal: Option<V52ReversalConfig>,
 }
 

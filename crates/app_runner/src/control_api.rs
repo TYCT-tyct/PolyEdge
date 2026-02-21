@@ -9,8 +9,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use core_types::{
-    ControlCommand, EngineEvent, ExecutionVenue, PaperDailySummary, PaperTradeRecord, ToxicRegime,
-    TimeframeClass,
+    ControlCommand, EngineEvent, ExecutionVenue, PaperDailySummary, PaperTradeRecord,
+    TimeframeClass, ToxicRegime,
 };
 use direction_detector::DirectionConfig;
 use fair_value::BasisMrConfig;
@@ -31,10 +31,10 @@ use crate::state::{
     ExitConfig, ExitReloadReq, FusionConfig, FusionReloadReq, HealthResp, PerfProfile,
     PerfProfileReloadReq, PredatorCConfig, PredatorCPriority, PredatorCrossSymbolConfig,
     PredatorDConfig, PredatorRegimeConfig, ProbabilityReloadReq, RiskReloadReq, RiskReloadResp,
-    ShadowFinalReport, SourceHealthConfig, SourceHealthReloadReq,
-    StrategyReloadReq, StrategyReloadResp, TakerReloadReq, TakerReloadResp, ToxicityConfig,
-    ToxicityFinalReport, ToxicityLiveReport, ToxicityReloadReq, V52Config, V52DualArbConfig,
-    V52ExecutionConfig, V52ReversalConfig, V52TimePhaseConfig,
+    RollV1Config, ShadowFinalReport, SourceHealthConfig, SourceHealthReloadReq,
+    StrategyEngineConfig, StrategyEngineMode, StrategyReloadReq, StrategyReloadResp,
+    TakerReloadReq, TakerReloadResp, ToxicityConfig, ToxicityFinalReport, ToxicityLiveReport,
+    ToxicityReloadReq, V52Config, V52ExecutionConfig, V52ReversalConfig, V52TimePhaseConfig,
 };
 use crate::stats_utils::percentile;
 use crate::toxicity_report::build_toxicity_live_report;
@@ -60,6 +60,7 @@ pub(super) fn build_router(state: AppState) -> Router {
         .route("/report/paper/history", get(report_paper_history))
         .route("/report/paper/daily", get(report_paper_daily))
         .route("/report/paper/summary", get(report_paper_summary))
+        .route("/report/gates/drop_reasons", get(report_gate_drop_reasons))
         .route("/control/pause", post(pause))
         .route("/control/resume", post(resume))
         .route("/control/drain/enable", post(drain_enable))
@@ -79,6 +80,8 @@ pub(super) fn build_router(state: AppState) -> Router {
         .route("/control/reload_toxicity", post(reload_toxicity))
         .route("/control/reload_risk", post(reload_risk))
         .route("/control/reload_predator_c", post(reload_predator_c))
+        .route("/control/switch_engine_mode", post(switch_engine_mode))
+        .route("/control/reload_roll_v1", post(reload_roll_v1))
         .route("/predator/sync-balance", post(sync_predator_balance))
         .route("/control/reload_fusion", post(reload_fusion))
         .route("/control/reload_edge_model", post(reload_edge_model))
@@ -333,10 +336,7 @@ async fn build_market_selection_snapshot(state: &AppState) -> serde_json::Value 
                 .map(timeframe_label)
                 .unwrap_or("unknown")
                 .to_string();
-            let title = market_to_title
-                .get(market_id)
-                .cloned()
-                .unwrap_or_default();
+            let title = market_to_title.get(market_id).cloned().unwrap_or_default();
             let market_type = market_to_type
                 .get(market_id)
                 .cloned()
@@ -462,10 +462,11 @@ struct PredatorCReloadReq {
     cross_symbol: Option<PredatorCrossSymbolConfig>,
     router: Option<RouterConfig>,
     compounder: Option<CompounderConfig>,
+    strategy_engine: Option<StrategyEngineConfig>,
+    roll_v1: Option<RollV1Config>,
     v52: Option<V52Config>,
     v52_time_phase: Option<V52TimePhaseConfig>,
     v52_execution: Option<V52ExecutionConfig>,
-    v52_dual_arb: Option<V52DualArbConfig>,
     v52_reversal: Option<V52ReversalConfig>,
 }
 
@@ -521,9 +522,103 @@ fn normalize_v52_config(v52: &mut V52Config) {
     v52.execution.alpha_window_poll_ms = v52.execution.alpha_window_poll_ms.clamp(1, 200);
     v52.execution.alpha_window_max_wait_ms =
         v52.execution.alpha_window_max_wait_ms.clamp(50, 5_000);
-    v52.dual_arb.safety_margin_bps = v52.dual_arb.safety_margin_bps.clamp(0.0, 100.0);
-    v52.dual_arb.threshold = v52.dual_arb.threshold.clamp(0.50, 1.10);
-    v52.dual_arb.fee_buffer_mode = "conservative_taker".to_string();
+}
+
+fn normalize_engine_symbol(raw: &str) -> Option<String> {
+    let sym = raw.trim().to_ascii_uppercase();
+    match sym.as_str() {
+        "BTC" | "BTCUSDT" => Some("BTCUSDT".to_string()),
+        "ETH" | "ETHUSDT" => Some("ETHUSDT".to_string()),
+        "SOL" | "SOLUSDT" => Some("SOLUSDT".to_string()),
+        "XRP" | "XRPUSDT" => Some("XRPUSDT".to_string()),
+        _ => None,
+    }
+}
+
+fn normalize_strategy_engine_config(cfg: &mut StrategyEngineConfig) {
+    cfg.enabled_symbols = cfg
+        .enabled_symbols
+        .iter()
+        .filter_map(|s| normalize_engine_symbol(s))
+        .collect::<Vec<_>>();
+    cfg.enabled_symbols.sort();
+    cfg.enabled_symbols.dedup();
+    if cfg.enabled_symbols.is_empty() {
+        cfg.enabled_symbols = vec![
+            "BTCUSDT".to_string(),
+            "ETHUSDT".to_string(),
+            "SOLUSDT".to_string(),
+            "XRPUSDT".to_string(),
+        ];
+    }
+    cfg.enabled_timeframes = cfg
+        .enabled_timeframes
+        .iter()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| s == "5m" || s == "15m")
+        .collect::<Vec<_>>();
+    if cfg.enabled_timeframes.is_empty() {
+        cfg.enabled_timeframes = vec!["5m".to_string(), "15m".to_string()];
+    }
+    cfg.market_scope = cfg.market_scope.trim().to_string();
+    if !cfg
+        .market_scope
+        .eq_ignore_ascii_case("near_expiry_active_only")
+    {
+        cfg.market_scope = "near_expiry_active_only".to_string();
+    }
+}
+
+fn normalize_roll_v1(cfg: &mut RollV1Config) {
+    cfg.tf5m.scan_interval_ms = cfg.tf5m.scan_interval_ms.clamp(10, 500);
+    cfg.tf15m.scan_interval_ms = cfg.tf15m.scan_interval_ms.clamp(10, 500);
+    cfg.tf5m.entry_start_remaining_ms = cfg.tf5m.entry_start_remaining_ms.clamp(20_000, 290_000);
+    cfg.tf5m.entry_end_remaining_ms = cfg.tf5m.entry_end_remaining_ms.clamp(1_000, 60_000);
+    if cfg.tf5m.entry_end_remaining_ms >= cfg.tf5m.entry_start_remaining_ms {
+        cfg.tf5m.entry_start_remaining_ms = 150_000;
+        cfg.tf5m.entry_end_remaining_ms = 12_000;
+    }
+    cfg.tf15m.entry_start_remaining_ms = cfg.tf15m.entry_start_remaining_ms.clamp(60_000, 850_000);
+    cfg.tf15m.entry_end_remaining_ms = cfg.tf15m.entry_end_remaining_ms.clamp(1_000, 120_000);
+    if cfg.tf15m.entry_end_remaining_ms >= cfg.tf15m.entry_start_remaining_ms {
+        cfg.tf15m.entry_start_remaining_ms = 420_000;
+        cfg.tf15m.entry_end_remaining_ms = 20_000;
+    }
+    cfg.tf5m.probe_add_pct_min = cfg.tf5m.probe_add_pct_min.clamp(0.0005, 0.02);
+    cfg.tf5m.probe_add_pct_max = cfg
+        .tf5m
+        .probe_add_pct_max
+        .clamp(cfg.tf5m.probe_add_pct_min, 0.03);
+    cfg.tf5m.scale_add_pct_min = cfg.tf5m.scale_add_pct_min.clamp(0.0005, 0.03);
+    cfg.tf5m.scale_add_pct_max = cfg
+        .tf5m
+        .scale_add_pct_max
+        .clamp(cfg.tf5m.scale_add_pct_min, 0.06);
+    cfg.tf5m.final_add_pct = cfg.tf5m.final_add_pct.clamp(0.0005, 0.08);
+    cfg.tf5m.max_position_pct_per_market = cfg.tf5m.max_position_pct_per_market.clamp(0.005, 0.20);
+    cfg.tf15m.probe_add_pct_min = cfg.tf15m.probe_add_pct_min.clamp(0.0005, 0.02);
+    cfg.tf15m.probe_add_pct_max = cfg
+        .tf15m
+        .probe_add_pct_max
+        .clamp(cfg.tf15m.probe_add_pct_min, 0.03);
+    cfg.tf15m.scale_add_pct_min = cfg.tf15m.scale_add_pct_min.clamp(0.0005, 0.03);
+    cfg.tf15m.scale_add_pct_max = cfg
+        .tf15m
+        .scale_add_pct_max
+        .clamp(cfg.tf15m.scale_add_pct_min, 0.06);
+    cfg.tf15m.final_add_pct = cfg.tf15m.final_add_pct.clamp(0.0005, 0.08);
+    cfg.tf15m.max_position_pct_per_market =
+        cfg.tf15m.max_position_pct_per_market.clamp(0.005, 0.20);
+    cfg.risk.daily_loss_stop_pct = cfg.risk.daily_loss_stop_pct.clamp(0.1, 20.0);
+    cfg.risk.max_total_exposure_pct = cfg.risk.max_total_exposure_pct.clamp(1.0, 95.0);
+    if !cfg.fee_model.mode.eq_ignore_ascii_case("official_formula") {
+        cfg.fee_model.mode = "official_formula".to_string();
+    }
+    cfg.reverse.strong_reversal_velocity_bps_per_sec = cfg
+        .reverse
+        .strong_reversal_velocity_bps_per_sec
+        .clamp(-2000.0, -10.0);
+    cfg.reverse.maker_first_ttl_ms = cfg.reverse.maker_first_ttl_ms.clamp(10, 5_000);
 }
 
 fn normalize_fusion_mode(raw_mode: &str) -> Option<&'static str> {
@@ -568,6 +663,14 @@ async fn reload_predator_c(
     if let Some(v) = req.compounder {
         cfg.compounder = v;
     }
+    if let Some(mut v) = req.strategy_engine {
+        normalize_strategy_engine_config(&mut v);
+        cfg.strategy_engine = v;
+    }
+    if let Some(mut v) = req.roll_v1 {
+        normalize_roll_v1(&mut v);
+        cfg.roll_v1 = v;
+    }
     if let Some(v) = req.v52 {
         cfg.v52 = v;
     }
@@ -576,9 +679,6 @@ async fn reload_predator_c(
     }
     if let Some(v) = req.v52_execution {
         cfg.v52.execution = v;
-    }
-    if let Some(v) = req.v52_dual_arb {
-        cfg.v52.dual_arb = v;
     }
     if let Some(v) = req.v52_reversal {
         cfg.v52.reversal = v;
@@ -964,14 +1064,19 @@ async fn reload_strategy(
         if let Some(v) = req.v52 {
             predator_cfg.v52 = v;
         }
+        if let Some(mut v) = req.strategy_engine {
+            normalize_strategy_engine_config(&mut v);
+            predator_cfg.strategy_engine = v;
+        }
+        if let Some(mut v) = req.roll_v1 {
+            normalize_roll_v1(&mut v);
+            predator_cfg.roll_v1 = v;
+        }
         if let Some(v) = req.v52_time_phase {
             predator_cfg.v52.time_phase = v;
         }
         if let Some(v) = req.v52_execution {
             predator_cfg.v52.execution = v;
-        }
-        if let Some(v) = req.v52_dual_arb {
-            predator_cfg.v52.dual_arb = v;
         }
         if let Some(v) = req.v52_reversal {
             predator_cfg.v52.reversal = v;
@@ -1015,6 +1120,81 @@ async fn reload_strategy(
         fair_value: fair_cfg,
         v52: v52_cfg,
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct SwitchEngineModeReq {
+    engine_mode: StrategyEngineMode,
+}
+
+async fn switch_engine_mode(
+    State(state): State<AppState>,
+    Json(req): Json<SwitchEngineModeReq>,
+) -> Json<serde_json::Value> {
+    let mut cfg = state.shared.predator_cfg.write().await;
+    cfg.strategy_engine.engine_mode = req.engine_mode.clone();
+    let fee_mode = cfg.roll_v1.fee_model.mode.clone();
+    let snapshot = cfg.strategy_engine.clone();
+    drop(cfg);
+    if snapshot.engine_mode == StrategyEngineMode::RollV1
+        && fee_mode.eq_ignore_ascii_case("official_formula")
+    {
+        std::env::set_var("POLYEDGE_FEE_MODEL", "official_formula");
+    } else {
+        std::env::set_var("POLYEDGE_FEE_MODEL", "legacy_linear");
+    }
+    crate::execution_eval::reload_dynamic_fee_config_from_env();
+    append_jsonl(
+        &dataset_path("reports", "strategy_engine_switch.jsonl"),
+        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "strategy_engine": snapshot}),
+    );
+    Json(serde_json::json!({"ok": true, "strategy_engine": snapshot}))
+}
+
+async fn reload_roll_v1(
+    State(state): State<AppState>,
+    Json(mut cfg): Json<RollV1Config>,
+) -> Json<serde_json::Value> {
+    normalize_roll_v1(&mut cfg);
+    {
+        let mut predator_cfg = state.shared.predator_cfg.write().await;
+        predator_cfg.roll_v1 = cfg.clone();
+    }
+    if cfg.fee_model.mode.eq_ignore_ascii_case("official_formula") {
+        std::env::set_var("POLYEDGE_FEE_MODEL", "official_formula");
+    } else {
+        std::env::set_var("POLYEDGE_FEE_MODEL", "legacy_linear");
+    }
+    crate::execution_eval::reload_dynamic_fee_config_from_env();
+    append_jsonl(
+        &dataset_path("reports", "roll_v1_reload.jsonl"),
+        &serde_json::json!({"ts_ms": Utc::now().timestamp_millis(), "roll_v1": cfg}),
+    );
+    Json(serde_json::json!({"ok": true, "roll_v1": cfg}))
+}
+
+#[derive(Debug, Deserialize)]
+struct DropReasonQuery {
+    top: Option<usize>,
+}
+
+async fn report_gate_drop_reasons(
+    State(state): State<AppState>,
+    Query(query): Query<DropReasonQuery>,
+) -> Json<serde_json::Value> {
+    let live = state.shadow_stats.build_live_report().await;
+    let mut rows = live
+        .blocked_reason_by_symbol_timeframe
+        .into_iter()
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    let top = query.top.unwrap_or(200).clamp(1, 2_000);
+    rows.truncate(top);
+    Json(serde_json::json!({
+        "ts_ms": Utc::now().timestamp_millis(),
+        "engine_mode": format!("{:?}", state.shared.predator_cfg.read().await.strategy_engine.engine_mode),
+        "rows": rows
+    }))
 }
 
 async fn reload_taker(

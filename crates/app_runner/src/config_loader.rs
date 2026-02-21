@@ -9,7 +9,7 @@ use strategy_maker::MakerConfig;
 use crate::seat_types::SeatConfig;
 use crate::state::{
     EdgeModelConfig, ExecutionConfig, ExitConfig, FusionConfig, PerfProfile, PredatorCConfig,
-    PredatorCPriority, SettlementConfig, SourceHealthConfig, ToxicityConfig,
+    PredatorCPriority, SettlementConfig, SourceHealthConfig, StrategyEngineMode, ToxicityConfig,
 };
 
 fn strategy_config_path() -> PathBuf {
@@ -109,6 +109,17 @@ fn parse_toml_array_of_strings(val: &str) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
+fn normalize_engine_symbol(raw: &str) -> Option<String> {
+    let sym = raw.trim().to_ascii_uppercase();
+    match sym.as_str() {
+        "BTC" | "BTCUSDT" => Some("BTCUSDT".to_string()),
+        "ETH" | "ETHUSDT" => Some("ETHUSDT".to_string()),
+        "SOL" | "SOLUSDT" => Some("SOLUSDT".to_string()),
+        "XRP" | "XRPUSDT" => Some("XRPUSDT".to_string()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn parse_toml_array_for_key(raw: &str, key: &str) -> Option<Vec<String>> {
     let Ok(value) = toml::from_str::<toml::Value>(raw) else {
@@ -169,7 +180,9 @@ pub(super) fn load_strategy_config() -> MakerConfig {
             match key {
                 "base_quote_size" => cfg.base_quote_size = val.parse::<f64>().unwrap().max(0.01),
                 "min_edge_bps" => cfg.min_edge_bps = val.parse::<f64>().unwrap().max(0.0),
-                "inventory_skew" => cfg.inventory_skew = val.parse::<f64>().unwrap().clamp(0.0, 1.0),
+                "inventory_skew" => {
+                    cfg.inventory_skew = val.parse::<f64>().unwrap().clamp(0.0, 1.0)
+                }
                 "max_spread" => cfg.max_spread = val.parse::<f64>().unwrap().max(0.0001),
                 "ttl_ms" => cfg.ttl_ms = val.parse::<u64>().unwrap().max(50),
                 _ => {}
@@ -177,17 +190,29 @@ pub(super) fn load_strategy_config() -> MakerConfig {
         } else if in_taker {
             match key {
                 "trigger_bps" => cfg.taker_trigger_bps = val.parse::<f64>().unwrap().max(0.0),
-                "max_slippage_bps" => cfg.taker_max_slippage_bps = val.parse::<f64>().unwrap().max(0.0),
-                "stale_tick_filter_ms" => cfg.stale_tick_filter_ms = val.parse::<f64>().unwrap().clamp(50.0, 5_000.0),
+                "max_slippage_bps" => {
+                    cfg.taker_max_slippage_bps = val.parse::<f64>().unwrap().max(0.0)
+                }
+                "stale_tick_filter_ms" => {
+                    cfg.stale_tick_filter_ms = val.parse::<f64>().unwrap().clamp(50.0, 5_000.0)
+                }
                 "market_tier_profile" => cfg.market_tier_profile = val.to_string(),
                 _ => {}
             }
         } else if in_online {
             match key {
-                "capital_fraction_kelly" => cfg.capital_fraction_kelly = val.parse::<f64>().unwrap().clamp(0.01, 1.0),
-                "variance_penalty_lambda" => cfg.variance_penalty_lambda = val.parse::<f64>().unwrap().clamp(0.0, 5.0),
-                "min_eval_notional_usdc" => cfg.min_eval_notional_usdc = val.parse::<f64>().unwrap().max(0.0),
-                "min_expected_edge_usdc" => cfg.min_expected_edge_usdc = val.parse::<f64>().unwrap().max(0.0),
+                "capital_fraction_kelly" => {
+                    cfg.capital_fraction_kelly = val.parse::<f64>().unwrap().clamp(0.01, 1.0)
+                }
+                "variance_penalty_lambda" => {
+                    cfg.variance_penalty_lambda = val.parse::<f64>().unwrap().clamp(0.0, 5.0)
+                }
+                "min_eval_notional_usdc" => {
+                    cfg.min_eval_notional_usdc = val.parse::<f64>().unwrap().max(0.0)
+                }
+                "min_expected_edge_usdc" => {
+                    cfg.min_expected_edge_usdc = val.parse::<f64>().unwrap().max(0.0)
+                }
                 _ => {}
             }
         }
@@ -419,9 +444,7 @@ pub(super) fn load_fusion_config() -> FusionConfig {
             "both [fusion] and legacy [transport] are present; [fusion] takes precedence"
         );
     } else if saw_transport {
-        tracing::warn!(
-            "legacy [transport] section detected; please migrate to [fusion]"
-        );
+        tracing::warn!("legacy [transport] section detected; please migrate to [fusion]");
     }
     std::env::set_var(
         "POLYEDGE_UDP_LOCAL_ONLY",
@@ -457,10 +480,18 @@ pub(super) fn load_source_health_config() -> SourceHealthConfig {
         match key {
             "min_samples" => cfg.min_samples = val.parse::<u64>().unwrap().max(1),
             "gap_window_ms" => cfg.gap_window_ms = val.parse::<i64>().unwrap().clamp(50, 60_000),
-            "jitter_limit_ms" => cfg.jitter_limit_ms = val.parse::<f64>().unwrap().clamp(0.1, 2_000.0),
-            "deviation_limit_bps" => cfg.deviation_limit_bps = val.parse::<f64>().unwrap().clamp(0.1, 10_000.0),
-            "freshness_limit_ms" => cfg.freshness_limit_ms = val.parse::<f64>().unwrap().clamp(50.0, 60_000.0),
-            "min_score_for_trading" => cfg.min_score_for_trading = val.parse::<f64>().unwrap().clamp(0.0, 1.0),
+            "jitter_limit_ms" => {
+                cfg.jitter_limit_ms = val.parse::<f64>().unwrap().clamp(0.1, 2_000.0)
+            }
+            "deviation_limit_bps" => {
+                cfg.deviation_limit_bps = val.parse::<f64>().unwrap().clamp(0.1, 10_000.0)
+            }
+            "freshness_limit_ms" => {
+                cfg.freshness_limit_ms = val.parse::<f64>().unwrap().clamp(50.0, 60_000.0)
+            }
+            "min_score_for_trading" => {
+                cfg.min_score_for_trading = val.parse::<f64>().unwrap().clamp(0.0, 1.0)
+            }
             _ => {}
         }
     }
@@ -496,7 +527,9 @@ pub(super) fn load_edge_model_config() -> EdgeModelConfig {
             "gate_mode" => cfg.gate_mode = val.to_string(),
             "version" => cfg.version = val.to_string(),
             "base_gate_bps" => cfg.base_gate_bps = val.parse::<f64>().unwrap().max(0.0),
-            "congestion_penalty_bps" => cfg.congestion_penalty_bps = val.parse::<f64>().unwrap().max(0.0),
+            "congestion_penalty_bps" => {
+                cfg.congestion_penalty_bps = val.parse::<f64>().unwrap().max(0.0)
+            }
             "latency_penalty_bps" => cfg.latency_penalty_bps = val.parse::<f64>().unwrap().max(0.0),
             "fail_cost_bps" => cfg.fail_cost_bps = val.parse::<f64>().unwrap().max(0.0),
             _ => {}
@@ -533,18 +566,31 @@ pub(super) fn load_exit_config() -> ExitConfig {
             "enabled" => cfg.enabled = val.parse::<bool>().unwrap(),
             "t300ms_reversal_bps" => cfg.t300ms_reversal_bps = val.parse::<f64>().unwrap(),
             "t100ms_reversal_bps" => cfg.t100ms_reversal_bps = val.parse::<f64>().unwrap(),
-            "convergence_exit_ratio" => cfg.convergence_exit_ratio = val.parse::<f64>().unwrap().clamp(0.0, 1.0),
+            "convergence_exit_ratio" => {
+                cfg.convergence_exit_ratio = val.parse::<f64>().unwrap().clamp(0.0, 1.0)
+            }
             "time_stop_ms" => cfg.time_stop_ms = val.parse::<u64>().unwrap().clamp(50, 600_000),
             "edge_decay_bps" => cfg.edge_decay_bps = val.parse::<f64>().unwrap(),
             "adverse_move_bps" => cfg.adverse_move_bps = val.parse::<f64>().unwrap(),
             "flatten_on_trigger" => cfg.flatten_on_trigger = val.parse::<bool>().unwrap(),
             "t3_take_ratio" => cfg.t3_take_ratio = val.parse::<f64>().unwrap().clamp(0.0, 5.0),
             "t15_min_unrealized_usdc" => cfg.t15_min_unrealized_usdc = val.parse::<f64>().unwrap(),
-            "t60_true_prob_floor" => cfg.t60_true_prob_floor = val.parse::<f64>().unwrap().clamp(0.0, 1.0),
-            "t300_force_exit_ms" => cfg.t300_force_exit_ms = val.parse::<u64>().unwrap().clamp(1_000, 1_800_000),
-            "t300_hold_prob_threshold" => cfg.t300_hold_prob_threshold = val.parse::<f64>().unwrap().clamp(0.0, 1.0),
-            "t300_hold_time_to_expiry_ms" => cfg.t300_hold_time_to_expiry_ms = val.parse::<u64>().unwrap().clamp(1_000, 1_800_000),
-            "max_single_trade_loss_usdc" => cfg.max_single_trade_loss_usdc = val.parse::<f64>().unwrap().max(0.0),
+            "t60_true_prob_floor" => {
+                cfg.t60_true_prob_floor = val.parse::<f64>().unwrap().clamp(0.0, 1.0)
+            }
+            "t300_force_exit_ms" => {
+                cfg.t300_force_exit_ms = val.parse::<u64>().unwrap().clamp(1_000, 1_800_000)
+            }
+            "t300_hold_prob_threshold" => {
+                cfg.t300_hold_prob_threshold = val.parse::<f64>().unwrap().clamp(0.0, 1.0)
+            }
+            "t300_hold_time_to_expiry_ms" => {
+                cfg.t300_hold_time_to_expiry_ms =
+                    val.parse::<u64>().unwrap().clamp(1_000, 1_800_000)
+            }
+            "max_single_trade_loss_usdc" => {
+                cfg.max_single_trade_loss_usdc = val.parse::<f64>().unwrap().max(0.0)
+            }
             _ => {}
         }
     }
@@ -569,9 +615,14 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
     let mut in_cross = false;
     let mut in_router = false;
     let mut in_compounder = false;
+    let mut in_strategy_engine = false;
+    let mut in_roll_v1_5m = false;
+    let mut in_roll_v1_15m = false;
+    let mut in_roll_v1_risk = false;
+    let mut in_roll_v1_fee_model = false;
+    let mut in_roll_v1_reverse = false;
     let mut in_v52_time_phase = false;
     let mut in_v52_execution = false;
-    let mut in_v52_dual_arb = false;
     let mut in_v52_reversal = false;
     let mut gatling_symbol_section: Option<String> = None;
 
@@ -592,9 +643,17 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
             in_cross = line == "[predator_c.cross_symbol]";
             in_router = line == "[predator_c.router]";
             in_compounder = line == "[predator_c.compounder]";
+            in_strategy_engine =
+                line == "[strategy_engine]" || line == "[predator_c.strategy_engine]";
+            in_roll_v1_5m = line == "[roll_v1.5m]" || line == "[predator_c.roll_v1.5m]";
+            in_roll_v1_15m = line == "[roll_v1.15m]" || line == "[predator_c.roll_v1.15m]";
+            in_roll_v1_risk = line == "[roll_v1.risk]" || line == "[predator_c.roll_v1.risk]";
+            in_roll_v1_fee_model =
+                line == "[roll_v1.fee_model]" || line == "[predator_c.roll_v1.fee_model]";
+            in_roll_v1_reverse =
+                line == "[roll_v1.reverse]" || line == "[predator_c.roll_v1.reverse]";
             in_v52_time_phase = line == "[v52.time_phase]" || line == "[predator_c.v52.time_phase]";
             in_v52_execution = line == "[v52.execution]" || line == "[predator_c.v52.execution]";
-            in_v52_dual_arb = line == "[v52.dual_arb]" || line == "[predator_c.v52.dual_arb]";
             in_v52_reversal = line == "[v52.reversal]" || line == "[predator_c.v52.reversal]";
             continue;
         }
@@ -608,9 +667,14 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
             || in_cross
             || in_router
             || in_compounder
+            || in_strategy_engine
+            || in_roll_v1_5m
+            || in_roll_v1_15m
+            || in_roll_v1_risk
+            || in_roll_v1_fee_model
+            || in_roll_v1_reverse
             || in_v52_time_phase
             || in_v52_execution
-            || in_v52_dual_arb
             || in_v52_reversal
             || gatling_symbol_section.is_some())
         {
@@ -1134,6 +1198,151 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
             continue;
         }
 
+        if in_strategy_engine {
+            match key {
+                "engine_mode" => {
+                    let mode = val.trim().to_ascii_lowercase();
+                    cfg.strategy_engine.engine_mode = match mode.as_str() {
+                        "roll_v1" => StrategyEngineMode::RollV1,
+                        _ => StrategyEngineMode::LegacyV52,
+                    };
+                }
+                "enabled_symbols" => {
+                    let parsed = parse_toml_array_of_strings(v.trim());
+                    if !parsed.is_empty() {
+                        cfg.strategy_engine.enabled_symbols = parsed;
+                    }
+                }
+                "enabled_timeframes" => {
+                    let parsed = parse_toml_array_of_strings(v.trim());
+                    if !parsed.is_empty() {
+                        cfg.strategy_engine.enabled_timeframes = parsed;
+                    }
+                }
+                "market_scope" => {
+                    cfg.strategy_engine.market_scope = val.trim().to_string();
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if in_roll_v1_5m || in_roll_v1_15m {
+            let tf = if in_roll_v1_5m {
+                &mut cfg.roll_v1.tf5m
+            } else {
+                &mut cfg.roll_v1.tf15m
+            };
+            match key {
+                "scan_interval_ms" => {
+                    if let Ok(parsed) = val.parse::<u64>() {
+                        tf.scan_interval_ms = parsed;
+                    }
+                }
+                "entry_start_remaining_ms" => {
+                    if let Ok(parsed) = val.parse::<i64>() {
+                        tf.entry_start_remaining_ms = parsed;
+                    }
+                }
+                "entry_end_remaining_ms" => {
+                    if let Ok(parsed) = val.parse::<i64>() {
+                        tf.entry_end_remaining_ms = parsed;
+                    }
+                }
+                "probe_add_pct_min" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        tf.probe_add_pct_min = parsed;
+                    }
+                }
+                "probe_add_pct_max" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        tf.probe_add_pct_max = parsed;
+                    }
+                }
+                "scale_add_pct_min" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        tf.scale_add_pct_min = parsed;
+                    }
+                }
+                "scale_add_pct_max" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        tf.scale_add_pct_max = parsed;
+                    }
+                }
+                "final_add_pct" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        tf.final_add_pct = parsed;
+                    }
+                }
+                "max_position_pct_per_market" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        tf.max_position_pct_per_market = parsed;
+                    }
+                }
+                "reverse_velocity_bps_per_sec" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        tf.reverse_velocity_bps_per_sec = parsed;
+                    }
+                }
+                "reverse_persist_ms" => {
+                    if let Ok(parsed) = val.parse::<u64>() {
+                        tf.reverse_persist_ms = parsed;
+                    }
+                }
+                "reverse_drop_pct" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        tf.reverse_drop_pct = parsed;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if in_roll_v1_risk {
+            match key {
+                "daily_loss_stop_pct" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.roll_v1.risk.daily_loss_stop_pct = parsed;
+                    }
+                }
+                "max_total_exposure_pct" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.roll_v1.risk.max_total_exposure_pct = parsed;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if in_roll_v1_fee_model {
+            match key {
+                "mode" => {
+                    cfg.roll_v1.fee_model.mode = val.trim().to_string();
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if in_roll_v1_reverse {
+            match key {
+                "strong_reversal_velocity_bps_per_sec" => {
+                    if let Ok(parsed) = val.parse::<f64>() {
+                        cfg.roll_v1.reverse.strong_reversal_velocity_bps_per_sec = parsed;
+                    }
+                }
+                "maker_first_ttl_ms" => {
+                    if let Ok(parsed) = val.parse::<u64>() {
+                        cfg.roll_v1.reverse.maker_first_ttl_ms = parsed;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
         if in_v52_time_phase {
             match key {
                 "early_min_ratio" => {
@@ -1227,31 +1436,6 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
             continue;
         }
 
-        if in_v52_dual_arb {
-            match key {
-                "enabled" => {
-                    if let Ok(parsed) = val.parse::<bool>() {
-                        cfg.v52.dual_arb.enabled = parsed;
-                    }
-                }
-                "safety_margin_bps" => {
-                    if let Ok(parsed) = val.parse::<f64>() {
-                        cfg.v52.dual_arb.safety_margin_bps = parsed;
-                    }
-                }
-                "threshold" => {
-                    if let Ok(parsed) = val.parse::<f64>() {
-                        cfg.v52.dual_arb.threshold = parsed;
-                    }
-                }
-                "fee_buffer_mode" => {
-                    cfg.v52.dual_arb.fee_buffer_mode = val.trim().to_ascii_lowercase();
-                }
-                _ => {}
-            }
-            continue;
-        }
-
         if in_v52_reversal {
             match key {
                 "same_market_opposite_first" => {
@@ -1301,11 +1485,121 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
     cfg.v52.execution.alpha_window_poll_ms = cfg.v52.execution.alpha_window_poll_ms.clamp(1, 200);
     cfg.v52.execution.alpha_window_max_wait_ms =
         cfg.v52.execution.alpha_window_max_wait_ms.clamp(50, 5_000);
-    cfg.v52.dual_arb.safety_margin_bps = cfg.v52.dual_arb.safety_margin_bps.clamp(0.0, 100.0);
-    cfg.v52.dual_arb.threshold = cfg.v52.dual_arb.threshold.clamp(0.50, 1.10);
-    if cfg.v52.dual_arb.fee_buffer_mode != "conservative_taker" {
-        cfg.v52.dual_arb.fee_buffer_mode = "conservative_taker".to_string();
+    cfg.strategy_engine.enabled_symbols = cfg
+        .strategy_engine
+        .enabled_symbols
+        .iter()
+        .filter_map(|s| normalize_engine_symbol(s))
+        .collect::<Vec<_>>();
+    cfg.strategy_engine.enabled_symbols.sort();
+    cfg.strategy_engine.enabled_symbols.dedup();
+    if cfg.strategy_engine.enabled_symbols.is_empty() {
+        cfg.strategy_engine.enabled_symbols = vec![
+            "BTCUSDT".to_string(),
+            "ETHUSDT".to_string(),
+            "SOLUSDT".to_string(),
+            "XRPUSDT".to_string(),
+        ];
     }
+    cfg.strategy_engine.enabled_timeframes = cfg
+        .strategy_engine
+        .enabled_timeframes
+        .iter()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| s == "5m" || s == "15m")
+        .collect::<Vec<_>>();
+    if cfg.strategy_engine.enabled_timeframes.is_empty() {
+        cfg.strategy_engine.enabled_timeframes = vec!["5m".to_string(), "15m".to_string()];
+    }
+    cfg.strategy_engine.market_scope = cfg.strategy_engine.market_scope.trim().to_string();
+    if !cfg
+        .strategy_engine
+        .market_scope
+        .eq_ignore_ascii_case("near_expiry_active_only")
+    {
+        cfg.strategy_engine.market_scope = "near_expiry_active_only".to_string();
+    }
+    cfg.roll_v1.tf5m.scan_interval_ms = cfg.roll_v1.tf5m.scan_interval_ms.clamp(10, 500);
+    cfg.roll_v1.tf15m.scan_interval_ms = cfg.roll_v1.tf15m.scan_interval_ms.clamp(10, 500);
+    cfg.roll_v1.tf5m.entry_start_remaining_ms = cfg
+        .roll_v1
+        .tf5m
+        .entry_start_remaining_ms
+        .clamp(20_000, 290_000);
+    cfg.roll_v1.tf5m.entry_end_remaining_ms =
+        cfg.roll_v1.tf5m.entry_end_remaining_ms.clamp(1_000, 60_000);
+    if cfg.roll_v1.tf5m.entry_end_remaining_ms >= cfg.roll_v1.tf5m.entry_start_remaining_ms {
+        cfg.roll_v1.tf5m.entry_start_remaining_ms = 150_000;
+        cfg.roll_v1.tf5m.entry_end_remaining_ms = 12_000;
+    }
+    cfg.roll_v1.tf15m.entry_start_remaining_ms = cfg
+        .roll_v1
+        .tf15m
+        .entry_start_remaining_ms
+        .clamp(60_000, 850_000);
+    cfg.roll_v1.tf15m.entry_end_remaining_ms = cfg
+        .roll_v1
+        .tf15m
+        .entry_end_remaining_ms
+        .clamp(1_000, 120_000);
+    if cfg.roll_v1.tf15m.entry_end_remaining_ms >= cfg.roll_v1.tf15m.entry_start_remaining_ms {
+        cfg.roll_v1.tf15m.entry_start_remaining_ms = 420_000;
+        cfg.roll_v1.tf15m.entry_end_remaining_ms = 20_000;
+    }
+    cfg.roll_v1.tf5m.probe_add_pct_min = cfg.roll_v1.tf5m.probe_add_pct_min.clamp(0.0005, 0.02);
+    cfg.roll_v1.tf5m.probe_add_pct_max = cfg
+        .roll_v1
+        .tf5m
+        .probe_add_pct_max
+        .clamp(cfg.roll_v1.tf5m.probe_add_pct_min, 0.03);
+    cfg.roll_v1.tf5m.scale_add_pct_min = cfg.roll_v1.tf5m.scale_add_pct_min.clamp(0.0005, 0.03);
+    cfg.roll_v1.tf5m.scale_add_pct_max = cfg
+        .roll_v1
+        .tf5m
+        .scale_add_pct_max
+        .clamp(cfg.roll_v1.tf5m.scale_add_pct_min, 0.06);
+    cfg.roll_v1.tf5m.final_add_pct = cfg.roll_v1.tf5m.final_add_pct.clamp(0.0005, 0.08);
+    cfg.roll_v1.tf5m.max_position_pct_per_market = cfg
+        .roll_v1
+        .tf5m
+        .max_position_pct_per_market
+        .clamp(0.005, 0.20);
+    cfg.roll_v1.tf15m.probe_add_pct_min = cfg.roll_v1.tf15m.probe_add_pct_min.clamp(0.0005, 0.02);
+    cfg.roll_v1.tf15m.probe_add_pct_max = cfg
+        .roll_v1
+        .tf15m
+        .probe_add_pct_max
+        .clamp(cfg.roll_v1.tf15m.probe_add_pct_min, 0.03);
+    cfg.roll_v1.tf15m.scale_add_pct_min = cfg.roll_v1.tf15m.scale_add_pct_min.clamp(0.0005, 0.03);
+    cfg.roll_v1.tf15m.scale_add_pct_max = cfg
+        .roll_v1
+        .tf15m
+        .scale_add_pct_max
+        .clamp(cfg.roll_v1.tf15m.scale_add_pct_min, 0.06);
+    cfg.roll_v1.tf15m.final_add_pct = cfg.roll_v1.tf15m.final_add_pct.clamp(0.0005, 0.08);
+    cfg.roll_v1.tf15m.max_position_pct_per_market = cfg
+        .roll_v1
+        .tf15m
+        .max_position_pct_per_market
+        .clamp(0.005, 0.20);
+    cfg.roll_v1.risk.daily_loss_stop_pct = cfg.roll_v1.risk.daily_loss_stop_pct.clamp(0.1, 20.0);
+    cfg.roll_v1.risk.max_total_exposure_pct =
+        cfg.roll_v1.risk.max_total_exposure_pct.clamp(1.0, 95.0);
+    if !cfg
+        .roll_v1
+        .fee_model
+        .mode
+        .eq_ignore_ascii_case("official_formula")
+    {
+        cfg.roll_v1.fee_model.mode = "official_formula".to_string();
+    }
+    cfg.roll_v1.reverse.strong_reversal_velocity_bps_per_sec = cfg
+        .roll_v1
+        .reverse
+        .strong_reversal_velocity_bps_per_sec
+        .clamp(-2000.0, -10.0);
+    cfg.roll_v1.reverse.maker_first_ttl_ms =
+        cfg.roll_v1.reverse.maker_first_ttl_ms.clamp(10, 5_000);
     cfg.taker_sniper.min_win_rate_score = cfg.taker_sniper.min_win_rate_score.clamp(0.0, 100.0);
     cfg.taker_sniper.dynamic_fee_gate_scale =
         cfg.taker_sniper.dynamic_fee_gate_scale.clamp(0.05, 5.0);
