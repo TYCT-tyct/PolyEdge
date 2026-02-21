@@ -20,7 +20,7 @@ min_expected_edge_usdc = 0.0002
 [fair_value.basis_mr]
 enabled = true
 alpha_mean = 0.08
-alpha_var = 0.10
+alpha_var = 0.1
 alpha_ret = 0.15
 alpha_vol = 0.12
 k_revert = 0.85
@@ -34,20 +34,16 @@ outlier_method = "iqr"
 iqr_k = 1.5
 min_samples = 5
 
-# ===== Predator C+ (MVP) =====
-# Edge-confirmed: Direction only decides YES/NO side; EV thresholds are still enforced.
-
 [predator_c]
 enabled = true
-# "maker_first" | "taker_first" | "taker_only"
 priority = "taker_only"
 
 [predator_c.direction_detector]
 window_max_sec = 120
-threshold_5m_pct = 0.0010
-threshold_15m_pct = 0.0020
+threshold_5m_pct = 0.001
+threshold_15m_pct = 0.002
 threshold_1h_pct = 0.05
-threshold_1d_pct = 0.10
+threshold_1d_pct = 0.1
 lookback_short_sec = 10
 lookback_long_sec = 30
 min_sources_for_high_confidence = 1
@@ -68,7 +64,7 @@ source_vote_max_age_ms = 5000
 momentum_gain = 2.0
 lag_penalty_per_ms = 0.0002
 confidence_floor = 0.05
-sigma_annual = 0.90
+sigma_annual = 0.9
 horizon_sec = 30
 drift_annual = 0.0
 velocity_drift_gain = 0.35
@@ -77,29 +73,32 @@ fair_blend_weight = 0.35
 
 [predator_c.taker_sniper]
 min_direction_confidence = 0.08
-min_edge_net_bps = -5.0
-max_spread = 0.30
+min_edge_net_bps = 0.5
+max_spread = 0.3
 cooldown_ms_per_market = 300
-min_win_rate_score = 0.0
+min_win_rate_score = 5.0
 dynamic_fee_gate_enabled = false
-dynamic_fee_gate_scale = 0.08
-dynamic_fee_gate_max_confidence_relax = 0.70
+dynamic_fee_gate_scale = 0.05
+dynamic_fee_gate_max_confidence_relax = 0.8
 
 [predator_c.regime]
 enabled = true
-active_min_confidence = 0.08
+active_min_confidence = 0.15
 active_min_magnitude_pct = 0.001
-defend_tox_score = 1.00
+defend_tox_score = 1.0
 defend_on_toxic_danger = false
-defend_min_source_health = 0.10
-quiet_min_edge_multiplier = 0.80
-quiet_chunk_scale = 1.00
+defend_min_source_health = 0.1
+quiet_min_edge_multiplier = 0.8
+quiet_chunk_scale = 1.0
 
 [predator_c.cross_symbol]
 enabled = true
 leader_symbol = "BTCUSDT"
-follower_symbols = ["ETHUSDT", "SOLUSDT"]
-min_leader_confidence = 0.80
+follower_symbols = [
+    "ETHUSDT",
+    "SOLUSDT",
+]
+min_leader_confidence = 0.8
 min_leader_magnitude_pct = 0.12
 follower_stale_confidence_max = 0.65
 max_correlated_positions = 2
@@ -152,9 +151,9 @@ convergence_exit_ratio = 0.85
 time_stop_ms = 300000
 edge_decay_bps = -2.0
 adverse_move_bps = -8.0
-t3_take_ratio = 0.60
+t3_take_ratio = 0.6
 t15_min_unrealized_usdc = 0.0
-t60_true_prob_floor = 0.70
+t60_true_prob_floor = 0.7
 t300_force_exit_ms = 300000
 t300_hold_prob_threshold = 0.95
 t300_hold_time_to_expiry_ms = 300000
@@ -162,13 +161,12 @@ max_single_trade_loss_usdc = 1.0
 flatten_on_trigger = true
 
 [predator_c.router]
-max_locked_pct_5m = 0.30
-max_locked_pct_15m = 0.40
-max_locked_pct_1h = 0.50
-max_locked_pct_1d = 0.30
+max_locked_pct_5m = 0.3
+max_locked_pct_15m = 0.4
+max_locked_pct_1h = 0.5
+max_locked_pct_1d = 0.3
 max_concurrent_positions = 8
-liquidity_reserve_pct = 0.20
-# Micro-live hard caps (keep permissive in paper/shadow; override when armed)
+liquidity_reserve_pct = 0.2
 max_order_notional_usdc = 2.0
 max_total_notional_usdc = 10.0
 
@@ -176,18 +174,20 @@ max_total_notional_usdc = 10.0
 enabled = true
 initial_capital_usdc = 10.0
 compound_ratio = 1.0
-position_fraction = 0.80
+position_fraction = 0.8
 min_quote_size = 1.0
-# For micro-live: loss <= -1U triggers pause+flatten (enforced only when live-armed).
-daily_loss_cap_usdc = 0.50
+daily_loss_cap_usdc = 0.5
 
 [v52.time_phase]
 early_min_ratio = 0.55
-late_max_ratio = 0.10
-early_size_scale = 1.00
-maturity_size_scale = 1.00
-late_size_scale = 0.10
-allow_timeframes = ["5m", "15m"]
+late_max_ratio = 0.1
+early_size_scale = 1.0
+maturity_size_scale = 1.0
+late_size_scale = 0.1
+allow_timeframes = [
+    "5m",
+    "15m",
+]
 
 [v52.execution]
 late_force_taker_remaining_ms = 30000
@@ -211,8 +211,6 @@ same_market_opposite_first = true
 
 [fusion]
 enable_udp = true
-# SEAT Latency Fabric v1.0: WebSocket 为主通道，UDP 仅紧急 fallback
-# 可选: "direct_only"(仅直连WS) / "active_active"(双路并行) / "hyper_mesh"(主模式, 自适应融合)
 mode = "hyper_mesh"
 udp_local_only = true
 udp_share_cap = 0.35
@@ -220,7 +218,6 @@ jitter_threshold_ms = 25
 fallback_arm_duration_ms = 8000
 fallback_cooldown_sec = 300
 udp_port = 6666
-# 更激进去重窗口
 dedupe_window_ms = 2
 dedupe_price_bps = 0.02
 
@@ -245,9 +242,6 @@ congestion_penalty_bps = 2.0
 latency_penalty_bps = 2.0
 fail_cost_bps = 1.0
 
-
-# ===== Risk Controls (P2) =====
-
 [risk_controls]
 enabled = true
 
@@ -257,13 +251,13 @@ max_per_market_exposure_usdc = 2.0
 max_concurrent_positions = 8
 
 [risk_controls.kill_switch]
-max_drawdown_pct = 0.20
+max_drawdown_pct = 0.2
 max_loss_streak = 5
 cooldown_sec = 60
 
 [risk_controls.progressive_limits]
 enabled = true
-drawdown_tier1_ratio = 0.50
-drawdown_tier2_ratio = 0.80
-tier1_size_scale = 0.70
-tier2_size_scale = 0.40
+drawdown_tier1_ratio = 0.5
+drawdown_tier2_ratio = 0.8
+tier1_size_scale = 0.7
+tier2_size_scale = 0.4
