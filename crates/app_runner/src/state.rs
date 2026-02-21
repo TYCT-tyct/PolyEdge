@@ -330,6 +330,8 @@ pub(crate) struct EngineShared {
     pub(crate) latest_books: Arc<RwLock<HashMap<String, BookTop>>>,
     pub(crate) latest_signals: Arc<DashMap<String, SignalCacheEntry>>,
     pub(crate) market_to_symbol: Arc<RwLock<HashMap<String, String>>>,
+    pub(crate) market_to_title: Arc<RwLock<HashMap<String, String>>>,
+    pub(crate) market_to_type: Arc<RwLock<HashMap<String, String>>>,
     pub(crate) token_to_symbol: Arc<RwLock<HashMap<String, String>>>,
     pub(crate) market_to_timeframe: Arc<RwLock<HashMap<String, TimeframeClass>>>,
     pub(crate) symbol_to_markets: Arc<RwLock<HashMap<String, Vec<String>>>>,
@@ -1880,7 +1882,8 @@ impl ShadowStats {
     }
 
     pub(crate) fn mark_death_box_toxic_reversal(&self) {
-        self.death_box_toxic_reversal.fetch_add(1, Ordering::Relaxed);
+        self.death_box_toxic_reversal
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn mark_death_box_fee_bleed(&self) {

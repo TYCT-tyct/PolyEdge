@@ -9,6 +9,7 @@ use axum::{Json, Router};
 use chrono::Utc;
 use core_types::{
     ControlCommand, EngineEvent, ExecutionVenue, PaperDailySummary, PaperTradeRecord, ToxicRegime,
+    TimeframeClass,
 };
 use direction_detector::DirectionConfig;
 use fair_value::BasisMrConfig;
@@ -29,7 +30,7 @@ use crate::state::{
     ExitConfig, ExitReloadReq, FusionConfig, FusionReloadReq, HealthResp, PerfProfile,
     PerfProfileReloadReq, PredatorCConfig, PredatorCPriority, PredatorCrossSymbolConfig,
     PredatorDConfig, PredatorRegimeConfig, ProbabilityReloadReq, RiskReloadReq, RiskReloadResp,
-    ShadowFinalReport, ShadowLiveReport, SourceHealthConfig, SourceHealthReloadReq,
+    ShadowFinalReport, SourceHealthConfig, SourceHealthReloadReq,
     StrategyReloadReq, StrategyReloadResp, TakerReloadReq, TakerReloadResp, ToxicityConfig,
     ToxicityFinalReport, ToxicityLiveReport, ToxicityReloadReq, V52Config, V52DualArbConfig,
     V52ExecutionConfig, V52ReversalConfig, V52TimePhaseConfig,
@@ -296,8 +297,91 @@ struct PaperHistoryQuery {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Serialize)]
+struct MarketSelectionRow {
+    market_id: String,
+    symbol: String,
+    market_type: String,
+    timeframe: String,
+    title: String,
+}
+
+fn timeframe_label(tf: &TimeframeClass) -> &'static str {
+    match tf {
+        TimeframeClass::Tf5m => "5m",
+        TimeframeClass::Tf15m => "15m",
+        TimeframeClass::Tf1h => "1h",
+        TimeframeClass::Tf1d => "1d",
+    }
+}
+
+async fn build_market_selection_snapshot(state: &AppState) -> serde_json::Value {
+    let symbols = (*state.shared.universe_symbols).clone();
+    let market_types = (*state.shared.universe_market_types).clone();
+    let timeframes = (*state.shared.universe_timeframes).clone();
+    let market_to_symbol = state.shared.market_to_symbol.read().await.clone();
+    let market_to_title = state.shared.market_to_title.read().await.clone();
+    let market_to_type = state.shared.market_to_type.read().await.clone();
+    let market_to_timeframe = state.shared.market_to_timeframe.read().await.clone();
+
+    let mut markets = market_to_symbol
+        .iter()
+        .map(|(market_id, symbol)| {
+            let timeframe = market_to_timeframe
+                .get(market_id)
+                .map(timeframe_label)
+                .unwrap_or("unknown")
+                .to_string();
+            let title = market_to_title
+                .get(market_id)
+                .cloned()
+                .unwrap_or_default();
+            let market_type = market_to_type
+                .get(market_id)
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string());
+            MarketSelectionRow {
+                market_id: market_id.clone(),
+                symbol: symbol.clone(),
+                market_type,
+                timeframe,
+                title,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    markets.sort_by(|a, b| {
+        a.symbol
+            .cmp(&b.symbol)
+            .then(a.timeframe.cmp(&b.timeframe))
+            .then(a.market_id.cmp(&b.market_id))
+    });
+
+    let title = format!(
+        "PolyEdge Selected Markets: {} + {} + {}",
+        symbols.join("/"),
+        market_types.join("/"),
+        timeframes.join("/")
+    );
+    serde_json::json!({
+        "title": title,
+        "symbols": symbols,
+        "market_types": market_types,
+        "timeframes": timeframes,
+        "total_markets": markets.len(),
+        "markets": markets,
+        "generated_at_ms": Utc::now().timestamp_millis(),
+    })
+}
+
 async fn report_paper_live(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.paper.live_report().await)
+    let live = state.paper.live_report().await;
+    let market_selection = build_market_selection_snapshot(&state).await;
+    let mut payload = serde_json::to_value(live).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("market_selection".to_string(), market_selection);
+    }
+    Json(payload)
 }
 
 async fn report_paper_history(
@@ -1142,7 +1226,7 @@ async fn reload_perf_profile(
     Json(cfg.clone())
 }
 
-async fn report_shadow_live(State(state): State<AppState>) -> Json<ShadowLiveReport> {
+async fn report_shadow_live(State(state): State<AppState>) -> impl IntoResponse {
     let mut live = state.shadow_stats.build_live_report().await;
     live.edge_model_version = state.shared.edge_model_cfg.read().await.version.clone();
     {
@@ -1152,7 +1236,12 @@ async fn report_shadow_live(State(state): State<AppState>) -> Json<ShadowLiveRep
         live.source_health = rows;
     }
     persist_live_report_files(&live);
-    Json(live)
+    let market_selection = build_market_selection_snapshot(&state).await;
+    let mut payload = serde_json::to_value(live).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("market_selection".to_string(), market_selection);
+    }
+    Json(payload)
 }
 
 async fn report_shadow_final(State(state): State<AppState>) -> Json<ShadowFinalReport> {

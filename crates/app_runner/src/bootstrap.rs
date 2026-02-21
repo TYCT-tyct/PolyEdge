@@ -223,6 +223,8 @@ pub(super) async fn async_main() -> Result<()> {
         latest_books: Arc::new(RwLock::new(HashMap::new())),
         latest_signals: Arc::new(DashMap::new()),
         market_to_symbol: Arc::new(RwLock::new(HashMap::new())),
+        market_to_title: Arc::new(RwLock::new(HashMap::new())),
+        market_to_type: Arc::new(RwLock::new(HashMap::new())),
         token_to_symbol: Arc::new(RwLock::new(HashMap::new())),
         market_to_timeframe: Arc::new(RwLock::new(HashMap::new())),
         symbol_to_markets: Arc::new(RwLock::new(HashMap::new())),

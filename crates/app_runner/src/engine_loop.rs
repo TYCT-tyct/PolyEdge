@@ -32,6 +32,7 @@ use crate::paper_runtime::{global_paper_runtime, PaperIntentCtx};
 use crate::report_io::{
     append_jsonl, current_jsonl_queue_depth, dataset_path, next_normalized_ingest_seq,
 };
+use crate::state::CachedPrebuild;
 use crate::state::{
     exit_reason_label, EngineShared, SignalCacheEntry, StrategyIngress, StrategyIngressMsg,
 };
@@ -47,7 +48,6 @@ use crate::strategy_runtime::{
 };
 use crate::toxicity_runtime::update_toxic_state_from_outcome;
 use crate::{publish_if_telemetry_subscribers, spawn_detached};
-use crate::state::CachedPrebuild;
 use core_types::PrebuiltAuth;
 
 pub(crate) fn spawn_presign_worker(shared: Arc<EngineShared>) {
@@ -62,7 +62,8 @@ pub(crate) fn spawn_presign_worker(shared: Arc<EngineShared>) {
 
             let markets: Vec<_> = {
                 let books = shared.latest_books.read().await;
-                books.iter()
+                books
+                    .iter()
                     .filter(|(_, b)| b.ask_yes > 0.0 && b.bid_yes > 0.0)
                     .map(|(k, b)| (k.clone(), b.clone()))
                     .take(5) // Only top 5 to avoid overwhelming gateway
@@ -83,15 +84,18 @@ pub(crate) fn spawn_presign_worker(shared: Arc<EngineShared>) {
                     "time_window_sec": 60,
                 });
 
-                if let Ok(res) = client.post(format!("{}/prebuild_order", gateway))
+                if let Ok(res) = client
+                    .post(format!("{}/prebuild_order", gateway))
                     .json(&req_payload)
-                    .send().await
+                    .send()
+                    .await
                 {
                     if let Ok(json) = res.json::<serde_json::Value>().await {
                         if json["ok"].as_bool().unwrap_or(false) {
                             let payload_str = json["body"].as_str().unwrap_or("");
                             let hmacs = json["hmac_signatures"].as_object().unwrap();
-                            let hmac_map: HashMap<String, String> = hmacs.iter()
+                            let hmac_map: HashMap<String, String> = hmacs
+                                .iter()
                                 .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
                                 .collect();
 
@@ -101,7 +105,10 @@ pub(crate) fn spawn_presign_worker(shared: Arc<EngineShared>) {
                                 payload_bytes: payload_str.as_bytes().to_vec(),
                                 auth: PrebuiltAuth {
                                     api_key: json["api_key"].as_str().unwrap().to_string(),
-                                    passphrase: json["api_passphrase"].as_str().unwrap().to_string(),
+                                    passphrase: json["api_passphrase"]
+                                        .as_str()
+                                        .unwrap()
+                                        .to_string(),
                                     address: json["address"].as_str().unwrap().to_string(),
                                     timestamp_sec: "".to_string(), // Populated at execution
                                     hmac_signature: "".to_string(), // Populated at execution
@@ -121,10 +128,7 @@ pub(crate) fn spawn_presign_worker(shared: Arc<EngineShared>) {
     });
 }
 
-pub(crate) fn spawn_udp_ghost_receiver(
-    execution: Arc<ClobExecution>,
-    shared: Arc<EngineShared>,
-) {
+pub(crate) fn spawn_udp_ghost_receiver(execution: Arc<ClobExecution>, shared: Arc<EngineShared>) {
     spawn_detached("udp_ghost_receiver", true, async move {
         let port = shared.fusion_cfg.read().await.udp_trigger_port;
         let addr = format!("0.0.0.0:{}", port);
@@ -145,9 +149,13 @@ pub(crate) fn spawn_udp_ghost_receiver(
                 }
                 let action = buf[1];
                 let sym_len = buf[2] as usize;
-                if len < 3 + sym_len { continue; }
+                if len < 3 + sym_len {
+                    continue;
+                }
                 let symbol_bytes = &buf[3..3 + sym_len];
-                let Ok(symbol_str) = std::str::from_utf8(symbol_bytes) else { continue };
+                let Ok(symbol_str) = std::str::from_utf8(symbol_bytes) else {
+                    continue;
+                };
 
                 let target_side = match action {
                     0x01 => OrderSide::BuyYes,
@@ -159,13 +167,17 @@ pub(crate) fn spawn_udp_ghost_receiver(
                     let map = shared.symbol_to_markets.read().await;
                     map.get(symbol_str).and_then(|m| m.first().cloned())
                 };
-                let Some(mid) = market_id else { continue; };
+                let Some(mid) = market_id else {
+                    continue;
+                };
 
                 let book_top = {
                     let books = shared.latest_books.read().await;
                     books.get(&mid).cloned()
                 };
-                let Some(book) = book_top else { continue; };
+                let Some(book) = book_top else {
+                    continue;
+                };
 
                 let (exec_price, target_l2) = if target_side == OrderSide::BuyYes {
                     (book.ask_yes, book.ask_size_yes)
@@ -173,14 +185,18 @@ pub(crate) fn spawn_udp_ghost_receiver(
                     (book.bid_yes, book.bid_size_yes)
                 };
 
-                if exec_price <= 0.0 || exec_price >= 1.0 || target_l2 <= 0.0 { continue; }
+                if exec_price <= 0.0 || exec_price >= 1.0 || target_l2 <= 0.0 {
+                    continue;
+                }
 
                 if *shared.draining.read().await {
                     continue; // Operation Silence: Do not accept new ghost gatling orders
                 }
 
                 let tf = TimeframeClass::Tf5m;
-                let fee_bps = crate::execution_eval::get_fee_rate_bps_cached(&shared, &book.token_id_yes).await;
+                let fee_bps =
+                    crate::execution_eval::get_fee_rate_bps_cached(&shared, &book.token_id_yes)
+                        .await;
                 let mut sniper = shared.predator_taker_sniper.write().await;
 
                 // Forge a dummy momentum override signal for execution eval
@@ -225,7 +241,11 @@ pub(crate) fn spawn_udp_ghost_receiver(
                         for chunk in plan.chunks {
                             let intent = core_types::OrderIntentV2 {
                                 market_id: mid.clone(),
-                                token_id: Some(if target_side == OrderSide::BuyYes { book.token_id_yes.clone() } else { book.token_id_no.clone() }),
+                                token_id: Some(if target_side == OrderSide::BuyYes {
+                                    book.token_id_yes.clone()
+                                } else {
+                                    book.token_id_no.clone()
+                                }),
                                 side: target_side.clone(),
                                 price: exec_price,
                                 size: chunk.size,
@@ -242,10 +262,16 @@ pub(crate) fn spawn_udp_ghost_receiver(
                             };
                             let _ = execution.place_order_v2(intent).await;
                             if chunk.send_delay_ms > 0 {
-                                tokio::time::sleep(std::time::Duration::from_millis(chunk.send_delay_ms)).await;
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    chunk.send_delay_ms,
+                                ))
+                                .await;
                             }
                         }
-                        tracing::warn!("👻 [UDP-FIRE] Ghost Link triggered Gatling burst to market={}", mid);
+                        tracing::warn!(
+                            "👻 [UDP-FIRE] Ghost Link triggered Gatling burst to market={}",
+                            mid
+                        );
                     }
                 }
             }
@@ -273,7 +299,11 @@ pub(crate) fn spawn_strategy_engine(
                     core_affinity::set_for_current(core_ids[id]);
                     tracing::info!("📌 Strategy Engine pinned to CPU Core {}", id);
                 } else {
-                    tracing::warn!("⚠️ Invalid POLYEDGE_CORE_ENGINE={}. Available cores: {}", id, core_ids.len());
+                    tracing::warn!(
+                        "⚠️ Invalid POLYEDGE_CORE_ENGINE={}. Available cores: {}",
+                        id,
+                        core_ids.len()
+                    );
                 }
             }
         }
@@ -322,7 +352,22 @@ pub(crate) fn spawn_strategy_engine(
             .and_then(|v| v.trim().parse::<f64>().ok())
             .unwrap_or(12.0)
             .clamp(0.10, 50.0);
+        let price_tape_enabled = std::env::var("POLYEDGE_PRICE_TAPE_ENABLED")
+            .ok()
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no"
+                )
+            })
+            .unwrap_or(true);
+        let price_tape_interval_ms = std::env::var("POLYEDGE_PRICE_TAPE_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(250)
+            .clamp(20, 5_000);
         let mut stale_book_drops: u64 = 0;
+        let mut last_price_tape_ms: HashMap<String, i64> = HashMap::new();
         let symbol_refresh_inflight = Arc::new(AtomicBool::new(false));
         refresh_market_symbol_map(&shared).await;
 
@@ -347,7 +392,7 @@ pub(crate) fn spawn_strategy_engine(
                         // Launch flatten async task in background to keep engine spinning
                         let exec_clone = execution.clone();
                         spawn_detached("engine_flatten_cmd", false, async move {
-                           let _ = exec_clone.flatten_all().await;
+                            let _ = exec_clone.flatten_all().await;
                         });
                     }
                     _ => {}
@@ -455,7 +500,9 @@ pub(crate) fn spawn_strategy_engine(
                                 // Background issue logging
                                 let stats_clone = shared.shadow_stats.clone();
                                 tokio::spawn(async move {
-                                    stats_clone.record_issue("strategy_ingress_disconnected").await;
+                                    stats_clone
+                                        .record_issue("strategy_ingress_disconnected")
+                                        .await;
                                 });
                                 break;
                             }
@@ -567,16 +614,71 @@ pub(crate) fn spawn_strategy_engine(
                         }
                         continue;
                     };
-                    let tick_fast_filtered = pick_latest_tick(&latest_fast_ticks, &symbol).and_then(|tick| {
-                        if fast_tick_allowed_in_fusion_mode(
-                            tick.source.as_str(),
-                            &current_fusion_mode,
-                        ) {
-                            Some(tick)
-                        } else {
-                            None
+                    if price_tape_enabled {
+                        let now_ms = Utc::now().timestamp_millis();
+                        let should_emit = last_price_tape_ms
+                            .get(&book.market_id)
+                            .map(|last_ms| now_ms.saturating_sub(*last_ms) >= price_tape_interval_ms)
+                            .unwrap_or(true);
+                        if should_emit {
+                            let market_type = shared
+                                .market_to_type
+                                .read()
+                                .await
+                                .get(&book.market_id)
+                                .cloned()
+                                .unwrap_or_else(|| "unknown".to_string());
+                            let market_title = shared
+                                .market_to_title
+                                .read()
+                                .await
+                                .get(&book.market_id)
+                                .cloned()
+                                .unwrap_or_default();
+                            let timeframe = shared
+                                .market_to_timeframe
+                                .read()
+                                .await
+                                .get(&book.market_id)
+                                .map(timeframe_class_label)
+                                .unwrap_or("unknown");
+                            let mid_yes = ((book.bid_yes + book.ask_yes) * 0.5).clamp(0.0, 1.0);
+                            let mid_no = ((book.bid_no + book.ask_no) * 0.5).clamp(0.0, 1.0);
+                            let ingest_seq = next_normalized_ingest_seq();
+                            append_jsonl(
+                                &dataset_path("normalized", "market_price_tape.jsonl"),
+                                &serde_json::json!({
+                                    "ts_ms": now_ms,
+                                    "source_seq": now_ms.max(0) as u64,
+                                    "ingest_seq": ingest_seq,
+                                    "market_id": book.market_id.clone(),
+                                    "title": market_title,
+                                    "symbol": symbol.clone(),
+                                    "market_type": market_type,
+                                    "timeframe": timeframe,
+                                    "bid_yes": book.bid_yes,
+                                    "ask_yes": book.ask_yes,
+                                    "bid_no": book.bid_no,
+                                    "ask_no": book.ask_no,
+                                    "mid_yes": mid_yes,
+                                    "mid_no": mid_no,
+                                    "ts_exchange_ms": book.ts_ms,
+                                }),
+                            );
+                            last_price_tape_ms.insert(book.market_id.clone(), now_ms);
                         }
-                    });
+                    }
+                    let tick_fast_filtered = pick_latest_tick(&latest_fast_ticks, &symbol)
+                        .and_then(|tick| {
+                            if fast_tick_allowed_in_fusion_mode(
+                                tick.source.as_str(),
+                                &current_fusion_mode,
+                            ) {
+                                Some(tick)
+                            } else {
+                                None
+                            }
+                        });
                     let Some(tick_fast) = tick_fast_filtered else {
                         shared.shadow_stats.record_issue("tick_missing").await;
                         continue;
@@ -1820,11 +1922,21 @@ async fn refresh_market_symbol_map(shared: &EngineShared) {
     match discovery.discover().await {
         Ok(markets) => {
             let mut market_map = HashMap::new();
+            let mut market_title_map = HashMap::new();
+            let mut market_type_map = HashMap::new();
             let mut token_map = HashMap::new();
             let mut timeframe_map = HashMap::new();
             let mut symbol_to_markets = HashMap::<String, Vec<String>>::new();
             for m in markets {
                 market_map.insert(m.market_id.clone(), m.symbol.clone());
+                market_title_map.insert(m.market_id.clone(), m.question.clone());
+                market_type_map.insert(
+                    m.market_id.clone(),
+                    m.market_type
+                        .as_deref()
+                        .map(|v| v.to_ascii_lowercase())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                );
                 symbol_to_markets
                     .entry(m.symbol.clone())
                     .or_default()
@@ -1852,6 +1964,14 @@ async fn refresh_market_symbol_map(shared: &EngineShared) {
                 *map = token_map;
             }
             {
+                let mut map = shared.market_to_title.write().await;
+                *map = market_title_map;
+            }
+            {
+                let mut map = shared.market_to_type.write().await;
+                *map = market_type_map;
+            }
+            {
                 let mut map = shared.market_to_timeframe.write().await;
                 *map = timeframe_map;
             }
@@ -1863,6 +1983,15 @@ async fn refresh_market_symbol_map(shared: &EngineShared) {
         Err(err) => {
             tracing::warn!(?err, "market discovery refresh failed");
         }
+    }
+}
+
+fn timeframe_class_label(tf: &TimeframeClass) -> &'static str {
+    match tf {
+        TimeframeClass::Tf5m => "5m",
+        TimeframeClass::Tf15m => "15m",
+        TimeframeClass::Tf1h => "1h",
+        TimeframeClass::Tf1d => "1d",
     }
 }
 
