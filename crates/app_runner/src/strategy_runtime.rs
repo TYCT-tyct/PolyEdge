@@ -1172,14 +1172,41 @@ pub(super) async fn evaluate_and_route_roll_v1(
             edge_gross_bps_for_side(probability.p_settle, &OrderSide::BuyYes, yes_price);
         let no_edge_gross =
             edge_gross_bps_for_side(probability.p_settle, &OrderSide::BuyNo, no_price);
+        let Some(frame_total_ms) = timeframe_total_ms(timeframe.clone()) else {
+            shared
+                .shadow_stats
+                .mark_blocked_with_reason_ctx(
+                    "v52_blocked_timeframe",
+                    Some(symbol),
+                    Some(tf_label),
+                )
+                .await;
+            continue;
+        };
+        let time_to_expiry_ms = (frame_total_ms - now_ms.rem_euclid(frame_total_ms)).max(0);
+        let remaining_ratio = (time_to_expiry_ms as f64 / frame_total_ms as f64).clamp(0.0, 1.0);
+        let time_phase = classify_time_phase(remaining_ratio, &predator_cfg.v52.time_phase);
+        let entry_force_taker = should_force_taker_fallback(
+            time_phase,
+            time_to_expiry_ms,
+            &predator_cfg.v52.execution,
+        );
         let yes_fee_taker_bps =
             calculate_dynamic_taker_fee_bps(&OrderSide::BuyYes, yes_price, fee_bps);
         let no_fee_taker_bps =
             calculate_dynamic_taker_fee_bps(&OrderSide::BuyNo, no_price, fee_bps);
-        let yes_edge_net =
-            yes_edge_gross - yes_fee_taker_bps + rebate_est_bps - edge_model_cfg.fail_cost_bps;
-        let no_edge_net =
-            no_edge_gross - no_fee_taker_bps + rebate_est_bps - edge_model_cfg.fail_cost_bps;
+        let yes_expected_fee_bps = if entry_force_taker {
+            yes_fee_taker_bps
+        } else {
+            -rebate_est_bps.max(0.0)
+        };
+        let no_expected_fee_bps = if entry_force_taker {
+            no_fee_taker_bps
+        } else {
+            -rebate_est_bps.max(0.0)
+        };
+        let yes_edge_net = yes_edge_gross - yes_expected_fee_bps - edge_model_cfg.fail_cost_bps;
+        let no_edge_net = no_edge_gross - no_expected_fee_bps - edge_model_cfg.fail_cost_bps;
 
         if neutral_fallback && probability.confidence < tf_cfg.min_direction_confidence {
             shared
@@ -1192,40 +1219,40 @@ pub(super) async fn evaluate_and_route_roll_v1(
         let (side, entry_price, edge_gross_bps, edge_net_bps, fee_applied) = match direction_signal
             .direction
         {
-            Direction::Up => (
-                OrderSide::BuyYes,
-                yes_price,
-                yes_edge_gross,
-                yes_edge_net,
-                yes_fee_taker_bps,
-            ),
-            Direction::Down => (
-                OrderSide::BuyNo,
-                no_price,
-                no_edge_gross,
-                no_edge_net,
-                no_fee_taker_bps,
-            ),
-            Direction::Neutral => {
-                if yes_edge_net >= no_edge_net {
-                    (
-                        OrderSide::BuyYes,
-                        yes_price,
-                        yes_edge_gross,
-                        yes_edge_net,
-                        yes_fee_taker_bps,
-                    )
-                } else {
-                    (
-                        OrderSide::BuyNo,
-                        no_price,
-                        no_edge_gross,
-                        no_edge_net,
-                        no_fee_taker_bps,
-                    )
+                Direction::Up => (
+                    OrderSide::BuyYes,
+                    yes_price,
+                    yes_edge_gross,
+                    yes_edge_net,
+                    yes_expected_fee_bps,
+                ),
+                Direction::Down => (
+                    OrderSide::BuyNo,
+                    no_price,
+                    no_edge_gross,
+                    no_edge_net,
+                    no_expected_fee_bps,
+                ),
+                Direction::Neutral => {
+                    if yes_edge_net >= no_edge_net {
+                        (
+                            OrderSide::BuyYes,
+                            yes_price,
+                            yes_edge_gross,
+                            yes_edge_net,
+                            yes_expected_fee_bps,
+                        )
+                    } else {
+                        (
+                            OrderSide::BuyNo,
+                            no_price,
+                            no_edge_gross,
+                            no_edge_net,
+                            no_expected_fee_bps,
+                        )
+                    }
                 }
-            }
-        };
+            };
         if edge_net_bps <= 0.0 {
             shared
                 .shadow_stats
