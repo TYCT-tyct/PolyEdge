@@ -45,3 +45,8 @@ temp_keys/
 
 # Local machine artifacts
 *.marker
+
+# One-off review artifacts
+.ai_slop_*.txt
+ai_slop_diff.txt
+modify_configs.py
