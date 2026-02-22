@@ -1015,20 +1015,28 @@ pub(crate) fn spawn_strategy_engine(
                         .push_tick_to_decision_ms(tick_to_decision_ms)
                         .await;
 
+                    let predator_cfg = shared.predator_cfg.read().await.clone();
+                    let roll_mode = matches!(
+                        predator_cfg.strategy_engine.engine_mode,
+                        crate::state::StrategyEngineMode::RollV1
+                    );
+
                     let spread_yes = (book.ask_yes - book.bid_yes).max(0.0);
                     let effective_max_spread = adaptive_max_spread(
                         cfg.max_spread,
                         tox_decision.tox_score,
                         markout_samples,
                     );
-                    if should_observe_only_symbol(
-                        &symbol,
-                        &cfg,
-                        &tox_decision,
-                        stale_ms,
-                        spread_yes,
-                        book_top_lag_ms,
-                    ) {
+                    if !roll_mode
+                        && should_observe_only_symbol(
+                            &symbol,
+                            &cfg,
+                            &tox_decision,
+                            stale_ms,
+                            spread_yes,
+                            book_top_lag_ms,
+                        )
+                    {
                         mark_blocked_for_market(
                             &shared,
                             &book.market_id,
@@ -1060,7 +1068,9 @@ pub(crate) fn spawn_strategy_engine(
                                     .map(timeframe_class_label),
                             )
                             .await;
-                        continue;
+                        if !roll_mode {
+                            continue;
+                        }
                     }
                     if signal.confidence <= 0.0 {
                         {
@@ -1140,7 +1150,9 @@ pub(crate) fn spawn_strategy_engine(
                             "market_score_low",
                         )
                         .await;
-                        continue;
+                        if !roll_mode {
+                            continue;
+                        }
                     }
                     if !active_by_rank {
                         mark_blocked_for_market(
@@ -1150,10 +1162,11 @@ pub(crate) fn spawn_strategy_engine(
                             "market_rank_blocked",
                         )
                         .await;
-                        continue;
+                        if !roll_mode {
+                            continue;
+                        }
                     }
 
-                    let predator_cfg = shared.predator_cfg.read().await.clone();
                     if predator_cfg.enabled {
                         if *shared.draining.read().await {
                             mark_blocked_for_market(
