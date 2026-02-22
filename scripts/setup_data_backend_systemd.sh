@@ -24,25 +24,21 @@ if [[ "$ROLE" == "ireland" ]]; then
   sudo cp "$REPO_DIR/ops/systemd/polyedge-data-backend-ireland.service" /etc/systemd/system/
   sudo cp "$REPO_DIR/ops/systemd/polyedge-data-backend-api.service" /etc/systemd/system/
 
-  if [[ ! -f /etc/polyedge/data-backend-ireland.env ]]; then
-    sudo tee /etc/polyedge/data-backend-ireland.env >/dev/null <<'EOF'
+  sudo tee /etc/polyedge/data-backend-ireland.env >/dev/null <<'EOF'
 RUST_LOG=info
 POLYEDGE_DATA_ROOT=/dev/xvdbb/polyedge-data
 POLYEDGE_SYMBOLS=BTCUSDT
-POLYEDGE_TIMEFRAMES=5m
+POLYEDGE_TIMEFRAMES=5m,15m
 POLYEDGE_IRELAND_UDP_BIND=0.0.0.0:9801
 POLYEDGE_SNAPSHOT_MS=100
 POLYEDGE_DISCOVERY_REFRESH_SEC=10
 EOF
-  fi
 
-  if [[ ! -f /etc/polyedge/data-backend-api.env ]]; then
-    sudo tee /etc/polyedge/data-backend-api.env >/dev/null <<'EOF'
+  sudo tee /etc/polyedge/data-backend-api.env >/dev/null <<'EOF'
 RUST_LOG=info
 POLYEDGE_DATA_ROOT=/dev/xvdbb/polyedge-data
 POLYEDGE_API_BIND=0.0.0.0:8095
 EOF
-  fi
 
   sudo systemctl daemon-reload
   sudo systemctl enable --now polyedge-data-backend-ireland.service
@@ -53,15 +49,13 @@ EOF
 else
   sudo cp "$REPO_DIR/ops/systemd/polyedge-data-backend-tokyo.service" /etc/systemd/system/
 
-  if [[ ! -f /etc/polyedge/data-backend-tokyo.env ]]; then
-    sudo tee /etc/polyedge/data-backend-tokyo.env >/dev/null <<'EOF'
+  sudo tee /etc/polyedge/data-backend-tokyo.env >/dev/null <<'EOF'
 RUST_LOG=info
 POLYEDGE_DATA_ROOT=/var/lib/polyedge-data
 POLYEDGE_SYMBOLS=BTCUSDT
 POLYEDGE_TOKYO_BIND=0.0.0.0:0
 POLYEDGE_IRELAND_UDP=10.0.3.123:9801
 EOF
-  fi
 
   sudo mkdir -p /var/lib/polyedge-data
   sudo chown -R "$RUN_USER":"$RUN_USER" /var/lib/polyedge-data

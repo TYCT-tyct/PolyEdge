@@ -175,6 +175,24 @@ struct SnapshotQuery {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+struct MarketsQuery {
+    date: Option<String>,
+    symbol: Option<String>,
+    timeframe: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HistorySnapshotQuery {
+    date: Option<String>,
+    symbol: Option<String>,
+    timeframe: Option<String>,
+    market_id: Option<String>,
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
+    limit: Option<usize>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     install_tracing();
@@ -244,7 +262,7 @@ async fn run_tokyo_collector(args: TokyoCollectorArgs) -> Result<()> {
 
         let payload = serde_json::to_vec(&row)?;
         let _ = sock.send_to(&payload, dst).await;
-        append_jsonl(&dated_path(&out_root, "raw", "tokyo_binance_ticks.jsonl"), &row)?;
+        append_jsonl(&tokyo_tick_path(&out_root, &row), &row)?;
     }
 }
 
@@ -281,6 +299,15 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
                         "markets": w.meta.values().collect::<Vec<_>>()
                     });
                     let _ = write_json_pretty(discover_root.join("reports").join("latest_markets.json"), &report);
+                    let day = Utc::now().format("%Y-%m-%d").to_string();
+                    let _ = write_json_pretty(
+                        discover_root
+                            .join("reports")
+                            .join("catalog")
+                            .join(day)
+                            .join("markets.json"),
+                        &report,
+                    );
                 }
                 Err(err) => {
                     tracing::warn!(?err, "market discovery refresh failed");
@@ -324,7 +351,7 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
                     w.tokyo_prev.insert(row.symbol.clone(), prev);
                 }
             }
-            let _ = append_jsonl(&dated_path(&udp_root, "raw", "tokyo_binance_ticks.jsonl"), &row);
+            let _ = append_jsonl(&tokyo_tick_path(&udp_root, &row), &row);
         }
     });
 
@@ -362,7 +389,8 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
                     let mut w = pm_state.write().await;
                     w.books.insert(row.market_id.clone(), row.clone());
                 }
-                let _ = append_jsonl(&dated_path(&pm_root, "raw", "pm_books.jsonl"), &row);
+                let _ = append_jsonl(&pm_books_symbol_tf_path(&pm_root, &row), &row);
+                let _ = append_jsonl(&pm_books_market_path(&pm_root, &row), &row);
             }
 
             tracing::warn!("pm stream ended; restarting");
@@ -406,7 +434,7 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
                     let mut w = ch_state.write().await;
                     w.chainlink_last.insert(row.symbol.clone(), row.clone());
                 }
-                let _ = append_jsonl(&dated_path(&ch_root, "raw", "chainlink_ticks.jsonl"), &row);
+                let _ = append_jsonl(&chainlink_tick_path(&ch_root, &row), &row);
             }
             tracing::warn!("chainlink stream ended; restarting");
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -421,10 +449,8 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
             continue;
         }
         for row in rows {
-            append_jsonl(
-                &dated_path(&root, "normalized", "snapshot_100ms.jsonl"),
-                &row,
-            )?;
+            append_jsonl(&snapshot_symbol_tf_path(&root, &row), &row)?;
+            append_jsonl(&snapshot_market_path(&root, &row), &row)?;
         }
     }
 }
@@ -642,6 +668,9 @@ async fn run_api(args: ApiArgs) -> Result<()> {
         .route("/api/live/latest", get(api_latest))
         .route("/api/live/trades", get(api_trades))
         .route("/api/live/heatmap", get(api_heatmap))
+        .route("/api/history/dates", get(api_history_dates))
+        .route("/api/history/markets", get(api_history_markets))
+        .route("/api/history/snapshot", get(api_history_snapshot))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&args.bind)
@@ -656,9 +685,30 @@ async fn api_health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"ok": true, "ts_ms": now_ms()}))
 }
 
-async fn api_markets(State(st): State<ApiState>) -> Json<serde_json::Value> {
-    let path = st.root.join("reports").join("latest_markets.json");
-    let payload = read_json_or(path, serde_json::json!({"markets": [], "market_count": 0, "ts_ms": now_ms()}));
+async fn api_markets(
+    State(st): State<ApiState>,
+    Query(q): Query<MarketsQuery>,
+) -> Json<serde_json::Value> {
+    let path = if let Some(date) = q.date.as_deref() {
+        st.root
+            .join("reports")
+            .join("catalog")
+            .join(date)
+            .join("markets.json")
+    } else {
+        st.root.join("reports").join("latest_markets.json")
+    };
+    let mut payload =
+        read_json_or(path, serde_json::json!({"markets": [], "market_count": 0, "ts_ms": now_ms()}));
+    if let Some(markets) = payload.get_mut("markets").and_then(|v| v.as_array_mut()) {
+        if let Some(sym) = q.symbol.as_deref() {
+            markets.retain(|m| m.get("symbol").and_then(|x| x.as_str()) == Some(sym));
+        }
+        if let Some(tf) = q.timeframe.as_deref() {
+            markets.retain(|m| m.get("timeframe").and_then(|x| x.as_str()) == Some(tf));
+        }
+        payload["market_count"] = serde_json::json!(markets.len());
+    }
     Json(payload)
 }
 
@@ -666,7 +716,9 @@ async fn api_snapshot(
     State(st): State<ApiState>,
     Query(q): Query<SnapshotQuery>,
 ) -> Json<serde_json::Value> {
-    let path = latest_dated_file(&st.root, "normalized", "snapshot_100ms.jsonl");
+    let symbol = q.symbol.clone().unwrap_or_else(|| "BTCUSDT".to_string());
+    let timeframe = q.timeframe.clone().unwrap_or_else(|| "5m".to_string());
+    let path = latest_symbol_tf_snapshot_file(&st.root, &symbol, &timeframe);
     let limit = q.limit.unwrap_or(300).clamp(1, 5000);
     let mut rows = path
         .as_ref()
@@ -675,17 +727,16 @@ async fn api_snapshot(
     if let Some(mid) = q.market_id.as_deref() {
         rows.retain(|r| r.get("market_id").and_then(|v| v.as_str()) == Some(mid));
     }
-    if let Some(sym) = q.symbol.as_deref() {
-        rows.retain(|r| r.get("symbol").and_then(|v| v.as_str()) == Some(sym));
-    }
-    if let Some(tf) = q.timeframe.as_deref() {
-        rows.retain(|r| r.get("timeframe").and_then(|v| v.as_str()) == Some(tf));
-    }
     Json(serde_json::json!({"ts_ms": now_ms(), "count": rows.len(), "rows": rows}))
 }
 
-async fn api_latest(State(st): State<ApiState>) -> Json<serde_json::Value> {
-    let path = latest_dated_file(&st.root, "normalized", "snapshot_100ms.jsonl");
+async fn api_latest(
+    State(st): State<ApiState>,
+    Query(q): Query<SnapshotQuery>,
+) -> Json<serde_json::Value> {
+    let symbol = q.symbol.clone().unwrap_or_else(|| "BTCUSDT".to_string());
+    let timeframe = q.timeframe.clone().unwrap_or_else(|| "5m".to_string());
+    let path = latest_symbol_tf_snapshot_file(&st.root, &symbol, &timeframe);
     let row = path
         .as_ref()
         .and_then(|p| read_last_jsonl_rows(p, 1).into_iter().next())
@@ -702,8 +753,13 @@ async fn api_trades(State(st): State<ApiState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({"ts_ms": now_ms(), "count": rows.len(), "rows": rows}))
 }
 
-async fn api_heatmap(State(st): State<ApiState>) -> Json<serde_json::Value> {
-    let path = latest_dated_file(&st.root, "normalized", "snapshot_100ms.jsonl");
+async fn api_heatmap(
+    State(st): State<ApiState>,
+    Query(q): Query<SnapshotQuery>,
+) -> Json<serde_json::Value> {
+    let symbol = q.symbol.clone().unwrap_or_else(|| "BTCUSDT".to_string());
+    let timeframe = q.timeframe.clone().unwrap_or_else(|| "5m".to_string());
+    let path = latest_symbol_tf_snapshot_file(&st.root, &symbol, &timeframe);
     let rows = path
         .as_ref()
         .map(|p| read_last_jsonl_rows(p, 20_000))
@@ -730,6 +786,74 @@ async fn api_heatmap(State(st): State<ApiState>) -> Json<serde_json::Value> {
         }));
     }
     Json(serde_json::json!({"ts_ms": now_ms(), "cells": out}))
+}
+
+async fn api_history_dates(State(st): State<ApiState>) -> Json<serde_json::Value> {
+    let dates = list_date_dirs(&st.root.join("normalized"));
+    Json(serde_json::json!({
+        "ts_ms": now_ms(),
+        "count": dates.len(),
+        "dates": dates
+    }))
+}
+
+async fn api_history_markets(
+    State(st): State<ApiState>,
+    Query(q): Query<MarketsQuery>,
+) -> Json<serde_json::Value> {
+    let date = q
+        .date
+        .clone()
+        .or_else(|| list_date_dirs(&st.root.join("reports").join("catalog")).into_iter().next());
+    let Some(date) = date else {
+        return Json(serde_json::json!({"ts_ms": now_ms(), "market_count": 0, "markets": []}));
+    };
+    let path = st
+        .root
+        .join("reports")
+        .join("catalog")
+        .join(&date)
+        .join("markets.json");
+    let mut payload =
+        read_json_or(path, serde_json::json!({"markets": [], "market_count": 0, "ts_ms": now_ms()}));
+    payload["date"] = serde_json::json!(date);
+    if let Some(markets) = payload.get_mut("markets").and_then(|v| v.as_array_mut()) {
+        if let Some(sym) = q.symbol.as_deref() {
+            markets.retain(|m| m.get("symbol").and_then(|x| x.as_str()) == Some(sym));
+        }
+        if let Some(tf) = q.timeframe.as_deref() {
+            markets.retain(|m| m.get("timeframe").and_then(|x| x.as_str()) == Some(tf));
+        }
+        payload["market_count"] = serde_json::json!(markets.len());
+    }
+    Json(payload)
+}
+
+async fn api_history_snapshot(
+    State(st): State<ApiState>,
+    Query(q): Query<HistorySnapshotQuery>,
+) -> Json<serde_json::Value> {
+    let date = q
+        .date
+        .clone()
+        .or_else(|| list_date_dirs(&st.root.join("normalized")).into_iter().next());
+    let Some(date) = date else {
+        return Json(serde_json::json!({"ts_ms": now_ms(), "count": 0, "rows": []}));
+    };
+    let symbol = q.symbol.clone().unwrap_or_else(|| "BTCUSDT".to_string());
+    let timeframe = q.timeframe.clone().unwrap_or_else(|| "5m".to_string());
+    let path = history_snapshot_path(&st.root, &date, &symbol, &timeframe, q.market_id.as_deref());
+    let limit = q.limit.unwrap_or(10_000).clamp(1, 200_000);
+    let rows = read_jsonl_filtered_rows(&path, q.from_ms, q.to_ms, limit);
+    Json(serde_json::json!({
+        "ts_ms": now_ms(),
+        "date": date,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "market_id": q.market_id,
+        "count": rows.len(),
+        "rows": rows
+    }))
 }
 
 fn parse_symbols(s: &str) -> Vec<String> {
@@ -766,9 +890,88 @@ fn parse_end_ms(v: &str) -> Option<i64> {
         .map(|d| d.timestamp_millis())
 }
 
-fn dated_path(root: &Path, bucket: &str, file: &str) -> PathBuf {
-    let date = Utc::now().format("%Y-%m-%d").to_string();
-    root.join(bucket).join(date).join(file)
+fn utc_date_from_ms(ms: i64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(ms)
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string())
+}
+
+fn path_safe_segment(v: &str) -> String {
+    v.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn tokyo_tick_path(root: &Path, row: &TokyoTick) -> PathBuf {
+    let d = utc_date_from_ms(row.ts_tokyo_recv_ms);
+    root.join("raw")
+        .join(d)
+        .join("symbol")
+        .join(path_safe_segment(&row.symbol))
+        .join("tokyo_binance_ticks.jsonl")
+}
+
+fn chainlink_tick_path(root: &Path, row: &ChainlinkTick) -> PathBuf {
+    let d = utc_date_from_ms(row.ts_chainlink_recv_ms);
+    root.join("raw")
+        .join(d)
+        .join("symbol")
+        .join(path_safe_segment(&row.symbol))
+        .join("chainlink_ticks.jsonl")
+}
+
+fn pm_books_symbol_tf_path(root: &Path, row: &PmBookRow) -> PathBuf {
+    let d = utc_date_from_ms(row.ts_pm_recv_ms);
+    root.join("raw")
+        .join(d)
+        .join("symbol")
+        .join(path_safe_segment(&row.symbol))
+        .join("timeframe")
+        .join(path_safe_segment(&row.timeframe))
+        .join("pm_books.jsonl")
+}
+
+fn pm_books_market_path(root: &Path, row: &PmBookRow) -> PathBuf {
+    let d = utc_date_from_ms(row.ts_pm_recv_ms);
+    root.join("raw")
+        .join(d)
+        .join("symbol")
+        .join(path_safe_segment(&row.symbol))
+        .join("timeframe")
+        .join(path_safe_segment(&row.timeframe))
+        .join("market")
+        .join(path_safe_segment(&row.market_id))
+        .join("pm_books.jsonl")
+}
+
+fn snapshot_symbol_tf_path(root: &Path, row: &SnapshotRow) -> PathBuf {
+    let d = utc_date_from_ms(row.ts_ms_utc);
+    root.join("normalized")
+        .join(d)
+        .join("symbol")
+        .join(path_safe_segment(&row.symbol))
+        .join("timeframe")
+        .join(path_safe_segment(&row.timeframe))
+        .join("snapshot_100ms.jsonl")
+}
+
+fn snapshot_market_path(root: &Path, row: &SnapshotRow) -> PathBuf {
+    let d = utc_date_from_ms(row.ts_ms_utc);
+    root.join("normalized")
+        .join(d)
+        .join("symbol")
+        .join(path_safe_segment(&row.symbol))
+        .join("timeframe")
+        .join(path_safe_segment(&row.timeframe))
+        .join("market")
+        .join(path_safe_segment(&row.market_id))
+        .join("snapshot_100ms.jsonl")
 }
 
 fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -821,6 +1024,56 @@ fn latest_dated_file(root: &Path, bucket: &str, file: &str) -> Option<PathBuf> {
     None
 }
 
+fn list_date_dirs(base: &Path) -> Vec<String> {
+    let mut out = fs::read_dir(base)
+        .ok()
+        .into_iter()
+        .flat_map(|it| it.filter_map(|e| e.ok()))
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect::<Vec<_>>();
+    out.sort();
+    out.reverse();
+    out
+}
+
+fn latest_symbol_tf_snapshot_file(root: &Path, symbol: &str, timeframe: &str) -> Option<PathBuf> {
+    let base = root.join("normalized");
+    for date in list_date_dirs(&base) {
+        let p = base
+            .join(date)
+            .join("symbol")
+            .join(path_safe_segment(symbol))
+            .join("timeframe")
+            .join(path_safe_segment(timeframe))
+            .join("snapshot_100ms.jsonl");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+fn history_snapshot_path(
+    root: &Path,
+    date: &str,
+    symbol: &str,
+    timeframe: &str,
+    market_id: Option<&str>,
+) -> PathBuf {
+    let mut p = root
+        .join("normalized")
+        .join(date)
+        .join("symbol")
+        .join(path_safe_segment(symbol))
+        .join("timeframe")
+        .join(path_safe_segment(timeframe));
+    if let Some(mid) = market_id {
+        p = p.join("market").join(path_safe_segment(mid));
+    }
+    p.join("snapshot_100ms.jsonl")
+}
+
 fn read_last_jsonl_rows(path: &Path, limit: usize) -> Vec<serde_json::Value> {
     let file = match OpenOptions::new().read(true).open(path) {
         Ok(f) => f,
@@ -836,4 +1089,39 @@ fn read_last_jsonl_rows(path: &Path, limit: usize) -> Vec<serde_json::Value> {
         rows.drain(0..(rows.len() - limit));
     }
     rows
+}
+
+fn read_jsonl_filtered_rows(
+    path: &Path,
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    let file = match OpenOptions::new().read(true).open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let reader = BufReader::new(file);
+    let mut out = Vec::new();
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let ts = v.get("ts_ms_utc").and_then(|x| x.as_i64());
+        if let Some(fm) = from_ms {
+            if ts.map(|t| t < fm).unwrap_or(false) {
+                continue;
+            }
+        }
+        if let Some(tm) = to_ms {
+            if ts.map(|t| t > tm).unwrap_or(false) {
+                continue;
+            }
+        }
+        out.push(v);
+        if out.len() > limit {
+            out.drain(0..(out.len() - limit));
+        }
+    }
+    out
 }
