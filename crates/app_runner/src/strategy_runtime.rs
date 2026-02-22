@@ -1404,6 +1404,57 @@ pub(super) async fn evaluate_and_route_roll_v1(
                 edge_gross_bps = alt_edge_gross_bps;
                 edge_net_bps = alt_edge_net_bps;
                 fee_applied = alt_fee_applied;
+            } else if !entry_force_taker {
+                // Maker quote can be absent in thin books right after market open.
+                // Fallback to taker price path (with taker fee model) to avoid missing early ramps.
+                let taker_yes_price = aggressive_price_for_side(&book, &OrderSide::BuyYes);
+                let taker_no_price = aggressive_price_for_side(&book, &OrderSide::BuyNo);
+                let taker_yes_gross =
+                    edge_gross_bps_for_side(probability.p_settle, &OrderSide::BuyYes, taker_yes_price);
+                let taker_no_gross =
+                    edge_gross_bps_for_side(probability.p_settle, &OrderSide::BuyNo, taker_no_price);
+                let taker_yes_net = taker_yes_gross - yes_fee_taker_bps - edge_model_cfg.fail_cost_bps;
+                let taker_no_net = taker_no_gross - no_fee_taker_bps - edge_model_cfg.fail_cost_bps;
+                let choose_yes = taker_yes_price.is_finite()
+                    && taker_yes_price > 0.0
+                    && taker_yes_net > 0.0
+                    && (taker_yes_net >= taker_no_net || !(taker_no_price.is_finite() && taker_no_price > 0.0));
+                let choose_no = taker_no_price.is_finite() && taker_no_price > 0.0 && taker_no_net > 0.0;
+                if choose_yes {
+                    side = OrderSide::BuyYes;
+                    entry_price = taker_yes_price;
+                    edge_gross_bps = taker_yes_gross;
+                    edge_net_bps = taker_yes_net;
+                    fee_applied = yes_fee_taker_bps;
+                } else if choose_no {
+                    side = OrderSide::BuyNo;
+                    entry_price = taker_no_price;
+                    edge_gross_bps = taker_no_gross;
+                    edge_net_bps = taker_no_net;
+                    fee_applied = no_fee_taker_bps;
+                } else {
+                    shared
+                        .shadow_stats
+                        .mark_blocked_with_reason_ctx("no_quote_spread", Some(symbol), Some(tf_label))
+                        .await;
+                    if trace_scan {
+                        record_roll_trace(serde_json::json!({
+                            "ts_ms": now_ms,
+                            "event": "scan",
+                            "reason": "no_quote_spread",
+                            "symbol": symbol,
+                            "market_id": market_id,
+                            "timeframe": tf_label,
+                            "maker_yes_price": yes_price,
+                            "maker_no_price": no_price,
+                            "taker_yes_price": taker_yes_price,
+                            "taker_no_price": taker_no_price,
+                            "taker_yes_edge_net_bps": taker_yes_net,
+                            "taker_no_edge_net_bps": taker_no_net,
+                        }));
+                    }
+                    continue;
+                }
             } else {
                 shared
                     .shadow_stats
