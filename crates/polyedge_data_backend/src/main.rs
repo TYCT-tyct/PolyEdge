@@ -1158,10 +1158,63 @@ async fn fetch_price_to_beat_from_event_slug(event_slug: &str) -> Result<f64> {
 }
 
 fn extract_price_to_beat_from_html(html: &str, event_slug: &str) -> Option<f64> {
+    if let Some(price) = extract_price_to_beat_by_ticker(html, event_slug) {
+        return Some(price);
+    }
     if let Some(price) = extract_price_to_beat_near_slug(html, event_slug) {
         return Some(price);
     }
     extract_price_to_beat_generic(html)
+}
+
+fn extract_price_to_beat_by_ticker(html: &str, event_slug: &str) -> Option<f64> {
+    let marker = "\"eventMetadata\":{\"priceToBeat\":";
+    let ticker_marker = "\"ticker\":\"";
+    let mut from = 0usize;
+    while let Some(off) = html[from..].find(marker) {
+        let pos = from + off;
+        let mut s = &html[pos + marker.len()..];
+        let mut token = String::new();
+        for ch in s.chars() {
+            if ch.is_ascii_digit() || ch == '.' {
+                token.push(ch);
+            } else {
+                break;
+            }
+        }
+        let price = token.parse::<f64>().ok();
+        let next_event_pos = html[pos + marker.len()..]
+            .find(marker)
+            .map(|x| pos + marker.len() + x)
+            .unwrap_or(html.len());
+        let search_end = (pos + 30_000).min(next_event_pos).min(html.len());
+        s = &html[pos..search_end];
+        let ticker = if let Some(tpos) = s.find(ticker_marker) {
+            let mut t = String::new();
+            for ch in s[tpos + ticker_marker.len()..].chars() {
+                if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' {
+                    t.push(ch);
+                } else {
+                    break;
+                }
+            }
+            Some(t)
+        } else {
+            None
+        };
+        if ticker.as_deref() == Some(event_slug) {
+            if let Some(p) = price {
+                if p.is_finite() && p > 100.0 {
+                    return Some(p);
+                }
+            }
+        }
+        from = pos + marker.len();
+        if from >= html.len() {
+            break;
+        }
+    }
+    None
 }
 
 fn extract_price_to_beat_near_slug(html: &str, slug: &str) -> Option<f64> {
