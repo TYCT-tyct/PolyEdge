@@ -525,7 +525,7 @@ fn run_deploy_ireland(base: RemoteBase) -> Result<()> {
         "scripts/setup_data_backend_systemd.sh",
         &format!("{target}:/tmp/setup_data_backend_systemd.sh"),
     )?;
-    run_ssh(&base, &target, &format!("chmod +x /tmp/setup_data_backend_systemd.sh; POLYEDGE_REPO_DIR={} POLYEDGE_BIN_PATH={}/target/release/polyedge_data_backend POLYEDGE_USER={} bash /tmp/setup_data_backend_systemd.sh ireland", base.repo, base.repo, base.user))?;
+    run_ssh(&base, &target, &format!("sed -i 's/\\r$//' /tmp/setup_data_backend_systemd.sh; chmod +x /tmp/setup_data_backend_systemd.sh; POLYEDGE_REPO_DIR={} POLYEDGE_BIN_PATH={}/target/release/polyedge_data_backend POLYEDGE_USER={} bash /tmp/setup_data_backend_systemd.sh ireland", base.repo, base.repo, base.user))?;
     run_status_ireland(base)
 }
 

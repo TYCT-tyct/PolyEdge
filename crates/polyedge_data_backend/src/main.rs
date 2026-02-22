@@ -178,6 +178,7 @@ struct SnapshotQuery {
 #[tokio::main]
 async fn main() -> Result<()> {
     install_tracing();
+    install_rustls_provider();
     let cli = Cli::parse();
     match cli.command {
         Command::TokyoCollector(args) => run_tokyo_collector(args).await,
@@ -192,6 +193,10 @@ fn install_tracing() {
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info,polyedge_data_backend=debug".into()),
         )
         .try_init();
+}
+
+fn install_rustls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 async fn run_tokyo_collector(args: TokyoCollectorArgs) -> Result<()> {
