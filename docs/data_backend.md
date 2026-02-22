@@ -2,7 +2,7 @@
 
 独立数据后端，不依赖旧交易循环。交易热路径与分析路径解耦：
 
-- 热路径：东京价 + PM 盘口 + Chainlink 融合，持续生成 `snapshot_1s.jsonl`
+- 热路径：东京价 + PM 盘口 + Chainlink 融合，持续生成 `snapshot_100ms.jsonl`
 - 分析路径（可选）：异步批量写入 ClickHouse
 - 热缓存（可选）：将最新快照写入 Redis，前端低延迟读取
 
@@ -13,7 +13,7 @@
    - 打时间戳并通过 UDP 转发到爱尔兰
 2. `ireland-ingest`
    - 接收东京 tick + Polymarket CLOB + Chainlink
-   - 统一输出 `snapshot_1s.jsonl`（按秒聚合，非阻塞）
+   - 统一输出 `snapshot_100ms.jsonl`（100ms 原始快照，非聚合）
    - 可选异步落 ClickHouse、Redis
 3. `api`
    - `/api/live/markets`
@@ -59,7 +59,7 @@ cargo run -p polyedge_data_backend -- api \
 
 - `POLYEDGE_CH_URL`（示例：`http://127.0.0.1:8123`）
 - `POLYEDGE_CH_DATABASE`（默认 `polyedge`）
-- `POLYEDGE_CH_SNAPSHOT_TABLE`（默认 `snapshot_1s`）
+- `POLYEDGE_CH_SNAPSHOT_TABLE`（默认 `snapshot_100ms`）
 - `POLYEDGE_CH_TTL_DAYS`（默认 `30`）
 - `POLYEDGE_REDIS_URL`（示例：`redis://127.0.0.1:6379/0`）
 - `POLYEDGE_REDIS_PREFIX`（默认 `polyedge`）

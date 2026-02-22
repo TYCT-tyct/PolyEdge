@@ -52,7 +52,7 @@ main() {
 
   ensure_env_line "$ENV_FILE" "POLYEDGE_CH_URL" "http://127.0.0.1:8123"
   ensure_env_line "$ENV_FILE" "POLYEDGE_CH_DATABASE" "polyedge"
-  ensure_env_line "$ENV_FILE" "POLYEDGE_CH_SNAPSHOT_TABLE" "snapshot_1s"
+  ensure_env_line "$ENV_FILE" "POLYEDGE_CH_SNAPSHOT_TABLE" "snapshot_100ms"
   ensure_env_line "$ENV_FILE" "POLYEDGE_CH_TTL_DAYS" "30"
   ensure_env_line "$ENV_FILE" "POLYEDGE_REDIS_URL" "redis://127.0.0.1:6379/0"
   ensure_env_line "$ENV_FILE" "POLYEDGE_REDIS_PREFIX" "polyedge"

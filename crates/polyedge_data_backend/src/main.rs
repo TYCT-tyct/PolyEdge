@@ -58,19 +58,19 @@ struct IrelandIngestArgs {
     dataset_root: String,
     #[arg(long, env = "POLYEDGE_SYMBOLS", default_value = "BTCUSDT")]
     symbols: String,
-    #[arg(long, env = "POLYEDGE_TIMEFRAMES", default_value = "5m")]
+    #[arg(long, env = "POLYEDGE_TIMEFRAMES", default_value = "5m,15m")]
     timeframes: String,
     #[arg(long, env = "POLYEDGE_IRELAND_UDP_BIND", default_value = "0.0.0.0:9801")]
     udp_bind: String,
     #[arg(long, env = "POLYEDGE_SNAPSHOT_MS", default_value_t = 100)]
     snapshot_ms: u64,
-    #[arg(long, env = "POLYEDGE_DISCOVERY_REFRESH_SEC", default_value_t = 10)]
+    #[arg(long, env = "POLYEDGE_DISCOVERY_REFRESH_SEC", default_value_t = 2)]
     discovery_refresh_sec: u64,
     #[arg(long, env = "POLYEDGE_CH_URL", default_value = "")]
     clickhouse_url: String,
     #[arg(long, env = "POLYEDGE_CH_DATABASE", default_value = "polyedge")]
     clickhouse_database: String,
-    #[arg(long, env = "POLYEDGE_CH_SNAPSHOT_TABLE", default_value = "snapshot_1s")]
+    #[arg(long, env = "POLYEDGE_CH_SNAPSHOT_TABLE", default_value = "snapshot_100ms")]
     clickhouse_snapshot_table: String,
     #[arg(long, env = "POLYEDGE_CH_TTL_DAYS", default_value_t = 30)]
     clickhouse_ttl_days: u32,
@@ -361,7 +361,7 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
     let discover_symbols = symbols.clone();
     let discover_tfs = timeframes.clone();
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(args.discovery_refresh_sec.max(3)));
+        let mut tick = tokio::time::interval(Duration::from_secs(args.discovery_refresh_sec.max(1)));
         loop {
             tick.tick().await;
             match discover_once(&discover_symbols, &discover_tfs).await {
@@ -550,43 +550,18 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
     });
 
     let mut snap_tick = tokio::time::interval(Duration::from_millis(args.snapshot_ms.max(20)));
-    let mut sec_cache: HashMap<(String, String, String), SnapshotRow> = HashMap::new();
     loop {
         snap_tick.tick().await;
         let rows = build_snapshots(shared.clone()).await;
         if rows.is_empty() {
             continue;
         }
-        let mut seen_keys = std::collections::HashSet::new();
         for row in rows {
-            let key = (row.symbol.clone(), row.timeframe.clone(), row.market_id.clone());
-            seen_keys.insert(key.clone());
-            let sec = row.ts_ms_utc / 1000;
-            if let Some(prev) = sec_cache.get(&key).cloned() {
-                let prev_sec = prev.ts_ms_utc / 1000;
-                if prev_sec == sec {
-                    sec_cache.insert(key, row);
-                    continue;
-                }
-                append_jsonl(&snapshot_symbol_tf_1s_path(&root, &prev), &prev)?;
-                append_jsonl(&snapshot_market_1s_path(&root, &prev), &prev)?;
-                if let Some(tx) = sink_tx.as_ref() {
-                    let _ = tx.try_send(SinkEvent::Snapshot(prev));
-                }
-            }
-            sec_cache.insert(key, row);
-        }
-        let stale_keys = sec_cache
-            .keys()
-            .filter(|k| !seen_keys.contains(*k))
-            .cloned()
-            .collect::<Vec<_>>();
-        for key in stale_keys {
-            if let Some(last) = sec_cache.remove(&key) {
-                append_jsonl(&snapshot_symbol_tf_1s_path(&root, &last), &last)?;
-                append_jsonl(&snapshot_market_1s_path(&root, &last), &last)?;
-                if let Some(tx) = sink_tx.as_ref() {
-                    let _ = tx.try_send(SinkEvent::Snapshot(last));
+            append_jsonl(&snapshot_symbol_tf_100ms_path(&root, &row), &row)?;
+            append_jsonl(&snapshot_market_100ms_path(&root, &row), &row)?;
+            if let Some(tx) = sink_tx.as_ref() {
+                if tx.try_send(SinkEvent::Snapshot(row)).is_err() {
+                    tracing::warn!("analytics sink queue full; dropping snapshot event");
                 }
             }
         }
@@ -1682,7 +1657,7 @@ fn pm_books_market_path(root: &Path, row: &PmBookRow) -> PathBuf {
         .join("pm_books.jsonl")
 }
 
-fn snapshot_symbol_tf_1s_path(root: &Path, row: &SnapshotRow) -> PathBuf {
+fn snapshot_symbol_tf_100ms_path(root: &Path, row: &SnapshotRow) -> PathBuf {
     let d = utc_date_from_ms(row.ts_ms_utc);
     root.join("normalized")
         .join(d)
@@ -1690,10 +1665,10 @@ fn snapshot_symbol_tf_1s_path(root: &Path, row: &SnapshotRow) -> PathBuf {
         .join(path_safe_segment(&row.symbol))
         .join("timeframe")
         .join(path_safe_segment(&row.timeframe))
-        .join("snapshot_1s.jsonl")
+        .join("snapshot_100ms.jsonl")
 }
 
-fn snapshot_market_1s_path(root: &Path, row: &SnapshotRow) -> PathBuf {
+fn snapshot_market_100ms_path(root: &Path, row: &SnapshotRow) -> PathBuf {
     let d = utc_date_from_ms(row.ts_ms_utc);
     root.join("normalized")
         .join(d)
@@ -1703,7 +1678,7 @@ fn snapshot_market_1s_path(root: &Path, row: &SnapshotRow) -> PathBuf {
         .join(path_safe_segment(&row.timeframe))
         .join("market")
         .join(path_safe_segment(&row.market_id))
-        .join("snapshot_1s.jsonl")
+        .join("snapshot_100ms.jsonl")
 }
 
 fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -1772,15 +1747,25 @@ fn list_date_dirs(base: &Path) -> Vec<String> {
 fn latest_symbol_tf_snapshot_file(root: &Path, symbol: &str, timeframe: &str) -> Option<PathBuf> {
     let base = root.join("normalized");
     for date in list_date_dirs(&base) {
-        let p1 = base
-            .join(date)
+        let p100ms = base
+            .join(&date)
+            .join("symbol")
+            .join(path_safe_segment(symbol))
+            .join("timeframe")
+            .join(path_safe_segment(timeframe))
+            .join("snapshot_100ms.jsonl");
+        if p100ms.exists() {
+            return Some(p100ms);
+        }
+        let p1s = base
+            .join(&date)
             .join("symbol")
             .join(path_safe_segment(symbol))
             .join("timeframe")
             .join(path_safe_segment(timeframe))
             .join("snapshot_1s.jsonl");
-        if p1.exists() {
-            return Some(p1);
+        if p1s.exists() {
+            return Some(p1s);
         }
     }
     None
@@ -1793,7 +1778,7 @@ fn history_snapshot_path(
     timeframe: &str,
     market_id: Option<&str>,
 ) -> PathBuf {
-    let mut p = root
+    let mut p100ms = root
         .join("normalized")
         .join(date)
         .join("symbol")
@@ -1801,9 +1786,23 @@ fn history_snapshot_path(
         .join("timeframe")
         .join(path_safe_segment(timeframe));
     if let Some(mid) = market_id {
-        p = p.join("market").join(path_safe_segment(mid));
+        p100ms = p100ms.join("market").join(path_safe_segment(mid));
     }
-    p.join("snapshot_1s.jsonl")
+    let p100ms = p100ms.join("snapshot_100ms.jsonl");
+    if p100ms.exists() {
+        return p100ms;
+    }
+    let mut p1s = root
+        .join("normalized")
+        .join(date)
+        .join("symbol")
+        .join(path_safe_segment(symbol))
+        .join("timeframe")
+        .join(path_safe_segment(timeframe));
+    if let Some(mid) = market_id {
+        p1s = p1s.join("market").join(path_safe_segment(mid));
+    }
+    p1s.join("snapshot_1s.jsonl")
 }
 
 fn read_last_jsonl_rows(path: &Path, limit: usize) -> Vec<serde_json::Value> {
