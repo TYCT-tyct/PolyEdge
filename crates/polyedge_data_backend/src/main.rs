@@ -794,6 +794,16 @@ fn resolve_target_anchor(
                 price: p,
                 source: "tokyo_market_open".to_string(),
             })
+        })
+        .or_else(|| {
+            if now_ms >= start {
+                state.tokyo_last.get(&meta.symbol).map(|x| TargetAnchor {
+                    price: x.binance_price,
+                    source: "tokyo_first_seen_after_open".to_string(),
+                })
+            } else {
+                None
+            }
         });
     if let Some(anchor) = resolved.clone() {
         state.target_anchor.insert(meta.market_id.clone(), anchor);
