@@ -372,45 +372,10 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
     let discover_tfs = timeframes.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(args.discovery_refresh_sec.max(1)));
-        let mut price_to_beat_cache = HashMap::<String, f64>::new();
-        let mut price_to_beat_retry_after = HashMap::<String, i64>::new();
         loop {
             tick.tick().await;
             match discover_once(&discover_symbols, &discover_tfs).await {
-                Ok(mut meta_rows) => {
-                    let now = now_ms();
-                    for meta in &mut meta_rows {
-                        if meta.target_price.is_some() {
-                            continue;
-                        }
-                        let Some(slug) = meta.event_slug.as_deref() else {
-                            continue;
-                        };
-                        if let Some(cached) = price_to_beat_cache.get(slug).copied() {
-                            meta.target_price = Some(cached);
-                            meta.target_source = Some("pm_price_to_beat".to_string());
-                            continue;
-                        }
-                        let next_retry = price_to_beat_retry_after.get(slug).copied().unwrap_or(0);
-                        if now < next_retry {
-                            continue;
-                        }
-                        match fetch_price_to_beat_from_event_slug(slug).await {
-                            Ok(price) if price.is_finite() && price > 0.0 => {
-                                price_to_beat_cache.insert(slug.to_string(), price);
-                                meta.target_price = Some(price);
-                                meta.target_source = Some("pm_price_to_beat".to_string());
-                            }
-                            Ok(_) => {
-                                price_to_beat_retry_after.insert(slug.to_string(), now + 60_000);
-                            }
-                            Err(err) => {
-                                tracing::debug!(?err, event_slug = %slug, "priceToBeat fetch failed");
-                                price_to_beat_retry_after.insert(slug.to_string(), now + 60_000);
-                            }
-                        }
-                    }
-
+                Ok(meta_rows) => {
                     let mut w = discover_state.write().await;
                     w.meta = meta_rows
                         .into_iter()
@@ -428,11 +393,11 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
                         .meta
                         .values()
                         .map(|m| {
-                            let start_price = w
-                                .target_anchor
-                                .get(&m.market_id)
-                                .map(|a| a.price)
-                                .or(m.target_price);
+                            let start_anchor = w.target_anchor.get(&m.market_id);
+                            let start_price = start_anchor.map(|a| a.price).or(m.target_price);
+                            let start_source = start_anchor
+                                .map(|a| a.source.clone())
+                                .or_else(|| m.target_source.clone());
                             serde_json::json!({
                                 "market_id": m.market_id,
                                 "symbol": m.symbol,
@@ -442,9 +407,11 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
                                 "end_date": m.end_date,
                                 "event_start_time": m.event_start_time,
                                 "start_ts_utc_ms": m.start_ts_utc_ms,
-                                "target_price": m.target_price,
-                                "target_source": m.target_source,
-                                "start_price": start_price
+                                "target_price": start_price,
+                                "target_source": start_source,
+                                "start_price": start_price,
+                                "target_price_raw": m.target_price,
+                                "target_source_raw": m.target_source
                             })
                         })
                         .collect::<Vec<_>>();
@@ -540,7 +507,10 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
                         continue;
                     }
                 };
-                let row = map_book_to_row(&pm_state, &book).await;
+                let row = match map_book_to_row(&pm_state, &book).await {
+                    Some(v) => v,
+                    None => continue,
+                };
                 {
                     let mut w = pm_state.write().await;
                     w.books.insert(row.market_id.clone(), row.clone());
@@ -616,36 +586,36 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
     }
 }
 
-async fn map_book_to_row(state: &Arc<RwLock<IngestState>>, book: &BookTop) -> PmBookRow {
+async fn map_book_to_row(state: &Arc<RwLock<IngestState>>, book: &BookTop) -> Option<PmBookRow> {
     let meta = {
         let r = state.read().await;
         r.meta.get(&book.market_id).cloned()
     };
+    let meta = meta?;
 
-    PmBookRow {
+    let bid_yes = book.bid_yes.min(book.ask_yes);
+    let ask_yes = book.ask_yes.max(book.bid_yes);
+    let bid_no = book.bid_no.min(book.ask_no);
+    let ask_no = book.ask_no.max(book.bid_no);
+
+    Some(PmBookRow {
         ts_pm_recv_ms: now_ms(),
         ts_exchange_ms: book.ts_ms,
         market_id: book.market_id.clone(),
         token_id_yes: book.token_id_yes.clone(),
         token_id_no: book.token_id_no.clone(),
-        symbol: meta
-            .as_ref()
-            .map(|m| m.symbol.clone())
-            .unwrap_or_else(|| "UNKNOWN".to_string()),
-        timeframe: meta
-            .as_ref()
-            .map(|m| m.timeframe.clone())
-            .unwrap_or_else(|| "unknown".to_string()),
-        title: meta.as_ref().map(|m| m.title.clone()).unwrap_or_default(),
-        bid_yes: book.bid_yes,
-        ask_yes: book.ask_yes,
-        mid_yes: (book.bid_yes + book.ask_yes) * 0.5,
-        bid_no: book.bid_no,
-        ask_no: book.ask_no,
-        mid_no: (book.bid_no + book.ask_no) * 0.5,
-        spread_yes: (book.ask_yes - book.bid_yes).max(0.0),
-        spread_no: (book.ask_no - book.bid_no).max(0.0),
-    }
+        symbol: meta.symbol,
+        timeframe: meta.timeframe,
+        title: meta.title,
+        bid_yes,
+        ask_yes,
+        mid_yes: (bid_yes + ask_yes) * 0.5,
+        bid_no,
+        ask_no,
+        mid_no: (bid_no + ask_no) * 0.5,
+        spread_yes: (ask_yes - bid_yes).max(0.0),
+        spread_no: (ask_no - bid_no).max(0.0),
+    })
 }
 
 async fn build_snapshots(state: Arc<RwLock<IngestState>>) -> Vec<SnapshotRow> {
@@ -1144,121 +1114,6 @@ async fn discover_once(symbols: &[String], timeframes: &[String]) -> Result<Vec<
     Ok(markets.into_iter().map(map_market_meta).collect())
 }
 
-async fn fetch_price_to_beat_from_event_slug(event_slug: &str) -> Result<f64> {
-    let url = format!("https://polymarket.com/event/{}", event_slug);
-    let resp = reqwest::Client::new()
-        .get(&url)
-        .timeout(Duration::from_secs(6))
-        .send()
-        .await?
-        .error_for_status()?;
-    let body = resp.text().await?;
-    extract_price_to_beat_from_html(&body, event_slug)
-        .ok_or_else(|| anyhow!("priceToBeat not found in event html {}", event_slug))
-}
-
-fn extract_price_to_beat_from_html(html: &str, event_slug: &str) -> Option<f64> {
-    if let Some(price) = extract_price_to_beat_by_ticker(html, event_slug) {
-        return Some(price);
-    }
-    if let Some(price) = extract_price_to_beat_near_slug(html, event_slug) {
-        return Some(price);
-    }
-    extract_price_to_beat_generic(html)
-}
-
-fn extract_price_to_beat_by_ticker(html: &str, event_slug: &str) -> Option<f64> {
-    let marker = "\"eventMetadata\":{\"priceToBeat\":";
-    let ticker_marker = "\"ticker\":\"";
-    let mut from = 0usize;
-    while let Some(off) = html[from..].find(marker) {
-        let pos = from + off;
-        let mut s = &html[pos + marker.len()..];
-        let mut token = String::new();
-        for ch in s.chars() {
-            if ch.is_ascii_digit() || ch == '.' {
-                token.push(ch);
-            } else {
-                break;
-            }
-        }
-        let price = token.parse::<f64>().ok();
-        let next_event_pos = html[pos + marker.len()..]
-            .find(marker)
-            .map(|x| pos + marker.len() + x)
-            .unwrap_or(html.len());
-        let search_end = (pos + 30_000).min(next_event_pos).min(html.len());
-        s = &html[pos..search_end];
-        let ticker = if let Some(tpos) = s.find(ticker_marker) {
-            let mut t = String::new();
-            for ch in s[tpos + ticker_marker.len()..].chars() {
-                if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' {
-                    t.push(ch);
-                } else {
-                    break;
-                }
-            }
-            Some(t)
-        } else {
-            None
-        };
-        if ticker.as_deref() == Some(event_slug) {
-            if let Some(p) = price {
-                if p.is_finite() && p > 100.0 {
-                    return Some(p);
-                }
-            }
-        }
-        from = pos + marker.len();
-        if from >= html.len() {
-            break;
-        }
-    }
-    None
-}
-
-fn extract_price_to_beat_near_slug(html: &str, slug: &str) -> Option<f64> {
-    let mut from = 0usize;
-    while let Some(off) = html[from..].find(slug) {
-        let idx = from + off;
-        let end = (idx + 6_000).min(html.len());
-        if let Some(v) = extract_price_to_beat_generic(&html[idx..end]) {
-            return Some(v);
-        }
-        from = idx.saturating_add(slug.len());
-        if from >= html.len() {
-            break;
-        }
-    }
-    None
-}
-
-fn extract_price_to_beat_generic(html: &str) -> Option<f64> {
-    for marker in ["\"priceToBeat\":", "\\\"priceToBeat\\\":"] {
-        let Some(pos) = html.find(marker) else {
-            continue;
-        };
-        let mut s = html[pos + marker.len()..].trim_start();
-        if s.starts_with('"') {
-            s = &s[1..];
-        }
-        let mut token = String::new();
-        for ch in s.chars() {
-            if ch.is_ascii_digit() || ch == '.' {
-                token.push(ch);
-            } else {
-                break;
-            }
-        }
-        if let Ok(v) = token.parse::<f64>() {
-            if v.is_finite() && v > 100.0 {
-                return Some(v);
-            }
-        }
-    }
-    None
-}
-
 fn map_market_meta(m: MarketDescriptor) -> MarketMeta {
     let target = extract_price_from_title(&m.question);
     let target_source = target.as_ref().map(|_| "title_parse".to_string());
@@ -1398,6 +1253,18 @@ fn resolve_target_anchor(
     let start = meta.start_ts_utc_ms?;
     let existing = state.target_anchor.get(&meta.market_id).cloned();
     if let Some(existing) = existing {
+        // If the first anchor used Tokyo fallback, upgrade to Chainlink open anchor
+        // once the exact open tick becomes available.
+        if existing.source == "tokyo_first_seen_after_open" {
+            if let Some(observed) = resolve_open_anchor_from_ticks(state, &meta.symbol, start, now_ms) {
+                if observed.source == "chainlink_market_open" {
+                    state
+                        .target_anchor
+                        .insert(meta.market_id.clone(), observed.clone());
+                    return Some(observed);
+                }
+            }
+        }
         // If existing target came from metadata parse, re-validate near market-open
         // against observable Chainlink/Tokyo ticks and self-correct if drift is large.
         if existing.source == "pm_price_to_beat" || existing.source == "metadata_target" {
