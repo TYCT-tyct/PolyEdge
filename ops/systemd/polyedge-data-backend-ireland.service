@@ -1,0 +1,19 @@
+[Unit]
+Description=PolyEdge Data Backend (Ireland Ingest)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/PolyEdge
+EnvironmentFile=-/etc/polyedge/data-backend-ireland.env
+ExecStart=/home/ubuntu/PolyEdge/target/release/polyedge_data_backend ireland-ingest --dataset-root /dev/xvdbb/polyedge-data --symbols BTCUSDT --timeframes 5m --udp-bind 0.0.0.0:9801 --snapshot-ms 100 --discovery-refresh-sec 10
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+StandardOutput=append:/var/log/polyedge/data-backend-ireland.log
+StandardError=append:/var/log/polyedge/data-backend-ireland.err.log
+
+[Install]
+WantedBy=multi-user.target

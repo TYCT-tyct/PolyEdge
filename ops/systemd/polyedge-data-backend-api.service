@@ -1,0 +1,19 @@
+[Unit]
+Description=PolyEdge Data Backend API (Ireland)
+After=network-online.target polyedge-data-backend-ireland.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/PolyEdge
+EnvironmentFile=-/etc/polyedge/data-backend-api.env
+ExecStart=/home/ubuntu/PolyEdge/target/release/polyedge_data_backend api --dataset-root /dev/xvdbb/polyedge-data --bind 0.0.0.0:8095
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+StandardOutput=append:/var/log/polyedge/data-backend-api.log
+StandardError=append:/var/log/polyedge/data-backend-api.err.log
+
+[Install]
+WantedBy=multi-user.target

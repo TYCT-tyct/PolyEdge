@@ -1750,6 +1750,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "polyedge_data_backend"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "clap",
+ "core_types",
+ "feed_polymarket",
+ "feed_reference",
+ "futures",
+ "market_discovery",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "portable-atomic"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
