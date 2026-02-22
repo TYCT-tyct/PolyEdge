@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -124,6 +124,53 @@ fn direction_signal_for_side(base: &DirectionSignal, side: &OrderSide) -> Direct
 
 fn record_roll_trace(payload: serde_json::Value) {
     append_jsonl(&dataset_path("reports", "roll_v1_trace.jsonl"), &payload);
+}
+
+fn roll_scan_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("POLYEDGE_ROLL_SCAN_TRACE_ENABLED")
+            .ok()
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn roll_scan_trace_interval_ms() -> i64 {
+    static INTERVAL_MS: OnceLock<i64> = OnceLock::new();
+    *INTERVAL_MS.get_or_init(|| {
+        std::env::var("POLYEDGE_ROLL_SCAN_TRACE_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(200)
+            .clamp(20, 2_000)
+    })
+}
+
+fn should_emit_roll_scan_trace(
+    shared: &Arc<EngineShared>,
+    symbol: &str,
+    market_id: &str,
+    timeframe: &str,
+    now_ms: i64,
+) -> bool {
+    if !roll_scan_trace_enabled() {
+        return false;
+    }
+    let key = format!("{symbol}|{timeframe}|{market_id}");
+    let interval_ms = roll_scan_trace_interval_ms();
+    match shared.roll_scan_trace_last_ms.get(&key) {
+        Some(last) if now_ms.saturating_sub(*last.value()) < interval_ms => false,
+        _ => {
+            shared.roll_scan_trace_last_ms.insert(key, now_ms);
+            true
+        }
+    }
 }
 
 fn flatten_side_for_entry(side: &OrderSide) -> OrderSide {
@@ -1117,6 +1164,7 @@ pub(super) async fn evaluate_and_route_roll_v1(
         let Some(book) = book_by_market.get(&market_id).cloned() else {
             continue;
         };
+        let trace_scan = should_emit_roll_scan_trace(shared, symbol, &market_id, tf_label, now_ms);
         let Some(sig_entry) = shared
             .latest_signals
             .get(&market_id)
@@ -1146,15 +1194,28 @@ pub(super) async fn evaluate_and_route_roll_v1(
                 .shadow_stats
                 .mark_blocked_with_reason_ctx(reason, Some(symbol), Some(tf_label))
                 .await;
-            record_roll_trace(serde_json::json!({
-                "ts_ms": now_ms,
-                "event": "skip",
-                "reason": reason,
-                "symbol": symbol,
-                "market_id": market_id,
-                "timeframe": tf_label,
-                "remaining_ms": remaining_ms,
-            }));
+            if trace_scan {
+                record_roll_trace(serde_json::json!({
+                    "ts_ms": now_ms,
+                    "event": "scan",
+                    "reason": reason,
+                    "symbol": symbol,
+                    "market_id": market_id,
+                    "timeframe": tf_label,
+                    "remaining_ms": remaining_ms,
+                    "direction": format!("{:?}", direction_signal.direction),
+                    "direction_confidence": direction_signal.confidence,
+                    "velocity_bps_per_sec": direction_signal.velocity_bps_per_sec,
+                    "acceleration": direction_signal.acceleration,
+                    "fair_yes": sig_entry.signal.fair_yes,
+                    "bid_yes": book.bid_yes,
+                    "ask_yes": book.ask_yes,
+                    "bid_no": book.bid_no,
+                    "ask_no": book.ask_no,
+                    "mid_yes": ((book.bid_yes + book.ask_yes) * 0.5).clamp(0.0, 1.0),
+                    "mid_no": ((book.bid_no + book.ask_no) * 0.5).clamp(0.0, 1.0),
+                }));
+            }
             continue;
         }
 
@@ -1287,6 +1348,31 @@ pub(super) async fn evaluate_and_route_roll_v1(
                     }
                 }
             };
+        if trace_scan {
+            record_roll_trace(serde_json::json!({
+                "ts_ms": now_ms,
+                "event": "scan_eval",
+                "symbol": symbol,
+                "market_id": market_id,
+                "timeframe": tf_label,
+                "remaining_ms": remaining_ms,
+                "direction": format!("{:?}", direction_signal.direction),
+                "direction_confidence": direction_signal.confidence,
+                "velocity_bps_per_sec": direction_signal.velocity_bps_per_sec,
+                "acceleration": direction_signal.acceleration,
+                "prob_settle": probability.p_settle,
+                "prob_confidence": probability.confidence,
+                "yes_price": yes_price,
+                "no_price": no_price,
+                "yes_edge_gross_bps": yes_edge_gross,
+                "no_edge_gross_bps": no_edge_gross,
+                "yes_edge_net_bps": yes_edge_net,
+                "no_edge_net_bps": no_edge_net,
+                "selected_side": format!("{:?}", side),
+                "selected_entry_price": entry_price,
+                "selected_edge_net_bps": edge_net_bps,
+            }));
+        }
         let (alt_side, alt_entry_price, alt_edge_gross_bps, alt_edge_net_bps, alt_fee_applied) =
             match side {
                 OrderSide::BuyYes => (
@@ -1376,6 +1462,21 @@ pub(super) async fn evaluate_and_route_roll_v1(
             RollStage::Idle
         };
         if matches!(stage, RollStage::Idle | RollStage::Settled) {
+            if trace_scan {
+                record_roll_trace(serde_json::json!({
+                    "ts_ms": now_ms,
+                    "event": "scan",
+                    "reason": if matches!(stage, RollStage::Settled) { "stage_settled" } else { "stage_idle" },
+                    "symbol": symbol,
+                    "market_id": market_id,
+                    "timeframe": tf_label,
+                    "remaining_ms": remaining_ms,
+                    "side": format!("{:?}", side),
+                    "entry_price": entry_price,
+                    "edge_net_bps": edge_net_bps,
+                    "edge_gross_bps": edge_gross_bps,
+                }));
+            }
             continue;
         }
 

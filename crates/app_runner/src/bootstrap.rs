@@ -246,6 +246,7 @@ pub(super) async fn async_main() -> Result<()> {
         market_to_timeframe: Arc::new(RwLock::new(HashMap::new())),
         market_to_end_ts_ms: Arc::new(RwLock::new(HashMap::new())),
         symbol_to_markets: Arc::new(RwLock::new(HashMap::new())),
+        roll_scan_trace_last_ms: Arc::new(DashMap::new()),
         fee_cache: Arc::new(RwLock::new(HashMap::new())),
         fee_refresh_inflight: Arc::new(RwLock::new(HashMap::new())),
         scoring_cache: Arc::new(RwLock::new(HashMap::new())),
