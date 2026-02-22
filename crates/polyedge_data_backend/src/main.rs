@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
@@ -18,9 +18,10 @@ use feed_polymarket::PolymarketFeed;
 use feed_reference::MultiSourceRefFeed;
 use futures::StreamExt;
 use market_discovery::{DiscoveryConfig, MarketDiscovery, MarketDescriptor};
+use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 
 #[derive(Parser, Debug)]
 #[command(name = "polyedge-data-backend", version, about = "Independent high-resolution data backend")]
@@ -65,6 +66,26 @@ struct IrelandIngestArgs {
     snapshot_ms: u64,
     #[arg(long, env = "POLYEDGE_DISCOVERY_REFRESH_SEC", default_value_t = 10)]
     discovery_refresh_sec: u64,
+    #[arg(long, env = "POLYEDGE_CH_URL", default_value = "")]
+    clickhouse_url: String,
+    #[arg(long, env = "POLYEDGE_CH_DATABASE", default_value = "polyedge")]
+    clickhouse_database: String,
+    #[arg(long, env = "POLYEDGE_CH_SNAPSHOT_TABLE", default_value = "snapshot_1s")]
+    clickhouse_snapshot_table: String,
+    #[arg(long, env = "POLYEDGE_CH_TTL_DAYS", default_value_t = 30)]
+    clickhouse_ttl_days: u32,
+    #[arg(long, env = "POLYEDGE_REDIS_URL", default_value = "")]
+    redis_url: String,
+    #[arg(long, env = "POLYEDGE_REDIS_PREFIX", default_value = "polyedge")]
+    redis_prefix: String,
+    #[arg(long, env = "POLYEDGE_REDIS_TTL_SEC", default_value_t = 7200)]
+    redis_ttl_sec: u64,
+    #[arg(long, env = "POLYEDGE_SINK_BATCH_SIZE", default_value_t = 200)]
+    sink_batch_size: usize,
+    #[arg(long, env = "POLYEDGE_SINK_FLUSH_MS", default_value_t = 1000)]
+    sink_flush_ms: u64,
+    #[arg(long, env = "POLYEDGE_SINK_QUEUE_CAP", default_value_t = 20000)]
+    sink_queue_cap: usize,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -73,6 +94,10 @@ struct ApiArgs {
     dataset_root: String,
     #[arg(long, env = "POLYEDGE_API_BIND", default_value = "0.0.0.0:8095")]
     bind: String,
+    #[arg(long, env = "POLYEDGE_REDIS_URL", default_value = "")]
+    redis_url: String,
+    #[arg(long, env = "POLYEDGE_REDIS_PREFIX", default_value = "polyedge")]
+    redis_prefix: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,13 +194,34 @@ struct IngestState {
     books: HashMap<String, PmBookRow>,
     meta: HashMap<String, MarketMeta>,
     target_anchor: HashMap<String, TargetAnchor>,
-    settled_markets: std::collections::HashSet<String>,
+    settled_markets: HashSet<String>,
     historical_up_stats: HashMap<(String, String), (u64, u64)>,
+}
+
+#[derive(Clone, Debug)]
+struct AnalyticsSinkConfig {
+    clickhouse_url: Option<String>,
+    clickhouse_database: String,
+    clickhouse_snapshot_table: String,
+    clickhouse_ttl_days: u32,
+    redis_url: Option<String>,
+    redis_prefix: String,
+    redis_ttl_sec: u64,
+    batch_size: usize,
+    flush_ms: u64,
+    queue_cap: usize,
+}
+
+#[derive(Debug, Clone)]
+enum SinkEvent {
+    Snapshot(SnapshotRow),
 }
 
 #[derive(Clone)]
 struct ApiState {
     root: PathBuf,
+    redis_url: Option<String>,
+    redis_prefix: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -290,6 +336,25 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
     tracing::info!(?symbols, ?timeframes, udp_bind = %args.udp_bind, root = %args.dataset_root, "ireland ingest started");
 
     let shared = Arc::new(RwLock::new(IngestState::default()));
+    let sink_cfg = AnalyticsSinkConfig {
+        clickhouse_url: normalize_opt_url(&args.clickhouse_url),
+        clickhouse_database: args.clickhouse_database.clone(),
+        clickhouse_snapshot_table: args.clickhouse_snapshot_table.clone(),
+        clickhouse_ttl_days: args.clickhouse_ttl_days.max(1),
+        redis_url: normalize_opt_url(&args.redis_url),
+        redis_prefix: args.redis_prefix.clone(),
+        redis_ttl_sec: args.redis_ttl_sec.max(60),
+        batch_size: args.sink_batch_size.clamp(10, 5_000),
+        flush_ms: args.sink_flush_ms.clamp(100, 5_000),
+        queue_cap: args.sink_queue_cap.clamp(1_000, 200_000),
+    };
+    let sink_tx = if sink_cfg.clickhouse_url.is_some() || sink_cfg.redis_url.is_some() {
+        let (tx, rx) = mpsc::channel::<SinkEvent>(sink_cfg.queue_cap);
+        tokio::spawn(run_analytics_sink(sink_cfg.clone(), rx));
+        Some(tx)
+    } else {
+        None
+    };
 
     let discover_state = shared.clone();
     let discover_root = root.clone();
@@ -505,6 +570,9 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
                 }
                 append_jsonl(&snapshot_symbol_tf_1s_path(&root, &prev), &prev)?;
                 append_jsonl(&snapshot_market_1s_path(&root, &prev), &prev)?;
+                if let Some(tx) = sink_tx.as_ref() {
+                    let _ = tx.try_send(SinkEvent::Snapshot(prev));
+                }
             }
             sec_cache.insert(key, row);
         }
@@ -517,6 +585,9 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
             if let Some(last) = sec_cache.remove(&key) {
                 append_jsonl(&snapshot_symbol_tf_1s_path(&root, &last), &last)?;
                 append_jsonl(&snapshot_market_1s_path(&root, &last), &last)?;
+                if let Some(tx) = sink_tx.as_ref() {
+                    let _ = tx.try_send(SinkEvent::Snapshot(last));
+                }
             }
         }
     }
@@ -697,6 +768,255 @@ fn estimate_predicted_win_rate(
     let a = acceleration.unwrap_or(0.0);
     let raw = mid_yes + d * 40.0 + v * 0.001 + a * 0.00005;
     Some(raw.clamp(0.0, 1.0))
+}
+
+fn normalize_opt_url(v: &str) -> Option<String> {
+    let s = v.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClickHouseSnapshotRow {
+    ts_ms_utc: i64,
+    market_id: String,
+    symbol: String,
+    timeframe: String,
+    title: String,
+    target_price: Option<f64>,
+    binance_price_tokyo: Option<f64>,
+    chainlink_price: Option<f64>,
+    chainlink_age_ms: Option<i64>,
+    chainlink_stale: Option<u8>,
+    bid_yes: f64,
+    ask_yes: f64,
+    mid_yes: f64,
+    bid_no: f64,
+    ask_no: f64,
+    mid_no: f64,
+    delta_price: Option<f64>,
+    delta_pct: Option<f64>,
+    velocity_bps_per_sec: Option<f64>,
+    acceleration: Option<f64>,
+    remaining_ms: Option<i64>,
+    predicted_win_rate: Option<f64>,
+    historical_win_rate: Option<f64>,
+    net_ev_bps: Option<f64>,
+    time_edge_ms: Option<f64>,
+}
+
+impl From<SnapshotRow> for ClickHouseSnapshotRow {
+    fn from(v: SnapshotRow) -> Self {
+        Self {
+            ts_ms_utc: v.ts_ms_utc,
+            market_id: v.market_id,
+            symbol: v.symbol,
+            timeframe: v.timeframe,
+            title: v.title,
+            target_price: v.target_price,
+            binance_price_tokyo: v.binance_price_tokyo,
+            chainlink_price: v.chainlink_price,
+            chainlink_age_ms: v.chainlink_age_ms,
+            chainlink_stale: v.chainlink_stale.map(|b| if b { 1 } else { 0 }),
+            bid_yes: v.bid_yes,
+            ask_yes: v.ask_yes,
+            mid_yes: v.mid_yes,
+            bid_no: v.bid_no,
+            ask_no: v.ask_no,
+            mid_no: v.mid_no,
+            delta_price: v.delta_price,
+            delta_pct: v.delta_pct,
+            velocity_bps_per_sec: v.velocity_bps_per_sec,
+            acceleration: v.acceleration,
+            remaining_ms: v.remaining_ms,
+            predicted_win_rate: v.predicted_win_rate,
+            historical_win_rate: v.historical_win_rate,
+            net_ev_bps: v.net_ev_bps,
+            time_edge_ms: v.time_edge_ms,
+        }
+    }
+}
+
+async fn run_analytics_sink(cfg: AnalyticsSinkConfig, mut rx: mpsc::Receiver<SinkEvent>) {
+    if let Some(ch_url) = cfg.clickhouse_url.as_deref() {
+        if let Err(err) = init_clickhouse(ch_url, &cfg).await {
+            tracing::warn!(?err, "clickhouse init failed; continue without hard fail");
+        }
+    }
+
+    let mut flush_tick = tokio::time::interval(Duration::from_millis(cfg.flush_ms));
+    let mut batch = Vec::<SnapshotRow>::with_capacity(cfg.batch_size.saturating_mul(2));
+    loop {
+        tokio::select! {
+            maybe_evt = rx.recv() => {
+                match maybe_evt {
+                    Some(SinkEvent::Snapshot(row)) => {
+                        batch.push(row);
+                        if batch.len() >= cfg.batch_size {
+                            flush_sink_batch(&cfg, &mut batch).await;
+                        }
+                    }
+                    None => {
+                        flush_sink_batch(&cfg, &mut batch).await;
+                        break;
+                    }
+                }
+            }
+            _ = flush_tick.tick() => {
+                if !batch.is_empty() {
+                    flush_sink_batch(&cfg, &mut batch).await;
+                }
+            }
+        }
+    }
+}
+
+async fn flush_sink_batch(cfg: &AnalyticsSinkConfig, batch: &mut Vec<SnapshotRow>) {
+    if batch.is_empty() {
+        return;
+    }
+    let mut to_flush = Vec::new();
+    std::mem::swap(batch, &mut to_flush);
+
+    if let Some(ch_url) = cfg.clickhouse_url.as_deref() {
+        if let Err(err) = flush_clickhouse_snapshots(ch_url, cfg, &to_flush).await {
+            tracing::warn!(?err, rows = to_flush.len(), "clickhouse flush failed");
+        }
+    }
+    if let Some(redis_url) = cfg.redis_url.as_deref() {
+        if let Err(err) = flush_redis_latest(redis_url, cfg, &to_flush).await {
+            tracing::warn!(?err, rows = to_flush.len(), "redis latest cache flush failed");
+        }
+    }
+}
+
+async fn init_clickhouse(ch_url: &str, cfg: &AnalyticsSinkConfig) -> Result<()> {
+    let client = reqwest::Client::new();
+    let db = &cfg.clickhouse_database;
+    let tbl = &cfg.clickhouse_snapshot_table;
+    let ttl_days = cfg.clickhouse_ttl_days.max(1);
+    let create_db = format!("CREATE DATABASE IF NOT EXISTS {}", db);
+    let create_tbl = format!(
+        "CREATE TABLE IF NOT EXISTS {}.{} (
+            ts_ms_utc Int64,
+            market_id String,
+            symbol LowCardinality(String),
+            timeframe LowCardinality(String),
+            title String,
+            target_price Nullable(Float64),
+            binance_price_tokyo Nullable(Float64),
+            chainlink_price Nullable(Float64),
+            chainlink_age_ms Nullable(Int64),
+            chainlink_stale Nullable(UInt8),
+            bid_yes Float64,
+            ask_yes Float64,
+            mid_yes Float64,
+            bid_no Float64,
+            ask_no Float64,
+            mid_no Float64,
+            delta_price Nullable(Float64),
+            delta_pct Nullable(Float64),
+            velocity_bps_per_sec Nullable(Float64),
+            acceleration Nullable(Float64),
+            remaining_ms Nullable(Int64),
+            predicted_win_rate Nullable(Float64),
+            historical_win_rate Nullable(Float64),
+            net_ev_bps Nullable(Float64),
+            time_edge_ms Nullable(Float64),
+            ingested_at DateTime64(3, 'UTC') DEFAULT now64(3)
+        )
+        ENGINE = MergeTree
+        PARTITION BY toDate(fromUnixTimestamp64Milli(ts_ms_utc))
+        ORDER BY (symbol, timeframe, market_id, ts_ms_utc)
+        TTL toDate(fromUnixTimestamp64Milli(ts_ms_utc)) + toIntervalDay({})
+        SETTINGS index_granularity = 8192",
+        db, tbl, ttl_days
+    );
+    for q in [&create_db, &create_tbl] {
+        let resp = client.post(ch_url).query(&[("query", q)]).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("clickhouse init failed status={} body={}", status, body));
+        }
+    }
+    Ok(())
+}
+
+async fn flush_clickhouse_snapshots(
+    ch_url: &str,
+    cfg: &AnalyticsSinkConfig,
+    rows: &[SnapshotRow],
+) -> Result<()> {
+    let db = &cfg.clickhouse_database;
+    let tbl = &cfg.clickhouse_snapshot_table;
+    let query = format!("INSERT INTO {}.{} FORMAT JSONEachRow", db, tbl);
+    let mut body = String::with_capacity(rows.len().saturating_mul(512));
+    for row in rows.iter().cloned() {
+        let ch_row: ClickHouseSnapshotRow = row.into();
+        let line = serde_json::to_string(&ch_row)?;
+        body.push_str(&line);
+        body.push('\n');
+    }
+    let resp = reqwest::Client::new()
+        .post(ch_url)
+        .query(&[("query", query.as_str())])
+        .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
+        .body(body)
+        .send()
+        .await?;
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        Err(anyhow!("clickhouse insert failed status={} body={}", status, body))
+    }
+}
+
+async fn flush_redis_latest(redis_url: &str, cfg: &AnalyticsSinkConfig, rows: &[SnapshotRow]) -> Result<()> {
+    let client = redis::Client::open(redis_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut latest_symbol_tf: HashMap<(String, String), &SnapshotRow> = HashMap::new();
+    let mut latest_market: HashMap<(String, String, String), &SnapshotRow> = HashMap::new();
+    for row in rows {
+        latest_symbol_tf.insert((row.symbol.clone(), row.timeframe.clone()), row);
+        latest_market.insert(
+            (row.symbol.clone(), row.timeframe.clone(), row.market_id.clone()),
+            row,
+        );
+    }
+
+    for ((symbol, timeframe), row) in latest_symbol_tf {
+        let key = format!(
+            "{}:snapshot:latest:{}:{}",
+            cfg.redis_prefix, symbol, timeframe
+        );
+        let payload = serde_json::to_string(row)?;
+        let _: () = conn.set_ex(key, payload, cfg.redis_ttl_sec).await?;
+    }
+    for ((symbol, timeframe, market_id), row) in latest_market {
+        let key = format!(
+            "{}:snapshot:latest:{}:{}:{}",
+            cfg.redis_prefix, symbol, timeframe, market_id
+        );
+        let payload = serde_json::to_string(row)?;
+        let _: () = conn.set_ex(key, payload, cfg.redis_ttl_sec).await?;
+    }
+    Ok(())
+}
+
+async fn read_cached_row(redis_url: &str, key: &str) -> Result<serde_json::Value> {
+    let client = redis::Client::open(redis_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+    let raw: Option<String> = conn.get(key).await?;
+    let Some(raw) = raw else {
+        return Ok(serde_json::Value::Null);
+    };
+    serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| anyhow!(e))
 }
 
 async fn discover_once(symbols: &[String], timeframes: &[String]) -> Result<Vec<MarketMeta>> {
@@ -890,13 +1210,18 @@ fn resolve_target_anchor(
 async fn run_api(args: ApiArgs) -> Result<()> {
     ensure_non_legacy_root(&args.dataset_root)?;
     let root = PathBuf::from(&args.dataset_root);
-    let state = ApiState { root };
+    let state = ApiState {
+        root,
+        redis_url: normalize_opt_url(&args.redis_url),
+        redis_prefix: args.redis_prefix,
+    };
 
     let app = Router::new()
         .route("/health", get(api_health))
         .route("/api/live/markets", get(api_markets))
         .route("/api/live/snapshot", get(api_snapshot))
         .route("/api/live/latest", get(api_latest))
+        .route("/api/live/latest_cached", get(api_latest_cached))
         .route("/api/live/trades", get(api_trades))
         .route("/api/live/heatmap", get(api_heatmap))
         .route("/api/history/dates", get(api_history_dates))
@@ -973,6 +1298,43 @@ async fn api_latest(
         .and_then(|p| read_last_jsonl_rows(p, 1).into_iter().next())
         .unwrap_or_else(|| serde_json::json!({}));
     Json(serde_json::json!({"ts_ms": now_ms(), "row": row}))
+}
+
+async fn api_latest_cached(
+    State(st): State<ApiState>,
+    Query(q): Query<SnapshotQuery>,
+) -> Json<serde_json::Value> {
+    let symbol = q.symbol.unwrap_or_else(|| "BTCUSDT".to_string());
+    let timeframe = q.timeframe.unwrap_or_else(|| "5m".to_string());
+    let market_id = q.market_id;
+    let Some(redis_url) = st.redis_url.clone() else {
+        return Json(serde_json::json!({
+            "ts_ms": now_ms(),
+            "cache_enabled": false,
+            "row": serde_json::Value::Null
+        }));
+    };
+    let key = if let Some(mid) = market_id {
+        format!(
+            "{}:snapshot:latest:{}:{}:{}",
+            st.redis_prefix, symbol, timeframe, mid
+        )
+    } else {
+        format!("{}:snapshot:latest:{}:{}", st.redis_prefix, symbol, timeframe)
+    };
+    let row = match read_cached_row(&redis_url, &key).await {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(?err, key = %key, "redis latest_cached read failed");
+            serde_json::Value::Null
+        }
+    };
+    Json(serde_json::json!({
+        "ts_ms": now_ms(),
+        "cache_enabled": true,
+        "key": key,
+        "row": row
+    }))
 }
 
 async fn api_trades(State(st): State<ApiState>) -> Json<serde_json::Value> {
