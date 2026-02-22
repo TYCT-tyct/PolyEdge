@@ -1487,10 +1487,12 @@ async fn api_latest_cached(
     let timeframe = q.timeframe.unwrap_or_else(|| "5m".to_string());
     let market_id = q.market_id;
     let Some(redis_url) = st.redis_url.clone() else {
+        let row = latest_row_from_file(&st.root, &symbol, &timeframe, market_id.as_deref())
+            .unwrap_or(serde_json::Value::Null);
         return Json(serde_json::json!({
             "ts_ms": now_ms(),
             "cache_enabled": false,
-            "row": serde_json::Value::Null
+            "row": row
         }));
     };
     let key = if let Some(mid) = market_id.as_deref() {
