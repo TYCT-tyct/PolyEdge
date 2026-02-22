@@ -30,6 +30,7 @@ pub struct DiscoveryConfig {
     pub max_future_ms_1h: i64,
     pub max_future_ms_1d: i64,
     pub max_past_ms: i64,
+    pub one_market_per_template: bool,
 }
 
 impl Default for DiscoveryConfig {
@@ -115,6 +116,9 @@ impl Default for DiscoveryConfig {
                 0,
                 30 * 60 * 1_000,
             ),
+            // Keep one active market per (symbol, market_type, timeframe) template
+            // to prevent stale/future window fanout from diluting strategy decisions.
+            one_market_per_template: env_bool("POLYEDGE_DISCOVERY_ONE_PER_TEMPLATE", true),
         }
     }
 }
@@ -286,8 +290,41 @@ impl MarketDiscovery {
         if out.is_empty() {
             return Err(anyhow!("no markets discovered from gamma"));
         }
+
+        if self.cfg.one_market_per_template {
+            out = collapse_to_one_market_per_template(out, now_ms);
+        }
+
         Ok(out)
     }
+}
+
+fn collapse_to_one_market_per_template(
+    markets: Vec<MarketDescriptor>,
+    now_ms: i64,
+) -> Vec<MarketDescriptor> {
+    let mut best = std::collections::HashMap::<String, (i64, i64, MarketDescriptor)>::new();
+    for m in markets {
+        let key = format!(
+            "{}|{}|{}",
+            m.symbol,
+            m.market_type.clone().unwrap_or_else(|| "unknown".to_string()),
+            m.timeframe.clone().unwrap_or_else(|| "unknown".to_string())
+        );
+        let end_ms = parse_end_date_ms(m.end_date.as_deref()).unwrap_or(i64::MAX / 4);
+        // Prefer windows that have not ended; then choose the nearest expiry.
+        let ended_penalty = if end_ms < now_ms { 1_i64 } else { 0_i64 };
+        let distance = end_ms.saturating_sub(now_ms).abs();
+        let candidate = (ended_penalty, distance, m);
+
+        match best.get(&key) {
+            Some((bp, bd, _)) if (*bp, *bd) <= (candidate.0, candidate.1) => {}
+            _ => {
+                best.insert(key, candidate);
+            }
+        }
+    }
+    best.into_values().map(|(_, _, m)| m).collect()
 }
 
 fn detect_symbol(text: &str, allowed_symbols: &[String]) -> Option<String> {
@@ -503,5 +540,35 @@ mod tests {
             now_ms,
             &cfg
         ));
+    }
+
+    #[test]
+    fn collapse_keeps_nearest_non_ended_window() {
+        let mk = |id: &str, end_date: &str| MarketDescriptor {
+            market_id: id.to_string(),
+            question: "Bitcoin Up or Down - 5 Minutes".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            token_id_yes: Some(format!("y-{id}")),
+            token_id_no: Some(format!("n-{id}")),
+            event_slug: None,
+            end_date: Some(end_date.to_string()),
+            timeframe: Some("5m".to_string()),
+            market_type: Some("updown".to_string()),
+            best_bid: None,
+            best_ask: None,
+        };
+
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 2, 22, 16, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        let input = vec![
+            mk("past", "2026-02-22T15:55:00Z"),
+            mk("future_far", "2026-02-22T16:20:00Z"),
+            mk("future_near", "2026-02-22T16:05:00Z"),
+        ];
+        let out = collapse_to_one_market_per_template(input, now);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].market_id, "future_near");
     }
 }

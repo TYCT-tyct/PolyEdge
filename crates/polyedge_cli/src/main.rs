@@ -681,12 +681,18 @@ async fn run_recorder(args: RecorderRun) -> Result<()> {
                     let row = serde_json::json!({
                         "ts_ms": now_ms,
                         "market_id": book.market_id,
+                        "token_id_yes": book.token_id_yes,
+                        "token_id_no": book.token_id_no,
                         "symbol": m.map(|x| x.symbol.clone()).unwrap_or_else(|| "UNKNOWN".to_string()),
                         "market_type": m.map(|x| x.market_type.clone()).unwrap_or_else(|| "unknown".to_string()),
                         "timeframe": m.map(|x| x.timeframe.clone()).unwrap_or_else(|| "unknown".to_string()),
                         "title": m.map(|x| x.title.clone()).unwrap_or_default(),
                         "bid_yes": book.bid_yes, "ask_yes": book.ask_yes,
                         "bid_no": book.bid_no, "ask_no": book.ask_no,
+                        "mid_yes": ((book.bid_yes + book.ask_yes) * 0.5),
+                        "mid_no": ((book.bid_no + book.ask_no) * 0.5),
+                        "spread_yes": (book.ask_yes - book.bid_yes),
+                        "spread_no": (book.ask_no - book.bid_no),
                         "bid_size_yes": book.bid_size_yes, "ask_size_yes": book.ask_size_yes,
                         "bid_size_no": book.bid_size_no, "ask_size_no": book.ask_size_no,
                         "ts_exchange_ms": book.ts_ms, "recv_ts_local_ns": book.recv_ts_local_ns
