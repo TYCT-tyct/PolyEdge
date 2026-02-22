@@ -937,8 +937,9 @@ async fn init_clickhouse(ch_url: &str, cfg: &AnalyticsSinkConfig) -> Result<()> 
     );
     for q in [&create_db, &create_tbl] {
         let resp = client
-            .get(ch_url)
-            .query(&[("query", q)])
+            .post(ch_url)
+            .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body((*q).to_string())
             .send()
             .await?;
         if !resp.status().is_success() {
