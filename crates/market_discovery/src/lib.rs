@@ -8,6 +8,7 @@ pub struct MarketDescriptor {
     pub market_id: String,
     pub question: String,
     pub symbol: String,
+    pub market_slug: Option<String>,
     pub token_id_yes: Option<String>,
     pub token_id_no: Option<String>,
     pub event_slug: Option<String>,
@@ -273,6 +274,7 @@ impl MarketDiscovery {
                         market_id: market.id,
                         question: market.question,
                         symbol,
+                        market_slug: market.slug,
                         token_id_yes: parse_token_pair(market.clob_token_ids.as_deref())
                             .map(|x| x.0),
                         token_id_no: parse_token_pair(market.clob_token_ids.as_deref())
@@ -552,6 +554,7 @@ mod tests {
             market_id: id.to_string(),
             question: "Bitcoin Up or Down - 5 Minutes".to_string(),
             symbol: "BTCUSDT".to_string(),
+            market_slug: None,
             token_id_yes: Some(format!("y-{id}")),
             token_id_no: Some(format!("n-{id}")),
             event_slug: None,

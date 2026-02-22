@@ -1138,7 +1138,7 @@ fn map_market_meta(m: MarketDescriptor) -> MarketMeta {
         symbol: m.symbol,
         timeframe,
         title: m.question,
-        event_slug: m.event_slug,
+        event_slug: m.event_slug.or(m.market_slug),
         end_date: m.end_date,
         event_start_time: m.event_start_time,
         start_ts_utc_ms,
