@@ -1022,6 +1022,15 @@ pub(crate) fn spawn_strategy_engine(
                     );
 
                     let spread_yes = (book.ask_yes - book.bid_yes).max(0.0);
+                    let spread_no = (book.ask_no - book.bid_no).max(0.0);
+                    let yes_valid = book.ask_yes > 0.0 && book.bid_yes > 0.0;
+                    let no_valid = book.ask_no > 0.0 && book.bid_no > 0.0;
+                    let spread_for_gate = match (yes_valid, no_valid) {
+                        (true, true) => spread_yes.min(spread_no),
+                        (true, false) => spread_yes,
+                        (false, true) => spread_no,
+                        (false, false) => f64::INFINITY,
+                    };
                     let effective_max_spread = adaptive_max_spread(
                         cfg.max_spread,
                         tox_decision.tox_score,
@@ -1033,7 +1042,7 @@ pub(crate) fn spawn_strategy_engine(
                             &cfg,
                             &tox_decision,
                             stale_ms,
-                            spread_yes,
+                            spread_for_gate,
                             book_top_lag_ms,
                         )
                     {
@@ -1047,9 +1056,9 @@ pub(crate) fn spawn_strategy_engine(
                         continue;
                     }
                     let queue_fill_proxy =
-                        estimate_queue_fill_proxy(tox_decision.tox_score, spread_yes, stale_ms);
+                        estimate_queue_fill_proxy(tox_decision.tox_score, spread_for_gate, stale_ms);
 
-                    if spread_yes > effective_max_spread {
+                    if spread_for_gate > effective_max_spread {
                         {
                             let mut states = shared.tox_state.write().await;
                             let st = states.entry(book.market_id.clone()).or_default();
