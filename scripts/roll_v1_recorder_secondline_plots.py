@@ -172,8 +172,17 @@ def resample_seconds(rows: List[dict], sec: int) -> pd.DataFrame:
     t0 = int(df["ts_ms"].iloc[0])
     t1 = int(df["ts_ms"].iloc[-1])
     freq = max(1, sec) * 1000
+    # Use second buckets instead of exact millisecond reindex to avoid flattening
+    # when incoming ticks are not aligned to the target grid.
+    df["ts_bucket"] = (((df["ts_ms"] - t0) // freq) * freq) + t0
+    bucket_last = (
+        df.sort_values("ts_ms")
+        .groupby("ts_bucket", as_index=False)["mid_yes"]
+        .last()
+        .rename(columns={"ts_bucket": "ts_ms"})
+    )
     idx = pd.Index(range(t0, t1 + 1, freq), name="ts_ms")
-    s = df.set_index("ts_ms")["mid_yes"].reindex(idx).ffill().bfill()
+    s = bucket_last.set_index("ts_ms")["mid_yes"].reindex(idx).ffill().bfill()
     out = s.reset_index()
     out["elapsed_s"] = (out["ts_ms"] - t0) / 1000.0
     return out

@@ -581,6 +581,8 @@ fn spawn_roll_v1_position_lifecycle(
     spawn_detached("roll_v1_position_lifecycle", false, async move {
         let mut reverse_start_ms: Option<i64> = None;
         let mut peak_prob = side_probability_from_mid_yes(entry_price.clamp(0.0, 1.0), &entry_side);
+        let mut last_side_prob = peak_prob;
+        let mut last_prob_ts_ms = Utc::now().timestamp_millis();
         let scan_ms = tf_cfg.scan_interval_ms.clamp(20, 250);
         let tf_label = timeframe_tag(timeframe.clone()).to_string();
         loop {
@@ -600,6 +602,10 @@ fn spawn_roll_v1_position_lifecycle(
             };
             let mid_yes = ((book.bid_yes + book.ask_yes) * 0.5).clamp(0.0, 1.0);
             let side_prob = side_probability_from_mid_yes(mid_yes, &entry_side).clamp(0.0, 1.0);
+            let dt_sec = ((now_ms - last_prob_ts_ms).max(1) as f64) / 1000.0;
+            let prob_velocity_bps = ((side_prob - last_side_prob) / dt_sec) * 10_000.0;
+            last_side_prob = side_prob;
+            last_prob_ts_ms = now_ms;
             if side_prob.is_finite() {
                 peak_prob = peak_prob.max(side_prob);
             }
@@ -618,8 +624,16 @@ fn spawn_roll_v1_position_lifecycle(
                 .as_ref()
                 .map(|s| aligned_velocity_for_position_side(s.velocity_bps_per_sec, &entry_side))
                 .unwrap_or(0.0);
-            let reversal_condition = aligned_velocity_bps <= tf_cfg.reverse_velocity_bps_per_sec
+            let direction_neutral = direction
+                .as_ref()
+                .map(|s| matches!(s.direction, Direction::Neutral))
+                .unwrap_or(true);
+            let velocity_reversal = aligned_velocity_bps <= tf_cfg.reverse_velocity_bps_per_sec;
+            let momentum_reversal_fallback = direction_neutral
+                && prob_velocity_bps <= tf_cfg.reverse_velocity_bps_per_sec
                 && drop_pct >= tf_cfg.reverse_drop_pct;
+            let reversal_condition =
+                drop_pct >= tf_cfg.reverse_drop_pct && (velocity_reversal || momentum_reversal_fallback);
             if reversal_condition {
                 let started = reverse_start_ms.get_or_insert(now_ms);
                 if now_ms.saturating_sub(*started) < tf_cfg.reverse_persist_ms as i64 {
@@ -1014,13 +1028,9 @@ pub(super) async fn evaluate_and_route_roll_v1(
     };
     let neutral_fallback = matches!(direction_signal.direction, Direction::Neutral);
     if neutral_fallback {
-        shared
-            .shadow_stats
-            .mark_blocked_with_reason_ctx("neutral_direction_fallback", Some(symbol), None)
-            .await;
         record_roll_trace(serde_json::json!({
             "ts_ms": now_ms,
-            "event": "skip",
+            "event": "info",
             "reason": "neutral_direction_fallback",
             "symbol": symbol,
         }));

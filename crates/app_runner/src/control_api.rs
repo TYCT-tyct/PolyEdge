@@ -320,9 +320,32 @@ fn timeframe_label(tf: &TimeframeClass) -> &'static str {
 }
 
 async fn build_market_selection_snapshot(state: &AppState) -> serde_json::Value {
-    let symbols = (*state.shared.universe_symbols).clone();
+    let universe_symbols = (*state.shared.universe_symbols).clone();
     let market_types = (*state.shared.universe_market_types).clone();
-    let timeframes = (*state.shared.universe_timeframes).clone();
+    let universe_timeframes = (*state.shared.universe_timeframes).clone();
+    let predator_cfg = state.shared.predator_cfg.read().await.clone();
+    let roll_mode = matches!(
+        predator_cfg.strategy_engine.engine_mode,
+        StrategyEngineMode::RollV1
+    );
+    let symbols = if roll_mode {
+        predator_cfg.strategy_engine.enabled_symbols.clone()
+    } else {
+        universe_symbols
+    };
+    let timeframes = if roll_mode {
+        predator_cfg.strategy_engine.enabled_timeframes.clone()
+    } else {
+        universe_timeframes
+    };
+    let symbol_filter = symbols
+        .iter()
+        .map(|s| s.to_ascii_uppercase())
+        .collect::<HashSet<_>>();
+    let timeframe_filter = timeframes
+        .iter()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .collect::<HashSet<_>>();
     let market_to_symbol = state.shared.market_to_symbol.read().await.clone();
     let market_to_title = state.shared.market_to_title.read().await.clone();
     let market_to_type = state.shared.market_to_type.read().await.clone();
@@ -330,24 +353,33 @@ async fn build_market_selection_snapshot(state: &AppState) -> serde_json::Value 
 
     let mut markets = market_to_symbol
         .iter()
-        .map(|(market_id, symbol)| {
+        .filter_map(|(market_id, symbol)| {
+            let symbol_norm = symbol.to_ascii_uppercase();
+            if !symbol_filter.is_empty() && !symbol_filter.contains(&symbol_norm) {
+                return None;
+            }
             let timeframe = market_to_timeframe
                 .get(market_id)
                 .map(timeframe_label)
                 .unwrap_or("unknown")
                 .to_string();
+            if !timeframe_filter.is_empty()
+                && !timeframe_filter.contains(&timeframe.to_ascii_lowercase())
+            {
+                return None;
+            }
             let title = market_to_title.get(market_id).cloned().unwrap_or_default();
             let market_type = market_to_type
                 .get(market_id)
                 .cloned()
                 .unwrap_or_else(|| "unknown".to_string());
-            MarketSelectionRow {
+            Some(MarketSelectionRow {
                 market_id: market_id.clone(),
-                symbol: symbol.clone(),
+                symbol: symbol_norm,
                 market_type,
                 timeframe,
                 title,
-            }
+            })
         })
         .collect::<Vec<_>>();
 
