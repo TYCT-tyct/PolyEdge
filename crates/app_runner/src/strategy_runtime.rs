@@ -1346,11 +1346,16 @@ pub(super) async fn evaluate_and_route_roll_v1(
         let time_to_expiry_ms = (frame_total_ms - now_ms.rem_euclid(frame_total_ms)).max(0);
         let remaining_ratio = (time_to_expiry_ms as f64 / frame_total_ms as f64).clamp(0.0, 1.0);
         let time_phase = classify_time_phase(remaining_ratio, &predator_cfg.v52.time_phase);
-        let entry_force_taker = should_force_taker_fallback(
-            time_phase,
-            time_to_expiry_ms,
-            &predator_cfg.v52.execution,
+        let priority_prefers_taker = matches!(
+            predator_cfg.priority,
+            PredatorCPriority::TakerFirst | PredatorCPriority::TakerOnly
         );
+        let entry_force_taker = priority_prefers_taker
+            || should_force_taker_fallback(
+                time_phase,
+                time_to_expiry_ms,
+                &predator_cfg.v52.execution,
+            );
         // Keep EV model aligned with execution intent:
         // - force-taker phases evaluate against aggressive price
         // - maker-first phases evaluate against maker price level
@@ -3032,7 +3037,23 @@ pub(super) async fn predator_execute_opportunity(
         OrderSide::BuyYes | OrderSide::SellYes => book.token_id_yes.clone(),
         OrderSide::BuyNo | OrderSide::SellNo => book.token_id_no.clone(),
     };
-    let execution_style = if force_taker_now {
+    let execution_style = if matches!(
+        predator_cfg.strategy_engine.engine_mode,
+        StrategyEngineMode::RollV1
+    ) {
+        match predator_cfg.priority {
+            PredatorCPriority::TakerOnly | PredatorCPriority::TakerFirst => {
+                ExecutionStyle::Taker
+            }
+            PredatorCPriority::MakerFirst => {
+                if force_taker_now {
+                    ExecutionStyle::Taker
+                } else {
+                    ExecutionStyle::Maker
+                }
+            }
+        }
+    } else if force_taker_now {
         ExecutionStyle::Taker
     } else {
         ExecutionStyle::Maker

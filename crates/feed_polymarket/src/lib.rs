@@ -227,7 +227,7 @@ impl PolymarketFeed {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(120));
+            .unwrap_or(Duration::from_secs(30));
         let refresh_deadline = tokio::time::sleep(refresh_every);
         tokio::pin!(refresh_deadline);
         let mut parse_failures = 0_u64;

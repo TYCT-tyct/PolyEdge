@@ -370,10 +370,16 @@ pub(crate) fn spawn_strategy_engine(
         let mut stale_book_drops: u64 = 0;
         let mut last_price_tape_ms: HashMap<String, i64> = HashMap::new();
         let symbol_refresh_inflight = Arc::new(AtomicBool::new(false));
+        let discovery_refresh_sec = std::env::var("POLYEDGE_DISCOVERY_REFRESH_SEC")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(30)
+            .clamp(5, 600);
+        let discovery_refresh_interval = Duration::from_secs(discovery_refresh_sec);
         refresh_market_symbol_map(&shared).await;
 
         loop {
-            if last_discovery_refresh.elapsed() >= Duration::from_secs(300) {
+            if last_discovery_refresh.elapsed() >= discovery_refresh_interval {
                 refresh_market_symbol_map(&shared).await;
                 last_discovery_refresh = Instant::now();
             }

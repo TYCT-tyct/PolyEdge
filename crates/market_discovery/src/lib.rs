@@ -112,7 +112,7 @@ impl Default for DiscoveryConfig {
             ),
             max_past_ms: env_i64_ms(
                 "POLYEDGE_DISCOVERY_MAX_PAST_MS",
-                2 * 60 * 1_000,
+                20 * 1_000,
                 0,
                 30 * 60 * 1_000,
             ),
