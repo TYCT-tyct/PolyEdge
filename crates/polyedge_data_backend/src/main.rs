@@ -936,7 +936,12 @@ async fn init_clickhouse(ch_url: &str, cfg: &AnalyticsSinkConfig) -> Result<()> 
         db, tbl, ttl_days
     );
     for q in [&create_db, &create_tbl] {
-        let resp = client.post(ch_url).query(&[("query", q)]).send().await?;
+        let resp = client
+            .post(ch_url)
+            .query(&[("query", q)])
+            .body("")
+            .send()
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -965,16 +970,34 @@ async fn flush_clickhouse_snapshots(
         .post(ch_url)
         .query(&[("query", query.as_str())])
         .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
-        .body(body)
+        .body(body.clone())
         .send()
         .await?;
     if resp.status().is_success() {
-        Ok(())
-    } else {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        Err(anyhow!("clickhouse insert failed status={} body={}", status, body))
+        return Ok(());
     }
+    let status = resp.status();
+    let body_err = resp.text().await.unwrap_or_default();
+    if body_err.contains("UNKNOWN_DATABASE") || body_err.contains("UNKNOWN_TABLE") {
+        init_clickhouse(ch_url, cfg).await?;
+        let resp2 = reqwest::Client::new()
+            .post(ch_url)
+            .query(&[("query", query.as_str())])
+            .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
+            .body(body)
+            .send()
+            .await?;
+        if resp2.status().is_success() {
+            return Ok(());
+        }
+        let st2 = resp2.status();
+        let b2 = resp2.text().await.unwrap_or_default();
+        return Err(anyhow!("clickhouse insert retry failed status={} body={}", st2, b2));
+    }
+    Err(anyhow!(
+        "clickhouse insert failed status={} body={}",
+        status, body_err
+    ))
 }
 
 async fn flush_redis_latest(redis_url: &str, cfg: &AnalyticsSinkConfig, rows: &[SnapshotRow]) -> Result<()> {
