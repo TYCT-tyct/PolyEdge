@@ -122,10 +122,12 @@ struct MarketMeta {
     symbol: String,
     timeframe: String,
     title: String,
+    event_slug: Option<String>,
     end_date: Option<String>,
     event_start_time: Option<String>,
     start_ts_utc_ms: Option<i64>,
     target_price: Option<f64>,
+    target_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,6 +158,7 @@ struct SnapshotRow {
     timeframe: String,
     title: String,
     target_price: Option<f64>,
+    target_source: Option<String>,
     binance_price_tokyo: Option<f64>,
     chainlink_price: Option<f64>,
     chainlink_age_ms: Option<i64>,
@@ -362,10 +365,45 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
     let discover_tfs = timeframes.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(args.discovery_refresh_sec.max(1)));
+        let mut price_to_beat_cache = HashMap::<String, f64>::new();
+        let mut price_to_beat_retry_after = HashMap::<String, i64>::new();
         loop {
             tick.tick().await;
             match discover_once(&discover_symbols, &discover_tfs).await {
-                Ok(meta_rows) => {
+                Ok(mut meta_rows) => {
+                    let now = now_ms();
+                    for meta in &mut meta_rows {
+                        if meta.target_price.is_some() {
+                            continue;
+                        }
+                        let Some(slug) = meta.event_slug.as_deref() else {
+                            continue;
+                        };
+                        if let Some(cached) = price_to_beat_cache.get(slug).copied() {
+                            meta.target_price = Some(cached);
+                            meta.target_source = Some("pm_price_to_beat".to_string());
+                            continue;
+                        }
+                        let next_retry = price_to_beat_retry_after.get(slug).copied().unwrap_or(0);
+                        if now < next_retry {
+                            continue;
+                        }
+                        match fetch_price_to_beat_from_event_slug(slug).await {
+                            Ok(price) if price.is_finite() && price > 0.0 => {
+                                price_to_beat_cache.insert(slug.to_string(), price);
+                                meta.target_price = Some(price);
+                                meta.target_source = Some("pm_price_to_beat".to_string());
+                            }
+                            Ok(_) => {
+                                price_to_beat_retry_after.insert(slug.to_string(), now + 60_000);
+                            }
+                            Err(err) => {
+                                tracing::debug!(?err, event_slug = %slug, "priceToBeat fetch failed");
+                                price_to_beat_retry_after.insert(slug.to_string(), now + 60_000);
+                            }
+                        }
+                    }
+
                     let mut w = discover_state.write().await;
                     w.meta = meta_rows
                         .into_iter()
@@ -375,6 +413,7 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
                         if let Some(meta) = w.meta.get_mut(&market_id) {
                             if meta.target_price.is_none() {
                                 meta.target_price = Some(anchor.price);
+                                meta.target_source = Some(anchor.source.clone());
                             }
                         }
                     }
@@ -392,10 +431,12 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
                                 "symbol": m.symbol,
                                 "timeframe": m.timeframe,
                                 "title": m.title,
+                                "event_slug": m.event_slug,
                                 "end_date": m.end_date,
                                 "event_start_time": m.event_start_time,
                                 "start_ts_utc_ms": m.start_ts_utc_ms,
                                 "target_price": m.target_price,
+                                "target_source": m.target_source,
                                 "start_price": start_price
                             })
                         })
@@ -560,8 +601,8 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
             append_jsonl(&snapshot_symbol_tf_100ms_path(&root, &row), &row)?;
             append_jsonl(&snapshot_market_100ms_path(&root, &row), &row)?;
             if let Some(tx) = sink_tx.as_ref() {
-                if tx.try_send(SinkEvent::Snapshot(row)).is_err() {
-                    tracing::warn!("analytics sink queue full; dropping snapshot event");
+                if let Err(err) = tx.send(SinkEvent::Snapshot(row)).await {
+                    tracing::warn!(?err, "analytics sink queue closed; snapshot not sent");
                 }
             }
         }
@@ -605,8 +646,18 @@ async fn build_snapshots(state: Arc<RwLock<IngestState>>) -> Vec<SnapshotRow> {
     let mut out = Vec::new();
 
     let mut w = state.write().await;
-    for (market_id, book) in w.books.clone() {
+    let active_market_ids = w.meta.keys().cloned().collect::<Vec<_>>();
+    let active_set = active_market_ids.iter().cloned().collect::<HashSet<_>>();
+    w.books.retain(|mid, _| active_set.contains(mid));
+    w.target_anchor.retain(|mid, _| active_set.contains(mid));
+    w.settled_markets.retain(|mid| active_set.contains(mid));
+
+    for market_id in active_market_ids {
         let meta = match w.meta.get(&market_id).cloned() {
+            Some(v) => v,
+            None => continue,
+        };
+        let book = match w.books.get(&market_id).cloned() {
             Some(v) => v,
             None => continue,
         };
@@ -683,6 +734,7 @@ async fn build_snapshots(state: Arc<RwLock<IngestState>>) -> Vec<SnapshotRow> {
             timeframe: meta.timeframe,
             title: meta.title,
             target_price,
+            target_source: target.map(|x| x.source),
             binance_price_tokyo: tokyo.map(|x| x.binance_price),
             chainlink_price: chainlink.map(|x| x.chainlink_price),
             chainlink_age_ms,
@@ -1028,8 +1080,48 @@ async fn discover_once(symbols: &[String], timeframes: &[String]) -> Result<Vec<
     Ok(markets.into_iter().map(map_market_meta).collect())
 }
 
+async fn fetch_price_to_beat_from_event_slug(event_slug: &str) -> Result<f64> {
+    let url = format!("https://polymarket.com/event/{}", event_slug);
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(Duration::from_secs(6))
+        .send()
+        .await?
+        .error_for_status()?;
+    let body = resp.text().await?;
+    extract_price_to_beat_from_html(&body)
+        .ok_or_else(|| anyhow!("priceToBeat not found in event html {}", event_slug))
+}
+
+fn extract_price_to_beat_from_html(html: &str) -> Option<f64> {
+    for marker in ["\"priceToBeat\":", "\\\"priceToBeat\\\":"] {
+        let Some(pos) = html.find(marker) else {
+            continue;
+        };
+        let mut s = html[pos + marker.len()..].trim_start();
+        if s.starts_with('"') {
+            s = &s[1..];
+        }
+        let mut token = String::new();
+        for ch in s.chars() {
+            if ch.is_ascii_digit() || ch == '.' {
+                token.push(ch);
+            } else {
+                break;
+            }
+        }
+        if let Ok(v) = token.parse::<f64>() {
+            if v.is_finite() && v > 100.0 {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
 fn map_market_meta(m: MarketDescriptor) -> MarketMeta {
     let target = extract_price_from_title(&m.question);
+    let target_source = target.as_ref().map(|_| "title_parse".to_string());
     let timeframe = m.timeframe.unwrap_or_else(|| "unknown".to_string());
     let start_ts_utc_ms = m
         .event_start_time
@@ -1046,10 +1138,12 @@ fn map_market_meta(m: MarketDescriptor) -> MarketMeta {
         symbol: m.symbol,
         timeframe,
         title: m.question,
+        event_slug: m.event_slug,
         end_date: m.end_date,
         event_start_time: m.event_start_time,
         start_ts_utc_ms,
         target_price: target,
+        target_source,
     }
 }
 
@@ -1167,7 +1261,10 @@ fn resolve_target_anchor(
     if let Some(tp) = meta.target_price {
         let a = TargetAnchor {
             price: tp,
-            source: "metadata_target".to_string(),
+            source: meta
+                .target_source
+                .clone()
+                .unwrap_or_else(|| "metadata_target".to_string()),
         };
         state.target_anchor.insert(meta.market_id.clone(), a.clone());
         return Some(a);
@@ -1176,8 +1273,8 @@ fn resolve_target_anchor(
     if now_ms < start.saturating_sub(5_000) {
         return None;
     }
-    let by_chainlink = find_closest_price_chainlink(&state.chainlink_hist, &meta.symbol, start, 120_000);
-    let by_tokyo = find_closest_price_tokyo(&state.tokyo_hist, &meta.symbol, start, 120_000);
+    let by_chainlink = find_closest_price_chainlink(&state.chainlink_hist, &meta.symbol, start, 30_000);
+    let by_tokyo = find_closest_price_tokyo(&state.tokyo_hist, &meta.symbol, start, 30_000);
     let resolved = by_chainlink
         .map(|p| TargetAnchor {
             price: p,
@@ -1337,11 +1434,23 @@ async fn api_latest_cached(
 
 async fn api_trades(State(st): State<ApiState>) -> Json<serde_json::Value> {
     let path = latest_dated_file(&st.root, "normalized", "order_fill_events.jsonl");
-    let rows = path
-        .as_ref()
-        .map(|p| read_last_jsonl_rows(p, 500))
-        .unwrap_or_default();
-    Json(serde_json::json!({"ts_ms": now_ms(), "count": rows.len(), "rows": rows}))
+    let Some(path) = path else {
+        return Json(serde_json::json!({
+            "ts_ms": now_ms(),
+            "source": "none",
+            "count": 0,
+            "rows": [],
+            "message": "order_fill_events.jsonl not found"
+        }));
+    };
+    let rows = read_last_jsonl_rows(&path, 500);
+    Json(serde_json::json!({
+        "ts_ms": now_ms(),
+        "source": "file",
+        "path": path,
+        "count": rows.len(),
+        "rows": rows
+    }))
 }
 
 async fn api_heatmap(
@@ -1757,16 +1866,6 @@ fn latest_symbol_tf_snapshot_file(root: &Path, symbol: &str, timeframe: &str) ->
         if p100ms.exists() {
             return Some(p100ms);
         }
-        let p1s = base
-            .join(&date)
-            .join("symbol")
-            .join(path_safe_segment(symbol))
-            .join("timeframe")
-            .join(path_safe_segment(timeframe))
-            .join("snapshot_1s.jsonl");
-        if p1s.exists() {
-            return Some(p1s);
-        }
     }
     None
 }
@@ -1778,7 +1877,7 @@ fn history_snapshot_path(
     timeframe: &str,
     market_id: Option<&str>,
 ) -> PathBuf {
-    let mut p100ms = root
+    let mut path = root
         .join("normalized")
         .join(date)
         .join("symbol")
@@ -1786,23 +1885,9 @@ fn history_snapshot_path(
         .join("timeframe")
         .join(path_safe_segment(timeframe));
     if let Some(mid) = market_id {
-        p100ms = p100ms.join("market").join(path_safe_segment(mid));
+        path = path.join("market").join(path_safe_segment(mid));
     }
-    let p100ms = p100ms.join("snapshot_100ms.jsonl");
-    if p100ms.exists() {
-        return p100ms;
-    }
-    let mut p1s = root
-        .join("normalized")
-        .join(date)
-        .join("symbol")
-        .join(path_safe_segment(symbol))
-        .join("timeframe")
-        .join(path_safe_segment(timeframe));
-    if let Some(mid) = market_id {
-        p1s = p1s.join("market").join(path_safe_segment(mid));
-    }
-    p1s.join("snapshot_1s.jsonl")
+    path.join("snapshot_100ms.jsonl")
 }
 
 fn read_last_jsonl_rows(path: &Path, limit: usize) -> Vec<serde_json::Value> {
@@ -1811,15 +1896,17 @@ fn read_last_jsonl_rows(path: &Path, limit: usize) -> Vec<serde_json::Value> {
         Err(_) => return Vec::new(),
     };
     let reader = BufReader::new(file);
-    let mut rows = reader
-        .lines()
-        .map_while(Result::ok)
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(&line).ok())
-        .collect::<Vec<_>>();
-    if rows.len() > limit {
-        rows.drain(0..(rows.len() - limit));
+    let mut ring = VecDeque::with_capacity(limit.min(8_192));
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        ring.push_back(v);
+        if ring.len() > limit {
+            ring.pop_front();
+        }
     }
-    rows
+    ring.into_iter().collect()
 }
 
 fn read_jsonl_filtered_rows(
@@ -1833,7 +1920,7 @@ fn read_jsonl_filtered_rows(
         Err(_) => return Vec::new(),
     };
     let reader = BufReader::new(file);
-    let mut out = Vec::new();
+    let mut ring = VecDeque::with_capacity(limit.min(8_192));
     for line in reader.lines().map_while(Result::ok) {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
@@ -1849,10 +1936,10 @@ fn read_jsonl_filtered_rows(
                 continue;
             }
         }
-        out.push(v);
-        if out.len() > limit {
-            out.drain(0..(out.len() - limit));
+        ring.push_back(v);
+        if ring.len() > limit {
+            ring.pop_front();
         }
     }
-    out
+    ring.into_iter().collect()
 }
