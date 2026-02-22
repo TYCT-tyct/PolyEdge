@@ -1342,6 +1342,17 @@ pub(super) async fn evaluate_and_route_roll_v1(
         if max_total > 0.0 {
             notional_usdc = notional_usdc.min(max_total);
         }
+        let router_order_cap = predator_cfg.router.max_order_notional_usdc.max(0.0);
+        if router_order_cap > 0.0 {
+            notional_usdc = notional_usdc.min(router_order_cap);
+        }
+        if notional_usdc <= 0.0 {
+            shared
+                .shadow_stats
+                .mark_blocked_with_reason_ctx("router_notional_cap_zero", Some(symbol), Some(tf_label))
+                .await;
+            continue;
+        }
         let size = (notional_usdc / entry_price.max(1e-6)).max(0.01);
         let target_l2_size = match side {
             OrderSide::BuyYes => book.ask_size_yes,
