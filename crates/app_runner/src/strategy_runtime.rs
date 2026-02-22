@@ -27,6 +27,7 @@ use crate::execution_eval::{
 use crate::feed_runtime::settlement_prob_yes_for_symbol;
 use crate::fusion_engine::TokenBucket;
 use crate::paper_runtime::{global_paper_runtime, PaperIntentCtx};
+use crate::report_io::{append_jsonl, dataset_path};
 use crate::state::{
     EngineShared, PredatorCConfig, PredatorCPriority, PredatorRegimeConfig, RollV1ReverseConfig,
     RollV1TimeframeConfig, SourceHealthConfig, StrategyEngineMode, V52ExecutionConfig,
@@ -119,6 +120,10 @@ fn direction_signal_for_side(base: &DirectionSignal, side: &OrderSide) -> Direct
     let mut out = base.clone();
     out.direction = side_to_direction(side);
     out
+}
+
+fn record_roll_trace(payload: serde_json::Value) {
+    append_jsonl(&dataset_path("reports", "roll_v1_trace.jsonl"), &payload);
 }
 
 fn flatten_side_for_entry(side: &OrderSide) -> OrderSide {
@@ -950,6 +955,12 @@ pub(super) async fn evaluate_and_route_roll_v1(
                 .shadow_stats
                 .mark_predator_taker_skipped("no_direction_signal")
                 .await;
+            record_roll_trace(serde_json::json!({
+                "ts_ms": now_ms,
+                "event": "skip",
+                "reason": "no_direction_signal",
+                "symbol": symbol,
+            }));
             return PredatorExecResult::default();
         };
         sig
@@ -960,6 +971,12 @@ pub(super) async fn evaluate_and_route_roll_v1(
             .shadow_stats
             .mark_blocked_with_reason_ctx("neutral_direction_fallback", Some(symbol), None)
             .await;
+        record_roll_trace(serde_json::json!({
+            "ts_ms": now_ms,
+            "event": "skip",
+            "reason": "neutral_direction_fallback",
+            "symbol": symbol,
+        }));
     }
 
     shared
@@ -1129,6 +1146,15 @@ pub(super) async fn evaluate_and_route_roll_v1(
                 .shadow_stats
                 .mark_blocked_with_reason_ctx(reason, Some(symbol), Some(tf_label))
                 .await;
+            record_roll_trace(serde_json::json!({
+                "ts_ms": now_ms,
+                "event": "skip",
+                "reason": reason,
+                "symbol": symbol,
+                "market_id": market_id,
+                "timeframe": tf_label,
+                "remaining_ms": remaining_ms,
+            }));
             continue;
         }
 
@@ -1297,6 +1323,16 @@ pub(super) async fn evaluate_and_route_roll_v1(
                     .shadow_stats
                     .mark_blocked_with_reason_ctx("no_quote_spread", Some(symbol), Some(tf_label))
                     .await;
+                record_roll_trace(serde_json::json!({
+                    "ts_ms": now_ms,
+                    "event": "skip",
+                    "reason": "no_quote_spread",
+                    "symbol": symbol,
+                    "market_id": market_id,
+                    "timeframe": tf_label,
+                    "yes_price": yes_price,
+                    "no_price": no_price,
+                }));
                 continue;
             }
         }
@@ -1305,6 +1341,18 @@ pub(super) async fn evaluate_and_route_roll_v1(
                 .shadow_stats
                 .mark_blocked_with_reason_ctx("fee_negative_ev", Some(symbol), Some(tf_label))
                 .await;
+            record_roll_trace(serde_json::json!({
+                "ts_ms": now_ms,
+                "event": "skip",
+                "reason": "fee_negative_ev",
+                "symbol": symbol,
+                "market_id": market_id,
+                "timeframe": tf_label,
+                "side": format!("{:?}", side),
+                "entry_price": entry_price,
+                "edge_net_bps": edge_net_bps,
+                "edge_gross_bps": edge_gross_bps,
+            }));
             continue;
         }
 
@@ -1371,6 +1419,23 @@ pub(super) async fn evaluate_and_route_roll_v1(
             target_l2_size,
             fee_applied,
         });
+        record_roll_trace(serde_json::json!({
+            "ts_ms": now_ms,
+            "event": "candidate",
+            "symbol": symbol,
+            "market_id": cands.last().map(|c| c.market_id.clone()).unwrap_or_default(),
+            "timeframe": tf_label,
+            "side": format!("{:?}", cands.last().map(|c| c.side.clone()).unwrap_or(OrderSide::BuyYes)),
+            "entry_price": cands.last().map(|c| c.entry_price).unwrap_or(0.0),
+            "edge_net_bps": cands.last().map(|c| c.edge_net_bps).unwrap_or(0.0),
+            "edge_gross_bps": cands.last().map(|c| c.edge_gross_bps).unwrap_or(0.0),
+            "size": cands.last().map(|c| c.size).unwrap_or(0.0),
+            "remaining_ms": remaining_ms,
+            "direction": format!("{:?}", direction_signal.direction),
+            "direction_confidence": direction_signal.confidence,
+            "prob_settle": probability.p_settle,
+            "prob_confidence": probability.confidence,
+        }));
     }
 
     if cands.is_empty() {
