@@ -12,6 +12,7 @@ pub struct MarketDescriptor {
     pub token_id_no: Option<String>,
     pub event_slug: Option<String>,
     pub end_date: Option<String>,
+    pub event_start_time: Option<String>,
     pub timeframe: Option<String>,   // "5m" / "15m" / "1h" / "1d"
     pub market_type: Option<String>, // "updown" / "above_below" / "range"
     pub best_bid: Option<f64>,
@@ -278,6 +279,7 @@ impl MarketDiscovery {
                             .map(|x| x.1),
                         event_slug: market.event_slug,
                         end_date: market.end_date,
+                        event_start_time: market.event_start_time,
                         timeframe: timeframe.map(|v| v.to_string()),
                         market_type: Some(market_type.to_string()),
                         best_bid: market.best_bid,
@@ -438,6 +440,8 @@ struct GammaMarket {
     #[serde(default)]
     end_date: Option<String>,
     #[serde(default)]
+    event_start_time: Option<String>,
+    #[serde(default)]
     best_bid: Option<f64>,
     #[serde(default)]
     best_ask: Option<f64>,
@@ -552,6 +556,7 @@ mod tests {
             token_id_no: Some(format!("n-{id}")),
             event_slug: None,
             end_date: Some(end_date.to_string()),
+            event_start_time: None,
             timeframe: Some("5m".to_string()),
             market_type: Some("updown".to_string()),
             best_bid: None,

@@ -101,6 +101,7 @@ struct MarketMeta {
     timeframe: String,
     title: String,
     end_date: Option<String>,
+    event_start_time: Option<String>,
     start_ts_utc_ms: Option<i64>,
     target_price: Option<f64>,
     target_source: String,
@@ -639,16 +640,22 @@ fn map_market_meta(m: MarketDescriptor) -> MarketMeta {
     let target = extract_price_from_title(&m.question);
     let timeframe = m.timeframe.unwrap_or_else(|| "unknown".to_string());
     let start_ts_utc_ms = m
-        .end_date
+        .event_start_time
         .as_deref()
         .and_then(parse_end_ms)
-        .and_then(|end| parse_timeframe_ms(&timeframe).map(|dur| end.saturating_sub(dur)));
+        .or_else(|| {
+            m.end_date
+                .as_deref()
+                .and_then(parse_end_ms)
+                .and_then(|end| parse_timeframe_ms(&timeframe).map(|dur| end.saturating_sub(dur)))
+        });
     MarketMeta {
         market_id: m.market_id,
         symbol: m.symbol,
         timeframe,
         title: m.question,
         end_date: m.end_date,
+        event_start_time: m.event_start_time,
         start_ts_utc_ms,
         target_price: target,
         target_source: if target.is_some() {
