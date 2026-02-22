@@ -18,15 +18,15 @@ sudo chown "$RUN_USER":"$RUN_USER" /var/log/polyedge
 sudo systemctl disable --now polyedge-recorder.service 2>/dev/null || true
 
 if [[ "$ROLE" == "ireland" ]]; then
-  sudo mkdir -p /dev/xvdbb/polyedge-data || true
-  sudo chown -R "$RUN_USER":"$RUN_USER" /dev/xvdbb/polyedge-data || true
+  sudo mkdir -p /data/polyedge-data || true
+  sudo chown -R "$RUN_USER":"$RUN_USER" /data/polyedge-data || true
 
   sudo cp "$REPO_DIR/ops/systemd/polyedge-data-backend-ireland.service" /etc/systemd/system/
   sudo cp "$REPO_DIR/ops/systemd/polyedge-data-backend-api.service" /etc/systemd/system/
 
   sudo tee /etc/polyedge/data-backend-ireland.env >/dev/null <<'EOF'
 RUST_LOG=info
-POLYEDGE_DATA_ROOT=/dev/xvdbb/polyedge-data
+POLYEDGE_DATA_ROOT=/data/polyedge-data
 POLYEDGE_SYMBOLS=BTCUSDT
 POLYEDGE_TIMEFRAMES=5m,15m
 POLYEDGE_IRELAND_UDP_BIND=0.0.0.0:9801
@@ -36,7 +36,7 @@ EOF
 
   sudo tee /etc/polyedge/data-backend-api.env >/dev/null <<'EOF'
 RUST_LOG=info
-POLYEDGE_DATA_ROOT=/dev/xvdbb/polyedge-data
+POLYEDGE_DATA_ROOT=/data/polyedge-data
 POLYEDGE_API_BIND=0.0.0.0:8095
 EOF
 

@@ -53,7 +53,7 @@ struct TokyoCollectorArgs {
 
 #[derive(clap::Args, Debug, Clone)]
 struct IrelandIngestArgs {
-    #[arg(long, env = "POLYEDGE_DATA_ROOT", default_value = "/dev/xvdbb/polyedge-data")]
+    #[arg(long, env = "POLYEDGE_DATA_ROOT", default_value = "/data/polyedge-data")]
     dataset_root: String,
     #[arg(long, env = "POLYEDGE_SYMBOLS", default_value = "BTCUSDT")]
     symbols: String,
@@ -69,7 +69,7 @@ struct IrelandIngestArgs {
 
 #[derive(clap::Args, Debug, Clone)]
 struct ApiArgs {
-    #[arg(long, env = "POLYEDGE_DATA_ROOT", default_value = "/dev/xvdbb/polyedge-data")]
+    #[arg(long, env = "POLYEDGE_DATA_ROOT", default_value = "/data/polyedge-data")]
     dataset_root: String,
     #[arg(long, env = "POLYEDGE_API_BIND", default_value = "0.0.0.0:8095")]
     bind: String,
