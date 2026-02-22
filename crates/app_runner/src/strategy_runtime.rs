@@ -594,6 +594,76 @@ fn spawn_roll_v1_position_lifecycle(
                 i64::MAX
             };
             if remaining_ms <= tf_cfg.entry_end_remaining_ms {
+                let close_side = flatten_side_for_entry(&entry_side);
+                let (prob_fast, prob_settle, confidence) = shared
+                    .predator_latest_probability
+                    .read()
+                    .await
+                    .get(&market_id)
+                    .map(|p| (p.p_fast, p.p_settle, p.confidence))
+                    .unwrap_or((0.5, 0.5, 0.0));
+                let close_attempt = place_roll_v1_order_and_track(
+                    &shared,
+                    &bus,
+                    &execution,
+                    &shadow,
+                    &market_id,
+                    &symbol,
+                    close_side.clone(),
+                    size,
+                    ExecutionStyle::Maker,
+                    reverse_cfg.maker_first_ttl_ms,
+                    taker_max_slippage_bps,
+                    fee_rate_bps,
+                    0.0,
+                    PaperAction::ReversalExit,
+                    prob_fast,
+                    prob_settle,
+                    confidence,
+                )
+                .await;
+                if let Some((ack, _)) = close_attempt {
+                    spawn_roll_v1_maker_ttl_fallback(
+                        shared.clone(),
+                        bus.clone(),
+                        execution.clone(),
+                        shadow.clone(),
+                        market_id.clone(),
+                        symbol.clone(),
+                        ack.order_id,
+                        close_side,
+                        size,
+                        fee_rate_bps,
+                        reverse_cfg.maker_first_ttl_ms,
+                        taker_max_slippage_bps,
+                        PaperAction::ReversalExit,
+                    );
+                } else {
+                    let _ = place_roll_v1_order_and_track(
+                        &shared,
+                        &bus,
+                        &execution,
+                        &shadow,
+                        &market_id,
+                        &symbol,
+                        close_side,
+                        size,
+                        ExecutionStyle::Taker,
+                        150,
+                        taker_max_slippage_bps,
+                        fee_rate_bps,
+                        0.0,
+                        PaperAction::ReversalExit,
+                        prob_fast,
+                        prob_settle,
+                        confidence,
+                    )
+                    .await;
+                }
+                shared
+                    .shadow_stats
+                    .record_exit_reason("roll_v1_final_window_exit")
+                    .await;
                 break;
             }
             let book = match shared.latest_books.read().await.get(&market_id).cloned() {
