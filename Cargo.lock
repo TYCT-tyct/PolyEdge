@@ -1763,6 +1763,7 @@ dependencies = [
  "futures",
  "market_discovery",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
