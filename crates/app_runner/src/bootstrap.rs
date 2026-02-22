@@ -195,7 +195,13 @@ pub(super) async fn async_main() -> Result<()> {
 
     let risk_manager = Arc::new(DefaultRiskManager::new(risk_limits.clone()));
     let predator_cfg = Arc::new(RwLock::new(load_predator_c_config()));
-    let predator_cfg0 = predator_cfg.read().await.clone();
+    let mut predator_cfg0 = predator_cfg.read().await.clone();
+    if paper_enabled && predator_cfg0.compounder.enabled {
+        // Keep risk/compounder baseline consistent with paper bankroll to avoid
+        // premature risk-cap triggers caused by mismatched initial capital bases.
+        predator_cfg0.compounder.initial_capital_usdc = paper_initial_capital.max(1.0);
+        *predator_cfg.write().await = predator_cfg0.clone();
+    }
     if predator_cfg0
         .roll_v1
         .fee_model
