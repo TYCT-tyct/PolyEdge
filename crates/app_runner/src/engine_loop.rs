@@ -351,7 +351,7 @@ pub(crate) fn spawn_strategy_engine(
         let strategy_max_decision_backlog_ms = std::env::var("POLYEDGE_MAX_DECISION_BACKLOG_MS")
             .ok()
             .and_then(|v| v.trim().parse::<f64>().ok())
-            .unwrap_or(12.0)
+            .unwrap_or(20.0)
             .clamp(0.10, 50.0);
         let price_tape_enabled = std::env::var("POLYEDGE_PRICE_TAPE_ENABLED")
             .ok()
@@ -796,6 +796,13 @@ pub(crate) fn spawn_strategy_engine(
                         continue;
                     }
                     if latency_sample.local_backlog_ms > strategy_max_decision_backlog_ms {
+                        let roll_mode_backlog_guard = {
+                            let predator_cfg = shared.predator_cfg.read().await;
+                            matches!(
+                                predator_cfg.strategy_engine.engine_mode,
+                                crate::state::StrategyEngineMode::RollV1
+                            )
+                        };
                         mark_blocked_for_market(
                             &shared,
                             &book.market_id,
@@ -804,7 +811,9 @@ pub(crate) fn spawn_strategy_engine(
                         )
                         .await;
                         metrics::counter!("strategy.decision_backlog_guard").increment(1);
-                        continue;
+                        if !roll_mode_backlog_guard {
+                            continue;
+                        }
                     }
                     let queue_wait_ms = if ingress_enqueued_ns > 0 {
                         ((now_ns() - ingress_enqueued_ns).max(0) as f64) / 1_000_000.0
