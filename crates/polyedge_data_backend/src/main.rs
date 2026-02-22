@@ -1395,26 +1395,73 @@ fn resolve_target_anchor(
     meta: &MarketMeta,
     now_ms: i64,
 ) -> Option<TargetAnchor> {
-    if let Some(existing) = state.target_anchor.get(&meta.market_id).cloned() {
+    let start = meta.start_ts_utc_ms?;
+    let existing = state.target_anchor.get(&meta.market_id).cloned();
+    if let Some(existing) = existing {
+        // If existing target came from metadata parse, re-validate near market-open
+        // against observable Chainlink/Tokyo ticks and self-correct if drift is large.
+        if existing.source == "pm_price_to_beat" || existing.source == "metadata_target" {
+            if let Some(observed) = resolve_open_anchor_from_ticks(state, &meta.symbol, start, now_ms) {
+                if (existing.price - observed.price).abs() > 5.0 {
+                    state
+                        .target_anchor
+                        .insert(meta.market_id.clone(), observed.clone());
+                    return Some(observed);
+                }
+            }
+        }
         return Some(existing);
     }
+
+    // Prefer observed open-anchor from ticks. This follows the official settlement rule
+    // (start/end based on Chainlink BTC/USD stream) and avoids page-scrape mis-association.
+    if let Some(observed) = resolve_open_anchor_from_ticks(state, &meta.symbol, start, now_ms) {
+        if let Some(tp) = meta.target_price {
+            // Keep pm_price_to_beat only when it is consistent with open-anchor.
+            if (tp - observed.price).abs() <= 5.0 {
+                let trusted = TargetAnchor {
+                    price: tp,
+                    source: meta
+                        .target_source
+                        .clone()
+                        .unwrap_or_else(|| "pm_price_to_beat".to_string()),
+                };
+                state
+                    .target_anchor
+                    .insert(meta.market_id.clone(), trusted.clone());
+                return Some(trusted);
+            }
+        }
+        state
+            .target_anchor
+            .insert(meta.market_id.clone(), observed.clone());
+        return Some(observed);
+    }
+
+    // Before market-open tick anchor is available, use metadata as temporary fallback only.
     if let Some(tp) = meta.target_price {
-        let a = TargetAnchor {
+        return Some(TargetAnchor {
             price: tp,
             source: meta
                 .target_source
                 .clone()
                 .unwrap_or_else(|| "metadata_target".to_string()),
-        };
-        state.target_anchor.insert(meta.market_id.clone(), a.clone());
-        return Some(a);
+        });
     }
-    let start = meta.start_ts_utc_ms?;
+    None
+}
+
+fn resolve_open_anchor_from_ticks(
+    state: &IngestState,
+    symbol: &str,
+    start: i64,
+    now_ms: i64,
+) -> Option<TargetAnchor> {
     if now_ms < start.saturating_sub(5_000) {
         return None;
     }
-    let by_chainlink = find_closest_price_chainlink(&state.chainlink_hist, &meta.symbol, start, 30_000);
-    let by_tokyo = find_closest_price_tokyo(&state.tokyo_hist, &meta.symbol, start, 30_000);
+    let by_chainlink = find_closest_price_chainlink(&state.chainlink_hist, symbol, start, 30_000);
+    let by_tokyo = find_closest_price_tokyo(&state.tokyo_hist, symbol, start, 30_000);
     let resolved = by_chainlink
         .map(|p| TargetAnchor {
             price: p,
@@ -1428,7 +1475,7 @@ fn resolve_target_anchor(
         })
         .or_else(|| {
             if now_ms >= start {
-                state.tokyo_last.get(&meta.symbol).map(|x| TargetAnchor {
+                state.tokyo_last.get(symbol).map(|x| TargetAnchor {
                     price: x.binance_price,
                     source: "tokyo_first_seen_after_open".to_string(),
                 })
@@ -1436,9 +1483,6 @@ fn resolve_target_anchor(
                 None
             }
         });
-    if let Some(anchor) = resolved.clone() {
-        state.target_anchor.insert(meta.market_id.clone(), anchor);
-    }
     resolved
 }
 
