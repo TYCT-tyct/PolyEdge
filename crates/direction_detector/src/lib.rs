@@ -252,7 +252,8 @@ impl DirectionDetector {
             now_ms.saturating_sub((self.cfg.lookback_long_sec as i64).saturating_mul(1_000));
 
         // 提取 Binance 针对于特定历史时间的锚点
-        let anchor_short_binance = find_anchor_price(&w.binance_ticks, anchor_short_ms)?;
+        let anchor_short_binance = find_anchor_price(&w.binance_ticks, anchor_short_ms)
+            .or_else(|| w.binance_ticks.front().map(|(_, px)| *px))?;
         // 长窗口冷启动降级：
         // 若刚开盘不足 long lookback，不直接返回 None，而是退化到当前窗口最早 Binance 价格。
         // 这样 5m 开局 10~40s 也能产生有效方向信号，避免首分钟“永远 neutral”。
