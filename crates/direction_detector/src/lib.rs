@@ -253,14 +253,26 @@ impl DirectionDetector {
 
         // 提取 Binance 针对于特定历史时间的锚点
         let anchor_short_binance = find_anchor_price(&w.binance_ticks, anchor_short_ms)?;
-        let anchor_long_binance = find_anchor_price(&w.binance_ticks, anchor_long_ms)?;
+        // 长窗口冷启动降级：
+        // 若刚开盘不足 long lookback，不直接返回 None，而是退化到当前窗口最早 Binance 价格。
+        // 这样 5m 开局 10~40s 也能产生有效方向信号，避免首分钟“永远 neutral”。
+        let anchor_long_binance = find_anchor_price(&w.binance_ticks, anchor_long_ms)
+            .or_else(|| w.binance_ticks.front().map(|(_, px)| *px))?;
         if anchor_short_binance <= 0.0 || anchor_long_binance <= 0.0 {
             return None;
         }
 
         let ret_short = (latest_binance - anchor_short_binance) / anchor_short_binance;
         let ret_long = (latest_binance - anchor_long_binance) / anchor_long_binance;
-        let magnitude_pct = (ret_short * 0.7 + ret_long * 0.3) * 100.0;
+        let long_target_ms = (self.cfg.lookback_long_sec as i64).saturating_mul(1_000).max(1);
+        let hist_span_ms = match (w.binance_ticks.front(), w.binance_ticks.back()) {
+            (Some((first_ts, _)), Some((last_ts, _))) => last_ts.saturating_sub(*first_ts),
+            _ => 0,
+        };
+        let long_coverage = (hist_span_ms as f64 / long_target_ms as f64).clamp(0.0, 1.0);
+        let long_weight = 0.3 * long_coverage;
+        let short_weight = (1.0 - long_weight).clamp(0.7, 1.0);
+        let magnitude_pct = (ret_short * short_weight + ret_long * long_weight) * 100.0;
 
         // 加速度与速度的提取只针对 Binance (清洗了 Chainlink 的异物)
         let (velocity_bps_per_sec, acceleration) = kinematics_from_ticks(&w.binance_ticks);
@@ -787,5 +799,127 @@ mod tests {
         let sig = det.evaluate("BTCUSDT", now).unwrap();
         assert_eq!(sig.direction, Direction::Up);
         assert!(sig.tick_consistency >= 2);
+    }
+
+    fn piecewise_linear_series(points: &[(i64, f64)], step_ms: i64) -> Vec<(i64, f64)> {
+        let mut out = Vec::new();
+        if points.len() < 2 || step_ms <= 0 {
+            return out;
+        }
+        for win in points.windows(2) {
+            let (t0, p0) = win[0];
+            let (t1, p1) = win[1];
+            let span = (t1 - t0).max(step_ms);
+            let mut t = t0;
+            while t < t1 {
+                let frac = (t - t0) as f64 / span as f64;
+                let p = p0 + (p1 - p0) * frac.clamp(0.0, 1.0);
+                out.push((t, p));
+                t += step_ms;
+            }
+        }
+        if let Some(&(t, p)) = points.last() {
+            out.push((t, p));
+        }
+        out
+    }
+
+    fn roll_v1_like_cfg() -> DirectionConfig {
+        DirectionConfig {
+            threshold_15m_pct: 0.05,
+            min_ticks_for_signal: 3,
+            min_consecutive_ticks: 1,
+            min_velocity_bps_per_sec: 3.0,
+            min_acceleration: 0.0,
+            momentum_spike_multiplier: 1.8,
+            min_tick_rate_spike_ratio: 1.8,
+            tick_rate_short_ms: 300,
+            tick_rate_long_ms: 3_000,
+            enable_source_vote_gate: true,
+            require_secondary_confirmation: true,
+            fast_confirm_velocity_bps_per_sec: 30.0,
+            ..DirectionConfig::default()
+        }
+    }
+
+    #[test]
+    fn synthetic_roll_case_1_monotonic_rise_detects_uptrend() {
+        // 用户给定曲线（5min）:
+        // 12:35 54 -> 12:36 59.6 -> 12:37 90.5 -> 12:38 97.5 -> 12:39 99.5 -> 12:40 100
+        let anchors = [
+            (0_i64, 0.54_f64),
+            (60_000, 0.596),
+            (120_000, 0.905),
+            (180_000, 0.975),
+            (240_000, 0.995),
+            (300_000, 1.0),
+        ];
+        let series = piecewise_linear_series(&anchors, 40);
+        let mut det = DirectionDetector::new(roll_v1_like_cfg());
+        let symbol = "BTCUSDT";
+        let base_ms = 10_000_000_i64;
+
+        let mut first_up_ms: Option<i64> = None;
+        for (elapsed_ms, prob_yes) in series {
+            let ts = base_ms + elapsed_ms;
+            det.on_tick(&tick("binance_ws", symbol, ts, prob_yes.max(1e-6)));
+            if let Some(sig) = det.evaluate(symbol, ts) {
+                if sig.direction == Direction::Up && sig.triple_confirm {
+                    first_up_ms.get_or_insert(elapsed_ms);
+                }
+            }
+        }
+
+        let hit = first_up_ms.expect("scenario1 must produce at least one Up trigger");
+        println!("scenario1_first_up_ms={hit}");
+        // 该曲线在前半段就应出现明显上升识别，不应拖到最后几十秒
+        assert!(hit <= 180_000, "unexpected late trigger at {}ms", hit);
+    }
+
+    #[test]
+    fn synthetic_roll_case_2_drawdown_then_recovery_detects_uptrend_after_rebound() {
+        // 用户给定曲线（5min）:
+        // 11:25 58 -> 11:26 38 -> 11:27 51 -> 11:28 80 -> 11:29 85 -> 11:30 100
+        let anchors = [
+            (0_i64, 0.58_f64),
+            (60_000, 0.38),
+            (120_000, 0.51),
+            (180_000, 0.80),
+            (240_000, 0.85),
+            (300_000, 1.0),
+        ];
+        let series = piecewise_linear_series(&anchors, 40);
+        let mut det = DirectionDetector::new(roll_v1_like_cfg());
+        let symbol = "ETHUSDT";
+        let base_ms = 20_000_000_i64;
+
+        let mut saw_early_down = false;
+        let mut first_up_after_rebound_ms: Option<i64> = None;
+        for (elapsed_ms, prob_yes) in series {
+            let ts = base_ms + elapsed_ms;
+            det.on_tick(&tick("binance_ws", symbol, ts, prob_yes.max(1e-6)));
+            if let Some(sig) = det.evaluate(symbol, ts) {
+                if elapsed_ms <= 90_000 && sig.direction == Direction::Down && sig.triple_confirm {
+                    saw_early_down = true;
+                }
+                if elapsed_ms >= 120_000
+                    && sig.direction == Direction::Up
+                    && sig.triple_confirm
+                    && first_up_after_rebound_ms.is_none()
+                {
+                    first_up_after_rebound_ms = Some(elapsed_ms);
+                }
+            }
+        }
+
+        println!("scenario2_saw_early_down={saw_early_down}");
+        if let Some(ms) = first_up_after_rebound_ms {
+            println!("scenario2_first_up_after_rebound_ms={ms}");
+        }
+        assert!(saw_early_down, "scenario2 should detect initial drawdown");
+        assert!(
+            first_up_after_rebound_ms.is_some(),
+            "scenario2 should detect rebound uptrend"
+        );
     }
 }
