@@ -1161,7 +1161,6 @@ pub(super) async fn evaluate_and_route_roll_v1(
                 .shadow_stats
                 .mark_blocked_with_reason_ctx("low_confidence", Some(symbol), Some(tf_label))
                 .await;
-            continue;
         }
 
         let fee_bps = get_fee_rate_bps_cached(shared, &market_id).await;
@@ -1224,12 +1223,10 @@ pub(super) async fn evaluate_and_route_roll_v1(
                 .shadow_stats
                 .mark_blocked_with_reason_ctx("low_confidence_prob", Some(symbol), Some(tf_label))
                 .await;
-            continue;
         }
 
-        let (side, entry_price, edge_gross_bps, edge_net_bps, fee_applied) = match direction_signal
-            .direction
-        {
+        let (mut side, mut entry_price, mut edge_gross_bps, mut edge_net_bps, mut fee_applied) =
+            match direction_signal.direction {
                 Direction::Up => (
                     OrderSide::BuyYes,
                     yes_price,
@@ -1264,6 +1261,45 @@ pub(super) async fn evaluate_and_route_roll_v1(
                     }
                 }
             };
+        let (alt_side, alt_entry_price, alt_edge_gross_bps, alt_edge_net_bps, alt_fee_applied) =
+            match side {
+                OrderSide::BuyYes => (
+                    OrderSide::BuyNo,
+                    no_price,
+                    no_edge_gross,
+                    no_edge_net,
+                    no_expected_fee_bps,
+                ),
+                OrderSide::BuyNo => (
+                    OrderSide::BuyYes,
+                    yes_price,
+                    yes_edge_gross,
+                    yes_edge_net,
+                    yes_expected_fee_bps,
+                ),
+                _ => (
+                    OrderSide::BuyYes,
+                    yes_price,
+                    yes_edge_gross,
+                    yes_edge_net,
+                    yes_expected_fee_bps,
+                ),
+            };
+        if !entry_price.is_finite() || entry_price <= 0.0 {
+            if alt_entry_price.is_finite() && alt_entry_price > 0.0 {
+                side = alt_side;
+                entry_price = alt_entry_price;
+                edge_gross_bps = alt_edge_gross_bps;
+                edge_net_bps = alt_edge_net_bps;
+                fee_applied = alt_fee_applied;
+            } else {
+                shared
+                    .shadow_stats
+                    .mark_blocked_with_reason_ctx("no_quote_spread", Some(symbol), Some(tf_label))
+                    .await;
+                continue;
+            }
+        }
         if edge_net_bps <= 0.0 {
             shared
                 .shadow_stats
