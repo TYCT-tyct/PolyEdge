@@ -9,6 +9,7 @@ authors.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 chrono.workspace = true
+chrono-tz = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
 core_types = { path = "../core_types" }
 feed_polymarket = { path = "../feed_polymarket" }

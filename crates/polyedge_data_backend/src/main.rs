@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
@@ -10,7 +10,8 @@ use anyhow::{anyhow, Context, Result};
 use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
+use chrono_tz::America::New_York;
 use clap::{Parser, Subcommand};
 use core_types::{BookTop, MarketFeed, RefPriceWsFeed};
 use feed_polymarket::PolymarketFeed;
@@ -100,6 +101,7 @@ struct MarketMeta {
     timeframe: String,
     title: String,
     end_date: Option<String>,
+    start_ts_utc_ms: Option<i64>,
     target_price: Option<f64>,
     target_source: String,
 }
@@ -136,6 +138,8 @@ struct SnapshotRow {
     target_source: String,
     binance_price_tokyo: Option<f64>,
     chainlink_price: Option<f64>,
+    chainlink_age_ms: Option<i64>,
+    chainlink_stale: Option<bool>,
     bid_yes: f64,
     ask_yes: f64,
     mid_yes: f64,
@@ -151,15 +155,23 @@ struct SnapshotRow {
     time_edge_ms: Option<f64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TargetAnchor {
+    price: f64,
+    source: String,
+}
+
 #[derive(Default)]
 struct IngestState {
     tokyo_last: HashMap<String, TokyoTick>,
     tokyo_prev: HashMap<String, TokyoTick>,
     vel_prev: HashMap<String, (i64, f64)>,
     chainlink_last: HashMap<String, ChainlinkTick>,
+    tokyo_hist: HashMap<String, VecDeque<TokyoTick>>,
+    chainlink_hist: HashMap<String, VecDeque<ChainlinkTick>>,
     books: HashMap<String, PmBookRow>,
     meta: HashMap<String, MarketMeta>,
-    target_fallback: HashMap<String, f64>,
+    target_anchor: HashMap<String, TargetAnchor>,
 }
 
 #[derive(Clone)]
@@ -178,6 +190,7 @@ struct SnapshotQuery {
 #[derive(Debug, Deserialize)]
 struct MarketsQuery {
     date: Option<String>,
+    date_tz: Option<String>,
     symbol: Option<String>,
     timeframe: Option<String>,
 }
@@ -185,6 +198,7 @@ struct MarketsQuery {
 #[derive(Debug, Deserialize)]
 struct HistorySnapshotQuery {
     date: Option<String>,
+    date_tz: Option<String>,
     symbol: Option<String>,
     timeframe: Option<String>,
     market_id: Option<String>,
@@ -218,6 +232,7 @@ fn install_rustls_provider() {
 }
 
 async fn run_tokyo_collector(args: TokyoCollectorArgs) -> Result<()> {
+    ensure_non_legacy_root(&args.dataset_root)?;
     let symbols = parse_symbols(&args.symbols);
     let out_root = PathBuf::from(args.dataset_root);
     let dst: SocketAddr = args
@@ -267,6 +282,7 @@ async fn run_tokyo_collector(args: TokyoCollectorArgs) -> Result<()> {
 }
 
 async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
+    ensure_non_legacy_root(&args.dataset_root)?;
     let symbols = parse_symbols(&args.symbols);
     let timeframes = parse_lower_csv(&args.timeframes);
     let root = PathBuf::from(&args.dataset_root);
@@ -293,6 +309,14 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
                         .into_iter()
                         .map(|m| (m.market_id.clone(), m))
                         .collect::<HashMap<_, _>>();
+                    for (market_id, anchor) in w.target_anchor.clone() {
+                        if let Some(meta) = w.meta.get_mut(&market_id) {
+                            if meta.target_price.is_none() {
+                                meta.target_price = Some(anchor.price);
+                                meta.target_source = anchor.source;
+                            }
+                        }
+                    }
                     let report = serde_json::json!({
                         "ts_ms": now_ms(),
                         "market_count": w.meta.len(),
@@ -350,6 +374,7 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
                 if let Some(prev) = w.tokyo_last.insert(row.symbol.clone(), row.clone()) {
                     w.tokyo_prev.insert(row.symbol.clone(), prev);
                 }
+                push_tokyo_hist(&mut w.tokyo_hist, &row);
             }
             let _ = append_jsonl(&tokyo_tick_path(&udp_root, &row), &row);
         }
@@ -433,6 +458,7 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
                 {
                     let mut w = ch_state.write().await;
                     w.chainlink_last.insert(row.symbol.clone(), row.clone());
+                    push_chainlink_hist(&mut w.chainlink_hist, &row);
                 }
                 let _ = append_jsonl(&chainlink_tick_path(&ch_root, &row), &row);
             }
@@ -503,16 +529,12 @@ async fn build_snapshots(state: Arc<RwLock<IngestState>>) -> Vec<SnapshotRow> {
         let prev = w.tokyo_prev.get(&symbol).cloned();
         let chainlink = w.chainlink_last.get(&symbol).cloned();
 
-        let target_price = if let Some(tp) = meta.target_price {
-            Some(tp)
-        } else if let Some(existing) = w.target_fallback.get(&market_id).copied() {
-            Some(existing)
-        } else if let Some(tk) = tokyo.as_ref() {
-            w.target_fallback.insert(market_id.clone(), tk.binance_price);
-            Some(tk.binance_price)
-        } else {
-            None
-        };
+        let target = resolve_target_anchor(&mut w, &meta, now);
+        let target_price = target.as_ref().map(|x| x.price);
+        let target_source = target
+            .as_ref()
+            .map(|x| x.source.clone())
+            .unwrap_or_else(|| "none".to_string());
 
         let delta_price = target_price.and_then(|t| tokyo.as_ref().map(|x| x.binance_price - t));
         let delta_pct = match (delta_price, target_price) {
@@ -540,9 +562,14 @@ async fn build_snapshots(state: Arc<RwLock<IngestState>>) -> Vec<SnapshotRow> {
 
         let time_edge_ms = tokyo
             .as_ref()
-            .map(|t| book.ts_pm_recv_ms as f64 - t.ts_tokyo_recv_ms as f64);
+            .map(|t| book.ts_exchange_ms as f64 - t.ts_exchange_ms as f64);
 
         let net_ev_bps = estimate_net_ev_bps(delta_pct, book.spread_yes, velocity);
+
+        let chainlink_age_ms = chainlink
+            .as_ref()
+            .map(|x| now.saturating_sub(x.ts_chainlink_recv_ms));
+        let chainlink_stale = chainlink_age_ms.map(|age| age > 5000);
 
         out.push(SnapshotRow {
             ts_ms_utc: now,
@@ -552,13 +579,11 @@ async fn build_snapshots(state: Arc<RwLock<IngestState>>) -> Vec<SnapshotRow> {
             timeframe: meta.timeframe,
             title: meta.title,
             target_price,
-            target_source: if meta.target_price.is_some() {
-                meta.target_source
-            } else {
-                "fallback_first_tokyo_price".to_string()
-            },
+            target_source,
             binance_price_tokyo: tokyo.map(|x| x.binance_price),
             chainlink_price: chainlink.map(|x| x.chainlink_price),
+            chainlink_age_ms,
+            chainlink_stale,
             bid_yes: book.bid_yes,
             ask_yes: book.ask_yes,
             mid_yes: book.mid_yes,
@@ -612,12 +637,19 @@ async fn discover_once(symbols: &[String], timeframes: &[String]) -> Result<Vec<
 
 fn map_market_meta(m: MarketDescriptor) -> MarketMeta {
     let target = extract_price_from_title(&m.question);
+    let timeframe = m.timeframe.unwrap_or_else(|| "unknown".to_string());
+    let start_ts_utc_ms = m
+        .end_date
+        .as_deref()
+        .and_then(parse_end_ms)
+        .and_then(|end| parse_timeframe_ms(&timeframe).map(|dur| end.saturating_sub(dur)));
     MarketMeta {
         market_id: m.market_id,
         symbol: m.symbol,
-        timeframe: m.timeframe.unwrap_or_else(|| "unknown".to_string()),
+        timeframe,
         title: m.question,
         end_date: m.end_date,
+        start_ts_utc_ms,
         target_price: target,
         target_source: if target.is_some() {
             "title_parse".to_string()
@@ -657,7 +689,120 @@ fn extract_price_from_title(title: &str) -> Option<f64> {
     best
 }
 
+fn parse_timeframe_ms(tf: &str) -> Option<i64> {
+    match tf.trim().to_ascii_lowercase().as_str() {
+        "5m" => Some(5 * 60 * 1000),
+        "15m" => Some(15 * 60 * 1000),
+        "1h" => Some(60 * 60 * 1000),
+        _ => None,
+    }
+}
+
+fn push_tokyo_hist(hist: &mut HashMap<String, VecDeque<TokyoTick>>, row: &TokyoTick) {
+    let q = hist.entry(row.symbol.clone()).or_default();
+    q.push_back(row.clone());
+    let cutoff = row.ts_exchange_ms.saturating_sub(6 * 60 * 60 * 1000);
+    while q.front().map(|x| x.ts_exchange_ms < cutoff).unwrap_or(false) {
+        q.pop_front();
+    }
+    if q.len() > 500_000 {
+        q.pop_front();
+    }
+}
+
+fn push_chainlink_hist(hist: &mut HashMap<String, VecDeque<ChainlinkTick>>, row: &ChainlinkTick) {
+    let q = hist.entry(row.symbol.clone()).or_default();
+    q.push_back(row.clone());
+    let cutoff = row.ts_exchange_ms.saturating_sub(6 * 60 * 60 * 1000);
+    while q.front().map(|x| x.ts_exchange_ms < cutoff).unwrap_or(false) {
+        q.pop_front();
+    }
+    if q.len() > 500_000 {
+        q.pop_front();
+    }
+}
+
+fn find_closest_price_tokyo(
+    hist: &HashMap<String, VecDeque<TokyoTick>>,
+    symbol: &str,
+    ts_ms: i64,
+    tolerance_ms: i64,
+) -> Option<f64> {
+    let q = hist.get(symbol)?;
+    q.iter()
+        .filter_map(|x| {
+            let d = (x.ts_exchange_ms - ts_ms).abs();
+            if d <= tolerance_ms {
+                Some((d, x.binance_price))
+            } else {
+                None
+            }
+        })
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, p)| p)
+}
+
+fn find_closest_price_chainlink(
+    hist: &HashMap<String, VecDeque<ChainlinkTick>>,
+    symbol: &str,
+    ts_ms: i64,
+    tolerance_ms: i64,
+) -> Option<f64> {
+    let q = hist.get(symbol)?;
+    q.iter()
+        .filter_map(|x| {
+            let d = (x.ts_exchange_ms - ts_ms).abs();
+            if d <= tolerance_ms {
+                Some((d, x.chainlink_price))
+            } else {
+                None
+            }
+        })
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, p)| p)
+}
+
+fn resolve_target_anchor(
+    state: &mut IngestState,
+    meta: &MarketMeta,
+    now_ms: i64,
+) -> Option<TargetAnchor> {
+    if let Some(existing) = state.target_anchor.get(&meta.market_id).cloned() {
+        return Some(existing);
+    }
+    if let Some(tp) = meta.target_price {
+        let a = TargetAnchor {
+            price: tp,
+            source: meta.target_source.clone(),
+        };
+        state.target_anchor.insert(meta.market_id.clone(), a.clone());
+        return Some(a);
+    }
+    let start = meta.start_ts_utc_ms?;
+    if now_ms < start.saturating_sub(5_000) {
+        return None;
+    }
+    let by_chainlink = find_closest_price_chainlink(&state.chainlink_hist, &meta.symbol, start, 120_000);
+    let by_tokyo = find_closest_price_tokyo(&state.tokyo_hist, &meta.symbol, start, 120_000);
+    let resolved = by_chainlink
+        .map(|p| TargetAnchor {
+            price: p,
+            source: "chainlink_market_open".to_string(),
+        })
+        .or_else(|| {
+            by_tokyo.map(|p| TargetAnchor {
+                price: p,
+                source: "tokyo_market_open".to_string(),
+            })
+        });
+    if let Some(anchor) = resolved.clone() {
+        state.target_anchor.insert(meta.market_id.clone(), anchor);
+    }
+    resolved
+}
+
 async fn run_api(args: ApiArgs) -> Result<()> {
+    ensure_non_legacy_root(&args.dataset_root)?;
     let root = PathBuf::from(&args.dataset_root);
     let state = ApiState { root };
 
@@ -789,11 +934,22 @@ async fn api_heatmap(
 }
 
 async fn api_history_dates(State(st): State<ApiState>) -> Json<serde_json::Value> {
-    let dates = list_date_dirs(&st.root.join("normalized"));
+    let utc_dates = list_date_dirs(&st.root.join("normalized"));
+    let mut et_dates = utc_dates
+        .iter()
+        .filter_map(|d| naive_date(d))
+        .flat_map(|d| [d.pred_opt().unwrap_or(d), d])
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .collect::<Vec<_>>();
+    et_dates.sort();
+    et_dates.dedup();
+    et_dates.reverse();
     Json(serde_json::json!({
         "ts_ms": now_ms(),
-        "count": dates.len(),
-        "dates": dates
+        "count_utc": utc_dates.len(),
+        "count_et": et_dates.len(),
+        "dates_utc": utc_dates,
+        "dates_et": et_dates
     }))
 }
 
@@ -801,6 +957,7 @@ async fn api_history_markets(
     State(st): State<ApiState>,
     Query(q): Query<MarketsQuery>,
 ) -> Json<serde_json::Value> {
+    let req_tz = q.date_tz.clone().unwrap_or_else(|| "et".to_string());
     let date = q
         .date
         .clone()
@@ -808,46 +965,97 @@ async fn api_history_markets(
     let Some(date) = date else {
         return Json(serde_json::json!({"ts_ms": now_ms(), "market_count": 0, "markets": []}));
     };
-    let path = st
-        .root
-        .join("reports")
-        .join("catalog")
-        .join(&date)
-        .join("markets.json");
-    let mut payload =
-        read_json_or(path, serde_json::json!({"markets": [], "market_count": 0, "ts_ms": now_ms()}));
-    payload["date"] = serde_json::json!(date);
-    if let Some(markets) = payload.get_mut("markets").and_then(|v| v.as_array_mut()) {
-        if let Some(sym) = q.symbol.as_deref() {
-            markets.retain(|m| m.get("symbol").and_then(|x| x.as_str()) == Some(sym));
+    let storage_dates = resolve_storage_dates_from_query(&date, &req_tz);
+    let mut all = Vec::<serde_json::Value>::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+    for storage_date in &storage_dates {
+        let path = st
+            .root
+            .join("reports")
+            .join("catalog")
+            .join(storage_date)
+            .join("markets.json");
+        let payload = read_json_or(path, serde_json::json!({"markets": []}));
+        if let Some(markets) = payload.get("markets").and_then(|v| v.as_array()) {
+            for m in markets {
+                let market_id = m
+                    .get("market_id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if market_id.is_empty() || seen.contains(&market_id) {
+                    continue;
+                }
+                seen.insert(market_id);
+                all.push(m.clone());
+            }
         }
-        if let Some(tf) = q.timeframe.as_deref() {
-            markets.retain(|m| m.get("timeframe").and_then(|x| x.as_str()) == Some(tf));
-        }
-        payload["market_count"] = serde_json::json!(markets.len());
     }
-    Json(payload)
+    if let Some(sym) = q.symbol.as_deref() {
+        all.retain(|m| m.get("symbol").and_then(|x| x.as_str()) == Some(sym));
+    }
+    if let Some(tf) = q.timeframe.as_deref() {
+        all.retain(|m| m.get("timeframe").and_then(|x| x.as_str()) == Some(tf));
+    }
+    Json(serde_json::json!({
+        "ts_ms": now_ms(),
+        "date": date,
+        "date_tz": req_tz,
+        "storage_dates": storage_dates,
+        "market_count": all.len(),
+        "markets": all
+    }))
 }
 
 async fn api_history_snapshot(
     State(st): State<ApiState>,
     Query(q): Query<HistorySnapshotQuery>,
 ) -> Json<serde_json::Value> {
+    let req_tz = q.date_tz.clone().unwrap_or_else(|| "et".to_string());
     let date = q
         .date
-        .clone()
-        .or_else(|| list_date_dirs(&st.root.join("normalized")).into_iter().next());
+        .clone();
+    let date = date
+        .or_else(|| {
+            if req_tz.eq_ignore_ascii_case("utc") {
+                list_date_dirs(&st.root.join("normalized")).into_iter().next()
+            } else {
+                Some(ts_to_et(now_ms()).chars().take(10).collect::<String>())
+            }
+        });
     let Some(date) = date else {
         return Json(serde_json::json!({"ts_ms": now_ms(), "count": 0, "rows": []}));
     };
     let symbol = q.symbol.clone().unwrap_or_else(|| "BTCUSDT".to_string());
     let timeframe = q.timeframe.clone().unwrap_or_else(|| "5m".to_string());
-    let path = history_snapshot_path(&st.root, &date, &symbol, &timeframe, q.market_id.as_deref());
     let limit = q.limit.unwrap_or(10_000).clamp(1, 200_000);
-    let rows = read_jsonl_filtered_rows(&path, q.from_ms, q.to_ms, limit);
+    let storage_dates = resolve_storage_dates_from_query(&date, &req_tz);
+    let paths = storage_dates
+        .iter()
+        .map(|d| history_snapshot_path(&st.root, d, &symbol, &timeframe, q.market_id.as_deref()))
+        .collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    for p in &paths {
+        let mut part = read_jsonl_filtered_rows(p, q.from_ms, q.to_ms, limit);
+        rows.append(&mut part);
+    }
+    if req_tz.eq_ignore_ascii_case("et") {
+        rows.retain(|v| {
+            v.get("ts_et")
+                .and_then(|x| x.as_str())
+                .map(|s| s.starts_with(&date))
+                .unwrap_or(false)
+        });
+    }
+    rows.sort_by_key(|v| v.get("ts_ms_utc").and_then(|x| x.as_i64()).unwrap_or(0));
+    if rows.len() > limit {
+        rows.drain(0..(rows.len() - limit));
+    }
     Json(serde_json::json!({
         "ts_ms": now_ms(),
         "date": date,
+        "date_tz": req_tz,
+        "storage_dates": storage_dates,
         "symbol": symbol,
         "timeframe": timeframe,
         "market_id": q.market_id,
@@ -870,13 +1078,24 @@ fn parse_lower_csv(s: &str) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
+fn ensure_non_legacy_root(root: &str) -> Result<()> {
+    let normalized = root.replace('\\', "/").to_ascii_lowercase();
+    if normalized.contains("/home/ubuntu/polyedge/datasets") {
+        return Err(anyhow!(
+            "refuse to use legacy data root {} ; use /dev/xvdbb/polyedge-data",
+            root
+        ));
+    }
+    Ok(())
+}
+
 fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
 }
 
 fn ts_to_et(ms: i64) -> String {
     if let Some(dt) = DateTime::<Utc>::from_timestamp_millis(ms) {
-        dt.with_timezone(&chrono::FixedOffset::west_opt(5 * 3600).unwrap())
+        dt.with_timezone(&New_York)
             .format("%Y-%m-%d %H:%M:%S ET")
             .to_string()
     } else {
@@ -888,6 +1107,35 @@ fn parse_end_ms(v: &str) -> Option<i64> {
     DateTime::parse_from_rfc3339(v)
         .ok()
         .map(|d| d.timestamp_millis())
+}
+
+fn naive_date(s: &str) -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+}
+
+fn resolve_storage_dates_from_query(date: &str, date_tz: &str) -> Vec<String> {
+    if date_tz.eq_ignore_ascii_case("utc") {
+        return vec![date.to_string()];
+    }
+    let Some(d) = naive_date(date) else {
+        return vec![date.to_string()];
+    };
+    let start_local = New_York
+        .with_ymd_and_hms(d.year(), d.month(), d.day(), 0, 0, 0)
+        .single();
+    let end_local = New_York
+        .with_ymd_and_hms(d.year(), d.month(), d.day(), 23, 59, 59)
+        .single();
+    let mut out = Vec::<String>::new();
+    if let Some(v) = start_local {
+        out.push(v.with_timezone(&Utc).format("%Y-%m-%d").to_string());
+    }
+    if let Some(v) = end_local {
+        out.push(v.with_timezone(&Utc).format("%Y-%m-%d").to_string());
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn utc_date_from_ms(ms: i64) -> String {
