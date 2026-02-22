@@ -81,8 +81,6 @@ struct TokyoTick {
     ts_exchange_ms: i64,
     symbol: String,
     binance_price: f64,
-    source: String,
-    source_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,7 +89,6 @@ struct ChainlinkTick {
     ts_exchange_ms: i64,
     symbol: String,
     chainlink_price: f64,
-    source_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,7 +101,6 @@ struct MarketMeta {
     event_start_time: Option<String>,
     start_ts_utc_ms: Option<i64>,
     target_price: Option<f64>,
-    target_source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,13 +126,11 @@ struct PmBookRow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SnapshotRow {
     ts_ms_utc: i64,
-    ts_et: String,
     market_id: String,
     symbol: String,
     timeframe: String,
     title: String,
     target_price: Option<f64>,
-    target_source: String,
     binance_price_tokyo: Option<f64>,
     chainlink_price: Option<f64>,
     chainlink_age_ms: Option<i64>,
@@ -152,6 +146,8 @@ struct SnapshotRow {
     velocity_bps_per_sec: Option<f64>,
     acceleration: Option<f64>,
     remaining_ms: Option<i64>,
+    predicted_win_rate: Option<f64>,
+    historical_win_rate: Option<f64>,
     net_ev_bps: Option<f64>,
     time_edge_ms: Option<f64>,
 }
@@ -173,6 +169,8 @@ struct IngestState {
     books: HashMap<String, PmBookRow>,
     meta: HashMap<String, MarketMeta>,
     target_anchor: HashMap<String, TargetAnchor>,
+    settled_markets: std::collections::HashSet<String>,
+    historical_up_stats: HashMap<(String, String), (u64, u64)>,
 }
 
 #[derive(Clone)]
@@ -272,8 +270,6 @@ async fn run_tokyo_collector(args: TokyoCollectorArgs) -> Result<()> {
             ts_exchange_ms: tick.event_ts_exchange_ms,
             symbol: tick.symbol,
             binance_price: tick.price,
-            source: tick.source.to_string(),
-            source_seq: tick.source_seq,
         };
 
         let payload = serde_json::to_vec(&row)?;
@@ -314,14 +310,35 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
                         if let Some(meta) = w.meta.get_mut(&market_id) {
                             if meta.target_price.is_none() {
                                 meta.target_price = Some(anchor.price);
-                                meta.target_source = anchor.source;
                             }
                         }
                     }
+                    let markets = w
+                        .meta
+                        .values()
+                        .map(|m| {
+                            let start_price = w
+                                .target_anchor
+                                .get(&m.market_id)
+                                .map(|a| a.price)
+                                .or(m.target_price);
+                            serde_json::json!({
+                                "market_id": m.market_id,
+                                "symbol": m.symbol,
+                                "timeframe": m.timeframe,
+                                "title": m.title,
+                                "end_date": m.end_date,
+                                "event_start_time": m.event_start_time,
+                                "start_ts_utc_ms": m.start_ts_utc_ms,
+                                "target_price": m.target_price,
+                                "start_price": start_price
+                            })
+                        })
+                        .collect::<Vec<_>>();
                     let report = serde_json::json!({
                         "ts_ms": now_ms(),
-                        "market_count": w.meta.len(),
-                        "markets": w.meta.values().collect::<Vec<_>>()
+                        "market_count": markets.len(),
+                        "markets": markets
                     });
                     let _ = write_json_pretty(discover_root.join("reports").join("latest_markets.json"), &report);
                     let day = Utc::now().format("%Y-%m-%d").to_string();
@@ -454,7 +471,6 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
                     ts_exchange_ms: tick.event_ts_exchange_ms,
                     symbol: tick.symbol,
                     chainlink_price: tick.price,
-                    source_seq: tick.source_seq,
                 };
                 {
                     let mut w = ch_state.write().await;
@@ -469,15 +485,39 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
     });
 
     let mut snap_tick = tokio::time::interval(Duration::from_millis(args.snapshot_ms.max(20)));
+    let mut sec_cache: HashMap<(String, String, String), SnapshotRow> = HashMap::new();
     loop {
         snap_tick.tick().await;
         let rows = build_snapshots(shared.clone()).await;
         if rows.is_empty() {
             continue;
         }
+        let mut seen_keys = std::collections::HashSet::new();
         for row in rows {
-            append_jsonl(&snapshot_symbol_tf_path(&root, &row), &row)?;
-            append_jsonl(&snapshot_market_path(&root, &row), &row)?;
+            let key = (row.symbol.clone(), row.timeframe.clone(), row.market_id.clone());
+            seen_keys.insert(key.clone());
+            let sec = row.ts_ms_utc / 1000;
+            if let Some(prev) = sec_cache.get(&key).cloned() {
+                let prev_sec = prev.ts_ms_utc / 1000;
+                if prev_sec == sec {
+                    sec_cache.insert(key, row);
+                    continue;
+                }
+                append_jsonl(&snapshot_symbol_tf_1s_path(&root, &prev), &prev)?;
+                append_jsonl(&snapshot_market_1s_path(&root, &prev), &prev)?;
+            }
+            sec_cache.insert(key, row);
+        }
+        let stale_keys = sec_cache
+            .keys()
+            .filter(|k| !seen_keys.contains(*k))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in stale_keys {
+            if let Some(last) = sec_cache.remove(&key) {
+                append_jsonl(&snapshot_symbol_tf_1s_path(&root, &last), &last)?;
+                append_jsonl(&snapshot_market_1s_path(&root, &last), &last)?;
+            }
         }
     }
 }
@@ -517,7 +557,6 @@ async fn map_book_to_row(state: &Arc<RwLock<IngestState>>, book: &BookTop) -> Pm
 async fn build_snapshots(state: Arc<RwLock<IngestState>>) -> Vec<SnapshotRow> {
     let now = now_ms();
     let mut out = Vec::new();
-    let et = ts_to_et(now);
 
     let mut w = state.write().await;
     for (market_id, book) in w.books.clone() {
@@ -532,10 +571,6 @@ async fn build_snapshots(state: Arc<RwLock<IngestState>>) -> Vec<SnapshotRow> {
 
         let target = resolve_target_anchor(&mut w, &meta, now);
         let target_price = target.as_ref().map(|x| x.price);
-        let target_source = target
-            .as_ref()
-            .map(|x| x.source.clone())
-            .unwrap_or_else(|| "none".to_string());
 
         let delta_price = target_price.and_then(|t| tokyo.as_ref().map(|x| x.binance_price - t));
         let delta_pct = match (delta_price, target_price) {
@@ -566,6 +601,29 @@ async fn build_snapshots(state: Arc<RwLock<IngestState>>) -> Vec<SnapshotRow> {
             .map(|t| book.ts_exchange_ms as f64 - t.ts_exchange_ms as f64);
 
         let net_ev_bps = estimate_net_ev_bps(delta_pct, book.spread_yes, velocity);
+        let predicted_win_rate = estimate_predicted_win_rate(book.mid_yes, delta_pct, velocity, acceleration);
+        if let (Some(rem), Some(target), Some(ch)) = (remaining_ms, target_price, chainlink.as_ref()) {
+            if rem <= 0 && !w.settled_markets.contains(&market_id) {
+                let final_up = ch.chainlink_price >= target;
+                let k = (meta.symbol.clone(), meta.timeframe.clone());
+                let entry = w.historical_up_stats.entry(k).or_insert((0, 0));
+                if final_up {
+                    entry.0 = entry.0.saturating_add(1);
+                }
+                entry.1 = entry.1.saturating_add(1);
+                w.settled_markets.insert(market_id.clone());
+            }
+        }
+        let historical_win_rate = w
+            .historical_up_stats
+            .get(&(meta.symbol.clone(), meta.timeframe.clone()))
+            .and_then(|(wins, total)| {
+                if *total == 0 {
+                    None
+                } else {
+                    Some(*wins as f64 / *total as f64)
+                }
+            });
 
         let chainlink_age_ms = chainlink
             .as_ref()
@@ -574,13 +632,11 @@ async fn build_snapshots(state: Arc<RwLock<IngestState>>) -> Vec<SnapshotRow> {
 
         out.push(SnapshotRow {
             ts_ms_utc: now,
-            ts_et: et.clone(),
             market_id,
             symbol: meta.symbol,
             timeframe: meta.timeframe,
             title: meta.title,
             target_price,
-            target_source,
             binance_price_tokyo: tokyo.map(|x| x.binance_price),
             chainlink_price: chainlink.map(|x| x.chainlink_price),
             chainlink_age_ms,
@@ -596,6 +652,8 @@ async fn build_snapshots(state: Arc<RwLock<IngestState>>) -> Vec<SnapshotRow> {
             velocity_bps_per_sec: velocity,
             acceleration,
             remaining_ms,
+            predicted_win_rate,
+            historical_win_rate,
             net_ev_bps,
             time_edge_ms,
         });
@@ -623,6 +681,22 @@ fn estimate_net_ev_bps(delta_pct: Option<f64>, spread_yes: f64, velocity: Option
     let signal_bps = d * 10_000.0 + v * 0.15;
     let cost_bps = (spread_yes * 10_000.0) + 44.0; // include upper taker fee envelope
     Some(signal_bps - cost_bps)
+}
+
+fn estimate_predicted_win_rate(
+    mid_yes: f64,
+    delta_pct: Option<f64>,
+    velocity: Option<f64>,
+    acceleration: Option<f64>,
+) -> Option<f64> {
+    if !mid_yes.is_finite() {
+        return None;
+    }
+    let d = delta_pct.unwrap_or(0.0);
+    let v = velocity.unwrap_or(0.0);
+    let a = acceleration.unwrap_or(0.0);
+    let raw = mid_yes + d * 40.0 + v * 0.001 + a * 0.00005;
+    Some(raw.clamp(0.0, 1.0))
 }
 
 async fn discover_once(symbols: &[String], timeframes: &[String]) -> Result<Vec<MarketMeta>> {
@@ -658,11 +732,6 @@ fn map_market_meta(m: MarketDescriptor) -> MarketMeta {
         event_start_time: m.event_start_time,
         start_ts_utc_ms,
         target_price: target,
-        target_source: if target.is_some() {
-            "title_parse".to_string()
-        } else {
-            "none".to_string()
-        },
     }
 }
 
@@ -780,7 +849,7 @@ fn resolve_target_anchor(
     if let Some(tp) = meta.target_price {
         let a = TargetAnchor {
             price: tp,
-            source: meta.target_source.clone(),
+            source: "metadata_target".to_string(),
         };
         state.target_anchor.insert(meta.market_id.clone(), a.clone());
         return Some(a);
@@ -1058,9 +1127,9 @@ async fn api_history_snapshot(
     }
     if req_tz.eq_ignore_ascii_case("et") {
         rows.retain(|v| {
-            v.get("ts_et")
-                .and_then(|x| x.as_str())
-                .map(|s| s.starts_with(&date))
+            v.get("ts_ms_utc")
+                .and_then(|x| x.as_i64())
+                .map(|ms| et_date_from_ms(ms) == date)
                 .unwrap_or(false)
         });
     }
@@ -1099,7 +1168,7 @@ fn ensure_non_legacy_root(root: &str) -> Result<()> {
     let normalized = root.replace('\\', "/").to_ascii_lowercase();
     if normalized.contains("/home/ubuntu/polyedge/datasets") {
         return Err(anyhow!(
-            "refuse to use legacy data root {} ; use /dev/xvdbb/polyedge-data",
+            "refuse to use legacy data root {} ; use /data/polyedge-data",
             root
         ));
     }
@@ -1117,6 +1186,19 @@ fn ts_to_et(ms: i64) -> String {
             .to_string()
     } else {
         "invalid".to_string()
+    }
+}
+
+fn et_date_from_ms(ms: i64) -> String {
+    if let Some(dt) = DateTime::<Utc>::from_timestamp_millis(ms) {
+        dt.with_timezone(&New_York)
+            .format("%Y-%m-%d")
+            .to_string()
+    } else {
+        Utc::now()
+            .with_timezone(&New_York)
+            .format("%Y-%m-%d")
+            .to_string()
     }
 }
 
@@ -1215,7 +1297,7 @@ fn pm_books_market_path(root: &Path, row: &PmBookRow) -> PathBuf {
         .join("pm_books.jsonl")
 }
 
-fn snapshot_symbol_tf_path(root: &Path, row: &SnapshotRow) -> PathBuf {
+fn snapshot_symbol_tf_1s_path(root: &Path, row: &SnapshotRow) -> PathBuf {
     let d = utc_date_from_ms(row.ts_ms_utc);
     root.join("normalized")
         .join(d)
@@ -1223,10 +1305,10 @@ fn snapshot_symbol_tf_path(root: &Path, row: &SnapshotRow) -> PathBuf {
         .join(path_safe_segment(&row.symbol))
         .join("timeframe")
         .join(path_safe_segment(&row.timeframe))
-        .join("snapshot_100ms.jsonl")
+        .join("snapshot_1s.jsonl")
 }
 
-fn snapshot_market_path(root: &Path, row: &SnapshotRow) -> PathBuf {
+fn snapshot_market_1s_path(root: &Path, row: &SnapshotRow) -> PathBuf {
     let d = utc_date_from_ms(row.ts_ms_utc);
     root.join("normalized")
         .join(d)
@@ -1236,7 +1318,7 @@ fn snapshot_market_path(root: &Path, row: &SnapshotRow) -> PathBuf {
         .join(path_safe_segment(&row.timeframe))
         .join("market")
         .join(path_safe_segment(&row.market_id))
-        .join("snapshot_100ms.jsonl")
+        .join("snapshot_1s.jsonl")
 }
 
 fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -1305,15 +1387,15 @@ fn list_date_dirs(base: &Path) -> Vec<String> {
 fn latest_symbol_tf_snapshot_file(root: &Path, symbol: &str, timeframe: &str) -> Option<PathBuf> {
     let base = root.join("normalized");
     for date in list_date_dirs(&base) {
-        let p = base
+        let p1 = base
             .join(date)
             .join("symbol")
             .join(path_safe_segment(symbol))
             .join("timeframe")
             .join(path_safe_segment(timeframe))
-            .join("snapshot_100ms.jsonl");
-        if p.exists() {
-            return Some(p);
+            .join("snapshot_1s.jsonl");
+        if p1.exists() {
+            return Some(p1);
         }
     }
     None
@@ -1336,7 +1418,7 @@ fn history_snapshot_path(
     if let Some(mid) = market_id {
         p = p.join("market").join(path_safe_segment(mid));
     }
-    p.join("snapshot_100ms.jsonl")
+    p.join("snapshot_1s.jsonl")
 }
 
 fn read_last_jsonl_rows(path: &Path, limit: usize) -> Vec<serde_json::Value> {
