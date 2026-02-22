@@ -236,6 +236,13 @@ struct SnapshotQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct QualityQuery {
+    symbol: Option<String>,
+    timeframe: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
 struct MarketsQuery {
     date: Option<String>,
     date_tz: Option<String>,
@@ -597,7 +604,7 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
         if rows.is_empty() {
             continue;
         }
-        for row in rows {
+        for row in rows.into_iter().filter_map(sanitize_snapshot_row) {
             append_jsonl(&snapshot_symbol_tf_100ms_path(&root, &row), &row)?;
             append_jsonl(&snapshot_market_100ms_path(&root, &row), &row)?;
             if let Some(tx) = sink_tx.as_ref() {
@@ -814,6 +821,7 @@ struct ClickHouseSnapshotRow {
     timeframe: String,
     title: String,
     target_price: Option<f64>,
+    target_source: Option<String>,
     binance_price_tokyo: Option<f64>,
     chainlink_price: Option<f64>,
     chainlink_age_ms: Option<i64>,
@@ -844,6 +852,7 @@ impl From<SnapshotRow> for ClickHouseSnapshotRow {
             timeframe: v.timeframe,
             title: v.title,
             target_price: v.target_price,
+            target_source: v.target_source,
             binance_price_tokyo: v.binance_price_tokyo,
             chainlink_price: v.chainlink_price,
             chainlink_age_ms: v.chainlink_age_ms,
@@ -905,8 +914,15 @@ async fn flush_sink_batch(cfg: &AnalyticsSinkConfig, batch: &mut Vec<SnapshotRow
     if batch.is_empty() {
         return;
     }
-    let mut to_flush = Vec::new();
-    std::mem::swap(batch, &mut to_flush);
+    let mut raw = Vec::new();
+    std::mem::swap(batch, &mut raw);
+    let to_flush = raw
+        .into_iter()
+        .filter_map(sanitize_snapshot_row)
+        .collect::<Vec<_>>();
+    if to_flush.is_empty() {
+        return;
+    }
 
     if let Some(ch_url) = cfg.clickhouse_url.as_deref() {
         if let Err(err) = flush_clickhouse_snapshots(ch_url, cfg, &to_flush).await {
@@ -918,6 +934,34 @@ async fn flush_sink_batch(cfg: &AnalyticsSinkConfig, batch: &mut Vec<SnapshotRow
             tracing::warn!(?err, rows = to_flush.len(), "redis latest cache flush failed");
         }
     }
+}
+
+fn sanitize_optional_f64(v: Option<f64>) -> Option<f64> {
+    v.filter(|x| x.is_finite())
+}
+
+fn sanitize_snapshot_row(mut row: SnapshotRow) -> Option<SnapshotRow> {
+    if !(row.bid_yes.is_finite()
+        && row.ask_yes.is_finite()
+        && row.mid_yes.is_finite()
+        && row.bid_no.is_finite()
+        && row.ask_no.is_finite()
+        && row.mid_no.is_finite())
+    {
+        return None;
+    }
+    row.target_price = sanitize_optional_f64(row.target_price);
+    row.binance_price_tokyo = sanitize_optional_f64(row.binance_price_tokyo);
+    row.chainlink_price = sanitize_optional_f64(row.chainlink_price);
+    row.delta_price = sanitize_optional_f64(row.delta_price);
+    row.delta_pct = sanitize_optional_f64(row.delta_pct);
+    row.velocity_bps_per_sec = sanitize_optional_f64(row.velocity_bps_per_sec);
+    row.acceleration = sanitize_optional_f64(row.acceleration);
+    row.predicted_win_rate = sanitize_optional_f64(row.predicted_win_rate);
+    row.historical_win_rate = sanitize_optional_f64(row.historical_win_rate);
+    row.net_ev_bps = sanitize_optional_f64(row.net_ev_bps);
+    row.time_edge_ms = sanitize_optional_f64(row.time_edge_ms);
+    Some(row)
 }
 
 async fn init_clickhouse(ch_url: &str, cfg: &AnalyticsSinkConfig) -> Result<()> {
@@ -934,6 +978,7 @@ async fn init_clickhouse(ch_url: &str, cfg: &AnalyticsSinkConfig) -> Result<()> 
             timeframe LowCardinality(String),
             title String,
             target_price Nullable(Float64),
+            target_source Nullable(String),
             binance_price_tokyo Nullable(Float64),
             chainlink_price Nullable(Float64),
             chainlink_age_ms Nullable(Int64),
@@ -962,6 +1007,12 @@ async fn init_clickhouse(ch_url: &str, cfg: &AnalyticsSinkConfig) -> Result<()> 
         SETTINGS index_granularity = 8192",
         db, tbl, ttl_days
     );
+    let alter_cols = [
+        format!(
+            "ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS target_source Nullable(String) AFTER target_price",
+            db, tbl
+        ),
+    ];
     for q in [&create_db, &create_tbl] {
         let resp = client
             .post(ch_url)
@@ -973,6 +1024,19 @@ async fn init_clickhouse(ch_url: &str, cfg: &AnalyticsSinkConfig) -> Result<()> 
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             return Err(anyhow!("clickhouse init failed status={} body={}", status, body));
+        }
+    }
+    for q in &alter_cols {
+        let resp = client
+            .post(ch_url)
+            .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(q.clone())
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!(status = %status, body = %body, query = %q, "clickhouse alter column failed");
         }
     }
     Ok(())
@@ -1089,11 +1153,34 @@ async fn fetch_price_to_beat_from_event_slug(event_slug: &str) -> Result<f64> {
         .await?
         .error_for_status()?;
     let body = resp.text().await?;
-    extract_price_to_beat_from_html(&body)
+    extract_price_to_beat_from_html(&body, event_slug)
         .ok_or_else(|| anyhow!("priceToBeat not found in event html {}", event_slug))
 }
 
-fn extract_price_to_beat_from_html(html: &str) -> Option<f64> {
+fn extract_price_to_beat_from_html(html: &str, event_slug: &str) -> Option<f64> {
+    if let Some(price) = extract_price_to_beat_near_slug(html, event_slug) {
+        return Some(price);
+    }
+    extract_price_to_beat_generic(html)
+}
+
+fn extract_price_to_beat_near_slug(html: &str, slug: &str) -> Option<f64> {
+    let mut from = 0usize;
+    while let Some(off) = html[from..].find(slug) {
+        let idx = from + off;
+        let end = (idx + 6_000).min(html.len());
+        if let Some(v) = extract_price_to_beat_generic(&html[idx..end]) {
+            return Some(v);
+        }
+        from = idx.saturating_add(slug.len());
+        if from >= html.len() {
+            break;
+        }
+    }
+    None
+}
+
+fn extract_price_to_beat_generic(html: &str) -> Option<f64> {
     for marker in ["\"priceToBeat\":", "\\\"priceToBeat\\\":"] {
         let Some(pos) = html.find(marker) else {
             continue;
@@ -1317,6 +1404,7 @@ async fn run_api(args: ApiArgs) -> Result<()> {
         .route("/api/live/snapshot", get(api_snapshot))
         .route("/api/live/latest", get(api_latest))
         .route("/api/live/latest_cached", get(api_latest_cached))
+        .route("/api/live/quality", get(api_live_quality))
         .route("/api/live/trades", get(api_trades))
         .route("/api/live/heatmap", get(api_heatmap))
         .route("/api/history/dates", get(api_history_dates))
@@ -1387,11 +1475,7 @@ async fn api_latest(
 ) -> Json<serde_json::Value> {
     let symbol = q.symbol.clone().unwrap_or_else(|| "BTCUSDT".to_string());
     let timeframe = q.timeframe.clone().unwrap_or_else(|| "5m".to_string());
-    let path = latest_symbol_tf_snapshot_file(&st.root, &symbol, &timeframe);
-    let row = path
-        .as_ref()
-        .and_then(|p| read_last_jsonl_rows(p, 1).into_iter().next())
-        .unwrap_or_else(|| serde_json::json!({}));
+    let row = latest_row_from_cache_or_file(&st, &symbol, &timeframe, q.market_id.as_deref()).await;
     Json(serde_json::json!({"ts_ms": now_ms(), "row": row}))
 }
 
@@ -1409,7 +1493,7 @@ async fn api_latest_cached(
             "row": serde_json::Value::Null
         }));
     };
-    let key = if let Some(mid) = market_id {
+    let key = if let Some(mid) = market_id.as_deref() {
         format!(
             "{}:snapshot:latest:{}:{}:{}",
             st.redis_prefix, symbol, timeframe, mid
@@ -1424,12 +1508,146 @@ async fn api_latest_cached(
             serde_json::Value::Null
         }
     };
+    let row = if row.is_null() {
+        latest_row_from_file(&st.root, &symbol, &timeframe, market_id.as_deref())
+            .unwrap_or(serde_json::Value::Null)
+    } else {
+        row
+    };
     Json(serde_json::json!({
         "ts_ms": now_ms(),
         "cache_enabled": true,
         "key": key,
         "row": row
     }))
+}
+
+async fn api_live_quality(
+    State(st): State<ApiState>,
+    Query(q): Query<QualityQuery>,
+) -> Json<serde_json::Value> {
+    let symbol = q.symbol.unwrap_or_else(|| "BTCUSDT".to_string());
+    let timeframe = q.timeframe.unwrap_or_else(|| "5m".to_string());
+    let limit = q.limit.unwrap_or(5_000).clamp(100, 100_000);
+    let Some(path) = latest_symbol_tf_snapshot_file(&st.root, &symbol, &timeframe) else {
+        return Json(serde_json::json!({
+            "ts_ms": now_ms(),
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "path": serde_json::Value::Null,
+            "rows": 0,
+            "message": "snapshot_100ms.jsonl not found"
+        }));
+    };
+    let rows = read_last_jsonl_rows(&path, limit);
+    let total = rows.len();
+    let key_fields = [
+        "market_id",
+        "target_price",
+        "target_source",
+        "binance_price_tokyo",
+        "mid_yes",
+        "mid_no",
+        "delta_price",
+        "delta_pct",
+        "remaining_ms",
+        "chainlink_price",
+    ];
+    let mut null_counts = HashMap::<&str, usize>::new();
+    let mut markets = HashSet::<String>::new();
+    let mut ts = Vec::<i64>::new();
+    for r in &rows {
+        for k in key_fields {
+            if r.get(k).is_none() || r.get(k).is_some_and(|v| v.is_null()) {
+                *null_counts.entry(k).or_insert(0) += 1;
+            }
+        }
+        if let Some(mid) = r.get("market_id").and_then(|v| v.as_str()) {
+            markets.insert(mid.to_string());
+        }
+        if let Some(t) = r.get("ts_ms_utc").and_then(|v| v.as_i64()) {
+            ts.push(t);
+        }
+    }
+    ts.sort_unstable();
+    let sample_rate_hz = if ts.len() > 1 {
+        let span_s =
+            (ts.last().copied().unwrap_or(0) - ts.first().copied().unwrap_or(0)) as f64 / 1000.0;
+        if span_s > 0.0 {
+            Some(ts.len() as f64 / span_s)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let mut null_rate = serde_json::Map::new();
+    for k in key_fields {
+        let c = null_counts.get(k).copied().unwrap_or(0);
+        let rate = if total > 0 {
+            c as f64 / total as f64
+        } else {
+            0.0
+        };
+        null_rate.insert(k.to_string(), serde_json::json!({"count": c, "rate": rate}));
+    }
+    Json(serde_json::json!({
+        "ts_ms": now_ms(),
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "path": path,
+        "rows": total,
+        "market_count": markets.len(),
+        "sample_rate_hz": sample_rate_hz,
+        "null_rate": null_rate
+    }))
+}
+
+async fn latest_row_from_cache_or_file(
+    st: &ApiState,
+    symbol: &str,
+    timeframe: &str,
+    market_id: Option<&str>,
+) -> serde_json::Value {
+    if let Some(redis_url) = st.redis_url.as_deref() {
+        let key = if let Some(mid) = market_id {
+            format!(
+                "{}:snapshot:latest:{}:{}:{}",
+                st.redis_prefix, symbol, timeframe, mid
+            )
+        } else {
+            format!("{}:snapshot:latest:{}:{}", st.redis_prefix, symbol, timeframe)
+        };
+        if let Ok(row) = read_cached_row(redis_url, &key).await {
+            if !row.is_null() {
+                return row;
+            }
+        }
+    }
+    latest_row_from_file(&st.root, symbol, timeframe, market_id).unwrap_or_else(|| serde_json::json!({}))
+}
+
+fn latest_row_from_file(root: &Path, symbol: &str, timeframe: &str, market_id: Option<&str>) -> Option<serde_json::Value> {
+    if let Some(mid) = market_id {
+        for date in list_date_dirs(&root.join("normalized")) {
+            let p = history_snapshot_path(root, &date, symbol, timeframe, Some(mid));
+            if p.exists() {
+                if let Some(v) = read_last_jsonl_rows(&p, 1).into_iter().next() {
+                    return Some(v);
+                }
+            }
+        }
+        return None;
+    }
+    for date in list_date_dirs(&root.join("normalized")) {
+        let p = history_snapshot_path(root, &date, symbol, timeframe, None);
+        if p.exists() {
+            if let Some(v) = read_last_jsonl_rows(&p, 1).into_iter().next() {
+                return Some(v);
+            }
+        }
+    }
+    None
 }
 
 async fn api_trades(State(st): State<ApiState>) -> Json<serde_json::Value> {
