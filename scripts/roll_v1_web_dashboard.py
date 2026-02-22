@@ -25,6 +25,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--suggest-slope-up-bps", type=float, default=35.0)
     p.add_argument("--suggest-slope-down-bps", type=float, default=-35.0)
     p.add_argument("--suggest-lookback-sec", type=int, default=5)
+    p.add_argument(
+        "--min-span-sec",
+        type=float,
+        default=30.0,
+        help="drop markets whose tape span is shorter than this window",
+    )
     return p.parse_args()
 
 
@@ -227,10 +233,14 @@ def build_dataset(
     lookback_sec: int,
     slope_up_bps: float,
     slope_down_bps: float,
+    min_span_sec: float,
 ) -> dict:
     markets = []
     for market_id, rows in price_by_market.items():
         if not rows:
+            continue
+        span_sec = (rows[-1]["ts_ms"] - rows[0]["ts_ms"]) / 1000.0
+        if span_sec < min_span_sec:
             continue
         symbol = rows[0]["symbol"]
         timeframe = rows[0]["timeframe"]
@@ -277,6 +287,7 @@ def build_dataset(
                 "symbol": symbol,
                 "timeframe": timeframe,
                 "title": title,
+                "span_sec": span_sec,
                 "prices": prices,
                 "shots": shots,
                 "fills": fills,
@@ -415,6 +426,7 @@ def main() -> None:
         args.suggest_lookback_sec,
         args.suggest_slope_up_bps,
         args.suggest_slope_down_bps,
+        args.min_span_sec,
     )
 
     if args.out:
