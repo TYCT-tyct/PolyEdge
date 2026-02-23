@@ -372,10 +372,47 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
     let discover_tfs = timeframes.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(args.discovery_refresh_sec.max(1)));
+        let mut ptb_cache = HashMap::<String, f64>::new();
+        let mut ptb_retry_after = HashMap::<String, i64>::new();
         loop {
             tick.tick().await;
             match discover_once(&discover_symbols, &discover_tfs).await {
-                Ok(meta_rows) => {
+                Ok(mut meta_rows) => {
+                    let now = now_ms();
+                    for meta in &mut meta_rows {
+                        if meta.target_source.as_deref() == Some("pm_event_price_to_beat")
+                            && meta.target_price.is_some()
+                        {
+                            continue;
+                        }
+                        let Some(slug) = meta.event_slug.as_deref() else {
+                            continue;
+                        };
+                        if let Some(v) = ptb_cache.get(slug).copied() {
+                            meta.target_price = Some(v);
+                            meta.target_source = Some("pm_event_price_to_beat".to_string());
+                            continue;
+                        }
+                        let next = ptb_retry_after.get(slug).copied().unwrap_or(0);
+                        if now < next {
+                            continue;
+                        }
+                        match fetch_gamma_event_price_to_beat(slug, &meta.market_id).await {
+                            Ok(Some(v)) if v.is_finite() && v > 100.0 => {
+                                ptb_cache.insert(slug.to_string(), v);
+                                meta.target_price = Some(v);
+                                meta.target_source = Some("pm_event_price_to_beat".to_string());
+                            }
+                            Ok(_) => {
+                                ptb_retry_after.insert(slug.to_string(), now + 5_000);
+                            }
+                            Err(err) => {
+                                tracing::debug!(?err, event_slug = %slug, "gamma priceToBeat fetch failed");
+                                ptb_retry_after.insert(slug.to_string(), now + 5_000);
+                            }
+                        }
+                    }
+
                     let mut w = discover_state.write().await;
                     w.meta = meta_rows
                         .into_iter()
@@ -1114,6 +1151,64 @@ async fn discover_once(symbols: &[String], timeframes: &[String]) -> Result<Vec<
     Ok(markets.into_iter().map(map_market_meta).collect())
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GammaMarketLite {
+    #[serde(default)]
+    events: Option<Vec<GammaEventLite>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GammaEventLite {
+    #[serde(default)]
+    event_metadata: Option<GammaEventMetadataLite>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GammaEventMetadataLite {
+    #[serde(default)]
+    price_to_beat: Option<f64>,
+}
+
+async fn fetch_gamma_event_price_to_beat(event_slug: &str, market_id: &str) -> Result<Option<f64>> {
+    let client = reqwest::Client::new();
+
+    let by_slug = client
+        .get("https://gamma-api.polymarket.com/markets")
+        .query(&[("slug", event_slug)])
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<GammaMarketLite>>()
+        .await?;
+    if let Some(v) = by_slug
+        .into_iter()
+        .flat_map(|m| m.events.unwrap_or_default())
+        .filter_map(|e| e.event_metadata.and_then(|x| x.price_to_beat))
+        .next()
+    {
+        return Ok(Some(v));
+    }
+
+    let by_id = client
+        .get("https://gamma-api.polymarket.com/markets")
+        .query(&[("id", market_id)])
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<GammaMarketLite>>()
+        .await?;
+    Ok(by_id
+        .into_iter()
+        .flat_map(|m| m.events.unwrap_or_default())
+        .filter_map(|e| e.event_metadata.and_then(|x| x.price_to_beat))
+        .next())
+}
+
 fn map_market_meta(m: MarketDescriptor) -> MarketMeta {
     let target = m.price_to_beat.or_else(|| extract_price_from_title(&m.question));
     let target_source = if m.price_to_beat.is_some() {
@@ -1255,6 +1350,19 @@ fn resolve_target_anchor(
     now_ms: i64,
 ) -> Option<TargetAnchor> {
     let start = meta.start_ts_utc_ms?;
+    if meta.target_source.as_deref() == Some("pm_event_price_to_beat") {
+        if let Some(tp) = meta.target_price {
+            let fixed = TargetAnchor {
+                price: tp,
+                source: "pm_event_price_to_beat".to_string(),
+            };
+            state
+                .target_anchor
+                .insert(meta.market_id.clone(), fixed.clone());
+            return Some(fixed);
+        }
+    }
+
     let existing = state.target_anchor.get(&meta.market_id).cloned();
     if let Some(existing) = existing {
         if existing.source == "pm_event_price_to_beat" {
@@ -1285,19 +1393,6 @@ fn resolve_target_anchor(
             }
         }
         return Some(existing);
-    }
-
-    if meta.target_source.as_deref() == Some("pm_event_price_to_beat") {
-        if let Some(tp) = meta.target_price {
-            let fixed = TargetAnchor {
-                price: tp,
-                source: "pm_event_price_to_beat".to_string(),
-            };
-            state
-                .target_anchor
-                .insert(meta.market_id.clone(), fixed.clone());
-            return Some(fixed);
-        }
     }
 
     // Prefer observed open-anchor from ticks. This follows the official settlement rule
