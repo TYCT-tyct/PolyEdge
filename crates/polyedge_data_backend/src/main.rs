@@ -1241,13 +1241,17 @@ async fn fetch_page_price_to_beat(event_slug: &str) -> Result<Option<f64>> {
 }
 
 fn extract_next_data_script(html: &str) -> Option<&str> {
-    let marker = "<script id=\"__NEXT_DATA__\"";
-    let script_pos = html.find(marker)?;
-    let after_tag = &html[script_pos..];
-    let open_end = after_tag.find('>')?;
-    let rest = &after_tag[open_end + 1..];
-    let end = rest.find("</script>")?;
-    Some(&rest[..end])
+    let id_pos = html.find("id=\"__NEXT_DATA__\"")?;
+    let script_start = html[..id_pos].rfind("<script")?;
+    let after_start = &html[script_start..];
+    let open_rel = after_start.find('>')?;
+    let content_start = script_start + open_rel + 1;
+    let close_rel = html[content_start..].find("</script>")?;
+    let content_end = content_start + close_rel;
+    if content_end <= content_start {
+        return None;
+    }
+    Some(&html[content_start..content_end])
 }
 
 fn find_price_to_beat_by_ticker(v: &serde_json::Value, slug: &str) -> Option<f64> {
