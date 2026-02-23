@@ -40,9 +40,9 @@ function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
 }
 
-function computeGapThresholdMs(points: ChartPoint[]): number {
+function computeGapThresholdMs(points: ChartPoint[], bucketMs: number): number {
   if (points.length < 4) {
-    return 3000;
+    return Math.max(2500, bucketMs * 4);
   }
   const deltas: number[] = [];
   let prev = points[0]?.timestamp_ms ?? 0;
@@ -54,11 +54,11 @@ function computeGapThresholdMs(points: ChartPoint[]): number {
     prev = cur;
   }
   if (deltas.length === 0) {
-    return 3000;
+    return Math.max(2500, bucketMs * 4);
   }
   deltas.sort((a, b) => a - b);
-  const median = deltas[Math.floor(deltas.length / 2)] ?? 100;
-  return Math.max(3000, Math.min(120_000, median * 8));
+  const median = deltas[Math.floor(deltas.length / 2)] ?? bucketMs;
+  return Math.max(2500, Math.min(180_000, Math.max(bucketMs * 4, median * 5)));
 }
 
 function toMidCents(
@@ -68,13 +68,13 @@ function toMidCents(
   const hasBid = bid != null && Number.isFinite(bid);
   const hasAsk = ask != null && Number.isFinite(ask);
   if (hasBid && hasAsk) {
-    return (((bid as number) + (ask as number)) * 0.5) * 100;
+    return clamp((((bid as number) + (ask as number)) * 0.5) * 100, 0, 100);
   }
   if (hasBid) {
-    return (bid as number) * 100;
+    return clamp((bid as number) * 100, 0, 100);
   }
   if (hasAsk) {
-    return (ask as number) * 100;
+    return clamp((ask as number) * 100, 0, 100);
   }
   return null;
 }
@@ -86,79 +86,91 @@ function toProbCents(prob: number | null | undefined): number | null {
   return clamp(prob * 100, 0, 100);
 }
 
-function toPlotData(points: ChartPoint[]): uPlot.AlignedData {
-  const bucketed = bucketizePoints(points);
-  const xs: number[] = [];
-  const delta: Array<number | null> = [];
-  const up: Array<number | null> = [];
-  const down: Array<number | null> = [];
-  const gapThresholdMs = computeGapThresholdMs(bucketed);
-  let prevTs = 0;
-
-  for (const p of bucketed) {
-    if (!Number.isFinite(p.timestamp_ms) || p.timestamp_ms <= 0) {
-      continue;
-    }
-    if (prevTs > 0 && p.timestamp_ms > prevTs + gapThresholdMs) {
-      xs.push((prevTs + 1) / 1000);
-      delta.push(null);
-      up.push(null);
-      down.push(null);
-    }
-
-    xs.push(p.timestamp_ms / 1000);
-    delta.push(p.delta_pct);
-    let upC = toProbCents(p.mid_yes) ?? toMidCents(p.best_bid_up, p.best_ask_up);
-    let downC =
-      toProbCents(p.mid_no) ??
-      (upC != null ? 100 - upC : toMidCents(p.best_bid_down, p.best_ask_down));
-    if (upC != null && downC != null) {
-      const sum = upC + downC;
-      if (sum > 1e-9 && Math.abs(sum - 100) > 8) {
-        const scale = 100 / sum;
-        upC *= scale;
-        downC *= scale;
-      }
-      upC = clamp(upC, 0, 100);
-      downC = clamp(downC, 0, 100);
-    }
-    up.push(upC);
-    down.push(downC);
-    prevTs = p.timestamp_ms;
-  }
-
-  const bucketMs = inferBucketMs(bucketed);
-  const upClean = despikeSeries(up, 18, 8);
-  const downClean = despikeSeries(down, 18, 8);
-  const upStable = stabilizeStepSeries(upClean, 0.6, 16, 0.5);
-  const downStable = stabilizeStepSeries(downClean, 0.6, 16, 0.5);
-  const [upNorm, downNorm] = normalizePairSeries(upStable, downStable);
-
-  return [xs, delta, upNorm, downNorm];
+function toDisplayUpCents(p: ChartPoint): number | null {
+  return toProbCents(p.mid_yes) ?? toMidCents(p.best_bid_up, p.best_ask_up);
 }
 
-function median(values: number[]): number {
-  if (values.length === 0) {
-    return NaN;
+function toDisplayDownCents(p: ChartPoint): number | null {
+  return toProbCents(p.mid_no) ?? toMidCents(p.best_bid_down, p.best_ask_down);
+}
+
+function normalizePairedCents(
+  up: number | null,
+  down: number | null
+): { up: number | null; down: number | null } {
+  if (up == null && down == null) {
+    return { up: null, down: null };
   }
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  if (sorted.length % 2 === 0) {
-    return (sorted[mid - 1]! + sorted[mid]!) * 0.5;
+  if (up == null && down != null) {
+    return { up: clamp(100 - down, 0, 100), down: clamp(down, 0, 100) };
   }
-  return sorted[mid]!;
+  if (down == null && up != null) {
+    return { up: clamp(up, 0, 100), down: clamp(100 - up, 0, 100) };
+  }
+  const safeUp = clamp(up as number, 0, 100);
+  const safeDown = clamp(down as number, 0, 100);
+  const sum = safeUp + safeDown;
+  if (sum < 85 || sum > 115) {
+    if (sum <= 0.0001) {
+      return { up: null, down: null };
+    }
+    const scale = 100 / sum;
+    return {
+      up: clamp(safeUp * scale, 0, 100),
+      down: clamp(safeDown * scale, 0, 100)
+    };
+  }
+  return { up: safeUp, down: safeDown };
+}
+
+function collectCadenceMs(points: ChartPoint[]): number {
+  if (points.length < 3) {
+    return 100;
+  }
+  const deltas: number[] = [];
+  let prev = points[0]?.timestamp_ms ?? 0;
+  for (let i = 1; i < points.length; i += 1) {
+    const cur = points[i]?.timestamp_ms ?? 0;
+    if (cur > prev) {
+      deltas.push(cur - prev);
+    }
+    prev = cur;
+  }
+  if (deltas.length === 0) {
+    return 100;
+  }
+  deltas.sort((a, b) => a - b);
+  return clamp(deltas[Math.floor(deltas.length / 2)] ?? 100, 50, 10_000);
 }
 
 function inferBucketMs(points: ChartPoint[]): number {
-  return 1000;
+  if (points.length < 4) {
+    return 100;
+  }
+  const first = points[0]?.timestamp_ms ?? 0;
+  const last = points[points.length - 1]?.timestamp_ms ?? first;
+  const spanMs = Math.max(1, last - first);
+  const cadenceMs = collectCadenceMs(points);
+
+  let targetPoints = 1000;
+  if (spanMs <= 10 * 60_000) {
+    targetPoints = 800;
+  } else if (spanMs <= 30 * 60_000) {
+    targetPoints = 1000;
+  } else if (spanMs <= 2 * 60 * 60_000) {
+    targetPoints = 1300;
+  } else {
+    targetPoints = 1600;
+  }
+
+  const raw = Math.max(cadenceMs, Math.ceil(spanMs / targetPoints));
+  const buckets = [100, 200, 250, 500, 1000, 2000, 5000, 10_000, 15_000, 30_000, 60_000];
+  const picked = buckets.find((v) => v >= raw) ?? 60_000;
+  return Math.max(cadenceMs, picked);
 }
 
-function bucketizePoints(points: ChartPoint[]): ChartPoint[] {
-  if (points.length < 4) {
-    return points;
-  }
-  const bucketMs = inferBucketMs(points);
-  if (bucketMs <= 100) {
+function bucketizePoints(points: ChartPoint[], bucketMs: number): ChartPoint[] {
+  if (points.length < 4 || bucketMs <= 100) {
     return points;
   }
 
@@ -187,27 +199,78 @@ function bucketizePoints(points: ChartPoint[]): ChartPoint[] {
     const last = arr[arr.length - 1]!;
     const deltas = arr.map((x) => x.delta_pct).filter((v): v is number => v != null && Number.isFinite(v));
     const ups = arr
-      .map((x) => toProbCents(x.mid_yes) ?? toMidCents(x.best_bid_up, x.best_ask_up))
+      .map((x) => toDisplayUpCents(x))
       .filter((v): v is number => v != null && Number.isFinite(v));
     const downs = arr
-      .map((x) => toProbCents(x.mid_no) ?? toMidCents(x.best_bid_down, x.best_ask_down))
+      .map((x) => toDisplayDownCents(x))
       .filter((v): v is number => v != null && Number.isFinite(v));
 
-    const upC = ups.length > 0 ? median(ups) / 100 : (last.mid_yes ?? null);
-    const downC = downs.length > 0 ? median(downs) / 100 : (last.mid_no ?? null);
+    const upRaw = ups.length > 0 ? median(ups) : (toDisplayUpCents(last) ?? null);
+    const downRaw = downs.length > 0 ? median(downs) : (toDisplayDownCents(last) ?? null);
+    const normalized = normalizePairedCents(upRaw, downRaw);
     out.push({
       ...last,
       timestamp_ms: key + bucketMs - 1,
       delta_pct: deltas.length > 0 ? median(deltas) : last.delta_pct,
-      mid_yes: upC,
-      mid_no: downC,
-      best_bid_up: upC,
-      best_ask_up: upC,
-      best_bid_down: downC,
-      best_ask_down: downC
+      mid_yes: normalized.up == null ? null : normalized.up / 100,
+      mid_no: normalized.down == null ? null : normalized.down / 100
     });
   }
   return out;
+}
+
+function toPlotData(points: ChartPoint[]): uPlot.AlignedData {
+  const bucketMs = inferBucketMs(points);
+  const bucketed = bucketizePoints(points, bucketMs);
+  const xs: number[] = [];
+  const delta: Array<number | null> = [];
+  const up: Array<number | null> = [];
+  const down: Array<number | null> = [];
+  const gapThresholdMs = computeGapThresholdMs(bucketed, bucketMs);
+  let prevTs = 0;
+  let prevRoundId = "";
+
+  for (const p of bucketed) {
+    if (!Number.isFinite(p.timestamp_ms) || p.timestamp_ms <= 0) {
+      continue;
+    }
+    if (
+      prevTs > 0 &&
+      (p.timestamp_ms > prevTs + gapThresholdMs ||
+        (prevRoundId.length > 0 && p.round_id.length > 0 && p.round_id !== prevRoundId))
+    ) {
+      xs.push((prevTs + 1) / 1000);
+      delta.push(null);
+      up.push(null);
+      down.push(null);
+    }
+
+    xs.push(p.timestamp_ms / 1000);
+    delta.push(p.delta_pct);
+    const upC = toDisplayUpCents(p);
+    const downC = toDisplayDownCents(p);
+    const normalized = normalizePairedCents(upC, downC);
+    up.push(normalized.up);
+    down.push(normalized.down);
+    prevTs = p.timestamp_ms;
+    prevRoundId = p.round_id;
+  }
+
+  const upStable = cleanProbabilitySeries(up, bucketMs);
+  const downStable = cleanProbabilitySeries(down, bucketMs);
+  return [xs, delta, upStable, downStable];
+}
+
+function median(values: number[]): number {
+  if (values.length === 0) {
+    return NaN;
+  }
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 0) {
+    return (sorted[mid - 1]! + sorted[mid]!) * 0.5;
+  }
+  return sorted[mid]!;
 }
 
 function despikeSeries(
@@ -281,66 +344,13 @@ function smoothProbSeries(
   return out;
 }
 
-function stabilizeStepSeries(
-  values: Array<number | null>,
-  minMove: number,
-  maxJump: number,
-  quantum: number
-): Array<number | null> {
-  const out: Array<number | null> = [];
-  let prev: number | null = null;
-  for (const raw of values) {
-    if (raw == null || !Number.isFinite(raw)) {
-      out.push(null);
-      prev = null;
-      continue;
-    }
-    let cur = clamp(raw, 0, 100);
-    if (prev == null) {
-      cur = Math.round(cur / quantum) * quantum;
-      out.push(cur);
-      prev = cur;
-      continue;
-    }
-    const diff = cur - prev;
-    if (Math.abs(diff) < minMove) {
-      cur = prev;
-    } else {
-      if (diff > maxJump) {
-        cur = prev + maxJump;
-      } else if (diff < -maxJump) {
-        cur = prev - maxJump;
-      }
-      cur = Math.round(cur / quantum) * quantum;
-    }
-    cur = clamp(cur, 0, 100);
-    out.push(cur);
-    prev = cur;
-  }
-  return out;
-}
-
-function normalizePairSeries(
-  up: Array<number | null>,
-  down: Array<number | null>
-): [Array<number | null>, Array<number | null>] {
-  const upOut = up.slice();
-  const downOut = down.slice();
-  for (let i = 0; i < upOut.length; i += 1) {
-    const u = upOut[i];
-    const d = downOut[i];
-    if (u == null || d == null) {
-      continue;
-    }
-    const sum = u + d;
-    if (sum <= 1e-9) {
-      continue;
-    }
-    const scale = 100 / sum;
-    upOut[i] = clamp(u * scale, 0, 100);
-    downOut[i] = clamp(d * scale, 0, 100);
-  }
-  return [upOut, downOut];
+function cleanProbabilitySeries(values: Array<number | null>, bucketMs: number): Array<number | null> {
+  const spikeThreshold = bucketMs <= 500 ? 26 : bucketMs <= 2000 ? 18 : 12;
+  const recoveryThreshold = bucketMs <= 500 ? 8 : bucketMs <= 2000 ? 6 : 4;
+  const alpha = bucketMs <= 500 ? 0.42 : bucketMs <= 2000 ? 0.33 : 0.25;
+  const maxStep = bucketMs <= 500 ? 10 : bucketMs <= 2000 ? 7 : 5;
+  const deSpiked = despikeSeries(values, spikeThreshold, recoveryThreshold);
+  return smoothProbSeries(deSpiked, alpha, maxStep);
 }
 
 function buildMiniPath(points: ChartPoint[], width: number, height: number): string {
@@ -416,7 +426,10 @@ function MarketChartImpl({ points, rounds, height = 420 }: MarketChartProps) {
   const userAdjustedRef = useRef(false);
 
   const data = useMemo(() => toPlotData(points), [points]);
-  const miniPath = useMemo(() => buildMiniPath(points, 1200, 38), [points]);
+  const miniPath = useMemo(() => {
+    const bucketed = bucketizePoints(points, inferBucketMs(points));
+    return buildMiniPath(bucketed, 1200, 38);
+  }, [points]);
   const domain = useMemo(() => computeDomain(points), [points]);
 
   const [brush, setBrush] = useState<BrushState>({ leftPct: 0, widthPct: 100 });
@@ -473,7 +486,6 @@ function MarketChartImpl({ points, rounds, height = 420 }: MarketChartProps) {
       return;
     }
 
-    const steppedPath = uPlot.paths.stepped({ align: 1 });
     const plot = new uPlot(
       {
         width: Math.max(640, root.clientWidth),
@@ -520,7 +532,6 @@ function MarketChartImpl({ points, rounds, height = 420 }: MarketChartProps) {
             scale: "pct",
             stroke: "#efe349",
             width: 1.7,
-            paths: steppedPath,
             points: { show: false }
           },
           {
@@ -528,7 +539,6 @@ function MarketChartImpl({ points, rounds, height = 420 }: MarketChartProps) {
             scale: "prob",
             stroke: "#64be4e",
             width: 1.55,
-            paths: steppedPath,
             points: { show: false }
           },
           {
@@ -536,7 +546,6 @@ function MarketChartImpl({ points, rounds, height = 420 }: MarketChartProps) {
             scale: "prob",
             stroke: "#ff2f57",
             width: 1.55,
-            paths: steppedPath,
             points: { show: false }
           }
         ],

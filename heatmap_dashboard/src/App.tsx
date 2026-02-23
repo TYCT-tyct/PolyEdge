@@ -117,6 +117,24 @@ function formatCent(v: number | null | undefined): string {
   return `${(v * 100).toFixed(1)}¢`;
 }
 
+function midpointProb(
+  bid: number | null | undefined,
+  ask: number | null | undefined
+): number | null {
+  const hasBid = bid != null && Number.isFinite(bid);
+  const hasAsk = ask != null && Number.isFinite(ask);
+  if (hasBid && hasAsk) {
+    return Math.max(0, Math.min(1, ((bid as number) + (ask as number)) * 0.5));
+  }
+  if (hasBid) {
+    return Math.max(0, Math.min(1, bid as number));
+  }
+  if (hasAsk) {
+    return Math.max(0, Math.min(1, ask as number));
+  }
+  return null;
+}
+
 function formatCentFromCents(v: number | null | undefined): string {
   if (v == null || !Number.isFinite(v)) {
     return "--";
@@ -531,6 +549,8 @@ export default function App() {
       const nextPoint: ChartPoint = {
         timestamp_ms: livePoint.timestamp_ms ?? 0,
         delta_pct: livePoint.delta_pct,
+        mid_yes: midpointProb(livePoint.best_bid_up, livePoint.best_ask_up),
+        mid_no: midpointProb(livePoint.best_bid_down, livePoint.best_ask_down),
         best_bid_up: livePoint.best_bid_up,
         best_ask_up: livePoint.best_ask_up,
         best_bid_down: livePoint.best_bid_down,
