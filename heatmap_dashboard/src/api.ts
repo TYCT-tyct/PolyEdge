@@ -263,6 +263,8 @@ export async function getChart(marketType: MarketType, view: WindowType): Promis
       .map((s) => ({
         timestamp_ms: s.ts_ireland_sample_ms,
         delta_pct: s.delta_pct,
+        mid_yes: s.mid_yes,
+        mid_no: s.mid_no,
         best_bid_up: s.bid_yes,
         best_ask_up: s.ask_yes,
         best_bid_down: s.bid_no,
@@ -424,6 +426,8 @@ export async function getRoundChart(
       .map((s) => ({
         timestamp_ms: s.ts_ireland_sample_ms,
         delta_pct: s.delta_pct,
+        mid_yes: s.mid_yes,
+        mid_no: s.mid_no,
         best_bid_up: s.bid_yes,
         best_ask_up: s.ask_yes,
         best_bid_down: s.bid_no,

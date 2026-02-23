@@ -591,12 +591,12 @@ async fn stats(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
         FORMAT JSON";
     let accuracy_query = "SELECT
             count() AS market_accuracy_n,
-            avg(toFloat64((ifNull(s.close_mid_up, 0.5) >= 0.5) = (r.label_up = 1))) AS market_accuracy
+            avg(toFloat64((ifNull(s.eval_mid_up, 0.5) >= 0.5) = (r.label_up = 1))) AS market_accuracy
         FROM polyedge_forge.rounds r
         LEFT JOIN (
             SELECT
                 round_id,
-                argMinIf(mid_yes, remaining_ms, remaining_ms >= 0) AS close_mid_up
+                argMinIf(mid_yes, abs(remaining_ms - if(timeframe='5m', 60000, 180000)), remaining_ms >= 0) AS eval_mid_up
             FROM polyedge_forge.snapshot_100ms
             WHERE symbol='BTCUSDT' AND timeframe IN ('5m','15m')
             GROUP BY round_id
@@ -665,6 +665,8 @@ async fn chart(
         "SELECT
             ts_ireland_sample_ms AS timestamp_ms,
             delta_pct,
+            mid_yes,
+            mid_no,
             bid_yes AS best_bid_up,
             ask_yes AS best_ask_up,
             bid_no AS best_bid_down,
@@ -753,6 +755,8 @@ async fn chart_round(
         "SELECT
             ts_ireland_sample_ms AS timestamp_ms,
             delta_pct,
+            mid_yes,
+            mid_no,
             bid_yes AS best_bid_up,
             ask_yes AS best_ask_up,
             bid_no AS best_bid_down,
@@ -1191,6 +1195,7 @@ async fn accuracy_series(
         .ok_or_else(|| ApiError::bad_request("invalid market_type"))?;
     let window = params.window.unwrap_or(20).clamp(2, 200) as usize;
     let limit = params.limit.unwrap_or(500).clamp(20, 5000);
+    let eval_remaining_ms = market_type_to_ms(market_type) / 5;
 
     let Some(ch_url) = state.ch_url.as_deref() else {
         return Err(ApiError::internal("clickhouse not configured"));
@@ -1203,13 +1208,13 @@ async fn accuracy_series(
                 r.round_id,
                 r.end_ts_ms AS timestamp_ms,
                 toInt8(r.label_up) AS outcome,
-                ifNull(s.close_mid_up, 0.5) AS close_mid_up,
-                toInt8((ifNull(s.close_mid_up, 0.5) >= 0.5) = (r.label_up = 1)) AS correct
+                ifNull(s.eval_mid_up, 0.5) AS eval_mid_up,
+                toInt8((ifNull(s.eval_mid_up, 0.5) >= 0.5) = (r.label_up = 1)) AS correct
             FROM polyedge_forge.rounds r
             LEFT JOIN (
                 SELECT
                     round_id,
-                    argMinIf(mid_yes, remaining_ms, remaining_ms >= 0) AS close_mid_up
+                    argMinIf(mid_yes, abs(remaining_ms - {eval_remaining_ms}), remaining_ms >= 0) AS eval_mid_up
                 FROM polyedge_forge.snapshot_100ms
                 WHERE symbol='BTCUSDT'
                   AND timeframe='{market_type}'

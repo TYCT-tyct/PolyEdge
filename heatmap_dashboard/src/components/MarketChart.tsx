@@ -79,6 +79,13 @@ function toMidCents(
   return null;
 }
 
+function toProbCents(prob: number | null | undefined): number | null {
+  if (prob == null || !Number.isFinite(prob)) {
+    return null;
+  }
+  return clamp(prob * 100, 0, 100);
+}
+
 function toPlotData(points: ChartPoint[]): uPlot.AlignedData {
   const bucketed = bucketizePoints(points);
   const xs: number[] = [];
@@ -101,8 +108,10 @@ function toPlotData(points: ChartPoint[]): uPlot.AlignedData {
 
     xs.push(p.timestamp_ms / 1000);
     delta.push(p.delta_pct);
-    let upC = toMidCents(p.best_bid_up, p.best_ask_up);
-    let downC = toMidCents(p.best_bid_down, p.best_ask_down);
+    let upC = toProbCents(p.mid_yes) ?? toMidCents(p.best_bid_up, p.best_ask_up);
+    let downC =
+      toProbCents(p.mid_no) ??
+      (upC != null ? 100 - upC : toMidCents(p.best_bid_down, p.best_ask_down));
     if (upC != null && downC != null) {
       const sum = upC + downC;
       if (sum > 1e-9 && Math.abs(sum - 100) > 8) {
@@ -119,10 +128,12 @@ function toPlotData(points: ChartPoint[]): uPlot.AlignedData {
   }
 
   const bucketMs = inferBucketMs(bucketed);
-  const alpha = 0.34;
-  const maxStep = 8;
-  const upSmoothed = smoothProbSeries(up, alpha, maxStep);
-  const downSmoothed = smoothProbSeries(down, alpha, maxStep);
+  const upClean = despikeSeries(up, 18, 8);
+  const downClean = despikeSeries(down, 18, 8);
+  const alpha = 0.24;
+  const maxStep = 6;
+  const upSmoothed = smoothProbSeries(upClean, alpha, maxStep);
+  const downSmoothed = smoothProbSeries(downClean, alpha, maxStep);
   const [upNorm, downNorm] = normalizePairSeries(upSmoothed, downSmoothed);
 
   return [xs, delta, upNorm, downNorm];
@@ -195,6 +206,32 @@ function bucketizePoints(points: ChartPoint[]): ChartPoint[] {
       best_bid_down: downC,
       best_ask_down: downC
     });
+  }
+  return out;
+}
+
+function despikeSeries(
+  values: Array<number | null>,
+  spikeThreshold: number,
+  recoveryThreshold: number
+): Array<number | null> {
+  if (values.length < 3) {
+    return values.slice();
+  }
+  const out = values.slice();
+  for (let i = 1; i < values.length - 1; i += 1) {
+    const prev = out[i - 1];
+    const cur = out[i];
+    const next = values[i + 1];
+    if (prev == null || cur == null || next == null) {
+      continue;
+    }
+    const jumpPrev = Math.abs(cur - prev);
+    const jumpNext = Math.abs(cur - next);
+    const recover = Math.abs(next - prev);
+    if (jumpPrev >= spikeThreshold && jumpNext >= spikeThreshold && recover <= recoveryThreshold) {
+      out[i] = (prev + next) * 0.5;
+    }
   }
   return out;
 }
