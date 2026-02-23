@@ -1241,9 +1241,11 @@ async fn fetch_page_price_to_beat(event_slug: &str) -> Result<Option<f64>> {
 }
 
 fn extract_next_data_script(html: &str) -> Option<&str> {
-    let marker = "<script id=\"__NEXT_DATA__\" type=\"application/json\">";
-    let start = html.find(marker)? + marker.len();
-    let rest = &html[start..];
+    let marker = "<script id=\"__NEXT_DATA__\"";
+    let script_pos = html.find(marker)?;
+    let after_tag = &html[script_pos..];
+    let open_end = after_tag.find('>')?;
+    let rest = &after_tag[open_end + 1..];
     let end = rest.find("</script>")?;
     Some(&rest[..end])
 }
