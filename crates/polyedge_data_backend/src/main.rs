@@ -404,7 +404,21 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
                                 meta.target_source = Some("pm_event_price_to_beat".to_string());
                             }
                             Ok(_) => {
-                                ptb_retry_after.insert(slug.to_string(), now + 5_000);
+                                match fetch_page_price_to_beat(slug).await {
+                                    Ok(Some(v)) if v.is_finite() && v > 100.0 => {
+                                        ptb_cache.insert(slug.to_string(), v);
+                                        meta.target_price = Some(v);
+                                        meta.target_source =
+                                            Some("pm_page_price_to_beat".to_string());
+                                    }
+                                    Ok(_) => {
+                                        ptb_retry_after.insert(slug.to_string(), now + 5_000);
+                                    }
+                                    Err(err) => {
+                                        tracing::debug!(?err, event_slug = %slug, "page priceToBeat fetch failed");
+                                        ptb_retry_after.insert(slug.to_string(), now + 5_000);
+                                    }
+                                }
                             }
                             Err(err) => {
                                 tracing::debug!(?err, event_slug = %slug, "gamma priceToBeat fetch failed");
@@ -1209,6 +1223,62 @@ async fn fetch_gamma_event_price_to_beat(event_slug: &str, market_id: &str) -> R
         .next())
 }
 
+async fn fetch_page_price_to_beat(event_slug: &str) -> Result<Option<f64>> {
+    let url = format!("https://polymarket.com/event/{}", event_slug);
+    let html = reqwest::Client::new()
+        .get(url)
+        .timeout(Duration::from_secs(6))
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    let Some(next_data_raw) = extract_next_data_script(&html) else {
+        return Ok(None);
+    };
+    let v: serde_json::Value = serde_json::from_str(next_data_raw)?;
+    Ok(find_price_to_beat_by_ticker(&v, event_slug))
+}
+
+fn extract_next_data_script(html: &str) -> Option<&str> {
+    let marker = "<script id=\"__NEXT_DATA__\" type=\"application/json\">";
+    let start = html.find(marker)? + marker.len();
+    let rest = &html[start..];
+    let end = rest.find("</script>")?;
+    Some(&rest[..end])
+}
+
+fn find_price_to_beat_by_ticker(v: &serde_json::Value, slug: &str) -> Option<f64> {
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some(ticker) = map.get("ticker").and_then(|x| x.as_str()) {
+                if ticker.eq_ignore_ascii_case(slug) {
+                    if let Some(p) = map
+                        .get("eventMetadata")
+                        .and_then(|x| x.get("priceToBeat"))
+                        .and_then(|x| x.as_f64())
+                        .or_else(|| map.get("priceToBeat").and_then(|x| x.as_f64()))
+                    {
+                        if p.is_finite() && p > 100.0 {
+                            return Some(p);
+                        }
+                    }
+                }
+            }
+            for val in map.values() {
+                if let Some(p) = find_price_to_beat_by_ticker(val, slug) {
+                    return Some(p);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .find_map(|x| find_price_to_beat_by_ticker(x, slug)),
+        _ => None,
+    }
+}
+
 fn map_market_meta(m: MarketDescriptor) -> MarketMeta {
     let target = m.price_to_beat.or_else(|| extract_price_from_title(&m.question));
     let target_source = if m.price_to_beat.is_some() {
@@ -1350,11 +1420,17 @@ fn resolve_target_anchor(
     now_ms: i64,
 ) -> Option<TargetAnchor> {
     let start = meta.start_ts_utc_ms?;
-    if meta.target_source.as_deref() == Some("pm_event_price_to_beat") {
+    if matches!(
+        meta.target_source.as_deref(),
+        Some("pm_event_price_to_beat") | Some("pm_page_price_to_beat")
+    ) {
         if let Some(tp) = meta.target_price {
             let fixed = TargetAnchor {
                 price: tp,
-                source: "pm_event_price_to_beat".to_string(),
+                source: meta
+                    .target_source
+                    .clone()
+                    .unwrap_or_else(|| "pm_page_price_to_beat".to_string()),
             };
             state
                 .target_anchor
