@@ -1,6 +1,7 @@
 import type {
   AccuracySeriesResponse,
   AvailableRoundsResponse,
+  ChartPoint,
   ChartResponse,
   HeatmapResponse,
   MarketType,
@@ -159,6 +160,99 @@ function downsampleRows<T>(rows: T[], max: number): { rows: T[]; step: number } 
   return { rows: out, step };
 }
 
+function finiteOrNull(v: number | null | undefined): number | null {
+  return v != null && Number.isFinite(v) ? v : null;
+}
+
+function midpointProb(
+  bid: number | null | undefined,
+  ask: number | null | undefined
+): number | null {
+  const b = finiteOrNull(bid);
+  const a = finiteOrNull(ask);
+  if (b != null && a != null) {
+    return Math.max(0, Math.min(1, (b + a) * 0.5));
+  }
+  if (b != null) {
+    return Math.max(0, Math.min(1, b));
+  }
+  if (a != null) {
+    return Math.max(0, Math.min(1, a));
+  }
+  return null;
+}
+
+function computeDeltaPct(
+  deltaPct: number | null | undefined,
+  btc: number | null | undefined,
+  target: number | null | undefined
+): number | null {
+  const d = finiteOrNull(deltaPct);
+  if (d != null) {
+    return d;
+  }
+  const px = finiteOrNull(btc);
+  const tp = finiteOrNull(target);
+  if (px == null || tp == null || tp <= 0) {
+    return null;
+  }
+  return ((px - tp) / tp) * 100;
+}
+
+function normalizeChartPoint(p: ChartPoint): ChartPoint {
+  const bestBidUp = finiteOrNull(p.best_bid_up);
+  const bestAskUp = finiteOrNull(p.best_ask_up);
+  const bestBidDown = finiteOrNull(p.best_bid_down);
+  const bestAskDown = finiteOrNull(p.best_ask_down);
+  return {
+    ...p,
+    timestamp_ms: Number.isFinite(p.timestamp_ms) ? p.timestamp_ms : 0,
+    delta_pct: computeDeltaPct(p.delta_pct, p.btc_price, p.target_price),
+    mid_yes: finiteOrNull(p.mid_yes) ?? midpointProb(bestBidUp, bestAskUp),
+    mid_no: finiteOrNull(p.mid_no) ?? midpointProb(bestBidDown, bestAskDown),
+    best_bid_up: bestBidUp,
+    best_ask_up: bestAskUp,
+    best_bid_down: bestBidDown,
+    best_ask_down: bestAskDown,
+    time_remaining_s: finiteOrNull(p.time_remaining_s),
+    btc_price: finiteOrNull(p.btc_price),
+    target_price: finiteOrNull(p.target_price)
+  };
+}
+
+function normalizeChartResponse(data: ChartResponse): ChartResponse {
+  const sorted = [...data.points]
+    .map((p) => normalizeChartPoint(p))
+    .filter((p) => p.timestamp_ms > 0)
+    .sort((a, b) => a.timestamp_ms - b.timestamp_ms);
+  const deduped: ChartPoint[] = [];
+  for (const p of sorted) {
+    const prev = deduped[deduped.length - 1];
+    if (prev && prev.timestamp_ms === p.timestamp_ms) {
+      deduped[deduped.length - 1] = p;
+    } else {
+      deduped.push(p);
+    }
+  }
+  return {
+    ...data,
+    points: deduped
+  };
+}
+
+function normalizeRoundChartResponse(data: RoundChartResponse): RoundChartResponse {
+  return {
+    ...data,
+    points: normalizeChartResponse({
+      points: data.points,
+      rounds: [],
+      total_samples: data.total_samples,
+      downsampled: false,
+      step: data.step
+    }).points
+  };
+}
+
 async function getHistoryRaw(marketType: MarketType, lookbackMinutes: number, limit: number): Promise<HistoryRaw> {
   const qs = new URLSearchParams({
     lookback_minutes: String(lookbackMinutes),
@@ -244,7 +338,7 @@ export async function getChart(marketType: MarketType, view: WindowType): Promis
     try {
       const data = await requestJson<ChartResponse>(`/api/chart?${qs.toString()}`);
       apiSupport.chart = true;
-      return data;
+      return normalizeChartResponse(data);
     } catch (err) {
       if (!(err instanceof HttpError) || err.status !== 404) {
         throw err;
@@ -260,20 +354,22 @@ export async function getChart(marketType: MarketType, view: WindowType): Promis
     const nowMs = Date.now();
     const cutoffMs = minutes > 0 ? nowMs - minutes * 60_000 : 0;
     const points = history.samples
-      .map((s) => ({
-        timestamp_ms: s.ts_ireland_sample_ms,
-        delta_pct: s.delta_pct,
-        mid_yes: s.mid_yes,
-        mid_no: s.mid_no,
-        best_bid_up: s.bid_yes,
-        best_ask_up: s.ask_yes,
-        best_bid_down: s.bid_no,
-        best_ask_down: s.ask_no,
-        round_id: s.round_id,
-        time_remaining_s: s.remaining_ms / 1000,
-        btc_price: s.binance_price,
-        target_price: s.target_price
-      }))
+      .map((s) =>
+        normalizeChartPoint({
+          timestamp_ms: s.ts_ireland_sample_ms,
+          delta_pct: s.delta_pct,
+          mid_yes: s.mid_yes,
+          mid_no: s.mid_no,
+          best_bid_up: s.bid_yes,
+          best_ask_up: s.ask_yes,
+          best_bid_down: s.bid_no,
+          best_ask_down: s.ask_no,
+          round_id: s.round_id,
+          time_remaining_s: s.remaining_ms / 1000,
+          btc_price: s.binance_price,
+          target_price: s.target_price
+        })
+      )
       .filter((p) => (minutes > 0 ? p.timestamp_ms >= cutoffMs : true))
       .sort((a, b) => a.timestamp_ms - b.timestamp_ms);
     const sampled = downsampleRows(points, maxPoints);
@@ -338,7 +434,12 @@ export async function getRoundHistory(marketType: MarketType, limit = 200): Prom
           final_btc_price: final,
           outcome: Number(r.label_up),
           delta_pct: target > 0 ? ((final - target) / target) * 100 : null,
-          mkt_price_cents: latest?.mid_yes != null ? latest.mid_yes * 100 : null
+          mkt_price_cents:
+            latest?.mid_yes != null
+              ? latest.mid_yes * 100
+              : midpointProb(latest?.bid_yes ?? null, latest?.ask_yes ?? null) != null
+                ? (midpointProb(latest?.bid_yes ?? null, latest?.ask_yes ?? null) as number) * 100
+                : null
         };
       })
       .sort((a, b) => b.end_time_ms - a.end_time_ms)
@@ -411,7 +512,7 @@ export async function getRoundChart(
     try {
       const data = await requestJson<RoundChartResponse>(`/api/chart/round?${qs.toString()}`);
       apiSupport.roundChart = true;
-      return data;
+      return normalizeRoundChartResponse(data);
     } catch (err) {
       if (!(err instanceof HttpError) || err.status !== 404) {
         throw err;
@@ -423,20 +524,22 @@ export async function getRoundChart(
     const history = await getHistoryRaw(marketType, 12 * 60, 80_000);
     const points = history.samples
       .filter((s) => s.round_id === roundId)
-      .map((s) => ({
-        timestamp_ms: s.ts_ireland_sample_ms,
-        delta_pct: s.delta_pct,
-        mid_yes: s.mid_yes,
-        mid_no: s.mid_no,
-        best_bid_up: s.bid_yes,
-        best_ask_up: s.ask_yes,
-        best_bid_down: s.bid_no,
-        best_ask_down: s.ask_no,
-        round_id: s.round_id,
-        time_remaining_s: s.remaining_ms / 1000,
-        btc_price: s.binance_price,
-        target_price: s.target_price
-      }));
+      .map((s) =>
+        normalizeChartPoint({
+          timestamp_ms: s.ts_ireland_sample_ms,
+          delta_pct: s.delta_pct,
+          mid_yes: s.mid_yes,
+          mid_no: s.mid_no,
+          best_bid_up: s.bid_yes,
+          best_ask_up: s.ask_yes,
+          best_bid_down: s.bid_no,
+          best_ask_down: s.ask_no,
+          round_id: s.round_id,
+          time_remaining_s: s.remaining_ms / 1000,
+          btc_price: s.binance_price,
+          target_price: s.target_price
+        })
+      );
     const round = history.rounds.find((r) => r.round_id === roundId);
     return {
       points,

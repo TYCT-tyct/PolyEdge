@@ -99,9 +99,21 @@ function toDisplayDownCents(p: ChartPoint): number | null {
   return toProbCents(p.mid_no) ?? toMidCents(p.best_bid_down, p.best_ask_down);
 }
 
+function quoteSpreadCents(
+  bid: number | null | undefined,
+  ask: number | null | undefined
+): number | null {
+  if (bid == null || ask == null || !Number.isFinite(bid) || !Number.isFinite(ask)) {
+    return null;
+  }
+  return Math.abs((ask - bid) * 100);
+}
+
 function normalizePairedCents(
   up: number | null,
-  down: number | null
+  down: number | null,
+  spreadUp: number | null = null,
+  spreadDown: number | null = null
 ): { up: number | null; down: number | null } {
   if (up == null && down == null) {
     return { up: null, down: null };
@@ -115,17 +127,56 @@ function normalizePairedCents(
   const safeUp = clamp(up as number, 0, 100);
   const safeDown = clamp(down as number, 0, 100);
   const sum = safeUp + safeDown;
-  if (sum < 85 || sum > 115) {
-    if (sum <= 0.0001) {
-      return { up: null, down: null };
-    }
-    const scale = 100 / sum;
-    return {
-      up: clamp(safeUp * scale, 0, 100),
-      down: clamp(safeDown * scale, 0, 100)
-    };
+  if (sum >= 92 && sum <= 108) {
+    return { up: safeUp, down: safeDown };
   }
-  return { up: safeUp, down: safeDown };
+
+  // For inconsistent two-sided quotes, trust the tighter side and derive the other side.
+  const trustUp = spreadUp != null && Number.isFinite(spreadUp);
+  const trustDown = spreadDown != null && Number.isFinite(spreadDown);
+  const preferUp = (() => {
+    if (trustUp && trustDown) {
+      return (spreadUp as number) <= (spreadDown as number);
+    }
+    if (trustUp) {
+      return true;
+    }
+    if (trustDown) {
+      return false;
+    }
+    return Math.abs(safeUp - 50) >= Math.abs(safeDown - 50);
+  })();
+  if (preferUp) {
+    return { up: safeUp, down: clamp(100 - safeUp, 0, 100) };
+  }
+  return { up: clamp(100 - safeDown, 0, 100), down: safeDown };
+}
+
+function resolvePairFromPoint(p: ChartPoint): { up: number | null; down: number | null } {
+  const rawUp = toDisplayUpCents(p);
+  const rawDown = toDisplayDownCents(p);
+  return normalizePairedCents(
+    rawUp,
+    rawDown,
+    quoteSpreadCents(p.best_bid_up, p.best_ask_up),
+    quoteSpreadCents(p.best_bid_down, p.best_ask_down)
+  );
+}
+
+function resolveDeltaPct(p: ChartPoint): number | null {
+  if (p.delta_pct != null && Number.isFinite(p.delta_pct)) {
+    return p.delta_pct;
+  }
+  if (
+    p.btc_price != null &&
+    p.target_price != null &&
+    Number.isFinite(p.btc_price) &&
+    Number.isFinite(p.target_price) &&
+    p.target_price > 0
+  ) {
+    return ((p.btc_price - p.target_price) / p.target_price) * 100;
+  }
+  return null;
 }
 
 function collectCadenceMs(points: ChartPoint[]): number {
@@ -202,21 +253,21 @@ function bucketizePoints(points: ChartPoint[], bucketMs: number): ChartPoint[] {
       continue;
     }
     const last = arr[arr.length - 1]!;
-    const deltas = arr.map((x) => x.delta_pct).filter((v): v is number => v != null && Number.isFinite(v));
-    const ups = arr
-      .map((x) => toDisplayUpCents(x))
+    const deltas = arr
+      .map((x) => resolveDeltaPct(x))
       .filter((v): v is number => v != null && Number.isFinite(v));
-    const downs = arr
-      .map((x) => toDisplayDownCents(x))
-      .filter((v): v is number => v != null && Number.isFinite(v));
+    const pairs = arr.map((x) => resolvePairFromPoint(x));
+    const ups = pairs.map((x) => x.up).filter((v): v is number => v != null && Number.isFinite(v));
+    const downs = pairs.map((x) => x.down).filter((v): v is number => v != null && Number.isFinite(v));
 
-    const upRaw = ups.length > 0 ? median(ups) : (toDisplayUpCents(last) ?? null);
-    const downRaw = downs.length > 0 ? median(downs) : (toDisplayDownCents(last) ?? null);
+    const lastPair = resolvePairFromPoint(last);
+    const upRaw = ups.length > 0 ? median(ups) : lastPair.up;
+    const downRaw = downs.length > 0 ? median(downs) : lastPair.down;
     const normalized = normalizePairedCents(upRaw, downRaw);
     out.push({
       ...last,
       timestamp_ms: key + bucketMs - 1,
-      delta_pct: deltas.length > 0 ? median(deltas) : last.delta_pct,
+      delta_pct: deltas.length > 0 ? median(deltas) : resolveDeltaPct(last),
       mid_yes: normalized.up == null ? null : normalized.up / 100,
       mid_no: normalized.down == null ? null : normalized.down / 100
     });
@@ -234,37 +285,51 @@ function preparePlot(points: ChartPoint[]): PreparedPlot {
   const gapThresholdMs = computeGapThresholdMs(bucketed, bucketMs);
   let prevTs = 0;
   let prevRoundId = "";
+  let prevDelta: number | null = null;
+  let prevUp: number | null = null;
+  let prevDown: number | null = null;
 
   for (const p of bucketed) {
     if (!Number.isFinite(p.timestamp_ms) || p.timestamp_ms <= 0) {
       continue;
     }
-    if (
-      prevTs > 0 &&
-      (p.timestamp_ms > prevTs + gapThresholdMs ||
-        (prevRoundId.length > 0 && p.round_id.length > 0 && p.round_id !== prevRoundId))
-    ) {
-      xs.push((prevTs + 1) / 1000);
-      delta.push(null);
-      up.push(null);
-      down.push(null);
+    const pair = resolvePairFromPoint(p);
+    const roundChanged = prevRoundId.length > 0 && p.round_id.length > 0 && p.round_id !== prevRoundId;
+    const gapMs = prevTs > 0 ? p.timestamp_ms - prevTs : 0;
+    if (prevTs > 0) {
+      if (roundChanged && gapMs > 1 && gapMs <= 120_000) {
+        const anchorTs = Math.max(prevTs + 1, p.timestamp_ms - 1);
+        if (anchorTs > prevTs) {
+          xs.push(anchorTs / 1000);
+          delta.push(prevDelta);
+          up.push(prevUp);
+          down.push(prevDown);
+        }
+      } else if (gapMs > gapThresholdMs) {
+        xs.push((prevTs + 1) / 1000);
+        delta.push(null);
+        up.push(null);
+        down.push(null);
+      }
     }
 
     xs.push(p.timestamp_ms / 1000);
-    delta.push(p.delta_pct);
-    const upC = toDisplayUpCents(p);
-    const downC = toDisplayDownCents(p);
-    const normalized = normalizePairedCents(upC, downC);
-    up.push(normalized.up);
-    down.push(normalized.down);
+    const deltaValue = resolveDeltaPct(p);
+    delta.push(deltaValue);
+    up.push(pair.up);
+    down.push(pair.down);
     prevTs = p.timestamp_ms;
     prevRoundId = p.round_id;
+    prevDelta = deltaValue;
+    prevUp = pair.up;
+    prevDown = pair.down;
   }
 
+  const deltaStable = smoothDeltaSeries(delta, bucketMs);
   const upStable = cleanProbabilitySeries(up, bucketMs);
   const downStable = cleanProbabilitySeries(down, bucketMs);
   return {
-    data: [xs, delta, upStable, downStable],
+    data: [xs, deltaStable, upStable, downStable],
     bucketed
   };
 }
@@ -361,6 +426,35 @@ function cleanProbabilitySeries(values: Array<number | null>, bucketMs: number):
   return smoothProbSeries(deSpiked, alpha, maxStep);
 }
 
+function smoothDeltaSeries(values: Array<number | null>, bucketMs: number): Array<number | null> {
+  if (values.length < 3) {
+    return values.slice();
+  }
+  const radius = bucketMs <= 500 ? 2 : bucketMs <= 2000 ? 1 : 1;
+  const out = values.slice();
+  for (let i = 0; i < values.length; i += 1) {
+    let weightSum = 0;
+    let valueSum = 0;
+    for (let j = i - radius; j <= i + radius; j += 1) {
+      if (j < 0 || j >= values.length) {
+        continue;
+      }
+      const v = values[j];
+      if (v == null || !Number.isFinite(v)) {
+        continue;
+      }
+      const dist = Math.abs(j - i);
+      const w = dist === 0 ? 1.0 : dist === 1 ? 0.65 : 0.35;
+      valueSum += v * w;
+      weightSum += w;
+    }
+    if (weightSum > 0) {
+      out[i] = valueSum / weightSum;
+    }
+  }
+  return out;
+}
+
 function buildMiniPath(points: ChartPoint[], width: number, height: number): string {
   if (points.length < 2 || width <= 0 || height <= 0) {
     return "";
@@ -390,12 +484,13 @@ function buildMiniPath(points: ChartPoint[], width: number, height: number): str
 
 function formatMiniTs(tsMs: number): string {
   if (!Number.isFinite(tsMs) || tsMs <= 0) {
-    return "--:--";
+    return "--:--:--";
   }
   return new Date(tsMs).toLocaleTimeString("en-US", {
     hour12: false,
     hour: "2-digit",
-    minute: "2-digit"
+    minute: "2-digit",
+    second: "2-digit"
   });
 }
 
@@ -528,7 +623,8 @@ function MarketChartImpl({ points, rounds, height = 420 }: MarketChartProps) {
                 new Date(v * 1000).toLocaleTimeString("en-US", {
                   hour12: false,
                   hour: "2-digit",
-                  minute: "2-digit"
+                  minute: "2-digit",
+                  second: "2-digit"
                 })
               )
           },

@@ -397,7 +397,7 @@ const RoundHistoryPanel = memo(function RoundHistoryPanel({
             </tr>
           </thead>
           <tbody>
-            {rows.slice(0, 80).map((r) => (
+            {rows.slice(0, 20).map((r) => (
               <tr key={r.round_id}>
                 <td>{formatTime(r.end_time_ms)}</td>
                 <td>{formatUsd(r.target_price)}</td>
