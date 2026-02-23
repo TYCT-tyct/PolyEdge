@@ -1115,8 +1115,12 @@ async fn discover_once(symbols: &[String], timeframes: &[String]) -> Result<Vec<
 }
 
 fn map_market_meta(m: MarketDescriptor) -> MarketMeta {
-    let target = extract_price_from_title(&m.question);
-    let target_source = target.as_ref().map(|_| "title_parse".to_string());
+    let target = m.price_to_beat.or_else(|| extract_price_from_title(&m.question));
+    let target_source = if m.price_to_beat.is_some() {
+        Some("pm_event_price_to_beat".to_string())
+    } else {
+        target.as_ref().map(|_| "title_parse".to_string())
+    };
     let timeframe = m.timeframe.unwrap_or_else(|| "unknown".to_string());
     let start_ts_utc_ms = m
         .event_start_time
@@ -1253,6 +1257,9 @@ fn resolve_target_anchor(
     let start = meta.start_ts_utc_ms?;
     let existing = state.target_anchor.get(&meta.market_id).cloned();
     if let Some(existing) = existing {
+        if existing.source == "pm_event_price_to_beat" {
+            return Some(existing);
+        }
         // If the first anchor used Tokyo fallback, upgrade to Chainlink open anchor
         // once the exact open tick becomes available.
         if existing.source == "tokyo_first_seen_after_open" {
@@ -1278,6 +1285,19 @@ fn resolve_target_anchor(
             }
         }
         return Some(existing);
+    }
+
+    if meta.target_source.as_deref() == Some("pm_event_price_to_beat") {
+        if let Some(tp) = meta.target_price {
+            let fixed = TargetAnchor {
+                price: tp,
+                source: "pm_event_price_to_beat".to_string(),
+            };
+            state
+                .target_anchor
+                .insert(meta.market_id.clone(), fixed.clone());
+            return Some(fixed);
+        }
     }
 
     // Prefer observed open-anchor from ticks. This follows the official settlement rule

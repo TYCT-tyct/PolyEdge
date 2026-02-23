@@ -18,6 +18,7 @@ pub struct MarketDescriptor {
     pub market_type: Option<String>, // "updown" / "above_below" / "range"
     pub best_bid: Option<f64>,
     pub best_ask: Option<f64>,
+    pub price_to_beat: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -270,6 +271,12 @@ impl MarketDiscovery {
                         continue;
                     };
 
+                    let price_to_beat = market
+                        .events
+                        .as_ref()
+                        .and_then(|evs| evs.first())
+                        .and_then(|ev| ev.event_metadata.as_ref())
+                        .and_then(|m| m.price_to_beat);
                     out.push(MarketDescriptor {
                         market_id: market.id,
                         question: market.question,
@@ -286,6 +293,7 @@ impl MarketDiscovery {
                         market_type: Some(market_type.to_string()),
                         best_bid: market.best_bid,
                         best_ask: market.best_ask,
+                        price_to_beat,
                     });
                 }
             }
@@ -455,6 +463,22 @@ struct GammaMarket {
     closed: bool,
     #[serde(default)]
     accepting_orders: bool,
+    #[serde(default)]
+    events: Option<Vec<GammaEvent>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GammaEvent {
+    #[serde(default)]
+    event_metadata: Option<GammaEventMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GammaEventMetadata {
+    #[serde(default)]
+    price_to_beat: Option<f64>,
 }
 
 fn parse_token_pair(input: Option<&str>) -> Option<(String, String)> {
@@ -564,6 +588,7 @@ mod tests {
             market_type: Some("updown".to_string()),
             best_bid: None,
             best_ask: None,
+            price_to_beat: None,
         };
 
         let now = chrono::Utc
