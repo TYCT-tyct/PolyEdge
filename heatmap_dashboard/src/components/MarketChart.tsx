@@ -130,11 +130,9 @@ function toPlotData(points: ChartPoint[]): uPlot.AlignedData {
   const bucketMs = inferBucketMs(bucketed);
   const upClean = despikeSeries(up, 18, 8);
   const downClean = despikeSeries(down, 18, 8);
-  const alpha = 0.24;
-  const maxStep = 6;
-  const upSmoothed = smoothProbSeries(upClean, alpha, maxStep);
-  const downSmoothed = smoothProbSeries(downClean, alpha, maxStep);
-  const [upNorm, downNorm] = normalizePairSeries(upSmoothed, downSmoothed);
+  const upStable = stabilizeStepSeries(upClean, 0.6, 16, 0.5);
+  const downStable = stabilizeStepSeries(downClean, 0.6, 16, 0.5);
+  const [upNorm, downNorm] = normalizePairSeries(upStable, downStable);
 
   return [xs, delta, upNorm, downNorm];
 }
@@ -189,18 +187,20 @@ function bucketizePoints(points: ChartPoint[]): ChartPoint[] {
     const last = arr[arr.length - 1]!;
     const deltas = arr.map((x) => x.delta_pct).filter((v): v is number => v != null && Number.isFinite(v));
     const ups = arr
-      .map((x) => toMidCents(x.best_bid_up, x.best_ask_up))
+      .map((x) => toProbCents(x.mid_yes) ?? toMidCents(x.best_bid_up, x.best_ask_up))
       .filter((v): v is number => v != null && Number.isFinite(v));
     const downs = arr
-      .map((x) => toMidCents(x.best_bid_down, x.best_ask_down))
+      .map((x) => toProbCents(x.mid_no) ?? toMidCents(x.best_bid_down, x.best_ask_down))
       .filter((v): v is number => v != null && Number.isFinite(v));
 
-    const upC = ups.length > 0 ? median(ups) / 100 : null;
-    const downC = downs.length > 0 ? median(downs) / 100 : null;
+    const upC = ups.length > 0 ? median(ups) / 100 : (last.mid_yes ?? null);
+    const downC = downs.length > 0 ? median(downs) / 100 : (last.mid_no ?? null);
     out.push({
       ...last,
       timestamp_ms: key + bucketMs - 1,
       delta_pct: deltas.length > 0 ? median(deltas) : last.delta_pct,
+      mid_yes: upC,
+      mid_no: downC,
       best_bid_up: upC,
       best_ask_up: upC,
       best_bid_down: downC,
@@ -277,6 +277,45 @@ function smoothProbSeries(
     next = clamp(next, 0, 100);
     out.push(next);
     prev = next;
+  }
+  return out;
+}
+
+function stabilizeStepSeries(
+  values: Array<number | null>,
+  minMove: number,
+  maxJump: number,
+  quantum: number
+): Array<number | null> {
+  const out: Array<number | null> = [];
+  let prev: number | null = null;
+  for (const raw of values) {
+    if (raw == null || !Number.isFinite(raw)) {
+      out.push(null);
+      prev = null;
+      continue;
+    }
+    let cur = clamp(raw, 0, 100);
+    if (prev == null) {
+      cur = Math.round(cur / quantum) * quantum;
+      out.push(cur);
+      prev = cur;
+      continue;
+    }
+    const diff = cur - prev;
+    if (Math.abs(diff) < minMove) {
+      cur = prev;
+    } else {
+      if (diff > maxJump) {
+        cur = prev + maxJump;
+      } else if (diff < -maxJump) {
+        cur = prev - maxJump;
+      }
+      cur = Math.round(cur / quantum) * quantum;
+    }
+    cur = clamp(cur, 0, 100);
+    out.push(cur);
+    prev = cur;
   }
   return out;
 }
@@ -435,7 +474,6 @@ function MarketChartImpl({ points, rounds, height = 420 }: MarketChartProps) {
     }
 
     const steppedPath = uPlot.paths.stepped({ align: 1 });
-    const linearPath = uPlot.paths.linear();
     const plot = new uPlot(
       {
         width: Math.max(640, root.clientWidth),
@@ -489,16 +527,16 @@ function MarketChartImpl({ points, rounds, height = 420 }: MarketChartProps) {
             label: "看涨价格",
             scale: "prob",
             stroke: "#64be4e",
-            width: 1.35,
-            paths: linearPath,
+            width: 1.55,
+            paths: steppedPath,
             points: { show: false }
           },
           {
             label: "看跌价格",
             scale: "prob",
             stroke: "#ff2f57",
-            width: 1.35,
-            paths: linearPath,
+            width: 1.55,
+            paths: steppedPath,
             points: { show: false }
           }
         ],
