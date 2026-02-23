@@ -168,18 +168,17 @@ function summarizeGaps(points: ChartPoint[]): { count: number; maxGapMs: number 
   if (points.length < 2) {
     return { count: 0, maxGapMs: 0 };
   }
-  const ordered = [...points]
-    .filter((p) => Number.isFinite(p.timestamp_ms))
-    .sort((a, b) => a.timestamp_ms - b.timestamp_ms);
-  if (ordered.length < 2) {
-    return { count: 0, maxGapMs: 0 };
-  }
+  let prev = -1;
   const diffs: number[] = [];
-  for (let i = 1; i < ordered.length; i += 1) {
-    const d = ordered[i]!.timestamp_ms - ordered[i - 1]!.timestamp_ms;
-    if (d > 0) {
-      diffs.push(d);
+  for (const p of points) {
+    const ts = p.timestamp_ms;
+    if (!Number.isFinite(ts) || ts <= 0) {
+      continue;
     }
+    if (prev > 0 && ts > prev) {
+      diffs.push(ts - prev);
+    }
+    prev = ts;
   }
   if (diffs.length === 0) {
     return { count: 0, maxGapMs: 0 };

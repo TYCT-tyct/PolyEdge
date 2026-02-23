@@ -36,6 +36,11 @@ interface DragState {
   endMs: number;
 }
 
+interface PreparedPlot {
+  data: uPlot.AlignedData;
+  bucketed: ChartPoint[];
+}
+
 function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
 }
@@ -219,7 +224,7 @@ function bucketizePoints(points: ChartPoint[], bucketMs: number): ChartPoint[] {
   return out;
 }
 
-function toPlotData(points: ChartPoint[]): uPlot.AlignedData {
+function preparePlot(points: ChartPoint[]): PreparedPlot {
   const bucketMs = inferBucketMs(points);
   const bucketed = bucketizePoints(points, bucketMs);
   const xs: number[] = [];
@@ -258,7 +263,10 @@ function toPlotData(points: ChartPoint[]): uPlot.AlignedData {
 
   const upStable = cleanProbabilitySeries(up, bucketMs);
   const downStable = cleanProbabilitySeries(down, bucketMs);
-  return [xs, delta, upStable, downStable];
+  return {
+    data: [xs, delta, upStable, downStable],
+    bucketed
+  };
 }
 
 function median(values: number[]): number {
@@ -392,16 +400,31 @@ function formatMiniTs(tsMs: number): string {
 }
 
 function computeDomain(points: ChartPoint[]): DomainRange | null {
-  const validTs = points
-    .map((p) => p.timestamp_ms)
-    .filter((ts) => Number.isFinite(ts) && ts > 0)
-    .sort((a, b) => a - b);
-  if (validTs.length < 2) {
+  if (points.length < 2) {
+    return null;
+  }
+  let minMs = Number.POSITIVE_INFINITY;
+  let maxMs = 0;
+  let validCount = 0;
+  for (const p of points) {
+    const ts = p.timestamp_ms;
+    if (!Number.isFinite(ts) || ts <= 0) {
+      continue;
+    }
+    validCount += 1;
+    if (ts < minMs) {
+      minMs = ts;
+    }
+    if (ts > maxMs) {
+      maxMs = ts;
+    }
+  }
+  if (validCount < 2 || !Number.isFinite(minMs) || maxMs <= 0) {
     return null;
   }
   return {
-    minMs: validTs[0]!,
-    maxMs: validTs[validTs.length - 1]!
+    minMs,
+    maxMs
   };
 }
 
@@ -425,11 +448,9 @@ function MarketChartImpl({ points, rounds, height = 420 }: MarketChartProps) {
   const dragRef = useRef<DragState | null>(null);
   const userAdjustedRef = useRef(false);
 
-  const data = useMemo(() => toPlotData(points), [points]);
-  const miniPath = useMemo(() => {
-    const bucketed = bucketizePoints(points, inferBucketMs(points));
-    return buildMiniPath(bucketed, 1200, 38);
-  }, [points]);
+  const prepared = useMemo(() => preparePlot(points), [points]);
+  const data = prepared.data;
+  const miniPath = useMemo(() => buildMiniPath(prepared.bucketed, 1200, 38), [prepared.bucketed]);
   const domain = useMemo(() => computeDomain(points), [points]);
 
   const [brush, setBrush] = useState<BrushState>({ leftPct: 0, widthPct: 100 });
