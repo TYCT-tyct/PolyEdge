@@ -2537,21 +2537,21 @@ fn run_strategy_simulation(
             .filter(|v| *v > 0)
             .unwrap_or(5 * 60 * 1000);
         let round_progress = (1.0 - sample.remaining_ms as f64 / round_ms as f64).clamp(0.0, 1.0);
-        let early_noise = if round_progress < 0.45 {
-            (0.45 - round_progress) / 0.45
+        let early_noise = if round_progress < 0.60 {
+            (0.60 - round_progress) / 0.60
         } else {
             0.0
         };
         let up_bias = if side == StrategySide::Up { 0.065 } else { 0.0 };
-        let signal_extra = early_noise * 0.09 + up_bias;
-        let confidence_extra = early_noise * 0.06 + if side == StrategySide::Up { 0.035 } else { 0.0 };
-        let edge_extra = early_noise * 0.012 + if side == StrategySide::Up { 0.006 } else { 0.0 };
+        let signal_extra = early_noise * 0.14 + up_bias;
+        let confidence_extra = early_noise * 0.11 + if side == StrategySide::Up { 0.035 } else { 0.0 };
+        let edge_extra = early_noise * 0.022 + if side == StrategySide::Up { 0.008 } else { 0.0 };
         let entry_spread_guard = (cfg.max_exec_spread_cents * (0.74 - early_noise * 0.16))
             .clamp(cfg.max_exec_spread_cents * 0.52, cfg.max_exec_spread_cents * 0.82);
         let delta_align = if side == StrategySide::Up {
-            sample.delta_pct >= -0.004
+            sample.delta_pct >= (-0.004 + early_noise * 0.006)
         } else {
-            sample.delta_pct <= 0.006
+            sample.delta_pct <= (0.006 - early_noise * 0.004)
         };
         last_side = side.as_str();
 
@@ -2708,6 +2708,10 @@ fn run_strategy_simulation(
                             cfg.entry_threshold_base,
                             cfg.entry_threshold_cap,
                         );
+                    let early_round_guard = early_noise <= 0.0
+                        || (fair_confidence >= (confidence_floor + early_noise * 0.06).min(0.97)
+                            && signal.edge_prob.abs() >= edge_required + early_noise * 0.010
+                            && score.abs() >= (signal_required + early_noise * 0.08).min(0.99));
                     let anti_chop_override = fair_confidence >= (confidence_floor + 0.08).min(0.95);
                     let round_entries =
                         entries_by_round.get(&sample.round_id).copied().unwrap_or(0);
@@ -2717,6 +2721,7 @@ fn run_strategy_simulation(
                         && signal.edge_prob.abs() >= edge_required
                         && edge_align
                         && delta_align
+                        && early_round_guard
                         && (!is_choppy || anti_chop_override)
                         && entry_price <= cfg.entry_max_price_cents
                         && side_spread(sample, side) * 100.0 <= entry_spread_guard
@@ -2764,6 +2769,10 @@ fn run_strategy_simulation(
                     cfg.entry_threshold_base,
                     cfg.entry_threshold_cap,
                 );
+            let early_round_guard = early_noise <= 0.0
+                || (fair_confidence >= (confidence_floor + early_noise * 0.06).min(0.97)
+                    && signal.edge_prob.abs() >= edge_required + early_noise * 0.010
+                    && score.abs() >= (signal_required + early_noise * 0.08).min(0.99));
             let anti_chop_override = fair_confidence >= (confidence_floor + 0.08).min(0.95);
             let can_enter = signal.confirmed
                 && score.abs() >= signal_required
@@ -2771,6 +2780,7 @@ fn run_strategy_simulation(
                 && edge_align
                 && fair_confidence >= confidence_floor
                 && delta_align
+                && early_round_guard
                 && (!is_choppy || anti_chop_override)
                 && sample.spread_mid <= cfg.spread_limit_prob
                 && entry_spread_cents <= cfg.max_exec_spread_cents
