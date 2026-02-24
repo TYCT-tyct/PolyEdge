@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use crate::api::{run_api_server, ApiConfig};
 use crate::cli::IrelandRecorderArgs;
 use crate::common::{
-    parse_lower_csv, parse_price_from_text, parse_timestamp_ms, parse_upper_csv, timeframe_to_ms,
+    parse_lower_csv, parse_timestamp_ms, parse_upper_csv, timeframe_to_ms,
 };
 use crate::db_sink::{normalize_opt_url, run_db_sink, DbEvent, DbSinkConfig};
 use crate::models::{
@@ -28,6 +28,33 @@ use crate::persist::{log_ingest, persist_event};
 
 const MARKET_FUTURE_GUARD_MS: i64 = 500;
 const MARKET_STALE_GUARD_MS: i64 = 5_000;
+const MOTION_PRICE_TAU_SEC: f64 = 1.2;
+const MOTION_VELOCITY_TAU_SEC: f64 = 1.8;
+const MOTION_MIN_DT_SEC: f64 = 0.02;
+const MOTION_MAX_DT_SEC: f64 = 5.0;
+const MOTION_VELOCITY_ABS_CAP: f64 = 5_000.0;
+const MOTION_ACCEL_ABS_CAP: f64 = 25_000.0;
+const PROB_SMOOTH_TAU_SEC: f64 = 2.8;
+const DELTA_SMOOTH_TAU_SEC: f64 = 2.4;
+const PROB_MAX_STEP_PER_SEC: f64 = 0.10;
+const DELTA_MAX_STEP_PCT_PER_SEC: f64 = 0.18;
+const PROB_STATE_RETENTION_MS: i64 = 2 * 60 * 60 * 1000;
+
+fn ema_alpha_from_tau(dt_s: f64, tau_s: f64) -> f64 {
+    if !dt_s.is_finite() || !tau_s.is_finite() || dt_s <= 0.0 || tau_s <= 0.0 {
+        return 1.0;
+    }
+    // Continuous-time EMA mapped to discrete step: alpha = 1 - exp(-dt/tau).
+    let a = 1.0 - (-dt_s / tau_s).exp();
+    a.clamp(0.0, 1.0)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProbSmoothState {
+    ts_ms: i64,
+    ema_up: f64,
+    ema_delta_pct: Option<f64>,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct RoundQualityPolicy {
@@ -414,9 +441,12 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
     let mut quote_cache_by_market: HashMap<String, (f64, f64, f64, f64)> = HashMap::new();
     let mut markets_by_id: HashMap<String, MarketMeta> = HashMap::new();
     let mut motion_by_key: HashMap<String, MotionState> = HashMap::new();
+    let mut prob_smooth_by_market: HashMap<String, ProbSmoothState> = HashMap::new();
     let mut emitted_rounds: HashSet<String> = HashSet::new();
     let mut round_buffers: HashMap<String, RoundBuffer> = HashMap::new();
     let mut target_cache: HashMap<String, (i64, f64)> = HashMap::new();
+    let mut target_retry_after_ms: HashMap<String, i64> = HashMap::new();
+    let mut target_anchor_by_round: HashMap<String, f64> = HashMap::new();
     let vatic_http = Client::builder()
         .timeout(Duration::from_millis(1500))
         .build()?;
@@ -451,6 +481,9 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
             }
             _ = ticker.tick() => {
                 let now_ms = Utc::now().timestamp_millis();
+                prob_smooth_by_market.retain(|_, v| {
+                    now_ms.saturating_sub(v.ts_ms) <= PROB_STATE_RETENTION_MS
+                });
                 for market in markets_by_id.values() {
                     if now_ms + MARKET_FUTURE_GUARD_MS < market.start_ts_ms {
                         continue;
@@ -490,6 +523,8 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     let tokyo = tokyo_by_symbol.get(&market.symbol);
                     let chainlink = chainlink_by_symbol.get(&market.symbol);
                     let binance_price = tokyo.map(|v| v.binance_price);
+                    let round_start = market.start_ts_ms;
+                    let round_id = format!("{}_{}_{}", market.symbol, market.timeframe, round_start);
                     let mut target_price = market.target_price;
                     if target_price.is_none() {
                         let cache_key =
@@ -499,19 +534,100 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                 target_price = Some(cached_price);
                             }
                         }
-                        if target_price.is_none() {
-                            if let Some(v) = fetch_target_from_vatic(
+                        let retry_after = target_retry_after_ms.get(&cache_key).copied().unwrap_or(0);
+                        if target_price.is_none() && now_ms >= retry_after {
+                            let round_start_sec = aligned_round_timestamp_sec(
+                                market.start_ts_ms,
+                                &market.timeframe,
+                            );
+                            if let Some(v) = fetch_target_from_vatic_market(
                                 &vatic_http,
                                 &market.symbol,
                                 &market.timeframe,
-                                market.start_ts_ms / 1000,
+                                round_start_sec,
                             )
                             .await
                             {
-                                target_cache.insert(cache_key, (now_ms, v));
+                                target_cache.insert(cache_key.clone(), (now_ms, v));
+                                target_retry_after_ms.remove(&cache_key);
                                 target_price = Some(v);
+                                log_ingest(
+                                    &persist_tx,
+                                    "info",
+                                    "target_price",
+                                    &format!(
+                                        "source=vatic_market symbol={} tf={} start_ms={} target={}",
+                                        market.symbol, market.timeframe, market.start_ts_ms, v
+                                    ),
+                                );
+                            } else if let Some(v) = fetch_target_from_vatic_active(
+                                &vatic_http,
+                                &market.symbol,
+                                &market.timeframe,
+                            )
+                            .await
+                            {
+                                target_cache.insert(cache_key.clone(), (now_ms, v));
+                                target_retry_after_ms.remove(&cache_key);
+                                target_price = Some(v);
+                                log_ingest(
+                                    &persist_tx,
+                                    "warn",
+                                    "target_price",
+                                    &format!(
+                                        "source=vatic_active_fallback symbol={} tf={} start_ms={} target={}",
+                                        market.symbol, market.timeframe, market.start_ts_ms, v
+                                    ),
+                                );
+                            } else if let Some(v) = fetch_target_from_vatic(
+                                &vatic_http,
+                                &market.symbol,
+                                &market.timeframe,
+                                round_start_sec,
+                            )
+                            .await
+                            {
+                                target_cache.insert(cache_key.clone(), (now_ms, v));
+                                target_retry_after_ms.remove(&cache_key);
+                                target_price = Some(v);
+                                log_ingest(
+                                    &persist_tx,
+                                    "warn",
+                                    "target_price",
+                                    &format!(
+                                        "source=vatic_timestamp_fallback symbol={} tf={} start_ms={} target={}",
+                                        market.symbol, market.timeframe, market.start_ts_ms, v
+                                    ),
+                                );
+                            } else if let Some(v) =
+                                fetch_target_from_official_binance(&market.symbol, market.start_ts_ms)
+                                    .await
+                            {
+                                target_cache.insert(cache_key.clone(), (now_ms, v));
+                                target_retry_after_ms.remove(&cache_key);
+                                target_price = Some(v);
+                                log_ingest(
+                                    &persist_tx,
+                                    "warn",
+                                    "target_price",
+                                    &format!(
+                                        "source=binance_official_fallback symbol={} tf={} start_ms={} target={}",
+                                        market.symbol, market.timeframe, market.start_ts_ms, v
+                                    ),
+                                );
+                            } else {
+                                target_retry_after_ms.insert(cache_key, now_ms.saturating_add(30_000));
                             }
                         }
+                    }
+                    if target_price.is_none() {
+                        if let Some(anchor) = target_anchor_by_round.get(&round_id).copied() {
+                            target_price = Some(anchor);
+                        }
+                    } else if let Some(target) = target_price
+                        .filter(|v| v.is_finite() && *v > 0.0)
+                    {
+                        target_anchor_by_round.insert(round_id.clone(), target);
                     }
 
                     let delta_price = match (binance_price, target_price) {
@@ -522,6 +638,56 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         (Some(d), Some(target)) if target > 0.0 => Some((d / target) * 100.0),
                         _ => None,
                     };
+                    let raw_mid_yes = (stable_quote.bid_yes + stable_quote.ask_yes) * 0.5;
+                    let raw_mid_no = (stable_quote.bid_no + stable_quote.ask_no) * 0.5;
+                    let raw_sum = (raw_mid_yes + raw_mid_no).max(1e-9);
+                    let raw_mid_yes_norm = (raw_mid_yes / raw_sum).clamp(0.0, 1.0);
+                    let raw_mid_no_norm = (1.0 - raw_mid_yes_norm).clamp(0.0, 1.0);
+                    let (mid_yes_smooth, mid_no_smooth, delta_pct_smooth) = {
+                        if let Some(prev) = prob_smooth_by_market.get(&market.market_id).copied() {
+                            let dt_ms = now_ms.saturating_sub(prev.ts_ms);
+                            let dt_s_raw = (dt_ms as f64 / 1000.0).max(0.0);
+                            let dt_s = dt_s_raw.clamp(MOTION_MIN_DT_SEC, MOTION_MAX_DT_SEC);
+                            let alpha_prob = ema_alpha_from_tau(dt_s, PROB_SMOOTH_TAU_SEC);
+                            let mut ema_up =
+                                prev.ema_up + alpha_prob * (raw_mid_yes_norm - prev.ema_up);
+                            let max_step = PROB_MAX_STEP_PER_SEC * dt_s;
+                            ema_up = ema_up
+                                .clamp(prev.ema_up - max_step, prev.ema_up + max_step)
+                                .clamp(0.0, 1.0);
+                            let ema_delta = match (delta_pct, prev.ema_delta_pct) {
+                                (Some(raw), Some(prev_d)) if raw.is_finite() && prev_d.is_finite() => {
+                                    let alpha_delta = ema_alpha_from_tau(dt_s, DELTA_SMOOTH_TAU_SEC);
+                                    let mut next = prev_d + alpha_delta * (raw - prev_d);
+                                    let max_step = DELTA_MAX_STEP_PCT_PER_SEC * dt_s;
+                                    next = next.clamp(prev_d - max_step, prev_d + max_step);
+                                    Some(next)
+                                }
+                                (Some(raw), _) if raw.is_finite() => Some(raw),
+                                (None, Some(prev_d)) if prev_d.is_finite() => Some(prev_d),
+                                _ => None,
+                            };
+                            prob_smooth_by_market.insert(
+                                market.market_id.clone(),
+                                ProbSmoothState {
+                                    ts_ms: now_ms,
+                                    ema_up,
+                                    ema_delta_pct: ema_delta,
+                                },
+                            );
+                            (ema_up, (1.0 - ema_up).clamp(0.0, 1.0), ema_delta)
+                        } else {
+                            prob_smooth_by_market.insert(
+                                market.market_id.clone(),
+                                ProbSmoothState {
+                                    ts_ms: now_ms,
+                                    ema_up: raw_mid_yes_norm,
+                                    ema_delta_pct: delta_pct,
+                                },
+                            );
+                            (raw_mid_yes_norm, raw_mid_no_norm, delta_pct)
+                        }
+                    };
 
                     let motion_key = format!("{}|{}", market.symbol, market.timeframe);
                     let (velocity, acceleration) = match binance_price {
@@ -529,28 +695,44 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             if let Some(prev) = motion_by_key.get(&motion_key).copied() {
                                 let dt_ms = now_ms.saturating_sub(prev.ts_ms);
                                 if dt_ms > 0 {
-                                    let dt_s = dt_ms as f64 / 1000.0;
-                                    let vel = ((px - prev.price) / prev.price) * 10_000.0 / dt_s;
-                                    let acc = (vel - prev.velocity) / dt_s;
+                                    let dt_s_raw = dt_ms as f64 / 1000.0;
+                                    let dt_s = dt_s_raw.clamp(MOTION_MIN_DT_SEC, MOTION_MAX_DT_SEC);
+                                    let prev_ema_price = prev.ema_price.max(1e-9);
+                                    let alpha_price = ema_alpha_from_tau(dt_s, MOTION_PRICE_TAU_SEC);
+                                    let ema_price = prev_ema_price
+                                        + alpha_price * (px - prev_ema_price);
+                                    let vel_raw =
+                                        ((ema_price - prev_ema_price) / prev_ema_price) * 10_000.0
+                                            / dt_s;
+                                    let vel_raw =
+                                        vel_raw.clamp(-MOTION_VELOCITY_ABS_CAP, MOTION_VELOCITY_ABS_CAP);
+                                    let alpha_vel = ema_alpha_from_tau(dt_s, MOTION_VELOCITY_TAU_SEC);
+                                    let ema_vel = prev.ema_velocity
+                                        + alpha_vel * (vel_raw - prev.ema_velocity);
+                                    let ema_vel =
+                                        ema_vel.clamp(-MOTION_VELOCITY_ABS_CAP, MOTION_VELOCITY_ABS_CAP);
+                                    let acc_raw = (ema_vel - prev.ema_velocity) / dt_s;
+                                    let acc =
+                                        acc_raw.clamp(-MOTION_ACCEL_ABS_CAP, MOTION_ACCEL_ABS_CAP);
                                     motion_by_key.insert(
                                         motion_key,
                                         MotionState {
                                             ts_ms: now_ms,
-                                            price: px,
-                                            velocity: vel,
+                                            ema_price,
+                                            ema_velocity: ema_vel,
                                         },
                                     );
-                                    (Some(vel), Some(acc))
+                                    (Some(ema_vel), Some(acc))
                                 } else {
-                                    (Some(prev.velocity), Some(0.0))
+                                    (Some(prev.ema_velocity), Some(0.0))
                                 }
                             } else {
                                 motion_by_key.insert(
                                     motion_key,
                                     MotionState {
                                         ts_ms: now_ms,
-                                        price: px,
-                                        velocity: 0.0,
+                                        ema_price: px,
+                                        ema_velocity: 0.0,
                                     },
                                 );
                                 (Some(0.0), Some(0.0))
@@ -559,8 +741,6 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         _ => (None, None),
                     };
 
-                    let round_start = market.start_ts_ms;
-                    let round_id = format!("{}_{}_{}", market.symbol, market.timeframe, round_start);
                     if emitted_rounds.contains(&round_id) {
                         continue;
                     }
@@ -585,8 +765,10 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         timeframe: market.timeframe.clone(),
                         title: market.title.clone(),
                         target_price,
-                        mid_yes: (stable_quote.bid_yes + stable_quote.ask_yes) * 0.5,
-                        mid_no: (stable_quote.bid_no + stable_quote.ask_no) * 0.5,
+                        mid_yes: raw_mid_yes,
+                        mid_no: raw_mid_no,
+                        mid_yes_smooth,
+                        mid_no_smooth,
                         bid_yes: stable_quote.bid_yes,
                         ask_yes: stable_quote.ask_yes,
                         bid_no: stable_quote.bid_no,
@@ -600,7 +782,8 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         ts_chainlink_recv_ms: chainlink.map(|v| v.ts_ireland_recv_ms),
                         delta_price,
                         delta_pct,
-                        remaining_ms: market.end_ts_ms.saturating_sub(now_ms),
+                        delta_pct_smooth,
+                        remaining_ms: market.end_ts_ms.saturating_sub(now_ms).max(0),
                         velocity_bps_per_sec: velocity,
                         acceleration,
                         round_id: round_id.clone(),
@@ -619,9 +802,23 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     if remaining_ms <= 0 && !emitted_rounds.contains(&round_id) {
                         emitted_rounds.insert(round_id.clone());
                         if let Some(buffer) = round_buffers.remove(&round_id) {
+                            target_anchor_by_round.remove(&round_id);
                             let report = buffer.evaluate(&quality_policy, sample_period_ms);
                             let target = buffer.target_price_latest.unwrap_or(0.0);
                             let settle = buffer.settle_price_latest.unwrap_or(0.0);
+                            if !(target.is_finite() && target > 0.0 && settle.is_finite() && settle > 0.0)
+                            {
+                                log_ingest(
+                                    &persist_tx,
+                                    "warn",
+                                    "round_quality",
+                                    &format!(
+                                        "skip_invalid_round {} target={} settle={} reason=invalid_target_or_settle",
+                                        round_id, target, settle
+                                    ),
+                                );
+                                continue;
+                            }
                             let round = RoundRow {
                                 round_id: buffer.round_id.clone(),
                                 market_id: buffer.market_id.clone(),
@@ -710,9 +907,23 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                 for rid in stale_round_ids {
                     emitted_rounds.insert(rid.clone());
                     if let Some(buffer) = round_buffers.remove(&rid) {
+                        target_anchor_by_round.remove(&rid);
                         let report = buffer.evaluate(&quality_policy, sample_period_ms);
                         let target = buffer.target_price_latest.unwrap_or(0.0);
                         let settle = buffer.settle_price_latest.unwrap_or(0.0);
+                        if !(target.is_finite() && target > 0.0 && settle.is_finite() && settle > 0.0)
+                        {
+                            log_ingest(
+                                &persist_tx,
+                                "warn",
+                                "round_quality",
+                                &format!(
+                                    "skip_invalid_stale_round {} target={} settle={} reason=invalid_target_or_settle",
+                                    rid, target, settle
+                                ),
+                            );
+                            continue;
+                        }
                         let round = RoundRow {
                             round_id: buffer.round_id.clone(),
                             market_id: buffer.market_id.clone(),
@@ -997,15 +1208,111 @@ async fn discover_markets(symbols: &[String], timeframes: &[String]) -> Result<V
 
 fn to_market_meta(m: MarketDescriptor, tf: String, start_ts_ms: i64, end_ts_ms: i64) -> MarketMeta {
     let symbol = m.symbol.to_ascii_uppercase();
+    let target_price = m.price_to_beat;
     MarketMeta {
         market_id: m.market_id,
         symbol,
         timeframe: tf,
         title: m.question.clone(),
-        target_price: parse_price_from_text(&m.question),
+        target_price,
         end_ts_ms,
         start_ts_ms,
     }
+}
+
+fn vatic_market_type(timeframe: &str) -> Option<&'static str> {
+    match timeframe {
+        "5m" => Some("5min"),
+        "15m" => Some("15min"),
+        "30m" => Some("30min"),
+        "1h" => Some("1hour"),
+        "2h" => Some("2hour"),
+        "4h" => Some("4hour"),
+        _ => None,
+    }
+}
+
+fn parse_target_from_json_value(v: &serde_json::Value) -> Option<f64> {
+    if let Some(v) = v
+        .get("datapoint")
+        .and_then(|x| x.get("price"))
+        .and_then(|x| x.as_f64())
+        .filter(|x| x.is_finite() && *x > 0.0)
+    {
+        return Some(v);
+    }
+    v.get("target_price")
+        .and_then(|x| x.as_f64())
+        .or_else(|| v.get("target").and_then(|x| x.as_f64()))
+        .or_else(|| v.get("price").and_then(|x| x.as_f64()))
+        .filter(|x| x.is_finite() && *x > 0.0)
+}
+
+fn symbol_to_asset(symbol: &str) -> String {
+    symbol
+        .strip_suffix("USDT")
+        .unwrap_or(symbol)
+        .to_ascii_lowercase()
+}
+
+async fn fetch_target_from_vatic_market(
+    http: &Client,
+    symbol: &str,
+    timeframe: &str,
+    market_start_sec: i64,
+) -> Option<f64> {
+    let market_type = vatic_market_type(timeframe)?;
+    let asset = symbol_to_asset(symbol);
+    let url = format!(
+        "https://api.vatic.trading/api/v1/history/market?asset={asset}&type={market_type}&marketStart={market_start_sec}"
+    );
+    let resp = http.get(url).send().await.ok()?;
+    let json: serde_json::Value = resp.json().await.ok()?;
+    parse_target_from_json_value(&json)
+}
+
+async fn fetch_target_from_vatic_active(
+    http: &Client,
+    symbol: &str,
+    timeframe: &str,
+) -> Option<f64> {
+    let market_type = vatic_market_type(timeframe)?;
+    let asset = symbol_to_asset(symbol);
+    let url = format!(
+        "https://api.vatic.trading/api/v1/targets/active?asset={asset}&types={market_type}"
+    );
+    let resp = http.get(url).send().await.ok()?;
+    let json: serde_json::Value = resp.json().await.ok()?;
+
+    if let Some(v) = parse_target_from_json_value(&json) {
+        return Some(v);
+    }
+    if let Some(v) = json.get("data").and_then(parse_target_from_json_value) {
+        return Some(v);
+    }
+    if let Some(v) = json.get("result").and_then(parse_target_from_json_value) {
+        return Some(v);
+    }
+
+    let results = json.get("results").and_then(|v| v.as_array())?;
+    for item in results {
+        let mt = item
+            .get("marketType")
+            .or_else(|| item.get("market_type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if !mt.eq_ignore_ascii_case(market_type) {
+            continue;
+        }
+        let ok = item.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+        if !ok {
+            continue;
+        }
+        if let Some(v) = parse_target_from_json_value(item) {
+            return Some(v);
+        }
+    }
+    None
 }
 
 async fn fetch_target_from_vatic(
@@ -1014,22 +1321,73 @@ async fn fetch_target_from_vatic(
     timeframe: &str,
     timestamp_sec: i64,
 ) -> Option<f64> {
-    let market_type = match timeframe {
-        "5m" => "5min",
-        "15m" => "15min",
-        _ => return None,
-    };
-    let asset = symbol
-        .strip_suffix("USDT")
-        .unwrap_or(symbol)
-        .to_ascii_lowercase();
+    let market_type = vatic_market_type(timeframe)?;
+    let asset = symbol_to_asset(symbol);
     let url = format!(
         "https://api.vatic.trading/api/v1/targets/timestamp?asset={asset}&type={market_type}&timestamp={timestamp_sec}"
     );
     let resp = http.get(url).send().await.ok()?;
     let json: serde_json::Value = resp.json().await.ok()?;
-    json.get("target_price")
-        .and_then(|v| v.as_f64())
-        .or_else(|| json.get("target").and_then(|v| v.as_f64()))
-        .or_else(|| json.get("price").and_then(|v| v.as_f64()))
+    parse_target_from_json_value(&json)
+}
+
+async fn fetch_target_from_official_binance(symbol: &str, market_start_ms: i64) -> Option<f64> {
+    let http = reqwest::Client::new();
+    let start_ms = market_start_ms.max(0);
+    let end_ms = start_ms.saturating_add(5_000);
+    let url = format!(
+        "https://api.binance.com/api/v3/aggTrades?symbol={symbol}&startTime={start_ms}&endTime={end_ms}&limit=1000"
+    );
+    let resp = http.get(url).send().await.ok()?;
+    let trades: serde_json::Value = resp.json().await.ok()?;
+    let mut px_qty = 0.0f64;
+    let mut qty = 0.0f64;
+    if let Some(arr) = trades.as_array() {
+        for row in arr {
+            let p = row
+                .get("p")
+                .and_then(|v| v.as_str())
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0)?;
+            let q = row
+                .get("q")
+                .and_then(|v| v.as_str())
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0)?;
+            px_qty += p * q;
+            qty += q;
+        }
+    }
+    if qty > 0.0 {
+        return Some(px_qty / qty);
+    }
+
+    let kline_url = format!(
+        "https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&startTime={start_ms}&limit=1"
+    );
+    let resp = http.get(kline_url).send().await.ok()?;
+    let klines: serde_json::Value = resp.json().await.ok()?;
+    let first = klines.as_array()?.first()?;
+    let open = first
+        .as_array()?
+        .get(1)?
+        .as_str()?
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v > 0.0)?;
+    Some(open)
+}
+
+fn aligned_round_timestamp_sec(start_ts_ms: i64, timeframe: &str) -> i64 {
+    let raw_sec = start_ts_ms.div_euclid(1_000);
+    let bucket = match timeframe {
+        "5m" => 5 * 60,
+        "15m" => 15 * 60,
+        "30m" => 30 * 60,
+        "1h" => 60 * 60,
+        "2h" => 2 * 60 * 60,
+        "4h" => 4 * 60 * 60,
+        _ => 5 * 60,
+    };
+    raw_sec.div_euclid(bucket) * bucket
 }
