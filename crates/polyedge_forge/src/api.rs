@@ -2146,6 +2146,11 @@ fn run_strategy_simulation(
             let can_exit_now = held_ms >= cfg.min_hold_ms;
             let force_reverse_exit = pos.reverse_streak >= cfg.reverse_signal_ticks
                 && trend_signed <= cfg.reverse_signal_threshold * 1.25;
+            let profit_lock_ready = pos.peak_pnl_cents >= cfg.trail_activate_profit_cents * 0.65;
+            let profit_lock_reversal = profit_lock_ready
+                && drawdown >= (pos.peak_pnl_cents * 0.45).max(cfg.trail_drawdown_cents * 0.8)
+                && trend_signed < 0.0;
+            let flipped_to_net_negative = profit_lock_ready && pnl <= -0.2;
             let fast_loss_guard = pnl <= -(cfg.stop_loss_cents * 0.40).max(1.8)
                 && trend_signed <= cfg.reverse_signal_threshold * 0.85
                 && pos.reverse_streak >= 1;
@@ -2158,6 +2163,10 @@ fn run_strategy_simulation(
                 && bid_cents_exec >= cfg.endgame_take_profit_cents
             {
                 exit_reason = Some("endgame_take_profit");
+            } else if profit_lock_reversal {
+                exit_reason = Some("profit_lock_reversal");
+            } else if flipped_to_net_negative {
+                exit_reason = Some("profit_flip_negative");
             } else if fast_loss_guard {
                 exit_reason = Some("fast_loss_guard");
             } else if can_exit_now && pnl <= -cfg.stop_loss_cents {
@@ -2178,7 +2187,12 @@ fn run_strategy_simulation(
             if let Some(reason) = exit_reason {
                 let emergency = matches!(
                     reason,
-                    "round_rollover" | "stop_loss" | "endgame_take_profit" | "fast_loss_guard"
+                    "round_rollover"
+                        | "stop_loss"
+                        | "endgame_take_profit"
+                        | "fast_loss_guard"
+                        | "profit_flip_negative"
+                        | "profit_lock_reversal"
                 );
                 let can_fill = spread_side_cents <= cfg.max_exec_spread_cents;
                 if !can_fill && !emergency {
