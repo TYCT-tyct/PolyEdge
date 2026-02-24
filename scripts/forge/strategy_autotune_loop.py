@@ -2,6 +2,7 @@
 import argparse
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib import error, parse, request
 
@@ -254,6 +255,55 @@ def extract_best(payload: dict) -> dict:
     }
 
 
+def run_seed_optimize(
+    base_url: str,
+    base_query: dict,
+    seed: int,
+    iterations: int,
+    timeout_sec: int,
+) -> dict:
+    q = dict(base_query)
+    q["seed"] = seed
+    q["iterations"] = iterations
+    payload = fetch_json(build_url(base_url, "/api/strategy/optimize", q), timeout_sec)
+    row = extract_best(payload)
+    row["seed"] = seed
+    return row
+
+
+def run_seed_batch_parallel(
+    base_url: str,
+    base_query: dict,
+    seeds: list[int],
+    iterations: int,
+    timeout_sec: int,
+    workers: int,
+) -> tuple[list[dict], list[dict]]:
+    rows: list[dict] = []
+    errors: list[dict] = []
+    max_workers = max(1, min(workers, len(seeds)))
+    if max_workers <= 1:
+        for seed in seeds:
+            try:
+                rows.append(run_seed_optimize(base_url, base_query, seed, iterations, timeout_sec))
+            except Exception as exc:
+                errors.append({"seed": seed, "error": str(exc)})
+        return rows, errors
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        fut_map = {
+            ex.submit(run_seed_optimize, base_url, base_query, seed, iterations, timeout_sec): seed
+            for seed in seeds
+        }
+        for fut in as_completed(fut_map):
+            seed = fut_map[fut]
+            try:
+                rows.append(fut.result())
+            except Exception as exc:
+                errors.append({"seed": seed, "error": str(exc)})
+    return rows, errors
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Continuous strategy autotune loop for polyedge_forge")
     ap.add_argument("--base-url", default="http://127.0.0.1:9810")
@@ -270,6 +320,8 @@ def main() -> None:
     ap.add_argument("--seed-to", type=int, default=24)
     ap.add_argument("--iterations-sweep", type=int, default=1200)
     ap.add_argument("--iterations-persist", type=int, default=2200)
+    ap.add_argument("--top-k-seeds", type=int, default=6)
+    ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--persist-ttl-sec", type=int, default=86400)
     ap.add_argument("--promote-min-coverage", type=float, default=0.70)
     ap.add_argument("--promote-min-absolute-win", type=float, default=78.0)
@@ -313,34 +365,42 @@ def main() -> None:
             best = None
             rows = []
             optimize_errors = []
+            seeds = list(range(args.seed_from, args.seed_to + 1))
 
-            for seed in range(args.seed_from, args.seed_to + 1):
-                q = dict(base_query)
-                q["seed"] = seed
-                q["iterations"] = args.iterations_sweep
-                try:
-                    payload = fetch_json(
-                        build_url(args.base_url, "/api/strategy/optimize", q), args.timeout_sec
-                    )
-                    row = extract_best(payload)
-                    row["seed"] = seed
-                    rows.append(row)
-                    if best is None or score_row(row) > score_row(best):
-                        best = row
-                except Exception as exc:
-                    optimize_errors.append({"seed": seed, "error": str(exc)})
+            sweep_rows, sweep_errors = run_seed_batch_parallel(
+                base_url=args.base_url,
+                base_query=base_query,
+                seeds=seeds,
+                iterations=args.iterations_sweep,
+                timeout_sec=args.timeout_sec,
+                workers=args.workers,
+            )
+            rows.extend(sweep_rows)
+            optimize_errors.extend(sweep_errors)
+            for row in rows:
+                if best is None or score_row(row) > score_row(best):
+                    best = row
 
             if best is None:
                 raise RuntimeError("all optimize sweeps failed")
 
-            q_deep = dict(base_query)
-            q_deep["seed"] = best["seed"]
-            q_deep["iterations"] = args.iterations_persist
-            deep_payload = fetch_json(
-                build_url(args.base_url, "/api/strategy/optimize", q_deep), args.timeout_sec
+            rows_sorted = sorted(rows, key=score_row, reverse=True)
+            top_k = max(1, min(args.top_k_seeds, len(rows_sorted)))
+            top_seed_rows = rows_sorted[:top_k]
+            deep_seeds = sorted({to_int(r.get("seed")) for r in top_seed_rows if to_int(r.get("seed")) > 0})
+
+            deep_rows, deep_errors = run_seed_batch_parallel(
+                base_url=args.base_url,
+                base_query=base_query,
+                seeds=deep_seeds,
+                iterations=args.iterations_persist,
+                timeout_sec=args.timeout_sec,
+                workers=args.workers,
             )
-            deep_best = extract_best(deep_payload)
-            challenger_config = deep_best.get("config") or {}
+            optimize_errors.extend(deep_errors)
+            if not deep_rows:
+                deep_rows = [best]
+            deep_rows_sorted = sorted(deep_rows, key=score_row, reverse=True)
 
             baseline_eval = evaluate_config(
                 base_url=args.base_url,
@@ -354,18 +414,47 @@ def main() -> None:
                 config=None,
                 label="baseline_autotune",
             )
-            challenger_eval = evaluate_config(
-                base_url=args.base_url,
-                market_type=args.market_type,
-                timeout_sec=args.timeout_sec,
-                target_win_rate=args.target_win_rate,
-                window_trades=args.window_trades,
-                lookback_minutes=args.evaluation_lookback_minutes,
-                max_trades=args.evaluation_max_trades,
-                use_autotune=False,
-                config=challenger_config,
-                label="challenger",
+
+            challenger_candidates = []
+            for idx, cand in enumerate(deep_rows_sorted):
+                cfg = cand.get("config") or {}
+                if not cfg:
+                    continue
+                eval_row = evaluate_config(
+                    base_url=args.base_url,
+                    market_type=args.market_type,
+                    timeout_sec=args.timeout_sec,
+                    target_win_rate=args.target_win_rate,
+                    window_trades=args.window_trades,
+                    lookback_minutes=args.evaluation_lookback_minutes,
+                    max_trades=args.evaluation_max_trades,
+                    use_autotune=False,
+                    config=cfg,
+                    label=f"challenger_{idx+1}",
+                )
+                challenger_candidates.append(
+                    {
+                        "seed": cand.get("seed"),
+                        "opt": cand,
+                        "eval": eval_row,
+                    }
+                )
+            if not challenger_candidates:
+                raise RuntimeError("no challenger candidates after deep search")
+
+            challenger_candidates.sort(
+                key=lambda x: (
+                    to_float((x.get("eval") or {}).get("score")),
+                    to_float((x.get("eval") or {}).get("latest_win")),
+                    to_float((x.get("eval") or {}).get("latest_avg_pnl")),
+                ),
+                reverse=True,
             )
+            chosen = challenger_candidates[0]
+            chosen_seed = to_int(chosen.get("seed"))
+            chosen_opt = chosen.get("opt") or {}
+            challenger_eval = chosen.get("eval") or {}
+            challenger_config = (chosen_opt.get("config") or {})
 
             promote_ok, promote_reasons = should_promote(challenger_eval, baseline_eval, args)
             promote_resp = {"ok": False}
@@ -376,7 +465,10 @@ def main() -> None:
                     "config": challenger_config,
                     "ttl_sec": args.persist_ttl_sec,
                     "source": "autotune_loop_challenger",
-                    "note": f"cycle={cycle}; seed={best['seed']}; objective={to_float(deep_best.get('objective')):.4f}",
+                    "note": (
+                        f"cycle={cycle}; seed={chosen_seed}; "
+                        f"objective={to_float(chosen_opt.get('objective')):.4f}"
+                    ),
                 }
                 promote_resp = post_json(
                     build_url(args.base_url, "/api/strategy/autotune/set"),
@@ -477,9 +569,13 @@ def main() -> None:
                 "finished_ms": finished,
                 "duration_ms": finished - started,
                 "best_seed_sweep": best,
-                "best_deep": deep_best,
+                "top_seed_rows": top_seed_rows,
+                "deep_rows": deep_rows_sorted,
+                "chosen_challenger_seed": chosen_seed,
+                "chosen_challenger_opt": chosen_opt,
                 "baseline_eval": baseline_eval,
                 "challenger_eval": challenger_eval,
+                "challenger_candidates": challenger_candidates,
                 "live_eval": live_eval,
                 "promote": {
                     "ok": promote_ok,
@@ -501,7 +597,7 @@ def main() -> None:
                 f.write(json.dumps(report, ensure_ascii=False) + "\n")
 
             print(
-                f"[cycle={cycle}] best_seed={best['seed']} "
+                f"[cycle={cycle}] best_seed={best['seed']} chosen={chosen_seed} "
                 f"base_win={to_float(baseline_eval.get('latest_win')):.2f} "
                 f"chal_win={to_float(challenger_eval.get('latest_win')):.2f} "
                 f"promoted={promoted} rollback={rollback_done} "
