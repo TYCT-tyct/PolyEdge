@@ -8,28 +8,67 @@ from pathlib import Path
 from urllib import error, parse, request
 
 
-def fetch_json(url: str, timeout_sec: int) -> dict:
-    try:
-        with request.urlopen(url, timeout=timeout_sec) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"GET {url} failed: status={exc.code} body={body}") from exc
+def fetch_json(url: str, timeout_sec: int, retries: int = 2) -> dict:
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            with request.urlopen(url, timeout=timeout_sec) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            # Server-side failures can be transient under load.
+            if exc.code >= 500 and attempt < retries:
+                time.sleep(0.4 * (attempt + 1))
+                last_exc = RuntimeError(
+                    f"GET {url} failed: status={exc.code} body={body}"
+                )
+                continue
+            raise RuntimeError(
+                f"GET {url} failed: status={exc.code} body={body}"
+            ) from exc
+        except Exception as exc:  # network reset / remote close / timeout
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(0.4 * (attempt + 1))
+                continue
+            raise RuntimeError(f"GET {url} failed: {exc}") from exc
+    if last_exc is None:
+        raise RuntimeError(f"GET {url} failed")
+    raise RuntimeError(f"GET {url} failed: {last_exc}") from last_exc
 
 
-def post_json(url: str, payload: dict, timeout_sec: int) -> dict:
-    req = request.Request(
-        url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with request.urlopen(req, timeout=timeout_sec) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"POST {url} failed: status={exc.code} body={body}") from exc
+def post_json(url: str, payload: dict, timeout_sec: int, retries: int = 2) -> dict:
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        req = request.Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=timeout_sec) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            if exc.code >= 500 and attempt < retries:
+                time.sleep(0.4 * (attempt + 1))
+                last_exc = RuntimeError(
+                    f"POST {url} failed: status={exc.code} body={body}"
+                )
+                continue
+            raise RuntimeError(
+                f"POST {url} failed: status={exc.code} body={body}"
+            ) from exc
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(0.4 * (attempt + 1))
+                continue
+            raise RuntimeError(f"POST {url} failed: {exc}") from exc
+    if last_exc is None:
+        raise RuntimeError(f"POST {url} failed")
+    raise RuntimeError(f"POST {url} failed: {last_exc}") from last_exc
 
 
 def build_url(base_url: str, path: str, query: dict | None = None) -> str:
