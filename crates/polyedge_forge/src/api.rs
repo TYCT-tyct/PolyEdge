@@ -1790,20 +1790,6 @@ fn rolling_vol_absdiff(p_hist: &VecDeque<f64>) -> f64 {
     sum / n as f64
 }
 
-fn rolling_median(p_hist: &VecDeque<f64>) -> f64 {
-    if p_hist.is_empty() {
-        return 0.5;
-    }
-    let mut v: Vec<f64> = p_hist.iter().copied().collect();
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let n = v.len();
-    if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        (v[n / 2 - 1] + v[n / 2]) * 0.5
-    }
-}
-
 fn recent_sign_flips(score_hist: &VecDeque<f64>, lookback: usize) -> usize {
     if score_hist.len() < 3 {
         return 0;
@@ -2029,14 +2015,9 @@ struct StrategySimulationResult {
     total_pnl_cents: f64,
     max_drawdown_cents: f64,
     max_profit_trade_cents: f64,
-    worst_loss_cents: f64,
-    loss_count: usize,
     blocked_exits: usize,
     emergency_wide_exit_count: usize,
     execution_penalty_cents_total: f64,
-    stop_loss_exit_count: usize,
-    fast_loss_exit_count: usize,
-    early_adverse_exit_count: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2134,14 +2115,9 @@ fn run_summary_json(run: &StrategySimulationResult) -> Value {
         "total_pnl_cents": run.total_pnl_cents,
         "max_drawdown_cents": run.max_drawdown_cents,
         "max_profit_trade_cents": run.max_profit_trade_cents,
-        "worst_loss_cents": run.worst_loss_cents,
-        "loss_count": run.loss_count,
         "blocked_exits": run.blocked_exits,
         "emergency_wide_exit_count": run.emergency_wide_exit_count,
         "execution_penalty_cents_total": run.execution_penalty_cents_total,
-        "stop_loss_exit_count": run.stop_loss_exit_count,
-        "fast_loss_exit_count": run.fast_loss_exit_count,
-        "early_adverse_exit_count": run.early_adverse_exit_count,
     })
 }
 
@@ -2410,9 +2386,6 @@ fn run_strategy_simulation(
     let mut blocked_exits = 0usize;
     let mut emergency_wide_exit_count = 0usize;
     let mut execution_penalty_cents_total = 0.0_f64;
-    let mut stop_loss_exit_count = 0usize;
-    let mut fast_loss_exit_count = 0usize;
-    let mut early_adverse_exit_count = 0usize;
 
     for sample in samples {
         if !last_round.is_empty() && sample.round_id != last_round {
@@ -2435,15 +2408,6 @@ fn run_strategy_simulation(
             StrategySide::Down
         };
         let local_vol = rolling_vol_absdiff(&p_hist);
-        let p_median = rolling_median(&p_hist);
-        let overextension = if side == StrategySide::Up {
-            (sample.p_up - p_median).max(0.0)
-        } else {
-            (p_median - sample.p_up).max(0.0)
-        };
-        let overextension_limit =
-            (0.085 + local_vol * 2.4 + sample.spread_mid * 1.1).clamp(0.085, 0.24);
-        let is_overextended = overextension >= overextension_limit;
         let choppy_flips = recent_sign_flips(&score_hist, 9);
         let is_choppy = choppy_flips >= 4 && local_vol >= 0.012;
         let delta_align = if side == StrategySide::Up {
@@ -2482,10 +2446,6 @@ fn run_strategy_simulation(
             let fast_loss_guard = pnl <= -(cfg.stop_loss_cents * 0.40).max(1.8)
                 && trend_signed <= cfg.reverse_signal_threshold * 0.85
                 && pos.reverse_streak >= 1;
-            let early_adverse_exit = held_ms <= 7_000
-                && pnl <= -(cfg.stop_loss_cents * 0.72).max(3.2)
-                && trend_signed <= cfg.reverse_signal_threshold * 0.55
-                && pos.peak_pnl_cents <= 1.5;
             let first_reversal_take_profit = can_exit_now
                 && pnl >= (cfg.trail_drawdown_cents * 0.45).max(1.0)
                 && trend_signed <= -0.05
@@ -2509,8 +2469,6 @@ fn run_strategy_simulation(
                 exit_reason = Some("profit_flip_negative");
             } else if fast_loss_guard {
                 exit_reason = Some("fast_loss_guard");
-            } else if early_adverse_exit {
-                exit_reason = Some("early_adverse_exit");
             } else if first_reversal_take_profit {
                 exit_reason = Some("first_reversal_take_profit");
             } else if trend_fade_exit {
@@ -2537,7 +2495,6 @@ fn run_strategy_simulation(
                         | "stop_loss"
                         | "endgame_take_profit"
                         | "fast_loss_guard"
-                        | "early_adverse_exit"
                         | "profit_flip_negative"
                         | "profit_lock_reversal"
                 );
@@ -2553,13 +2510,6 @@ fn run_strategy_simulation(
                     exit_price_cents -= extra_penalty;
                     execution_penalty_cents_total += extra_penalty;
                     emergency_wide_exit_count = emergency_wide_exit_count.saturating_add(1);
-                }
-                if reason == "stop_loss" {
-                    stop_loss_exit_count = stop_loss_exit_count.saturating_add(1);
-                } else if reason == "fast_loss_guard" {
-                    fast_loss_exit_count = fast_loss_exit_count.saturating_add(1);
-                } else if reason == "early_adverse_exit" {
-                    early_adverse_exit_count = early_adverse_exit_count.saturating_add(1);
                 }
                 let net_pnl = exit_price_cents - pos.entry_price_cents;
                 let duration_s = ((sample.ts_ms - pos.entry_ts_ms).max(0) as f64) / 1000.0;
@@ -2613,7 +2563,6 @@ fn run_strategy_simulation(
                             cfg.entry_threshold_cap,
                         );
                     let anti_chop_override = fair_confidence >= (confidence_floor + 0.08).min(0.95);
-                    let strong_override = fair_confidence >= 0.86;
                     let round_entries =
                         entries_by_round.get(&sample.round_id).copied().unwrap_or(0);
                     let can_flip = score.abs() >= signal_required
@@ -2622,7 +2571,6 @@ fn run_strategy_simulation(
                         && signal.edge_prob.abs() >= edge_required
                         && edge_align
                         && delta_align
-                        && (!is_overextended || strong_override)
                         && (!is_choppy || anti_chop_override)
                         && entry_price <= cfg.entry_max_price_cents
                         && entry_potential >= cfg.entry_min_potential_cents
@@ -2668,14 +2616,12 @@ fn run_strategy_simulation(
                     cfg.entry_threshold_cap,
                 );
             let anti_chop_override = fair_confidence >= (confidence_floor + 0.08).min(0.95);
-            let strong_override = fair_confidence >= 0.86;
             let can_enter = signal.confirmed
                 && score.abs() >= signal_required
                 && signal.edge_prob.abs() >= edge_required
                 && edge_align
                 && fair_confidence >= confidence_floor
                 && delta_align
-                && (!is_overextended || strong_override)
                 && (!is_choppy || anti_chop_override)
                 && sample.spread_mid <= cfg.spread_limit_prob
                 && entry_spread_cents <= cfg.max_exec_spread_cents
@@ -2747,8 +2693,6 @@ fn run_strategy_simulation(
 
     let mut total_pnl = 0.0_f64;
     let mut wins = 0usize;
-    let mut loss_count = 0usize;
-    let mut worst_loss_cents = 0.0_f64;
     let mut equity = 0.0_f64;
     let mut peak_equity = 0.0_f64;
     let mut max_drawdown = 0.0_f64;
@@ -2759,11 +2703,6 @@ fn run_strategy_simulation(
         total_pnl += pnl;
         if pnl > 0.0 {
             wins += 1;
-        } else {
-            loss_count = loss_count.saturating_add(1);
-            if pnl < worst_loss_cents {
-                worst_loss_cents = pnl;
-            }
         }
         equity += pnl;
         if equity > peak_equity {
@@ -2859,14 +2798,9 @@ fn run_strategy_simulation(
         } else {
             0.0
         },
-        worst_loss_cents,
-        loss_count,
         blocked_exits,
         emergency_wide_exit_count,
         execution_penalty_cents_total,
-        stop_loss_exit_count,
-        fast_loss_exit_count,
-        early_adverse_exit_count,
     }
 }
 
@@ -3121,6 +3055,22 @@ fn build_strategy_arms(
         ),
         (
             0.82, 0.014, 0.090, 24.0, 75.0, 70_000, 8.0, 7usize, 28.0, 11.0, 98.0, 97.0, 0.05,
+            1usize,
+        ),
+        (
+            0.86, 0.010, 0.095, 18.0, 78.0, 20_000, 6.0, 2usize, 10.0, 3.8, 90.0, 88.0, 0.045,
+            1usize,
+        ),
+        (
+            0.88, 0.009, 0.105, 20.0, 76.0, 24_000, 5.5, 1usize, 9.0, 3.2, 89.0, 87.0, 0.042,
+            1usize,
+        ),
+        (
+            0.90, 0.008, 0.115, 22.0, 74.0, 28_000, 5.0, 1usize, 8.0, 3.0, 88.5, 86.5, 0.040,
+            1usize,
+        ),
+        (
+            0.84, 0.011, 0.085, 16.0, 80.0, 18_000, 6.5, 2usize, 11.0, 4.2, 91.0, 89.0, 0.046,
             1usize,
         ),
     ];
@@ -3478,11 +3428,6 @@ fn score_with_rolling(
     };
     let pf_bonus = ((pf.min(4.0) - 1.0).max(0.0)) * 22.0;
     let pf_penalty = ((1.0 - pf).max(0.0)) * 180.0;
-    let tail_penalty = (-run.worst_loss_cents - 18.0).max(0.0) * 5.0;
-    let crash_penalty = run.fast_loss_exit_count as f64 * 8.0
-        + run.stop_loss_exit_count as f64 * 4.0
-        + run.early_adverse_exit_count as f64 * 2.0
-        + run.loss_count as f64 * 0.8;
     let churn_penalty = if run.avg_duration_s < 6.0 {
         (6.0 - run.avg_duration_s) * 5.0
     } else {
@@ -3498,10 +3443,8 @@ fn score_with_rolling(
             - run.max_drawdown_cents * 0.02
             - run.execution_penalty_cents_total * 0.4
             - run.blocked_exits as f64 * 18.0
-            - shortfall * shortfall * 1.6
+            - shortfall * shortfall * 2.4
             - non_positive_pnl_penalty
-            - tail_penalty
-            - crash_penalty
             + pf_bonus
             - pf_penalty
             - churn_penalty
@@ -3514,8 +3457,6 @@ fn score_with_rolling(
             - run.max_drawdown_cents * 0.03
             - run.execution_penalty_cents_total * 0.6
             - run.blocked_exits as f64 * 25.0
-            - tail_penalty
-            - crash_penalty
             - 320.0
             - trade_shortfall * 35.0
             - pf_penalty
@@ -3627,21 +3568,16 @@ async fn strategy_optimize(
             let fill_risk_penalty = valid_run.blocked_exits as f64 * 18.0
                 + valid_run.execution_penalty_cents_total * 0.9
                 + valid_run.emergency_wide_exit_count as f64 * 3.0;
-            let tail_risk_penalty = (-valid_run.worst_loss_cents - 18.0).max(0.0) * 4.0
-                + valid_run.fast_loss_exit_count as f64 * 7.0
-                + valid_run.stop_loss_exit_count as f64 * 3.0
-                + valid_run.loss_count as f64 * 0.9;
             let train_trade_shortfall = window_trades.saturating_sub(train_run.trade_count) as f64;
             let valid_trade_shortfall = window_trades.saturating_sub(valid_run.trade_count) as f64;
             let coverage_gate_penalty =
                 train_trade_shortfall * 800.0 + valid_trade_shortfall * 900.0;
 
-            let objective = train_obj * 0.15 + valid_obj * 1.08
+            let objective = train_obj * 0.14 + valid_obj * 1.12
                 - consistency_penalty
                 - validation_fail_penalty
                 - train_fail_penalty
                 - fill_risk_penalty
-                - tail_risk_penalty
                 - coverage_gate_penalty;
             let hit = (valid_hit || valid_rs.latest_win_rate_pct >= (target_win_rate - 3.0))
                 && valid_run.avg_pnl_cents > 0.0
