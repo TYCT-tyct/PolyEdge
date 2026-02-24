@@ -758,6 +758,13 @@ export default function App() {
 
   pushLivePointRef.current = (marketType: MarketType, livePoint: LiveSnapshot | null) => {
     if (!livePoint || !livePoint.timestamp_ms) {
+      stableLiveRef.current[marketType] = null;
+      liveUiCommitRef.current[marketType] = {
+        uiTs: performance.now(),
+        roundId: "",
+        remSec: -1
+      };
+      setLive((prev) => ({ ...prev, [marketType]: null }));
       return;
     }
     if (livePoint.timestamp_ms <= lastLiveTsRef.current[marketType]) {
@@ -876,7 +883,13 @@ export default function App() {
       inFlight = true;
       try {
         const rows = await getLatestAllRaw();
-        if (!alive || rows.length === 0) {
+        if (!alive) {
+          inFlight = false;
+          return;
+        }
+        if (rows.length === 0) {
+          pushLivePointRef.current("5m", null);
+          pushLivePointRef.current("15m", null);
           inFlight = false;
           return;
         }

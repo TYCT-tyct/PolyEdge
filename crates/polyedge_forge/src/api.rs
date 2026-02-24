@@ -33,6 +33,9 @@ struct ApiState {
     redis_client: Option<redis::Client>,
 }
 
+const LIVE_SNAPSHOT_MAX_AGE_MS: i64 = 4_000;
+const LIVE_ROUND_END_GRACE_MS: i64 = 1_500;
+
 #[derive(Debug, Deserialize)]
 struct HistoryQueryParams {
     lookback_minutes: Option<u32>,
@@ -275,8 +278,12 @@ async fn fetch_latest_snapshot(
     symbol: &str,
     timeframe: &str,
 ) -> Result<Option<Value>, ApiError> {
+    let now_ms = Utc::now().timestamp_millis();
     if state.redis_client.is_none() {
-        return fetch_latest_snapshot_from_clickhouse(state, symbol, timeframe).await;
+        let row = fetch_latest_snapshot_from_clickhouse(state, symbol, timeframe).await?;
+        return Ok(
+            row.filter(|v| is_live_snapshot_fresh(v, timeframe, now_ms))
+        );
     }
 
     let key_direct = format!(
@@ -286,7 +293,9 @@ async fn fetch_latest_snapshot(
         timeframe
     );
     if let Some(v) = read_key_value(state, &key_direct).await? {
-        return Ok(Some(v));
+        if is_live_snapshot_fresh(&v, timeframe, now_ms) {
+            return Ok(Some(v));
+        }
     }
 
     let tf_key = format!("{}:snapshot:latest:tf:{}", state.redis_prefix, timeframe);
@@ -317,13 +326,18 @@ async fn fetch_latest_snapshot(
             .get("ts_ireland_sample_ms")
             .and_then(Value::as_i64)
             .unwrap_or(i64::MIN);
-        if ts > best_ts {
+        if ts > best_ts && is_live_snapshot_fresh(row, timeframe, now_ms) {
             best_ts = ts;
             best = Some(row.clone());
         }
     }
 
-    Ok(best)
+    if best.is_some() {
+        return Ok(best);
+    }
+
+    let row = fetch_latest_snapshot_from_clickhouse(state, symbol, timeframe).await?;
+    Ok(row.filter(|v| is_live_snapshot_fresh(v, timeframe, now_ms)))
 }
 
 async fn fetch_latest_snapshot_from_clickhouse(
@@ -438,11 +452,43 @@ fn compact_live_snapshot(snapshot: &Value, market_type: &str) -> Value {
 }
 
 async fn latest_all(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
-    read_key_json(
+    let now_ms = Utc::now().timestamp_millis();
+    if let Some(v) = read_key_value(
         &state,
         &format!("{}:snapshot:latest:all", state.redis_prefix),
     )
-    .await
+    .await?
+    {
+        if let Some(arr) = v.as_array() {
+            let filtered = arr
+                .iter()
+                .filter(|row| {
+                    row.get("symbol")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .eq_ignore_ascii_case("BTCUSDT")
+                })
+                .filter_map(|row| {
+                    let tf = row.get("timeframe").and_then(Value::as_str)?;
+                    if is_live_snapshot_fresh(row, tf, now_ms) {
+                        Some(row.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            return Ok(Json(Value::Array(filtered)));
+        }
+    }
+
+    let mut rows = Vec::<Value>::new();
+    if let Some(v) = fetch_latest_snapshot(&state, "BTCUSDT", "5m").await? {
+        rows.push(v);
+    }
+    if let Some(v) = fetch_latest_snapshot(&state, "BTCUSDT", "15m").await? {
+        rows.push(v);
+    }
+    Ok(Json(Value::Array(rows)))
 }
 
 async fn latest_timeframe(
@@ -953,6 +999,41 @@ async fn query_clickhouse_json(ch_url: &str, query: &str) -> Result<Value, ApiEr
 
     serde_json::from_str::<Value>(&body)
         .map_err(|e| ApiError::internal(format!("clickhouse json parse failed: {}", e)))
+}
+
+fn is_live_snapshot_fresh(snapshot: &Value, market_type: &str, now_ms: i64) -> bool {
+    let ts_ms = snapshot
+        .get("ts_ireland_sample_ms")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    if ts_ms <= 0 {
+        return false;
+    }
+    if now_ms.saturating_sub(ts_ms) > LIVE_SNAPSHOT_MAX_AGE_MS {
+        return false;
+    }
+
+    let remaining_ms = snapshot
+        .get("remaining_ms")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    if remaining_ms <= 0 && now_ms.saturating_sub(ts_ms) > LIVE_ROUND_END_GRACE_MS {
+        return false;
+    }
+
+    let round_id = snapshot
+        .get("round_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let start_ms = parse_round_start_ms(round_id).unwrap_or(0);
+    if start_ms > 0 {
+        let end_ms = start_ms.saturating_add(market_type_to_ms(market_type));
+        if now_ms > end_ms.saturating_add(LIVE_ROUND_END_GRACE_MS) {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn is_safe_identifier(v: &str) -> bool {
