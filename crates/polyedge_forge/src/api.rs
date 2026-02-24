@@ -2978,6 +2978,14 @@ fn score_with_rolling(
     let rs = compute_rolling_stats(&run.all_trade_pnls, window_trades);
     let trade_shortfall = window_trades.saturating_sub(run.trade_count) as f64;
     let coverage_ratio = (run.trade_count as f64 / window_trades as f64).clamp(0.0, 1.0);
+    if run.trade_count < window_trades {
+        let objective = -5000.0
+            - trade_shortfall * 60.0
+            - run.max_drawdown_cents * 0.05
+            - run.execution_penalty_cents_total
+            - run.blocked_exits as f64 * 30.0;
+        return (rs, objective, false);
+    }
     let shortfall = (target_win_rate - rs.latest_win_rate_pct).max(0.0);
     let target_hit = rs.windows > 0
         && rs.latest_win_rate_pct >= target_win_rate
