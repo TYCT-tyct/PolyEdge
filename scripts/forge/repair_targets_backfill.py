@@ -101,6 +101,21 @@ def parse_target(v: Dict) -> Optional[float]:
     return None
 
 
+def parse_window_start_sec(v: Dict) -> Optional[int]:
+    ws = v.get("windowStart")
+    if isinstance(ws, (int, float)):
+        return int(ws)
+    market_start = v.get("market_start")
+    if isinstance(market_start, (int, float)):
+        return int(market_start)
+    market = v.get("market")
+    if isinstance(market, dict):
+        ts_start = market.get("timestamp_start")
+        if isinstance(ts_start, (int, float)):
+            return int(ts_start)
+    return None
+
+
 def vatic_get(url: str, timeout: float) -> Optional[Dict]:
     try:
         r = requests.get(url, timeout=timeout)
@@ -230,17 +245,30 @@ def decide_target(
             timeout=vatic_timeout,
         )
         if j:
-            # active may return top-level price or result array.
-            v = parse_target(j)
-            if not v and isinstance(j.get("results"), list):
+            v = None
+            if isinstance(j.get("results"), list):
                 for item in j["results"]:
-                    if str(item.get("marketType", "")).lower() == vt.lower():
-                        v = parse_target(item)
-                        if v:
-                            break
+                    if str(item.get("marketType", "")).lower() != vt.lower():
+                        continue
+                    if parse_window_start_sec(item) != sec:
+                        continue
+                    v = parse_target(item)
+                    if v:
+                        break
             if v:
                 cache[cache_key] = (v, "vatic_active")
                 return cache[cache_key]
+
+        if rr.timeframe in CHAINLINK_BACKED:
+            j = vatic_get(
+                f"https://api.vatic.trading/api/v1/targets/chainlink?asset={asset}&type={vt}&timestamp={sec}",
+                timeout=vatic_timeout,
+            )
+            if j:
+                v = parse_target(j)
+                if v:
+                    cache[cache_key] = (v, "vatic_chainlink")
+                    return cache[cache_key]
 
     off = official_from_snapshot(ch, db, snap_tbl, rr)
     if off:
@@ -411,4 +439,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
