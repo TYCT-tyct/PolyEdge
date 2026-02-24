@@ -2380,6 +2380,7 @@ fn run_strategy_simulation(
         } else {
             StrategySide::Down
         };
+        let local_vol = rolling_vol_absdiff(&p_hist);
         last_side = side.as_str();
 
         if let Some(pos) = position.as_mut() {
@@ -2496,10 +2497,26 @@ fn run_strategy_simulation(
                     let entry_price =
                         entry_price_raw + cfg.slippage_cents_per_side + entry_fee_cents;
                     let entry_potential = (99.0 - entry_price).max(0.0);
+                    let fair_confidence = if side == StrategySide::Up {
+                        signal.p_fair_up
+                    } else {
+                        1.0 - signal.p_fair_up
+                    };
+                    let confidence_floor = (0.56 + local_vol * 2.8 + sample.spread_mid * 2.0)
+                        .clamp(0.56, 0.86);
+                    let edge_required = (cfg.entry_edge_prob * (1.0 + local_vol * 8.0))
+                        .clamp(cfg.entry_edge_prob, cfg.entry_edge_prob * 2.6);
+                    let signal_required =
+                        (entry_thr + local_vol * 1.6 + sample.spread_mid * 0.8).clamp(
+                            cfg.entry_threshold_base,
+                            cfg.entry_threshold_cap,
+                        );
                     let round_entries =
                         entries_by_round.get(&sample.round_id).copied().unwrap_or(0);
-                    let can_flip = score.abs() >= entry_thr
+                    let can_flip = score.abs() >= signal_required
                         && sample.spread_mid <= cfg.spread_limit_prob
+                        && fair_confidence >= confidence_floor
+                        && signal.edge_prob.abs() >= edge_required
                         && entry_price <= cfg.entry_max_price_cents
                         && entry_potential >= cfg.entry_min_potential_cents
                         && round_entries < cfg.max_entries_per_round;
@@ -2524,9 +2541,24 @@ fn run_strategy_simulation(
             let entry_fee_cents = cfg.fee_cents_per_side + dynamic_taker_fee_cents(entry_price_raw);
             let entry_price = entry_price_raw + cfg.slippage_cents_per_side + entry_fee_cents;
             let entry_potential = (99.0 - entry_price).max(0.0);
+            let fair_confidence = if side == StrategySide::Up {
+                signal.p_fair_up
+            } else {
+                1.0 - signal.p_fair_up
+            };
+            let confidence_floor =
+                (0.56 + local_vol * 2.8 + sample.spread_mid * 2.0).clamp(0.56, 0.86);
+            let edge_required = (cfg.entry_edge_prob * (1.0 + local_vol * 8.0))
+                .clamp(cfg.entry_edge_prob, cfg.entry_edge_prob * 2.6);
+            let signal_required =
+                (entry_thr + local_vol * 1.6 + sample.spread_mid * 0.8).clamp(
+                    cfg.entry_threshold_base,
+                    cfg.entry_threshold_cap,
+                );
             let can_enter = signal.confirmed
-                && score.abs() >= entry_thr
-                && signal.edge_prob.abs() >= cfg.entry_edge_prob
+                && score.abs() >= signal_required
+                && signal.edge_prob.abs() >= edge_required
+                && fair_confidence >= confidence_floor
                 && sample.spread_mid <= cfg.spread_limit_prob
                 && entry_spread_cents <= cfg.max_exec_spread_cents
                 && entry_price <= cfg.entry_max_price_cents
