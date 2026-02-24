@@ -135,6 +135,7 @@ struct StrategyOptimizeQueryParams {
     window_trades: Option<u32>,
     target_win_rate: Option<f64>,
     iterations: Option<u32>,
+    seed: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3506,7 +3507,7 @@ async fn strategy_optimize(
 
     let base_cfg = StrategyRuntimeConfig::default();
     let pool: Vec<(String, StrategyRuntimeConfig)> = build_strategy_arms(base_cfg, max_arms);
-    let mut seed = 0xC0DEC0DE1234ABCDu64;
+    let mut seed = params.seed.unwrap_or(0xC0DEC0DE1234ABCDu64);
 
     let mut leaderboard: Vec<Value> = Vec::new();
     let mut best_objective = f64::NEG_INFINITY;
