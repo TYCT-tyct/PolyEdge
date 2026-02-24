@@ -3437,9 +3437,9 @@ async fn strategy_optimize(
     } else {
         samples.as_slice()
     };
-    let valid_window_trades = window_trades.min(40).max(20);
+    let valid_window_trades = window_trades;
     let valid_target_win_rate = (target_win_rate - 6.0).clamp(40.0, 99.9);
-    let valid_max_trades = std::cmp::max(120, max_trades / 2);
+    let valid_max_trades = std::cmp::max(std::cmp::max(160, window_trades * 3), max_trades);
 
     let base_cfg = StrategyRuntimeConfig::default();
     let pool: Vec<(String, StrategyRuntimeConfig)> = build_strategy_arms(base_cfg, max_arms);
