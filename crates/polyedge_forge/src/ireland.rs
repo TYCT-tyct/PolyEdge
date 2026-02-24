@@ -34,9 +34,8 @@ const MOTION_MIN_DT_SEC: f64 = 0.02;
 const MOTION_MAX_DT_SEC: f64 = 5.0;
 const MOTION_VELOCITY_ABS_CAP: f64 = 5_000.0;
 const MOTION_ACCEL_ABS_CAP: f64 = 25_000.0;
-const PROB_SMOOTH_TAU_SEC: f64 = 2.8;
+const PROB_SMOOTH_TAU_SEC: f64 = 1.6;
 const DELTA_SMOOTH_TAU_SEC: f64 = 2.4;
-const PROB_MAX_STEP_PER_SEC: f64 = 0.10;
 const DELTA_MAX_STEP_PCT_PER_SEC: f64 = 0.18;
 const PROB_STATE_RETENTION_MS: i64 = 2 * 60 * 60 * 1000;
 
@@ -441,7 +440,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
     let mut quote_cache_by_market: HashMap<String, (f64, f64, f64, f64)> = HashMap::new();
     let mut markets_by_id: HashMap<String, MarketMeta> = HashMap::new();
     let mut motion_by_key: HashMap<String, MotionState> = HashMap::new();
-    let mut prob_smooth_by_market: HashMap<String, ProbSmoothState> = HashMap::new();
+    let mut prob_smooth_by_round: HashMap<String, ProbSmoothState> = HashMap::new();
     let mut emitted_rounds: HashSet<String> = HashSet::new();
     let mut round_buffers: HashMap<String, RoundBuffer> = HashMap::new();
     let mut target_cache: HashMap<String, (i64, f64)> = HashMap::new();
@@ -481,7 +480,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
             }
             _ = ticker.tick() => {
                 let now_ms = Utc::now().timestamp_millis();
-                prob_smooth_by_market.retain(|_, v| {
+                prob_smooth_by_round.retain(|_, v| {
                     now_ms.saturating_sub(v.ts_ms) <= PROB_STATE_RETENTION_MS
                 });
                 for market in markets_by_id.values() {
@@ -661,17 +660,14 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     let raw_mid_yes_norm = (raw_mid_yes / raw_sum).clamp(0.0, 1.0);
                     let raw_mid_no_norm = (1.0 - raw_mid_yes_norm).clamp(0.0, 1.0);
                     let (mid_yes_smooth, mid_no_smooth, delta_pct_smooth) = {
-                        if let Some(prev) = prob_smooth_by_market.get(&market.market_id).copied() {
+                        if let Some(prev) = prob_smooth_by_round.get(&round_id).copied() {
                             let dt_ms = now_ms.saturating_sub(prev.ts_ms);
                             let dt_s_raw = (dt_ms as f64 / 1000.0).max(0.0);
                             let dt_s = dt_s_raw.clamp(MOTION_MIN_DT_SEC, MOTION_MAX_DT_SEC);
                             let alpha_prob = ema_alpha_from_tau(dt_s, PROB_SMOOTH_TAU_SEC);
-                            let mut ema_up =
-                                prev.ema_up + alpha_prob * (raw_mid_yes_norm - prev.ema_up);
-                            let max_step = PROB_MAX_STEP_PER_SEC * dt_s;
-                            ema_up = ema_up
-                                .clamp(prev.ema_up - max_step, prev.ema_up + max_step)
-                                .clamp(0.0, 1.0);
+                            let ema_up =
+                                (prev.ema_up + alpha_prob * (raw_mid_yes_norm - prev.ema_up))
+                                    .clamp(0.0, 1.0);
                             let ema_delta = match (delta_pct, prev.ema_delta_pct) {
                                 (Some(raw), Some(prev_d)) if raw.is_finite() && prev_d.is_finite() => {
                                     let alpha_delta = ema_alpha_from_tau(dt_s, DELTA_SMOOTH_TAU_SEC);
@@ -684,8 +680,8 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                 (None, Some(prev_d)) if prev_d.is_finite() => Some(prev_d),
                                 _ => None,
                             };
-                            prob_smooth_by_market.insert(
-                                market.market_id.clone(),
+                            prob_smooth_by_round.insert(
+                                round_id.clone(),
                                 ProbSmoothState {
                                     ts_ms: now_ms,
                                     ema_up,
@@ -694,8 +690,8 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             );
                             (ema_up, (1.0 - ema_up).clamp(0.0, 1.0), ema_delta)
                         } else {
-                            prob_smooth_by_market.insert(
-                                market.market_id.clone(),
+                            prob_smooth_by_round.insert(
+                                round_id.clone(),
                                 ProbSmoothState {
                                     ts_ms: now_ms,
                                     ema_up: raw_mid_yes_norm,
@@ -820,6 +816,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         emitted_rounds.insert(round_id.clone());
                         if let Some(buffer) = round_buffers.remove(&round_id) {
                             target_anchor_by_round.remove(&round_id);
+                            prob_smooth_by_round.remove(&round_id);
                             let report = buffer.evaluate(&quality_policy, sample_period_ms);
                             let target = buffer.target_price_latest.unwrap_or(0.0);
                             let settle = buffer.settle_price_latest.unwrap_or(0.0);
@@ -925,6 +922,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     emitted_rounds.insert(rid.clone());
                     if let Some(buffer) = round_buffers.remove(&rid) {
                         target_anchor_by_round.remove(&rid);
+                        prob_smooth_by_round.remove(&rid);
                         let report = buffer.evaluate(&quality_policy, sample_period_ms);
                         let target = buffer.target_price_latest.unwrap_or(0.0);
                         let settle = buffer.settle_price_latest.unwrap_or(0.0);

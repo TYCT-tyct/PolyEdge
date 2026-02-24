@@ -391,13 +391,13 @@ fn compact_live_snapshot(snapshot: &Value, market_type: &str) -> Value {
     };
 
     let mid_yes = snapshot
-        .get("mid_yes_smooth")
+        .get("mid_yes")
         .and_then(Value::as_f64)
-        .or_else(|| snapshot.get("mid_yes").and_then(Value::as_f64));
+        .or_else(|| snapshot.get("mid_yes_smooth").and_then(Value::as_f64));
     let mid_no = snapshot
-        .get("mid_no_smooth")
+        .get("mid_no")
         .and_then(Value::as_f64)
-        .or_else(|| snapshot.get("mid_no").and_then(Value::as_f64));
+        .or_else(|| snapshot.get("mid_no_smooth").and_then(Value::as_f64));
     let raw_bid_yes = snapshot.get("bid_yes").and_then(Value::as_f64);
     let raw_ask_yes = snapshot.get("ask_yes").and_then(Value::as_f64);
     let raw_bid_no = snapshot.get("bid_no").and_then(Value::as_f64);
@@ -410,10 +410,10 @@ fn compact_live_snapshot(snapshot: &Value, market_type: &str) -> Value {
         (Some(b), Some(a)) if a.is_finite() && b.is_finite() => (a - b).abs().clamp(0.001, 0.06),
         _ => 0.01,
     };
-    let best_bid_up = mid_yes.map(|m| (m - yes_spread * 0.5).clamp(0.0, 1.0));
-    let best_ask_up = mid_yes.map(|m| (m + yes_spread * 0.5).clamp(0.0, 1.0));
-    let best_bid_down = mid_no.map(|m| (m - no_spread * 0.5).clamp(0.0, 1.0));
-    let best_ask_down = mid_no.map(|m| (m + no_spread * 0.5).clamp(0.0, 1.0));
+    let best_bid_up = raw_bid_yes.or_else(|| mid_yes.map(|m| (m - yes_spread * 0.5).clamp(0.0, 1.0)));
+    let best_ask_up = raw_ask_yes.or_else(|| mid_yes.map(|m| (m + yes_spread * 0.5).clamp(0.0, 1.0)));
+    let best_bid_down = raw_bid_no.or_else(|| mid_no.map(|m| (m - no_spread * 0.5).clamp(0.0, 1.0)));
+    let best_ask_down = raw_ask_no.or_else(|| mid_no.map(|m| (m + no_spread * 0.5).clamp(0.0, 1.0)));
 
     json!({
         "timestamp_ms": snapshot.get("ts_ireland_sample_ms").and_then(Value::as_i64),
@@ -632,7 +632,7 @@ async fn stats(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
         LEFT JOIN (
             SELECT
                 round_id,
-                argMinIf(coalesce(mid_yes_smooth, mid_yes), abs(remaining_ms - if(timeframe='5m', 60000, 180000)), remaining_ms >= 0) AS eval_mid_up
+                argMinIf(coalesce(mid_yes, mid_yes_smooth), abs(remaining_ms - if(timeframe='5m', 60000, 180000)), remaining_ms >= 0) AS eval_mid_up
             FROM polyedge_forge.snapshot_100ms
             WHERE symbol='BTCUSDT' AND timeframe IN ('5m','15m')
             GROUP BY round_id
@@ -1086,7 +1086,7 @@ async fn rounds(
         LEFT JOIN (
             SELECT
                 round_id,
-                argMinIf(coalesce(mid_yes_smooth, mid_yes), remaining_ms, remaining_ms >= 0) AS close_mid_up
+                argMinIf(coalesce(mid_yes, mid_yes_smooth), remaining_ms, remaining_ms >= 0) AS close_mid_up
             FROM polyedge_forge.snapshot_100ms
             WHERE symbol='BTCUSDT'
               AND timeframe='{market_type}'
@@ -1195,7 +1195,7 @@ async fn heatmap(
             SELECT
                 round(round(delta_pct / 0.05) * 0.05, 2) AS delta_bin_raw,
                 intDiv(greatest(remaining_ms, 0), 30000) * 30 AS time_left_s_bin,
-                coalesce(mid_yes_smooth, mid_yes) * 100.0 AS avg_up_price_cents_raw,
+                coalesce(mid_yes, mid_yes_smooth) * 100.0 AS avg_up_price_cents_raw,
                 1 AS sample_count_raw
             FROM polyedge_forge.snapshot_100ms
             WHERE symbol='BTCUSDT'
@@ -1269,7 +1269,7 @@ async fn accuracy_series(
         INNER JOIN (
             SELECT
                 round_id,
-                argMinIf(coalesce(mid_yes_smooth, mid_yes), abs(remaining_ms - {eval_remaining_ms}), remaining_ms >= 0) AS eval_mid_up
+                argMinIf(coalesce(mid_yes, mid_yes_smooth), abs(remaining_ms - {eval_remaining_ms}), remaining_ms >= 0) AS eval_mid_up
             FROM polyedge_forge.snapshot_100ms
             WHERE symbol='BTCUSDT'
               AND timeframe='{market_type}'

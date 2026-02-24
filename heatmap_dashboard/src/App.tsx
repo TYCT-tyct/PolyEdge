@@ -253,9 +253,9 @@ function normalizeLiveSnapshot(
   nextRaw: LiveSnapshot
 ): LiveSnapshot {
   const preferredUpMid =
-    finiteOrNull(nextRaw.mid_yes_smooth) ?? finiteOrNull(nextRaw.mid_yes);
+    finiteOrNull(nextRaw.mid_yes) ?? finiteOrNull(nextRaw.mid_yes_smooth);
   const preferredDownMid =
-    finiteOrNull(nextRaw.mid_no_smooth) ?? finiteOrNull(nextRaw.mid_no);
+    finiteOrNull(nextRaw.mid_no) ?? finiteOrNull(nextRaw.mid_no_smooth);
 
   const up = quoteFromPreferredMid(
     preferredUpMid,
@@ -801,13 +801,13 @@ export default function App() {
         delta_pct: stablePoint.delta_pct_smooth ?? stablePoint.delta_pct,
         delta_pct_smooth: stablePoint.delta_pct_smooth ?? stablePoint.delta_pct ?? null,
         mid_yes:
-          stablePoint.mid_yes_smooth ??
           stablePoint.mid_yes ??
+          stablePoint.mid_yes_smooth ??
           midpointProb(stablePoint.best_bid_up, stablePoint.best_ask_up),
         mid_yes_smooth: stablePoint.mid_yes_smooth ?? stablePoint.mid_yes ?? null,
         mid_no:
-          stablePoint.mid_no_smooth ??
           stablePoint.mid_no ??
+          stablePoint.mid_no_smooth ??
           midpointProb(stablePoint.best_bid_down, stablePoint.best_ask_down),
         mid_no_smooth: stablePoint.mid_no_smooth ?? stablePoint.mid_no ?? null,
         best_bid_up: stablePoint.best_bid_up,
@@ -913,10 +913,10 @@ export default function App() {
             mid_no: r.mid_no ?? null,
             mid_yes_smooth: r.mid_yes_smooth ?? null,
             mid_no_smooth: r.mid_no_smooth ?? null,
-            best_bid_up: r.bid_yes ?? r.mid_yes_smooth ?? r.mid_yes,
-            best_ask_up: r.ask_yes ?? r.mid_yes_smooth ?? r.mid_yes,
-            best_bid_down: r.bid_no ?? r.mid_no_smooth ?? r.mid_no,
-            best_ask_down: r.ask_no ?? r.mid_no_smooth ?? r.mid_no,
+            best_bid_up: r.bid_yes ?? r.mid_yes ?? r.mid_yes_smooth,
+            best_ask_up: r.ask_yes ?? r.mid_yes ?? r.mid_yes_smooth,
+            best_bid_down: r.bid_no ?? r.mid_no ?? r.mid_no_smooth,
+            best_ask_down: r.ask_no ?? r.mid_no ?? r.mid_no_smooth,
             time_remaining_s: r.remaining_ms / 1000,
             velocity_bps_per_sec: r.velocity_bps_per_sec ?? null,
             acceleration: r.acceleration ?? null,

@@ -217,12 +217,12 @@ function normalizeChartPoint(p: ChartPoint): ChartPoint {
       p.target_price
     ),
     mid_yes:
-      finiteOrNull(p.mid_yes_smooth) ??
       finiteOrNull(p.mid_yes) ??
+      finiteOrNull(p.mid_yes_smooth) ??
       midpointProb(bestBidUp, bestAskUp),
     mid_no:
-      finiteOrNull(p.mid_no_smooth) ??
       finiteOrNull(p.mid_no) ??
+      finiteOrNull(p.mid_no_smooth) ??
       midpointProb(bestBidDown, bestAskDown),
     best_bid_up: bestBidUp,
     best_ask_up: bestAskUp,
