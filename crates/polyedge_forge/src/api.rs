@@ -2445,6 +2445,10 @@ fn run_strategy_simulation(
             let fast_loss_guard = pnl <= -(cfg.stop_loss_cents * 0.40).max(1.8)
                 && trend_signed <= cfg.reverse_signal_threshold * 0.85
                 && pos.reverse_streak >= 1;
+            let first_reversal_take_profit = can_exit_now
+                && pnl >= (cfg.trail_drawdown_cents * 0.45).max(1.0)
+                && trend_signed <= -0.05
+                && pos.reverse_streak >= 1;
             let trend_fade_exit = can_exit_now
                 && pnl >= cfg.trail_activate_profit_cents * 0.35
                 && drawdown >= (cfg.trail_drawdown_cents * 0.55).max(1.2)
@@ -2464,6 +2468,8 @@ fn run_strategy_simulation(
                 exit_reason = Some("profit_flip_negative");
             } else if fast_loss_guard {
                 exit_reason = Some("fast_loss_guard");
+            } else if first_reversal_take_profit {
+                exit_reason = Some("first_reversal_take_profit");
             } else if trend_fade_exit {
                 exit_reason = Some("trend_fade_exit");
             } else if can_exit_now && pnl <= -cfg.stop_loss_cents {
@@ -2541,8 +2547,8 @@ fn run_strategy_simulation(
                     } else {
                         1.0 - signal.p_fair_up
                     };
-                    let confidence_floor = (0.52 + local_vol * 2.2 + sample.spread_mid * 1.4)
-                        .clamp(0.52, 0.83);
+                    let confidence_floor = (0.56 + local_vol * 2.6 + sample.spread_mid * 1.6)
+                        .clamp(0.56, 0.86);
                     let edge_required = (cfg.entry_edge_prob * (1.0 + local_vol * 5.5))
                         .clamp(cfg.entry_edge_prob, cfg.entry_edge_prob * 2.0);
                     let edge_align = if side == StrategySide::Up {
@@ -2595,7 +2601,7 @@ fn run_strategy_simulation(
                 1.0 - signal.p_fair_up
             };
             let confidence_floor =
-                (0.52 + local_vol * 2.2 + sample.spread_mid * 1.4).clamp(0.52, 0.83);
+                (0.56 + local_vol * 2.6 + sample.spread_mid * 1.6).clamp(0.56, 0.86);
             let edge_required = (cfg.entry_edge_prob * (1.0 + local_vol * 5.5))
                 .clamp(cfg.entry_edge_prob, cfg.entry_edge_prob * 2.0);
             let edge_align = if side == StrategySide::Up {
