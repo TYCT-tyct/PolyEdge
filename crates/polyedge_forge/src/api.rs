@@ -90,6 +90,23 @@ struct StrategyPaperQueryParams {
     max_points: Option<u32>,
     max_trades: Option<u32>,
     full_history: Option<bool>,
+    entry_threshold_base: Option<f64>,
+    entry_threshold_cap: Option<f64>,
+    spread_limit_prob: Option<f64>,
+    entry_min_potential_cents: Option<f64>,
+    entry_max_price_cents: Option<f64>,
+    min_hold_ms: Option<i64>,
+    stop_loss_cents: Option<f64>,
+    reverse_signal_threshold: Option<f64>,
+    reverse_signal_ticks: Option<u32>,
+    trail_activate_profit_cents: Option<f64>,
+    trail_drawdown_cents: Option<f64>,
+    take_profit_near_max_cents: Option<f64>,
+    endgame_take_profit_cents: Option<f64>,
+    endgame_remaining_ms: Option<i64>,
+    liquidity_widen_prob: Option<f64>,
+    cooldown_ms: Option<i64>,
+    max_entries_per_round: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1864,7 +1881,61 @@ async fn strategy_paper(
     State(state): State<ApiState>,
     Query(params): Query<StrategyPaperQueryParams>,
 ) -> Result<Json<Value>, ApiError> {
-    let cfg = StrategyRuntimeConfig::default();
+    let mut cfg = StrategyRuntimeConfig::default();
+    if let Some(v) = params.entry_threshold_base {
+        cfg.entry_threshold_base = v.clamp(0.40, 0.95);
+    }
+    if let Some(v) = params.entry_threshold_cap {
+        cfg.entry_threshold_cap = v.clamp(cfg.entry_threshold_base, 0.99);
+    }
+    if let Some(v) = params.spread_limit_prob {
+        cfg.spread_limit_prob = v.clamp(0.005, 0.12);
+    }
+    if let Some(v) = params.entry_min_potential_cents {
+        cfg.entry_min_potential_cents = v.clamp(1.0, 70.0);
+    }
+    if let Some(v) = params.entry_max_price_cents {
+        cfg.entry_max_price_cents = v.clamp(45.0, 98.5);
+    }
+    if let Some(v) = params.min_hold_ms {
+        cfg.min_hold_ms = v.clamp(0, 240_000);
+    }
+    if let Some(v) = params.stop_loss_cents {
+        cfg.stop_loss_cents = v.clamp(2.0, 60.0);
+    }
+    if let Some(v) = params.reverse_signal_threshold {
+        cfg.reverse_signal_threshold = v.clamp(-0.95, -0.02);
+    }
+    if let Some(v) = params.reverse_signal_ticks {
+        cfg.reverse_signal_ticks = v.clamp(1, 12) as usize;
+    }
+    if let Some(v) = params.trail_activate_profit_cents {
+        cfg.trail_activate_profit_cents = v.clamp(2.0, 80.0);
+    }
+    if let Some(v) = params.trail_drawdown_cents {
+        cfg.trail_drawdown_cents = v.clamp(1.0, 50.0);
+    }
+    if let Some(v) = params.take_profit_near_max_cents {
+        cfg.take_profit_near_max_cents = v.clamp(70.0, 99.5);
+    }
+    if let Some(v) = params.endgame_take_profit_cents {
+        cfg.endgame_take_profit_cents = v.clamp(50.0, 99.0);
+    }
+    if let Some(v) = params.endgame_remaining_ms {
+        cfg.endgame_remaining_ms = v.clamp(1_000, 180_000);
+    }
+    if let Some(v) = params.liquidity_widen_prob {
+        cfg.liquidity_widen_prob = v.clamp(0.01, 0.2);
+    }
+    if let Some(v) = params.cooldown_ms {
+        cfg.cooldown_ms = v.clamp(0, 120_000);
+    }
+    if let Some(v) = params.max_entries_per_round {
+        cfg.max_entries_per_round = v.clamp(1, 8) as usize;
+    }
+    if cfg.entry_threshold_cap < cfg.entry_threshold_base {
+        cfg.entry_threshold_cap = cfg.entry_threshold_base;
+    }
     let market_type = if let Some(mt) = params.market_type.as_deref() {
         normalize_market_type(mt).ok_or_else(|| ApiError::bad_request("invalid market_type"))?
     } else {
