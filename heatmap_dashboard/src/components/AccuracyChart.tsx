@@ -12,7 +12,12 @@ interface AccuracyChartProps {
 const HALF_HOUR_SEC = 30 * 60;
 const LOOKBACK_SEC = 24 * 60 * 60;
 
-function formatAxisTs(formatter: Intl.DateTimeFormat, tsSec: number): string {
+function axisParts(formatter: Intl.DateTimeFormat, tsSec: number): {
+  mm: string;
+  dd: string;
+  hh: string;
+  mi: string;
+} {
   const parts = formatter.formatToParts(new Date(tsSec * 1000));
   let mm = "";
   let dd = "";
@@ -29,8 +34,19 @@ function formatAxisTs(formatter: Intl.DateTimeFormat, tsSec: number): string {
       mi = p.value;
     }
   }
-  if (!mm || !dd || !hh || !mi) {
+  return { mm, dd, hh, mi };
+}
+
+function formatAxisTs(formatter: Intl.DateTimeFormat, tsSec: number, includeDate: boolean): string {
+  const { mm, dd, hh, mi } = axisParts(formatter, tsSec);
+  if (!hh || !mi) {
     return formatter.format(new Date(tsSec * 1000));
+  }
+  if (!includeDate) {
+    return `${hh}:${mi}`;
+  }
+  if (!mm || !dd) {
+    return `${hh}:${mi}`;
   }
   return `${mm}/${dd} ${hh}:${mi}`;
 }
@@ -103,12 +119,17 @@ function AccuracyChartImpl({ points, timeMode }: AccuracyChartProps) {
               const widthPx = Math.max(640, u.bbox.width);
               const maxLabels = Math.max(4, Math.floor(widthPx / 110));
               const stride = Math.max(1, Math.ceil(vals.length / maxLabels));
+              let lastShownDay = "";
               return vals.map((v, idx) => {
                 const isEdge = idx === 0 || idx + 1 === vals.length;
                 if (!isEdge && idx % stride !== 0) {
                   return "";
                 }
-                return formatAxisTs(axisTimeFormatter, v);
+                const { mm, dd } = axisParts(axisTimeFormatter, v);
+                const day = `${mm}/${dd}`;
+                const includeDate = idx === 0 || day !== lastShownDay;
+                lastShownDay = day;
+                return formatAxisTs(axisTimeFormatter, v, includeDate);
               });
             }
           },
