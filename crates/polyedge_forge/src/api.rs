@@ -2395,6 +2395,59 @@ fn profit_factor(pnls: &[f64]) -> f64 {
     gross_win / gross_loss
 }
 
+fn loss_tail_penalty(pnls: &[f64]) -> f64 {
+    if pnls.len() < 20 {
+        return 0.0;
+    }
+    let mut sorted = pnls.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let tail_n = (sorted.len() / 10).max(3);
+    let tail = &sorted[..tail_n];
+    let tail_avg = tail.iter().copied().sum::<f64>() / tail_n as f64;
+    tail_avg.abs() * 2.4
+}
+
+fn side_loss_penalty(trades: &[Value]) -> f64 {
+    let mut up_n = 0usize;
+    let mut up_w = 0usize;
+    let mut up_p = 0.0_f64;
+    let mut dn_n = 0usize;
+    let mut dn_w = 0usize;
+    for t in trades {
+        let side = t.get("side").and_then(Value::as_str).unwrap_or_default();
+        let pnl = row_f64(t, "pnl_cents").unwrap_or(0.0);
+        if side == "UP" {
+            up_n = up_n.saturating_add(1);
+            up_p += pnl;
+            if pnl > 0.0 {
+                up_w = up_w.saturating_add(1);
+            }
+        } else if side == "DOWN" {
+            dn_n = dn_n.saturating_add(1);
+            if pnl > 0.0 {
+                dn_w = dn_w.saturating_add(1);
+            }
+        }
+    }
+    if up_n < 12 || dn_n < 12 {
+        return 0.0;
+    }
+    let up_wr = up_w as f64 * 100.0 / up_n as f64;
+    let dn_wr = dn_w as f64 * 100.0 / dn_n as f64;
+    let up_avg = up_p / up_n as f64;
+    let mut penalty = 0.0_f64;
+    if dn_wr > up_wr + 8.0 {
+        penalty += (dn_wr - up_wr - 8.0) * 2.1;
+    }
+    if up_wr < 55.0 {
+        penalty += (55.0 - up_wr) * 1.4;
+    }
+    if up_avg < 0.0 {
+        penalty += up_avg.abs() * 22.0;
+    }
+    penalty
+}
+
 fn split_samples_by_round(
     samples: &[StrategySample],
     valid_ratio: f64,
@@ -2479,10 +2532,26 @@ fn run_strategy_simulation(
         let local_vol = rolling_vol_absdiff(&p_hist);
         let choppy_flips = recent_sign_flips(&score_hist, 9);
         let is_choppy = choppy_flips >= 4 && local_vol >= 0.012;
-        let delta_align = if side == StrategySide::Up {
-            sample.delta_pct >= -0.012
+        let round_ms = infer_market_type_from_round_id(&sample.round_id)
+            .map(market_type_to_ms)
+            .filter(|v| *v > 0)
+            .unwrap_or(5 * 60 * 1000);
+        let round_progress = (1.0 - sample.remaining_ms as f64 / round_ms as f64).clamp(0.0, 1.0);
+        let early_noise = if round_progress < 0.45 {
+            (0.45 - round_progress) / 0.45
         } else {
-            sample.delta_pct <= 0.012
+            0.0
+        };
+        let up_bias = if side == StrategySide::Up { 0.065 } else { 0.0 };
+        let signal_extra = early_noise * 0.09 + up_bias;
+        let confidence_extra = early_noise * 0.06 + if side == StrategySide::Up { 0.035 } else { 0.0 };
+        let edge_extra = early_noise * 0.012 + if side == StrategySide::Up { 0.006 } else { 0.0 };
+        let entry_spread_guard = (cfg.max_exec_spread_cents * (0.74 - early_noise * 0.16))
+            .clamp(cfg.max_exec_spread_cents * 0.52, cfg.max_exec_spread_cents * 0.82);
+        let delta_align = if side == StrategySide::Up {
+            sample.delta_pct >= -0.004
+        } else {
+            sample.delta_pct <= 0.006
         };
         last_side = side.as_str();
 
@@ -2515,6 +2584,9 @@ fn run_strategy_simulation(
             let fast_loss_guard = pnl <= -(cfg.stop_loss_cents * 0.40).max(1.8)
                 && trend_signed <= cfg.reverse_signal_threshold * 0.85
                 && pos.reverse_streak >= 1;
+            let early_hard_stop = held_ms <= 12_000
+                && pnl <= -(cfg.stop_loss_cents * 0.55).max(4.0)
+                && trend_signed <= -0.08;
             let first_reversal_take_profit = can_exit_now
                 && pnl >= (cfg.trail_drawdown_cents * 0.45).max(1.0)
                 && trend_signed <= -0.05
@@ -2538,6 +2610,8 @@ fn run_strategy_simulation(
                 exit_reason = Some("profit_flip_negative");
             } else if fast_loss_guard {
                 exit_reason = Some("fast_loss_guard");
+            } else if early_hard_stop {
+                exit_reason = Some("early_hard_stop");
             } else if first_reversal_take_profit {
                 exit_reason = Some("first_reversal_take_profit");
             } else if trend_fade_exit {
@@ -2564,6 +2638,7 @@ fn run_strategy_simulation(
                         | "stop_loss"
                         | "endgame_take_profit"
                         | "fast_loss_guard"
+                        | "early_hard_stop"
                         | "profit_flip_negative"
                         | "profit_lock_reversal"
                 );
@@ -2618,16 +2693,18 @@ fn run_strategy_simulation(
                         1.0 - signal.p_fair_up
                     };
                     let confidence_floor = (0.56 + local_vol * 2.6 + sample.spread_mid * 1.6)
-                        .clamp(0.56, 0.86);
+                        .clamp(0.56, 0.86)
+                        + confidence_extra;
                     let edge_required = (cfg.entry_edge_prob * (1.0 + local_vol * 5.5))
-                        .clamp(cfg.entry_edge_prob, cfg.entry_edge_prob * 2.0);
+                        .clamp(cfg.entry_edge_prob, cfg.entry_edge_prob * 2.0)
+                        + edge_extra;
                     let edge_align = if side == StrategySide::Up {
                         signal.edge_prob >= -(edge_required * 0.45)
                     } else {
                         signal.edge_prob <= edge_required * 0.45
                     };
                     let signal_required =
-                        (entry_thr + local_vol * 1.1 + sample.spread_mid * 0.5).clamp(
+                        (entry_thr + local_vol * 1.1 + sample.spread_mid * 0.5 + signal_extra).clamp(
                             cfg.entry_threshold_base,
                             cfg.entry_threshold_cap,
                         );
@@ -2642,6 +2719,7 @@ fn run_strategy_simulation(
                         && delta_align
                         && (!is_choppy || anti_chop_override)
                         && entry_price <= cfg.entry_max_price_cents
+                        && side_spread(sample, side) * 100.0 <= entry_spread_guard
                         && entry_potential >= cfg.entry_min_potential_cents
                         && round_entries < cfg.max_entries_per_round;
                     if can_flip {
@@ -2671,16 +2749,18 @@ fn run_strategy_simulation(
                 1.0 - signal.p_fair_up
             };
             let confidence_floor =
-                (0.56 + local_vol * 2.6 + sample.spread_mid * 1.6).clamp(0.56, 0.86);
+                (0.56 + local_vol * 2.6 + sample.spread_mid * 1.6).clamp(0.56, 0.86)
+                    + confidence_extra;
             let edge_required = (cfg.entry_edge_prob * (1.0 + local_vol * 5.5))
-                .clamp(cfg.entry_edge_prob, cfg.entry_edge_prob * 2.0);
+                .clamp(cfg.entry_edge_prob, cfg.entry_edge_prob * 2.0)
+                + edge_extra;
             let edge_align = if side == StrategySide::Up {
                 signal.edge_prob >= -(edge_required * 0.45)
             } else {
                 signal.edge_prob <= edge_required * 0.45
             };
             let signal_required =
-                (entry_thr + local_vol * 1.1 + sample.spread_mid * 0.5).clamp(
+                (entry_thr + local_vol * 1.1 + sample.spread_mid * 0.5 + signal_extra).clamp(
                     cfg.entry_threshold_base,
                     cfg.entry_threshold_cap,
                 );
@@ -2694,6 +2774,7 @@ fn run_strategy_simulation(
                 && (!is_choppy || anti_chop_override)
                 && sample.spread_mid <= cfg.spread_limit_prob
                 && entry_spread_cents <= cfg.max_exec_spread_cents
+                && entry_spread_cents <= entry_spread_guard
                 && entry_price <= cfg.entry_max_price_cents
                 && entry_potential >= cfg.entry_min_potential_cents;
             let round_entries = entries_by_round.get(&sample.round_id).copied().unwrap_or(0);
@@ -3594,6 +3675,8 @@ fn score_with_rolling(
 ) -> (RollingStats, f64, bool) {
     let rs = compute_rolling_stats(&run.all_trade_pnls, window_trades);
     let pf = profit_factor(&run.all_trade_pnls);
+    let tail_penalty = loss_tail_penalty(&run.all_trade_pnls);
+    let side_penalty = side_loss_penalty(&run.trades);
     let trade_shortfall = window_trades.saturating_sub(run.trade_count) as f64;
     let coverage_ratio = (run.trade_count as f64 / window_trades as f64).clamp(0.0, 1.0);
     if run.trade_count < window_trades {
@@ -3602,6 +3685,8 @@ fn score_with_rolling(
             - run.max_drawdown_cents * 0.05
             - run.execution_penalty_cents_total
             - run.blocked_exits as f64 * 30.0
+            - tail_penalty * 1.2
+            - side_penalty * 0.9
             - (1.0 - pf.min(1.0)) * 220.0;
         return (rs, objective, false);
     }
@@ -3632,6 +3717,8 @@ fn score_with_rolling(
             - run.max_drawdown_cents * 0.02
             - run.execution_penalty_cents_total * 0.4
             - run.blocked_exits as f64 * 18.0
+            - tail_penalty
+            - side_penalty
             - shortfall * shortfall * 2.4
             - non_positive_pnl_penalty
             + pf_bonus
@@ -3646,6 +3733,8 @@ fn score_with_rolling(
             - run.max_drawdown_cents * 0.03
             - run.execution_penalty_cents_total * 0.6
             - run.blocked_exits as f64 * 25.0
+            - tail_penalty * 1.1
+            - side_penalty * 0.8
             - 320.0
             - trade_shortfall * 35.0
             - pf_penalty
