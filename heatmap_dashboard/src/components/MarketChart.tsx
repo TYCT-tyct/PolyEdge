@@ -390,28 +390,15 @@ function preparePlot(points: ChartPoint[]): PreparedPlot {
   const xs: number[] = [];
   const delta: Array<number | null> = [];
   const upRaw: Array<number | null> = [];
-  let prevRoundId = "";
 
   for (const p of bucketed) {
     if (!Number.isFinite(p.timestamp_ms) || p.timestamp_ms <= 0) {
       continue;
     }
-    if (prevRoundId && p.round_id && p.round_id !== prevRoundId) {
-      const gapTs = Math.max(
-        (xs[xs.length - 1] ?? p.timestamp_ms / 1000) + 0.001,
-        p.timestamp_ms / 1000 - 0.001
-      );
-      xs.push(gapTs);
-      delta.push(null);
-      upRaw.push(null);
-    }
     const pair = resolvePairFromPoint(p);
     xs.push(p.timestamp_ms / 1000);
     delta.push(resolveDeltaPct(p));
     upRaw.push(pair.up);
-    if (p.round_id) {
-      prevRoundId = p.round_id;
-    }
   }
 
   const upDisplay = upRaw.map((v) => quantizeCents(v));
