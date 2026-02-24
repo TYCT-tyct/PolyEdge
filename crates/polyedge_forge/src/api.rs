@@ -92,6 +92,7 @@ struct StrategyPaperQueryParams {
     max_points: Option<u32>,
     max_trades: Option<u32>,
     full_history: Option<bool>,
+    use_autotune: Option<bool>,
     entry_threshold_base: Option<f64>,
     entry_threshold_cap: Option<f64>,
     spread_limit_prob: Option<f64>,
@@ -136,6 +137,15 @@ struct StrategyOptimizeQueryParams {
     target_win_rate: Option<f64>,
     iterations: Option<u32>,
     seed: Option<u64>,
+    recent_lookback_minutes: Option<u32>,
+    recent_weight: Option<f64>,
+    persist_best: Option<bool>,
+    persist_ttl_sec: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StrategyAutotuneLatestQueryParams {
+    market_type: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -241,6 +251,7 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         .route("/api/strategy/paper", get(strategy_paper))
         .route("/api/strategy/full", get(strategy_full))
         .route("/api/strategy/optimize", get(strategy_optimize))
+        .route("/api/strategy/autotune/latest", get(strategy_autotune_latest))
         .with_state(state);
 
     if let Some(dist) = cfg.dashboard_dist_dir {
@@ -1055,6 +1066,39 @@ async fn read_key_value(state: &ApiState, key: &str) -> Result<Option<Value>, Ap
     let parsed: Value = serde_json::from_str(&payload)
         .map_err(|e| ApiError::internal(format!("redis payload json parse failed: {}", e)))?;
     Ok(Some(parsed))
+}
+
+async fn write_key_value(
+    state: &ApiState,
+    key: &str,
+    value: &Value,
+    ttl_sec: Option<u32>,
+) -> Result<(), ApiError> {
+    let Some(client) = state.redis_client.as_ref() else {
+        return Err(ApiError::internal("redis not configured"));
+    };
+    let payload = serde_json::to_string(value)
+        .map_err(|e| ApiError::internal(format!("redis payload serialize failed: {}", e)))?;
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .map_err(|e| ApiError::internal(format!("redis connect failed: {}", e)))?;
+    if let Some(ttl) = ttl_sec {
+        let _: () = conn
+            .set_ex(key, payload, ttl as u64)
+            .await
+            .map_err(|e| ApiError::internal(format!("redis set_ex failed: {}", e)))?;
+    } else {
+        let _: () = conn
+            .set(key, payload)
+            .await
+            .map_err(|e| ApiError::internal(format!("redis set failed: {}", e)))?;
+    }
+    Ok(())
+}
+
+fn strategy_autotune_key(redis_prefix: &str, market_type: &str) -> String {
+    format!("{redis_prefix}:strategy:autotune:{market_type}")
 }
 
 async fn read_key_json(state: &ApiState, key: &str) -> Result<Json<Value>, ApiError> {
@@ -2858,7 +2902,24 @@ async fn strategy_paper(
     State(state): State<ApiState>,
     Query(params): Query<StrategyPaperQueryParams>,
 ) -> Result<Json<Value>, ApiError> {
+    let market_type = if let Some(mt) = params.market_type.as_deref() {
+        normalize_market_type(mt).ok_or_else(|| ApiError::bad_request("invalid market_type"))?
+    } else {
+        "5m"
+    };
+    let use_autotune = params.use_autotune.unwrap_or(true);
     let mut cfg = StrategyRuntimeConfig::default();
+    let mut config_source = "default";
+    let mut autotune_info = Value::Null;
+    if use_autotune {
+        let key = strategy_autotune_key(&state.redis_prefix, market_type);
+        if let Some(saved) = read_key_value(&state, &key).await? {
+            let tuned_cfg = strategy_cfg_from_payload(cfg, &saved);
+            cfg = tuned_cfg;
+            config_source = "autotune";
+            autotune_info = saved;
+        }
+    }
     if let Some(v) = params.entry_threshold_base {
         cfg.entry_threshold_base = v.clamp(0.40, 0.95);
     }
@@ -2916,11 +2977,6 @@ async fn strategy_paper(
     if cfg.entry_threshold_cap < cfg.entry_threshold_base {
         cfg.entry_threshold_cap = cfg.entry_threshold_base;
     }
-    let market_type = if let Some(mt) = params.market_type.as_deref() {
-        normalize_market_type(mt).ok_or_else(|| ApiError::bad_request("invalid market_type"))?
-    } else {
-        "5m"
-    };
     let full_history = params.full_history.unwrap_or(false);
     let lookback_minutes = params
         .lookback_minutes
@@ -2965,6 +3021,8 @@ async fn strategy_paper(
         "lookback_minutes": lookback_minutes,
         "full_history": full_history,
         "samples": samples.len(),
+        "config_source": config_source,
+        "autotune": autotune_info,
         "config": {
             "entry_threshold_base": cfg.entry_threshold_base,
             "entry_threshold_cap": cfg.entry_threshold_cap,
@@ -3001,6 +3059,25 @@ async fn strategy_paper(
             "execution_penalty_cents_total": run.execution_penalty_cents_total,
         },
         "trades": run.trades,
+    })))
+}
+
+async fn strategy_autotune_latest(
+    State(state): State<ApiState>,
+    Query(params): Query<StrategyAutotuneLatestQueryParams>,
+) -> Result<Json<Value>, ApiError> {
+    let market_type = if let Some(mt) = params.market_type.as_deref() {
+        normalize_market_type(mt).ok_or_else(|| ApiError::bad_request("invalid market_type"))?
+    } else {
+        "5m"
+    };
+    let key = strategy_autotune_key(&state.redis_prefix, market_type);
+    let payload = read_key_value(&state, &key).await?;
+    Ok(Json(json!({
+        "market_type": market_type,
+        "key": key,
+        "found": payload.is_some(),
+        "data": payload,
     })))
 }
 
@@ -3487,6 +3564,11 @@ async fn strategy_optimize(
     let window_trades = params.window_trades.unwrap_or(50).clamp(10, 200) as usize;
     let target_win_rate = params.target_win_rate.unwrap_or(90.0).clamp(40.0, 99.9);
     let iterations = params.iterations.unwrap_or(600).clamp(50, 5000) as usize;
+    let recent_lookback_minutes = params
+        .recent_lookback_minutes
+        .unwrap_or(12 * 60)
+        .clamp(60, 30 * 24 * 60);
+    let recent_weight = params.recent_weight.unwrap_or(0.62).clamp(0.25, 0.90);
 
     let samples = load_strategy_samples(
         &state,
@@ -3520,6 +3602,21 @@ async fn strategy_optimize(
     let valid_window_trades = window_trades;
     let valid_target_win_rate = (target_win_rate - 6.0).clamp(40.0, 99.9);
     let valid_max_trades = std::cmp::max(std::cmp::max(160, window_trades * 3), max_trades);
+    let latest_ts_ms = samples.last().map(|s| s.ts_ms).unwrap_or(0);
+    let recent_from_ms =
+        latest_ts_ms.saturating_sub(i64::from(recent_lookback_minutes) * 60_000);
+    let mut recent_samples_buf: Vec<StrategySample> = samples
+        .iter()
+        .filter(|s| s.ts_ms >= recent_from_ms)
+        .cloned()
+        .collect();
+    if recent_samples_buf.len() < 200 {
+        recent_samples_buf = valid_samples.to_vec();
+    }
+    let recent_samples: &[StrategySample] = recent_samples_buf.as_slice();
+    let recent_target_win_rate = (target_win_rate - 2.0).clamp(40.0, 99.9);
+    let recent_max_trades = std::cmp::max(valid_max_trades, window_trades * 4);
+    let valid_weight = (1.0 - recent_weight).max(0.1);
 
     let base_cfg = StrategyRuntimeConfig::default();
     let pool: Vec<(String, StrategyRuntimeConfig)> = build_strategy_arms(base_cfg, max_arms);
@@ -3534,18 +3631,24 @@ async fn strategy_optimize(
         |name: String, cfg: &StrategyRuntimeConfig| -> (Value, f64, bool) {
             let train_run = run_strategy_simulation(train_samples, cfg, max_trades);
             let valid_run = run_strategy_simulation(valid_samples, cfg, valid_max_trades);
+            let recent_run = run_strategy_simulation(recent_samples, cfg, recent_max_trades);
 
             let (train_rs, train_obj, _train_hit) =
                 score_with_rolling(&train_run, window_trades, target_win_rate);
             let (valid_rs, valid_obj, valid_hit) =
                 score_with_rolling(&valid_run, valid_window_trades, valid_target_win_rate);
+            let (recent_rs, recent_obj, recent_hit) =
+                score_with_rolling(&recent_run, valid_window_trades, recent_target_win_rate);
 
             let pf_train = profit_factor(&train_run.all_trade_pnls);
             let pf_valid = profit_factor(&valid_run.all_trade_pnls);
+            let pf_recent = profit_factor(&recent_run.all_trade_pnls);
             let wr_gap = (train_rs.latest_win_rate_pct - valid_rs.latest_win_rate_pct).abs();
             let pnl_gap = (train_run.avg_pnl_cents - valid_run.avg_pnl_cents).abs();
             let pf_gap = (pf_train - pf_valid).abs();
-            let consistency_penalty = wr_gap * 1.1 + pnl_gap * 1.6 + pf_gap * 8.0;
+            let recent_wr_gap = (recent_rs.latest_win_rate_pct - valid_rs.latest_win_rate_pct).abs();
+            let consistency_penalty =
+                wr_gap * 1.1 + pnl_gap * 1.6 + pf_gap * 8.0 + recent_wr_gap * 1.8;
             let validation_fail_penalty =
                 if valid_run.avg_pnl_cents <= 0.0 || valid_run.total_pnl_cents <= 0.0 {
                     300.0
@@ -3565,23 +3668,42 @@ async fn strategy_optimize(
             } else {
                 0.0
             };
+            let recent_fail_penalty = if recent_run.avg_pnl_cents <= 0.0
+                || recent_run.total_pnl_cents <= 0.0
+                || pf_recent < 1.0
+            {
+                260.0
+                    + recent_run.avg_pnl_cents.abs() * 240.0
+                    + recent_run.total_pnl_cents.abs() * 0.02
+                    + (1.0 - pf_recent).max(0.0) * 220.0
+            } else {
+                0.0
+            };
             let fill_risk_penalty = valid_run.blocked_exits as f64 * 18.0
                 + valid_run.execution_penalty_cents_total * 0.9
                 + valid_run.emergency_wide_exit_count as f64 * 3.0;
             let train_trade_shortfall = window_trades.saturating_sub(train_run.trade_count) as f64;
             let valid_trade_shortfall = window_trades.saturating_sub(valid_run.trade_count) as f64;
+            let recent_trade_shortfall =
+                window_trades.saturating_sub(recent_run.trade_count) as f64;
             let coverage_gate_penalty =
-                train_trade_shortfall * 800.0 + valid_trade_shortfall * 900.0;
+                train_trade_shortfall * 800.0
+                    + valid_trade_shortfall * 900.0
+                    + recent_trade_shortfall * 1100.0;
 
-            let objective = train_obj * 0.14 + valid_obj * 1.12
+            let objective = train_obj * 0.14 + valid_obj * valid_weight + recent_obj * recent_weight * 1.15
                 - consistency_penalty
                 - validation_fail_penalty
                 - train_fail_penalty
+                - recent_fail_penalty
                 - fill_risk_penalty
                 - coverage_gate_penalty;
             let hit = (valid_hit || valid_rs.latest_win_rate_pct >= (target_win_rate - 3.0))
+                && (recent_hit || recent_rs.latest_win_rate_pct >= (target_win_rate - 2.0))
                 && valid_run.avg_pnl_cents > 0.0
-                && pf_valid >= 1.05;
+                && recent_run.avg_pnl_cents > 0.0
+                && pf_valid >= 1.05
+                && pf_recent >= 1.02;
 
             let payload = json!({
                 "name": name,
@@ -3589,15 +3711,19 @@ async fn strategy_optimize(
                 "rolling_window": rolling_stats_json(valid_rs),
                 "rolling_window_train": rolling_stats_json(train_rs),
                 "rolling_window_validation": rolling_stats_json(valid_rs),
+                "rolling_window_recent": rolling_stats_json(recent_rs),
                 "summary": run_summary_json(&valid_run),
                 "summary_train": run_summary_json(&train_run),
                 "summary_validation": run_summary_json(&valid_run),
+                "summary_recent": run_summary_json(&recent_run),
                 "profit_factor_train": pf_train,
                 "profit_factor_validation": pf_valid,
+                "profit_factor_recent": pf_recent,
                 "consistency": {
                     "win_rate_gap_pct": wr_gap,
                     "avg_pnl_gap_cents": pnl_gap,
-                    "profit_factor_gap": pf_gap
+                    "profit_factor_gap": pf_gap,
+                    "recent_win_rate_gap_pct": recent_wr_gap
                 },
                 "config": strategy_cfg_json(cfg),
             });
@@ -3665,6 +3791,34 @@ async fn strategy_optimize(
         }
     }
 
+    let persist_requested = params.persist_best.unwrap_or(false);
+    let persist_ttl_sec = params.persist_ttl_sec.filter(|v| *v > 0);
+    let persist_key = strategy_autotune_key(&state.redis_prefix, market_type);
+    let mut persist_error: Option<String> = None;
+    let mut persisted = false;
+    if persist_requested {
+        if best_payload.is_null() {
+            persist_error = Some("best payload is null".to_string());
+        } else {
+            let save_doc = json!({
+                "saved_at_ms": Utc::now().timestamp_millis(),
+                "market_type": market_type,
+                "target_win_rate_pct": target_win_rate,
+                "window_trades": window_trades,
+                "recent_lookback_minutes": recent_lookback_minutes,
+                "recent_weight": recent_weight,
+                "config": best_payload.get("config").cloned().unwrap_or(Value::Null),
+                "best": best_payload.clone(),
+                "leaderboard_top": leaderboard.iter().take(5).cloned().collect::<Vec<Value>>(),
+            });
+            if let Err(e) = write_key_value(&state, &persist_key, &save_doc, persist_ttl_sec).await {
+                persist_error = Some(e.message);
+            } else {
+                persisted = true;
+            }
+        }
+    }
+
     Ok(Json(json!({
         "market_type": market_type,
         "full_history": full_history,
@@ -3672,12 +3826,23 @@ async fn strategy_optimize(
         "samples": samples.len(),
         "samples_train": train_samples.len(),
         "samples_validation": valid_samples.len(),
+        "samples_recent": recent_samples.len(),
+        "recent_lookback_minutes": recent_lookback_minutes,
+        "recent_weight": recent_weight,
         "using_validation_split": using_validation,
         "target_win_rate_pct": target_win_rate,
         "window_trades": window_trades,
         "window_trades_validation": valid_window_trades,
+        "window_trades_recent": valid_window_trades,
         "iterations_requested": iterations,
         "target_reached": reached_target,
+        "persist": {
+            "requested": persist_requested,
+            "saved": persisted,
+            "key": persist_key,
+            "ttl_sec": persist_ttl_sec,
+            "error": persist_error,
+        },
         "best": best_payload,
         "leaderboard": leaderboard,
     })))
