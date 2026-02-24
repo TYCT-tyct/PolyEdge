@@ -118,6 +118,21 @@ struct StrategyFullQueryParams {
     max_trades: Option<u32>,
     full_history: Option<bool>,
     max_arms: Option<u32>,
+    window_trades: Option<u32>,
+    target_win_rate: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StrategyOptimizeQueryParams {
+    market_type: Option<String>,
+    lookback_minutes: Option<u32>,
+    max_points: Option<u32>,
+    max_trades: Option<u32>,
+    full_history: Option<bool>,
+    max_arms: Option<u32>,
+    window_trades: Option<u32>,
+    target_win_rate: Option<f64>,
+    iterations: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -219,6 +234,7 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         .route("/api/accuracy_series", get(accuracy_series))
         .route("/api/strategy/paper", get(strategy_paper))
         .route("/api/strategy/full", get(strategy_full))
+        .route("/api/strategy/optimize", get(strategy_optimize))
         .with_state(state);
 
     if let Some(dist) = cfg.dashboard_dist_dir {
@@ -1927,12 +1943,100 @@ fn compute_signal(
 struct StrategySimulationResult {
     current: Value,
     trades: Vec<Value>,
+    all_trade_pnls: Vec<f64>,
     trade_count: usize,
     win_rate_pct: f64,
     avg_pnl_cents: f64,
     avg_duration_s: f64,
     total_pnl_cents: f64,
     max_drawdown_cents: f64,
+    max_profit_trade_cents: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RollingStats {
+    window_trades: usize,
+    windows: usize,
+    latest_win_rate_pct: f64,
+    avg_win_rate_pct: f64,
+    min_win_rate_pct: f64,
+    latest_avg_pnl_cents: f64,
+}
+
+fn compute_rolling_stats(pnls: &[f64], window_trades: usize) -> RollingStats {
+    let w = window_trades.max(1);
+    if pnls.len() < w {
+        return RollingStats {
+            window_trades: w,
+            windows: 0,
+            latest_win_rate_pct: 0.0,
+            avg_win_rate_pct: 0.0,
+            min_win_rate_pct: 0.0,
+            latest_avg_pnl_cents: 0.0,
+        };
+    }
+
+    let mut win_sum = 0usize;
+    let mut pnl_sum = 0.0_f64;
+    for v in &pnls[..w] {
+        if *v > 0.0 {
+            win_sum += 1;
+        }
+        pnl_sum += *v;
+    }
+
+    let mut windows = 0usize;
+    let mut acc_win_rate = 0.0_f64;
+    let mut min_win_rate = 100.0_f64;
+    let mut latest_win_rate = 0.0_f64;
+    let mut latest_avg_pnl = 0.0_f64;
+    for end in (w - 1)..pnls.len() {
+        if end >= w {
+            let out = pnls[end - w];
+            if out > 0.0 {
+                win_sum = win_sum.saturating_sub(1);
+            }
+            pnl_sum -= out;
+            let incoming = pnls[end];
+            if incoming > 0.0 {
+                win_sum += 1;
+            }
+            pnl_sum += incoming;
+        }
+        let wr = (win_sum as f64) * 100.0 / w as f64;
+        let ap = pnl_sum / w as f64;
+        windows += 1;
+        acc_win_rate += wr;
+        if wr < min_win_rate {
+            min_win_rate = wr;
+        }
+        latest_win_rate = wr;
+        latest_avg_pnl = ap;
+    }
+
+    RollingStats {
+        window_trades: w,
+        windows,
+        latest_win_rate_pct: latest_win_rate,
+        avg_win_rate_pct: if windows > 0 {
+            acc_win_rate / windows as f64
+        } else {
+            0.0
+        },
+        min_win_rate_pct: if windows > 0 { min_win_rate } else { 0.0 },
+        latest_avg_pnl_cents: latest_avg_pnl,
+    }
+}
+
+fn rolling_stats_json(rs: RollingStats) -> Value {
+    json!({
+        "window_trades": rs.window_trades,
+        "windows": rs.windows,
+        "latest_win_rate_pct": rs.latest_win_rate_pct,
+        "avg_win_rate_pct": rs.avg_win_rate_pct,
+        "min_win_rate_pct": rs.min_win_rate_pct,
+        "latest_avg_pnl_cents": rs.latest_avg_pnl_cents,
+    })
 }
 
 fn run_strategy_simulation(
@@ -2163,6 +2267,14 @@ fn run_strategy_simulation(
     } else {
         0.0
     };
+    let all_trade_pnls: Vec<f64> = trades
+        .iter()
+        .map(|t| row_f64(t, "pnl_cents").unwrap_or(0.0))
+        .collect();
+    let max_profit_trade_cents = all_trade_pnls
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
 
     let trades_view = if trades.len() > max_trades {
         trades[trades.len() - max_trades..].to_vec()
@@ -2212,13 +2324,69 @@ fn run_strategy_simulation(
     StrategySimulationResult {
         current,
         trades: trades_view,
+        all_trade_pnls,
         trade_count,
         win_rate_pct,
         avg_pnl_cents: avg_pnl,
         avg_duration_s,
         total_pnl_cents: total_pnl,
         max_drawdown_cents: max_drawdown,
+        max_profit_trade_cents: if max_profit_trade_cents.is_finite() {
+            max_profit_trade_cents
+        } else {
+            0.0
+        },
     }
+}
+
+async fn load_strategy_samples(
+    state: &ApiState,
+    market_type: &str,
+    full_history: bool,
+    lookback_minutes: u32,
+    max_points: u32,
+) -> Result<Vec<StrategySample>, ApiError> {
+    let Some(ch_url) = state.ch_url.as_deref() else {
+        return Err(ApiError::internal("clickhouse not configured"));
+    };
+    let from_ms = Utc::now()
+        .timestamp_millis()
+        .saturating_sub(i64::from(lookback_minutes) * 60_000);
+    let ts_filter = if full_history {
+        String::new()
+    } else {
+        format!("AND ts_ireland_sample_ms >= {from_ms}")
+    };
+    let q = format!(
+        "SELECT
+            intDiv(ts_ireland_sample_ms, 1000) * 1000 AS ts_ms,
+            argMax(round_id, ts_ireland_sample_ms) AS round_id,
+            argMax(remaining_ms, ts_ireland_sample_ms) AS remaining_ms,
+            argMax(mid_yes, ts_ireland_sample_ms) AS mid_yes,
+            argMax(mid_yes_smooth, ts_ireland_sample_ms) AS mid_yes_smooth,
+            argMax(mid_no, ts_ireland_sample_ms) AS mid_no,
+            argMax(mid_no_smooth, ts_ireland_sample_ms) AS mid_no_smooth,
+            argMax(bid_yes, ts_ireland_sample_ms) AS bid_yes,
+            argMax(ask_yes, ts_ireland_sample_ms) AS ask_yes,
+            argMax(bid_no, ts_ireland_sample_ms) AS bid_no,
+            argMax(ask_no, ts_ireland_sample_ms) AS ask_no,
+            argMax(delta_pct, ts_ireland_sample_ms) AS delta_pct,
+            argMax(delta_pct_smooth, ts_ireland_sample_ms) AS delta_pct_smooth,
+            argMax(velocity_bps_per_sec, ts_ireland_sample_ms) AS velocity_bps_per_sec,
+            argMax(acceleration, ts_ireland_sample_ms) AS acceleration,
+            argMax(binance_price, ts_ireland_sample_ms) AS binance_price,
+            argMax(target_price, ts_ireland_sample_ms) AS target_price
+        FROM polyedge_forge.snapshot_100ms
+        WHERE symbol='BTCUSDT'
+          AND timeframe='{market_type}'
+          {ts_filter}
+        GROUP BY ts_ms
+        ORDER BY ts_ms ASC
+        LIMIT {max_points}
+        FORMAT JSON"
+    );
+    let rows = rows_from_json(query_clickhouse_json(ch_url, &q).await?);
+    Ok(parse_strategy_rows(rows))
 }
 
 async fn strategy_paper(
@@ -2299,47 +2467,7 @@ async fn strategy_paper(
         .clamp(20_000, 5_000_000);
     let max_trades = params.max_trades.unwrap_or(200).clamp(20, 1000) as usize;
 
-    let Some(ch_url) = state.ch_url.as_deref() else {
-        return Err(ApiError::internal("clickhouse not configured"));
-    };
-    let from_ms = Utc::now()
-        .timestamp_millis()
-        .saturating_sub(i64::from(lookback_minutes) * 60_000);
-    let ts_filter = if full_history {
-        String::new()
-    } else {
-        format!("AND ts_ireland_sample_ms >= {from_ms}")
-    };
-    let q = format!(
-        "SELECT
-            intDiv(ts_ireland_sample_ms, 1000) * 1000 AS ts_ms,
-            argMax(round_id, ts_ireland_sample_ms) AS round_id,
-            argMax(remaining_ms, ts_ireland_sample_ms) AS remaining_ms,
-            argMax(mid_yes, ts_ireland_sample_ms) AS mid_yes,
-            argMax(mid_yes_smooth, ts_ireland_sample_ms) AS mid_yes_smooth,
-            argMax(mid_no, ts_ireland_sample_ms) AS mid_no,
-            argMax(mid_no_smooth, ts_ireland_sample_ms) AS mid_no_smooth,
-            argMax(bid_yes, ts_ireland_sample_ms) AS bid_yes,
-            argMax(ask_yes, ts_ireland_sample_ms) AS ask_yes,
-            argMax(bid_no, ts_ireland_sample_ms) AS bid_no,
-            argMax(ask_no, ts_ireland_sample_ms) AS ask_no,
-            argMax(delta_pct, ts_ireland_sample_ms) AS delta_pct,
-            argMax(delta_pct_smooth, ts_ireland_sample_ms) AS delta_pct_smooth,
-            argMax(velocity_bps_per_sec, ts_ireland_sample_ms) AS velocity_bps_per_sec,
-            argMax(acceleration, ts_ireland_sample_ms) AS acceleration,
-            argMax(binance_price, ts_ireland_sample_ms) AS binance_price,
-            argMax(target_price, ts_ireland_sample_ms) AS target_price
-        FROM polyedge_forge.snapshot_100ms
-        WHERE symbol='BTCUSDT'
-          AND timeframe='{market_type}'
-          {ts_filter}
-        GROUP BY ts_ms
-        ORDER BY ts_ms ASC
-        LIMIT {max_points}
-        FORMAT JSON"
-    );
-    let rows = rows_from_json(query_clickhouse_json(ch_url, &q).await?);
-    let samples = parse_strategy_rows(rows);
+    let samples = load_strategy_samples(&state, market_type, full_history, lookback_minutes, max_points).await?;
     if samples.len() < 20 {
         return Ok(Json(json!({
             "market_type": market_type,
@@ -2473,48 +2601,10 @@ async fn strategy_full(
         .clamp(20_000, 5_000_000);
     let max_trades = params.max_trades.unwrap_or(300).clamp(20, 1000) as usize;
     let max_arms = params.max_arms.unwrap_or(8).clamp(2, 24) as usize;
+    let window_trades = params.window_trades.unwrap_or(50).clamp(10, 200) as usize;
+    let target_win_rate = params.target_win_rate.unwrap_or(80.0).clamp(40.0, 99.9);
 
-    let Some(ch_url) = state.ch_url.as_deref() else {
-        return Err(ApiError::internal("clickhouse not configured"));
-    };
-    let from_ms = Utc::now()
-        .timestamp_millis()
-        .saturating_sub(i64::from(lookback_minutes) * 60_000);
-    let ts_filter = if full_history {
-        String::new()
-    } else {
-        format!("AND ts_ireland_sample_ms >= {from_ms}")
-    };
-    let q = format!(
-        "SELECT
-            intDiv(ts_ireland_sample_ms, 1000) * 1000 AS ts_ms,
-            argMax(round_id, ts_ireland_sample_ms) AS round_id,
-            argMax(remaining_ms, ts_ireland_sample_ms) AS remaining_ms,
-            argMax(mid_yes, ts_ireland_sample_ms) AS mid_yes,
-            argMax(mid_yes_smooth, ts_ireland_sample_ms) AS mid_yes_smooth,
-            argMax(mid_no, ts_ireland_sample_ms) AS mid_no,
-            argMax(mid_no_smooth, ts_ireland_sample_ms) AS mid_no_smooth,
-            argMax(bid_yes, ts_ireland_sample_ms) AS bid_yes,
-            argMax(ask_yes, ts_ireland_sample_ms) AS ask_yes,
-            argMax(bid_no, ts_ireland_sample_ms) AS bid_no,
-            argMax(ask_no, ts_ireland_sample_ms) AS ask_no,
-            argMax(delta_pct, ts_ireland_sample_ms) AS delta_pct,
-            argMax(delta_pct_smooth, ts_ireland_sample_ms) AS delta_pct_smooth,
-            argMax(velocity_bps_per_sec, ts_ireland_sample_ms) AS velocity_bps_per_sec,
-            argMax(acceleration, ts_ireland_sample_ms) AS acceleration,
-            argMax(binance_price, ts_ireland_sample_ms) AS binance_price,
-            argMax(target_price, ts_ireland_sample_ms) AS target_price
-        FROM polyedge_forge.snapshot_100ms
-        WHERE symbol='BTCUSDT'
-          AND timeframe='{market_type}'
-          {ts_filter}
-        GROUP BY ts_ms
-        ORDER BY ts_ms ASC
-        LIMIT {max_points}
-        FORMAT JSON"
-    );
-    let rows = rows_from_json(query_clickhouse_json(ch_url, &q).await?);
-    let samples = parse_strategy_rows(rows);
+    let samples = load_strategy_samples(&state, market_type, full_history, lookback_minutes, max_points).await?;
     if samples.len() < 20 {
         return Ok(Json(json!({
             "market_type": market_type,
@@ -2529,11 +2619,21 @@ async fn strategy_full(
     let mut evaluations: Vec<Value> = Vec::new();
     for (name, cfg) in &arms {
         let run = run_strategy_simulation(&samples, cfg, max_trades);
-        let objective = run.win_rate_pct * 1.9
-            + run.avg_pnl_cents * 2.2
-            + (run.total_pnl_cents.max(0.0) * 0.02)
-            + (run.avg_duration_s.min(180.0) * 0.04)
-            - (run.max_drawdown_cents * 0.02);
+        let rs = compute_rolling_stats(&run.all_trade_pnls, window_trades);
+        let objective = if rs.windows > 0 {
+            rs.latest_win_rate_pct * 2.8
+                + rs.avg_win_rate_pct * 1.7
+                + rs.min_win_rate_pct * 0.6
+                + run.avg_pnl_cents * 2.0
+                + run.total_pnl_cents.max(0.0) * 0.02
+                - run.max_drawdown_cents * 0.02
+                + if rs.latest_win_rate_pct >= target_win_rate { 120.0 } else { 0.0 }
+        } else {
+            run.win_rate_pct
+                + run.avg_pnl_cents
+                + run.total_pnl_cents.max(0.0) * 0.01
+                - 120.0
+        };
         evaluations.push(json!({
             "name": name,
             "objective": objective,
@@ -2544,7 +2644,9 @@ async fn strategy_full(
                 "avg_duration_s": run.avg_duration_s,
                 "total_pnl_cents": run.total_pnl_cents,
                 "max_drawdown_cents": run.max_drawdown_cents,
+                "max_profit_trade_cents": run.max_profit_trade_cents,
             },
+            "rolling_window": rolling_stats_json(rs),
             "config": {
                 "entry_threshold_base": cfg.entry_threshold_base,
                 "entry_threshold_cap": cfg.entry_threshold_cap,
@@ -2579,21 +2681,20 @@ async fn strategy_full(
     let max_win_rate = evaluations
         .iter()
         .map(|v| {
-            v.get("summary")
-                .and_then(|s| s.get("win_rate_pct"))
+            v.get("rolling_window")
+                .and_then(|s| s.get("latest_win_rate_pct"))
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0)
         })
         .fold(0.0_f64, f64::max);
     let max_profit_per_trade_cents = evaluations
         .iter()
-        .flat_map(|v| {
-            v.get("trades")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default()
+        .map(|v| {
+            v.get("summary")
+                .and_then(|s| s.get("max_profit_trade_cents"))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
         })
-        .map(|t| row_f64(&t, "pnl_cents").unwrap_or(0.0))
         .fold(f64::NEG_INFINITY, f64::max);
 
     // Lightweight online learner (UCB1) replay by round for arm adaptation preview.
@@ -2650,6 +2751,8 @@ async fn strategy_full(
         "market_type": market_type,
         "full_history": full_history,
         "lookback_minutes": lookback_minutes,
+        "target_win_rate_pct": target_win_rate,
+        "window_trades": window_trades,
         "samples": samples.len(),
         "rounds": rounds.len(),
         "arms_tested": evaluations.len(),
@@ -2662,6 +2765,285 @@ async fn strategy_full(
         "learner_ucb": {
             "arms": learner_arms
         }
+    })))
+}
+
+fn clamp_runtime_cfg(cfg: &mut StrategyRuntimeConfig) {
+    cfg.entry_threshold_base = cfg.entry_threshold_base.clamp(0.40, 0.95);
+    cfg.entry_threshold_cap = cfg
+        .entry_threshold_cap
+        .clamp(cfg.entry_threshold_base, 0.99);
+    cfg.spread_limit_prob = cfg.spread_limit_prob.clamp(0.005, 0.12);
+    cfg.entry_edge_prob = cfg.entry_edge_prob.clamp(0.002, 0.25);
+    cfg.entry_min_potential_cents = cfg.entry_min_potential_cents.clamp(1.0, 70.0);
+    cfg.entry_max_price_cents = cfg.entry_max_price_cents.clamp(45.0, 98.5);
+    cfg.min_hold_ms = cfg.min_hold_ms.clamp(0, 240_000);
+    cfg.stop_loss_cents = cfg.stop_loss_cents.clamp(2.0, 60.0);
+    cfg.reverse_signal_threshold = cfg.reverse_signal_threshold.clamp(-0.95, -0.02);
+    cfg.reverse_signal_ticks = cfg.reverse_signal_ticks.clamp(1, 12);
+    cfg.trail_activate_profit_cents = cfg.trail_activate_profit_cents.clamp(2.0, 80.0);
+    cfg.trail_drawdown_cents = cfg.trail_drawdown_cents.clamp(1.0, 50.0);
+    cfg.take_profit_near_max_cents = cfg.take_profit_near_max_cents.clamp(70.0, 99.5);
+    cfg.endgame_take_profit_cents = cfg.endgame_take_profit_cents.clamp(50.0, 99.0);
+    cfg.endgame_remaining_ms = cfg.endgame_remaining_ms.clamp(1_000, 180_000);
+    cfg.liquidity_widen_prob = cfg.liquidity_widen_prob.clamp(0.01, 0.2);
+    cfg.cooldown_ms = cfg.cooldown_ms.clamp(0, 120_000);
+    cfg.max_entries_per_round = cfg.max_entries_per_round.clamp(1, 8);
+}
+
+fn lcg_next(seed: &mut u64) -> f64 {
+    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+    let x = (*seed >> 33) as u32;
+    (x as f64) / (u32::MAX as f64)
+}
+
+fn mutate_cfg(parent: &StrategyRuntimeConfig, seed: &mut u64, iter: usize, max_iter: usize) -> StrategyRuntimeConfig {
+    let mut c = *parent;
+    let progress = if max_iter > 0 {
+        (iter as f64 / max_iter as f64).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let scale = (1.0 - progress * 0.7).clamp(0.25, 1.0);
+    let r = |seed: &mut u64| -> f64 { lcg_next(seed) * 2.0 - 1.0 };
+
+    c.entry_threshold_base += r(seed) * 0.08 * scale;
+    c.entry_threshold_cap += r(seed) * 0.08 * scale;
+    c.spread_limit_prob += r(seed) * 0.012 * scale;
+    c.entry_edge_prob += r(seed) * 0.02 * scale;
+    c.entry_min_potential_cents += r(seed) * 8.0 * scale;
+    c.entry_max_price_cents += r(seed) * 8.0 * scale;
+    c.min_hold_ms += (r(seed) * 30_000.0 * scale) as i64;
+    c.stop_loss_cents += r(seed) * 8.0 * scale;
+    c.reverse_signal_threshold += r(seed) * 0.18 * scale;
+    c.reverse_signal_ticks = ((c.reverse_signal_ticks as f64) + r(seed) * 2.5 * scale).round() as usize;
+    c.trail_activate_profit_cents += r(seed) * 10.0 * scale;
+    c.trail_drawdown_cents += r(seed) * 6.0 * scale;
+    c.take_profit_near_max_cents += r(seed) * 4.0 * scale;
+    c.endgame_take_profit_cents += r(seed) * 5.0 * scale;
+    c.endgame_remaining_ms += (r(seed) * 30_000.0 * scale) as i64;
+    c.liquidity_widen_prob += r(seed) * 0.03 * scale;
+    c.cooldown_ms += (r(seed) * 8_000.0 * scale) as i64;
+    c.max_entries_per_round = ((c.max_entries_per_round as f64) + r(seed) * 1.5 * scale).round() as usize;
+    clamp_runtime_cfg(&mut c);
+    c
+}
+
+fn score_with_rolling(
+    run: &StrategySimulationResult,
+    window_trades: usize,
+    target_win_rate: f64,
+) -> (RollingStats, f64, bool) {
+    let rs = compute_rolling_stats(&run.all_trade_pnls, window_trades);
+    let target_hit = rs.windows > 0
+        && rs.latest_win_rate_pct >= target_win_rate
+        && run.avg_pnl_cents > 0.0
+        && run.trade_count >= window_trades;
+    let objective = if rs.windows > 0 {
+        rs.latest_win_rate_pct * 3.2
+            + rs.avg_win_rate_pct * 1.8
+            + rs.min_win_rate_pct * 0.8
+            + run.avg_pnl_cents * 2.2
+            + run.total_pnl_cents.max(0.0) * 0.02
+            - run.max_drawdown_cents * 0.02
+            + if target_hit { 160.0 } else { 0.0 }
+    } else {
+        run.win_rate_pct + run.avg_pnl_cents - 180.0
+    };
+    (rs, objective, target_hit)
+}
+
+async fn strategy_optimize(
+    State(state): State<ApiState>,
+    Query(params): Query<StrategyOptimizeQueryParams>,
+) -> Result<Json<Value>, ApiError> {
+    let market_type = if let Some(mt) = params.market_type.as_deref() {
+        normalize_market_type(mt).ok_or_else(|| ApiError::bad_request("invalid market_type"))?
+    } else {
+        "5m"
+    };
+    let full_history = params.full_history.unwrap_or(true);
+    let lookback_minutes = params
+        .lookback_minutes
+        .unwrap_or(if full_history { 30 * 24 * 60 } else { 12 * 60 })
+        .clamp(30, 365 * 24 * 60);
+    let max_points = params
+        .max_points
+        .unwrap_or(if full_history { 2_400_000 } else { 220_000 })
+        .clamp(20_000, 5_000_000);
+    let max_trades = params.max_trades.unwrap_or(400).clamp(20, 2000) as usize;
+    let max_arms = params.max_arms.unwrap_or(8).clamp(2, 24) as usize;
+    let window_trades = params.window_trades.unwrap_or(50).clamp(10, 200) as usize;
+    let target_win_rate = params.target_win_rate.unwrap_or(80.0).clamp(40.0, 99.9);
+    let iterations = params.iterations.unwrap_or(600).clamp(50, 5000) as usize;
+
+    let samples = load_strategy_samples(&state, market_type, full_history, lookback_minutes, max_points).await?;
+    if samples.len() < 20 {
+        return Ok(Json(json!({
+            "market_type": market_type,
+            "full_history": full_history,
+            "samples": samples.len(),
+            "error": "not enough samples",
+        })));
+    }
+
+    let base_cfg = StrategyRuntimeConfig::default();
+    let pool: Vec<(String, StrategyRuntimeConfig)> = build_strategy_arms(base_cfg, max_arms);
+    let mut seed = 0xC0DEC0DE1234ABCDu64;
+
+    let mut leaderboard: Vec<Value> = Vec::new();
+    let mut best_objective = f64::NEG_INFINITY;
+    let mut best_payload = Value::Null;
+    let mut reached_target = false;
+
+    // warmup evaluate initial arms
+    for (name, cfg) in &pool {
+        let run = run_strategy_simulation(&samples, cfg, max_trades);
+        let (rs, objective, hit) = score_with_rolling(&run, window_trades, target_win_rate);
+        let payload = json!({
+            "name": name,
+            "objective": objective,
+            "rolling_window": rolling_stats_json(rs),
+            "summary": {
+                "trade_count": run.trade_count,
+                "win_rate_pct": run.win_rate_pct,
+                "avg_pnl_cents": run.avg_pnl_cents,
+                "avg_duration_s": run.avg_duration_s,
+                "total_pnl_cents": run.total_pnl_cents,
+                "max_drawdown_cents": run.max_drawdown_cents,
+                "max_profit_trade_cents": run.max_profit_trade_cents,
+            },
+            "config": {
+                "entry_threshold_base": cfg.entry_threshold_base,
+                "entry_threshold_cap": cfg.entry_threshold_cap,
+                "spread_limit_prob": cfg.spread_limit_prob,
+                "entry_edge_prob": cfg.entry_edge_prob,
+                "entry_min_potential_cents": cfg.entry_min_potential_cents,
+                "entry_max_price_cents": cfg.entry_max_price_cents,
+                "min_hold_ms": cfg.min_hold_ms,
+                "stop_loss_cents": cfg.stop_loss_cents,
+                "reverse_signal_threshold": cfg.reverse_signal_threshold,
+                "reverse_signal_ticks": cfg.reverse_signal_ticks,
+                "trail_activate_profit_cents": cfg.trail_activate_profit_cents,
+                "trail_drawdown_cents": cfg.trail_drawdown_cents,
+                "take_profit_near_max_cents": cfg.take_profit_near_max_cents,
+                "endgame_take_profit_cents": cfg.endgame_take_profit_cents,
+                "endgame_remaining_ms": cfg.endgame_remaining_ms,
+                "liquidity_widen_prob": cfg.liquidity_widen_prob,
+                "cooldown_ms": cfg.cooldown_ms,
+                "max_entries_per_round": cfg.max_entries_per_round,
+            },
+        });
+        leaderboard.push(payload.clone());
+        if objective > best_objective {
+            best_objective = objective;
+            best_payload = payload;
+        }
+        if hit {
+            reached_target = true;
+        }
+    }
+    leaderboard.sort_by(|a, b| {
+        let av = a.get("objective").and_then(Value::as_f64).unwrap_or(f64::NEG_INFINITY);
+        let bv = b.get("objective").and_then(Value::as_f64).unwrap_or(f64::NEG_INFINITY);
+        bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    leaderboard.truncate(16);
+
+    if !reached_target {
+        for iter in 0..iterations {
+            let elite_count = min(leaderboard.len(), 4).max(1);
+            let pick = (lcg_next(&mut seed) * elite_count as f64).floor() as usize;
+            let parent_cfg = if let Some(parent) = leaderboard.get(pick) {
+                let mut c = base_cfg;
+                if let Some(v) = parent.get("config").and_then(|v| v.get("entry_threshold_base")).and_then(Value::as_f64) { c.entry_threshold_base = v; }
+                if let Some(v) = parent.get("config").and_then(|v| v.get("entry_threshold_cap")).and_then(Value::as_f64) { c.entry_threshold_cap = v; }
+                if let Some(v) = parent.get("config").and_then(|v| v.get("spread_limit_prob")).and_then(Value::as_f64) { c.spread_limit_prob = v; }
+                if let Some(v) = parent.get("config").and_then(|v| v.get("entry_edge_prob")).and_then(Value::as_f64) { c.entry_edge_prob = v; }
+                if let Some(v) = parent.get("config").and_then(|v| v.get("entry_min_potential_cents")).and_then(Value::as_f64) { c.entry_min_potential_cents = v; }
+                if let Some(v) = parent.get("config").and_then(|v| v.get("entry_max_price_cents")).and_then(Value::as_f64) { c.entry_max_price_cents = v; }
+                if let Some(v) = parent.get("config").and_then(|v| v.get("min_hold_ms")).and_then(Value::as_i64) { c.min_hold_ms = v; }
+                if let Some(v) = parent.get("config").and_then(|v| v.get("stop_loss_cents")).and_then(Value::as_f64) { c.stop_loss_cents = v; }
+                if let Some(v) = parent.get("config").and_then(|v| v.get("reverse_signal_threshold")).and_then(Value::as_f64) { c.reverse_signal_threshold = v; }
+                if let Some(v) = parent.get("config").and_then(|v| v.get("reverse_signal_ticks")).and_then(Value::as_u64) { c.reverse_signal_ticks = v as usize; }
+                if let Some(v) = parent.get("config").and_then(|v| v.get("trail_activate_profit_cents")).and_then(Value::as_f64) { c.trail_activate_profit_cents = v; }
+                if let Some(v) = parent.get("config").and_then(|v| v.get("trail_drawdown_cents")).and_then(Value::as_f64) { c.trail_drawdown_cents = v; }
+                if let Some(v) = parent.get("config").and_then(|v| v.get("take_profit_near_max_cents")).and_then(Value::as_f64) { c.take_profit_near_max_cents = v; }
+                if let Some(v) = parent.get("config").and_then(|v| v.get("endgame_take_profit_cents")).and_then(Value::as_f64) { c.endgame_take_profit_cents = v; }
+                if let Some(v) = parent.get("config").and_then(|v| v.get("endgame_remaining_ms")).and_then(Value::as_i64) { c.endgame_remaining_ms = v; }
+                if let Some(v) = parent.get("config").and_then(|v| v.get("liquidity_widen_prob")).and_then(Value::as_f64) { c.liquidity_widen_prob = v; }
+                if let Some(v) = parent.get("config").and_then(|v| v.get("cooldown_ms")).and_then(Value::as_i64) { c.cooldown_ms = v; }
+                if let Some(v) = parent.get("config").and_then(|v| v.get("max_entries_per_round")).and_then(Value::as_u64) { c.max_entries_per_round = v as usize; }
+                c
+            } else {
+                base_cfg
+            };
+            let candidate_cfg = mutate_cfg(&parent_cfg, &mut seed, iter, iterations);
+            let run = run_strategy_simulation(&samples, &candidate_cfg, max_trades);
+            let (rs, objective, hit) = score_with_rolling(&run, window_trades, target_win_rate);
+            let payload = json!({
+                "name": format!("iter_{iter}"),
+                "objective": objective,
+                "rolling_window": rolling_stats_json(rs),
+                "summary": {
+                    "trade_count": run.trade_count,
+                    "win_rate_pct": run.win_rate_pct,
+                    "avg_pnl_cents": run.avg_pnl_cents,
+                    "avg_duration_s": run.avg_duration_s,
+                    "total_pnl_cents": run.total_pnl_cents,
+                    "max_drawdown_cents": run.max_drawdown_cents,
+                    "max_profit_trade_cents": run.max_profit_trade_cents,
+                },
+                "config": {
+                    "entry_threshold_base": candidate_cfg.entry_threshold_base,
+                    "entry_threshold_cap": candidate_cfg.entry_threshold_cap,
+                    "spread_limit_prob": candidate_cfg.spread_limit_prob,
+                    "entry_edge_prob": candidate_cfg.entry_edge_prob,
+                    "entry_min_potential_cents": candidate_cfg.entry_min_potential_cents,
+                    "entry_max_price_cents": candidate_cfg.entry_max_price_cents,
+                    "min_hold_ms": candidate_cfg.min_hold_ms,
+                    "stop_loss_cents": candidate_cfg.stop_loss_cents,
+                    "reverse_signal_threshold": candidate_cfg.reverse_signal_threshold,
+                    "reverse_signal_ticks": candidate_cfg.reverse_signal_ticks,
+                    "trail_activate_profit_cents": candidate_cfg.trail_activate_profit_cents,
+                    "trail_drawdown_cents": candidate_cfg.trail_drawdown_cents,
+                    "take_profit_near_max_cents": candidate_cfg.take_profit_near_max_cents,
+                    "endgame_take_profit_cents": candidate_cfg.endgame_take_profit_cents,
+                    "endgame_remaining_ms": candidate_cfg.endgame_remaining_ms,
+                    "liquidity_widen_prob": candidate_cfg.liquidity_widen_prob,
+                    "cooldown_ms": candidate_cfg.cooldown_ms,
+                    "max_entries_per_round": candidate_cfg.max_entries_per_round,
+                },
+            });
+            leaderboard.push(payload.clone());
+            leaderboard.sort_by(|a, b| {
+                let av = a.get("objective").and_then(Value::as_f64).unwrap_or(f64::NEG_INFINITY);
+                let bv = b.get("objective").and_then(Value::as_f64).unwrap_or(f64::NEG_INFINITY);
+                bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            leaderboard.truncate(16);
+            if objective > best_objective {
+                best_objective = objective;
+                best_payload = payload;
+            }
+            if hit {
+                reached_target = true;
+                break;
+            }
+        }
+    }
+
+    Ok(Json(json!({
+        "market_type": market_type,
+        "full_history": full_history,
+        "lookback_minutes": lookback_minutes,
+        "samples": samples.len(),
+        "target_win_rate_pct": target_win_rate,
+        "window_trades": window_trades,
+        "iterations_requested": iterations,
+        "target_reached": reached_target,
+        "best": best_payload,
+        "leaderboard": leaderboard,
     })))
 }
 
