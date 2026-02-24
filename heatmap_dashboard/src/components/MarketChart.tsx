@@ -46,11 +46,10 @@ function clamp(v: number, lo: number, hi: number): number {
 }
 
 const ONE_SECOND_MS = 1_000;
-const HOLD_LAST_MAX_GAP_MS = 3_600_000;
+const HOLD_LAST_MAX_GAP_MS = 3_000;
 const PAIR_SUM_TOLERANCE_CENTS = 6;
 const DISPLAY_CENT_STEP = 1.0;
 const DELTA_AXIS_HEADROOM_PCT = 0.05;
-const SHORT_GAP_HOLD_BUCKETS = 3_600;
 
 function toMidCents(
   bid: number | null | undefined,
@@ -152,69 +151,6 @@ function computeVisiblePctRange(
     return computeRobustPctRange(values);
   }
   return computeRobustPctRange(visible);
-}
-
-function holdShortNullGaps(
-  values: Array<number | null>,
-  maxGapBuckets: number
-): Array<number | null> {
-  const out: Array<number | null> = new Array(values.length).fill(null);
-  let last: number | null = null;
-  let gapCount = 0;
-
-  for (let i = 0; i < values.length; i += 1) {
-    const v = values[i];
-    if (v != null && Number.isFinite(v)) {
-      out[i] = v;
-      last = v;
-      gapCount = 0;
-      continue;
-    }
-    if (last != null && gapCount < maxGapBuckets) {
-      // Preserve continuity for short feed holes and round-switch micro-gaps.
-      out[i] = last;
-      gapCount += 1;
-      continue;
-    }
-    out[i] = null;
-    last = null;
-    gapCount = 0;
-  }
-  return out;
-}
-
-function fillSeriesContinuity(values: Array<number | null>): Array<number | null> {
-  if (values.length === 0) {
-    return values;
-  }
-  const out = [...values];
-  let firstFinite: number | null = null;
-  for (const v of out) {
-    if (v != null && Number.isFinite(v)) {
-      firstFinite = v;
-      break;
-    }
-  }
-  if (firstFinite == null) {
-    return out;
-  }
-  for (let i = 0; i < out.length; i += 1) {
-    if (out[i] == null || !Number.isFinite(out[i])) {
-      out[i] = firstFinite;
-    } else {
-      break;
-    }
-  }
-  let last = out[0] ?? firstFinite;
-  for (let i = 1; i < out.length; i += 1) {
-    const v = out[i];
-    if (v == null || !Number.isFinite(v)) {
-      out[i] = last;
-      continue;
-    }
-    last = v;
-  }
-  return out;
 }
 
 function toDisplayUpCents(p: ChartPoint): number | null {
@@ -411,8 +347,9 @@ function bucketizePoints(points: ChartPoint[]): ChartPoint[] {
     if (bucket - lastObs.sourceTsMs <= HOLD_LAST_MAX_GAP_MS) {
       out.push(synthPoint(lastObs.source, ts, lastObs.delta, lastObs.up, lastObs.down));
     } else {
-      // Display layer keeps continuity for long feed holes to avoid broken chart segments.
-      out.push(synthPoint(lastObs.source, ts, lastObs.delta, lastObs.up, lastObs.down));
+      // Long feed holes should be visible as gaps instead of synthetic continuity.
+      out.push(synthPoint(lastObs.source, ts, null, null, null, true));
+      lastObs = null;
     }
   }
   return out;
@@ -423,33 +360,38 @@ function preparePlot(points: ChartPoint[]): PreparedPlot {
   const xs: number[] = [];
   const delta: Array<number | null> = [];
   const upRaw: Array<number | null> = [];
+  let prevRoundId = "";
 
   for (const p of bucketed) {
     if (!Number.isFinite(p.timestamp_ms) || p.timestamp_ms <= 0) {
       continue;
     }
+    if (prevRoundId && p.round_id && p.round_id !== prevRoundId) {
+      const gapTs = Math.max(
+        (xs[xs.length - 1] ?? p.timestamp_ms / 1000) + 0.001,
+        p.timestamp_ms / 1000 - 0.001
+      );
+      xs.push(gapTs);
+      delta.push(null);
+      upRaw.push(null);
+    }
     const pair = resolvePairFromPoint(p);
     xs.push(p.timestamp_ms / 1000);
     delta.push(resolveDeltaPct(p));
     upRaw.push(pair.up);
+    if (p.round_id) {
+      prevRoundId = p.round_id;
+    }
   }
 
-  // Keep display deterministic: 1s bucket + quote normalization + hold-last.
-  const upDisplay = holdShortNullGaps(
-    upRaw.map((v) => quantizeCents(v)),
-    SHORT_GAP_HOLD_BUCKETS
+  const upDisplay = upRaw.map((v) => quantizeCents(v));
+  const downDisplay = upDisplay.map((v) => (v == null ? null : quantizeCents(100 - v)));
+  const deltaDisplay = delta.map((v) =>
+    v == null || !Number.isFinite(v) ? null : Number(v.toFixed(4))
   );
-  const upContinuous = fillSeriesContinuity(upDisplay);
-  const downDisplay = upContinuous.map((v) => (v == null ? null : quantizeCents(100 - v)));
-  const downContinuous = fillSeriesContinuity(downDisplay);
-  const deltaDisplay = holdShortNullGaps(
-    delta.map((v) => (v == null || !Number.isFinite(v) ? null : Number(v.toFixed(4)))),
-    SHORT_GAP_HOLD_BUCKETS
-  );
-  const deltaContinuous = fillSeriesContinuity(deltaDisplay);
 
   return {
-    data: [xs, deltaContinuous, upContinuous, downContinuous],
+    data: [xs, deltaDisplay, upDisplay, downDisplay],
     bucketed
   };
 }

@@ -253,9 +253,9 @@ function normalizeLiveSnapshot(
   nextRaw: LiveSnapshot
 ): LiveSnapshot {
   const preferredUpMid =
-    finiteOrNull(nextRaw.mid_yes) ?? finiteOrNull(nextRaw.mid_yes_smooth);
+    finiteOrNull(nextRaw.mid_yes_smooth) ?? finiteOrNull(nextRaw.mid_yes);
   const preferredDownMid =
-    finiteOrNull(nextRaw.mid_no) ?? finiteOrNull(nextRaw.mid_no_smooth);
+    finiteOrNull(nextRaw.mid_no_smooth) ?? finiteOrNull(nextRaw.mid_no);
 
   const up = quoteFromPreferredMid(
     preferredUpMid,
@@ -782,7 +782,10 @@ export default function App() {
     };
 
     const prevStable = stableLiveRef.current[marketType];
-    const stablePoint = normalizeLiveSnapshot(prevStable, livePoint);
+    const stablePoint = normalizeLiveSnapshot(
+      prevStable?.round_id === livePoint.round_id ? prevStable : null,
+      livePoint
+    );
     stableLiveRef.current[marketType] = stablePoint;
 
     setLive((prev) => ({ ...prev, [marketType]: stablePoint }));
@@ -801,13 +804,13 @@ export default function App() {
         delta_pct: stablePoint.delta_pct_smooth ?? stablePoint.delta_pct,
         delta_pct_smooth: stablePoint.delta_pct_smooth ?? stablePoint.delta_pct ?? null,
         mid_yes:
-          stablePoint.mid_yes ??
           stablePoint.mid_yes_smooth ??
+          stablePoint.mid_yes ??
           midpointProb(stablePoint.best_bid_up, stablePoint.best_ask_up),
         mid_yes_smooth: stablePoint.mid_yes_smooth ?? stablePoint.mid_yes ?? null,
         mid_no:
-          stablePoint.mid_no ??
           stablePoint.mid_no_smooth ??
+          stablePoint.mid_no ??
           midpointProb(stablePoint.best_bid_down, stablePoint.best_ask_down),
         mid_no_smooth: stablePoint.mid_no_smooth ?? stablePoint.mid_no ?? null,
         best_bid_up: stablePoint.best_bid_up,
@@ -913,10 +916,10 @@ export default function App() {
             mid_no: r.mid_no ?? null,
             mid_yes_smooth: r.mid_yes_smooth ?? null,
             mid_no_smooth: r.mid_no_smooth ?? null,
-            best_bid_up: r.bid_yes ?? r.mid_yes ?? r.mid_yes_smooth,
-            best_ask_up: r.ask_yes ?? r.mid_yes ?? r.mid_yes_smooth,
-            best_bid_down: r.bid_no ?? r.mid_no ?? r.mid_no_smooth,
-            best_ask_down: r.ask_no ?? r.mid_no ?? r.mid_no_smooth,
+            best_bid_up: r.bid_yes ?? r.mid_yes_smooth ?? r.mid_yes,
+            best_ask_up: r.ask_yes ?? r.mid_yes_smooth ?? r.mid_yes,
+            best_bid_down: r.bid_no ?? r.mid_no_smooth ?? r.mid_no,
+            best_ask_down: r.ask_no ?? r.mid_no_smooth ?? r.mid_no,
             time_remaining_s: r.remaining_ms / 1000,
             velocity_bps_per_sec: r.velocity_bps_per_sec ?? null,
             acceleration: r.acceleration ?? null,

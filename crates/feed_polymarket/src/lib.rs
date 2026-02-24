@@ -661,9 +661,6 @@ fn collect_asset_updates(payload: &WsEvent, out: &mut Vec<AssetUpdate>) {
     if let Some(update) = parse_single_asset_update(payload) {
         out.push(update);
     }
-    if let Some(update) = parse_tick_side_update(payload) {
-        out.push(update);
-    }
     if let Some(update) = parse_change_based_update(payload) {
         out.push(update);
     }
@@ -719,6 +716,9 @@ fn parse_single_asset_update(payload: &WsEvent) -> Option<AssetUpdate> {
         top_level_price_and_size(payload.asks.as_ref().or(payload.sells.as_ref()));
     let best_ask = payload.best_ask.or(ask_top_price);
     let best_ask_size = ask_top_size;
+    if best_bid.is_none() && best_ask.is_none() {
+        return None;
+    }
 
     Some(AssetUpdate {
         asset_id,
@@ -774,36 +774,6 @@ fn parse_change_based_update(payload: &WsEvent) -> Option<AssetUpdate> {
         best_bid_size: bid_size,
         best_ask,
         best_ask_size: ask_size,
-        ts_exchange_ms: payload.timestamp.unwrap_or_else(now_ms),
-        recv_ts_local_ns: now_ns(),
-    })
-}
-
-fn parse_tick_side_update(payload: &WsEvent) -> Option<AssetUpdate> {
-    let asset_id = payload.asset_id.clone()?;
-    let price = payload.price?;
-    if !validate_price(price) {
-        return None;
-    }
-    let side = payload
-        .side
-        .as_deref()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    let size = payload.size;
-    let (best_bid, best_bid_size, best_ask, best_ask_size) =
-        if side == "sell" || side == "ask" {
-            (None, None, Some(price), size)
-        } else {
-            (Some(price), size, None, None)
-        };
-    Some(AssetUpdate {
-        asset_id,
-        best_bid,
-        best_bid_size,
-        best_ask,
-        best_ask_size,
         ts_exchange_ms: payload.timestamp.unwrap_or_else(now_ms),
         recv_ts_local_ns: now_ns(),
     })
@@ -960,12 +930,6 @@ struct WsEvent {
     best_ask: Option<f64>,
     #[serde(default, deserialize_with = "de_opt_i64")]
     timestamp: Option<i64>,
-    #[serde(default)]
-    side: Option<String>,
-    #[serde(default, deserialize_with = "de_opt_f64")]
-    price: Option<f64>,
-    #[serde(default, deserialize_with = "de_opt_f64")]
-    size: Option<f64>,
     #[serde(default)]
     hash: Option<String>,
     #[serde(default)]
@@ -1137,20 +1101,14 @@ mod tests {
 
         let mut updates = parse_asset_updates(&payload);
         updates.sort_by(|a, b| a.asset_id.cmp(&b.asset_id));
-        assert_eq!(updates.len(), 3);
+        assert_eq!(updates.len(), 2);
 
         let no = &updates[0];
         assert_eq!(no.asset_id, "no_token");
         assert_eq!(no.best_bid, Some(0.36));
         assert_eq!(no.best_ask, Some(0.37));
 
-        let tick = &updates[1];
-        assert_eq!(tick.asset_id, "tick_token");
-        assert_eq!(tick.best_bid, Some(0.41));
-        assert_eq!(tick.best_bid_size, Some(12.0));
-        assert_eq!(tick.best_ask, None);
-
-        let yes = &updates[2];
+        let yes = &updates[1];
         assert_eq!(yes.asset_id, "yes_token");
         assert_eq!(yes.best_bid, Some(0.63));
         assert_eq!(yes.best_ask, Some(0.64));

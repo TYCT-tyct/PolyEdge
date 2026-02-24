@@ -222,6 +222,26 @@ struct StableQuote {
     ask_no: f64,
 }
 
+fn fused_up_probability(quote: &StableQuote, prev_up: Option<f64>) -> f64 {
+    let up_from_yes = ((quote.bid_yes + quote.ask_yes) * 0.5).clamp(0.0, 1.0);
+    let up_from_no = (1.0 - (quote.bid_no + quote.ask_no) * 0.5).clamp(0.0, 1.0);
+    let diff = (up_from_yes - up_from_no).abs();
+
+    let fused = if diff <= 0.16 {
+        (up_from_yes + up_from_no) * 0.5
+    } else if let Some(prev) = prev_up {
+        if (up_from_yes - prev).abs() <= (up_from_no - prev).abs() {
+            up_from_yes
+        } else {
+            up_from_no
+        }
+    } else {
+        (up_from_yes + up_from_no) * 0.5
+    };
+
+    fused.clamp(0.0, 1.0)
+}
+
 fn sanitize_prob(v: f64) -> Option<f64> {
     if v.is_finite() {
         Some(v.clamp(0.0, 1.0))
@@ -654,13 +674,12 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         (Some(d), Some(target)) if target > 0.0 => Some((d / target) * 100.0),
                         _ => None,
                     };
-                    let raw_mid_yes = (stable_quote.bid_yes + stable_quote.ask_yes) * 0.5;
-                    let raw_mid_no = (stable_quote.bid_no + stable_quote.ask_no) * 0.5;
-                    let raw_sum = (raw_mid_yes + raw_mid_no).max(1e-9);
-                    let raw_mid_yes_norm = (raw_mid_yes / raw_sum).clamp(0.0, 1.0);
+                    let prev_prob_state = prob_smooth_by_round.get(&round_id).copied();
+                    let raw_mid_yes_norm =
+                        fused_up_probability(&stable_quote, prev_prob_state.map(|s| s.ema_up));
                     let raw_mid_no_norm = (1.0 - raw_mid_yes_norm).clamp(0.0, 1.0);
                     let (mid_yes_smooth, mid_no_smooth, delta_pct_smooth) = {
-                        if let Some(prev) = prob_smooth_by_round.get(&round_id).copied() {
+                        if let Some(prev) = prev_prob_state {
                             let dt_ms = now_ms.saturating_sub(prev.ts_ms);
                             let dt_s_raw = (dt_ms as f64 / 1000.0).max(0.0);
                             let dt_s = dt_s_raw.clamp(MOTION_MIN_DT_SEC, MOTION_MAX_DT_SEC);
@@ -778,8 +797,8 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         timeframe: market.timeframe.clone(),
                         title: market.title.clone(),
                         target_price,
-                        mid_yes: raw_mid_yes,
-                        mid_no: raw_mid_no,
+                        mid_yes: raw_mid_yes_norm,
+                        mid_no: raw_mid_no_norm,
                         mid_yes_smooth,
                         mid_no_smooth,
                         bid_yes: stable_quote.bid_yes,
