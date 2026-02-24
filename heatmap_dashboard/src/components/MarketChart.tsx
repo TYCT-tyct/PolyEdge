@@ -72,6 +72,12 @@ const HOLD_LAST_MAX_GAP_MS = 3_000;
 const PAIR_SUM_TOLERANCE_CENTS = 6;
 const DISPLAY_CENT_STEP = 1.0;
 const DELTA_AXIS_HEADROOM_PCT = 0.05;
+const VIS_UP_STEP_CAP_CENTS_PER_SEC = 10;
+const VIS_UP_STEP_CAP_CENTS_MID_CLOSE_PER_SEC = 18;
+const VIS_UP_STEP_CAP_CENTS_NEAR_CLOSE_PER_SEC = 28;
+const VIS_UP_EMA_ALPHA = 0.30;
+const VIS_UP_EMA_ALPHA_MID_CLOSE = 0.42;
+const VIS_UP_EMA_ALPHA_NEAR_CLOSE = 0.55;
 
 function toMidCents(
   bid: number | null | undefined,
@@ -235,6 +241,32 @@ function resolveDeltaPct(p: ChartPoint): number | null {
   return null;
 }
 
+function computeWindowDomain(points: ChartPoint[], windowType: WindowType): DomainRange | null {
+  const raw = computeDomain(points);
+  if (!raw) {
+    return null;
+  }
+  const spanMs = windowToMs(windowType);
+  if (spanMs <= 0) {
+    return raw;
+  }
+  const fullSpan = raw.maxMs - raw.minMs;
+  if (fullSpan <= spanMs) {
+    return raw;
+  }
+  return {
+    minMs: Math.max(raw.minMs, raw.maxMs - spanMs),
+    maxMs: raw.maxMs
+  };
+}
+
+function slicePointsByDomain(points: ChartPoint[], domain: DomainRange | null): ChartPoint[] {
+  if (!domain) {
+    return points;
+  }
+  return points.filter((p) => p.timestamp_ms >= domain.minMs && p.timestamp_ms <= domain.maxMs);
+}
+
 function sortAndDedupePoints(points: ChartPoint[]): ChartPoint[] {
   if (points.length < 2) {
     return points.filter((p) => Number.isFinite(p.timestamp_ms) && p.timestamp_ms > 0);
@@ -390,6 +422,34 @@ function bucketizePoints(points: ChartPoint[]): ChartPoint[] {
     if (observedPair.up == null && observedPair.down == null && lastObs && agg.roundId === lastRoundId) {
       observedPair = { up: lastObs.up, down: lastObs.down };
     }
+    if (lastObs && agg.roundId === lastRoundId && observedPair.up != null && lastObs.up != null) {
+      const dtSecRaw =
+        lastBucketStartMs != null ? (agg.bucketStartMs - lastBucketStartMs) / 1000 : 1;
+      const dtSec = clamp(dtSecRaw, 0.05, 3.0);
+      const remainingMs = Math.max(
+        0,
+        Math.round((agg.source.time_remaining_s ?? Number.POSITIVE_INFINITY) * 1000)
+      );
+      const maxStepPerSec =
+        remainingMs <= 30_000
+          ? VIS_UP_STEP_CAP_CENTS_NEAR_CLOSE_PER_SEC
+          : remainingMs <= 60_000
+            ? VIS_UP_STEP_CAP_CENTS_MID_CLOSE_PER_SEC
+            : VIS_UP_STEP_CAP_CENTS_PER_SEC;
+      const alpha =
+        remainingMs <= 30_000
+          ? VIS_UP_EMA_ALPHA_NEAR_CLOSE
+          : remainingMs <= 60_000
+            ? VIS_UP_EMA_ALPHA_MID_CLOSE
+            : VIS_UP_EMA_ALPHA;
+      const maxStep = maxStepPerSec * dtSec;
+      const gatedUp = clamp(observedPair.up, lastObs.up - maxStep, lastObs.up + maxStep);
+      const smoothUp = lastObs.up + alpha * (gatedUp - lastObs.up);
+      observedPair = {
+        up: clamp(smoothUp, 0, 100),
+        down: clamp(100 - smoothUp, 0, 100)
+      };
+    }
 
     const obs: BucketObservation = {
       source: agg.source,
@@ -516,9 +576,16 @@ function MarketChartImpl({ points, rounds, windowType = "all", timeMode, height 
   const lastRoundIdRef = useRef<string>("");
 
   const prepared = useMemo(() => preparePlot(points), [points]);
+  const domain = useMemo(
+    () => computeWindowDomain(prepared.bucketed, windowType),
+    [prepared.bucketed, windowType]
+  );
+  const miniPoints = useMemo(
+    () => slicePointsByDomain(prepared.bucketed, domain),
+    [prepared.bucketed, domain]
+  );
   const data = prepared.data;
-  const miniPath = useMemo(() => buildMiniPath(prepared.bucketed, 1200, 38), [prepared.bucketed]);
-  const domain = useMemo(() => computeDomain(prepared.bucketed), [prepared.bucketed]);
+  const miniPath = useMemo(() => buildMiniPath(miniPoints, 1200, 38), [miniPoints]);
   const steppedPathBuilder = useMemo(() => uPlot.paths.stepped?.({ align: 1 }), []);
   const axisTimeFormatter = useMemo(
     () =>
@@ -611,20 +678,12 @@ function MarketChartImpl({ points, rounds, windowType = "all", timeMode, height 
   );
 
   const applyWindowPreset = useCallback(
-    (nextWindowType: WindowType, anchorEndMs?: number | null) => {
+    (_nextWindowType: WindowType, _anchorEndMs?: number | null) => {
       const d = domainRef.current;
       if (!d) {
         return;
       }
-      const fullSpan = Math.max(1, d.maxMs - d.minMs);
-      const targetSpan = windowToMs(nextWindowType);
-      if (targetSpan <= 0 || targetSpan >= fullSpan) {
-        applyView(d.minMs, d.maxMs, false);
-        return;
-      }
-      const endMs = clamp(anchorEndMs ?? d.maxMs, d.minMs, d.maxMs);
-      const startMs = endMs - targetSpan;
-      applyView(startMs, endMs, false);
+      applyView(d.minMs, d.maxMs, false);
     },
     [applyView]
   );
@@ -926,8 +985,7 @@ function MarketChartImpl({ points, rounds, windowType = "all", timeMode, height 
 
   useEffect(() => {
     userAdjustedRef.current = false;
-    const anchor = viewRef.current?.endMs ?? domainRef.current?.maxMs ?? null;
-    applyWindowPreset(windowType, anchor);
+    applyWindowPreset(windowType, domainRef.current?.maxMs ?? null);
   }, [windowType, applyWindowPreset]);
 
   useEffect(() => {
