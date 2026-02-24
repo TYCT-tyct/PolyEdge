@@ -2,6 +2,7 @@
 import argparse
 import json
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib import error, parse, request
@@ -397,8 +398,11 @@ def main() -> None:
                     if best is None or score_row(row) > score_row(best):
                         best = row
                 if best is None:
+                    sample_errors = ", ".join(
+                        str((e or {}).get("error", "")) for e in optimize_errors[:3]
+                    )
                     raise RuntimeError(
-                        f"all optimize sweeps failed (errors={len(optimize_errors)})"
+                        f"all optimize sweeps failed (errors={len(optimize_errors)}; sample={sample_errors})"
                     )
 
             rows_sorted = sorted(rows, key=score_row, reverse=True)
@@ -630,6 +634,7 @@ def main() -> None:
                 "finished_ms": finished,
                 "duration_ms": finished - started,
                 "error": str(exc),
+                "traceback": traceback.format_exc(limit=3),
             }
             with report_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(report, ensure_ascii=False) + "\n")
