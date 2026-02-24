@@ -1989,10 +1989,10 @@ fn compute_signal(
     let micro_bias = 0.08 * tanh_norm(current.delta_pct, 0.09)
         + 0.04 * tanh_norm(current.velocity, 5.0)
         - 0.03 * (current.spread_mid / 0.03).clamp(0.0, 2.0);
-    let p_fair_up = (0.5 + 0.43 * base_score + micro_bias).clamp(0.005, 0.995);
+    let p_fair_up = (0.5 + 0.48 * base_score + micro_bias).clamp(0.005, 0.995);
     let edge_prob = p_fair_up - current.p_up.clamp(0.0, 1.0);
     let edge_score = tanh_norm(edge_prob, (cfg.entry_edge_prob * 1.4).max(0.01));
-    let score = (0.62 * base_score + 0.38 * edge_score).clamp(-1.0, 1.0);
+    let score = (0.78 * base_score + 0.22 * edge_score).clamp(-1.0, 1.0);
     StrategySignal {
         score,
         entry_threshold,
@@ -2401,7 +2401,7 @@ fn run_strategy_simulation(
         last_edge_prob = signal.edge_prob;
         last_round = sample.round_id.clone();
 
-        let side = if signal.edge_prob >= 0.0 {
+        let side = if score >= 0.0 {
             StrategySide::Up
         } else {
             StrategySide::Down
@@ -2445,6 +2445,10 @@ fn run_strategy_simulation(
             let fast_loss_guard = pnl <= -(cfg.stop_loss_cents * 0.40).max(1.8)
                 && trend_signed <= cfg.reverse_signal_threshold * 0.85
                 && pos.reverse_streak >= 1;
+            let trend_fade_exit = can_exit_now
+                && pnl >= cfg.trail_activate_profit_cents * 0.35
+                && drawdown >= (cfg.trail_drawdown_cents * 0.55).max(1.2)
+                && trend_signed <= 0.10;
             let mut exit_reason: Option<&str> = None;
             if sample.round_id != pos.entry_round_id {
                 exit_reason = Some("round_rollover");
@@ -2460,6 +2464,8 @@ fn run_strategy_simulation(
                 exit_reason = Some("profit_flip_negative");
             } else if fast_loss_guard {
                 exit_reason = Some("fast_loss_guard");
+            } else if trend_fade_exit {
+                exit_reason = Some("trend_fade_exit");
             } else if can_exit_now && pnl <= -cfg.stop_loss_cents {
                 exit_reason = Some("stop_loss");
             } else if force_reverse_exit
@@ -2539,6 +2545,11 @@ fn run_strategy_simulation(
                         .clamp(0.52, 0.83);
                     let edge_required = (cfg.entry_edge_prob * (1.0 + local_vol * 5.5))
                         .clamp(cfg.entry_edge_prob, cfg.entry_edge_prob * 2.0);
+                    let edge_align = if side == StrategySide::Up {
+                        signal.edge_prob >= -(edge_required * 0.45)
+                    } else {
+                        signal.edge_prob <= edge_required * 0.45
+                    };
                     let signal_required =
                         (entry_thr + local_vol * 1.1 + sample.spread_mid * 0.5).clamp(
                             cfg.entry_threshold_base,
@@ -2551,6 +2562,7 @@ fn run_strategy_simulation(
                         && sample.spread_mid <= cfg.spread_limit_prob
                         && fair_confidence >= confidence_floor
                         && signal.edge_prob.abs() >= edge_required
+                        && edge_align
                         && delta_align
                         && (!is_choppy || anti_chop_override)
                         && entry_price <= cfg.entry_max_price_cents
@@ -2586,6 +2598,11 @@ fn run_strategy_simulation(
                 (0.52 + local_vol * 2.2 + sample.spread_mid * 1.4).clamp(0.52, 0.83);
             let edge_required = (cfg.entry_edge_prob * (1.0 + local_vol * 5.5))
                 .clamp(cfg.entry_edge_prob, cfg.entry_edge_prob * 2.0);
+            let edge_align = if side == StrategySide::Up {
+                signal.edge_prob >= -(edge_required * 0.45)
+            } else {
+                signal.edge_prob <= edge_required * 0.45
+            };
             let signal_required =
                 (entry_thr + local_vol * 1.1 + sample.spread_mid * 0.5).clamp(
                     cfg.entry_threshold_base,
@@ -2595,6 +2612,7 @@ fn run_strategy_simulation(
             let can_enter = signal.confirmed
                 && score.abs() >= signal_required
                 && signal.edge_prob.abs() >= edge_required
+                && edge_align
                 && fair_confidence >= confidence_floor
                 && delta_align
                 && (!is_choppy || anti_chop_override)
@@ -3494,7 +3512,7 @@ async fn strategy_optimize(
             let train_run = run_strategy_simulation(train_samples, cfg, max_trades);
             let valid_run = run_strategy_simulation(valid_samples, cfg, valid_max_trades);
 
-            let (train_rs, train_obj, train_hit) =
+            let (train_rs, train_obj, _train_hit) =
                 score_with_rolling(&train_run, window_trades, target_win_rate);
             let (valid_rs, valid_obj, valid_hit) =
                 score_with_rolling(&valid_run, valid_window_trades, valid_target_win_rate);
@@ -3504,7 +3522,7 @@ async fn strategy_optimize(
             let wr_gap = (train_rs.latest_win_rate_pct - valid_rs.latest_win_rate_pct).abs();
             let pnl_gap = (train_run.avg_pnl_cents - valid_run.avg_pnl_cents).abs();
             let pf_gap = (pf_train - pf_valid).abs();
-            let consistency_penalty = wr_gap * 1.6 + pnl_gap * 2.4 + pf_gap * 14.0;
+            let consistency_penalty = wr_gap * 1.1 + pnl_gap * 1.6 + pf_gap * 8.0;
             let validation_fail_penalty =
                 if valid_run.avg_pnl_cents <= 0.0 || valid_run.total_pnl_cents <= 0.0 {
                     300.0
@@ -3515,12 +3533,12 @@ async fn strategy_optimize(
                 };
             let train_fail_penalty = if train_run.avg_pnl_cents <= 0.0
                 || train_run.total_pnl_cents <= 0.0
-                || pf_train < 1.0
+                || pf_train < 0.90
             {
-                220.0
-                    + train_run.avg_pnl_cents.abs() * 200.0
-                    + train_run.total_pnl_cents.abs() * 0.015
-                    + (1.0 - pf_train).max(0.0) * 320.0
+                80.0
+                    + train_run.avg_pnl_cents.abs() * 80.0
+                    + train_run.total_pnl_cents.abs() * 0.004
+                    + (0.90 - pf_train).max(0.0) * 160.0
             } else {
                 0.0
             };
@@ -3532,18 +3550,15 @@ async fn strategy_optimize(
             let coverage_gate_penalty =
                 train_trade_shortfall * 800.0 + valid_trade_shortfall * 900.0;
 
-            let objective = train_obj * 0.42 + valid_obj * 0.78
+            let objective = train_obj * 0.18 + valid_obj * 0.98
                 - consistency_penalty
                 - validation_fail_penalty
                 - train_fail_penalty
                 - fill_risk_penalty
                 - coverage_gate_penalty;
-            let hit = train_hit
-                && (valid_hit || valid_rs.latest_win_rate_pct >= (target_win_rate - 5.0))
+            let hit = (valid_hit || valid_rs.latest_win_rate_pct >= (target_win_rate - 3.0))
                 && valid_run.avg_pnl_cents > 0.0
-                && pf_valid >= 1.03
-                && train_run.avg_pnl_cents > 0.0
-                && pf_train >= 1.01;
+                && pf_valid >= 1.05;
 
             let payload = json!({
                 "name": name,
