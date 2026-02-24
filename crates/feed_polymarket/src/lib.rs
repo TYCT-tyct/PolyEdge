@@ -716,7 +716,7 @@ fn parse_single_asset_update(payload: &WsEvent) -> Option<AssetUpdate> {
         top_level_price_and_size(payload.asks.as_ref().or(payload.sells.as_ref()));
     let best_ask = payload.best_ask.or(ask_top_price);
     let best_ask_size = ask_top_size;
-    if best_bid.is_none() && best_ask.is_none() {
+    if best_bid.is_none() || best_ask.is_none() {
         return None;
     }
 
