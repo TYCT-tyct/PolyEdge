@@ -93,6 +93,7 @@ struct StrategyPaperQueryParams {
     entry_threshold_base: Option<f64>,
     entry_threshold_cap: Option<f64>,
     spread_limit_prob: Option<f64>,
+    entry_edge_prob: Option<f64>,
     entry_min_potential_cents: Option<f64>,
     entry_max_price_cents: Option<f64>,
     min_hold_ms: Option<i64>,
@@ -107,6 +108,16 @@ struct StrategyPaperQueryParams {
     liquidity_widen_prob: Option<f64>,
     cooldown_ms: Option<i64>,
     max_entries_per_round: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StrategyFullQueryParams {
+    market_type: Option<String>,
+    lookback_minutes: Option<u32>,
+    max_points: Option<u32>,
+    max_trades: Option<u32>,
+    full_history: Option<bool>,
+    max_arms: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -207,6 +218,7 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         .route("/api/heatmap", get(heatmap))
         .route("/api/accuracy_series", get(accuracy_series))
         .route("/api/strategy/paper", get(strategy_paper))
+        .route("/api/strategy/full", get(strategy_full))
         .with_state(state);
 
     if let Some(dist) = cfg.dashboard_dist_dir {
@@ -1601,6 +1613,7 @@ struct StrategyRuntimeConfig {
     entry_threshold_base: f64,
     entry_threshold_cap: f64,
     spread_limit_prob: f64,
+    entry_edge_prob: f64,
     entry_min_potential_cents: f64,
     entry_max_price_cents: f64,
     min_hold_ms: i64,
@@ -1623,6 +1636,7 @@ impl Default for StrategyRuntimeConfig {
             entry_threshold_base: 0.68,
             entry_threshold_cap: 0.88,
             spread_limit_prob: 0.024,
+            entry_edge_prob: 0.040,
             entry_min_potential_cents: 8.0,
             entry_max_price_cents: 90.0,
             min_hold_ms: 25_000,
@@ -1877,6 +1891,336 @@ fn compute_score(
     (score.clamp(-1.0, 1.0), entry_threshold, confirmed)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct StrategySignal {
+    score: f64,
+    entry_threshold: f64,
+    confirmed: bool,
+    p_fair_up: f64,
+    edge_prob: f64,
+}
+
+fn compute_signal(
+    current: &StrategySample,
+    p_hist: &VecDeque<f64>,
+    score_hist: &VecDeque<f64>,
+    cfg: &StrategyRuntimeConfig,
+) -> StrategySignal {
+    let (base_score, entry_threshold, confirmed) = compute_score(current, p_hist, score_hist, cfg);
+    let micro_bias = 0.08 * tanh_norm(current.delta_pct, 0.09)
+        + 0.04 * tanh_norm(current.velocity, 5.0)
+        - 0.03 * (current.spread_mid / 0.03).clamp(0.0, 2.0);
+    let p_fair_up = (0.5 + 0.43 * base_score + micro_bias).clamp(0.005, 0.995);
+    let edge_prob = p_fair_up - current.p_up.clamp(0.0, 1.0);
+    let edge_score = tanh_norm(edge_prob, (cfg.entry_edge_prob * 1.4).max(0.01));
+    let score = (0.62 * base_score + 0.38 * edge_score).clamp(-1.0, 1.0);
+    StrategySignal {
+        score,
+        entry_threshold,
+        confirmed,
+        p_fair_up,
+        edge_prob,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StrategySimulationResult {
+    current: Value,
+    trades: Vec<Value>,
+    trade_count: usize,
+    win_rate_pct: f64,
+    avg_pnl_cents: f64,
+    avg_duration_s: f64,
+    total_pnl_cents: f64,
+    max_drawdown_cents: f64,
+}
+
+fn run_strategy_simulation(
+    samples: &[StrategySample],
+    cfg: &StrategyRuntimeConfig,
+    max_trades: usize,
+) -> StrategySimulationResult {
+    let mut p_hist = VecDeque::<f64>::with_capacity(24);
+    let mut score_hist = VecDeque::<f64>::with_capacity(24);
+    let mut position: Option<StrategyPosition> = None;
+    let mut trades: Vec<Value> = Vec::new();
+    let mut entries_by_round: HashMap<String, usize> = HashMap::new();
+    let mut last_exit_ts_ms: i64 = 0;
+
+    let mut last_round = String::new();
+    let mut trade_id = 1_i64;
+    let mut last_score = 0.0_f64;
+    let mut last_entry_threshold = cfg.entry_threshold_base;
+    let mut last_confirmed = false;
+    let mut last_side = "WAIT";
+    let mut last_p_fair_up = 0.5_f64;
+    let mut last_edge_prob = 0.0_f64;
+
+    for sample in samples {
+        if !last_round.is_empty() && sample.round_id != last_round {
+            p_hist.clear();
+            score_hist.clear();
+        }
+        let signal = compute_signal(sample, &p_hist, &score_hist, cfg);
+        let score = signal.score;
+        let entry_thr = signal.entry_threshold;
+        last_score = score;
+        last_entry_threshold = entry_thr;
+        last_confirmed = signal.confirmed;
+        last_p_fair_up = signal.p_fair_up;
+        last_edge_prob = signal.edge_prob;
+        last_round = sample.round_id.clone();
+
+        let side = if signal.edge_prob >= 0.0 {
+            StrategySide::Up
+        } else {
+            StrategySide::Down
+        };
+        last_side = side.as_str();
+
+        if let Some(pos) = position.as_mut() {
+            let bid_cents = side_bid(sample, pos.side) * 100.0;
+            let pnl = bid_cents - pos.entry_price_cents;
+            if pnl > pos.peak_pnl_cents {
+                pos.peak_pnl_cents = pnl;
+            }
+            let drawdown = pos.peak_pnl_cents - pnl;
+            let held_ms = (sample.ts_ms - pos.entry_ts_ms).max(0);
+            let trend_signed = score * pos.side.dir();
+            if trend_signed <= cfg.reverse_signal_threshold {
+                pos.reverse_streak = pos.reverse_streak.saturating_add(1);
+            } else {
+                pos.reverse_streak = 0;
+            }
+            let spread_side = side_spread(sample, pos.side);
+            let can_exit_now = held_ms >= cfg.min_hold_ms;
+            let force_reverse_exit = pos.reverse_streak >= cfg.reverse_signal_ticks
+                && trend_signed <= cfg.reverse_signal_threshold * 1.25;
+            let mut exit_reason: Option<&str> = None;
+            if sample.round_id != pos.entry_round_id {
+                exit_reason = Some("round_rollover");
+            } else if bid_cents >= cfg.take_profit_near_max_cents {
+                exit_reason = Some("near_max_take_profit");
+            } else if sample.remaining_ms <= cfg.endgame_remaining_ms
+                && bid_cents >= cfg.endgame_take_profit_cents
+            {
+                exit_reason = Some("endgame_take_profit");
+            } else if can_exit_now && pnl <= -cfg.stop_loss_cents {
+                exit_reason = Some("stop_loss");
+            } else if force_reverse_exit
+                || (can_exit_now && pos.reverse_streak >= cfg.reverse_signal_ticks)
+            {
+                exit_reason = Some("signal_reverse");
+            } else if can_exit_now
+                && pos.peak_pnl_cents >= cfg.trail_activate_profit_cents
+                && drawdown >= cfg.trail_drawdown_cents
+            {
+                exit_reason = Some("trail_drawdown");
+            } else if can_exit_now && spread_side >= cfg.liquidity_widen_prob {
+                exit_reason = Some("liquidity_widen");
+            }
+
+            if let Some(reason) = exit_reason {
+                let duration_s = ((sample.ts_ms - pos.entry_ts_ms).max(0) as f64) / 1000.0;
+                trades.push(json!({
+                    "id": trade_id,
+                    "side": pos.side.as_str(),
+                    "entry_ts_ms": pos.entry_ts_ms,
+                    "exit_ts_ms": sample.ts_ms,
+                    "entry_remaining_ms": pos.entry_remaining_ms,
+                    "exit_remaining_ms": sample.remaining_ms,
+                    "entry_price_cents": pos.entry_price_cents,
+                    "exit_price_cents": bid_cents,
+                    "pnl_cents": pnl,
+                    "peak_pnl_cents": pos.peak_pnl_cents,
+                    "duration_s": duration_s,
+                    "entry_score": pos.entry_score,
+                    "exit_score": score,
+                    "entry_reason": "edge_confirm",
+                    "exit_reason": reason,
+                }));
+                trade_id += 1;
+                position = None;
+                last_exit_ts_ms = sample.ts_ms;
+                if reason == "signal_reverse" {
+                    let entry_price = side_ask(sample, side) * 100.0;
+                    let entry_potential = (99.0 - entry_price).max(0.0);
+                    let round_entries = entries_by_round.get(&sample.round_id).copied().unwrap_or(0);
+                    let can_flip = score.abs() >= entry_thr
+                        && sample.spread_mid <= cfg.spread_limit_prob
+                        && entry_price <= cfg.entry_max_price_cents
+                        && entry_potential >= cfg.entry_min_potential_cents
+                        && round_entries < cfg.max_entries_per_round;
+                    if can_flip {
+                        position = Some(StrategyPosition {
+                            side,
+                            entry_price_cents: entry_price,
+                            entry_ts_ms: sample.ts_ms,
+                            entry_round_id: sample.round_id.clone(),
+                            entry_score: score,
+                            entry_remaining_ms: sample.remaining_ms,
+                            peak_pnl_cents: 0.0,
+                            reverse_streak: 0,
+                        });
+                        entries_by_round.insert(sample.round_id.clone(), round_entries + 1);
+                    }
+                }
+            }
+        } else {
+            let entry_price = side_ask(sample, side) * 100.0;
+            let entry_potential = (99.0 - entry_price).max(0.0);
+            let can_enter = signal.confirmed
+                && score.abs() >= entry_thr
+                && signal.edge_prob.abs() >= cfg.entry_edge_prob
+                && sample.spread_mid <= cfg.spread_limit_prob
+                && entry_price <= cfg.entry_max_price_cents
+                && entry_potential >= cfg.entry_min_potential_cents;
+            let round_entries = entries_by_round.get(&sample.round_id).copied().unwrap_or(0);
+            let cooled_down = last_exit_ts_ms <= 0
+                || sample.ts_ms.saturating_sub(last_exit_ts_ms) >= cfg.cooldown_ms;
+            if can_enter && cooled_down && round_entries < cfg.max_entries_per_round {
+                position = Some(StrategyPosition {
+                    side,
+                    entry_price_cents: entry_price,
+                    entry_ts_ms: sample.ts_ms,
+                    entry_round_id: sample.round_id.clone(),
+                    entry_score: score,
+                    entry_remaining_ms: sample.remaining_ms,
+                    peak_pnl_cents: 0.0,
+                    reverse_streak: 0,
+                });
+                entries_by_round.insert(sample.round_id.clone(), round_entries + 1);
+            }
+        }
+
+        p_hist.push_back(sample.p_up);
+        score_hist.push_back(score);
+        while p_hist.len() > 24 {
+            p_hist.pop_front();
+        }
+        while score_hist.len() > 24 {
+            score_hist.pop_front();
+        }
+    }
+
+    if let (Some(pos), Some(last)) = (position.as_ref(), samples.last()) {
+        let bid_cents = side_bid(last, pos.side) * 100.0;
+        let pnl = bid_cents - pos.entry_price_cents;
+        trades.push(json!({
+            "id": trade_id,
+            "side": pos.side.as_str(),
+            "entry_ts_ms": pos.entry_ts_ms,
+            "exit_ts_ms": last.ts_ms,
+            "entry_remaining_ms": pos.entry_remaining_ms,
+            "exit_remaining_ms": last.remaining_ms,
+            "entry_price_cents": pos.entry_price_cents,
+            "exit_price_cents": bid_cents,
+            "pnl_cents": pnl,
+            "peak_pnl_cents": pos.peak_pnl_cents.max(pnl),
+            "duration_s": ((last.ts_ms - pos.entry_ts_ms).max(0) as f64) / 1000.0,
+            "entry_score": pos.entry_score,
+            "exit_score": last_score,
+            "entry_reason": "p_fair_edge",
+            "exit_reason": "window_end",
+        }));
+    }
+
+    let mut total_pnl = 0.0_f64;
+    let mut wins = 0usize;
+    let mut equity = 0.0_f64;
+    let mut peak_equity = 0.0_f64;
+    let mut max_drawdown = 0.0_f64;
+    let mut total_duration_s = 0.0_f64;
+    for t in &trades {
+        let pnl = row_f64(t, "pnl_cents").unwrap_or(0.0);
+        total_duration_s += row_f64(t, "duration_s").unwrap_or(0.0);
+        total_pnl += pnl;
+        if pnl > 0.0 {
+            wins += 1;
+        }
+        equity += pnl;
+        if equity > peak_equity {
+            peak_equity = equity;
+        }
+        let dd = peak_equity - equity;
+        if dd > max_drawdown {
+            max_drawdown = dd;
+        }
+    }
+    let trade_count = trades.len();
+    let win_rate_pct = if trade_count > 0 {
+        (wins as f64) * 100.0 / trade_count as f64
+    } else {
+        0.0
+    };
+    let avg_pnl = if trade_count > 0 {
+        total_pnl / trade_count as f64
+    } else {
+        0.0
+    };
+    let avg_duration_s = if trade_count > 0 {
+        total_duration_s / trade_count as f64
+    } else {
+        0.0
+    };
+
+    let trades_view = if trades.len() > max_trades {
+        trades[trades.len() - max_trades..].to_vec()
+    } else {
+        trades
+    };
+
+    let current = samples
+        .last()
+        .map(|last| {
+            let action = if position.is_some() {
+                "HOLD"
+            } else if last_confirmed
+                && last_score.abs() >= last_entry_threshold
+                && last.spread_mid <= cfg.spread_limit_prob
+            {
+                if last_score >= 0.0 {
+                    "ENTER_UP"
+                } else {
+                    "ENTER_DOWN"
+                }
+            } else if last.spread_mid > 0.05 {
+                "RISK_OFF"
+            } else {
+                "WAIT"
+            };
+            json!({
+                "timestamp_ms": last.ts_ms,
+                "round_id": last.round_id,
+                "remaining_s": (last.remaining_ms as f64 / 1000.0),
+                "score": last_score,
+                "entry_threshold": last_entry_threshold,
+                "confirmed": last_confirmed,
+                "suggested_side": last_side,
+                "suggested_action": action,
+                "confidence": (last_score.abs() / last_entry_threshold.max(1e-6)).clamp(0.0, 2.0) * 0.5,
+                "p_up_pct": last.p_up * 100.0,
+                "p_fair_up_pct": last_p_fair_up * 100.0,
+                "edge_prob_pct": last_edge_prob * 100.0,
+                "delta_pct": last.delta_pct,
+                "spread_up_cents": last.spread_up * 100.0,
+                "spread_down_cents": last.spread_down * 100.0,
+            })
+        })
+        .unwrap_or(Value::Null);
+
+    StrategySimulationResult {
+        current,
+        trades: trades_view,
+        trade_count,
+        win_rate_pct,
+        avg_pnl_cents: avg_pnl,
+        avg_duration_s,
+        total_pnl_cents: total_pnl,
+        max_drawdown_cents: max_drawdown,
+    }
+}
+
 async fn strategy_paper(
     State(state): State<ApiState>,
     Query(params): Query<StrategyPaperQueryParams>,
@@ -1890,6 +2234,9 @@ async fn strategy_paper(
     }
     if let Some(v) = params.spread_limit_prob {
         cfg.spread_limit_prob = v.clamp(0.005, 0.12);
+    }
+    if let Some(v) = params.entry_edge_prob {
+        cfg.entry_edge_prob = v.clamp(0.002, 0.25);
     }
     if let Some(v) = params.entry_min_potential_cents {
         cfg.entry_min_potential_cents = v.clamp(1.0, 70.0);
@@ -2011,261 +2358,7 @@ async fn strategy_paper(
         })));
     }
 
-    let mut p_hist = VecDeque::<f64>::with_capacity(24);
-    let mut score_hist = VecDeque::<f64>::with_capacity(24);
-    let mut position: Option<StrategyPosition> = None;
-    let mut trades: Vec<Value> = Vec::new();
-    let mut entries_by_round: HashMap<String, usize> = HashMap::new();
-    let mut last_exit_ts_ms: i64 = 0;
-
-    let mut last_round = String::new();
-    let mut trade_id = 1_i64;
-    let mut last_score = 0.0_f64;
-    let mut last_entry_threshold = 0.62_f64;
-    let mut last_confirmed = false;
-    let mut last_side = "WAIT";
-
-    for sample in &samples {
-        if !last_round.is_empty() && sample.round_id != last_round {
-            p_hist.clear();
-            score_hist.clear();
-        }
-        let (score, entry_thr, confirmed) = compute_score(sample, &p_hist, &score_hist, &cfg);
-        last_score = score;
-        last_entry_threshold = entry_thr;
-        last_confirmed = confirmed;
-        last_round = sample.round_id.clone();
-
-        let side = if score >= 0.0 {
-            StrategySide::Up
-        } else {
-            StrategySide::Down
-        };
-        last_side = side.as_str();
-
-        if let Some(pos) = position.as_mut() {
-            let bid_cents = side_bid(sample, pos.side) * 100.0;
-            let pnl = bid_cents - pos.entry_price_cents;
-            if pnl > pos.peak_pnl_cents {
-                pos.peak_pnl_cents = pnl;
-            }
-            let drawdown = pos.peak_pnl_cents - pnl;
-            let held_ms = (sample.ts_ms - pos.entry_ts_ms).max(0);
-            let trend_signed = score * pos.side.dir();
-            if trend_signed <= cfg.reverse_signal_threshold {
-                pos.reverse_streak = pos.reverse_streak.saturating_add(1);
-            } else {
-                pos.reverse_streak = 0;
-            }
-            let spread_side = side_spread(sample, pos.side);
-            let can_exit_now = held_ms >= cfg.min_hold_ms;
-            let force_reverse_exit = pos.reverse_streak >= cfg.reverse_signal_ticks
-                && trend_signed <= cfg.reverse_signal_threshold * 1.25;
-            let mut exit_reason: Option<&str> = None;
-            if sample.round_id != pos.entry_round_id {
-                exit_reason = Some("round_rollover");
-            } else if bid_cents >= cfg.take_profit_near_max_cents {
-                exit_reason = Some("near_max_take_profit");
-            } else if sample.remaining_ms <= cfg.endgame_remaining_ms
-                && bid_cents >= cfg.endgame_take_profit_cents
-            {
-                exit_reason = Some("endgame_take_profit");
-            } else if can_exit_now && pnl <= -cfg.stop_loss_cents {
-                exit_reason = Some("stop_loss");
-            } else if force_reverse_exit || (can_exit_now && pos.reverse_streak >= cfg.reverse_signal_ticks) {
-                exit_reason = Some("signal_reverse");
-            } else if can_exit_now
-                && pos.peak_pnl_cents >= cfg.trail_activate_profit_cents
-                && drawdown >= cfg.trail_drawdown_cents
-            {
-                exit_reason = Some("trail_drawdown");
-            } else if can_exit_now && spread_side >= cfg.liquidity_widen_prob {
-                exit_reason = Some("liquidity_widen");
-            }
-
-            if let Some(reason) = exit_reason {
-                let duration_s = ((sample.ts_ms - pos.entry_ts_ms).max(0) as f64) / 1000.0;
-                trades.push(json!({
-                    "id": trade_id,
-                    "side": pos.side.as_str(),
-                    "entry_ts_ms": pos.entry_ts_ms,
-                    "exit_ts_ms": sample.ts_ms,
-                    "entry_remaining_ms": pos.entry_remaining_ms,
-                    "exit_remaining_ms": sample.remaining_ms,
-                    "entry_price_cents": pos.entry_price_cents,
-                    "exit_price_cents": bid_cents,
-                    "pnl_cents": pnl,
-                    "peak_pnl_cents": pos.peak_pnl_cents,
-                    "duration_s": duration_s,
-                    "entry_score": pos.entry_score,
-                    "exit_score": score,
-                    "entry_reason": "edge_confirm",
-                    "exit_reason": reason,
-                }));
-                trade_id += 1;
-                position = None;
-                last_exit_ts_ms = sample.ts_ms;
-                // If a strong reverse signal is present, allow immediate flip into the new side.
-                if reason == "signal_reverse" {
-                    let entry_price = side_ask(sample, side) * 100.0;
-                    let entry_potential = (99.0 - entry_price).max(0.0);
-                    let round_entries = entries_by_round.get(&sample.round_id).copied().unwrap_or(0);
-                    let can_flip = score.abs() >= entry_thr
-                        && sample.spread_mid <= cfg.spread_limit_prob
-                        && entry_price <= cfg.entry_max_price_cents
-                        && entry_potential >= cfg.entry_min_potential_cents
-                        && round_entries < cfg.max_entries_per_round;
-                    if can_flip {
-                        position = Some(StrategyPosition {
-                            side,
-                            entry_price_cents: entry_price,
-                            entry_ts_ms: sample.ts_ms,
-                            entry_round_id: sample.round_id.clone(),
-                            entry_score: score,
-                            entry_remaining_ms: sample.remaining_ms,
-                            peak_pnl_cents: 0.0,
-                            reverse_streak: 0,
-                        });
-                        entries_by_round.insert(sample.round_id.clone(), round_entries + 1);
-                    }
-                }
-            }
-        } else {
-            let entry_price = side_ask(sample, side) * 100.0;
-            let entry_potential = (99.0 - entry_price).max(0.0);
-            let can_enter = confirmed
-                && score.abs() >= entry_thr
-                && sample.spread_mid <= cfg.spread_limit_prob
-                && entry_price <= cfg.entry_max_price_cents
-                && entry_potential >= cfg.entry_min_potential_cents;
-            let round_entries = entries_by_round.get(&sample.round_id).copied().unwrap_or(0);
-            let cooled_down =
-                last_exit_ts_ms <= 0 || sample.ts_ms.saturating_sub(last_exit_ts_ms) >= cfg.cooldown_ms;
-            if can_enter && cooled_down && round_entries < cfg.max_entries_per_round {
-                position = Some(StrategyPosition {
-                    side,
-                    entry_price_cents: entry_price,
-                    entry_ts_ms: sample.ts_ms,
-                    entry_round_id: sample.round_id.clone(),
-                    entry_score: score,
-                    entry_remaining_ms: sample.remaining_ms,
-                    peak_pnl_cents: 0.0,
-                    reverse_streak: 0,
-                });
-                entries_by_round.insert(sample.round_id.clone(), round_entries + 1);
-            }
-        }
-
-        p_hist.push_back(sample.p_up);
-        score_hist.push_back(score);
-        while p_hist.len() > 24 {
-            p_hist.pop_front();
-        }
-        while score_hist.len() > 24 {
-            score_hist.pop_front();
-        }
-    }
-
-    if let (Some(pos), Some(last)) = (position.as_ref(), samples.last()) {
-        let bid_cents = side_bid(last, pos.side) * 100.0;
-        let pnl = bid_cents - pos.entry_price_cents;
-        trades.push(json!({
-            "id": trade_id,
-            "side": pos.side.as_str(),
-            "entry_ts_ms": pos.entry_ts_ms,
-            "exit_ts_ms": last.ts_ms,
-            "entry_remaining_ms": pos.entry_remaining_ms,
-            "exit_remaining_ms": last.remaining_ms,
-            "entry_price_cents": pos.entry_price_cents,
-            "exit_price_cents": bid_cents,
-            "pnl_cents": pnl,
-            "peak_pnl_cents": pos.peak_pnl_cents.max(pnl),
-            "duration_s": ((last.ts_ms - pos.entry_ts_ms).max(0) as f64) / 1000.0,
-            "entry_score": pos.entry_score,
-            "exit_score": last_score,
-            "entry_reason": "edge_confirm",
-            "exit_reason": "window_end",
-        }));
-    }
-
-    let mut total_pnl = 0.0_f64;
-    let mut wins = 0usize;
-    let mut equity = 0.0_f64;
-    let mut peak_equity = 0.0_f64;
-    let mut max_drawdown = 0.0_f64;
-    let mut total_duration_s = 0.0_f64;
-    for t in &trades {
-        let pnl = row_f64(t, "pnl_cents").unwrap_or(0.0);
-        total_duration_s += row_f64(t, "duration_s").unwrap_or(0.0);
-        total_pnl += pnl;
-        if pnl > 0.0 {
-            wins += 1;
-        }
-        equity += pnl;
-        if equity > peak_equity {
-            peak_equity = equity;
-        }
-        let dd = peak_equity - equity;
-        if dd > max_drawdown {
-            max_drawdown = dd;
-        }
-    }
-    let trade_count = trades.len();
-    let win_rate_pct = if trade_count > 0 {
-        (wins as f64) * 100.0 / trade_count as f64
-    } else {
-        0.0
-    };
-    let avg_pnl = if trade_count > 0 {
-        total_pnl / trade_count as f64
-    } else {
-        0.0
-    };
-    let avg_duration_s = if trade_count > 0 {
-        total_duration_s / trade_count as f64
-    } else {
-        0.0
-    };
-
-    let trades_view = if trades.len() > max_trades {
-        trades[trades.len() - max_trades..].to_vec()
-    } else {
-        trades
-    };
-
-    let current = samples.last().map(|last| {
-        let action = if position.is_some() {
-            "HOLD"
-        } else if last_confirmed
-            && last_score.abs() >= last_entry_threshold
-            && last.spread_mid <= cfg.spread_limit_prob
-        {
-            if last_score >= 0.0 {
-                "ENTER_UP"
-            } else {
-                "ENTER_DOWN"
-            }
-        } else if last.spread_mid > 0.05 {
-            "RISK_OFF"
-        } else {
-            "WAIT"
-        };
-        json!({
-            "timestamp_ms": last.ts_ms,
-            "round_id": last.round_id,
-            "remaining_s": (last.remaining_ms as f64 / 1000.0),
-            "score": last_score,
-            "entry_threshold": last_entry_threshold,
-            "confirmed": last_confirmed,
-            "suggested_side": last_side,
-            "suggested_action": action,
-            "confidence": (last_score.abs() / last_entry_threshold.max(1e-6)).clamp(0.0, 2.0) * 0.5,
-            "p_up_pct": last.p_up * 100.0,
-            "delta_pct": last.delta_pct,
-            "spread_up_cents": last.spread_up * 100.0,
-            "spread_down_cents": last.spread_down * 100.0,
-        })
-    }).unwrap_or(Value::Null);
+    let run = run_strategy_simulation(&samples, &cfg, max_trades);
 
     Ok(Json(json!({
         "market_type": market_type,
@@ -2276,6 +2369,7 @@ async fn strategy_paper(
             "entry_threshold_base": cfg.entry_threshold_base,
             "entry_threshold_cap": cfg.entry_threshold_cap,
             "spread_limit_prob": cfg.spread_limit_prob,
+            "entry_edge_prob": cfg.entry_edge_prob,
             "entry_min_potential_cents": cfg.entry_min_potential_cents,
             "entry_max_price_cents": cfg.entry_max_price_cents,
             "min_hold_ms": cfg.min_hold_ms,
@@ -2289,16 +2383,285 @@ async fn strategy_paper(
             "reverse_signal_threshold": cfg.reverse_signal_threshold,
             "reverse_signal_ticks": cfg.reverse_signal_ticks
         },
-        "current": current,
+        "current": run.current,
         "summary": {
-            "trade_count": trade_count,
-            "win_rate_pct": win_rate_pct,
-            "avg_pnl_cents": avg_pnl,
-            "avg_duration_s": avg_duration_s,
-            "total_pnl_cents": total_pnl,
-            "max_drawdown_cents": max_drawdown,
+            "trade_count": run.trade_count,
+            "win_rate_pct": run.win_rate_pct,
+            "avg_pnl_cents": run.avg_pnl_cents,
+            "avg_duration_s": run.avg_duration_s,
+            "total_pnl_cents": run.total_pnl_cents,
+            "max_drawdown_cents": run.max_drawdown_cents,
         },
-        "trades": trades_view,
+        "trades": run.trades,
+    })))
+}
+
+fn build_strategy_arms(base: StrategyRuntimeConfig, max_arms: usize) -> Vec<(String, StrategyRuntimeConfig)> {
+    let mut arms = Vec::<(String, StrategyRuntimeConfig)>::new();
+    let presets = [
+        (0.64, 0.030, 0.030, 10.0, 92.0, 20_000, 10.0, 4usize, 20.0, 8.0, 95.0, 90.0, 0.07, 1usize),
+        (0.68, 0.024, 0.040, 8.0, 90.0, 25_000, 10.0, 5usize, 24.0, 11.0, 93.0, 88.0, 0.07, 2usize),
+        (0.72, 0.024, 0.050, 12.0, 86.0, 35_000, 12.0, 5usize, 26.0, 10.0, 94.0, 90.0, 0.08, 1usize),
+        (0.76, 0.020, 0.060, 14.0, 84.0, 45_000, 14.0, 6usize, 30.0, 12.0, 96.0, 92.0, 0.08, 1usize),
+        (0.62, 0.038, 0.025, 6.0, 94.0, 15_000, 8.0, 3usize, 18.0, 6.0, 92.0, 86.0, 0.09, 2usize),
+        (0.70, 0.030, 0.045, 10.0, 88.0, 30_000, 12.0, 4usize, 22.0, 9.0, 94.0, 90.0, 0.07, 2usize),
+        (0.74, 0.024, 0.055, 14.0, 82.0, 55_000, 16.0, 6usize, 28.0, 12.0, 97.0, 94.0, 0.08, 1usize),
+        (0.66, 0.024, 0.035, 9.0, 90.0, 22_000, 10.0, 4usize, 20.0, 8.0, 93.0, 88.0, 0.06, 2usize),
+    ];
+    for (idx, p) in presets.iter().enumerate() {
+        let mut cfg = base;
+        cfg.entry_threshold_base = p.0;
+        cfg.entry_threshold_cap = (p.0 + 0.22).clamp(p.0, 0.99);
+        cfg.spread_limit_prob = p.1;
+        cfg.entry_edge_prob = p.2;
+        cfg.entry_min_potential_cents = p.3;
+        cfg.entry_max_price_cents = p.4;
+        cfg.min_hold_ms = p.5;
+        cfg.stop_loss_cents = p.6;
+        cfg.reverse_signal_ticks = p.7;
+        cfg.trail_activate_profit_cents = p.8;
+        cfg.trail_drawdown_cents = p.9;
+        cfg.take_profit_near_max_cents = p.10;
+        cfg.endgame_take_profit_cents = p.11;
+        cfg.liquidity_widen_prob = p.12;
+        cfg.max_entries_per_round = p.13;
+        arms.push((format!("arm_{:02}", idx + 1), cfg));
+    }
+    if arms.len() > max_arms {
+        arms.truncate(max_arms);
+    }
+    arms
+}
+
+fn group_round_samples(samples: &[StrategySample]) -> Vec<Vec<StrategySample>> {
+    let mut rounds = Vec::<Vec<StrategySample>>::new();
+    let mut cur: Vec<StrategySample> = Vec::new();
+    let mut cur_id = String::new();
+    for s in samples {
+        if cur_id.is_empty() || cur_id == s.round_id {
+            cur_id = s.round_id.clone();
+            cur.push(s.clone());
+        } else {
+            rounds.push(cur);
+            cur = vec![s.clone()];
+            cur_id = s.round_id.clone();
+        }
+    }
+    if !cur.is_empty() {
+        rounds.push(cur);
+    }
+    rounds
+}
+
+async fn strategy_full(
+    State(state): State<ApiState>,
+    Query(params): Query<StrategyFullQueryParams>,
+) -> Result<Json<Value>, ApiError> {
+    let market_type = if let Some(mt) = params.market_type.as_deref() {
+        normalize_market_type(mt).ok_or_else(|| ApiError::bad_request("invalid market_type"))?
+    } else {
+        "5m"
+    };
+    let full_history = params.full_history.unwrap_or(true);
+    let lookback_minutes = params
+        .lookback_minutes
+        .unwrap_or(if full_history { 30 * 24 * 60 } else { 12 * 60 })
+        .clamp(30, 365 * 24 * 60);
+    let max_points = params
+        .max_points
+        .unwrap_or(if full_history { 2_400_000 } else { 220_000 })
+        .clamp(20_000, 5_000_000);
+    let max_trades = params.max_trades.unwrap_or(300).clamp(20, 1000) as usize;
+    let max_arms = params.max_arms.unwrap_or(8).clamp(2, 24) as usize;
+
+    let Some(ch_url) = state.ch_url.as_deref() else {
+        return Err(ApiError::internal("clickhouse not configured"));
+    };
+    let from_ms = Utc::now()
+        .timestamp_millis()
+        .saturating_sub(i64::from(lookback_minutes) * 60_000);
+    let ts_filter = if full_history {
+        String::new()
+    } else {
+        format!("AND ts_ireland_sample_ms >= {from_ms}")
+    };
+    let q = format!(
+        "SELECT
+            intDiv(ts_ireland_sample_ms, 1000) * 1000 AS ts_ms,
+            argMax(round_id, ts_ireland_sample_ms) AS round_id,
+            argMax(remaining_ms, ts_ireland_sample_ms) AS remaining_ms,
+            argMax(mid_yes, ts_ireland_sample_ms) AS mid_yes,
+            argMax(mid_yes_smooth, ts_ireland_sample_ms) AS mid_yes_smooth,
+            argMax(mid_no, ts_ireland_sample_ms) AS mid_no,
+            argMax(mid_no_smooth, ts_ireland_sample_ms) AS mid_no_smooth,
+            argMax(bid_yes, ts_ireland_sample_ms) AS bid_yes,
+            argMax(ask_yes, ts_ireland_sample_ms) AS ask_yes,
+            argMax(bid_no, ts_ireland_sample_ms) AS bid_no,
+            argMax(ask_no, ts_ireland_sample_ms) AS ask_no,
+            argMax(delta_pct, ts_ireland_sample_ms) AS delta_pct,
+            argMax(delta_pct_smooth, ts_ireland_sample_ms) AS delta_pct_smooth,
+            argMax(velocity_bps_per_sec, ts_ireland_sample_ms) AS velocity_bps_per_sec,
+            argMax(acceleration, ts_ireland_sample_ms) AS acceleration,
+            argMax(binance_price, ts_ireland_sample_ms) AS binance_price,
+            argMax(target_price, ts_ireland_sample_ms) AS target_price
+        FROM polyedge_forge.snapshot_100ms
+        WHERE symbol='BTCUSDT'
+          AND timeframe='{market_type}'
+          {ts_filter}
+        GROUP BY ts_ms
+        ORDER BY ts_ms ASC
+        LIMIT {max_points}
+        FORMAT JSON"
+    );
+    let rows = rows_from_json(query_clickhouse_json(ch_url, &q).await?);
+    let samples = parse_strategy_rows(rows);
+    if samples.len() < 20 {
+        return Ok(Json(json!({
+            "market_type": market_type,
+            "full_history": full_history,
+            "samples": samples.len(),
+            "error": "not enough samples",
+        })));
+    }
+
+    let base_cfg = StrategyRuntimeConfig::default();
+    let arms = build_strategy_arms(base_cfg, max_arms);
+    let mut evaluations: Vec<Value> = Vec::new();
+    for (name, cfg) in &arms {
+        let run = run_strategy_simulation(&samples, cfg, max_trades);
+        let objective = run.win_rate_pct * 1.9
+            + run.avg_pnl_cents * 2.2
+            + (run.total_pnl_cents.max(0.0) * 0.02)
+            + (run.avg_duration_s.min(180.0) * 0.04)
+            - (run.max_drawdown_cents * 0.02);
+        evaluations.push(json!({
+            "name": name,
+            "objective": objective,
+            "summary": {
+                "trade_count": run.trade_count,
+                "win_rate_pct": run.win_rate_pct,
+                "avg_pnl_cents": run.avg_pnl_cents,
+                "avg_duration_s": run.avg_duration_s,
+                "total_pnl_cents": run.total_pnl_cents,
+                "max_drawdown_cents": run.max_drawdown_cents,
+            },
+            "config": {
+                "entry_threshold_base": cfg.entry_threshold_base,
+                "entry_threshold_cap": cfg.entry_threshold_cap,
+                "spread_limit_prob": cfg.spread_limit_prob,
+                "entry_edge_prob": cfg.entry_edge_prob,
+                "entry_min_potential_cents": cfg.entry_min_potential_cents,
+                "entry_max_price_cents": cfg.entry_max_price_cents,
+                "min_hold_ms": cfg.min_hold_ms,
+                "stop_loss_cents": cfg.stop_loss_cents,
+                "reverse_signal_threshold": cfg.reverse_signal_threshold,
+                "reverse_signal_ticks": cfg.reverse_signal_ticks,
+                "trail_activate_profit_cents": cfg.trail_activate_profit_cents,
+                "trail_drawdown_cents": cfg.trail_drawdown_cents,
+                "take_profit_near_max_cents": cfg.take_profit_near_max_cents,
+                "endgame_take_profit_cents": cfg.endgame_take_profit_cents,
+                "endgame_remaining_ms": cfg.endgame_remaining_ms,
+                "liquidity_widen_prob": cfg.liquidity_widen_prob,
+                "cooldown_ms": cfg.cooldown_ms,
+                "max_entries_per_round": cfg.max_entries_per_round,
+            },
+            "trades": run.trades,
+            "current": run.current,
+        }));
+    }
+    evaluations.sort_by(|a, b| {
+        let av = row_f64(a, "objective").unwrap_or(f64::NEG_INFINITY);
+        let bv = row_f64(b, "objective").unwrap_or(f64::NEG_INFINITY);
+        bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let best = evaluations.first().cloned().unwrap_or(Value::Null);
+    let max_win_rate = evaluations
+        .iter()
+        .map(|v| {
+            v.get("summary")
+                .and_then(|s| s.get("win_rate_pct"))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+        })
+        .fold(0.0_f64, f64::max);
+    let max_profit_per_trade_cents = evaluations
+        .iter()
+        .flat_map(|v| {
+            v.get("trades")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        })
+        .map(|t| row_f64(&t, "pnl_cents").unwrap_or(0.0))
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    // Lightweight online learner (UCB1) replay by round for arm adaptation preview.
+    let rounds = group_round_samples(&samples);
+    let mut plays = vec![0usize; arms.len()];
+    let mut reward_sum = vec![0.0_f64; arms.len()];
+    let mut wins = vec![0usize; arms.len()];
+    for r in &rounds {
+        let total_played: usize = plays.iter().sum();
+        let mut best_idx = 0usize;
+        let mut best_ucb = f64::NEG_INFINITY;
+        for idx in 0..arms.len() {
+            if plays[idx] == 0 {
+                best_idx = idx;
+                break;
+            }
+            let mean = reward_sum[idx] / plays[idx] as f64;
+            let explore = (2.0 * ((total_played + 1) as f64).ln() / plays[idx] as f64).sqrt();
+            let ucb = mean + explore;
+            if ucb > best_ucb {
+                best_ucb = ucb;
+                best_idx = idx;
+            }
+        }
+        let run = run_strategy_simulation(r, &arms[best_idx].1, 40);
+        plays[best_idx] += 1;
+        reward_sum[best_idx] += run.total_pnl_cents;
+        if run.total_pnl_cents > 0.0 {
+            wins[best_idx] += 1;
+        }
+    }
+    let learner_arms: Vec<Value> = arms
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| {
+            let p = plays[i];
+            let mean = if p > 0 { reward_sum[i] / p as f64 } else { 0.0 };
+            let wr = if p > 0 {
+                (wins[i] as f64) * 100.0 / p as f64
+            } else {
+                0.0
+            };
+            json!({
+                "name": name,
+                "plays": p,
+                "win_rate_pct": wr,
+                "mean_round_pnl_cents": mean,
+                "total_round_pnl_cents": reward_sum[i]
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "market_type": market_type,
+        "full_history": full_history,
+        "lookback_minutes": lookback_minutes,
+        "samples": samples.len(),
+        "rounds": rounds.len(),
+        "arms_tested": evaluations.len(),
+        "best": best,
+        "top_arms": evaluations.iter().take(5).cloned().collect::<Vec<_>>(),
+        "metrics": {
+            "estimated_max_win_rate_pct": max_win_rate,
+            "estimated_max_profit_per_trade_cents": if max_profit_per_trade_cents.is_finite() { max_profit_per_trade_cents } else { 0.0 }
+        },
+        "learner_ucb": {
+            "arms": learner_arms
+        }
     })))
 }
 
