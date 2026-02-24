@@ -37,6 +37,8 @@ const LIVE_SNAPSHOT_MAX_AGE_MS: i64 = 4_000;
 const LIVE_ROUND_END_GRACE_MS: i64 = 1_500;
 const RESOLVED_UP_PRICE_CENTS: f64 = 99.0;
 const RESOLVED_DOWN_PRICE_CENTS: f64 = 0.0;
+const OFFICIAL_TAKER_FEE_MAX_RATE: f64 = 0.25;
+const OFFICIAL_TAKER_FEE_EXPONENT: f64 = 2.0;
 
 #[derive(Debug, Deserialize)]
 struct HistoryQueryParams {
@@ -1723,6 +1725,15 @@ fn side_spread(sample: &StrategySample, side: StrategySide) -> f64 {
     }
 }
 
+fn dynamic_taker_fee_cents(price_cents: f64) -> f64 {
+    if !price_cents.is_finite() || price_cents <= 0.0 {
+        return 0.0;
+    }
+    let p = (price_cents / 100.0).clamp(0.0001, 0.9999);
+    let fee_rate = OFFICIAL_TAKER_FEE_MAX_RATE * (p * (1.0 - p)).powf(OFFICIAL_TAKER_FEE_EXPONENT);
+    (price_cents * fee_rate).clamp(0.0, 12.0)
+}
+
 fn confirm_direction(score_hist: &VecDeque<f64>, current_score: f64) -> bool {
     if score_hist.len() < 2 || !current_score.is_finite() {
         return false;
@@ -2112,8 +2123,9 @@ fn run_strategy_simulation(
         if let Some(pos) = position.as_mut() {
             let bid_cents_raw = side_bid(sample, pos.side) * 100.0;
             let spread_side_cents = side_spread(sample, pos.side) * 100.0;
+            let exit_fee_cents = cfg.fee_cents_per_side + dynamic_taker_fee_cents(bid_cents_raw);
             let bid_cents_exec =
-                bid_cents_raw - cfg.slippage_cents_per_side - cfg.fee_cents_per_side;
+                bid_cents_raw - cfg.slippage_cents_per_side - exit_fee_cents;
             let pnl = bid_cents_exec - pos.entry_price_cents;
             if pnl > pos.peak_pnl_cents {
                 pos.peak_pnl_cents = pnl;
@@ -2129,6 +2141,9 @@ fn run_strategy_simulation(
             let can_exit_now = held_ms >= cfg.min_hold_ms;
             let force_reverse_exit = pos.reverse_streak >= cfg.reverse_signal_ticks
                 && trend_signed <= cfg.reverse_signal_threshold * 1.25;
+            let fast_loss_guard = pnl <= -(cfg.stop_loss_cents * 0.40).max(1.8)
+                && trend_signed <= cfg.reverse_signal_threshold * 0.85
+                && pos.reverse_streak >= 1;
             let mut exit_reason: Option<&str> = None;
             if sample.round_id != pos.entry_round_id {
                 exit_reason = Some("round_rollover");
@@ -2138,6 +2153,8 @@ fn run_strategy_simulation(
                 && bid_cents_exec >= cfg.endgame_take_profit_cents
             {
                 exit_reason = Some("endgame_take_profit");
+            } else if fast_loss_guard {
+                exit_reason = Some("fast_loss_guard");
             } else if can_exit_now && pnl <= -cfg.stop_loss_cents {
                 exit_reason = Some("stop_loss");
             } else if force_reverse_exit
@@ -2156,7 +2173,7 @@ fn run_strategy_simulation(
             if let Some(reason) = exit_reason {
                 let emergency = matches!(
                     reason,
-                    "round_rollover" | "stop_loss" | "endgame_take_profit"
+                    "round_rollover" | "stop_loss" | "endgame_take_profit" | "fast_loss_guard"
                 );
                 let can_fill = spread_side_cents <= cfg.max_exec_spread_cents;
                 if !can_fill && !emergency {
@@ -2191,12 +2208,17 @@ fn run_strategy_simulation(
                     "exit_reason": reason,
                     "exec_fill_ok": can_fill,
                     "exit_spread_cents": spread_side_cents,
+                    "exit_fee_cents": exit_fee_cents,
                 }));
                 trade_id += 1;
                 position = None;
                 last_exit_ts_ms = sample.ts_ms;
                 if reason == "signal_reverse" {
-                    let entry_price = side_ask(sample, side) * 100.0;
+                    let entry_price_raw = side_ask(sample, side) * 100.0;
+                    let entry_fee_cents =
+                        cfg.fee_cents_per_side + dynamic_taker_fee_cents(entry_price_raw);
+                    let entry_price =
+                        entry_price_raw + cfg.slippage_cents_per_side + entry_fee_cents;
                     let entry_potential = (99.0 - entry_price).max(0.0);
                     let round_entries =
                         entries_by_round.get(&sample.round_id).copied().unwrap_or(0);
@@ -2223,8 +2245,8 @@ fn run_strategy_simulation(
         } else {
             let entry_price_raw = side_ask(sample, side) * 100.0;
             let entry_spread_cents = side_spread(sample, side) * 100.0;
-            let entry_price =
-                entry_price_raw + cfg.slippage_cents_per_side + cfg.fee_cents_per_side;
+            let entry_fee_cents = cfg.fee_cents_per_side + dynamic_taker_fee_cents(entry_price_raw);
+            let entry_price = entry_price_raw + cfg.slippage_cents_per_side + entry_fee_cents;
             let entry_potential = (99.0 - entry_price).max(0.0);
             let can_enter = signal.confirmed
                 && score.abs() >= entry_thr
@@ -2264,7 +2286,8 @@ fn run_strategy_simulation(
     if let (Some(pos), Some(last)) = (position.as_ref(), samples.last()) {
         let bid_cents_raw = side_bid(last, pos.side) * 100.0;
         let spread_side_cents = side_spread(last, pos.side) * 100.0;
-        let mut bid_cents = bid_cents_raw - cfg.slippage_cents_per_side - cfg.fee_cents_per_side;
+        let exit_fee_cents = cfg.fee_cents_per_side + dynamic_taker_fee_cents(bid_cents_raw);
+        let mut bid_cents = bid_cents_raw - cfg.slippage_cents_per_side - exit_fee_cents;
         let can_fill = spread_side_cents <= cfg.max_exec_spread_cents;
         if !can_fill {
             let extra_penalty = (spread_side_cents - cfg.max_exec_spread_cents).max(0.0)
@@ -2292,6 +2315,7 @@ fn run_strategy_simulation(
             "exit_reason": "window_end",
             "exec_fill_ok": can_fill,
             "exit_spread_cents": spread_side_cents,
+            "exit_fee_cents": exit_fee_cents,
         }));
     }
 
