@@ -224,7 +224,10 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
             "/api/latest/{symbol}/{timeframe}/{market_id}",
             get(latest_market),
         )
-        .route("/api/history/{symbol}/{timeframe}", get(history_symbol_timeframe))
+        .route(
+            "/api/history/{symbol}/{timeframe}",
+            get(history_symbol_timeframe),
+        )
         .route("/api/stats", get(stats))
         .route("/api/chart", get(chart))
         .route("/api/chart/round", get(chart_round))
@@ -314,7 +317,11 @@ async fn ws_live_loop(mut socket: WebSocket, state: ApiState) {
         if text == last_payload {
             continue;
         }
-        if socket.send(Message::Text(text.clone().into())).await.is_err() {
+        if socket
+            .send(Message::Text(text.clone().into()))
+            .await
+            .is_err()
+        {
             break;
         }
         last_payload = text;
@@ -338,9 +345,7 @@ async fn fetch_latest_snapshot(
     let now_ms = Utc::now().timestamp_millis();
     if state.redis_client.is_none() {
         let row = fetch_latest_snapshot_from_clickhouse(state, symbol, timeframe).await?;
-        return Ok(
-            row.filter(|v| is_live_snapshot_fresh(v, timeframe, now_ms))
-        );
+        return Ok(row.filter(|v| is_live_snapshot_fresh(v, timeframe, now_ms)));
     }
 
     let mut fallback_direct: Option<Value> = None;
@@ -494,10 +499,14 @@ fn compact_live_snapshot(snapshot: &Value, market_type: &str) -> Value {
         (Some(b), Some(a)) if a.is_finite() && b.is_finite() => (a - b).abs().clamp(0.001, 0.06),
         _ => 0.01,
     };
-    let best_bid_up = raw_bid_yes.or_else(|| mid_yes.map(|m| (m - yes_spread * 0.5).clamp(0.0, 1.0)));
-    let best_ask_up = raw_ask_yes.or_else(|| mid_yes.map(|m| (m + yes_spread * 0.5).clamp(0.0, 1.0)));
-    let best_bid_down = raw_bid_no.or_else(|| mid_no.map(|m| (m - no_spread * 0.5).clamp(0.0, 1.0)));
-    let best_ask_down = raw_ask_no.or_else(|| mid_no.map(|m| (m + no_spread * 0.5).clamp(0.0, 1.0)));
+    let best_bid_up =
+        raw_bid_yes.or_else(|| mid_yes.map(|m| (m - yes_spread * 0.5).clamp(0.0, 1.0)));
+    let best_ask_up =
+        raw_ask_yes.or_else(|| mid_yes.map(|m| (m + yes_spread * 0.5).clamp(0.0, 1.0)));
+    let best_bid_down =
+        raw_bid_no.or_else(|| mid_no.map(|m| (m - no_spread * 0.5).clamp(0.0, 1.0)));
+    let best_ask_down =
+        raw_ask_no.or_else(|| mid_no.map(|m| (m + no_spread * 0.5).clamp(0.0, 1.0)));
 
     json!({
         "timestamp_ms": snapshot.get("ts_ireland_sample_ms").and_then(Value::as_i64),
@@ -963,7 +972,9 @@ async fn chart_round(
     let mut points = rows_from_json(query_clickhouse_json(ch_url, &point_query).await?);
     let total_samples = points.len();
     if total_samples == 0 {
-        return Ok(Json(json!({"points":[],"round":Value::Null,"total_samples":0,"step":1})));
+        return Ok(Json(
+            json!({"points":[],"round":Value::Null,"total_samples":0,"step":1}),
+        ));
     }
 
     let step = if total_samples <= max_points {
@@ -1442,7 +1453,11 @@ async fn accuracy_series(
 ) -> Result<Json<Value>, ApiError> {
     let market_type = normalize_market_type(&params.market_type)
         .ok_or_else(|| ApiError::bad_request("invalid market_type"))?;
-    let rolling_window = if market_type == "5m" { 40usize } else { 20usize };
+    let rolling_window = if market_type == "5m" {
+        40usize
+    } else {
+        20usize
+    };
     let lookback_hours = 24u32;
     let now_ms = Utc::now().timestamp_millis();
     let from_ms = now_ms.saturating_sub(i64::from(lookback_hours) * 3_600_000);
@@ -1533,7 +1548,8 @@ async fn accuracy_series(
 
     let start_aligned = (from_ms / bucket_ms) * bucket_ms;
     let end_aligned = ((now_ms + bucket_ms - 1) / bucket_ms) * bucket_ms;
-    let mut series: Vec<Value> = Vec::with_capacity(((end_aligned - start_aligned) / bucket_ms + 1).max(0) as usize);
+    let mut series: Vec<Value> =
+        Vec::with_capacity(((end_aligned - start_aligned) / bucket_ms + 1).max(0) as usize);
     let mut last_acc: Option<f64> = None;
     for ts in (start_aligned..=end_aligned).step_by(bucket_ms as usize) {
         if let Some((acc, n, rid)) = by_bucket.get(&ts) {
@@ -1644,6 +1660,10 @@ struct StrategyRuntimeConfig {
     liquidity_widen_prob: f64,
     cooldown_ms: i64,
     max_entries_per_round: usize,
+    max_exec_spread_cents: f64,
+    slippage_cents_per_side: f64,
+    fee_cents_per_side: f64,
+    emergency_wide_spread_penalty_ratio: f64,
 }
 
 impl Default for StrategyRuntimeConfig {
@@ -1667,6 +1687,10 @@ impl Default for StrategyRuntimeConfig {
             liquidity_widen_prob: 0.070,
             cooldown_ms: 8_000,
             max_entries_per_round: 2,
+            max_exec_spread_cents: 3.4,
+            slippage_cents_per_side: 0.25,
+            fee_cents_per_side: 0.35,
+            emergency_wide_spread_penalty_ratio: 0.50,
         }
     }
 }
@@ -1898,11 +1922,8 @@ fn compute_score(
         + 0.06 * tanh_norm(acc, 16.0);
 
     let vol = rolling_vol_absdiff(p_hist);
-    let entry_threshold =
-        (cfg.entry_threshold_base + vol * 3.6 + current.spread_mid * 1.3).clamp(
-            cfg.entry_threshold_base,
-            cfg.entry_threshold_cap,
-        );
+    let entry_threshold = (cfg.entry_threshold_base + vol * 3.6 + current.spread_mid * 1.3)
+        .clamp(cfg.entry_threshold_base, cfg.entry_threshold_cap);
     let confirmed = confirm_direction(score_hist, score);
     (score.clamp(-1.0, 1.0), entry_threshold, confirmed)
 }
@@ -1951,6 +1972,9 @@ struct StrategySimulationResult {
     total_pnl_cents: f64,
     max_drawdown_cents: f64,
     max_profit_trade_cents: f64,
+    blocked_exits: usize,
+    emergency_wide_exit_count: usize,
+    execution_penalty_cents_total: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2059,6 +2083,9 @@ fn run_strategy_simulation(
     let mut last_side = "WAIT";
     let mut last_p_fair_up = 0.5_f64;
     let mut last_edge_prob = 0.0_f64;
+    let mut blocked_exits = 0usize;
+    let mut emergency_wide_exit_count = 0usize;
+    let mut execution_penalty_cents_total = 0.0_f64;
 
     for sample in samples {
         if !last_round.is_empty() && sample.round_id != last_round {
@@ -2083,8 +2110,11 @@ fn run_strategy_simulation(
         last_side = side.as_str();
 
         if let Some(pos) = position.as_mut() {
-            let bid_cents = side_bid(sample, pos.side) * 100.0;
-            let pnl = bid_cents - pos.entry_price_cents;
+            let bid_cents_raw = side_bid(sample, pos.side) * 100.0;
+            let spread_side_cents = side_spread(sample, pos.side) * 100.0;
+            let bid_cents_exec =
+                bid_cents_raw - cfg.slippage_cents_per_side - cfg.fee_cents_per_side;
+            let pnl = bid_cents_exec - pos.entry_price_cents;
             if pnl > pos.peak_pnl_cents {
                 pos.peak_pnl_cents = pnl;
             }
@@ -2096,17 +2126,16 @@ fn run_strategy_simulation(
             } else {
                 pos.reverse_streak = 0;
             }
-            let spread_side = side_spread(sample, pos.side);
             let can_exit_now = held_ms >= cfg.min_hold_ms;
             let force_reverse_exit = pos.reverse_streak >= cfg.reverse_signal_ticks
                 && trend_signed <= cfg.reverse_signal_threshold * 1.25;
             let mut exit_reason: Option<&str> = None;
             if sample.round_id != pos.entry_round_id {
                 exit_reason = Some("round_rollover");
-            } else if bid_cents >= cfg.take_profit_near_max_cents {
+            } else if bid_cents_exec >= cfg.take_profit_near_max_cents {
                 exit_reason = Some("near_max_take_profit");
             } else if sample.remaining_ms <= cfg.endgame_remaining_ms
-                && bid_cents >= cfg.endgame_take_profit_cents
+                && bid_cents_exec >= cfg.endgame_take_profit_cents
             {
                 exit_reason = Some("endgame_take_profit");
             } else if can_exit_now && pnl <= -cfg.stop_loss_cents {
@@ -2120,11 +2149,29 @@ fn run_strategy_simulation(
                 && drawdown >= cfg.trail_drawdown_cents
             {
                 exit_reason = Some("trail_drawdown");
-            } else if can_exit_now && spread_side >= cfg.liquidity_widen_prob {
+            } else if can_exit_now && side_spread(sample, pos.side) >= cfg.liquidity_widen_prob {
                 exit_reason = Some("liquidity_widen");
             }
 
             if let Some(reason) = exit_reason {
+                let emergency = matches!(
+                    reason,
+                    "round_rollover" | "stop_loss" | "endgame_take_profit"
+                );
+                let can_fill = spread_side_cents <= cfg.max_exec_spread_cents;
+                if !can_fill && !emergency {
+                    blocked_exits = blocked_exits.saturating_add(1);
+                    continue;
+                }
+                let mut exit_price_cents = bid_cents_exec;
+                if !can_fill {
+                    let extra_penalty = (spread_side_cents - cfg.max_exec_spread_cents).max(0.0)
+                        * cfg.emergency_wide_spread_penalty_ratio;
+                    exit_price_cents -= extra_penalty;
+                    execution_penalty_cents_total += extra_penalty;
+                    emergency_wide_exit_count = emergency_wide_exit_count.saturating_add(1);
+                }
+                let net_pnl = exit_price_cents - pos.entry_price_cents;
                 let duration_s = ((sample.ts_ms - pos.entry_ts_ms).max(0) as f64) / 1000.0;
                 trades.push(json!({
                     "id": trade_id,
@@ -2134,14 +2181,16 @@ fn run_strategy_simulation(
                     "entry_remaining_ms": pos.entry_remaining_ms,
                     "exit_remaining_ms": sample.remaining_ms,
                     "entry_price_cents": pos.entry_price_cents,
-                    "exit_price_cents": bid_cents,
-                    "pnl_cents": pnl,
+                    "exit_price_cents": exit_price_cents,
+                    "pnl_cents": net_pnl,
                     "peak_pnl_cents": pos.peak_pnl_cents,
                     "duration_s": duration_s,
                     "entry_score": pos.entry_score,
                     "exit_score": score,
-                    "entry_reason": "edge_confirm",
+                    "entry_reason": "p_fair_edge",
                     "exit_reason": reason,
+                    "exec_fill_ok": can_fill,
+                    "exit_spread_cents": spread_side_cents,
                 }));
                 trade_id += 1;
                 position = None;
@@ -2149,7 +2198,8 @@ fn run_strategy_simulation(
                 if reason == "signal_reverse" {
                     let entry_price = side_ask(sample, side) * 100.0;
                     let entry_potential = (99.0 - entry_price).max(0.0);
-                    let round_entries = entries_by_round.get(&sample.round_id).copied().unwrap_or(0);
+                    let round_entries =
+                        entries_by_round.get(&sample.round_id).copied().unwrap_or(0);
                     let can_flip = score.abs() >= entry_thr
                         && sample.spread_mid <= cfg.spread_limit_prob
                         && entry_price <= cfg.entry_max_price_cents
@@ -2171,12 +2221,16 @@ fn run_strategy_simulation(
                 }
             }
         } else {
-            let entry_price = side_ask(sample, side) * 100.0;
+            let entry_price_raw = side_ask(sample, side) * 100.0;
+            let entry_spread_cents = side_spread(sample, side) * 100.0;
+            let entry_price =
+                entry_price_raw + cfg.slippage_cents_per_side + cfg.fee_cents_per_side;
             let entry_potential = (99.0 - entry_price).max(0.0);
             let can_enter = signal.confirmed
                 && score.abs() >= entry_thr
                 && signal.edge_prob.abs() >= cfg.entry_edge_prob
                 && sample.spread_mid <= cfg.spread_limit_prob
+                && entry_spread_cents <= cfg.max_exec_spread_cents
                 && entry_price <= cfg.entry_max_price_cents
                 && entry_potential >= cfg.entry_min_potential_cents;
             let round_entries = entries_by_round.get(&sample.round_id).copied().unwrap_or(0);
@@ -2208,7 +2262,17 @@ fn run_strategy_simulation(
     }
 
     if let (Some(pos), Some(last)) = (position.as_ref(), samples.last()) {
-        let bid_cents = side_bid(last, pos.side) * 100.0;
+        let bid_cents_raw = side_bid(last, pos.side) * 100.0;
+        let spread_side_cents = side_spread(last, pos.side) * 100.0;
+        let mut bid_cents = bid_cents_raw - cfg.slippage_cents_per_side - cfg.fee_cents_per_side;
+        let can_fill = spread_side_cents <= cfg.max_exec_spread_cents;
+        if !can_fill {
+            let extra_penalty = (spread_side_cents - cfg.max_exec_spread_cents).max(0.0)
+                * cfg.emergency_wide_spread_penalty_ratio;
+            bid_cents -= extra_penalty;
+            execution_penalty_cents_total += extra_penalty;
+            emergency_wide_exit_count = emergency_wide_exit_count.saturating_add(1);
+        }
         let pnl = bid_cents - pos.entry_price_cents;
         trades.push(json!({
             "id": trade_id,
@@ -2226,6 +2290,8 @@ fn run_strategy_simulation(
             "exit_score": last_score,
             "entry_reason": "p_fair_edge",
             "exit_reason": "window_end",
+            "exec_fill_ok": can_fill,
+            "exit_spread_cents": spread_side_cents,
         }));
     }
 
@@ -2336,6 +2402,9 @@ fn run_strategy_simulation(
         } else {
             0.0
         },
+        blocked_exits,
+        emergency_wide_exit_count,
+        execution_penalty_cents_total,
     }
 }
 
@@ -2467,7 +2536,14 @@ async fn strategy_paper(
         .clamp(20_000, 5_000_000);
     let max_trades = params.max_trades.unwrap_or(200).clamp(20, 1000) as usize;
 
-    let samples = load_strategy_samples(&state, market_type, full_history, lookback_minutes, max_points).await?;
+    let samples = load_strategy_samples(
+        &state,
+        market_type,
+        full_history,
+        lookback_minutes,
+        max_points,
+    )
+    .await?;
     if samples.len() < 20 {
         return Ok(Json(json!({
             "market_type": market_type,
@@ -2509,7 +2585,11 @@ async fn strategy_paper(
             "endgame_remaining_ms": cfg.endgame_remaining_ms,
             "liquidity_widen_prob": cfg.liquidity_widen_prob,
             "reverse_signal_threshold": cfg.reverse_signal_threshold,
-            "reverse_signal_ticks": cfg.reverse_signal_ticks
+            "reverse_signal_ticks": cfg.reverse_signal_ticks,
+            "max_exec_spread_cents": cfg.max_exec_spread_cents,
+            "slippage_cents_per_side": cfg.slippage_cents_per_side,
+            "fee_cents_per_side": cfg.fee_cents_per_side,
+            "emergency_wide_spread_penalty_ratio": cfg.emergency_wide_spread_penalty_ratio
         },
         "current": run.current,
         "summary": {
@@ -2519,22 +2599,52 @@ async fn strategy_paper(
             "avg_duration_s": run.avg_duration_s,
             "total_pnl_cents": run.total_pnl_cents,
             "max_drawdown_cents": run.max_drawdown_cents,
+            "max_profit_trade_cents": run.max_profit_trade_cents,
+            "blocked_exits": run.blocked_exits,
+            "emergency_wide_exit_count": run.emergency_wide_exit_count,
+            "execution_penalty_cents_total": run.execution_penalty_cents_total,
         },
         "trades": run.trades,
     })))
 }
 
-fn build_strategy_arms(base: StrategyRuntimeConfig, max_arms: usize) -> Vec<(String, StrategyRuntimeConfig)> {
+fn build_strategy_arms(
+    base: StrategyRuntimeConfig,
+    max_arms: usize,
+) -> Vec<(String, StrategyRuntimeConfig)> {
     let mut arms = Vec::<(String, StrategyRuntimeConfig)>::new();
     let presets = [
-        (0.64, 0.030, 0.030, 10.0, 92.0, 20_000, 10.0, 4usize, 20.0, 8.0, 95.0, 90.0, 0.07, 1usize),
-        (0.68, 0.024, 0.040, 8.0, 90.0, 25_000, 10.0, 5usize, 24.0, 11.0, 93.0, 88.0, 0.07, 2usize),
-        (0.72, 0.024, 0.050, 12.0, 86.0, 35_000, 12.0, 5usize, 26.0, 10.0, 94.0, 90.0, 0.08, 1usize),
-        (0.76, 0.020, 0.060, 14.0, 84.0, 45_000, 14.0, 6usize, 30.0, 12.0, 96.0, 92.0, 0.08, 1usize),
-        (0.62, 0.038, 0.025, 6.0, 94.0, 15_000, 8.0, 3usize, 18.0, 6.0, 92.0, 86.0, 0.09, 2usize),
-        (0.70, 0.030, 0.045, 10.0, 88.0, 30_000, 12.0, 4usize, 22.0, 9.0, 94.0, 90.0, 0.07, 2usize),
-        (0.74, 0.024, 0.055, 14.0, 82.0, 55_000, 16.0, 6usize, 28.0, 12.0, 97.0, 94.0, 0.08, 1usize),
-        (0.66, 0.024, 0.035, 9.0, 90.0, 22_000, 10.0, 4usize, 20.0, 8.0, 93.0, 88.0, 0.06, 2usize),
+        (
+            0.64, 0.030, 0.030, 10.0, 92.0, 20_000, 10.0, 4usize, 20.0, 8.0, 95.0, 90.0, 0.07,
+            1usize,
+        ),
+        (
+            0.68, 0.024, 0.040, 8.0, 90.0, 25_000, 10.0, 5usize, 24.0, 11.0, 93.0, 88.0, 0.07,
+            2usize,
+        ),
+        (
+            0.72, 0.024, 0.050, 12.0, 86.0, 35_000, 12.0, 5usize, 26.0, 10.0, 94.0, 90.0, 0.08,
+            1usize,
+        ),
+        (
+            0.76, 0.020, 0.060, 14.0, 84.0, 45_000, 14.0, 6usize, 30.0, 12.0, 96.0, 92.0, 0.08,
+            1usize,
+        ),
+        (
+            0.62, 0.038, 0.025, 6.0, 94.0, 15_000, 8.0, 3usize, 18.0, 6.0, 92.0, 86.0, 0.09, 2usize,
+        ),
+        (
+            0.70, 0.030, 0.045, 10.0, 88.0, 30_000, 12.0, 4usize, 22.0, 9.0, 94.0, 90.0, 0.07,
+            2usize,
+        ),
+        (
+            0.74, 0.024, 0.055, 14.0, 82.0, 55_000, 16.0, 6usize, 28.0, 12.0, 97.0, 94.0, 0.08,
+            1usize,
+        ),
+        (
+            0.66, 0.024, 0.035, 9.0, 90.0, 22_000, 10.0, 4usize, 20.0, 8.0, 93.0, 88.0, 0.06,
+            2usize,
+        ),
     ];
     for (idx, p) in presets.iter().enumerate() {
         let mut cfg = base;
@@ -2602,9 +2712,16 @@ async fn strategy_full(
     let max_trades = params.max_trades.unwrap_or(300).clamp(20, 1000) as usize;
     let max_arms = params.max_arms.unwrap_or(8).clamp(2, 24) as usize;
     let window_trades = params.window_trades.unwrap_or(50).clamp(10, 200) as usize;
-    let target_win_rate = params.target_win_rate.unwrap_or(80.0).clamp(40.0, 99.9);
+    let target_win_rate = params.target_win_rate.unwrap_or(90.0).clamp(40.0, 99.9);
 
-    let samples = load_strategy_samples(&state, market_type, full_history, lookback_minutes, max_points).await?;
+    let samples = load_strategy_samples(
+        &state,
+        market_type,
+        full_history,
+        lookback_minutes,
+        max_points,
+    )
+    .await?;
     if samples.len() < 20 {
         return Ok(Json(json!({
             "market_type": market_type,
@@ -2627,12 +2744,13 @@ async fn strategy_full(
                 + run.avg_pnl_cents * 2.0
                 + run.total_pnl_cents.max(0.0) * 0.02
                 - run.max_drawdown_cents * 0.02
-                + if rs.latest_win_rate_pct >= target_win_rate { 120.0 } else { 0.0 }
+                + if rs.latest_win_rate_pct >= target_win_rate {
+                    120.0
+                } else {
+                    0.0
+                }
         } else {
-            run.win_rate_pct
-                + run.avg_pnl_cents
-                + run.total_pnl_cents.max(0.0) * 0.01
-                - 120.0
+            run.win_rate_pct + run.avg_pnl_cents + run.total_pnl_cents.max(0.0) * 0.01 - 120.0
         };
         evaluations.push(json!({
             "name": name,
@@ -2645,6 +2763,9 @@ async fn strategy_full(
                 "total_pnl_cents": run.total_pnl_cents,
                 "max_drawdown_cents": run.max_drawdown_cents,
                 "max_profit_trade_cents": run.max_profit_trade_cents,
+                "blocked_exits": run.blocked_exits,
+                "emergency_wide_exit_count": run.emergency_wide_exit_count,
+                "execution_penalty_cents_total": run.execution_penalty_cents_total,
             },
             "rolling_window": rolling_stats_json(rs),
             "config": {
@@ -2666,6 +2787,10 @@ async fn strategy_full(
                 "liquidity_widen_prob": cfg.liquidity_widen_prob,
                 "cooldown_ms": cfg.cooldown_ms,
                 "max_entries_per_round": cfg.max_entries_per_round,
+                "max_exec_spread_cents": cfg.max_exec_spread_cents,
+                "slippage_cents_per_side": cfg.slippage_cents_per_side,
+                "fee_cents_per_side": cfg.fee_cents_per_side,
+                "emergency_wide_spread_penalty_ratio": cfg.emergency_wide_spread_penalty_ratio,
             },
             "trades": run.trades,
             "current": run.current,
@@ -2789,6 +2914,11 @@ fn clamp_runtime_cfg(cfg: &mut StrategyRuntimeConfig) {
     cfg.liquidity_widen_prob = cfg.liquidity_widen_prob.clamp(0.01, 0.2);
     cfg.cooldown_ms = cfg.cooldown_ms.clamp(0, 120_000);
     cfg.max_entries_per_round = cfg.max_entries_per_round.clamp(1, 8);
+    cfg.max_exec_spread_cents = cfg.max_exec_spread_cents.clamp(0.5, 12.0);
+    cfg.slippage_cents_per_side = cfg.slippage_cents_per_side.clamp(0.0, 4.0);
+    cfg.fee_cents_per_side = cfg.fee_cents_per_side.clamp(0.0, 4.0);
+    cfg.emergency_wide_spread_penalty_ratio =
+        cfg.emergency_wide_spread_penalty_ratio.clamp(0.0, 2.0);
 }
 
 fn lcg_next(seed: &mut u64) -> f64 {
@@ -2797,7 +2927,12 @@ fn lcg_next(seed: &mut u64) -> f64 {
     (x as f64) / (u32::MAX as f64)
 }
 
-fn mutate_cfg(parent: &StrategyRuntimeConfig, seed: &mut u64, iter: usize, max_iter: usize) -> StrategyRuntimeConfig {
+fn mutate_cfg(
+    parent: &StrategyRuntimeConfig,
+    seed: &mut u64,
+    iter: usize,
+    max_iter: usize,
+) -> StrategyRuntimeConfig {
     let mut c = *parent;
     let progress = if max_iter > 0 {
         (iter as f64 / max_iter as f64).clamp(0.0, 1.0)
@@ -2816,7 +2951,8 @@ fn mutate_cfg(parent: &StrategyRuntimeConfig, seed: &mut u64, iter: usize, max_i
     c.min_hold_ms += (r(seed) * 30_000.0 * scale) as i64;
     c.stop_loss_cents += r(seed) * 8.0 * scale;
     c.reverse_signal_threshold += r(seed) * 0.18 * scale;
-    c.reverse_signal_ticks = ((c.reverse_signal_ticks as f64) + r(seed) * 2.5 * scale).round() as usize;
+    c.reverse_signal_ticks =
+        ((c.reverse_signal_ticks as f64) + r(seed) * 2.5 * scale).round() as usize;
     c.trail_activate_profit_cents += r(seed) * 10.0 * scale;
     c.trail_drawdown_cents += r(seed) * 6.0 * scale;
     c.take_profit_near_max_cents += r(seed) * 4.0 * scale;
@@ -2824,7 +2960,12 @@ fn mutate_cfg(parent: &StrategyRuntimeConfig, seed: &mut u64, iter: usize, max_i
     c.endgame_remaining_ms += (r(seed) * 30_000.0 * scale) as i64;
     c.liquidity_widen_prob += r(seed) * 0.03 * scale;
     c.cooldown_ms += (r(seed) * 8_000.0 * scale) as i64;
-    c.max_entries_per_round = ((c.max_entries_per_round as f64) + r(seed) * 1.5 * scale).round() as usize;
+    c.max_entries_per_round =
+        ((c.max_entries_per_round as f64) + r(seed) * 1.5 * scale).round() as usize;
+    c.max_exec_spread_cents += r(seed) * 1.5 * scale;
+    c.slippage_cents_per_side += r(seed) * 0.4 * scale;
+    c.fee_cents_per_side += r(seed) * 0.2 * scale;
+    c.emergency_wide_spread_penalty_ratio += r(seed) * 0.25 * scale;
     clamp_runtime_cfg(&mut c);
     c
 }
@@ -2835,6 +2976,7 @@ fn score_with_rolling(
     target_win_rate: f64,
 ) -> (RollingStats, f64, bool) {
     let rs = compute_rolling_stats(&run.all_trade_pnls, window_trades);
+    let shortfall = (target_win_rate - rs.latest_win_rate_pct).max(0.0);
     let target_hit = rs.windows > 0
         && rs.latest_win_rate_pct >= target_win_rate
         && run.avg_pnl_cents > 0.0
@@ -2845,7 +2987,11 @@ fn score_with_rolling(
             + rs.min_win_rate_pct * 0.8
             + run.avg_pnl_cents * 2.2
             + run.total_pnl_cents.max(0.0) * 0.02
+            + run.max_profit_trade_cents.max(0.0) * 0.6
             - run.max_drawdown_cents * 0.02
+            - run.execution_penalty_cents_total * 0.4
+            - run.blocked_exits as f64 * 18.0
+            - shortfall * shortfall * 1.6
             + if target_hit { 160.0 } else { 0.0 }
     } else {
         run.win_rate_pct + run.avg_pnl_cents - 180.0
@@ -2874,10 +3020,17 @@ async fn strategy_optimize(
     let max_trades = params.max_trades.unwrap_or(400).clamp(20, 2000) as usize;
     let max_arms = params.max_arms.unwrap_or(8).clamp(2, 24) as usize;
     let window_trades = params.window_trades.unwrap_or(50).clamp(10, 200) as usize;
-    let target_win_rate = params.target_win_rate.unwrap_or(80.0).clamp(40.0, 99.9);
+    let target_win_rate = params.target_win_rate.unwrap_or(90.0).clamp(40.0, 99.9);
     let iterations = params.iterations.unwrap_or(600).clamp(50, 5000) as usize;
 
-    let samples = load_strategy_samples(&state, market_type, full_history, lookback_minutes, max_points).await?;
+    let samples = load_strategy_samples(
+        &state,
+        market_type,
+        full_history,
+        lookback_minutes,
+        max_points,
+    )
+    .await?;
     if samples.len() < 20 {
         return Ok(Json(json!({
             "market_type": market_type,
@@ -2912,6 +3065,9 @@ async fn strategy_optimize(
                 "total_pnl_cents": run.total_pnl_cents,
                 "max_drawdown_cents": run.max_drawdown_cents,
                 "max_profit_trade_cents": run.max_profit_trade_cents,
+                "blocked_exits": run.blocked_exits,
+                "emergency_wide_exit_count": run.emergency_wide_exit_count,
+                "execution_penalty_cents_total": run.execution_penalty_cents_total,
             },
             "config": {
                 "entry_threshold_base": cfg.entry_threshold_base,
@@ -2932,6 +3088,10 @@ async fn strategy_optimize(
                 "liquidity_widen_prob": cfg.liquidity_widen_prob,
                 "cooldown_ms": cfg.cooldown_ms,
                 "max_entries_per_round": cfg.max_entries_per_round,
+                "max_exec_spread_cents": cfg.max_exec_spread_cents,
+                "slippage_cents_per_side": cfg.slippage_cents_per_side,
+                "fee_cents_per_side": cfg.fee_cents_per_side,
+                "emergency_wide_spread_penalty_ratio": cfg.emergency_wide_spread_penalty_ratio,
             },
         });
         leaderboard.push(payload.clone());
@@ -2944,8 +3104,14 @@ async fn strategy_optimize(
         }
     }
     leaderboard.sort_by(|a, b| {
-        let av = a.get("objective").and_then(Value::as_f64).unwrap_or(f64::NEG_INFINITY);
-        let bv = b.get("objective").and_then(Value::as_f64).unwrap_or(f64::NEG_INFINITY);
+        let av = a
+            .get("objective")
+            .and_then(Value::as_f64)
+            .unwrap_or(f64::NEG_INFINITY);
+        let bv = b
+            .get("objective")
+            .and_then(Value::as_f64)
+            .unwrap_or(f64::NEG_INFINITY);
         bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
     });
     leaderboard.truncate(16);
@@ -2956,24 +3122,160 @@ async fn strategy_optimize(
             let pick = (lcg_next(&mut seed) * elite_count as f64).floor() as usize;
             let parent_cfg = if let Some(parent) = leaderboard.get(pick) {
                 let mut c = base_cfg;
-                if let Some(v) = parent.get("config").and_then(|v| v.get("entry_threshold_base")).and_then(Value::as_f64) { c.entry_threshold_base = v; }
-                if let Some(v) = parent.get("config").and_then(|v| v.get("entry_threshold_cap")).and_then(Value::as_f64) { c.entry_threshold_cap = v; }
-                if let Some(v) = parent.get("config").and_then(|v| v.get("spread_limit_prob")).and_then(Value::as_f64) { c.spread_limit_prob = v; }
-                if let Some(v) = parent.get("config").and_then(|v| v.get("entry_edge_prob")).and_then(Value::as_f64) { c.entry_edge_prob = v; }
-                if let Some(v) = parent.get("config").and_then(|v| v.get("entry_min_potential_cents")).and_then(Value::as_f64) { c.entry_min_potential_cents = v; }
-                if let Some(v) = parent.get("config").and_then(|v| v.get("entry_max_price_cents")).and_then(Value::as_f64) { c.entry_max_price_cents = v; }
-                if let Some(v) = parent.get("config").and_then(|v| v.get("min_hold_ms")).and_then(Value::as_i64) { c.min_hold_ms = v; }
-                if let Some(v) = parent.get("config").and_then(|v| v.get("stop_loss_cents")).and_then(Value::as_f64) { c.stop_loss_cents = v; }
-                if let Some(v) = parent.get("config").and_then(|v| v.get("reverse_signal_threshold")).and_then(Value::as_f64) { c.reverse_signal_threshold = v; }
-                if let Some(v) = parent.get("config").and_then(|v| v.get("reverse_signal_ticks")).and_then(Value::as_u64) { c.reverse_signal_ticks = v as usize; }
-                if let Some(v) = parent.get("config").and_then(|v| v.get("trail_activate_profit_cents")).and_then(Value::as_f64) { c.trail_activate_profit_cents = v; }
-                if let Some(v) = parent.get("config").and_then(|v| v.get("trail_drawdown_cents")).and_then(Value::as_f64) { c.trail_drawdown_cents = v; }
-                if let Some(v) = parent.get("config").and_then(|v| v.get("take_profit_near_max_cents")).and_then(Value::as_f64) { c.take_profit_near_max_cents = v; }
-                if let Some(v) = parent.get("config").and_then(|v| v.get("endgame_take_profit_cents")).and_then(Value::as_f64) { c.endgame_take_profit_cents = v; }
-                if let Some(v) = parent.get("config").and_then(|v| v.get("endgame_remaining_ms")).and_then(Value::as_i64) { c.endgame_remaining_ms = v; }
-                if let Some(v) = parent.get("config").and_then(|v| v.get("liquidity_widen_prob")).and_then(Value::as_f64) { c.liquidity_widen_prob = v; }
-                if let Some(v) = parent.get("config").and_then(|v| v.get("cooldown_ms")).and_then(Value::as_i64) { c.cooldown_ms = v; }
-                if let Some(v) = parent.get("config").and_then(|v| v.get("max_entries_per_round")).and_then(Value::as_u64) { c.max_entries_per_round = v as usize; }
+                if let Some(v) = parent
+                    .get("config")
+                    .and_then(|v| v.get("entry_threshold_base"))
+                    .and_then(Value::as_f64)
+                {
+                    c.entry_threshold_base = v;
+                }
+                if let Some(v) = parent
+                    .get("config")
+                    .and_then(|v| v.get("entry_threshold_cap"))
+                    .and_then(Value::as_f64)
+                {
+                    c.entry_threshold_cap = v;
+                }
+                if let Some(v) = parent
+                    .get("config")
+                    .and_then(|v| v.get("spread_limit_prob"))
+                    .and_then(Value::as_f64)
+                {
+                    c.spread_limit_prob = v;
+                }
+                if let Some(v) = parent
+                    .get("config")
+                    .and_then(|v| v.get("entry_edge_prob"))
+                    .and_then(Value::as_f64)
+                {
+                    c.entry_edge_prob = v;
+                }
+                if let Some(v) = parent
+                    .get("config")
+                    .and_then(|v| v.get("entry_min_potential_cents"))
+                    .and_then(Value::as_f64)
+                {
+                    c.entry_min_potential_cents = v;
+                }
+                if let Some(v) = parent
+                    .get("config")
+                    .and_then(|v| v.get("entry_max_price_cents"))
+                    .and_then(Value::as_f64)
+                {
+                    c.entry_max_price_cents = v;
+                }
+                if let Some(v) = parent
+                    .get("config")
+                    .and_then(|v| v.get("min_hold_ms"))
+                    .and_then(Value::as_i64)
+                {
+                    c.min_hold_ms = v;
+                }
+                if let Some(v) = parent
+                    .get("config")
+                    .and_then(|v| v.get("stop_loss_cents"))
+                    .and_then(Value::as_f64)
+                {
+                    c.stop_loss_cents = v;
+                }
+                if let Some(v) = parent
+                    .get("config")
+                    .and_then(|v| v.get("reverse_signal_threshold"))
+                    .and_then(Value::as_f64)
+                {
+                    c.reverse_signal_threshold = v;
+                }
+                if let Some(v) = parent
+                    .get("config")
+                    .and_then(|v| v.get("reverse_signal_ticks"))
+                    .and_then(Value::as_u64)
+                {
+                    c.reverse_signal_ticks = v as usize;
+                }
+                if let Some(v) = parent
+                    .get("config")
+                    .and_then(|v| v.get("trail_activate_profit_cents"))
+                    .and_then(Value::as_f64)
+                {
+                    c.trail_activate_profit_cents = v;
+                }
+                if let Some(v) = parent
+                    .get("config")
+                    .and_then(|v| v.get("trail_drawdown_cents"))
+                    .and_then(Value::as_f64)
+                {
+                    c.trail_drawdown_cents = v;
+                }
+                if let Some(v) = parent
+                    .get("config")
+                    .and_then(|v| v.get("take_profit_near_max_cents"))
+                    .and_then(Value::as_f64)
+                {
+                    c.take_profit_near_max_cents = v;
+                }
+                if let Some(v) = parent
+                    .get("config")
+                    .and_then(|v| v.get("endgame_take_profit_cents"))
+                    .and_then(Value::as_f64)
+                {
+                    c.endgame_take_profit_cents = v;
+                }
+                if let Some(v) = parent
+                    .get("config")
+                    .and_then(|v| v.get("endgame_remaining_ms"))
+                    .and_then(Value::as_i64)
+                {
+                    c.endgame_remaining_ms = v;
+                }
+                if let Some(v) = parent
+                    .get("config")
+                    .and_then(|v| v.get("liquidity_widen_prob"))
+                    .and_then(Value::as_f64)
+                {
+                    c.liquidity_widen_prob = v;
+                }
+                if let Some(v) = parent
+                    .get("config")
+                    .and_then(|v| v.get("cooldown_ms"))
+                    .and_then(Value::as_i64)
+                {
+                    c.cooldown_ms = v;
+                }
+                if let Some(v) = parent
+                    .get("config")
+                    .and_then(|v| v.get("max_entries_per_round"))
+                    .and_then(Value::as_u64)
+                {
+                    c.max_entries_per_round = v as usize;
+                }
+                if let Some(v) = parent
+                    .get("config")
+                    .and_then(|v| v.get("max_exec_spread_cents"))
+                    .and_then(Value::as_f64)
+                {
+                    c.max_exec_spread_cents = v;
+                }
+                if let Some(v) = parent
+                    .get("config")
+                    .and_then(|v| v.get("slippage_cents_per_side"))
+                    .and_then(Value::as_f64)
+                {
+                    c.slippage_cents_per_side = v;
+                }
+                if let Some(v) = parent
+                    .get("config")
+                    .and_then(|v| v.get("fee_cents_per_side"))
+                    .and_then(Value::as_f64)
+                {
+                    c.fee_cents_per_side = v;
+                }
+                if let Some(v) = parent
+                    .get("config")
+                    .and_then(|v| v.get("emergency_wide_spread_penalty_ratio"))
+                    .and_then(Value::as_f64)
+                {
+                    c.emergency_wide_spread_penalty_ratio = v;
+                }
                 c
             } else {
                 base_cfg
@@ -2993,6 +3295,9 @@ async fn strategy_optimize(
                     "total_pnl_cents": run.total_pnl_cents,
                     "max_drawdown_cents": run.max_drawdown_cents,
                     "max_profit_trade_cents": run.max_profit_trade_cents,
+                    "blocked_exits": run.blocked_exits,
+                    "emergency_wide_exit_count": run.emergency_wide_exit_count,
+                    "execution_penalty_cents_total": run.execution_penalty_cents_total,
                 },
                 "config": {
                     "entry_threshold_base": candidate_cfg.entry_threshold_base,
@@ -3013,12 +3318,22 @@ async fn strategy_optimize(
                     "liquidity_widen_prob": candidate_cfg.liquidity_widen_prob,
                     "cooldown_ms": candidate_cfg.cooldown_ms,
                     "max_entries_per_round": candidate_cfg.max_entries_per_round,
+                    "max_exec_spread_cents": candidate_cfg.max_exec_spread_cents,
+                    "slippage_cents_per_side": candidate_cfg.slippage_cents_per_side,
+                    "fee_cents_per_side": candidate_cfg.fee_cents_per_side,
+                    "emergency_wide_spread_penalty_ratio": candidate_cfg.emergency_wide_spread_penalty_ratio,
                 },
             });
             leaderboard.push(payload.clone());
             leaderboard.sort_by(|a, b| {
-                let av = a.get("objective").and_then(Value::as_f64).unwrap_or(f64::NEG_INFINITY);
-                let bv = b.get("objective").and_then(Value::as_f64).unwrap_or(f64::NEG_INFINITY);
+                let av = a
+                    .get("objective")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(f64::NEG_INFINITY);
+                let bv = b
+                    .get("objective")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(f64::NEG_INFINITY);
                 bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
             });
             leaderboard.truncate(16);
