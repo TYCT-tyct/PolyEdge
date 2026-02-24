@@ -1620,23 +1620,23 @@ struct StrategyRuntimeConfig {
 impl Default for StrategyRuntimeConfig {
     fn default() -> Self {
         Self {
-            entry_threshold_base: 0.60,
+            entry_threshold_base: 0.68,
             entry_threshold_cap: 0.88,
-            spread_limit_prob: 0.030,
-            entry_min_potential_cents: 12.0,
-            entry_max_price_cents: 88.0,
-            min_hold_ms: 45_000,
-            stop_loss_cents: 18.0,
+            spread_limit_prob: 0.024,
+            entry_min_potential_cents: 8.0,
+            entry_max_price_cents: 90.0,
+            min_hold_ms: 25_000,
+            stop_loss_cents: 10.0,
             reverse_signal_threshold: -0.30,
-            reverse_signal_ticks: 4,
-            trail_activate_profit_cents: 18.0,
-            trail_drawdown_cents: 8.0,
-            take_profit_near_max_cents: 96.0,
-            endgame_take_profit_cents: 92.0,
+            reverse_signal_ticks: 5,
+            trail_activate_profit_cents: 24.0,
+            trail_drawdown_cents: 11.0,
+            take_profit_near_max_cents: 93.0,
+            endgame_take_profit_cents: 88.0,
             endgame_remaining_ms: 30_000,
             liquidity_widen_prob: 0.070,
             cooldown_ms: 8_000,
-            max_entries_per_round: 1,
+            max_entries_per_round: 2,
         }
     }
 }
@@ -2059,6 +2059,8 @@ async fn strategy_paper(
             }
             let spread_side = side_spread(sample, pos.side);
             let can_exit_now = held_ms >= cfg.min_hold_ms;
+            let force_reverse_exit = pos.reverse_streak >= cfg.reverse_signal_ticks
+                && trend_signed <= cfg.reverse_signal_threshold * 1.25;
             let mut exit_reason: Option<&str> = None;
             if sample.round_id != pos.entry_round_id {
                 exit_reason = Some("round_rollover");
@@ -2070,7 +2072,7 @@ async fn strategy_paper(
                 exit_reason = Some("endgame_take_profit");
             } else if can_exit_now && pnl <= -cfg.stop_loss_cents {
                 exit_reason = Some("stop_loss");
-            } else if can_exit_now && pos.reverse_streak >= cfg.reverse_signal_ticks {
+            } else if force_reverse_exit || (can_exit_now && pos.reverse_streak >= cfg.reverse_signal_ticks) {
                 exit_reason = Some("signal_reverse");
             } else if can_exit_now
                 && pos.peak_pnl_cents >= cfg.trail_activate_profit_cents
@@ -2103,6 +2105,30 @@ async fn strategy_paper(
                 trade_id += 1;
                 position = None;
                 last_exit_ts_ms = sample.ts_ms;
+                // If a strong reverse signal is present, allow immediate flip into the new side.
+                if reason == "signal_reverse" {
+                    let entry_price = side_ask(sample, side) * 100.0;
+                    let entry_potential = (99.0 - entry_price).max(0.0);
+                    let round_entries = entries_by_round.get(&sample.round_id).copied().unwrap_or(0);
+                    let can_flip = score.abs() >= entry_thr
+                        && sample.spread_mid <= cfg.spread_limit_prob
+                        && entry_price <= cfg.entry_max_price_cents
+                        && entry_potential >= cfg.entry_min_potential_cents
+                        && round_entries < cfg.max_entries_per_round;
+                    if can_flip {
+                        position = Some(StrategyPosition {
+                            side,
+                            entry_price_cents: entry_price,
+                            entry_ts_ms: sample.ts_ms,
+                            entry_round_id: sample.round_id.clone(),
+                            entry_score: score,
+                            entry_remaining_ms: sample.remaining_ms,
+                            peak_pnl_cents: 0.0,
+                            reverse_streak: 0,
+                        });
+                        entries_by_round.insert(sample.round_id.clone(), round_entries + 1);
+                    }
+                }
             }
         } else {
             let entry_price = side_ask(sample, side) * 100.0;
