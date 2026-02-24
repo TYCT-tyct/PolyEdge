@@ -170,6 +170,19 @@ function finiteOrNull(v: number | null | undefined): number | null {
   return v != null && Number.isFinite(v) ? v : null;
 }
 
+function roundOutcome(
+  settlePrice: number | null | undefined,
+  targetPrice: number | null | undefined,
+  fallbackLabel: number | boolean | null | undefined
+): number {
+  const settle = finiteOrNull(settlePrice);
+  const target = finiteOrNull(targetPrice);
+  if (settle != null && target != null && target > 0) {
+    return settle > target ? 1 : 0;
+  }
+  return Number(fallbackLabel) === 1 ? 1 : 0;
+}
+
 function midpointProb(
   bid: number | null | undefined,
   ask: number | null | undefined
@@ -296,7 +309,7 @@ export async function getStats(): Promise<StatsResponse> {
   ]);
   const totalSamples = h5.sample_count + h15.sample_count;
   const rounds = [...h5.rounds, ...h15.rounds];
-  const upCount = rounds.filter((r) => Number(r.label_up) === 1).length;
+  const upCount = rounds.filter((r) => roundOutcome(r.settle_price, r.target_price, r.label_up) === 1).length;
   const downCount = rounds.length - upCount;
   const allSamples = [...h5.samples, ...h15.samples].sort(
     (a, b) => a.ts_ireland_sample_ms - b.ts_ireland_sample_ms
@@ -405,7 +418,7 @@ export async function getChart(marketType: MarketType, view: WindowType): Promis
           start_ts_ms: r.start_ts_ms,
           end_ts_ms: r.end_ts_ms,
           target_price: r.target_price,
-          outcome: Number(r.label_up)
+          outcome: roundOutcome(r.settle_price, r.target_price, r.label_up)
         }))
         .filter((r) => (minutes > 0 ? (r.end_ts_ms ?? 0) >= cutoffMs : true)),
       total_samples: points.length,
@@ -440,7 +453,7 @@ export async function getRoundHistory(marketType: MarketType, limit = 200): Prom
       .map((r) => {
         const target = r.target_price;
         const final = r.settle_price;
-        const outcome = Number(r.label_up);
+        const outcome = roundOutcome(final, target, r.label_up);
         return {
           round_id: r.round_id,
           market_id: r.market_id,
@@ -565,7 +578,7 @@ export async function getRoundChart(
             start_time_ms: round.start_ts_ms,
             end_time_ms: round.end_ts_ms,
             target_price: round.target_price,
-            outcome: Number(round.label_up),
+            outcome: roundOutcome(round.settle_price, round.target_price, round.label_up),
             slug: `${marketType}-${Math.floor(round.start_ts_ms / 1000)}`
           }
         : null,

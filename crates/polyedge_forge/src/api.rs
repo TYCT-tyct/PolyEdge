@@ -615,7 +615,7 @@ async fn history_symbol_timeframe(
             end_ts_ms,
             target_price,
             settle_price,
-            label_up,
+            toInt8(settle_price > target_price) AS label_up,
             ts_recorded_ms
         FROM polyedge_forge.rounds
         WHERE symbol='{symbol}'
@@ -668,14 +668,17 @@ async fn stats(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
         FORMAT JSON";
     let round_query = "SELECT
             count() AS total_rounds,
-            sum(label_up) AS up_count,
-            count() - sum(label_up) AS down_count
+            sum(toUInt8(settle_price > target_price)) AS up_count,
+            count() - sum(toUInt8(settle_price > target_price)) AS down_count
         FROM polyedge_forge.rounds
         WHERE symbol='BTCUSDT' AND timeframe IN ('5m','15m')
         FORMAT JSON";
     let accuracy_query = "SELECT
             countIf(isNotNull(s.eval_mid_up)) AS market_accuracy_n,
-            avgIf(toFloat64((s.eval_mid_up >= 0.5) = (r.label_up = 1)), isNotNull(s.eval_mid_up)) AS market_accuracy
+            avgIf(
+                toFloat64((s.eval_mid_up >= 0.5) = (r.settle_price > r.target_price)),
+                isNotNull(s.eval_mid_up)
+            ) AS market_accuracy
         FROM polyedge_forge.rounds r
         LEFT JOIN (
             SELECT
@@ -777,7 +780,7 @@ async fn chart(
             start_ts_ms,
             end_ts_ms,
             target_price,
-            toInt8(label_up) AS outcome
+            toInt8(settle_price > target_price) AS outcome
         FROM polyedge_forge.rounds
         WHERE symbol='BTCUSDT'
           AND timeframe='{market_type}'
@@ -873,7 +876,7 @@ async fn chart_round(
             start_ts_ms AS start_time_ms,
             end_ts_ms AS end_time_ms,
             target_price,
-            toInt8(label_up) AS outcome
+            toInt8(settle_price > target_price) AS outcome
         FROM polyedge_forge.rounds
         WHERE symbol='BTCUSDT'
           AND timeframe='{market_type}'
@@ -1162,9 +1165,9 @@ async fn rounds(
             r.end_ts_ms AS end_time_ms,
             r.target_price,
             r.settle_price AS final_btc_price,
-            toInt8(r.label_up) AS outcome,
+            toInt8(r.settle_price > r.target_price) AS outcome,
             if(r.target_price > 0, (r.settle_price - r.target_price) / r.target_price * 100.0, NULL) AS delta_pct,
-            if(toInt8(r.label_up) = 1, {resolved_up_cents}, {resolved_down_cents}) AS mkt_price_cents
+            if(toInt8(r.settle_price > r.target_price) = 1, {resolved_up_cents}, {resolved_down_cents}) AS mkt_price_cents
         FROM polyedge_forge.rounds r
         WHERE r.symbol='BTCUSDT'
           AND r.timeframe='{market_type}'
@@ -1339,7 +1342,7 @@ async fn accuracy_series(
         "SELECT
             r.round_id,
             r.end_ts_ms AS timestamp_ms,
-            toInt8(r.label_up) AS outcome,
+            toInt8(r.settle_price > r.target_price) AS outcome,
             s.eval_mid_up AS eval_mid_up
         FROM polyedge_forge.rounds r
         INNER JOIN (
