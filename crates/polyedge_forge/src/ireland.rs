@@ -392,6 +392,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         clickhouse_url: normalize_opt_url(&args.clickhouse_url),
         clickhouse_database: args.clickhouse_database.clone(),
         clickhouse_snapshot_table: args.clickhouse_snapshot_table.clone(),
+        clickhouse_processed_table: args.clickhouse_processed_table.clone(),
         clickhouse_round_table: args.clickhouse_round_table.clone(),
         redis_url: normalize_opt_url(&args.redis_url),
         redis_prefix: args.redis_prefix.clone(),

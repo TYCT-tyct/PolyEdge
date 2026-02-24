@@ -16,6 +16,7 @@ const API_BASE = (import.meta.env.VITE_FORGE_API_BASE as string | undefined)?.tr
 const REQUEST_TIMEOUT_MS = 10_000;
 const RESOLVED_UP_PRICE_CENTS = 99.0;
 const RESOLVED_DOWN_PRICE_CENTS = 0.0;
+const inflightRequests = new Map<string, Promise<unknown>>();
 const apiSupport: {
   stats: boolean | null;
   chart: boolean | null;
@@ -100,16 +101,29 @@ function buildWsUrl(path: string): string {
 }
 
 async function requestJson<T>(path: string): Promise<T> {
-  const controller = new AbortController();
-  const timer = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  const resp = await fetch(buildHttpUrl(path), { cache: "no-store", signal: controller.signal }).finally(() =>
-    window.clearTimeout(timer)
-  );
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new HttpError(resp.status, `HTTP ${resp.status}: ${text}`);
+  const key = buildHttpUrl(path);
+  const existing = inflightRequests.get(key);
+  if (existing) {
+    return (await existing) as T;
   }
-  return (await resp.json()) as T;
+  const req = (async () => {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const resp = await fetch(key, { cache: "no-store", signal: controller.signal }).finally(() =>
+      window.clearTimeout(timer)
+    );
+    if (!resp.ok) {
+      const text = await resp.text();
+      throw new HttpError(resp.status, `HTTP ${resp.status}: ${text}`);
+    }
+    return (await resp.json()) as T;
+  })();
+  inflightRequests.set(key, req as Promise<unknown>);
+  try {
+    return await req;
+  } finally {
+    inflightRequests.delete(key);
+  }
 }
 
 function windowToMinutes(view: WindowType): number {

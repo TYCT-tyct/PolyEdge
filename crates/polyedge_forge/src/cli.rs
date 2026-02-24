@@ -55,6 +55,12 @@ pub struct IrelandRecorderArgs {
         default_value = "snapshot_100ms"
     )]
     pub clickhouse_snapshot_table: String,
+    #[arg(
+        long,
+        env = "FORGE_CH_PROCESSED_TABLE",
+        default_value = "snapshot_100ms_processed"
+    )]
+    pub clickhouse_processed_table: String,
     #[arg(long, env = "FORGE_CH_ROUND_TABLE", default_value = "rounds")]
     pub clickhouse_round_table: String,
     #[arg(

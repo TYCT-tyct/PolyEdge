@@ -13,6 +13,7 @@ pub struct DbSinkConfig {
     pub clickhouse_url: Option<String>,
     pub clickhouse_database: String,
     pub clickhouse_snapshot_table: String,
+    pub clickhouse_processed_table: String,
     pub clickhouse_round_table: String,
     pub redis_url: Option<String>,
     pub redis_prefix: String,
@@ -202,6 +203,7 @@ async fn execute_clickhouse_query(ch_url: &str, sql: &str) -> Result<()> {
 async fn init_clickhouse(ch_url: &str, cfg: &DbSinkConfig) -> Result<()> {
     let db = &cfg.clickhouse_database;
     let snapshot_tbl = &cfg.clickhouse_snapshot_table;
+    let processed_tbl = &cfg.clickhouse_processed_table;
     let round_tbl = &cfg.clickhouse_round_table;
 
     execute_clickhouse_query(ch_url, &format!("CREATE DATABASE IF NOT EXISTS {}", db)).await?;
@@ -282,6 +284,75 @@ async fn init_clickhouse(ch_url: &str, cfg: &DbSinkConfig) -> Result<()> {
     for q in alter_snapshot_queries {
         execute_clickhouse_query(ch_url, &q).await?;
     }
+
+    let create_processed_tbl = format!(
+        "CREATE TABLE IF NOT EXISTS {}.{} (
+            schema_version String,
+            ingest_seq UInt64,
+            ts_ireland_sample_ms Int64,
+            symbol LowCardinality(String),
+            timeframe LowCardinality(String),
+            market_id String,
+            round_id String,
+            title String,
+            target_price Nullable(Float64),
+            binance_price Nullable(Float64),
+            pm_live_btc_price Nullable(Float64),
+            chainlink_price Nullable(Float64),
+            remaining_ms Int64,
+            raw_up_prob Float64,
+            raw_down_prob Float64,
+            smooth_up_prob Float64,
+            smooth_down_prob Float64,
+            display_up_cents Float64,
+            display_down_cents Float64,
+            raw_delta_pct Nullable(Float64),
+            smooth_delta_pct Nullable(Float64),
+            velocity_bps_per_sec Nullable(Float64),
+            acceleration Nullable(Float64),
+            ingested_at DateTime64(3, 'UTC') DEFAULT now64(3)
+        )
+        ENGINE = MergeTree
+        PARTITION BY toDate(fromUnixTimestamp64Milli(ts_ireland_sample_ms))
+        ORDER BY (symbol, timeframe, round_id, ts_ireland_sample_ms)
+        SETTINGS index_granularity = 8192",
+        db, processed_tbl
+    );
+    execute_clickhouse_query(ch_url, &create_processed_tbl).await?;
+
+    let mv_name = format!("mv_{}_to_{}", snapshot_tbl, processed_tbl);
+    let create_processed_mv = format!(
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS {}.{}
+        TO {}.{}
+        AS
+        SELECT
+            schema_version,
+            ingest_seq,
+            ts_ireland_sample_ms,
+            symbol,
+            timeframe,
+            market_id,
+            round_id,
+            title,
+            target_price,
+            binance_price,
+            pm_live_btc_price,
+            chainlink_price,
+            remaining_ms,
+            mid_yes AS raw_up_prob,
+            mid_no AS raw_down_prob,
+            mid_yes_smooth AS smooth_up_prob,
+            mid_no_smooth AS smooth_down_prob,
+            mid_yes_smooth * 100.0 AS display_up_cents,
+            (1.0 - mid_yes_smooth) * 100.0 AS display_down_cents,
+            delta_pct AS raw_delta_pct,
+            delta_pct_smooth AS smooth_delta_pct,
+            velocity_bps_per_sec,
+            acceleration
+        FROM {}.{}",
+        db, mv_name, db, processed_tbl, db, snapshot_tbl
+    );
+    execute_clickhouse_query(ch_url, &create_processed_mv).await?;
 
     let create_round_tbl = format!(
         "CREATE TABLE IF NOT EXISTS {}.{} (
