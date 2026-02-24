@@ -2976,13 +2976,15 @@ fn score_with_rolling(
     target_win_rate: f64,
 ) -> (RollingStats, f64, bool) {
     let rs = compute_rolling_stats(&run.all_trade_pnls, window_trades);
+    let trade_shortfall = window_trades.saturating_sub(run.trade_count) as f64;
+    let coverage_ratio = (run.trade_count as f64 / window_trades as f64).clamp(0.0, 1.0);
     let shortfall = (target_win_rate - rs.latest_win_rate_pct).max(0.0);
     let target_hit = rs.windows > 0
         && rs.latest_win_rate_pct >= target_win_rate
         && run.avg_pnl_cents > 0.0
         && run.trade_count >= window_trades;
     let objective = if rs.windows > 0 {
-        rs.latest_win_rate_pct * 3.2
+        (rs.latest_win_rate_pct * 3.2
             + rs.avg_win_rate_pct * 1.8
             + rs.min_win_rate_pct * 0.8
             + run.avg_pnl_cents * 2.2
@@ -2992,9 +2994,17 @@ fn score_with_rolling(
             - run.execution_penalty_cents_total * 0.4
             - run.blocked_exits as f64 * 18.0
             - shortfall * shortfall * 1.6
-            + if target_hit { 160.0 } else { 0.0 }
+            + if target_hit { 160.0 } else { 0.0 })
+            * (0.60 + 0.40 * coverage_ratio)
+            - trade_shortfall * 25.0
     } else {
-        run.win_rate_pct + run.avg_pnl_cents - 180.0
+        run.win_rate_pct * 0.3
+            + run.avg_pnl_cents * 0.2
+            - run.max_drawdown_cents * 0.03
+            - run.execution_penalty_cents_total * 0.6
+            - run.blocked_exits as f64 * 25.0
+            - 320.0
+            - trade_shortfall * 35.0
     };
     (rs, objective, target_hit)
 }
