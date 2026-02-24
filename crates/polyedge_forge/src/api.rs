@@ -2502,12 +2502,12 @@ fn run_strategy_simulation(
                     } else {
                         1.0 - signal.p_fair_up
                     };
-                    let confidence_floor = (0.56 + local_vol * 2.8 + sample.spread_mid * 2.0)
-                        .clamp(0.56, 0.86);
-                    let edge_required = (cfg.entry_edge_prob * (1.0 + local_vol * 8.0))
-                        .clamp(cfg.entry_edge_prob, cfg.entry_edge_prob * 2.6);
+                    let confidence_floor = (0.52 + local_vol * 2.2 + sample.spread_mid * 1.4)
+                        .clamp(0.52, 0.83);
+                    let edge_required = (cfg.entry_edge_prob * (1.0 + local_vol * 5.5))
+                        .clamp(cfg.entry_edge_prob, cfg.entry_edge_prob * 2.0);
                     let signal_required =
-                        (entry_thr + local_vol * 1.6 + sample.spread_mid * 0.8).clamp(
+                        (entry_thr + local_vol * 1.1 + sample.spread_mid * 0.5).clamp(
                             cfg.entry_threshold_base,
                             cfg.entry_threshold_cap,
                         );
@@ -2547,11 +2547,11 @@ fn run_strategy_simulation(
                 1.0 - signal.p_fair_up
             };
             let confidence_floor =
-                (0.56 + local_vol * 2.8 + sample.spread_mid * 2.0).clamp(0.56, 0.86);
-            let edge_required = (cfg.entry_edge_prob * (1.0 + local_vol * 8.0))
-                .clamp(cfg.entry_edge_prob, cfg.entry_edge_prob * 2.6);
+                (0.52 + local_vol * 2.2 + sample.spread_mid * 1.4).clamp(0.52, 0.83);
+            let edge_required = (cfg.entry_edge_prob * (1.0 + local_vol * 5.5))
+                .clamp(cfg.entry_edge_prob, cfg.entry_edge_prob * 2.0);
             let signal_required =
-                (entry_thr + local_vol * 1.6 + sample.spread_mid * 0.8).clamp(
+                (entry_thr + local_vol * 1.1 + sample.spread_mid * 0.5).clamp(
                     cfg.entry_threshold_base,
                     cfg.entry_threshold_cap,
                 );
@@ -3488,12 +3488,17 @@ async fn strategy_optimize(
             let fill_risk_penalty = valid_run.blocked_exits as f64 * 18.0
                 + valid_run.execution_penalty_cents_total * 0.9
                 + valid_run.emergency_wide_exit_count as f64 * 3.0;
+            let train_trade_shortfall = window_trades.saturating_sub(train_run.trade_count) as f64;
+            let valid_trade_shortfall = window_trades.saturating_sub(valid_run.trade_count) as f64;
+            let coverage_gate_penalty =
+                train_trade_shortfall * 800.0 + valid_trade_shortfall * 900.0;
 
             let objective = train_obj * 0.42 + valid_obj * 0.78
                 - consistency_penalty
                 - validation_fail_penalty
                 - train_fail_penalty
-                - fill_risk_penalty;
+                - fill_risk_penalty
+                - coverage_gate_penalty;
             let hit = train_hit
                 && (valid_hit || valid_rs.latest_win_rate_pct >= (target_win_rate - 5.0))
                 && valid_run.avg_pnl_cents > 0.0
