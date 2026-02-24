@@ -2945,6 +2945,22 @@ fn build_strategy_arms(
             0.66, 0.024, 0.035, 9.0, 90.0, 22_000, 10.0, 4usize, 20.0, 8.0, 93.0, 88.0, 0.06,
             2usize,
         ),
+        (
+            0.78, 0.020, 0.075, 16.0, 82.0, 40_000, 8.0, 5usize, 22.0, 8.0, 96.0, 94.0, 0.05,
+            1usize,
+        ),
+        (
+            0.80, 0.018, 0.070, 18.0, 80.0, 50_000, 10.0, 6usize, 26.0, 10.0, 97.0, 95.0, 0.06,
+            1usize,
+        ),
+        (
+            0.84, 0.016, 0.085, 20.0, 78.0, 65_000, 9.0, 6usize, 24.0, 9.0, 98.0, 96.0, 0.06,
+            1usize,
+        ),
+        (
+            0.82, 0.014, 0.090, 24.0, 75.0, 70_000, 8.0, 7usize, 28.0, 11.0, 98.0, 97.0, 0.05,
+            1usize,
+        ),
     ];
     for (idx, p) in presets.iter().enumerate() {
         let mut cfg = base;
@@ -3426,6 +3442,17 @@ async fn strategy_optimize(
                 } else {
                     0.0
                 };
+            let train_fail_penalty = if train_run.avg_pnl_cents <= 0.0
+                || train_run.total_pnl_cents <= 0.0
+                || pf_train < 1.0
+            {
+                220.0
+                    + train_run.avg_pnl_cents.abs() * 200.0
+                    + train_run.total_pnl_cents.abs() * 0.015
+                    + (1.0 - pf_train).max(0.0) * 180.0
+            } else {
+                0.0
+            };
             let fill_risk_penalty = valid_run.blocked_exits as f64 * 18.0
                 + valid_run.execution_penalty_cents_total * 0.9
                 + valid_run.emergency_wide_exit_count as f64 * 3.0;
@@ -3433,11 +3460,14 @@ async fn strategy_optimize(
             let objective = train_obj * 0.42 + valid_obj * 0.78
                 - consistency_penalty
                 - validation_fail_penalty
+                - train_fail_penalty
                 - fill_risk_penalty;
             let hit = train_hit
                 && (valid_hit || valid_rs.latest_win_rate_pct >= (target_win_rate - 5.0))
                 && valid_run.avg_pnl_cents > 0.0
-                && pf_valid >= 1.03;
+                && pf_valid >= 1.03
+                && train_run.avg_pnl_cents > 0.0
+                && pf_train >= 1.01;
 
             let payload = json!({
                 "name": name,
