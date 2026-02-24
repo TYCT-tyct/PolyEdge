@@ -12,6 +12,29 @@ interface AccuracyChartProps {
 const HALF_HOUR_SEC = 30 * 60;
 const LOOKBACK_SEC = 24 * 60 * 60;
 
+function formatAxisTs(formatter: Intl.DateTimeFormat, tsSec: number): string {
+  const parts = formatter.formatToParts(new Date(tsSec * 1000));
+  let mm = "";
+  let dd = "";
+  let hh = "";
+  let mi = "";
+  for (const p of parts) {
+    if (p.type === "month") {
+      mm = p.value;
+    } else if (p.type === "day") {
+      dd = p.value;
+    } else if (p.type === "hour") {
+      hh = p.value;
+    } else if (p.type === "minute") {
+      mi = p.value;
+    }
+  }
+  if (!mm || !dd || !hh || !mi) {
+    return formatter.format(new Date(tsSec * 1000));
+  }
+  return `${mm}/${dd} ${hh}:${mi}`;
+}
+
 function toData(points: AccuracyPoint[]): uPlot.AlignedData {
   const xs: number[] = [];
   const ys: Array<number | null> = [];
@@ -76,7 +99,18 @@ function AccuracyChartImpl({ points, timeMode }: AccuracyChartProps) {
               }
               return out;
             },
-            values: (_u, vals) => vals.map((v) => axisTimeFormatter.format(new Date(v * 1000)))
+            values: (u, vals) => {
+              const widthPx = Math.max(640, u.bbox.width);
+              const maxLabels = Math.max(4, Math.floor(widthPx / 110));
+              const stride = Math.max(1, Math.ceil(vals.length / maxLabels));
+              return vals.map((v, idx) => {
+                const isEdge = idx === 0 || idx + 1 === vals.length;
+                if (!isEdge && idx % stride !== 0) {
+                  return "";
+                }
+                return formatAxisTs(axisTimeFormatter, v);
+              });
+            }
           },
           {
             scale: "acc",
