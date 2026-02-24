@@ -1729,9 +1729,14 @@ fn dynamic_taker_fee_cents(price_cents: f64) -> f64 {
     if !price_cents.is_finite() || price_cents <= 0.0 {
         return 0.0;
     }
+    // Official 5m/15m crypto fee curve (Polymarket docs):
+    // fee = C * p * fee_rate * (p * (1-p))^exponent, fee_rate=0.25, exponent=2.
+    // Here C=1 share and price_cents = p * 100.
     let p = (price_cents / 100.0).clamp(0.0001, 0.9999);
     let fee_rate = OFFICIAL_TAKER_FEE_MAX_RATE * (p * (1.0 - p)).powf(OFFICIAL_TAKER_FEE_EXPONENT);
-    (price_cents * fee_rate).clamp(0.0, 12.0)
+    let fee_usdc = (price_cents / 100.0) * fee_rate;
+    let fee_usdc_rounded_4dp = (fee_usdc * 10_000.0).round() / 10_000.0;
+    (fee_usdc_rounded_4dp * 100.0).clamp(0.0, 12.0)
 }
 
 fn confirm_direction(score_hist: &VecDeque<f64>, current_score: f64) -> bool {
