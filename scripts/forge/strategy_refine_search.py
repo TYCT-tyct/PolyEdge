@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import random
+import urllib.parse
+import urllib.request
+
+
+def get_json(base_url: str, path: str, query: dict, timeout: int) -> dict:
+    url = f"{base_url}{path}?{urllib.parse.urlencode(query)}"
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def eval_cfg(base_url: str, market_type: str, cfg: dict) -> dict:
+    q = {
+        "market_type": market_type,
+        "full_history": "true",
+        "lookback_minutes": "1440",
+        "max_trades": "900",
+        "use_autotune": "false",
+    }
+    for k, v in cfg.items():
+        q[k] = str(v)
+    p = get_json(base_url, "/api/strategy/paper", q, timeout=180)
+    t = p.get("trades") or []
+    s = p.get("summary") or {}
+
+    def stat(arr: list[dict]) -> tuple[float, float, float]:
+        n = len(arr)
+        if n == 0:
+            return 0.0, 0.0, 0.0
+        pnls = [float(x.get("pnl_cents") or 0.0) for x in arr]
+        wins = sum(1 for p in pnls if p > 0.0)
+        total = sum(pnls)
+        return wins * 100.0 / n, total / n, total
+
+    w50, a50, t50 = stat(t[-50:])
+    w80, a80, t80 = stat(t[-80:])
+    max_drawdown = float(s.get("max_drawdown_cents") or 0.0)
+    score = (
+        w50 * 10.0
+        + w80 * 4.0
+        + a50 * 4.0
+        + a80 * 2.0
+        + max(0.0, t50) * 0.02
+        - max(0.0, 90.0 - w50) * 50.0
+        - max_drawdown * 0.015
+    )
+    return {
+        "w50": w50,
+        "a50": a50,
+        "t50": t50,
+        "w80": w80,
+        "a80": a80,
+        "t80": t80,
+        "score": score,
+        "n": len(t),
+        "full": float(s.get("win_rate_pct") or 0.0),
+        "total": float(s.get("total_pnl_cents") or 0.0),
+        "max_drawdown": max_drawdown,
+    }
+
+
+def clamp_param(k: str, v: float | int) -> float | int:
+    bounds = {
+        "entry_threshold_base": (0.40, 0.95),
+        "entry_threshold_cap": (0.45, 0.99),
+        "spread_limit_prob": (0.005, 0.05),
+        "entry_edge_prob": (0.002, 0.25),
+        "entry_min_potential_cents": (1.0, 70.0),
+        "entry_max_price_cents": (45.0, 98.5),
+        "min_hold_ms": (0, 25000),
+        "stop_loss_cents": (2.0, 60.0),
+        "reverse_signal_threshold": (-0.95, -0.02),
+        "reverse_signal_ticks": (1, 12),
+        "trail_activate_profit_cents": (2.0, 80.0),
+        "trail_drawdown_cents": (1.0, 50.0),
+        "take_profit_near_max_cents": (70.0, 99.5),
+        "endgame_take_profit_cents": (50.0, 99.0),
+        "endgame_remaining_ms": (1000, 45000),
+        "liquidity_widen_prob": (0.02, 0.20),
+        "cooldown_ms": (0, 20000),
+        "max_entries_per_round": (1, 2),
+        "max_exec_spread_cents": (0.8, 3.4),
+        "slippage_cents_per_side": (0.03, 0.35),
+        "fee_cents_per_side": (0.03, 0.45),
+        "emergency_wide_spread_penalty_ratio": (0.0, 0.8),
+    }
+    lo, hi = bounds[k]
+    if k in {
+        "min_hold_ms",
+        "reverse_signal_ticks",
+        "endgame_remaining_ms",
+        "cooldown_ms",
+        "max_entries_per_round",
+    }:
+        return int(max(lo, min(hi, round(float(v)))))
+    return max(lo, min(hi, float(v)))
+
+
+def mutate(cfg: dict, scale: float) -> dict:
+    c = dict(cfg)
+    steps = {
+        "entry_threshold_base": 0.06,
+        "entry_threshold_cap": 0.06,
+        "spread_limit_prob": 0.006,
+        "entry_edge_prob": 0.015,
+        "entry_min_potential_cents": 3.5,
+        "entry_max_price_cents": 4.5,
+        "min_hold_ms": 3000,
+        "stop_loss_cents": 2.0,
+        "reverse_signal_threshold": 0.12,
+        "trail_activate_profit_cents": 3.0,
+        "trail_drawdown_cents": 1.5,
+        "take_profit_near_max_cents": 3.0,
+        "endgame_take_profit_cents": 3.0,
+        "endgame_remaining_ms": 3500,
+        "liquidity_widen_prob": 0.02,
+        "cooldown_ms": 2500,
+        "max_exec_spread_cents": 0.4,
+        "slippage_cents_per_side": 0.03,
+        "fee_cents_per_side": 0.03,
+        "emergency_wide_spread_penalty_ratio": 0.12,
+    }
+
+    for k in c.keys():
+        if k in {"max_entries_per_round", "reverse_signal_ticks"}:
+            if random.random() < 0.20:
+                c[k] = clamp_param(k, float(c[k]) + random.choice([-1, 1]))
+            continue
+        if k in {"fee_cents_per_side", "slippage_cents_per_side"} and random.random() >= 0.18:
+            continue
+        step = steps.get(k, 0.10)
+        c[k] = clamp_param(k, float(c[k]) + random.uniform(-step, step) * scale)
+
+    c["entry_threshold_cap"] = max(float(c["entry_threshold_cap"]), float(c["entry_threshold_base"]) + 0.03)
+    c["entry_threshold_cap"] = clamp_param("entry_threshold_cap", c["entry_threshold_cap"])
+    return c
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Refine local neighborhood around a seed config.")
+    ap.add_argument("--base-url", default="http://127.0.0.1:9810")
+    ap.add_argument("--market-type", default="5m")
+    ap.add_argument("--input", required=True, help="Path to JSON containing candidate config object.")
+    ap.add_argument("--iters", type=int, default=280)
+    ap.add_argument("--out", default="/tmp/refine_result.json")
+    args = ap.parse_args()
+
+    with open(args.input, "r", encoding="utf-8") as f:
+        base_cfg = json.load(f)
+
+    best_cfg = dict(base_cfg)
+    best = eval_cfg(args.base_url, args.market_type, best_cfg)
+    print("BASE", json.dumps(best, ensure_ascii=False))
+
+    for i in range(1, args.iters + 1):
+        scale = 1.0 if i < int(args.iters * 0.45) else (0.6 if i < int(args.iters * 0.8) else 0.35)
+        cand = mutate(best_cfg if random.random() < 0.70 else base_cfg, scale)
+        res = eval_cfg(args.base_url, args.market_type, cand)
+        if (res["score"], res["w50"], res["a50"], res["w80"]) > (
+            best["score"],
+            best["w50"],
+            best["a50"],
+            best["w80"],
+        ):
+            best = res
+            best_cfg = cand
+            print(
+                "NEW",
+                i,
+                json.dumps(
+                    {
+                        "w50": round(best["w50"], 2),
+                        "a50": round(best["a50"], 3),
+                        "w80": round(best["w80"], 2),
+                        "a80": round(best["a80"], 3),
+                        "score": round(best["score"], 2),
+                        "n": best["n"],
+                        "full": round(best["full"], 2),
+                        "total": round(best["total"], 2),
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+
+    out = {"best_metrics": best, "best_cfg": best_cfg}
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+    print("FINAL", json.dumps(best, ensure_ascii=False))
+    print("CFG", json.dumps(best_cfg, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
