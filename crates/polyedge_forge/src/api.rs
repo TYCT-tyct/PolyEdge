@@ -35,6 +35,8 @@ struct ApiState {
 
 const LIVE_SNAPSHOT_MAX_AGE_MS: i64 = 4_000;
 const LIVE_ROUND_END_GRACE_MS: i64 = 1_500;
+const RESOLVED_UP_PRICE_CENTS: f64 = 99.0;
+const RESOLVED_DOWN_PRICE_CENTS: f64 = 0.0;
 
 #[derive(Debug, Deserialize)]
 struct HistoryQueryParams {
@@ -1162,22 +1164,15 @@ async fn rounds(
             r.settle_price AS final_btc_price,
             toInt8(r.label_up) AS outcome,
             if(r.target_price > 0, (r.settle_price - r.target_price) / r.target_price * 100.0, NULL) AS delta_pct,
-            ifNull(s.close_mid_up, 0.5) * 100.0 AS mkt_price_cents
+            if(toInt8(r.label_up) = 1, {resolved_up_cents}, {resolved_down_cents}) AS mkt_price_cents
         FROM polyedge_forge.rounds r
-        LEFT JOIN (
-            SELECT
-                round_id,
-                argMinIf(coalesce(mid_yes, mid_yes_smooth), remaining_ms, remaining_ms >= 0) AS close_mid_up
-            FROM polyedge_forge.snapshot_100ms
-            WHERE symbol='BTCUSDT'
-              AND timeframe='{market_type}'
-            GROUP BY round_id
-        ) s ON r.round_id = s.round_id
         WHERE r.symbol='BTCUSDT'
           AND r.timeframe='{market_type}'
         ORDER BY end_ts_ms DESC
         LIMIT {limit}
-        FORMAT JSON"
+        FORMAT JSON",
+        resolved_up_cents = RESOLVED_UP_PRICE_CENTS,
+        resolved_down_cents = RESOLVED_DOWN_PRICE_CENTS
     );
 
     let rows = rows_from_json(query_clickhouse_json(ch_url, &query).await?);

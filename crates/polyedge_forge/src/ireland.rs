@@ -38,7 +38,7 @@ const PROB_SMOOTH_TAU_SEC: f64 = 4.0;
 const DELTA_SMOOTH_TAU_SEC: f64 = 2.4;
 const DELTA_MAX_STEP_PCT_PER_SEC: f64 = 0.18;
 const PROB_STATE_RETENTION_MS: i64 = 2 * 60 * 60 * 1000;
-const TARGET_RETRY_BACKOFF_MS: i64 = 3_000;
+const TARGET_RETRY_BACKOFF_MS: i64 = 1_200;
 
 fn ema_alpha_from_tau(dt_s: f64, tau_s: f64) -> f64 {
     if !dt_s.is_finite() || !tau_s.is_finite() || dt_s <= 0.0 || tau_s <= 0.0 {

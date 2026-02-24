@@ -14,6 +14,8 @@ import type {
 
 const API_BASE = (import.meta.env.VITE_FORGE_API_BASE as string | undefined)?.trim() ?? "";
 const REQUEST_TIMEOUT_MS = 10_000;
+const RESOLVED_UP_PRICE_CENTS = 99.0;
+const RESOLVED_DOWN_PRICE_CENTS = 0.0;
 const apiSupport: {
   stats: boolean | null;
   chart: boolean | null;
@@ -434,18 +436,11 @@ export async function getRoundHistory(marketType: MarketType, limit = 200): Prom
   }
   try {
     const history = await getHistoryRaw(marketType, 12 * 60, 50_000);
-    const latestSampleByRound = new Map<string, HistoryRaw["samples"][number]>();
-    for (const s of history.samples) {
-      const prev = latestSampleByRound.get(s.round_id);
-      if (!prev || s.ts_ireland_sample_ms > prev.ts_ireland_sample_ms) {
-        latestSampleByRound.set(s.round_id, s);
-      }
-    }
     const rows = history.rounds
       .map((r) => {
-        const latest = latestSampleByRound.get(r.round_id);
         const target = r.target_price;
         const final = r.settle_price;
+        const outcome = Number(r.label_up);
         return {
           round_id: r.round_id,
           market_id: r.market_id,
@@ -454,14 +449,9 @@ export async function getRoundHistory(marketType: MarketType, limit = 200): Prom
           end_time_ms: r.end_ts_ms,
           target_price: target,
           final_btc_price: final,
-          outcome: Number(r.label_up),
+          outcome,
           delta_pct: target > 0 ? ((final - target) / target) * 100 : null,
-          mkt_price_cents:
-            latest?.mid_yes != null
-              ? latest.mid_yes * 100
-              : midpointProb(latest?.bid_yes ?? null, latest?.ask_yes ?? null) != null
-                ? (midpointProb(latest?.bid_yes ?? null, latest?.ask_yes ?? null) as number) * 100
-                : null
+          mkt_price_cents: outcome === 1 ? RESOLVED_UP_PRICE_CENTS : RESOLVED_DOWN_PRICE_CENTS
         };
       })
       .sort((a, b) => b.end_time_ms - a.end_time_ms)
