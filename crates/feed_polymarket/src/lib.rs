@@ -664,6 +664,9 @@ fn collect_asset_updates(payload: &WsEvent, out: &mut Vec<AssetUpdate>) {
     if let Some(update) = parse_change_based_update(payload) {
         out.push(update);
     }
+    if let Some(update) = parse_trade_based_update(payload) {
+        out.push(update);
+    }
     for item in &payload.price_changes {
         collect_asset_updates(item, out);
     }
@@ -774,6 +777,38 @@ fn parse_change_based_update(payload: &WsEvent) -> Option<AssetUpdate> {
         best_bid_size: bid_size,
         best_ask,
         best_ask_size: ask_size,
+        ts_exchange_ms: payload.timestamp.unwrap_or_else(now_ms),
+        recv_ts_local_ns: now_ns(),
+    })
+}
+
+fn parse_trade_based_update(payload: &WsEvent) -> Option<AssetUpdate> {
+    if payload.best_bid.is_some()
+        || payload.best_ask.is_some()
+        || !payload.changes.is_empty()
+        || payload.bids.as_ref().is_some()
+        || payload.asks.as_ref().is_some()
+        || payload.buys.as_ref().is_some()
+        || payload.sells.as_ref().is_some()
+    {
+        return None;
+    }
+
+    let asset_id = payload.asset_id.clone()?;
+    let price = payload.price?;
+    if !validate_price(price) {
+        return None;
+    }
+    let size = payload.size;
+
+    // last_trade_price events carry executed price rather than top-of-book.
+    // Using bid=ask=trade keeps the displayed midpoint aligned with actual tape moves.
+    Some(AssetUpdate {
+        asset_id,
+        best_bid: Some(price),
+        best_bid_size: size,
+        best_ask: Some(price),
+        best_ask_size: size,
         ts_exchange_ms: payload.timestamp.unwrap_or_else(now_ms),
         recv_ts_local_ns: now_ns(),
     })
@@ -932,6 +967,10 @@ struct WsEvent {
     timestamp: Option<i64>,
     #[serde(default)]
     hash: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_f64")]
+    price: Option<f64>,
+    #[serde(default, deserialize_with = "de_opt_f64")]
+    size: Option<f64>,
     #[serde(default)]
     bids: Option<Vec<WsLevel>>,
     #[serde(default)]
@@ -1101,14 +1140,19 @@ mod tests {
 
         let mut updates = parse_asset_updates(&payload);
         updates.sort_by(|a, b| a.asset_id.cmp(&b.asset_id));
-        assert_eq!(updates.len(), 2);
+        assert_eq!(updates.len(), 3);
 
         let no = &updates[0];
         assert_eq!(no.asset_id, "no_token");
         assert_eq!(no.best_bid, Some(0.36));
         assert_eq!(no.best_ask, Some(0.37));
 
-        let yes = &updates[1];
+        let tick = &updates[1];
+        assert_eq!(tick.asset_id, "tick_token");
+        assert_eq!(tick.best_bid, Some(0.41));
+        assert_eq!(tick.best_ask, Some(0.41));
+
+        let yes = &updates[2];
         assert_eq!(yes.asset_id, "yes_token");
         assert_eq!(yes.best_bid, Some(0.63));
         assert_eq!(yes.best_ask, Some(0.64));
