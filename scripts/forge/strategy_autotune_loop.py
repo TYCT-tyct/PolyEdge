@@ -382,7 +382,24 @@ def main() -> None:
                     best = row
 
             if best is None:
-                raise RuntimeError("all optimize sweeps failed")
+                retry_seeds = seeds[: min(8, len(seeds))]
+                retry_rows, retry_errors = run_seed_batch_parallel(
+                    base_url=args.base_url,
+                    base_query=base_query,
+                    seeds=retry_seeds,
+                    iterations=max(80, args.iterations_sweep // 4),
+                    timeout_sec=args.timeout_sec,
+                    workers=1,
+                )
+                rows.extend(retry_rows)
+                optimize_errors.extend(retry_errors)
+                for row in rows:
+                    if best is None or score_row(row) > score_row(best):
+                        best = row
+                if best is None:
+                    raise RuntimeError(
+                        f"all optimize sweeps failed (errors={len(optimize_errors)})"
+                    )
 
             rows_sorted = sorted(rows, key=score_row, reverse=True)
             top_k = max(1, min(args.top_k_seeds, len(rows_sorted)))
