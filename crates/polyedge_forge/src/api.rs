@@ -2553,6 +2553,21 @@ fn run_strategy_simulation(
         } else {
             sample.delta_pct <= (0.006 - early_noise * 0.004)
         };
+        let prev_score = score_hist.back().copied().unwrap_or(score);
+        let score_momentum = score - prev_score;
+        let same_dir_recent = score_hist
+            .iter()
+            .rev()
+            .take(6)
+            .filter(|v| **v * side.dir() > 0.0)
+            .count();
+        let consistency_required = if early_noise > 0.35 { 5 } else { 4 };
+        let trend_consistent = same_dir_recent >= consistency_required;
+        let momentum_align = if side == StrategySide::Up {
+            score_momentum >= (-0.002 + early_noise * 0.028)
+        } else {
+            score_momentum <= (0.002 - early_noise * 0.028)
+        };
         last_side = side.as_str();
 
         if let Some(pos) = position.as_mut() {
@@ -2576,16 +2591,17 @@ fn run_strategy_simulation(
             let can_exit_now = held_ms >= cfg.min_hold_ms;
             let force_reverse_exit = pos.reverse_streak >= cfg.reverse_signal_ticks
                 && trend_signed <= cfg.reverse_signal_threshold * 1.25;
-            let profit_lock_ready = pos.peak_pnl_cents >= cfg.trail_activate_profit_cents * 0.65;
+            let profit_lock_ready = pos.peak_pnl_cents >= cfg.trail_activate_profit_cents * 0.45;
             let profit_lock_reversal = profit_lock_ready
-                && drawdown >= (pos.peak_pnl_cents * 0.45).max(cfg.trail_drawdown_cents * 0.8)
+                && drawdown >= (pos.peak_pnl_cents * 0.38).max(cfg.trail_drawdown_cents * 0.7)
                 && trend_signed < 0.0;
-            let flipped_to_net_negative = profit_lock_ready && pnl <= -0.2;
-            let fast_loss_guard = pnl <= -(cfg.stop_loss_cents * 0.40).max(1.8)
+            let had_realized_edge = pos.peak_pnl_cents >= (cfg.trail_drawdown_cents * 0.70).max(1.5);
+            let flipped_to_net_negative = had_realized_edge && pnl <= -0.2;
+            let fast_loss_guard = pnl <= -(cfg.stop_loss_cents * 0.32).max(1.4)
                 && trend_signed <= cfg.reverse_signal_threshold * 0.85
                 && pos.reverse_streak >= 1;
             let early_hard_stop = held_ms <= 12_000
-                && pnl <= -(cfg.stop_loss_cents * 0.55).max(4.0)
+                && pnl <= -(cfg.stop_loss_cents * 0.38).max(3.2)
                 && trend_signed <= -0.08;
             let first_reversal_take_profit = can_exit_now
                 && pnl >= (cfg.trail_drawdown_cents * 0.45).max(1.0)
@@ -2721,6 +2737,8 @@ fn run_strategy_simulation(
                         && signal.edge_prob.abs() >= edge_required
                         && edge_align
                         && delta_align
+                        && trend_consistent
+                        && momentum_align
                         && early_round_guard
                         && (!is_choppy || anti_chop_override)
                         && entry_price <= cfg.entry_max_price_cents
@@ -2780,6 +2798,8 @@ fn run_strategy_simulation(
                 && edge_align
                 && fair_confidence >= confidence_floor
                 && delta_align
+                && trend_consistent
+                && momentum_align
                 && early_round_guard
                 && (!is_choppy || anti_chop_override)
                 && sample.spread_mid <= cfg.spread_limit_prob
