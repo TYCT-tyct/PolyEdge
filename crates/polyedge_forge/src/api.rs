@@ -9,7 +9,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use redis::AsyncCommands;
@@ -111,6 +111,10 @@ struct StrategyPaperQueryParams {
     liquidity_widen_prob: Option<f64>,
     cooldown_ms: Option<i64>,
     max_entries_per_round: Option<u32>,
+    max_exec_spread_cents: Option<f64>,
+    slippage_cents_per_side: Option<f64>,
+    fee_cents_per_side: Option<f64>,
+    emergency_wide_spread_penalty_ratio: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,6 +150,21 @@ struct StrategyOptimizeQueryParams {
 #[derive(Debug, Deserialize)]
 struct StrategyAutotuneLatestQueryParams {
     market_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StrategyAutotuneHistoryQueryParams {
+    market_type: Option<String>,
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StrategyAutotuneSetBody {
+    market_type: Option<String>,
+    config: Value,
+    ttl_sec: Option<u32>,
+    source: Option<String>,
+    note: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -252,6 +271,8 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         .route("/api/strategy/full", get(strategy_full))
         .route("/api/strategy/optimize", get(strategy_optimize))
         .route("/api/strategy/autotune/latest", get(strategy_autotune_latest))
+        .route("/api/strategy/autotune/history", get(strategy_autotune_history))
+        .route("/api/strategy/autotune/set", post(strategy_autotune_set))
         .with_state(state);
 
     if let Some(dist) = cfg.dashboard_dist_dir {
@@ -1099,6 +1120,10 @@ async fn write_key_value(
 
 fn strategy_autotune_key(redis_prefix: &str, market_type: &str) -> String {
     format!("{redis_prefix}:strategy:autotune:{market_type}")
+}
+
+fn strategy_autotune_history_key(redis_prefix: &str, market_type: &str) -> String {
+    format!("{redis_prefix}:strategy:autotune:{market_type}:history")
 }
 
 async fn read_key_json(state: &ApiState, key: &str) -> Result<Json<Value>, ApiError> {
@@ -2974,6 +2999,18 @@ async fn strategy_paper(
     if let Some(v) = params.max_entries_per_round {
         cfg.max_entries_per_round = v.clamp(1, 8) as usize;
     }
+    if let Some(v) = params.max_exec_spread_cents {
+        cfg.max_exec_spread_cents = v.clamp(0.2, 30.0);
+    }
+    if let Some(v) = params.slippage_cents_per_side {
+        cfg.slippage_cents_per_side = v.clamp(0.0, 10.0);
+    }
+    if let Some(v) = params.fee_cents_per_side {
+        cfg.fee_cents_per_side = v.clamp(0.0, 12.0);
+    }
+    if let Some(v) = params.emergency_wide_spread_penalty_ratio {
+        cfg.emergency_wide_spread_penalty_ratio = v.clamp(0.2, 3.0);
+    }
     if cfg.entry_threshold_cap < cfg.entry_threshold_base {
         cfg.entry_threshold_cap = cfg.entry_threshold_base;
     }
@@ -3078,6 +3115,81 @@ async fn strategy_autotune_latest(
         "key": key,
         "found": payload.is_some(),
         "data": payload,
+    })))
+}
+
+async fn strategy_autotune_history(
+    State(state): State<ApiState>,
+    Query(params): Query<StrategyAutotuneHistoryQueryParams>,
+) -> Result<Json<Value>, ApiError> {
+    let market_type = if let Some(mt) = params.market_type.as_deref() {
+        normalize_market_type(mt).ok_or_else(|| ApiError::bad_request("invalid market_type"))?
+    } else {
+        "5m"
+    };
+    let limit = params.limit.unwrap_or(20).clamp(1, 200) as usize;
+    let key = strategy_autotune_history_key(&state.redis_prefix, market_type);
+    let mut items = read_key_value(&state, &key)
+        .await?
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    if items.len() > limit {
+        items.truncate(limit);
+    }
+    Ok(Json(json!({
+        "market_type": market_type,
+        "key": key,
+        "limit": limit,
+        "count": items.len(),
+        "items": items,
+    })))
+}
+
+async fn strategy_autotune_set(
+    State(state): State<ApiState>,
+    Json(body): Json<StrategyAutotuneSetBody>,
+) -> Result<Json<Value>, ApiError> {
+    let market_type = if let Some(mt) = body.market_type.as_deref() {
+        normalize_market_type(mt).ok_or_else(|| ApiError::bad_request("invalid market_type"))?
+    } else {
+        "5m"
+    };
+    let key = strategy_autotune_key(&state.redis_prefix, market_type);
+    let history_key = strategy_autotune_history_key(&state.redis_prefix, market_type);
+    let previous = read_key_value(&state, &key).await?;
+
+    let wrapped = json!({ "config": body.config });
+    let cfg = strategy_cfg_from_payload(StrategyRuntimeConfig::default(), &wrapped);
+    let saved_doc = json!({
+        "saved_at_ms": Utc::now().timestamp_millis(),
+        "market_type": market_type,
+        "source": body.source.unwrap_or_else(|| "manual".to_string()),
+        "note": body.note.unwrap_or_default(),
+        "config": strategy_cfg_json(&cfg),
+    });
+
+    write_key_value(&state, &key, &saved_doc, body.ttl_sec.filter(|v| *v > 0)).await?;
+
+    // Keep a small local history for rollback decisions.
+    let mut history: Vec<Value> = read_key_value(&state, &history_key)
+        .await?
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    if let Some(prev) = previous.clone() {
+        history.insert(0, prev);
+    }
+    if history.len() > 40 {
+        history.truncate(40);
+    }
+    let _ = write_key_value(&state, &history_key, &Value::Array(history), None).await;
+
+    Ok(Json(json!({
+        "ok": true,
+        "market_type": market_type,
+        "key": key,
+        "history_key": history_key,
+        "previous_found": previous.is_some(),
+        "saved": saved_doc,
     })))
 }
 
