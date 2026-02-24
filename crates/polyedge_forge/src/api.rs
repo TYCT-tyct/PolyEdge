@@ -3023,7 +3023,7 @@ async fn strategy_paper(
     } else {
         "5m"
     };
-    let use_autotune = params.use_autotune.unwrap_or(true);
+    let use_autotune = params.use_autotune.unwrap_or(false);
     let mut cfg = StrategyRuntimeConfig::default();
     let mut config_source = "default";
     let mut autotune_info = Value::Null;

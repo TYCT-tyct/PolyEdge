@@ -643,6 +643,7 @@ export async function getStrategyPaper(
     market_type: marketType,
     lookback_minutes: String(lookbackMinutes),
     max_trades: String(maxTrades),
+    use_autotune: "false",
   });
   return requestJson<StrategyPaperResponse>(`/api/strategy/paper?${qs.toString()}`);
 }
