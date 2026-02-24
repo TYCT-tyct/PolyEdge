@@ -406,14 +406,13 @@ fn compact_live_snapshot(snapshot: &Value, market_type: &str) -> Value {
         String::new()
     };
 
-    let mid_yes = snapshot
-        .get("mid_yes")
-        .and_then(Value::as_f64)
-        .or_else(|| snapshot.get("mid_yes_smooth").and_then(Value::as_f64));
-    let mid_no = snapshot
-        .get("mid_no")
-        .and_then(Value::as_f64)
-        .or_else(|| snapshot.get("mid_no_smooth").and_then(Value::as_f64));
+    let mid_yes_raw = snapshot.get("mid_yes").and_then(Value::as_f64);
+    let mid_no_raw = snapshot.get("mid_no").and_then(Value::as_f64);
+    let mid_yes_smooth = snapshot.get("mid_yes_smooth").and_then(Value::as_f64);
+    let mid_no_smooth = snapshot.get("mid_no_smooth").and_then(Value::as_f64);
+    // Live display should prefer smoothed mids to avoid transient quote noise.
+    let mid_yes = mid_yes_smooth.or(mid_yes_raw);
+    let mid_no = mid_no_smooth.or(mid_no_raw);
     let raw_bid_yes = snapshot.get("bid_yes").and_then(Value::as_f64);
     let raw_ask_yes = snapshot.get("ask_yes").and_then(Value::as_f64);
     let raw_bid_no = snapshot.get("bid_no").and_then(Value::as_f64);
@@ -437,7 +436,12 @@ fn compact_live_snapshot(snapshot: &Value, market_type: &str) -> Value {
         "market_type": market_type,
         "btc_price": snapshot.get("binance_price").and_then(Value::as_f64),
         "target_price": snapshot.get("target_price").and_then(Value::as_f64),
+        "mid_yes": mid_yes_raw,
+        "mid_no": mid_no_raw,
+        "mid_yes_smooth": mid_yes_smooth,
+        "mid_no_smooth": mid_no_smooth,
         "delta_pct": snapshot.get("delta_pct_smooth").and_then(Value::as_f64).or_else(|| snapshot.get("delta_pct").and_then(Value::as_f64)),
+        "delta_pct_smooth": snapshot.get("delta_pct_smooth").and_then(Value::as_f64),
         "best_bid_up": best_bid_up,
         "best_ask_up": best_ask_up,
         "best_bid_down": best_bid_down,
