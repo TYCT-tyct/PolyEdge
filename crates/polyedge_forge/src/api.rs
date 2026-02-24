@@ -1547,3 +1547,50 @@ fn is_safe_round_id(v: &str) -> bool {
         && v.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn live_snapshot_rejects_old_timestamp() {
+        let snap = json!({
+            "ts_ireland_sample_ms": 1_000_000_i64,
+            "remaining_ms": 120_000_i64,
+            "round_id": "BTCUSDT_5m_1000000",
+        });
+        assert!(!is_live_snapshot_fresh(
+            &snap,
+            "5m",
+            1_000_000 + LIVE_SNAPSHOT_MAX_AGE_MS + 1
+        ));
+    }
+
+    #[test]
+    fn live_snapshot_rejects_ended_round_after_grace() {
+        let start = 1_000_000_i64;
+        let end = start + market_type_to_ms("5m");
+        let snap = json!({
+            "ts_ireland_sample_ms": end,
+            "remaining_ms": 0_i64,
+            "round_id": format!("BTCUSDT_5m_{}", start),
+        });
+        assert!(!is_live_snapshot_fresh(
+            &snap,
+            "5m",
+            end + LIVE_ROUND_END_GRACE_MS + 1
+        ));
+    }
+
+    #[test]
+    fn live_snapshot_accepts_fresh_active_round() {
+        let start = 1_000_000_i64;
+        let snap = json!({
+            "ts_ireland_sample_ms": start + 100_000,
+            "remaining_ms": 200_000_i64,
+            "round_id": format!("BTCUSDT_5m_{}", start),
+        });
+        assert!(is_live_snapshot_fresh(&snap, "5m", start + 100_500));
+    }
+}
