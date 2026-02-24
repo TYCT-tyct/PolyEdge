@@ -8,6 +8,18 @@ interface AccuracyChartProps {
   points: AccuracyPoint[];
 }
 
+const HALF_HOUR_SEC = 30 * 60;
+const LOOKBACK_SEC = 24 * 60 * 60;
+
+function formatAxisTs(sec: number): string {
+  const d = new Date(sec * 1000);
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mi = String(d.getMinutes()).padStart(2, "0");
+  return `${mm}-${dd} ${hh}:${mi}`;
+}
+
 function toData(points: AccuracyPoint[]): uPlot.AlignedData {
   const xs: number[] = [];
   const ys: Array<number | null> = [];
@@ -34,7 +46,13 @@ function AccuracyChartImpl({ points }: AccuracyChartProps) {
         width: Math.max(640, root.clientWidth),
         height: 250,
         scales: {
-          x: { time: true },
+          x: {
+            time: true,
+            range: () => {
+              const nowSec = Date.now() / 1000;
+              return [nowSec - LOOKBACK_SEC, nowSec];
+            }
+          },
           acc: { range: [0, 100] }
         },
         axes: [
@@ -47,22 +65,14 @@ function AccuracyChartImpl({ points }: AccuracyChartProps) {
               if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) {
                 return [];
               }
-              const stepSec = 1800; // 30 minutes
-              const start = Math.ceil(min / stepSec) * stepSec;
+              const start = Math.ceil(min / HALF_HOUR_SEC) * HALF_HOUR_SEC;
               const out: number[] = [];
-              for (let t = start; t <= max; t += stepSec) {
+              for (let t = start; t <= max; t += HALF_HOUR_SEC) {
                 out.push(t);
               }
               return out;
             },
-            values: (_u, vals) =>
-              vals.map((v) =>
-                new Date(v * 1000).toLocaleTimeString("zh-CN", {
-                  hour12: false,
-                  hour: "2-digit",
-                  minute: "2-digit"
-                })
-              )
+            values: (_u, vals) => vals.map((v) => formatAxisTs(v))
           },
           {
             scale: "acc",
