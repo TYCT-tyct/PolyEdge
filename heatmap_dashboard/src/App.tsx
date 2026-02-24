@@ -547,7 +547,10 @@ const AccuracyPanel = memo(function AccuracyPanel({ accuracyTab, onTabChange, po
     if (points.length === 0) {
       return null;
     }
-    const vals = points.map((p) => p.accuracy_pct).filter((v) => Number.isFinite(v));
+    const vals = points
+      .filter((p) => p.sample_count > 0)
+      .map((p) => p.accuracy_pct)
+      .filter((v) => Number.isFinite(v));
     if (vals.length === 0) {
       return null;
     }
@@ -564,7 +567,7 @@ const AccuracyPanel = memo(function AccuracyPanel({ accuracyTab, onTabChange, po
         <div>
           <h2>市场方向一致率（过去24小时）</h2>
           <p className="muted">
-            5m 使用最近40轮滚动窗口，15m 使用最近20轮滚动窗口；图表按30分钟步进展示过去24小时走势。
+            5m 使用最近40轮滚动窗口，15m 使用最近20轮滚动窗口；图表按30分钟步进，并以阶梯线展示有效样本。
           </p>
         </div>
         <div className="btn-group">

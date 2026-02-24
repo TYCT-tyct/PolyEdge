@@ -10,10 +10,10 @@ interface AccuracyChartProps {
 
 function toData(points: AccuracyPoint[]): uPlot.AlignedData {
   const xs: number[] = [];
-  const ys: number[] = [];
+  const ys: Array<number | null> = [];
   for (const p of points) {
     xs.push(p.timestamp_ms / 1000);
-    ys.push(p.accuracy_pct);
+    ys.push(p.sample_count > 0 ? p.accuracy_pct : null);
   }
   return [xs, ys];
 }
@@ -78,6 +78,7 @@ function AccuracyChartImpl({ points }: AccuracyChartProps) {
             scale: "acc",
             stroke: "#efe349",
             width: 1.8,
+            paths: uPlot.paths.stepped?.({ align: 1, alignGaps: 1, ascDesc: true }),
             points: { show: false }
           }
         ]
