@@ -1671,14 +1671,14 @@ fn parse_strategy_rows(rows: Vec<Value>) -> Vec<StrategySample> {
             continue;
         }
 
-        let mut bid_yes = row_f64(&row, "bid_yes");
-        let mut ask_yes = row_f64(&row, "ask_yes");
-        let mut bid_no = row_f64(&row, "bid_no");
-        let mut ask_no = row_f64(&row, "ask_no");
+        let raw_bid_yes = row_f64(&row, "bid_yes");
+        let raw_ask_yes = row_f64(&row, "ask_yes");
+        let raw_bid_no = row_f64(&row, "bid_no");
+        let raw_ask_no = row_f64(&row, "ask_no");
 
         let p_mid_yes = row_f64(&row, "mid_yes_smooth")
             .or_else(|| row_f64(&row, "mid_yes"))
-            .or_else(|| match (bid_yes, ask_yes) {
+            .or_else(|| match (raw_bid_yes, raw_ask_yes) {
                 (Some(b), Some(a)) => Some((a + b) * 0.5),
                 (Some(v), None) | (None, Some(v)) => Some(v),
                 _ => None,
@@ -1690,33 +1690,32 @@ fn parse_strategy_rows(rows: Vec<Value>) -> Vec<StrategySample> {
         }
         p_up = p_up.clamp(0.0, 1.0);
 
-        if bid_yes.is_none() && ask_yes.is_none() {
-            let s = 0.01;
-            bid_yes = Some((p_up - s * 0.5).clamp(0.0, 1.0));
-            ask_yes = Some((p_up + s * 0.5).clamp(0.0, 1.0));
-        }
-        let mut by = bid_yes.unwrap_or(p_up).clamp(0.0, 1.0);
-        let mut ay = ask_yes.unwrap_or(p_up).clamp(0.0, 1.0);
-        if by > ay {
-            std::mem::swap(&mut by, &mut ay);
-        }
-
         let p_no_mid = row_f64(&row, "mid_no_smooth")
             .or_else(|| row_f64(&row, "mid_no"))
             .unwrap_or((1.0 - p_up).clamp(0.0, 1.0));
-        if bid_no.is_none() && ask_no.is_none() {
-            let s = 0.01;
-            bid_no = Some((p_no_mid - s * 0.5).clamp(0.0, 1.0));
-            ask_no = Some((p_no_mid + s * 0.5).clamp(0.0, 1.0));
+
+        let raw_spread_up = match (raw_bid_yes, raw_ask_yes) {
+            (Some(b), Some(a)) if a.is_finite() && b.is_finite() => (a - b).abs(),
+            _ => 0.012,
+        };
+        let raw_spread_down = match (raw_bid_no, raw_ask_no) {
+            (Some(b), Some(a)) if a.is_finite() && b.is_finite() => (a - b).abs(),
+            _ => 0.012,
+        };
+        let spread_up = raw_spread_up.clamp(0.003, 0.04);
+        let spread_down = raw_spread_down.clamp(0.003, 0.04);
+        // Use a synthetic tradable band around smoothed mids to suppress occasional bad top-of-book spikes.
+        let mut by = (p_up - spread_up * 0.5).clamp(0.0, 1.0);
+        let mut ay = (p_up + spread_up * 0.5).clamp(0.0, 1.0);
+        if by > ay {
+            std::mem::swap(&mut by, &mut ay);
         }
-        let mut bn = bid_no.unwrap_or(p_no_mid).clamp(0.0, 1.0);
-        let mut an = ask_no.unwrap_or(p_no_mid).clamp(0.0, 1.0);
+        let mut bn = (p_no_mid - spread_down * 0.5).clamp(0.0, 1.0);
+        let mut an = (p_no_mid + spread_down * 0.5).clamp(0.0, 1.0);
         if bn > an {
             std::mem::swap(&mut bn, &mut an);
         }
 
-        let spread_up = (ay - by).abs().clamp(0.001, 0.08);
-        let spread_down = (an - bn).abs().clamp(0.001, 0.08);
         let spread_mid = ((spread_up + spread_down) * 0.5).clamp(0.001, 0.08);
 
         let delta_pct = row_f64(&row, "delta_pct_smooth")
@@ -1878,6 +1877,8 @@ async fn strategy_paper(
     let mut score_hist = VecDeque::<f64>::with_capacity(24);
     let mut position: Option<StrategyPosition> = None;
     let mut trades: Vec<Value> = Vec::new();
+    let mut entries_by_round: HashMap<String, usize> = HashMap::new();
+    let mut last_exit_ts_ms: i64 = 0;
 
     let mut last_round = String::new();
     let mut trade_id = 1_i64;
@@ -1954,12 +1955,16 @@ async fn strategy_paper(
                 }));
                 trade_id += 1;
                 position = None;
+                last_exit_ts_ms = sample.ts_ms;
             }
         } else {
             let can_enter = confirmed
                 && score.abs() >= entry_thr
                 && sample.spread_mid <= 0.035;
-            if can_enter {
+            let round_entries = entries_by_round.get(&sample.round_id).copied().unwrap_or(0);
+            let cooled_down =
+                last_exit_ts_ms <= 0 || sample.ts_ms.saturating_sub(last_exit_ts_ms) >= 6_000;
+            if can_enter && cooled_down && round_entries < 1 {
                 let entry_price = side_ask(sample, side) * 100.0;
                 position = Some(StrategyPosition {
                     side,
@@ -1970,6 +1975,7 @@ async fn strategy_paper(
                     peak_pnl_cents: 0.0,
                     reverse_streak: 0,
                 });
+                entries_by_round.insert(sample.round_id.clone(), round_entries + 1);
             }
         }
 
