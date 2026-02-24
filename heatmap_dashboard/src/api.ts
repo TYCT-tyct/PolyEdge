@@ -267,11 +267,18 @@ function normalizeChartResponse(data: ChartResponse): ChartResponse {
   const sorted = [...data.points]
     .map((p) => normalizeChartPoint(p))
     .filter((p) => p.timestamp_ms > 0)
-    .sort((a, b) => a.timestamp_ms - b.timestamp_ms);
+    .sort((a, b) => {
+      if (a.timestamp_ms !== b.timestamp_ms) {
+        return a.timestamp_ms - b.timestamp_ms;
+      }
+      const ar = a.round_id ?? "";
+      const br = b.round_id ?? "";
+      return ar.localeCompare(br);
+    });
   const deduped: ChartPoint[] = [];
   for (const p of sorted) {
     const prev = deduped[deduped.length - 1];
-    if (prev && prev.timestamp_ms === p.timestamp_ms) {
+    if (prev && prev.timestamp_ms === p.timestamp_ms && (prev.round_id ?? "") === (p.round_id ?? "")) {
       deduped[deduped.length - 1] = p;
     } else {
       deduped.push(p);

@@ -220,11 +220,18 @@ function sortAndDedupePoints(points: ChartPoint[]): ChartPoint[] {
   }
   const sorted = points
     .filter((p) => Number.isFinite(p.timestamp_ms) && p.timestamp_ms > 0)
-    .sort((a, b) => a.timestamp_ms - b.timestamp_ms);
+    .sort((a, b) => {
+      if (a.timestamp_ms !== b.timestamp_ms) {
+        return a.timestamp_ms - b.timestamp_ms;
+      }
+      const ar = a.round_id ?? "";
+      const br = b.round_id ?? "";
+      return ar.localeCompare(br);
+    });
   const deduped: ChartPoint[] = [];
   for (const p of sorted) {
     const prev = deduped[deduped.length - 1];
-    if (prev && prev.timestamp_ms === p.timestamp_ms) {
+    if (prev && prev.timestamp_ms === p.timestamp_ms && (prev.round_id ?? "") === (p.round_id ?? "")) {
       deduped[deduped.length - 1] = p;
     } else {
       deduped.push(p);
@@ -272,6 +279,8 @@ function bucketizePoints(points: ChartPoint[]): ChartPoint[] {
   };
 
   type BucketAgg = {
+    bucketStartMs: number;
+    roundId: string;
     source: ChartPoint;
     sourceTsMs: number;
     deltas: number[];
@@ -279,15 +288,19 @@ function bucketizePoints(points: ChartPoint[]): ChartPoint[] {
     downs: number[];
   };
 
-  const buckets = new Map<number, BucketAgg>();
+  const buckets = new Map<string, BucketAgg>();
   for (const p of sorted) {
     const ts = p.timestamp_ms;
-    const key = Math.floor(ts / ONE_SECOND_MS) * ONE_SECOND_MS;
+    const bucketStartMs = Math.floor(ts / ONE_SECOND_MS) * ONE_SECOND_MS;
+    const roundId = (p.round_id ?? "").trim();
+    const key = `${roundId}|${bucketStartMs}`;
     const pair = resolvePairFromPoint(p);
     const delta = resolveDeltaPct(p);
     const existing = buckets.get(key);
     if (!existing) {
       buckets.set(key, {
+        bucketStartMs,
+        roundId,
         source: p,
         sourceTsMs: ts,
         deltas: delta != null && Number.isFinite(delta) ? [delta] : [],
@@ -311,47 +324,63 @@ function bucketizePoints(points: ChartPoint[]): ChartPoint[] {
     }
   }
 
-  const keys = [...buckets.keys()].sort((a, b) => a - b);
-  if (keys.length === 0) {
+  const ordered = [...buckets.values()].sort((a, b) => {
+    if (a.bucketStartMs !== b.bucketStartMs) {
+      return a.bucketStartMs - b.bucketStartMs;
+    }
+    return a.sourceTsMs - b.sourceTsMs;
+  });
+  if (ordered.length === 0) {
     return [];
   }
 
   const out: ChartPoint[] = [];
   let lastObs: BucketObservation | null = null;
-  const firstBucket = keys[0]!;
-  const lastBucket = keys[keys.length - 1]!;
+  let lastBucketStartMs: number | null = null;
+  let lastRoundId = "";
 
-  for (let bucket = firstBucket; bucket <= lastBucket; bucket += ONE_SECOND_MS) {
-    const ts = bucket + ONE_SECOND_MS - 1;
-    const agg = buckets.get(bucket) ?? null;
-    if (agg) {
-      const observedDelta =
-        median(agg.deltas) ?? resolveDeltaPct(agg.source) ?? lastObs?.delta ?? null;
-      let observedPair = normalizePairedCentsSoft(median(agg.ups), median(agg.downs));
-      if (observedPair.up == null && observedPair.down == null && lastObs) {
-        observedPair = { up: lastObs.up, down: lastObs.down };
+  for (const agg of ordered) {
+    if (
+      lastObs &&
+      lastBucketStartMs != null &&
+      agg.roundId === lastRoundId &&
+      agg.bucketStartMs > lastBucketStartMs + ONE_SECOND_MS
+    ) {
+      for (
+        let bucket = lastBucketStartMs + ONE_SECOND_MS;
+        bucket < agg.bucketStartMs;
+        bucket += ONE_SECOND_MS
+      ) {
+        const ts = bucket + ONE_SECOND_MS - 1;
+        if (bucket - lastObs.sourceTsMs <= HOLD_LAST_MAX_GAP_MS) {
+          out.push(synthPoint(lastObs.source, ts, lastObs.delta, lastObs.up, lastObs.down));
+        } else {
+          // Long feed holes should be visible as gaps instead of synthetic continuity.
+          out.push(synthPoint(lastObs.source, ts, null, null, null, true));
+          lastObs = null;
+          break;
+        }
       }
-      const obs: BucketObservation = {
-        source: agg.source,
-        sourceTsMs: agg.sourceTsMs,
-        delta: observedDelta,
-        up: observedPair.up,
-        down: observedPair.down
-      };
-      lastObs = obs;
-      out.push(synthPoint(obs.source, ts, obs.delta, obs.up, obs.down));
-      continue;
     }
-    if (!lastObs) {
-      continue;
+
+    const ts = agg.bucketStartMs + ONE_SECOND_MS - 1;
+    const observedDelta = median(agg.deltas) ?? resolveDeltaPct(agg.source) ?? lastObs?.delta ?? null;
+    let observedPair = normalizePairedCentsSoft(median(agg.ups), median(agg.downs));
+    if (observedPair.up == null && observedPair.down == null && lastObs && agg.roundId === lastRoundId) {
+      observedPair = { up: lastObs.up, down: lastObs.down };
     }
-    if (bucket - lastObs.sourceTsMs <= HOLD_LAST_MAX_GAP_MS) {
-      out.push(synthPoint(lastObs.source, ts, lastObs.delta, lastObs.up, lastObs.down));
-    } else {
-      // Long feed holes should be visible as gaps instead of synthetic continuity.
-      out.push(synthPoint(lastObs.source, ts, null, null, null, true));
-      lastObs = null;
-    }
+
+    const obs: BucketObservation = {
+      source: agg.source,
+      sourceTsMs: agg.sourceTsMs,
+      delta: observedDelta,
+      up: observedPair.up,
+      down: observedPair.down
+    };
+    lastObs = obs;
+    lastBucketStartMs = agg.bucketStartMs;
+    lastRoundId = agg.roundId;
+    out.push(synthPoint(obs.source, ts, obs.delta, obs.up, obs.down));
   }
   return out;
 }
@@ -653,7 +682,7 @@ function MarketChartImpl({ points, rounds, timeMode, height = 420 }: MarketChart
             scale: "pct",
             stroke: "#efe349",
             width: 1.7,
-            spanGaps: true,
+            spanGaps: false,
             paths: steppedPathBuilder,
             points: { show: false }
           },
@@ -662,7 +691,7 @@ function MarketChartImpl({ points, rounds, timeMode, height = 420 }: MarketChart
             scale: "prob",
             stroke: "#64be4e",
             width: 1.55,
-            spanGaps: true,
+            spanGaps: false,
             paths: steppedPathBuilder,
             points: { show: false }
           },
@@ -671,7 +700,7 @@ function MarketChartImpl({ points, rounds, timeMode, height = 420 }: MarketChart
             scale: "prob",
             stroke: "#ff2f57",
             width: 1.55,
-            spanGaps: true,
+            spanGaps: false,
             paths: steppedPathBuilder,
             points: { show: false }
           }
