@@ -157,3 +157,57 @@ export interface AccuracySeriesResponse {
   series: AccuracyPoint[];
   latest_accuracy_pct: number | null;
 }
+
+export interface StrategyPaperTrade {
+  id: number;
+  side: "UP" | "DOWN";
+  entry_ts_ms: number;
+  exit_ts_ms: number;
+  entry_price_cents: number;
+  exit_price_cents: number;
+  pnl_cents: number;
+  peak_pnl_cents: number;
+  duration_s: number;
+  entry_score: number;
+  exit_score: number;
+  entry_reason: string;
+  exit_reason: string;
+}
+
+export interface StrategyPaperResponse {
+  market_type: string;
+  lookback_minutes: number;
+  samples: number;
+  config: {
+    entry_threshold_base: number;
+    entry_threshold_cap: number;
+    spread_limit_prob: number;
+    stop_loss_cents: number;
+    trail_drawdown_cents: number;
+    reverse_signal_threshold: number;
+    reverse_signal_ticks: number;
+  };
+  current: {
+    timestamp_ms: number;
+    round_id: string;
+    remaining_s: number;
+    score: number;
+    entry_threshold: number;
+    confirmed: boolean;
+    suggested_side: "UP" | "DOWN" | "WAIT";
+    suggested_action: "ENTER_UP" | "ENTER_DOWN" | "WAIT" | "RISK_OFF" | "HOLD";
+    confidence: number;
+    p_up_pct: number;
+    delta_pct: number;
+    spread_up_cents: number;
+    spread_down_cents: number;
+  } | null;
+  summary: {
+    trade_count: number;
+    win_rate_pct: number;
+    avg_pnl_cents: number;
+    total_pnl_cents: number;
+    max_drawdown_cents: number;
+  };
+  trades: StrategyPaperTrade[];
+}

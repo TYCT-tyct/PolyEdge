@@ -1,5 +1,5 @@
 use std::cmp::min;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -81,6 +81,14 @@ struct AccuracyQueryParams {
     window: Option<u32>,
     lookback_hours: Option<u32>,
     limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StrategyPaperQueryParams {
+    market_type: Option<String>,
+    lookback_minutes: Option<u32>,
+    max_points: Option<u32>,
+    max_trades: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -180,6 +188,7 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         .route("/api/rounds/available", get(rounds_available))
         .route("/api/heatmap", get(heatmap))
         .route("/api/accuracy_series", get(accuracy_series))
+        .route("/api/strategy/paper", get(strategy_paper))
         .with_state(state);
 
     if let Some(dist) = cfg.dashboard_dist_dir {
@@ -1514,6 +1523,577 @@ async fn accuracy_series(
         "processed_rounds": processed_rounds,
         "series": series,
         "latest_accuracy_pct": latest_accuracy,
+    })))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrategySide {
+    Up,
+    Down,
+}
+
+impl StrategySide {
+    fn as_str(self) -> &'static str {
+        match self {
+            StrategySide::Up => "UP",
+            StrategySide::Down => "DOWN",
+        }
+    }
+
+    fn dir(self) -> f64 {
+        match self {
+            StrategySide::Up => 1.0,
+            StrategySide::Down => -1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StrategySample {
+    ts_ms: i64,
+    round_id: String,
+    remaining_ms: i64,
+    p_up: f64,
+    delta_pct: f64,
+    velocity: f64,
+    acceleration: f64,
+    bid_yes: f64,
+    ask_yes: f64,
+    bid_no: f64,
+    ask_no: f64,
+    spread_up: f64,
+    spread_down: f64,
+    spread_mid: f64,
+}
+
+#[derive(Debug, Clone)]
+struct StrategyPosition {
+    side: StrategySide,
+    entry_price_cents: f64,
+    entry_ts_ms: i64,
+    entry_round_id: String,
+    entry_score: f64,
+    peak_pnl_cents: f64,
+    reverse_streak: usize,
+}
+
+fn tanh_norm(v: f64, scale: f64) -> f64 {
+    if !v.is_finite() || !scale.is_finite() || scale <= 0.0 {
+        return 0.0;
+    }
+    (v / scale).tanh()
+}
+
+fn side_bid(sample: &StrategySample, side: StrategySide) -> f64 {
+    match side {
+        StrategySide::Up => sample.bid_yes,
+        StrategySide::Down => sample.bid_no,
+    }
+}
+
+fn side_ask(sample: &StrategySample, side: StrategySide) -> f64 {
+    match side {
+        StrategySide::Up => sample.ask_yes,
+        StrategySide::Down => sample.ask_no,
+    }
+}
+
+fn side_spread(sample: &StrategySample, side: StrategySide) -> f64 {
+    match side {
+        StrategySide::Up => sample.spread_up,
+        StrategySide::Down => sample.spread_down,
+    }
+}
+
+fn confirm_direction(score_hist: &VecDeque<f64>, current_score: f64) -> bool {
+    if score_hist.len() < 2 || !current_score.is_finite() {
+        return false;
+    }
+    let sgn = if current_score > 0.0 {
+        1
+    } else if current_score < 0.0 {
+        -1
+    } else {
+        0
+    };
+    if sgn == 0 {
+        return false;
+    }
+    let mut same = 0usize;
+    for v in score_hist.iter().rev().take(2) {
+        let vsgn = if *v > 0.0 {
+            1
+        } else if *v < 0.0 {
+            -1
+        } else {
+            0
+        };
+        if vsgn == sgn {
+            same += 1;
+        }
+    }
+    same == 2
+}
+
+fn rolling_vol_absdiff(p_hist: &VecDeque<f64>) -> f64 {
+    if p_hist.len() < 2 {
+        return 0.0;
+    }
+    let mut sum = 0.0;
+    let mut n = 0usize;
+    let mut prev: Option<f64> = None;
+    for p in p_hist {
+        if let Some(v) = prev {
+            sum += (p - v).abs();
+            n += 1;
+        }
+        prev = Some(*p);
+    }
+    if n == 0 {
+        return 0.0;
+    }
+    sum / n as f64
+}
+
+fn parse_strategy_rows(rows: Vec<Value>) -> Vec<StrategySample> {
+    let mut out = Vec::<StrategySample>::new();
+    for row in rows {
+        let ts_ms = row_i64(&row, "ts_ms").unwrap_or(0);
+        if ts_ms <= 0 {
+            continue;
+        }
+        let round_id = row
+            .get("round_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if round_id.is_empty() {
+            continue;
+        }
+
+        let mut bid_yes = row_f64(&row, "bid_yes");
+        let mut ask_yes = row_f64(&row, "ask_yes");
+        let mut bid_no = row_f64(&row, "bid_no");
+        let mut ask_no = row_f64(&row, "ask_no");
+
+        let p_mid_yes = row_f64(&row, "mid_yes_smooth")
+            .or_else(|| row_f64(&row, "mid_yes"))
+            .or_else(|| match (bid_yes, ask_yes) {
+                (Some(b), Some(a)) => Some((a + b) * 0.5),
+                (Some(v), None) | (None, Some(v)) => Some(v),
+                _ => None,
+            });
+
+        let mut p_up = p_mid_yes.unwrap_or(0.5);
+        if !p_up.is_finite() {
+            p_up = 0.5;
+        }
+        p_up = p_up.clamp(0.0, 1.0);
+
+        if bid_yes.is_none() && ask_yes.is_none() {
+            let s = 0.01;
+            bid_yes = Some((p_up - s * 0.5).clamp(0.0, 1.0));
+            ask_yes = Some((p_up + s * 0.5).clamp(0.0, 1.0));
+        }
+        let mut by = bid_yes.unwrap_or(p_up).clamp(0.0, 1.0);
+        let mut ay = ask_yes.unwrap_or(p_up).clamp(0.0, 1.0);
+        if by > ay {
+            std::mem::swap(&mut by, &mut ay);
+        }
+
+        let p_no_mid = row_f64(&row, "mid_no_smooth")
+            .or_else(|| row_f64(&row, "mid_no"))
+            .unwrap_or((1.0 - p_up).clamp(0.0, 1.0));
+        if bid_no.is_none() && ask_no.is_none() {
+            let s = 0.01;
+            bid_no = Some((p_no_mid - s * 0.5).clamp(0.0, 1.0));
+            ask_no = Some((p_no_mid + s * 0.5).clamp(0.0, 1.0));
+        }
+        let mut bn = bid_no.unwrap_or(p_no_mid).clamp(0.0, 1.0);
+        let mut an = ask_no.unwrap_or(p_no_mid).clamp(0.0, 1.0);
+        if bn > an {
+            std::mem::swap(&mut bn, &mut an);
+        }
+
+        let spread_up = (ay - by).abs().clamp(0.001, 0.08);
+        let spread_down = (an - bn).abs().clamp(0.001, 0.08);
+        let spread_mid = ((spread_up + spread_down) * 0.5).clamp(0.001, 0.08);
+
+        let delta_pct = row_f64(&row, "delta_pct_smooth")
+            .or_else(|| row_f64(&row, "delta_pct"))
+            .or_else(|| {
+                let px = row_f64(&row, "binance_price")?;
+                let tp = row_f64(&row, "target_price")?;
+                if tp > 0.0 {
+                    Some(((px - tp) / tp) * 100.0)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0.0);
+        let velocity = row_f64(&row, "velocity_bps_per_sec").unwrap_or(0.0);
+        let acceleration = row_f64(&row, "acceleration").unwrap_or(0.0);
+        let remaining_ms = row_i64(&row, "remaining_ms").unwrap_or(0).max(0);
+
+        if let Some(last) = out.last_mut() {
+            if last.round_id == round_id && last.ts_ms / 1000 == ts_ms / 1000 {
+                *last = StrategySample {
+                    ts_ms,
+                    round_id,
+                    remaining_ms,
+                    p_up,
+                    delta_pct,
+                    velocity,
+                    acceleration,
+                    bid_yes: by,
+                    ask_yes: ay,
+                    bid_no: bn,
+                    ask_no: an,
+                    spread_up,
+                    spread_down,
+                    spread_mid,
+                };
+                continue;
+            }
+        }
+
+        out.push(StrategySample {
+            ts_ms,
+            round_id,
+            remaining_ms,
+            p_up,
+            delta_pct,
+            velocity,
+            acceleration,
+            bid_yes: by,
+            ask_yes: ay,
+            bid_no: bn,
+            ask_no: an,
+            spread_up,
+            spread_down,
+            spread_mid,
+        });
+    }
+    out
+}
+
+fn compute_score(
+    current: &StrategySample,
+    p_hist: &VecDeque<f64>,
+    score_hist: &VecDeque<f64>,
+) -> (f64, f64, bool) {
+    let p_now = current.p_up;
+    let p_mom3 = if p_hist.len() >= 4 {
+        p_now - p_hist[p_hist.len() - 4]
+    } else {
+        0.0
+    };
+    let p_mom8 = if p_hist.len() >= 9 {
+        p_now - p_hist[p_hist.len() - 9]
+    } else {
+        0.0
+    };
+    let dlt = current.delta_pct;
+    let vel = current.velocity;
+    let acc = current.acceleration;
+
+    let score = 0.34 * tanh_norm(p_mom3, 0.028)
+        + 0.27 * tanh_norm(dlt, 0.07)
+        + 0.21 * tanh_norm(p_mom8, 0.045)
+        + 0.12 * tanh_norm(vel, 3.6)
+        + 0.06 * tanh_norm(acc, 16.0);
+
+    let vol = rolling_vol_absdiff(p_hist);
+    let entry_threshold = (0.56 + vol * 4.2 + current.spread_mid * 1.1).clamp(0.56, 0.82);
+    let confirmed = confirm_direction(score_hist, score);
+    (score.clamp(-1.0, 1.0), entry_threshold, confirmed)
+}
+
+async fn strategy_paper(
+    State(state): State<ApiState>,
+    Query(params): Query<StrategyPaperQueryParams>,
+) -> Result<Json<Value>, ApiError> {
+    let market_type = if let Some(mt) = params.market_type.as_deref() {
+        normalize_market_type(mt).ok_or_else(|| ApiError::bad_request("invalid market_type"))?
+    } else {
+        "5m"
+    };
+    let lookback_minutes = params.lookback_minutes.unwrap_or(6 * 60).clamp(30, 24 * 60);
+    let max_points = params.max_points.unwrap_or(160_000).clamp(3_000, 350_000);
+    let max_trades = params.max_trades.unwrap_or(200).clamp(20, 1000) as usize;
+
+    let Some(ch_url) = state.ch_url.as_deref() else {
+        return Err(ApiError::internal("clickhouse not configured"));
+    };
+    let from_ms = Utc::now()
+        .timestamp_millis()
+        .saturating_sub(i64::from(lookback_minutes) * 60_000);
+    let q = format!(
+        "SELECT
+            ts_ireland_sample_ms AS ts_ms,
+            round_id,
+            remaining_ms,
+            mid_yes,
+            mid_yes_smooth,
+            mid_no,
+            mid_no_smooth,
+            bid_yes,
+            ask_yes,
+            bid_no,
+            ask_no,
+            delta_pct,
+            delta_pct_smooth,
+            velocity_bps_per_sec,
+            acceleration,
+            binance_price,
+            target_price
+        FROM polyedge_forge.snapshot_100ms
+        WHERE symbol='BTCUSDT'
+          AND timeframe='{market_type}'
+          AND ts_ireland_sample_ms >= {from_ms}
+        ORDER BY ts_ireland_sample_ms ASC
+        LIMIT {max_points}
+        FORMAT JSON"
+    );
+    let rows = rows_from_json(query_clickhouse_json(ch_url, &q).await?);
+    let samples = parse_strategy_rows(rows);
+    if samples.len() < 20 {
+        return Ok(Json(json!({
+            "market_type": market_type,
+            "lookback_minutes": lookback_minutes,
+            "samples": samples.len(),
+            "current": Value::Null,
+            "summary": {
+                "trade_count": 0,
+                "win_rate_pct": 0.0,
+                "avg_pnl_cents": 0.0,
+                "total_pnl_cents": 0.0,
+                "max_drawdown_cents": 0.0,
+            },
+            "trades": [],
+        })));
+    }
+
+    let mut p_hist = VecDeque::<f64>::with_capacity(24);
+    let mut score_hist = VecDeque::<f64>::with_capacity(24);
+    let mut position: Option<StrategyPosition> = None;
+    let mut trades: Vec<Value> = Vec::new();
+
+    let mut last_round = String::new();
+    let mut trade_id = 1_i64;
+    let mut last_score = 0.0_f64;
+    let mut last_entry_threshold = 0.62_f64;
+    let mut last_confirmed = false;
+    let mut last_side = "WAIT";
+
+    for sample in &samples {
+        if !last_round.is_empty() && sample.round_id != last_round {
+            p_hist.clear();
+            score_hist.clear();
+        }
+        let (score, entry_thr, confirmed) = compute_score(sample, &p_hist, &score_hist);
+        last_score = score;
+        last_entry_threshold = entry_thr;
+        last_confirmed = confirmed;
+        last_round = sample.round_id.clone();
+
+        let side = if score >= 0.0 {
+            StrategySide::Up
+        } else {
+            StrategySide::Down
+        };
+        last_side = side.as_str();
+
+        if let Some(pos) = position.as_mut() {
+            let bid_cents = side_bid(sample, pos.side) * 100.0;
+            let pnl = bid_cents - pos.entry_price_cents;
+            if pnl > pos.peak_pnl_cents {
+                pos.peak_pnl_cents = pnl;
+            }
+            let drawdown = pos.peak_pnl_cents - pnl;
+            let trend_signed = score * pos.side.dir();
+            if trend_signed <= -0.18 {
+                pos.reverse_streak = pos.reverse_streak.saturating_add(1);
+            } else {
+                pos.reverse_streak = 0;
+            }
+            let spread_side = side_spread(sample, pos.side);
+            let mut exit_reason: Option<&str> = None;
+            if sample.round_id != pos.entry_round_id {
+                exit_reason = Some("round_rollover");
+            } else if pnl <= -5.0 {
+                exit_reason = Some("stop_loss");
+            } else if pos.reverse_streak >= 2 {
+                exit_reason = Some("signal_reverse");
+            } else if pos.peak_pnl_cents >= 10.0 && pnl <= 4.0 {
+                exit_reason = Some("lock_profit_lvl2");
+            } else if pos.peak_pnl_cents >= 6.0 && pnl <= 1.0 {
+                exit_reason = Some("lock_profit_lvl1");
+            } else if drawdown >= 3.5 && trend_signed < 0.10 {
+                exit_reason = Some("trail_drawdown");
+            } else if spread_side >= 0.055 {
+                exit_reason = Some("liquidity_widen");
+            }
+
+            if let Some(reason) = exit_reason {
+                let duration_s = ((sample.ts_ms - pos.entry_ts_ms).max(0) as f64) / 1000.0;
+                trades.push(json!({
+                    "id": trade_id,
+                    "side": pos.side.as_str(),
+                    "entry_ts_ms": pos.entry_ts_ms,
+                    "exit_ts_ms": sample.ts_ms,
+                    "entry_price_cents": pos.entry_price_cents,
+                    "exit_price_cents": bid_cents,
+                    "pnl_cents": pnl,
+                    "peak_pnl_cents": pos.peak_pnl_cents,
+                    "duration_s": duration_s,
+                    "entry_score": pos.entry_score,
+                    "exit_score": score,
+                    "entry_reason": "edge_confirm",
+                    "exit_reason": reason,
+                }));
+                trade_id += 1;
+                position = None;
+            }
+        } else {
+            let can_enter = confirmed
+                && score.abs() >= entry_thr
+                && sample.spread_mid <= 0.035;
+            if can_enter {
+                let entry_price = side_ask(sample, side) * 100.0;
+                position = Some(StrategyPosition {
+                    side,
+                    entry_price_cents: entry_price,
+                    entry_ts_ms: sample.ts_ms,
+                    entry_round_id: sample.round_id.clone(),
+                    entry_score: score,
+                    peak_pnl_cents: 0.0,
+                    reverse_streak: 0,
+                });
+            }
+        }
+
+        p_hist.push_back(sample.p_up);
+        score_hist.push_back(score);
+        while p_hist.len() > 24 {
+            p_hist.pop_front();
+        }
+        while score_hist.len() > 24 {
+            score_hist.pop_front();
+        }
+    }
+
+    if let (Some(pos), Some(last)) = (position.as_ref(), samples.last()) {
+        let bid_cents = side_bid(last, pos.side) * 100.0;
+        let pnl = bid_cents - pos.entry_price_cents;
+        trades.push(json!({
+            "id": trade_id,
+            "side": pos.side.as_str(),
+            "entry_ts_ms": pos.entry_ts_ms,
+            "exit_ts_ms": last.ts_ms,
+            "entry_price_cents": pos.entry_price_cents,
+            "exit_price_cents": bid_cents,
+            "pnl_cents": pnl,
+            "peak_pnl_cents": pos.peak_pnl_cents.max(pnl),
+            "duration_s": ((last.ts_ms - pos.entry_ts_ms).max(0) as f64) / 1000.0,
+            "entry_score": pos.entry_score,
+            "exit_score": last_score,
+            "entry_reason": "edge_confirm",
+            "exit_reason": "window_end",
+        }));
+    }
+
+    let mut total_pnl = 0.0_f64;
+    let mut wins = 0usize;
+    let mut equity = 0.0_f64;
+    let mut peak_equity = 0.0_f64;
+    let mut max_drawdown = 0.0_f64;
+    for t in &trades {
+        let pnl = row_f64(t, "pnl_cents").unwrap_or(0.0);
+        total_pnl += pnl;
+        if pnl > 0.0 {
+            wins += 1;
+        }
+        equity += pnl;
+        if equity > peak_equity {
+            peak_equity = equity;
+        }
+        let dd = peak_equity - equity;
+        if dd > max_drawdown {
+            max_drawdown = dd;
+        }
+    }
+    let trade_count = trades.len();
+    let win_rate_pct = if trade_count > 0 {
+        (wins as f64) * 100.0 / trade_count as f64
+    } else {
+        0.0
+    };
+    let avg_pnl = if trade_count > 0 {
+        total_pnl / trade_count as f64
+    } else {
+        0.0
+    };
+
+    let trades_view = if trades.len() > max_trades {
+        trades[trades.len() - max_trades..].to_vec()
+    } else {
+        trades
+    };
+
+    let current = samples.last().map(|last| {
+        let action = if position.is_some() {
+            "HOLD"
+        } else if last_confirmed && last_score.abs() >= last_entry_threshold && last.spread_mid <= 0.035 {
+            if last_score >= 0.0 {
+                "ENTER_UP"
+            } else {
+                "ENTER_DOWN"
+            }
+        } else if last.spread_mid > 0.05 {
+            "RISK_OFF"
+        } else {
+            "WAIT"
+        };
+        json!({
+            "timestamp_ms": last.ts_ms,
+            "round_id": last.round_id,
+            "remaining_s": (last.remaining_ms as f64 / 1000.0),
+            "score": last_score,
+            "entry_threshold": last_entry_threshold,
+            "confirmed": last_confirmed,
+            "suggested_side": last_side,
+            "suggested_action": action,
+            "confidence": (last_score.abs() / last_entry_threshold.max(1e-6)).clamp(0.0, 2.0) * 0.5,
+            "p_up_pct": last.p_up * 100.0,
+            "delta_pct": last.delta_pct,
+            "spread_up_cents": last.spread_up * 100.0,
+            "spread_down_cents": last.spread_down * 100.0,
+        })
+    }).unwrap_or(Value::Null);
+
+    Ok(Json(json!({
+        "market_type": market_type,
+        "lookback_minutes": lookback_minutes,
+        "samples": samples.len(),
+        "config": {
+            "entry_threshold_base": 0.56,
+            "entry_threshold_cap": 0.82,
+            "spread_limit_prob": 0.035,
+            "stop_loss_cents": 5.0,
+            "trail_drawdown_cents": 3.5,
+            "reverse_signal_threshold": -0.18,
+            "reverse_signal_ticks": 2
+        },
+        "current": current,
+        "summary": {
+            "trade_count": trade_count,
+            "win_rate_pct": win_rate_pct,
+            "avg_pnl_cents": avg_pnl,
+            "total_pnl_cents": total_pnl,
+            "max_drawdown_cents": max_drawdown,
+        },
+        "trades": trades_view,
     })))
 }
 

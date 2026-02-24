@@ -9,6 +9,7 @@ import {
   getLatestAllRaw,
   getRoundChart,
   getRoundHistory,
+  getStrategyPaper,
   getStats
 } from "./api";
 import { AccuracyChart } from "./components/AccuracyChart";
@@ -27,6 +28,7 @@ import type {
   RoundHistoryRow,
   RoundChartResponse,
   RoundsResponse,
+  StrategyPaperResponse,
   StatsResponse,
   WindowType
 } from "./types";
@@ -682,6 +684,112 @@ const RoundHistoryPanel = memo(function RoundHistoryPanel({
   );
 });
 
+interface StrategyPanelProps {
+  data: StrategyPaperResponse | null;
+  loading: boolean;
+  timeMode: TimeMode;
+}
+
+const StrategyPanel = memo(function StrategyPanel({ data, loading, timeMode }: StrategyPanelProps) {
+  const current = data?.current ?? null;
+  return (
+    <section className="panel">
+      <header className="panel-head">
+        <div>
+          <h2>策略 Paper（5m全时段）</h2>
+          <p className="muted">单模型双向策略：自动判断 UP/DOWN，只验证入场与出场，不做加仓和反向。</p>
+        </div>
+        <div className="btn-group">
+          {loading ? <span className="loading-chip">计算中...</span> : <span className="loading-chip">实时策略</span>}
+        </div>
+      </header>
+      <div className="info-cards compact">
+        <article className="info-card">
+          <span>当前动作</span>
+          <strong className={current?.suggested_action?.includes("UP") ? "up" : current?.suggested_action?.includes("DOWN") ? "down" : ""}>
+            {current?.suggested_action ?? "--"}
+          </strong>
+          <small>
+            {current ? `${formatTime(current.timestamp_ms, timeMode)} · ${current.round_id}` : "等待数据"}
+          </small>
+        </article>
+        <article className="info-card">
+          <span>信号强度 / 阈值</span>
+          <strong>{current ? `${current.score.toFixed(3)} / ${current.entry_threshold.toFixed(3)}` : "--"}</strong>
+          <small>置信度：{current ? `${(current.confidence * 100).toFixed(1)}%` : "--"}</small>
+        </article>
+        <article className="info-card">
+          <span>累计收益</span>
+          <strong className={(data?.summary.total_pnl_cents ?? 0) >= 0 ? "up" : "down"}>
+            {data ? `${data.summary.total_pnl_cents.toFixed(2)}¢` : "--"}
+          </strong>
+          <small>
+            交易 {data?.summary.trade_count ?? 0} · 胜率 {data ? `${data.summary.win_rate_pct.toFixed(1)}%` : "--"}
+          </small>
+        </article>
+      </div>
+      <div className="info-cards compact">
+        <article className="info-card">
+          <span>均值 / 回撤</span>
+          <strong>
+            {data ? `${data.summary.avg_pnl_cents.toFixed(2)}¢ / ${data.summary.max_drawdown_cents.toFixed(2)}¢` : "--"}
+          </strong>
+          <small>平均每笔 / 最大回撤</small>
+        </article>
+        <article className="info-card">
+          <span>盘口状态</span>
+          <strong>
+            {current ? `${current.spread_up_cents.toFixed(2)}¢ / ${current.spread_down_cents.toFixed(2)}¢` : "--"}
+          </strong>
+          <small>UP / DOWN 点差</small>
+        </article>
+        <article className="info-card">
+          <span>市场状态</span>
+          <strong>
+            {current ? `UP ${current.p_up_pct.toFixed(1)}%` : "--"}
+          </strong>
+          <small>
+            Δ {current ? `${current.delta_pct.toFixed(4)}%` : "--"} · 剩余 {current ? `${current.remaining_s.toFixed(1)}s` : "--"}
+          </small>
+        </article>
+      </div>
+      <div className="table-wrap">
+        <table className="history-table">
+          <thead>
+            <tr>
+              <th>方向</th>
+              <th>入场</th>
+              <th>出场</th>
+              <th>价格(¢)</th>
+              <th>盈亏</th>
+              <th>时长</th>
+              <th>原因</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(data?.trades ?? []).slice(-12).reverse().map((t) => (
+              <tr key={t.id}>
+                <td><span className={`chip ${t.side === "UP" ? "up" : "down"}`}>{t.side}</span></td>
+                <td>{formatTime(t.entry_ts_ms, timeMode)}</td>
+                <td>{formatTime(t.exit_ts_ms, timeMode)}</td>
+                <td>{t.entry_price_cents.toFixed(2)} → {t.exit_price_cents.toFixed(2)}</td>
+                <td className={t.pnl_cents >= 0 ? "up" : "down"}>{t.pnl_cents.toFixed(2)}¢</td>
+                <td>{t.duration_s.toFixed(1)}s</td>
+                <td>{t.entry_reason} / {t.exit_reason}</td>
+              </tr>
+            ))}
+            {(data?.trades?.length ?? 0) === 0 ? (
+              <tr>
+                <td colSpan={7}>暂无交易样本，等待策略信号触发。</td>
+              </tr>
+            ) : null}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+});
+
 export default function App() {
   const [wsStatus, setWsStatus] = useState<"connecting" | "open" | "closed" | "error">("connecting");
   const [live, setLive] = useState<Record<MarketType, LiveSnapshot | null>>({
@@ -718,6 +826,8 @@ export default function App() {
   const [heatmap, setHeatmap] = useState<HeatmapResponse | null>(null);
   const [accuracyTab, setAccuracyTab] = useState<MarketType>("5m");
   const [accuracy, setAccuracy] = useState<AccuracySeriesResponse | null>(null);
+  const [strategyPaper, setStrategyPaper] = useState<StrategyPaperResponse | null>(null);
+  const [strategyLoading, setStrategyLoading] = useState<boolean>(false);
   const [errorText, setErrorText] = useState<string>("");
   const [timeMode, setTimeMode] = useState<TimeMode>("local");
   const lastLiveTsRef = useRef<Record<MarketType, number>>({ "5m": 0, "15m": 0 });
@@ -1237,6 +1347,36 @@ export default function App() {
     };
   }, [accuracyTab]);
 
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      if (document.visibilityState !== "visible") {
+        return;
+      }
+      setStrategyLoading(true);
+      try {
+        const data = await getStrategyPaper("5m", 360, 180);
+        if (alive) {
+          setStrategyPaper(data);
+        }
+      } catch (err) {
+        if (alive) {
+          setErrorText(err instanceof Error ? err.message : String(err));
+        }
+      } finally {
+        if (alive) {
+          setStrategyLoading(false);
+        }
+      }
+    };
+    void load();
+    const id = window.setInterval(load, 6_000);
+    return () => {
+      alive = false;
+      window.clearInterval(id);
+    };
+  }, []);
+
   const currentHistory = roundHistory[roundHistoryTab];
   const historyRows = useMemo(() => currentHistory?.rounds ?? [], [currentHistory]);
   const heatmapCells = useMemo(() => heatmap?.cells ?? [], [heatmap]);
@@ -1317,6 +1457,8 @@ export default function App() {
         chart={charts["15m"]}
         loading={chartLoading["15m"]}
       />
+
+      <StrategyPanel data={strategyPaper} loading={strategyLoading} timeMode={timeMode} />
 
       <section className="panel">
         <header className="panel-head">

@@ -7,6 +7,7 @@ import type {
   MarketType,
   RoundChartResponse,
   RoundsResponse,
+  StrategyPaperResponse,
   StatsResponse,
   WindowType,
   WsLivePayload
@@ -631,6 +632,19 @@ export async function getAccuracySeries(
   const data = await requestJson<AccuracySeriesResponse>(`/api/accuracy_series?${qs.toString()}`);
   apiSupport.accuracy = true;
   return data;
+}
+
+export async function getStrategyPaper(
+  marketType: MarketType = "5m",
+  lookbackMinutes = 360,
+  maxTrades = 120
+): Promise<StrategyPaperResponse> {
+  const qs = new URLSearchParams({
+    market_type: marketType,
+    lookback_minutes: String(lookbackMinutes),
+    max_trades: String(maxTrades),
+  });
+  return requestJson<StrategyPaperResponse>(`/api/strategy/paper?${qs.toString()}`);
 }
 
 export function connectLiveWs(
