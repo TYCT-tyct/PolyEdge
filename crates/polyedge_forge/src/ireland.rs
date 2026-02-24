@@ -38,6 +38,7 @@ const PROB_SMOOTH_TAU_SEC: f64 = 4.0;
 const DELTA_SMOOTH_TAU_SEC: f64 = 2.4;
 const DELTA_MAX_STEP_PCT_PER_SEC: f64 = 0.18;
 const PROB_STATE_RETENTION_MS: i64 = 2 * 60 * 60 * 1000;
+const TARGET_RETRY_BACKOFF_MS: i64 = 3_000;
 
 fn ema_alpha_from_tau(dt_s: f64, tau_s: f64) -> f64 {
     if !dt_s.is_finite() || !tau_s.is_finite() || dt_s <= 0.0 || tau_s <= 0.0 {
@@ -579,25 +580,6 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                         market.symbol, market.timeframe, market.start_ts_ms, v
                                     ),
                                 );
-                            } else if let Some(v) = fetch_target_from_vatic_active(
-                                &vatic_http,
-                                &market.symbol,
-                                &market.timeframe,
-                            )
-                            .await
-                            {
-                                target_cache.insert(cache_key.clone(), (now_ms, v));
-                                target_retry_after_ms.remove(&cache_key);
-                                target_price = Some(v);
-                                log_ingest(
-                                    &persist_tx,
-                                    "warn",
-                                    "target_price",
-                                    &format!(
-                                        "source=vatic_active_fallback symbol={} tf={} start_ms={} target={}",
-                                        market.symbol, market.timeframe, market.start_ts_ms, v
-                                    ),
-                                );
                             } else if let Some(v) = fetch_target_from_vatic(
                                 &vatic_http,
                                 &market.symbol,
@@ -615,6 +597,46 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                     "target_price",
                                     &format!(
                                         "source=vatic_timestamp_fallback symbol={} tf={} start_ms={} target={}",
+                                        market.symbol, market.timeframe, market.start_ts_ms, v
+                                    ),
+                                );
+                            } else if let Some(v) = fetch_target_from_vatic_active(
+                                &vatic_http,
+                                &market.symbol,
+                                &market.timeframe,
+                                round_start_sec,
+                            )
+                            .await
+                            {
+                                target_cache.insert(cache_key.clone(), (now_ms, v));
+                                target_retry_after_ms.remove(&cache_key);
+                                target_price = Some(v);
+                                log_ingest(
+                                    &persist_tx,
+                                    "warn",
+                                    "target_price",
+                                    &format!(
+                                        "source=vatic_active_fallback symbol={} tf={} start_ms={} target={}",
+                                        market.symbol, market.timeframe, market.start_ts_ms, v
+                                    ),
+                                );
+                            } else if let Some(v) = fetch_target_from_vatic_chainlink(
+                                &vatic_http,
+                                &market.symbol,
+                                &market.timeframe,
+                                round_start_sec,
+                            )
+                            .await
+                            {
+                                target_cache.insert(cache_key.clone(), (now_ms, v));
+                                target_retry_after_ms.remove(&cache_key);
+                                target_price = Some(v);
+                                log_ingest(
+                                    &persist_tx,
+                                    "warn",
+                                    "target_price",
+                                    &format!(
+                                        "source=vatic_chainlink_fallback symbol={} tf={} start_ms={} target={}",
                                         market.symbol, market.timeframe, market.start_ts_ms, v
                                     ),
                                 );
@@ -652,7 +674,10 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                     ),
                                 );
                             } else {
-                                target_retry_after_ms.insert(cache_key, now_ms.saturating_add(30_000));
+                                target_retry_after_ms.insert(
+                                    cache_key,
+                                    now_ms.saturating_add(TARGET_RETRY_BACKOFF_MS),
+                                );
                             }
                         }
                     }
@@ -1282,6 +1307,17 @@ fn parse_target_from_json_value(v: &serde_json::Value) -> Option<f64> {
         .filter(|x| x.is_finite() && *x > 0.0)
 }
 
+fn parse_window_start_sec(v: &serde_json::Value) -> Option<i64> {
+    v.get("windowStart")
+        .and_then(|x| x.as_i64())
+        .or_else(|| v.get("market_start").and_then(|x| x.as_i64()))
+        .or_else(|| {
+            v.get("market")
+                .and_then(|m| m.get("timestamp_start"))
+                .and_then(|x| x.as_i64())
+        })
+}
+
 fn symbol_to_asset(symbol: &str) -> String {
     symbol
         .strip_suffix("USDT")
@@ -1334,6 +1370,7 @@ async fn fetch_target_from_vatic_active(
     http: &Client,
     symbol: &str,
     timeframe: &str,
+    market_start_sec: i64,
 ) -> Option<f64> {
     let market_type = vatic_market_type(timeframe)?;
     let asset = symbol_to_asset(symbol);
@@ -1343,13 +1380,33 @@ async fn fetch_target_from_vatic_active(
     let resp = http.get(url).send().await.ok()?;
     let json: serde_json::Value = resp.json().await.ok()?;
 
-    if let Some(v) = parse_target_from_json_value(&json) {
+    if let Some(v) = parse_target_from_json_value(&json).filter(|_| {
+        parse_window_start_sec(&json)
+            .map(|w| w == market_start_sec)
+            .unwrap_or(false)
+    }) {
         return Some(v);
     }
-    if let Some(v) = json.get("data").and_then(parse_target_from_json_value) {
+    if let Some(v) = json
+        .get("data")
+        .filter(|item| {
+            parse_window_start_sec(item)
+                .map(|w| w == market_start_sec)
+                .unwrap_or(false)
+        })
+        .and_then(parse_target_from_json_value)
+    {
         return Some(v);
     }
-    if let Some(v) = json.get("result").and_then(parse_target_from_json_value) {
+    if let Some(v) = json
+        .get("result")
+        .filter(|item| {
+            parse_window_start_sec(item)
+                .map(|w| w == market_start_sec)
+                .unwrap_or(false)
+        })
+        .and_then(parse_target_from_json_value)
+    {
         return Some(v);
     }
 
@@ -1365,6 +1422,12 @@ async fn fetch_target_from_vatic_active(
         }
         let ok = item.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
         if !ok {
+            continue;
+        }
+        let Some(window_start) = parse_window_start_sec(item) else {
+            continue;
+        };
+        if window_start != market_start_sec {
             continue;
         }
         if let Some(v) = parse_target_from_json_value(item) {
@@ -1384,6 +1447,25 @@ async fn fetch_target_from_vatic(
     let asset = symbol_to_asset(symbol);
     let url = format!(
         "https://api.vatic.trading/api/v1/targets/timestamp?asset={asset}&type={market_type}&timestamp={timestamp_sec}"
+    );
+    let resp = http.get(url).send().await.ok()?;
+    let json: serde_json::Value = resp.json().await.ok()?;
+    parse_target_from_json_value(&json)
+}
+
+async fn fetch_target_from_vatic_chainlink(
+    http: &Client,
+    symbol: &str,
+    timeframe: &str,
+    timestamp_sec: i64,
+) -> Option<f64> {
+    if !is_chainlink_backed_timeframe(timeframe) {
+        return None;
+    }
+    let market_type = vatic_market_type(timeframe)?;
+    let asset = symbol_to_asset(symbol);
+    let url = format!(
+        "https://api.vatic.trading/api/v1/targets/chainlink?asset={asset}&type={market_type}&timestamp={timestamp_sec}"
     );
     let resp = http.get(url).send().await.ok()?;
     let json: serde_json::Value = resp.json().await.ok()?;
@@ -1449,4 +1531,39 @@ fn aligned_round_timestamp_sec(start_ts_ms: i64, timeframe: &str) -> i64 {
         _ => 5 * 60,
     };
     raw_sec.div_euclid(bucket) * bucket
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_window_start_from_results_item() {
+        let v = json!({
+            "windowStart": 1771918200_i64,
+            "price": 63262.98
+        });
+        assert_eq!(parse_window_start_sec(&v), Some(1771918200_i64));
+    }
+
+    #[test]
+    fn parse_window_start_from_market_payload() {
+        let v = json!({
+            "market": {
+                "timestamp_start": 1771918200_i64
+            },
+            "datapoint": {
+                "price": 63262.98
+            }
+        });
+        assert_eq!(parse_window_start_sec(&v), Some(1771918200_i64));
+    }
+
+    #[test]
+    fn align_round_start_to_bucket() {
+        let ts_ms = 1771918380123_i64;
+        assert_eq!(aligned_round_timestamp_sec(ts_ms, "5m"), 1771918200_i64);
+        assert_eq!(aligned_round_timestamp_sec(ts_ms, "15m"), 1771918200_i64);
+    }
 }
