@@ -37,6 +37,9 @@ const MOTION_ACCEL_ABS_CAP: f64 = 25_000.0;
 const PROB_SMOOTH_TAU_SEC: f64 = 4.0;
 const DELTA_SMOOTH_TAU_SEC: f64 = 2.4;
 const DELTA_MAX_STEP_PCT_PER_SEC: f64 = 0.18;
+const PROB_RAW_MAX_STEP_PER_SEC: f64 = 0.45;
+const PROB_RAW_MAX_STEP_MID_CLOSE_PER_SEC: f64 = 0.80;
+const PROB_RAW_MAX_STEP_NEAR_CLOSE_PER_SEC: f64 = 1.20;
 const PROB_STATE_RETENTION_MS: i64 = 2 * 60 * 60 * 1000;
 const TARGET_RETRY_BACKOFF_MS: i64 = 1_200;
 
@@ -730,8 +733,20 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                 DELTA_SMOOTH_TAU_SEC
                             };
                             let alpha_prob = ema_alpha_from_tau(dt_s, prob_tau);
+                            let step_cap_per_sec = if remaining_ms_now <= 30_000 {
+                                PROB_RAW_MAX_STEP_NEAR_CLOSE_PER_SEC
+                            } else if remaining_ms_now <= 60_000 {
+                                PROB_RAW_MAX_STEP_MID_CLOSE_PER_SEC
+                            } else {
+                                PROB_RAW_MAX_STEP_PER_SEC
+                            };
+                            let max_raw_step = step_cap_per_sec * dt_s;
+                            let gated_raw_up = raw_mid_yes_norm.clamp(
+                                prev.ema_up - max_raw_step,
+                                prev.ema_up + max_raw_step,
+                            );
                             let ema_up =
-                                (prev.ema_up + alpha_prob * (raw_mid_yes_norm - prev.ema_up))
+                                (prev.ema_up + alpha_prob * (gated_raw_up - prev.ema_up))
                                     .clamp(0.0, 1.0);
                             let ema_delta = match (delta_pct, prev.ema_delta_pct) {
                                 (Some(raw), Some(prev_d)) if raw.is_finite() && prev_d.is_finite() => {

@@ -7,10 +7,12 @@ import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
 
 import type { ChartPoint, ChartRound } from "../types";
+import type { WindowType } from "../types";
 
 interface MarketChartProps {
   points: ChartPoint[];
   rounds: ChartRound[];
+  windowType?: WindowType;
   timeMode: "local" | "et";
   height?: number;
 }
@@ -44,6 +46,25 @@ interface PreparedPlot {
 
 function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
+}
+
+function windowToMs(view: WindowType | undefined): number {
+  switch (view) {
+    case "5m":
+      return 5 * 60_000;
+    case "15m":
+      return 15 * 60_000;
+    case "30m":
+      return 30 * 60_000;
+    case "1h":
+      return 60 * 60_000;
+    case "2h":
+      return 2 * 60 * 60_000;
+    case "4h":
+      return 4 * 60 * 60_000;
+    default:
+      return 0;
+  }
 }
 
 const ONE_SECOND_MS = 1_000;
@@ -481,7 +502,7 @@ function viewToBrush(domain: DomainRange, view: ViewRange): BrushState {
   };
 }
 
-function MarketChartImpl({ points, rounds, timeMode, height = 420 }: MarketChartProps) {
+function MarketChartImpl({ points, rounds, windowType = "all", timeMode, height = 420 }: MarketChartProps) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const miniCanvasRef = useRef<HTMLDivElement | null>(null);
   const plotRef = useRef<uPlot | null>(null);
@@ -587,6 +608,25 @@ function MarketChartImpl({ points, rounds, timeMode, height = 420 }: MarketChart
       syncPctScaleToView(startMs, endMs);
     },
     [syncPctScaleToView]
+  );
+
+  const applyWindowPreset = useCallback(
+    (nextWindowType: WindowType, anchorEndMs?: number | null) => {
+      const d = domainRef.current;
+      if (!d) {
+        return;
+      }
+      const fullSpan = Math.max(1, d.maxMs - d.minMs);
+      const targetSpan = windowToMs(nextWindowType);
+      if (targetSpan <= 0 || targetSpan >= fullSpan) {
+        applyView(d.minMs, d.maxMs, false);
+        return;
+      }
+      const endMs = clamp(anchorEndMs ?? d.maxMs, d.minMs, d.maxMs);
+      const startMs = endMs - targetSpan;
+      applyView(startMs, endMs, false);
+    },
+    [applyView]
   );
 
   const resetView = useCallback(() => {
@@ -870,7 +910,7 @@ function MarketChartImpl({ points, rounds, timeMode, height = 420 }: MarketChart
       return;
     }
     if (!viewRef.current || !userAdjustedRef.current) {
-      applyView(domain.minMs, domain.maxMs, false);
+      applyWindowPreset(windowType, domain.maxMs);
       return;
     }
     const cur = viewRef.current;
@@ -882,7 +922,13 @@ function MarketChartImpl({ points, rounds, timeMode, height = 420 }: MarketChart
     const start = clamp(cur.startMs, domain.minMs, domain.maxMs);
     const end = clamp(cur.endMs, domain.minMs, domain.maxMs);
     applyView(start, end, false);
-  }, [domain, applyView]);
+  }, [domain, applyView, applyWindowPreset, windowType]);
+
+  useEffect(() => {
+    userAdjustedRef.current = false;
+    const anchor = viewRef.current?.endMs ?? domainRef.current?.maxMs ?? null;
+    applyWindowPreset(windowType, anchor);
+  }, [windowType, applyWindowPreset]);
 
   useEffect(() => {
     const latestRoundId = prepared.bucketed[prepared.bucketed.length - 1]?.round_id ?? "";

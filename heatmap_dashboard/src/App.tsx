@@ -67,14 +67,9 @@ function windowToMinutes(view: WindowType): number {
   }
 }
 
-function trimPointsToWindow(points: ChartPoint[], view: WindowType, nowMs: number): ChartPoint[] {
-  const minutes = windowToMinutes(view);
+function trimPointsToWindow(points: ChartPoint[], view: WindowType, _nowMs: number): ChartPoint[] {
   let next = points;
-  if (minutes > 0) {
-    const cutoffMs = nowMs - minutes * 60_000;
-    next = next.filter((p) => p.timestamp_ms >= cutoffMs);
-  }
-  const cap = view === "all" ? 12_000 : Math.min(12_000, Math.max(3_500, minutes * 700));
+  const cap = view === "all" ? 36_000 : 24_000;
   if (next.length > cap) {
     next = next.slice(next.length - cap);
   }
@@ -82,19 +77,11 @@ function trimPointsToWindow(points: ChartPoint[], view: WindowType, nowMs: numbe
 }
 
 function trimChartToWindow(chart: ChartResponse, view: WindowType, nowMs: number): ChartResponse {
-  const minutes = windowToMinutes(view);
   const points = trimPointsToWindow(chart.points, view, nowMs);
-  const rounds =
-    minutes <= 0
-      ? chart.rounds
-      : chart.rounds.filter((r) => {
-          const endTs = r.end_ts_ms ?? r.end_time_ms ?? 0;
-          return endTs >= nowMs - minutes * 60_000;
-        });
   return {
     ...chart,
     points,
-    rounds
+    rounds: chart.rounds
   };
 }
 
@@ -301,6 +288,18 @@ function normalizeLiveSnapshot(
     };
   }
 
+  if (prevStable && prevStable.round_id === nextRaw.round_id && prevStable.timestamp_ms > 0) {
+    const dtSec = Math.max(0.05, (nextRaw.timestamp_ms - prevStable.timestamp_ms) / 1000);
+    const remaining = Math.max(0, nextRaw.time_remaining_s ?? 0);
+    const maxStepPerSec = remaining <= 30 ? 1.2 : remaining <= 60 ? 0.8 : 0.45;
+    const maxStep = maxStepPerSec * dtSec;
+    const prevMid = finiteOrNull(prevStable.mid_yes_smooth) ?? finiteOrNull(prevStable.mid_yes);
+    if (prevMid != null) {
+      upMid = clamp(upMid, prevMid - maxStep, prevMid + maxStep);
+      downMid = clamp(1 - upMid, 0, 1);
+    }
+  }
+
   // Keep display quotes deterministic and consistent with normalized mids.
   const upSpread = up.bid != null && up.ask != null ? Math.max(0, up.ask - up.bid) : 0;
   const downSpread = down.bid != null && down.ask != null ? Math.max(0, down.ask - down.bid) : 0;
@@ -501,7 +500,13 @@ function MarketSection({
         <span>速度 {formatBps(live?.velocity_bps_per_sec, "bps/s")}</span>
         <span>加速度 {formatBps(live?.acceleration, "bps/s²")}</span>
       </div>
-      <MarketChart points={chart?.points ?? []} rounds={chart?.rounds ?? []} timeMode={timeMode} height={360} />
+      <MarketChart
+        points={chart?.points ?? []}
+        rounds={chart?.rounds ?? []}
+        windowType={windowType}
+        timeMode={timeMode}
+        height={360}
+      />
       <div className="panel-foot">
         <span>
           {chart?.total_samples.toLocaleString() ?? "0"} 样本
@@ -1394,6 +1399,7 @@ export default function App() {
           <MarketChart
             points={roundChart.points}
             rounds={roundChart.round ? [roundChart.round] : []}
+            windowType="all"
             timeMode={timeMode}
             height={320}
           />

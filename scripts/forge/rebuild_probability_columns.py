@@ -70,13 +70,21 @@ def row_count(ch: CH, db: str, table: str, symbol: str, tfs: List[str], start_ms
 
 
 def build_update_sql(db: str, table: str, symbol: str, tfs: List[str], start_ms: int) -> str:
-    yes_mid = "((least(greatest(bid_yes, 0.0), 1.0) + least(greatest(ask_yes, 0.0), 1.0)) * 0.5)"
-    no_mid = "((least(greatest(bid_no, 0.0), 1.0) + least(greatest(ask_no, 0.0), 1.0)) * 0.5)"
+    yes_bid = "least(greatest(coalesce(bid_yes, 0.5), 0.0), 1.0)"
+    yes_ask = "least(greatest(coalesce(ask_yes, 0.5), 0.0), 1.0)"
+    no_bid = "least(greatest(coalesce(bid_no, 0.5), 0.0), 1.0)"
+    no_ask = "least(greatest(coalesce(ask_no, 0.5), 0.0), 1.0)"
+    up_yes = f"(({yes_bid} + {yes_ask}) * 0.5)"
+    up_no = f"(1.0 - (({no_bid} + {no_ask}) * 0.5))"
+    spread_yes = f"abs({yes_ask} - {yes_bid})"
+    spread_no = f"abs({no_ask} - {no_bid})"
+    diff = f"abs({up_yes} - {up_no})"
     up = (
-        "if("
-        f"({yes_mid} + {no_mid}) > 1e-9, "
-        f"greatest(0.0, least(1.0, {yes_mid} / ({yes_mid} + {no_mid}))), "
-        "0.5)"
+        "greatest(0.0, least(1.0, "
+        f"if({diff} <= 0.10, ({up_yes} + {up_no}) * 0.5, "
+        f"if({spread_yes} + 0.005 < {spread_no}, {up_yes}, "
+        f"if({spread_no} + 0.005 < {spread_yes}, {up_no}, ({up_yes} + {up_no}) * 0.5)))"
+        "))"
     )
     down = f"(1.0 - ({up}))"
     return f"""

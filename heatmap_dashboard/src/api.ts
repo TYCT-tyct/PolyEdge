@@ -160,7 +160,7 @@ function maxPointsForView(view: WindowType): number {
     case "4h":
       return 50_000;
     default:
-      return 12_000;
+      return 60_000;
   }
 }
 
@@ -382,7 +382,8 @@ export async function getLatestAllRaw(): Promise<LatestRawRow[]> {
 }
 
 export async function getChart(marketType: MarketType, view: WindowType): Promise<ChartResponse> {
-  const minutes = windowToMinutes(view);
+  const viewMinutes = windowToMinutes(view);
+  const minutes = view === "all" ? 12 * 60 : Math.max(6 * 60, viewMinutes * 12);
   const maxPoints = maxPointsForView(view);
   const qs = new URLSearchParams({
     market_type: marketType,
@@ -402,12 +403,9 @@ export async function getChart(marketType: MarketType, view: WindowType): Promis
     }
   }
   try {
-    const lookback = minutes === 0 ? 12 * 60 : minutes;
-    const estimatedLimit =
-      minutes === 0 ? 60_000 : Math.min(80_000, Math.max(4_000, lookback * 700));
+    const lookback = minutes;
+    const estimatedLimit = Math.min(100_000, Math.max(12_000, lookback * 800));
     const history = await getHistoryRaw(marketType, lookback, estimatedLimit);
-    const nowMs = Date.now();
-    const cutoffMs = minutes > 0 ? nowMs - minutes * 60_000 : 0;
     const points = history.samples
       .map((s) =>
         normalizeChartPoint({
@@ -428,7 +426,6 @@ export async function getChart(marketType: MarketType, view: WindowType): Promis
           target_price: s.target_price
         })
       )
-      .filter((p) => (minutes > 0 ? p.timestamp_ms >= cutoffMs : true))
       .sort((a, b) => a.timestamp_ms - b.timestamp_ms);
     const sampled = downsampleRows(points, maxPoints);
     return {
@@ -440,8 +437,7 @@ export async function getChart(marketType: MarketType, view: WindowType): Promis
           end_ts_ms: r.end_ts_ms,
           target_price: r.target_price,
           outcome: roundOutcome(r.settle_price, r.target_price, r.label_up)
-        }))
-        .filter((r) => (minutes > 0 ? (r.end_ts_ms ?? 0) >= cutoffMs : true)),
+        })),
       total_samples: points.length,
       downsampled: sampled.step > 1,
       step: sampled.step
