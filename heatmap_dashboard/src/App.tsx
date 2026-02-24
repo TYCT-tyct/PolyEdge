@@ -41,9 +41,9 @@ const WINDOW_OPTIONS: Array<{ value: WindowType; label: string }> = [
   { value: "all", label: "All" }
 ];
 
-const LIVE_POLL_MS = 1500;
+const LIVE_POLL_MS = 900;
 const WS_STALE_FALLBACK_MS = 3000;
-const LIVE_UI_MIN_INTERVAL_MS = 300;
+const LIVE_UI_MIN_INTERVAL_MS = 900;
 
 function windowToMinutes(view: WindowType): number {
   switch (view) {
@@ -117,6 +117,13 @@ function formatCent(v: number | null | undefined): string {
   return `${(v * 100).toFixed(1)}¢`;
 }
 
+function formatPercentValue(v: number | null | undefined): string {
+  if (v == null || !Number.isFinite(v)) {
+    return "--";
+  }
+  return `${(v * 100).toFixed(1)}%`;
+}
+
 function midpointProb(
   bid: number | null | undefined,
   ask: number | null | undefined
@@ -133,6 +140,188 @@ function midpointProb(
     return Math.max(0, Math.min(1, ask as number));
   }
   return null;
+}
+
+function clamp(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
+}
+
+function finiteOrNull(v: number | null | undefined): number | null {
+  return v != null && Number.isFinite(v) ? v : null;
+}
+
+function quoteFromPreferredMid(
+  preferredMid: number | null | undefined,
+  bid: number | null | undefined,
+  ask: number | null | undefined,
+  fallbackBid: number | null | undefined,
+  fallbackAsk: number | null | undefined
+): { bid: number | null; ask: number | null } {
+  const b = finiteOrNull(bid);
+  const a = finiteOrNull(ask);
+  const fb = finiteOrNull(fallbackBid);
+  const fa = finiteOrNull(fallbackAsk);
+
+  const raw = normalizeQuote(b, a, fb, fa);
+  const rawMid = stableMidpointProb(raw.bid, raw.ask, null);
+  const mid = finiteOrNull(preferredMid) ?? rawMid;
+  if (mid == null) {
+    return raw;
+  }
+
+  const rawSpread =
+    raw.bid != null && raw.ask != null ? Math.max(0, raw.ask - raw.bid) : 0;
+  const spread = clamp(rawSpread > 0 ? rawSpread : 0.008, 0.002, 0.08);
+  const nextBid = clamp(mid - spread * 0.5, 0, 1);
+  const nextAsk = clamp(mid + spread * 0.5, 0, 1);
+  return {
+    bid: Math.min(nextBid, nextAsk),
+    ask: Math.max(nextBid, nextAsk)
+  };
+}
+
+function stableMidpointProb(
+  bid: number | null | undefined,
+  ask: number | null | undefined,
+  fallback: number | null
+): number | null {
+  const b = bid != null && Number.isFinite(bid) ? bid : null;
+  const a = ask != null && Number.isFinite(ask) ? ask : null;
+  if (b != null && a != null) {
+    const lo = Math.min(b, a);
+    const hi = Math.max(b, a);
+    return clamp((lo + hi) * 0.5, 0, 1);
+  }
+  if (b != null) {
+    return clamp(b, 0, 1);
+  }
+  if (a != null) {
+    return clamp(a, 0, 1);
+  }
+  if (fallback != null && Number.isFinite(fallback)) {
+    return clamp(fallback, 0, 1);
+  }
+  return null;
+}
+
+function normalizeQuote(
+  bid: number | null | undefined,
+  ask: number | null | undefined,
+  fallbackBid: number | null | undefined,
+  fallbackAsk: number | null | undefined
+): { bid: number | null; ask: number | null } {
+  const b = bid != null && Number.isFinite(bid) ? clamp(bid, 0, 1) : null;
+  const a = ask != null && Number.isFinite(ask) ? clamp(ask, 0, 1) : null;
+  const fb = fallbackBid != null && Number.isFinite(fallbackBid) ? clamp(fallbackBid, 0, 1) : null;
+  const fa = fallbackAsk != null && Number.isFinite(fallbackAsk) ? clamp(fallbackAsk, 0, 1) : null;
+
+  let nextBid = b ?? fb;
+  let nextAsk = a ?? fa;
+  if (nextBid == null && nextAsk == null) {
+    return { bid: null, ask: null };
+  }
+  if (nextBid == null) {
+    nextBid = nextAsk;
+  }
+  if (nextAsk == null) {
+    nextAsk = nextBid;
+  }
+  if ((nextBid as number) > (nextAsk as number)) {
+    const t = nextBid;
+    nextBid = nextAsk;
+    nextAsk = t;
+  }
+  return { bid: nextBid, ask: nextAsk };
+}
+
+function displayUpProb(snapshot: LiveSnapshot | null): number | null {
+  if (!snapshot) {
+    return null;
+  }
+  return stableMidpointProb(snapshot.best_bid_up, snapshot.best_ask_up, null);
+}
+
+function displayDownProb(snapshot: LiveSnapshot | null): number | null {
+  if (!snapshot) {
+    return null;
+  }
+  return stableMidpointProb(snapshot.best_bid_down, snapshot.best_ask_down, null);
+}
+
+function normalizeLiveSnapshot(
+  prevStable: LiveSnapshot | null,
+  nextRaw: LiveSnapshot
+): LiveSnapshot {
+  const preferredUpMid =
+    finiteOrNull(nextRaw.mid_yes_smooth) ?? finiteOrNull(nextRaw.mid_yes);
+  const preferredDownMid =
+    finiteOrNull(nextRaw.mid_no_smooth) ?? finiteOrNull(nextRaw.mid_no);
+
+  const up = quoteFromPreferredMid(
+    preferredUpMid,
+    nextRaw.best_bid_up,
+    nextRaw.best_ask_up,
+    prevStable?.best_bid_up ?? null,
+    prevStable?.best_ask_up ?? null
+  );
+  const down = quoteFromPreferredMid(
+    preferredDownMid,
+    nextRaw.best_bid_down,
+    nextRaw.best_ask_down,
+    prevStable?.best_bid_down ?? null,
+    prevStable?.best_ask_down ?? null
+  );
+  let upMid = preferredUpMid ?? stableMidpointProb(up.bid, up.ask, null);
+  let downMid = preferredDownMid ?? stableMidpointProb(down.bid, down.ask, null);
+
+  if (upMid == null && downMid != null) {
+    upMid = clamp(1 - downMid, 0, 1);
+  } else if (downMid == null && upMid != null) {
+    downMid = clamp(1 - upMid, 0, 1);
+  }
+
+  if (upMid != null && downMid != null) {
+    const sum = upMid + downMid;
+    if (sum > 0) {
+      upMid = clamp(upMid / sum, 0, 1);
+      downMid = clamp(1 - upMid, 0, 1);
+    }
+  }
+
+  if (upMid == null || downMid == null) {
+    return {
+      ...nextRaw,
+      best_bid_up: up.bid,
+      best_ask_up: up.ask,
+      best_bid_down: down.bid,
+      best_ask_down: down.ask
+    };
+  }
+
+  // Keep display quotes deterministic and consistent with normalized mids.
+  const upSpread = up.bid != null && up.ask != null ? Math.max(0, up.ask - up.bid) : 0;
+  const downSpread = down.bid != null && down.ask != null ? Math.max(0, down.ask - down.bid) : 0;
+  const nextUpBid = clamp(upMid - upSpread * 0.5, 0, 1);
+  const nextUpAsk = clamp(upMid + upSpread * 0.5, 0, 1);
+  const nextDownBid = clamp(downMid - downSpread * 0.5, 0, 1);
+  const nextDownAsk = clamp(downMid + downSpread * 0.5, 0, 1);
+
+  const velocity = nextRaw.velocity_bps_per_sec ?? null;
+  const acceleration = nextRaw.acceleration ?? null;
+
+  return {
+    ...nextRaw,
+    mid_yes: upMid,
+    mid_no: downMid,
+    mid_yes_smooth: finiteOrNull(nextRaw.mid_yes_smooth) ?? upMid,
+    mid_no_smooth: finiteOrNull(nextRaw.mid_no_smooth) ?? downMid,
+    best_bid_up: Math.min(nextUpBid, nextUpAsk),
+    best_ask_up: Math.max(nextUpBid, nextUpAsk),
+    best_bid_down: Math.min(nextDownBid, nextDownAsk),
+    best_ask_down: Math.max(nextDownBid, nextDownAsk),
+    velocity_bps_per_sec: velocity,
+    acceleration
+  };
 }
 
 function formatCentFromCents(v: number | null | undefined): string {
@@ -162,6 +351,14 @@ function formatTime(ts: number | null | undefined): string {
     minute: "2-digit",
     second: "2-digit"
   });
+}
+
+function formatBps(v: number | null | undefined, unit = "bps/s"): string {
+  if (v == null || !Number.isFinite(v)) {
+    return "--";
+  }
+  const sign = v > 0 ? "+" : "";
+  return `${sign}${v.toFixed(2)} ${unit}`;
 }
 
 function summarizeGaps(points: ChartPoint[]): { count: number; maxGapMs: number } {
@@ -200,6 +397,8 @@ function summarizeGaps(points: ChartPoint[]): { count: number; maxGapMs: number 
 }
 
 function roundCard(title: string, snapshot: LiveSnapshot | null) {
+  const up = displayUpProb(snapshot);
+  const down = displayDownProb(snapshot);
   return (
     <article className="round-card">
       <div className="card-head">
@@ -212,18 +411,20 @@ function roundCard(title: string, snapshot: LiveSnapshot | null) {
         <span className={(snapshot?.delta_pct ?? 0) >= 0 ? "up" : "down"}>
           ▲ {formatPct(snapshot?.delta_pct)}
         </span>
+        <span>速度 {formatBps(snapshot?.velocity_bps_per_sec, "bps/s")}</span>
+        <span>加速度 {formatBps(snapshot?.acceleration, "bps/s²")}</span>
       </div>
       <div className="round-odds">
         <div>
           <label>看涨</label>
-          <strong className="up">{formatCent(snapshot?.best_bid_up)}</strong>
+          <strong className="up">{formatCent(up)}</strong>
           <small>
             {formatCent(snapshot?.best_bid_up)} / {formatCent(snapshot?.best_ask_up)}
           </small>
         </div>
         <div>
           <label>看跌</label>
-          <strong className="down">{formatCent(snapshot?.best_bid_down)}</strong>
+          <strong className="down">{formatCent(down)}</strong>
           <small>
             {formatCent(snapshot?.best_bid_down)} / {formatCent(snapshot?.best_ask_down)}
           </small>
@@ -253,6 +454,8 @@ function MarketSection({
   loading
 }: MarketSectionProps) {
   const gapInfo = useMemo(() => summarizeGaps(chart?.points ?? []), [chart?.points]);
+  const up = displayUpProb(live);
+  const down = displayDownProb(live);
 
   return (
     <section className="panel market-panel">
@@ -265,7 +468,7 @@ function MarketSection({
           </p>
         </div>
         <div className="btn-group">
-          {loading ? <span className="loading-chip">Loading...</span> : null}
+          {loading ? <span className="loading-chip">加载中...</span> : null}
           {WINDOW_OPTIONS.map((w) => (
             <button
               key={`${marketType}-${w.value}`}
@@ -279,21 +482,23 @@ function MarketSection({
       </header>
       <div className="market-kpi">
         <span>
-          看涨 <b className="up">{formatCent(live?.best_bid_up)}</b>
+          看涨 <b className="up">{formatCent(up)}</b>
         </span>
         <span>
-          看跌 <b className="down">{formatCent(live?.best_bid_down)}</b>
+          看跌 <b className="down">{formatCent(down)}</b>
         </span>
         <span>⏱ {formatCountdown(live?.time_remaining_s)}</span>
+        <span>速度 {formatBps(live?.velocity_bps_per_sec, "bps/s")}</span>
+        <span>加速度 {formatBps(live?.acceleration, "bps/s²")}</span>
       </div>
       <MarketChart points={chart?.points ?? []} rounds={chart?.rounds ?? []} height={360} />
       <div className="panel-foot">
         <span>
-          {chart?.total_samples.toLocaleString() ?? "0"} samples
+          {chart?.total_samples.toLocaleString() ?? "0"} 样本
           {chart?.downsampled ? ` (downsample x${chart.step})` : ""}
-          {gapInfo.count > 0 ? ` | gaps ${gapInfo.count} (max ${(gapInfo.maxGapMs / 1000).toFixed(1)}s)` : ""}
+          {gapInfo.count > 0 ? ` | 缺口 ${gapInfo.count} (max ${(gapInfo.maxGapMs / 1000).toFixed(1)}s)` : ""}
         </span>
-        <span>{chart?.rounds.length.toLocaleString() ?? "0"} rounds</span>
+        <span>{chart?.rounds.length.toLocaleString() ?? "0"} 轮</span>
       </div>
     </section>
   );
@@ -312,10 +517,9 @@ const HeatmapPanel = memo(function HeatmapPanel({ heatmapTab, onTabChange, cells
     <section className="panel">
       <header className="panel-head">
         <div>
-          <h2>MARKET PRICING HEATMAP</h2>
+          <h2>市场定价热力图</h2>
           <p className="muted">
-            Average UP price by delta % and time remaining — How does the market price UP/DOWN given
-            the current gap?
+            按 Δ价差与剩余时间统计的看涨均价分布，用于观察在不同价差区间下市场如何定价。
           </p>
         </div>
         <div className="btn-group">
@@ -327,7 +531,7 @@ const HeatmapPanel = memo(function HeatmapPanel({ heatmapTab, onTabChange, cells
           </button>
         </div>
       </header>
-      <HeatmapGrid cells={cells} />
+      <HeatmapGrid cells={cells} marketType={heatmapTab} />
     </section>
   );
 });
@@ -339,12 +543,29 @@ interface AccuracyPanelProps {
 }
 
 const AccuracyPanel = memo(function AccuracyPanel({ accuracyTab, onTabChange, points }: AccuracyPanelProps) {
+  const summary = useMemo(() => {
+    if (points.length === 0) {
+      return null;
+    }
+    const vals = points.map((p) => p.accuracy_pct).filter((v) => Number.isFinite(v));
+    if (vals.length === 0) {
+      return null;
+    }
+    const latest = vals[vals.length - 1] ?? null;
+    const min = Math.min(...vals);
+    const max = Math.max(...vals);
+    const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+    return { latest, min, max, avg, samples: vals.length };
+  }, [points]);
+
   return (
     <section className="panel">
       <header className="panel-head">
         <div>
-          <h2>MARKET ACCURACY (Rolling 20 Rounds)</h2>
-          <p className="muted">这是最近20个轮次的滚动正确率：市场最终定价方向与实际结果一致的比例。</p>
+          <h2>市场方向一致率（过去24小时）</h2>
+          <p className="muted">
+            5m 使用最近40轮滚动窗口，15m 使用最近20轮滚动窗口；图表按30分钟步进展示过去24小时走势。
+          </p>
         </div>
         <div className="btn-group">
           <button className={accuracyTab === "5m" ? "active" : ""} onClick={() => onTabChange("5m")}>
@@ -355,6 +576,25 @@ const AccuracyPanel = memo(function AccuracyPanel({ accuracyTab, onTabChange, po
           </button>
         </div>
       </header>
+      <div className="info-cards compact">
+        <article className="info-card">
+          <span>当前准确率</span>
+          <strong>{summary ? formatPercentValue((summary.latest ?? 0) / 100) : "--"}</strong>
+          <small>{accuracyTab === "5m" ? "窗口：40轮（5m）" : "窗口：20轮（15m）"}</small>
+        </article>
+        <article className="info-card">
+          <span>区间范围</span>
+          <strong>
+            {summary ? `${summary.min.toFixed(1)}% ~ ${summary.max.toFixed(1)}%` : "--"}
+          </strong>
+          <small>min / max</small>
+        </article>
+        <article className="info-card">
+          <span>平均准确率</span>
+          <strong>{summary ? `${summary.avg.toFixed(1)}%` : "--"}</strong>
+          <small>样本点：{summary?.samples ?? 0}</small>
+        </article>
+      </div>
       <AccuracyChart points={points} />
     </section>
   );
@@ -374,7 +614,10 @@ const RoundHistoryPanel = memo(function RoundHistoryPanel({
   return (
     <section className="panel">
       <header className="panel-head">
-        <h2>轮次历史</h2>
+        <div>
+          <h2>轮次历史</h2>
+          <p className="muted">仅展示最近20条记录，避免无上限增长影响可读性。</p>
+        </div>
         <div className="btn-group">
           <button className={roundHistoryTab === "5m" ? "active" : ""} onClick={() => onTabChange("5m")}>
             5m
@@ -466,6 +709,9 @@ export default function App() {
   const pushLivePointRef = useRef<(marketType: MarketType, livePoint: LiveSnapshot | null) => void>(() => {});
   const chartReqSeqRef = useRef<Record<MarketType, number>>({ "5m": 0, "15m": 0 });
   const chartInFlightRef = useRef<Record<MarketType, boolean>>({ "5m": false, "15m": false });
+  const stableLiveRef = useRef<Record<MarketType, LiveSnapshot | null>>({ "5m": null, "15m": null });
+  const boundaryRefreshRef = useRef<Record<MarketType, number>>({ "5m": 0, "15m": 0 });
+  const accuracyTabRef = useRef<MarketType>("5m");
 
   useEffect(() => {
     chartWindowRef.current = chartWindow;
@@ -475,11 +721,12 @@ export default function App() {
     wsStatusRef.current = wsStatus;
   }, [wsStatus]);
 
+  useEffect(() => {
+    accuracyTabRef.current = accuracyTab;
+  }, [accuracyTab]);
+
   const loadChartFor = useCallback(
     async (marketType: MarketType, windowType: WindowType) => {
-      if (chartInFlightRef.current[marketType]) {
-        return;
-      }
       chartInFlightRef.current[marketType] = true;
       const reqId = (chartReqSeqRef.current[marketType] ?? 0) + 1;
       chartReqSeqRef.current[marketType] = reqId;
@@ -534,30 +781,43 @@ export default function App() {
       remSec
     };
 
-    setLive((prev) => ({ ...prev, [marketType]: livePoint }));
+    const prevStable = stableLiveRef.current[marketType];
+    const stablePoint = normalizeLiveSnapshot(prevStable, livePoint);
+    stableLiveRef.current[marketType] = stablePoint;
+
+    setLive((prev) => ({ ...prev, [marketType]: stablePoint }));
     setCharts((prev) => {
       const current = prev[marketType];
       if (!current) {
         return prev;
       }
       const lastTs = current.points[current.points.length - 1]?.timestamp_ms ?? 0;
-      if (livePoint.timestamp_ms <= lastTs) {
+      if (stablePoint.timestamp_ms <= lastTs) {
         return prev;
       }
 
       const nextPoint: ChartPoint = {
-        timestamp_ms: livePoint.timestamp_ms ?? 0,
-        delta_pct: livePoint.delta_pct,
-        mid_yes: midpointProb(livePoint.best_bid_up, livePoint.best_ask_up),
-        mid_no: midpointProb(livePoint.best_bid_down, livePoint.best_ask_down),
-        best_bid_up: livePoint.best_bid_up,
-        best_ask_up: livePoint.best_ask_up,
-        best_bid_down: livePoint.best_bid_down,
-        best_ask_down: livePoint.best_ask_down,
-        round_id: livePoint.round_id,
-        time_remaining_s: livePoint.time_remaining_s,
-        btc_price: livePoint.btc_price,
-        target_price: livePoint.target_price
+        timestamp_ms: stablePoint.timestamp_ms ?? 0,
+        delta_pct: stablePoint.delta_pct_smooth ?? stablePoint.delta_pct,
+        delta_pct_smooth: stablePoint.delta_pct_smooth ?? stablePoint.delta_pct ?? null,
+        mid_yes:
+          stablePoint.mid_yes_smooth ??
+          stablePoint.mid_yes ??
+          midpointProb(stablePoint.best_bid_up, stablePoint.best_ask_up),
+        mid_yes_smooth: stablePoint.mid_yes_smooth ?? stablePoint.mid_yes ?? null,
+        mid_no:
+          stablePoint.mid_no_smooth ??
+          stablePoint.mid_no ??
+          midpointProb(stablePoint.best_bid_down, stablePoint.best_ask_down),
+        mid_no_smooth: stablePoint.mid_no_smooth ?? stablePoint.mid_no ?? null,
+        best_bid_up: stablePoint.best_bid_up,
+        best_ask_up: stablePoint.best_ask_up,
+        best_bid_down: stablePoint.best_bid_down,
+        best_ask_down: stablePoint.best_ask_down,
+        round_id: stablePoint.round_id,
+        time_remaining_s: stablePoint.time_remaining_s,
+        btc_price: stablePoint.btc_price,
+        target_price: stablePoint.target_price
       };
       const nextPoints = trimPointsToWindow(
         [...current.points, nextPoint],
@@ -573,6 +833,26 @@ export default function App() {
         }
       };
     });
+
+    if (prevStable?.round_id && prevStable.round_id !== stablePoint.round_id) {
+      void loadChartFor(marketType, chartWindowRef.current[marketType]);
+      if (accuracyTabRef.current === marketType) {
+        void getAccuracySeries(marketType, 24)
+          .then((v) => {
+            setAccuracy(v);
+          })
+          .catch(() => {
+            // ignore boundary refresh errors
+          });
+      }
+    }
+    if ((stablePoint.time_remaining_s ?? 999) <= 0.2) {
+      const now = Date.now();
+      if (now - (boundaryRefreshRef.current[marketType] ?? 0) >= 1000) {
+        boundaryRefreshRef.current[marketType] = now;
+        void loadChartFor(marketType, chartWindowRef.current[marketType]);
+      }
+    }
   };
 
   useEffect(() => {
@@ -584,7 +864,9 @@ export default function App() {
       }
       if (
         wsStatusRef.current === "open" &&
-        Date.now() - (lastWsTickMsRef.current || 0) < WS_STALE_FALLBACK_MS
+        Date.now() - (lastWsTickMsRef.current || 0) < WS_STALE_FALLBACK_MS &&
+        (stableLiveRef.current["5m"]?.time_remaining_s ?? 1) > 0 &&
+        (stableLiveRef.current["15m"]?.time_remaining_s ?? 1) > 0
       ) {
         return;
       }
@@ -625,12 +907,19 @@ export default function App() {
             market_type: marketType,
             btc_price: r.binance_price,
             target_price: r.target_price,
-            delta_pct: r.delta_pct,
-            best_bid_up: r.bid_yes ?? r.mid_yes,
-            best_ask_up: r.ask_yes ?? r.mid_yes,
-            best_bid_down: r.bid_no ?? r.mid_no,
-            best_ask_down: r.ask_no ?? r.mid_no,
+            delta_pct: r.delta_pct_smooth ?? r.delta_pct,
+            delta_pct_smooth: r.delta_pct_smooth ?? null,
+            mid_yes: r.mid_yes ?? null,
+            mid_no: r.mid_no ?? null,
+            mid_yes_smooth: r.mid_yes_smooth ?? null,
+            mid_no_smooth: r.mid_no_smooth ?? null,
+            best_bid_up: r.bid_yes ?? r.mid_yes_smooth ?? r.mid_yes,
+            best_ask_up: r.ask_yes ?? r.mid_yes_smooth ?? r.mid_yes,
+            best_bid_down: r.bid_no ?? r.mid_no_smooth ?? r.mid_no,
+            best_ask_down: r.ask_no ?? r.mid_no_smooth ?? r.mid_no,
             time_remaining_s: r.remaining_ms / 1000,
+            velocity_bps_per_sec: r.velocity_bps_per_sec ?? null,
+            acceleration: r.acceleration ?? null,
             slug: `${marketType}-${Math.floor(startMs / 1000)}`,
             start_time_ms: startMs,
             end_time_ms: startMs > 0 ? startMs + durMs : 0
@@ -702,7 +991,15 @@ export default function App() {
         await loadChartFor("5m", chartWindowRef.current["5m"]);
       }
       const currentWindow = chartWindowRef.current["5m"];
-      const delay = currentWindow === "all" ? 12_000 : 7_500;
+      const rem = stableLiveRef.current["5m"]?.time_remaining_s ?? 999;
+      const delay =
+        rem <= 1
+          ? 900
+          : rem <= 8
+            ? 2_000
+            : currentWindow === "all"
+              ? 12_000
+              : 7_500;
       timer = window.setTimeout(loop, delay);
     };
     void loop();
@@ -725,7 +1022,15 @@ export default function App() {
         await loadChartFor("15m", chartWindowRef.current["15m"]);
       }
       const currentWindow = chartWindowRef.current["15m"];
-      const delay = currentWindow === "all" ? 16_000 : 9_500;
+      const rem = stableLiveRef.current["15m"]?.time_remaining_s ?? 999;
+      const delay =
+        rem <= 1
+          ? 900
+          : rem <= 10
+            ? 2_200
+            : currentWindow === "all"
+              ? 16_000
+              : 9_500;
       timer = window.setTimeout(loop, delay);
     };
     void loop();
@@ -763,7 +1068,7 @@ export default function App() {
       }
     };
     void load();
-    const id = window.setInterval(load, 45_000);
+    const id = window.setInterval(load, 12_000);
     return () => {
       alive = false;
       window.clearInterval(id);
@@ -876,7 +1181,7 @@ export default function App() {
         return;
       }
       try {
-        const v = await getAccuracySeries(accuracyTab, 20, 600);
+        const v = await getAccuracySeries(accuracyTab, 24);
         if (alive) {
           setAccuracy(v);
         }
@@ -899,16 +1204,43 @@ export default function App() {
   const heatmapCells = useMemo(() => heatmap?.cells ?? [], [heatmap]);
   const accuracyPoints = useMemo(() => accuracy?.series ?? [], [accuracy]);
   const explorerDays = useMemo(() => availableRounds[explorerTab]?.days ?? [], [availableRounds, explorerTab]);
+  const selectedRoundMeta = useMemo(() => {
+    const round = roundChart?.round;
+    if (!round) {
+      return null;
+    }
+    const durationMs = Math.max(0, round.end_time_ms - round.start_time_ms);
+    return {
+      roundId: round.round_id,
+      start: round.start_time_ms,
+      end: round.end_time_ms,
+      durationMin: durationMs / 60_000,
+      target: round.target_price,
+      outcome: round.outcome
+    };
+  }, [roundChart]);
 
   return (
     <main className="page">
-      <header className="hero">
-        <h1>
-          PolyEdge Predictor <span>实时研究看板</span>
-        </h1>
-        <div className="live-indicator">
-          <span className={`dot ${wsStatus === "open" ? "ok" : ""}`} />
-          {wsStatus === "open" ? "实时连接" : "重连中"}
+      <header className="hero panel">
+        <div className="hero-left">
+          <p className="hero-kicker">POLYEDGE PREDATOR</p>
+          <h1>
+            实时研究仪表盘 <span>Polymarket BTC 短周期</span>
+          </h1>
+          <p className="hero-sub">
+            统一展示 5m / 15m 市场的概率、价差、轮次与准确率，用于策略研究与训练数据校验。
+          </p>
+        </div>
+        <div className="hero-right">
+          <div className="live-indicator">
+            <span className={`dot ${wsStatus === "open" ? "ok" : ""}`} />
+            {wsStatus === "open" ? "实时连接" : "重连中"}
+          </div>
+          <div className="hero-meta">
+            <span>5m: {formatTime(live["5m"]?.timestamp_ms)}</span>
+            <span>15m: {formatTime(live["15m"]?.timestamp_ms)}</span>
+          </div>
         </div>
       </header>
 
@@ -939,7 +1271,10 @@ export default function App() {
 
       <section className="panel">
         <header className="panel-head">
-          <h2>轮次浏览器</h2>
+          <div>
+            <h2>轮次浏览器</h2>
+            <p className="muted">选择日期和轮次后，会显示该轮完整时间线和关键参数。</p>
+          </div>
           <div className="btn-group">
             <button className={explorerTab === "5m" ? "active" : ""} onClick={() => setExplorerTab("5m")}>
               5m
@@ -985,6 +1320,32 @@ export default function App() {
             </select>
           </label>
         </div>
+        {selectedRoundMeta ? (
+          <div className="info-cards">
+            <article className="info-card">
+              <span>选中轮次</span>
+              <strong>{selectedRoundMeta.roundId}</strong>
+              <small>
+                {formatTime(selectedRoundMeta.start)} - {formatTime(selectedRoundMeta.end)}
+              </small>
+            </article>
+            <article className="info-card">
+              <span>时长</span>
+              <strong>{selectedRoundMeta.durationMin.toFixed(1)} min</strong>
+              <small>{explorerTab.toUpperCase()} 周期</small>
+            </article>
+            <article className="info-card">
+              <span>目标价 / 结果</span>
+              <strong>
+                {formatUsd(selectedRoundMeta.target)} ·{" "}
+                <span className={selectedRoundMeta.outcome === 1 ? "up" : "down"}>
+                  {selectedRoundMeta.outcome === 1 ? "UP" : selectedRoundMeta.outcome === 0 ? "DOWN" : "--"}
+                </span>
+              </strong>
+              <small>便于快速审查该轮时间线</small>
+            </article>
+          </div>
+        ) : null}
         {roundChart && roundChart.points.length > 0 ? (
           <MarketChart points={roundChart.points} rounds={roundChart.round ? [roundChart.round] : []} height={320} />
         ) : (

@@ -45,26 +45,12 @@ function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
 }
 
-function computeGapThresholdMs(points: ChartPoint[], bucketMs: number): number {
-  if (points.length < 4) {
-    return Math.max(2500, bucketMs * 4);
-  }
-  const deltas: number[] = [];
-  let prev = points[0]?.timestamp_ms ?? 0;
-  for (let i = 1; i < points.length; i += 1) {
-    const cur = points[i]?.timestamp_ms ?? 0;
-    if (cur > prev) {
-      deltas.push(cur - prev);
-    }
-    prev = cur;
-  }
-  if (deltas.length === 0) {
-    return Math.max(2500, bucketMs * 4);
-  }
-  deltas.sort((a, b) => a - b);
-  const median = deltas[Math.floor(deltas.length / 2)] ?? bucketMs;
-  return Math.max(2500, Math.min(180_000, Math.max(bucketMs * 4, median * 5)));
-}
+const ONE_SECOND_MS = 1_000;
+const HOLD_LAST_MAX_GAP_MS = 3_600_000;
+const PAIR_SUM_TOLERANCE_CENTS = 6;
+const DISPLAY_CENT_STEP = 1.0;
+const DELTA_AXIS_HEADROOM_PCT = 0.05;
+const SHORT_GAP_HOLD_BUCKETS = 3_600;
 
 function toMidCents(
   bid: number | null | undefined,
@@ -73,13 +59,13 @@ function toMidCents(
   const hasBid = bid != null && Number.isFinite(bid);
   const hasAsk = ask != null && Number.isFinite(ask);
   if (hasBid && hasAsk) {
-    return clamp((((bid as number) + (ask as number)) * 0.5) * 100, 0, 100);
+    return clamp(((bid + ask) * 0.5) * 100, 0, 100);
   }
   if (hasBid) {
-    return clamp((bid as number) * 100, 0, 100);
+    return clamp(bid * 100, 0, 100);
   }
   if (hasAsk) {
-    return clamp((ask as number) * 100, 0, 100);
+    return clamp(ask * 100, 0, 100);
   }
   return null;
 }
@@ -91,6 +77,146 @@ function toProbCents(prob: number | null | undefined): number | null {
   return clamp(prob * 100, 0, 100);
 }
 
+function quantizeCents(value: number | null): number | null {
+  if (value == null || !Number.isFinite(value)) {
+    return null;
+  }
+  const snapped = Math.round(value / DISPLAY_CENT_STEP) * DISPLAY_CENT_STEP;
+  return clamp(snapped, 0, 100);
+}
+
+function median(values: number[]): number | null {
+  if (values.length === 0) {
+    return null;
+  }
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 0) {
+    return (sorted[mid - 1]! + sorted[mid]!) * 0.5;
+  }
+  return sorted[mid]!;
+}
+
+function computeRobustPctRange(values: Array<number | null>): [number, number] {
+  const finite = values.filter((v): v is number => v != null && Number.isFinite(v));
+  if (finite.length === 0) {
+    return [-0.1, 0.1];
+  }
+
+  const minV = Math.min(...finite);
+  const maxV = Math.max(...finite);
+  const absMax = Math.max(Math.abs(minV), Math.abs(maxV));
+
+  // Keep 0 as center and add explicit headroom for readability.
+  const padded = absMax + DELTA_AXIS_HEADROOM_PCT;
+  const step =
+    padded < 0.20 ? 0.01 :
+    padded < 0.60 ? 0.02 :
+    padded < 1.50 ? 0.05 :
+    padded < 3.00 ? 0.10 :
+    padded < 8.00 ? 0.20 : 0.50;
+
+  let bound = Math.ceil(padded / step) * step;
+  bound = Number(bound.toFixed(4));
+  if (!Number.isFinite(bound) || bound <= 0) {
+    return [-0.1, 0.1];
+  }
+  if (bound < 0.05) {
+    bound = 0.05;
+  }
+  return [-bound, bound];
+}
+
+function computeVisiblePctRange(
+  xsSec: number[],
+  values: Array<number | null>,
+  startMs: number,
+  endMs: number
+): [number, number] {
+  if (xsSec.length === 0 || values.length === 0 || xsSec.length !== values.length) {
+    return computeRobustPctRange(values);
+  }
+  const startSec = Math.min(startMs, endMs) / 1000;
+  const endSec = Math.max(startMs, endMs) / 1000;
+  const visible: Array<number | null> = [];
+  for (let i = 0; i < xsSec.length; i += 1) {
+    const ts = xsSec[i];
+    if (!Number.isFinite(ts)) {
+      continue;
+    }
+    if (ts >= startSec && ts <= endSec) {
+      visible.push(values[i] ?? null);
+    }
+  }
+  if (visible.length === 0) {
+    return computeRobustPctRange(values);
+  }
+  return computeRobustPctRange(visible);
+}
+
+function holdShortNullGaps(
+  values: Array<number | null>,
+  maxGapBuckets: number
+): Array<number | null> {
+  const out: Array<number | null> = new Array(values.length).fill(null);
+  let last: number | null = null;
+  let gapCount = 0;
+
+  for (let i = 0; i < values.length; i += 1) {
+    const v = values[i];
+    if (v != null && Number.isFinite(v)) {
+      out[i] = v;
+      last = v;
+      gapCount = 0;
+      continue;
+    }
+    if (last != null && gapCount < maxGapBuckets) {
+      // Preserve continuity for short feed holes and round-switch micro-gaps.
+      out[i] = last;
+      gapCount += 1;
+      continue;
+    }
+    out[i] = null;
+    last = null;
+    gapCount = 0;
+  }
+  return out;
+}
+
+function fillSeriesContinuity(values: Array<number | null>): Array<number | null> {
+  if (values.length === 0) {
+    return values;
+  }
+  const out = [...values];
+  let firstFinite: number | null = null;
+  for (const v of out) {
+    if (v != null && Number.isFinite(v)) {
+      firstFinite = v;
+      break;
+    }
+  }
+  if (firstFinite == null) {
+    return out;
+  }
+  for (let i = 0; i < out.length; i += 1) {
+    if (out[i] == null || !Number.isFinite(out[i])) {
+      out[i] = firstFinite;
+    } else {
+      break;
+    }
+  }
+  let last = out[0] ?? firstFinite;
+  for (let i = 1; i < out.length; i += 1) {
+    const v = out[i];
+    if (v == null || !Number.isFinite(v)) {
+      out[i] = last;
+      continue;
+    }
+    last = v;
+  }
+  return out;
+}
+
 function toDisplayUpCents(p: ChartPoint): number | null {
   return toProbCents(p.mid_yes) ?? toMidCents(p.best_bid_up, p.best_ask_up);
 }
@@ -99,21 +225,9 @@ function toDisplayDownCents(p: ChartPoint): number | null {
   return toProbCents(p.mid_no) ?? toMidCents(p.best_bid_down, p.best_ask_down);
 }
 
-function quoteSpreadCents(
-  bid: number | null | undefined,
-  ask: number | null | undefined
-): number | null {
-  if (bid == null || ask == null || !Number.isFinite(bid) || !Number.isFinite(ask)) {
-    return null;
-  }
-  return Math.abs((ask - bid) * 100);
-}
-
-function normalizePairedCents(
+function normalizePairedCentsSoft(
   up: number | null,
-  down: number | null,
-  spreadUp: number | null = null,
-  spreadDown: number | null = null
+  down: number | null
 ): { up: number | null; down: number | null } {
   if (up == null && down == null) {
     return { up: null, down: null };
@@ -124,43 +238,27 @@ function normalizePairedCents(
   if (down == null && up != null) {
     return { up: clamp(up, 0, 100), down: clamp(100 - up, 0, 100) };
   }
+
   const safeUp = clamp(up as number, 0, 100);
   const safeDown = clamp(down as number, 0, 100);
   const sum = safeUp + safeDown;
-  if (sum >= 92 && sum <= 108) {
+  if (Math.abs(sum - 100) <= PAIR_SUM_TOLERANCE_CENTS) {
     return { up: safeUp, down: safeDown };
   }
-
-  // For inconsistent two-sided quotes, trust the tighter side and derive the other side.
-  const trustUp = spreadUp != null && Number.isFinite(spreadUp);
-  const trustDown = spreadDown != null && Number.isFinite(spreadDown);
-  const preferUp = (() => {
-    if (trustUp && trustDown) {
-      return (spreadUp as number) <= (spreadDown as number);
-    }
-    if (trustUp) {
-      return true;
-    }
-    if (trustDown) {
-      return false;
-    }
-    return Math.abs(safeUp - 50) >= Math.abs(safeDown - 50);
-  })();
-  if (preferUp) {
-    return { up: safeUp, down: clamp(100 - safeUp, 0, 100) };
+  if (sum <= 0) {
+    return { up: null, down: null };
   }
-  return { up: clamp(100 - safeDown, 0, 100), down: safeDown };
+  const scale = 100 / sum;
+  return {
+    up: clamp(safeUp * scale, 0, 100),
+    down: clamp(safeDown * scale, 0, 100)
+  };
 }
 
 function resolvePairFromPoint(p: ChartPoint): { up: number | null; down: number | null } {
   const rawUp = toDisplayUpCents(p);
   const rawDown = toDisplayDownCents(p);
-  return normalizePairedCents(
-    rawUp,
-    rawDown,
-    quoteSpreadCents(p.best_bid_up, p.best_ask_up),
-    quoteSpreadCents(p.best_bid_down, p.best_ask_down)
-  );
+  return normalizePairedCentsSoft(rawUp, rawDown);
 }
 
 function resolveDeltaPct(p: ChartPoint): number | null {
@@ -179,294 +277,197 @@ function resolveDeltaPct(p: ChartPoint): number | null {
   return null;
 }
 
-function collectCadenceMs(points: ChartPoint[]): number {
-  if (points.length < 3) {
-    return 100;
+function sortAndDedupePoints(points: ChartPoint[]): ChartPoint[] {
+  if (points.length < 2) {
+    return points.filter((p) => Number.isFinite(p.timestamp_ms) && p.timestamp_ms > 0);
   }
-  const deltas: number[] = [];
-  let prev = points[0]?.timestamp_ms ?? 0;
-  for (let i = 1; i < points.length; i += 1) {
-    const cur = points[i]?.timestamp_ms ?? 0;
-    if (cur > prev) {
-      deltas.push(cur - prev);
+  const sorted = points
+    .filter((p) => Number.isFinite(p.timestamp_ms) && p.timestamp_ms > 0)
+    .sort((a, b) => a.timestamp_ms - b.timestamp_ms);
+  const deduped: ChartPoint[] = [];
+  for (const p of sorted) {
+    const prev = deduped[deduped.length - 1];
+    if (prev && prev.timestamp_ms === p.timestamp_ms) {
+      deduped[deduped.length - 1] = p;
+    } else {
+      deduped.push(p);
     }
-    prev = cur;
   }
-  if (deltas.length === 0) {
-    return 100;
-  }
-  deltas.sort((a, b) => a - b);
-  return clamp(deltas[Math.floor(deltas.length / 2)] ?? 100, 50, 10_000);
+  return deduped;
 }
 
-function inferBucketMs(points: ChartPoint[]): number {
-  if (points.length < 4) {
-    return 100;
-  }
-  const first = points[0]?.timestamp_ms ?? 0;
-  const last = points[points.length - 1]?.timestamp_ms ?? first;
-  const spanMs = Math.max(1, last - first);
-  const cadenceMs = collectCadenceMs(points);
-
-  let targetPoints = 1000;
-  if (spanMs <= 10 * 60_000) {
-    targetPoints = 800;
-  } else if (spanMs <= 30 * 60_000) {
-    targetPoints = 1000;
-  } else if (spanMs <= 2 * 60 * 60_000) {
-    targetPoints = 1300;
-  } else {
-    targetPoints = 1600;
-  }
-
-  const raw = Math.max(cadenceMs, Math.ceil(spanMs / targetPoints));
-  const buckets = [100, 200, 250, 500, 1000, 2000, 5000, 10_000, 15_000, 30_000, 60_000];
-  const picked = buckets.find((v) => v >= raw) ?? 60_000;
-  return Math.max(cadenceMs, picked);
+function synthPoint(
+  source: ChartPoint,
+  timestampMs: number,
+  delta: number | null,
+  up: number | null,
+  down: number | null,
+  asGap = false
+): ChartPoint {
+  return {
+    ...source,
+    timestamp_ms: timestampMs,
+    delta_pct: delta,
+    mid_yes: up == null ? null : up / 100,
+    mid_no: down == null ? null : down / 100,
+    best_bid_up: asGap ? null : source.best_bid_up,
+    best_ask_up: asGap ? null : source.best_ask_up,
+    best_bid_down: asGap ? null : source.best_bid_down,
+    best_ask_down: asGap ? null : source.best_ask_down,
+    round_id: asGap ? "" : source.round_id,
+    btc_price: asGap ? null : source.btc_price,
+    target_price: asGap ? null : source.target_price
+  };
 }
 
-function bucketizePoints(points: ChartPoint[], bucketMs: number): ChartPoint[] {
-  if (points.length < 4 || bucketMs <= 100) {
-    return points;
+function bucketizePoints(points: ChartPoint[]): ChartPoint[] {
+  const sorted = sortAndDedupePoints(points);
+  if (sorted.length < 2) {
+    return sorted;
   }
 
-  const buckets = new Map<number, ChartPoint[]>();
-  for (const p of points) {
+  type BucketObservation = {
+    source: ChartPoint;
+    sourceTsMs: number;
+    delta: number | null;
+    up: number | null;
+    down: number | null;
+  };
+
+  type BucketAgg = {
+    source: ChartPoint;
+    sourceTsMs: number;
+    deltas: number[];
+    ups: number[];
+    downs: number[];
+  };
+
+  const buckets = new Map<number, BucketAgg>();
+  for (const p of sorted) {
     const ts = p.timestamp_ms;
-    if (!Number.isFinite(ts) || ts <= 0) {
+    const key = Math.floor(ts / ONE_SECOND_MS) * ONE_SECOND_MS;
+    const pair = resolvePairFromPoint(p);
+    const delta = resolveDeltaPct(p);
+    const existing = buckets.get(key);
+    if (!existing) {
+      buckets.set(key, {
+        source: p,
+        sourceTsMs: ts,
+        deltas: delta != null && Number.isFinite(delta) ? [delta] : [],
+        ups: pair.up != null && Number.isFinite(pair.up) ? [pair.up] : [],
+        downs: pair.down != null && Number.isFinite(pair.down) ? [pair.down] : []
+      });
       continue;
     }
-    const key = Math.floor(ts / bucketMs) * bucketMs;
-    const arr = buckets.get(key);
-    if (arr) {
-      arr.push(p);
-    } else {
-      buckets.set(key, [p]);
+    if (ts >= existing.sourceTsMs) {
+      existing.source = p;
+      existing.sourceTsMs = ts;
+    }
+    if (delta != null && Number.isFinite(delta)) {
+      existing.deltas.push(delta);
+    }
+    if (pair.up != null && Number.isFinite(pair.up)) {
+      existing.ups.push(pair.up);
+    }
+    if (pair.down != null && Number.isFinite(pair.down)) {
+      existing.downs.push(pair.down);
     }
   }
 
   const keys = [...buckets.keys()].sort((a, b) => a - b);
+  if (keys.length === 0) {
+    return [];
+  }
+
   const out: ChartPoint[] = [];
-  for (const key of keys) {
-    const arr = buckets.get(key)!;
-    if (arr.length === 0) {
+  let lastObs: BucketObservation | null = null;
+  const firstBucket = keys[0]!;
+  const lastBucket = keys[keys.length - 1]!;
+
+  for (let bucket = firstBucket; bucket <= lastBucket; bucket += ONE_SECOND_MS) {
+    const ts = bucket + ONE_SECOND_MS - 1;
+    const agg = buckets.get(bucket) ?? null;
+    if (agg) {
+      const observedDelta =
+        median(agg.deltas) ?? resolveDeltaPct(agg.source) ?? lastObs?.delta ?? null;
+      let observedPair = normalizePairedCentsSoft(median(agg.ups), median(agg.downs));
+      if (observedPair.up == null && observedPair.down == null && lastObs) {
+        observedPair = { up: lastObs.up, down: lastObs.down };
+      }
+      const obs: BucketObservation = {
+        source: agg.source,
+        sourceTsMs: agg.sourceTsMs,
+        delta: observedDelta,
+        up: observedPair.up,
+        down: observedPair.down
+      };
+      lastObs = obs;
+      out.push(synthPoint(obs.source, ts, obs.delta, obs.up, obs.down));
       continue;
     }
-    const last = arr[arr.length - 1]!;
-    const deltas = arr
-      .map((x) => resolveDeltaPct(x))
-      .filter((v): v is number => v != null && Number.isFinite(v));
-    const pairs = arr.map((x) => resolvePairFromPoint(x));
-    const ups = pairs.map((x) => x.up).filter((v): v is number => v != null && Number.isFinite(v));
-    const downs = pairs.map((x) => x.down).filter((v): v is number => v != null && Number.isFinite(v));
-
-    const lastPair = resolvePairFromPoint(last);
-    const upRaw = ups.length > 0 ? median(ups) : lastPair.up;
-    const downRaw = downs.length > 0 ? median(downs) : lastPair.down;
-    const normalized = normalizePairedCents(upRaw, downRaw);
-    out.push({
-      ...last,
-      timestamp_ms: key + bucketMs - 1,
-      delta_pct: deltas.length > 0 ? median(deltas) : resolveDeltaPct(last),
-      mid_yes: normalized.up == null ? null : normalized.up / 100,
-      mid_no: normalized.down == null ? null : normalized.down / 100
-    });
+    if (!lastObs) {
+      continue;
+    }
+    if (bucket - lastObs.sourceTsMs <= HOLD_LAST_MAX_GAP_MS) {
+      out.push(synthPoint(lastObs.source, ts, lastObs.delta, lastObs.up, lastObs.down));
+    } else {
+      // Display layer keeps continuity for long feed holes to avoid broken chart segments.
+      out.push(synthPoint(lastObs.source, ts, lastObs.delta, lastObs.up, lastObs.down));
+    }
   }
   return out;
 }
 
 function preparePlot(points: ChartPoint[]): PreparedPlot {
-  const bucketMs = inferBucketMs(points);
-  const bucketed = bucketizePoints(points, bucketMs);
+  const bucketed = bucketizePoints(points);
   const xs: number[] = [];
   const delta: Array<number | null> = [];
-  const up: Array<number | null> = [];
-  const down: Array<number | null> = [];
-  const gapThresholdMs = computeGapThresholdMs(bucketed, bucketMs);
-  let prevTs = 0;
-  let prevRoundId = "";
-  let prevDelta: number | null = null;
-  let prevUp: number | null = null;
-  let prevDown: number | null = null;
+  const upRaw: Array<number | null> = [];
 
   for (const p of bucketed) {
     if (!Number.isFinite(p.timestamp_ms) || p.timestamp_ms <= 0) {
       continue;
     }
     const pair = resolvePairFromPoint(p);
-    const roundChanged = prevRoundId.length > 0 && p.round_id.length > 0 && p.round_id !== prevRoundId;
-    const gapMs = prevTs > 0 ? p.timestamp_ms - prevTs : 0;
-    if (prevTs > 0) {
-      if (roundChanged && gapMs > 1 && gapMs <= 120_000) {
-        const anchorTs = Math.max(prevTs + 1, p.timestamp_ms - 1);
-        if (anchorTs > prevTs) {
-          xs.push(anchorTs / 1000);
-          delta.push(prevDelta);
-          up.push(prevUp);
-          down.push(prevDown);
-        }
-      } else if (gapMs > gapThresholdMs) {
-        xs.push((prevTs + 1) / 1000);
-        delta.push(null);
-        up.push(null);
-        down.push(null);
-      }
-    }
-
     xs.push(p.timestamp_ms / 1000);
-    const deltaValue = resolveDeltaPct(p);
-    delta.push(deltaValue);
-    up.push(pair.up);
-    down.push(pair.down);
-    prevTs = p.timestamp_ms;
-    prevRoundId = p.round_id;
-    prevDelta = deltaValue;
-    prevUp = pair.up;
-    prevDown = pair.down;
+    delta.push(resolveDeltaPct(p));
+    upRaw.push(pair.up);
   }
 
-  const deltaStable = smoothDeltaSeries(delta, bucketMs);
-  const upStable = cleanProbabilitySeries(up, bucketMs);
-  const downStable = cleanProbabilitySeries(down, bucketMs);
+  // Keep display deterministic: 1s bucket + quote normalization + hold-last.
+  const upDisplay = holdShortNullGaps(
+    upRaw.map((v) => quantizeCents(v)),
+    SHORT_GAP_HOLD_BUCKETS
+  );
+  const upContinuous = fillSeriesContinuity(upDisplay);
+  const downDisplay = upContinuous.map((v) => (v == null ? null : quantizeCents(100 - v)));
+  const downContinuous = fillSeriesContinuity(downDisplay);
+  const deltaDisplay = holdShortNullGaps(
+    delta.map((v) => (v == null || !Number.isFinite(v) ? null : Number(v.toFixed(4)))),
+    SHORT_GAP_HOLD_BUCKETS
+  );
+  const deltaContinuous = fillSeriesContinuity(deltaDisplay);
+
   return {
-    data: [xs, deltaStable, upStable, downStable],
+    data: [xs, deltaContinuous, upContinuous, downContinuous],
     bucketed
   };
-}
-
-function median(values: number[]): number {
-  if (values.length === 0) {
-    return NaN;
-  }
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  if (sorted.length % 2 === 0) {
-    return (sorted[mid - 1]! + sorted[mid]!) * 0.5;
-  }
-  return sorted[mid]!;
-}
-
-function despikeSeries(
-  values: Array<number | null>,
-  spikeThreshold: number,
-  recoveryThreshold: number
-): Array<number | null> {
-  if (values.length < 3) {
-    return values.slice();
-  }
-  const out = values.slice();
-  for (let i = 1; i < values.length - 1; i += 1) {
-    const prev = out[i - 1];
-    const cur = out[i];
-    const next = values[i + 1];
-    if (prev == null || cur == null || next == null) {
-      continue;
-    }
-    const jumpPrev = Math.abs(cur - prev);
-    const jumpNext = Math.abs(cur - next);
-    const recover = Math.abs(next - prev);
-    if (jumpPrev >= spikeThreshold && jumpNext >= spikeThreshold && recover <= recoveryThreshold) {
-      out[i] = (prev + next) * 0.5;
-    }
-  }
-  return out;
-}
-
-function smoothProbSeries(
-  values: Array<number | null>,
-  alpha: number,
-  maxStep: number
-): Array<number | null> {
-  const medianed = values.slice();
-  for (let i = 1; i < values.length - 1; i += 1) {
-    const a = values[i - 1];
-    const b = values[i];
-    const c = values[i + 1];
-    if (a == null || b == null || c == null) {
-      continue;
-    }
-    const arr = [a, b, c].sort((x, y) => x - y);
-    medianed[i] = arr[1] ?? b;
-  }
-
-  const out: Array<number | null> = [];
-  let prev: number | null = null;
-  for (const v of medianed) {
-    if (v == null || !Number.isFinite(v)) {
-      out.push(null);
-      prev = null;
-      continue;
-    }
-    const cur = clamp(v, 0, 100);
-    if (prev == null) {
-      out.push(cur);
-      prev = cur;
-      continue;
-    }
-    let next = prev + alpha * (cur - prev);
-    const delta = next - prev;
-    if (delta > maxStep) {
-      next = prev + maxStep;
-    } else if (delta < -maxStep) {
-      next = prev - maxStep;
-    }
-    next = clamp(next, 0, 100);
-    out.push(next);
-    prev = next;
-  }
-  return out;
-}
-
-function cleanProbabilitySeries(values: Array<number | null>, bucketMs: number): Array<number | null> {
-  const spikeThreshold = bucketMs <= 500 ? 26 : bucketMs <= 2000 ? 18 : 12;
-  const recoveryThreshold = bucketMs <= 500 ? 8 : bucketMs <= 2000 ? 6 : 4;
-  const alpha = bucketMs <= 500 ? 0.42 : bucketMs <= 2000 ? 0.33 : 0.25;
-  const maxStep = bucketMs <= 500 ? 10 : bucketMs <= 2000 ? 7 : 5;
-  const deSpiked = despikeSeries(values, spikeThreshold, recoveryThreshold);
-  return smoothProbSeries(deSpiked, alpha, maxStep);
-}
-
-function smoothDeltaSeries(values: Array<number | null>, bucketMs: number): Array<number | null> {
-  if (values.length < 3) {
-    return values.slice();
-  }
-  const radius = bucketMs <= 500 ? 2 : bucketMs <= 2000 ? 1 : 1;
-  const out = values.slice();
-  for (let i = 0; i < values.length; i += 1) {
-    let weightSum = 0;
-    let valueSum = 0;
-    for (let j = i - radius; j <= i + radius; j += 1) {
-      if (j < 0 || j >= values.length) {
-        continue;
-      }
-      const v = values[j];
-      if (v == null || !Number.isFinite(v)) {
-        continue;
-      }
-      const dist = Math.abs(j - i);
-      const w = dist === 0 ? 1.0 : dist === 1 ? 0.65 : 0.35;
-      valueSum += v * w;
-      weightSum += w;
-    }
-    if (weightSum > 0) {
-      out[i] = valueSum / weightSum;
-    }
-  }
-  return out;
 }
 
 function buildMiniPath(points: ChartPoint[], width: number, height: number): string {
   if (points.length < 2 || width <= 0 || height <= 0) {
     return "";
   }
-  const valid = points.filter((p) => Number.isFinite(p.timestamp_ms) && Number.isFinite(p.delta_pct ?? NaN));
+  const valid = points
+    .map((p) => ({ ts: p.timestamp_ms, delta: resolveDeltaPct(p) }))
+    .filter((p) => Number.isFinite(p.ts) && p.ts > 0 && p.delta != null && Number.isFinite(p.delta));
   if (valid.length < 2) {
     return "";
   }
 
-  const minX = valid[0]!.timestamp_ms;
-  const maxX = valid[valid.length - 1]!.timestamp_ms;
-  const ys = valid.map((p) => p.delta_pct as number);
+  const minX = valid[0]!.ts;
+  const maxX = valid[valid.length - 1]!.ts;
+  const ys = valid.map((p) => p.delta as number);
   const minY = Math.min(...ys);
   const maxY = Math.max(...ys);
   const xSpan = Math.max(1, maxX - minX);
@@ -475,8 +476,8 @@ function buildMiniPath(points: ChartPoint[], width: number, height: number): str
   let d = "";
   for (let i = 0; i < valid.length; i += 1) {
     const p = valid[i]!;
-    const x = ((p.timestamp_ms - minX) / xSpan) * width;
-    const y = height - (((p.delta_pct as number) - minY) / ySpan) * height;
+    const x = ((p.ts - minX) / xSpan) * width;
+    const y = height - (((p.delta as number) - minY) / ySpan) * height;
     d += `${i === 0 ? "M" : "L"}${x.toFixed(2)} ${y.toFixed(2)} `;
   }
   return d.trim();
@@ -486,12 +487,26 @@ function formatMiniTs(tsMs: number): string {
   if (!Number.isFinite(tsMs) || tsMs <= 0) {
     return "--:--:--";
   }
-  return new Date(tsMs).toLocaleTimeString("en-US", {
+  return new Date(tsMs).toLocaleTimeString("zh-CN", {
     hour12: false,
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit"
   });
+}
+
+function formatLegendTs(tsSec: number): string {
+  if (!Number.isFinite(tsSec) || tsSec <= 0) {
+    return "--";
+  }
+  const d = new Date(tsSec * 1000);
+  const y = d.getFullYear();
+  const mo = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  return `${y}-${mo}-${day} ${hh}:${mm}:${ss}`;
 }
 
 function computeDomain(points: ChartPoint[]): DomainRange | null {
@@ -537,18 +552,33 @@ function MarketChartImpl({ points, rounds, height = 420 }: MarketChartProps) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const miniCanvasRef = useRef<HTMLDivElement | null>(null);
   const plotRef = useRef<uPlot | null>(null);
+  const tooltipRef = useRef<HTMLDivElement | null>(null);
+  const bucketedRef = useRef<ChartPoint[]>([]);
   const roundsRef = useRef<ChartRound[]>(rounds);
   const domainRef = useRef<DomainRange | null>(null);
   const viewRef = useRef<ViewRange | null>(null);
   const dragRef = useRef<DragState | null>(null);
   const userAdjustedRef = useRef(false);
+  const lastRoundIdRef = useRef<string>("");
 
   const prepared = useMemo(() => preparePlot(points), [points]);
   const data = prepared.data;
   const miniPath = useMemo(() => buildMiniPath(prepared.bucketed, 1200, 38), [prepared.bucketed]);
-  const domain = useMemo(() => computeDomain(points), [points]);
+  const domain = useMemo(() => computeDomain(prepared.bucketed), [prepared.bucketed]);
+  const steppedPathBuilder = useMemo(() => uPlot.paths.stepped?.({ align: 1 }), []);
 
   const [brush, setBrush] = useState<BrushState>({ leftPct: 0, widthPct: 100 });
+
+  const syncPctScaleToView = useCallback((startMs: number, endMs: number) => {
+    const plot = plotRef.current;
+    if (!plot) {
+      return;
+    }
+    const xs = ((plot.data[0] as number[]) ?? []).slice();
+    const deltas = ((plot.data[1] as Array<number | null>) ?? []).slice();
+    const [min, max] = computeVisiblePctRange(xs, deltas, startMs, endMs);
+    plot.setScale("pct", { min, max });
+  }, []);
 
   const applyView = useCallback(
     (startMsRaw: number, endMsRaw: number, fromUser: boolean) => {
@@ -578,8 +608,9 @@ function MarketChartImpl({ points, rounds, height = 420 }: MarketChartProps) {
       viewRef.current = { startMs, endMs };
       setBrush(viewToBrush(d, { startMs, endMs }));
       plotRef.current?.setScale("x", { min: startMs / 1000, max: endMs / 1000 });
+      syncPctScaleToView(startMs, endMs);
     },
-    []
+    [syncPctScaleToView]
   );
 
   const resetView = useCallback(() => {
@@ -597,10 +628,20 @@ function MarketChartImpl({ points, rounds, height = 420 }: MarketChartProps) {
   }, [rounds]);
 
   useEffect(() => {
+    bucketedRef.current = prepared.bucketed;
+  }, [prepared.bucketed]);
+
+  useEffect(() => {
     const root = rootRef.current;
     if (!root) {
       return;
     }
+
+    const tooltipEl = document.createElement("div");
+    tooltipEl.className = "chart-tooltip";
+    tooltipEl.style.display = "none";
+    root.appendChild(tooltipEl);
+    tooltipRef.current = tooltipEl;
 
     const plot = new uPlot(
       {
@@ -610,7 +651,10 @@ function MarketChartImpl({ points, rounds, height = 420 }: MarketChartProps) {
         cursor: { drag: { x: true, y: false } },
         scales: {
           x: { time: true },
-          pct: { auto: true },
+          pct: {
+            auto: false,
+            range: (u) => computeRobustPctRange((u.data[1] as Array<number | null>) ?? [])
+          },
           prob: { range: [0, 100] }
         },
         axes: [
@@ -618,9 +662,10 @@ function MarketChartImpl({ points, rounds, height = 420 }: MarketChartProps) {
             stroke: "#706c5c",
             grid: { stroke: "rgba(104, 95, 72, 0.22)" },
             ticks: { stroke: "#706c5c" },
+            space: 90,
             values: (_u, vals) =>
               vals.map((v) =>
-                new Date(v * 1000).toLocaleTimeString("en-US", {
+                new Date(v * 1000).toLocaleTimeString("zh-CN", {
                   hour12: false,
                   hour: "2-digit",
                   minute: "2-digit",
@@ -632,7 +677,11 @@ function MarketChartImpl({ points, rounds, height = 420 }: MarketChartProps) {
             scale: "pct",
             stroke: "#f0df4e",
             grid: { stroke: "rgba(104, 95, 72, 0.24)" },
-            values: (_u, vals) => vals.map((v) => `${v.toFixed(2)}%`)
+            values: (_u, vals) =>
+              vals.map((v) => {
+                const sign = v > 0 ? "+" : "";
+                return `${sign}${v.toFixed(2)}%`;
+              })
           },
           {
             scale: "prob",
@@ -643,12 +692,16 @@ function MarketChartImpl({ points, rounds, height = 420 }: MarketChartProps) {
           }
         ],
         series: [
-          {},
+          {
+            value: (_u, v) => formatLegendTs(v as number)
+          },
           {
             label: "Δ价差%",
             scale: "pct",
             stroke: "#efe349",
             width: 1.7,
+            spanGaps: true,
+            paths: steppedPathBuilder,
             points: { show: false }
           },
           {
@@ -656,6 +709,8 @@ function MarketChartImpl({ points, rounds, height = 420 }: MarketChartProps) {
             scale: "prob",
             stroke: "#64be4e",
             width: 1.55,
+            spanGaps: true,
+            paths: steppedPathBuilder,
             points: { show: false }
           },
           {
@@ -663,10 +718,109 @@ function MarketChartImpl({ points, rounds, height = 420 }: MarketChartProps) {
             scale: "prob",
             stroke: "#ff2f57",
             width: 1.55,
+            spanGaps: true,
+            paths: steppedPathBuilder,
             points: { show: false }
           }
         ],
         hooks: {
+          setCursor: [
+            (u) => {
+              const tip = tooltipRef.current;
+              if (!tip) {
+                return;
+              }
+              const plotBox = u.bbox;
+              const cursorLeft = u.cursor.left;
+              const cursorTop = u.cursor.top;
+              if (
+                cursorLeft == null ||
+                cursorTop == null ||
+                !Number.isFinite(cursorLeft) ||
+                !Number.isFinite(cursorTop) ||
+                cursorLeft < 0 ||
+                cursorTop < 0 ||
+                cursorLeft > plotBox.width ||
+                cursorTop > plotBox.height
+              ) {
+                tip.style.display = "none";
+                return;
+              }
+              let idx: number | null = null;
+              if (u.cursor.idx != null && u.cursor.idx >= 0) {
+                idx = u.cursor.idx;
+              }
+              if (idx == null && u.cursor.left != null && Number.isFinite(u.cursor.left)) {
+                try {
+                  idx = u.posToIdx(u.cursor.left);
+                } catch {
+                  idx = null;
+                }
+              }
+              if (idx == null || idx < 0) {
+                tip.style.display = "none";
+                return;
+              }
+              const xs = (u.data[0] as number[]) ?? [];
+              if (idx >= xs.length) {
+                tip.style.display = "none";
+                return;
+              }
+
+              const tsSec = xs[idx];
+              const delta = ((u.data[1] as Array<number | null>) ?? [])[idx];
+              const up = ((u.data[2] as Array<number | null>) ?? [])[idx];
+              const down = ((u.data[3] as Array<number | null>) ?? [])[idx];
+              const row = bucketedRef.current[idx] ?? null;
+              const btc = row?.btc_price ?? null;
+              const target = row?.target_price ?? null;
+
+              const fmtPct = (v: number | null | undefined) =>
+                v == null || !Number.isFinite(v) ? "--" : `${v > 0 ? "+" : ""}${v.toFixed(4)}%`;
+              const fmtCent = (v: number | null | undefined) =>
+                v == null || !Number.isFinite(v) ? "--" : `${v.toFixed(1)}¢`;
+              const fmtUsd = (v: number | null | undefined) =>
+                v == null || !Number.isFinite(v)
+                  ? "--"
+                  : `$${v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+              tip.innerHTML = `
+                <div class="tt-time">${formatLegendTs(tsSec)}</div>
+                <div class="tt-row"><span>Δ价差</span><strong class="${(delta ?? 0) >= 0 ? "up" : "down"}">${fmtPct(delta)}</strong></div>
+                <div class="tt-row"><span>看涨价格</span><strong class="up">${fmtCent(up)}</strong></div>
+                <div class="tt-row"><span>看跌价格</span><strong class="down">${fmtCent(down)}</strong></div>
+                <div class="tt-row"><span>比特币</span><strong>${fmtUsd(btc)}</strong></div>
+                <div class="tt-row"><span>目标价</span><strong>${fmtUsd(target)}</strong></div>
+              `;
+              tip.style.display = "block";
+
+              const w = tip.offsetWidth || 220;
+              const h = tip.offsetHeight || 140;
+              const rootWidth = u.root.clientWidth;
+              const rootHeight = u.root.clientHeight;
+
+              const anchorX = Math.round(cursorLeft + plotBox.left);
+              const anchorY = Math.round(cursorTop + plotBox.top);
+
+              // Preferred placement: right-bottom of crosshair intersection.
+              let left = anchorX + 8;
+              let top = anchorY + 8;
+
+              // Flip if overflow.
+              if (left + w > rootWidth - 6) {
+                left = anchorX - w - 8;
+              }
+              if (top + h > rootHeight - 6) {
+                top = anchorY - h - 8;
+              }
+
+              left = clamp(left, 6, Math.max(6, rootWidth - w - 6));
+              top = clamp(top, 6, Math.max(6, rootHeight - h - 6));
+
+              tip.style.left = `${left}px`;
+              tip.style.top = `${top}px`;
+            }
+          ],
           draw: [
             (u) => {
               const ctx = u.ctx;
@@ -717,14 +871,29 @@ function MarketChartImpl({ points, rounds, height = 420 }: MarketChartProps) {
     window.addEventListener("resize", onResize);
     return () => {
       window.removeEventListener("resize", onResize);
+      tooltipRef.current = null;
+      tooltipEl.remove();
       plot.destroy();
       plotRef.current = null;
     };
-  }, [height]);
+  }, [height, steppedPathBuilder]);
 
   useEffect(() => {
-    plotRef.current?.setData(data);
-  }, [data]);
+    const plot = plotRef.current;
+    if (!plot) {
+      return;
+    }
+    plot.setData(data);
+    const curView = viewRef.current;
+    if (curView) {
+      syncPctScaleToView(curView.startMs, curView.endMs);
+      return;
+    }
+    const d = domainRef.current;
+    if (d) {
+      syncPctScaleToView(d.minMs, d.maxMs);
+    }
+  }, [data, syncPctScaleToView]);
 
   useEffect(() => {
     domainRef.current = domain;
@@ -745,6 +914,37 @@ function MarketChartImpl({ points, rounds, height = 420 }: MarketChartProps) {
     const end = clamp(cur.endMs, domain.minMs, domain.maxMs);
     applyView(start, end, false);
   }, [domain, applyView]);
+
+  useEffect(() => {
+    const latestRoundId = prepared.bucketed[prepared.bucketed.length - 1]?.round_id ?? "";
+    if (!latestRoundId) {
+      return;
+    }
+
+    const prevRoundId = lastRoundIdRef.current;
+    lastRoundIdRef.current = latestRoundId;
+    if (!prevRoundId || prevRoundId === latestRoundId) {
+      return;
+    }
+
+    // On market rollover, jump viewport so the new round is immediately visible.
+    const d = domainRef.current;
+    if (!d) {
+      return;
+    }
+    const latestRoundStartMs =
+      prepared.bucketed.find((p) => p.round_id === latestRoundId)?.timestamp_ms ?? null;
+    const prevView = viewRef.current;
+    const prevSpan = prevView ? Math.max(5_000, prevView.endMs - prevView.startMs) : d.maxMs - d.minMs;
+    userAdjustedRef.current = false;
+    if (latestRoundStartMs != null && Number.isFinite(latestRoundStartMs) && latestRoundStartMs > 0) {
+      const preRollMs = Math.min(20_000, Math.max(3_000, Math.round(prevSpan * 0.08)));
+      const anchorStart = latestRoundStartMs - preRollMs;
+      applyView(anchorStart, anchorStart + prevSpan, false);
+      return;
+    }
+    applyView(d.minMs, d.maxMs, false);
+  }, [prepared.bucketed, applyView]);
 
   useEffect(() => {
     const onPointerMove = (ev: PointerEvent) => {

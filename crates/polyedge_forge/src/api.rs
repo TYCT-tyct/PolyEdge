@@ -1,5 +1,5 @@
 use std::cmp::min;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -74,6 +74,7 @@ struct HeatmapQueryParams {
 struct AccuracyQueryParams {
     market_type: String,
     window: Option<u32>,
+    lookback_hours: Option<u32>,
     limit: Option<u32>,
 }
 
@@ -348,13 +349,18 @@ async fn fetch_latest_snapshot_from_clickhouse(
             chainlink_price,
             mid_yes,
             mid_no,
+            mid_yes_smooth,
+            mid_no_smooth,
             bid_yes,
             ask_yes,
             bid_no,
             ask_no,
             delta_price,
             delta_pct,
-            remaining_ms
+            delta_pct_smooth,
+            remaining_ms,
+            velocity_bps_per_sec,
+            acceleration
         FROM polyedge_forge.snapshot_100ms
         WHERE symbol='{}' AND timeframe='{}'
         ORDER BY ts_ireland_sample_ms DESC
@@ -384,18 +390,45 @@ fn compact_live_snapshot(snapshot: &Value, market_type: &str) -> Value {
         String::new()
     };
 
+    let mid_yes = snapshot
+        .get("mid_yes_smooth")
+        .and_then(Value::as_f64)
+        .or_else(|| snapshot.get("mid_yes").and_then(Value::as_f64));
+    let mid_no = snapshot
+        .get("mid_no_smooth")
+        .and_then(Value::as_f64)
+        .or_else(|| snapshot.get("mid_no").and_then(Value::as_f64));
+    let raw_bid_yes = snapshot.get("bid_yes").and_then(Value::as_f64);
+    let raw_ask_yes = snapshot.get("ask_yes").and_then(Value::as_f64);
+    let raw_bid_no = snapshot.get("bid_no").and_then(Value::as_f64);
+    let raw_ask_no = snapshot.get("ask_no").and_then(Value::as_f64);
+    let yes_spread = match (raw_bid_yes, raw_ask_yes) {
+        (Some(b), Some(a)) if a.is_finite() && b.is_finite() => (a - b).abs().clamp(0.001, 0.06),
+        _ => 0.01,
+    };
+    let no_spread = match (raw_bid_no, raw_ask_no) {
+        (Some(b), Some(a)) if a.is_finite() && b.is_finite() => (a - b).abs().clamp(0.001, 0.06),
+        _ => 0.01,
+    };
+    let best_bid_up = mid_yes.map(|m| (m - yes_spread * 0.5).clamp(0.0, 1.0));
+    let best_ask_up = mid_yes.map(|m| (m + yes_spread * 0.5).clamp(0.0, 1.0));
+    let best_bid_down = mid_no.map(|m| (m - no_spread * 0.5).clamp(0.0, 1.0));
+    let best_ask_down = mid_no.map(|m| (m + no_spread * 0.5).clamp(0.0, 1.0));
+
     json!({
         "timestamp_ms": snapshot.get("ts_ireland_sample_ms").and_then(Value::as_i64),
         "round_id": round_id,
         "market_type": market_type,
         "btc_price": snapshot.get("binance_price").and_then(Value::as_f64),
         "target_price": snapshot.get("target_price").and_then(Value::as_f64),
-        "delta_pct": snapshot.get("delta_pct").and_then(Value::as_f64),
-        "best_bid_up": snapshot.get("bid_yes").and_then(Value::as_f64),
-        "best_ask_up": snapshot.get("ask_yes").and_then(Value::as_f64),
-        "best_bid_down": snapshot.get("bid_no").and_then(Value::as_f64),
-        "best_ask_down": snapshot.get("ask_no").and_then(Value::as_f64),
+        "delta_pct": snapshot.get("delta_pct_smooth").and_then(Value::as_f64).or_else(|| snapshot.get("delta_pct").and_then(Value::as_f64)),
+        "best_bid_up": best_bid_up,
+        "best_ask_up": best_ask_up,
+        "best_bid_down": best_bid_down,
+        "best_ask_down": best_ask_down,
         "time_remaining_s": snapshot.get("remaining_ms").and_then(Value::as_i64).map(|v| v as f64 / 1000.0),
+        "velocity_bps_per_sec": snapshot.get("velocity_bps_per_sec").and_then(Value::as_f64),
+        "acceleration": snapshot.get("acceleration").and_then(Value::as_f64),
         "outcome": Value::Null,
         "slug": slug,
         "start_time_ms": start_time_ms,
@@ -503,12 +536,15 @@ async fn history_symbol_timeframe(
             pm_live_btc_price,
             mid_yes,
             mid_no,
+            mid_yes_smooth,
+            mid_no_smooth,
             bid_yes,
             ask_yes,
             bid_no,
             ask_no,
             delta_price,
             delta_pct,
+            delta_pct_smooth,
             remaining_ms,
             velocity_bps_per_sec,
             acceleration
@@ -590,13 +626,13 @@ async fn stats(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
         WHERE symbol='BTCUSDT' AND timeframe IN ('5m','15m')
         FORMAT JSON";
     let accuracy_query = "SELECT
-            count() AS market_accuracy_n,
-            avg(toFloat64((ifNull(s.eval_mid_up, 0.5) >= 0.5) = (r.label_up = 1))) AS market_accuracy
+            countIf(isNotNull(s.eval_mid_up)) AS market_accuracy_n,
+            avgIf(toFloat64((s.eval_mid_up >= 0.5) = (r.label_up = 1)), isNotNull(s.eval_mid_up)) AS market_accuracy
         FROM polyedge_forge.rounds r
         LEFT JOIN (
             SELECT
                 round_id,
-                argMinIf(mid_yes, abs(remaining_ms - if(timeframe='5m', 60000, 180000)), remaining_ms >= 0) AS eval_mid_up
+                argMinIf(coalesce(mid_yes_smooth, mid_yes), abs(remaining_ms - if(timeframe='5m', 60000, 180000)), remaining_ms >= 0) AS eval_mid_up
             FROM polyedge_forge.snapshot_100ms
             WHERE symbol='BTCUSDT' AND timeframe IN ('5m','15m')
             GROUP BY round_id
@@ -665,8 +701,11 @@ async fn chart(
         "SELECT
             ts_ireland_sample_ms AS timestamp_ms,
             delta_pct,
+            delta_pct_smooth,
             mid_yes,
             mid_no,
+            mid_yes_smooth,
+            mid_no_smooth,
             bid_yes AS best_bid_up,
             ask_yes AS best_ask_up,
             bid_no AS best_bid_down,
@@ -755,8 +794,11 @@ async fn chart_round(
         "SELECT
             ts_ireland_sample_ms AS timestamp_ms,
             delta_pct,
+            delta_pct_smooth,
             mid_yes,
             mid_no,
+            mid_yes_smooth,
+            mid_no_smooth,
             bid_yes AS best_bid_up,
             ask_yes AS best_ask_up,
             bid_no AS best_bid_down,
@@ -1044,7 +1086,7 @@ async fn rounds(
         LEFT JOIN (
             SELECT
                 round_id,
-                argMinIf(mid_yes, remaining_ms, remaining_ms >= 0) AS close_mid_up
+                argMinIf(coalesce(mid_yes_smooth, mid_yes), remaining_ms, remaining_ms >= 0) AS close_mid_up
             FROM polyedge_forge.snapshot_100ms
             WHERE symbol='BTCUSDT'
               AND timeframe='{market_type}'
@@ -1145,17 +1187,26 @@ async fn heatmap(
 
     let query = format!(
         "SELECT
-            round(delta_pct / 0.15) * 0.15 AS delta_bin_pct,
-            intDiv(greatest(remaining_ms, 0), 30000) * 30 AS time_left_s_bin,
-            avg(mid_yes * 100.0) AS avg_up_price_cents,
-            count() AS sample_count
-        FROM polyedge_forge.snapshot_100ms
-        WHERE symbol='BTCUSDT'
-          AND timeframe='{market_type}'
-          AND ts_ireland_sample_ms >= {from_ms}
-          AND delta_pct IS NOT NULL
-          AND remaining_ms >= 0
-          AND remaining_ms <= {duration_ms}
+            if(abs(delta_bin_raw) < 0.005, 0.0, delta_bin_raw) AS delta_bin_pct,
+            time_left_s_bin,
+            avg(avg_up_price_cents_raw) AS avg_up_price_cents,
+            sum(sample_count_raw) AS sample_count
+        FROM (
+            SELECT
+                round(round(delta_pct / 0.05) * 0.05, 2) AS delta_bin_raw,
+                intDiv(greatest(remaining_ms, 0), 30000) * 30 AS time_left_s_bin,
+                coalesce(mid_yes_smooth, mid_yes) * 100.0 AS avg_up_price_cents_raw,
+                1 AS sample_count_raw
+            FROM polyedge_forge.snapshot_100ms
+            WHERE symbol='BTCUSDT'
+              AND timeframe='{market_type}'
+              AND ts_ireland_sample_ms >= {from_ms}
+              AND delta_pct IS NOT NULL
+              AND delta_pct >= -5
+              AND delta_pct <= 5
+              AND remaining_ms >= 0
+              AND remaining_ms <= {duration_ms}
+        )
         GROUP BY delta_bin_pct, time_left_s_bin
         ORDER BY time_left_s_bin DESC, delta_bin_pct ASC
         FORMAT JSON"
@@ -1193,75 +1244,118 @@ async fn accuracy_series(
 ) -> Result<Json<Value>, ApiError> {
     let market_type = normalize_market_type(&params.market_type)
         .ok_or_else(|| ApiError::bad_request("invalid market_type"))?;
-    let window = params.window.unwrap_or(20).clamp(2, 200) as usize;
-    let limit = params.limit.unwrap_or(500).clamp(20, 5000);
-    let eval_remaining_ms = market_type_to_ms(market_type) / 5;
+    let rolling_window = if market_type == "5m" { 40usize } else { 20usize };
+    let lookback_hours = 24u32;
+    let now_ms = Utc::now().timestamp_millis();
+    let from_ms = now_ms.saturating_sub(i64::from(lookback_hours) * 3_600_000);
+    let bucket_ms: i64 = 1_800_000; // 30 minutes
+    let _window_override = params.window.unwrap_or(rolling_window as u32);
+    let _limit_override = params.limit.unwrap_or(5_000);
+    let _lookback_override = params.lookback_hours.unwrap_or(24);
+    let eval_remaining_ms = if market_type == "5m" { 60_000 } else { 180_000 };
+    let duration_ms = market_type_to_ms(market_type);
 
     let Some(ch_url) = state.ch_url.as_deref() else {
         return Err(ApiError::internal("clickhouse not configured"));
     };
 
     let query = format!(
-        "SELECT *
-         FROM (
+        "SELECT
+            r.round_id,
+            r.end_ts_ms AS timestamp_ms,
+            toInt8(r.label_up) AS outcome,
+            s.eval_mid_up AS eval_mid_up
+        FROM polyedge_forge.rounds r
+        INNER JOIN (
             SELECT
-                r.round_id,
-                r.end_ts_ms AS timestamp_ms,
-                toInt8(r.label_up) AS outcome,
-                ifNull(s.eval_mid_up, 0.5) AS eval_mid_up,
-                toInt8((ifNull(s.eval_mid_up, 0.5) >= 0.5) = (r.label_up = 1)) AS correct
-            FROM polyedge_forge.rounds r
-            LEFT JOIN (
-                SELECT
-                    round_id,
-                    argMinIf(mid_yes, abs(remaining_ms - {eval_remaining_ms}), remaining_ms >= 0) AS eval_mid_up
-                FROM polyedge_forge.snapshot_100ms
-                WHERE symbol='BTCUSDT'
-                  AND timeframe='{market_type}'
-                GROUP BY round_id
-            ) s ON r.round_id = s.round_id
-            WHERE r.symbol='BTCUSDT'
-              AND r.timeframe='{market_type}'
-            ORDER BY r.end_ts_ms DESC
-            LIMIT {limit}
-         )
-         ORDER BY timestamp_ms ASC
-         FORMAT JSON"
+                round_id,
+                argMinIf(coalesce(mid_yes_smooth, mid_yes), abs(remaining_ms - {eval_remaining_ms}), remaining_ms >= 0) AS eval_mid_up
+            FROM polyedge_forge.snapshot_100ms
+            WHERE symbol='BTCUSDT'
+              AND timeframe='{market_type}'
+              AND remaining_ms >= 0
+              AND remaining_ms <= {duration_ms}
+            GROUP BY round_id
+        ) s ON r.round_id = s.round_id
+        WHERE r.symbol='BTCUSDT'
+          AND r.timeframe='{market_type}'
+          AND isFinite(s.eval_mid_up)
+          AND r.end_ts_ms >= ({from_ms} - {duration_ms} * 4)
+        ORDER BY r.end_ts_ms ASC
+        FORMAT JSON"
     );
 
     let rows = rows_from_json(query_clickhouse_json(ch_url, &query).await?);
-    let mut window_buf = VecDeque::<i64>::new();
-    let mut window_sum = 0i64;
-    let mut series = Vec::with_capacity(rows.len());
+    let mut correctness_window: std::collections::VecDeque<i64> =
+        std::collections::VecDeque::with_capacity(rolling_window + 4);
+    let mut correctness_sum: i64 = 0;
+    let mut by_bucket: HashMap<i64, (f64, i64, String)> = HashMap::new();
+    let mut processed_rounds = 0usize;
 
     for row in rows {
-        let correct = row_i64(&row, "correct").unwrap_or(0).clamp(0, 1);
-        window_buf.push_back(correct);
-        window_sum += correct;
-        while window_buf.len() > window {
-            if let Some(v) = window_buf.pop_front() {
-                window_sum -= v;
+        let ts = row_i64(&row, "timestamp_ms").unwrap_or(0);
+        let outcome = row_i64(&row, "outcome").unwrap_or(0).clamp(0, 1);
+        let eval_mid_up = row_f64(&row, "eval_mid_up");
+        let Some(eval_mid_up) = eval_mid_up else {
+            continue;
+        };
+        if !eval_mid_up.is_finite() || ts <= 0 {
+            continue;
+        }
+        let correct = if (eval_mid_up >= 0.5) == (outcome == 1) {
+            1
+        } else {
+            0
+        };
+        correctness_window.push_back(correct);
+        correctness_sum += correct;
+        while correctness_window.len() > rolling_window {
+            if let Some(v) = correctness_window.pop_front() {
+                correctness_sum -= v;
             }
         }
 
-        let n = window_buf.len();
-        let acc = if n > 0 {
-            (window_sum as f64 / n as f64) * 100.0
-        } else {
-            0.0
-        };
-        let timestamp_ms = row_i64(&row, "timestamp_ms").unwrap_or(0);
-        let round_id = row
+        processed_rounds = processed_rounds.saturating_add(1);
+        if correctness_window.len() < rolling_window {
+            continue;
+        }
+        let acc = (correctness_sum as f64 / rolling_window as f64) * 100.0;
+        if ts < from_ms {
+            continue;
+        }
+        let bucket_ts = (ts / bucket_ms) * bucket_ms;
+        let n = rolling_window as i64;
+        let rid = row
             .get("round_id")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        series.push(json!({
-            "timestamp_ms": timestamp_ms,
-            "round_id": round_id,
-            "accuracy_pct": acc,
-            "window_size": n,
-        }));
+        by_bucket.insert(bucket_ts, (acc.clamp(0.0, 100.0), n, rid));
+    }
+
+    let start_aligned = (from_ms / bucket_ms) * bucket_ms;
+    let end_aligned = ((now_ms + bucket_ms - 1) / bucket_ms) * bucket_ms;
+    let mut series: Vec<Value> = Vec::with_capacity(((end_aligned - start_aligned) / bucket_ms + 1).max(0) as usize);
+    let mut last_acc: Option<f64> = None;
+    for ts in (start_aligned..=end_aligned).step_by(bucket_ms as usize) {
+        if let Some((acc, n, rid)) = by_bucket.get(&ts) {
+            last_acc = Some(*acc);
+            series.push(json!({
+                "timestamp_ms": ts,
+                "round_id": rid,
+                "accuracy_pct": *acc,
+                "sample_count": *n,
+            }));
+            continue;
+        }
+        if let Some(acc) = last_acc {
+            series.push(json!({
+                "timestamp_ms": ts,
+                "round_id": "",
+                "accuracy_pct": acc,
+                "sample_count": 0,
+            }));
+        }
     }
 
     let latest_accuracy = series
@@ -1271,7 +1365,10 @@ async fn accuracy_series(
 
     Ok(Json(json!({
         "market_type": market_type,
-        "window": window,
+        "window": rolling_window,
+        "lookback_hours": lookback_hours,
+        "bucket_minutes": 30,
+        "processed_rounds": processed_rounds,
         "series": series,
         "latest_accuracy_pct": latest_accuracy,
     })))

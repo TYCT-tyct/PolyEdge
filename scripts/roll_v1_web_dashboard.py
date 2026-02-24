@@ -222,9 +222,7 @@ def load_summary(path: Path) -> dict:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return {}
-
-
+        raise  # Linus: Fail loudly and explicitly
 def build_dataset(
     price_by_market: Dict[str, List[dict]],
     shots_by_market: Dict[str, List[ShotMarker]],

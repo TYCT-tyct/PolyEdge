@@ -8,6 +8,11 @@ export interface LiveSnapshot {
   btc_price: number | null;
   target_price: number | null;
   delta_pct: number | null;
+  delta_pct_smooth?: number | null;
+  mid_yes?: number | null;
+  mid_no?: number | null;
+  mid_yes_smooth?: number | null;
+  mid_no_smooth?: number | null;
   best_bid_up: number | null;
   best_ask_up: number | null;
   best_bid_down: number | null;
@@ -16,6 +21,8 @@ export interface LiveSnapshot {
   slug: string;
   start_time_ms: number;
   end_time_ms: number;
+  velocity_bps_per_sec?: number | null;
+  acceleration?: number | null;
 }
 
 export interface WsLivePayload {
@@ -26,8 +33,11 @@ export interface WsLivePayload {
 export interface ChartPoint {
   timestamp_ms: number;
   delta_pct: number | null;
+  delta_pct_smooth?: number | null;
   mid_yes?: number | null;
   mid_no?: number | null;
+  mid_yes_smooth?: number | null;
+  mid_no_smooth?: number | null;
   best_bid_up: number | null;
   best_ask_up: number | null;
   best_bid_down: number | null;
@@ -135,12 +145,15 @@ export interface AccuracyPoint {
   timestamp_ms: number;
   round_id: string;
   accuracy_pct: number;
-  window_size: number;
+  sample_count: number;
 }
 
 export interface AccuracySeriesResponse {
   market_type: MarketType;
-  window: number;
+  window: number | null;
+  lookback_hours: number;
+  bucket_minutes?: number;
+  processed_rounds?: number;
   series: AccuracyPoint[];
   latest_accuracy_pct: number | null;
 }

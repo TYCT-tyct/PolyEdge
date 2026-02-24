@@ -8,7 +8,7 @@ import math
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import requests
 import websockets
@@ -39,7 +39,7 @@ def summary(values: List[float]) -> Dict[str, float]:
     }
 
 
-def first_timestamp_ms(payload: Any) -> Optional[float]:
+def first_timestamp_ms(payload: object) -> Optional[float]:
     # Traverse nested ws payloads; return the first plausible millisecond timestamp.
     stack = [payload]
     now_ms = time.time() * 1000.0
@@ -51,7 +51,7 @@ def first_timestamp_ms(payload: Any) -> Optional[float]:
                     try:
                         x = float(v)
                     except Exception:
-                        continue
+                        raise  # Linus: Fail loudly and explicitly
                     # Heuristic: valid unix ms in a reasonable range.
                     if 1_500_000_000_000 <= x <= now_ms + 120_000:
                         return x
@@ -80,7 +80,7 @@ async def measure_binance_ws_lag(symbol: str, seconds: int) -> List[float]:
                         continue
                     lags.append(recv_ms - float(event_ts))
         except Exception:
-            await asyncio.sleep(0.3)
+            raise  # Linus: Fail loudly and explicitly
     return lags
 
 
@@ -111,11 +111,11 @@ async def measure_pm_clob_ws_lag(
                         latest_pm_recv_ms_holder["recv_ms"] = recv_ms
                     lags.append(recv_ms - ts)
         except Exception:
-            await asyncio.sleep(0.3)
+            raise  # Linus: Fail loudly and explicitly
     return lags
 
 
-async def measure_midpoint_delta(symbol: str, token_id: str, seconds: int, poll_interval_ms: int) -> Dict[str, Any]:
+async def measure_midpoint_delta(symbol: str, token_id: str, seconds: int, poll_interval_ms: int) -> dict:
     """
     Recommended delta proxy:
     latest Binance tick event time -> /midpoint receive time.
@@ -144,8 +144,7 @@ async def measure_midpoint_delta(symbol: str, token_id: str, seconds: int, poll_
                             latest_binance_event_ms = float(event_ts)
                         latest_binance_recv_ms = time.time() * 1000.0
             except Exception:
-                await asyncio.sleep(0.3)
-
+                raise  # Linus: Fail loudly and explicitly
     async def midpoint_task() -> None:
         nonlocal done
         end_at = time.time() + seconds
@@ -214,7 +213,7 @@ def fetch_token_pair(symbol: str) -> Dict[str, str]:
             try:
                 clob_ids = json.loads(clob_ids_raw)
             except Exception:
-                continue
+                raise  # Linus: Fail loudly and explicitly
             if isinstance(clob_ids, list) and len(clob_ids) >= 2:
                 return {
                     "market_id": str(m.get("id", "")),
@@ -287,7 +286,7 @@ async def main() -> int:
                             continue
                         lags.append(recv_ms - float(event_ts))
             except Exception:
-                await asyncio.sleep(0.3)
+                raise  # Linus: Fail loudly and explicitly
         return lags
 
     bin_task = asyncio.create_task(measure_binance_with_recv())
@@ -306,7 +305,7 @@ async def main() -> int:
     bin_lags, pm_lags, midpoint_delta = await asyncio.gather(bin_task, pm_task, midpoint_delta_task)
     http_rtt = measure_http_rtt(token_yes, args.http_samples)
 
-    payload: Dict[str, Any] = {
+    payload: dict = {
         "meta": {
             "ts_ms": int(time.time() * 1000),
             "symbol": args.symbol,

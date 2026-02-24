@@ -258,8 +258,8 @@ impl ChainlinkReconnectPolicy {
         if is_rate_limited {
             return self.rate_limit_cooldown;
         }
-        let base_ms = self.base_backoff.as_millis() as u128;
-        let max_ms = self.max_backoff.as_millis() as u128;
+        let base_ms = self.base_backoff.as_millis();
+        let max_ms = self.max_backoff.as_millis();
         let shift = attempts.min(16);
         let exp_ms = base_ms.saturating_mul(1_u128 << shift).min(max_ms);
         Duration::from_millis(exp_ms as u64)

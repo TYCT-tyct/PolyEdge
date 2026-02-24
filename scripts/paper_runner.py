@@ -43,7 +43,7 @@ def get_json(base_url: str, path: str, timeout: float = 5.0) -> Optional[dict]:
         resp.raise_for_status()
         return resp.json()
     except Exception:
-        return None
+        raise  # Linus: Fail loudly and explicitly
 @dataclass
 class InstanceRun:
     idx: int
@@ -178,10 +178,8 @@ def read_summary_from_sqlite(inst: InstanceRun) -> Optional[dict]:
                 # Table might not exist yet if Rust hasn't flushed
                 return None
 
-    except Exception as e:
-        print(f"[warning] Failed to read sqlite reports for {inst.run_id}: {e}")
-        return None
-
+    except Exception:
+        raise  # Linus: Fail loudly and explicitly
 def collect_final_summary(inst: InstanceRun) -> dict:
     api = get_json(inst.base_url, "/report/paper/summary", timeout=3.0)
     if api:

@@ -12,6 +12,10 @@ venv/
 env/
 .env
 
+# Frontend
+**/node_modules/
+**/dist/
+
 # Datasets & Temp
 datasets/
 crates/replay_engine/datasets/
@@ -42,6 +46,12 @@ temp_keys/
 *.key
 *.p12
 *.pfx
+.claude
+.agent
+.codex
+.cursor
+.gemini
+.shared
 
 # Local machine artifacts
 *.marker
@@ -50,3 +60,21 @@ temp_keys/
 .ai_slop_*.txt
 ai_slop_diff.txt
 modify_configs.py
+
+# Local prompt scratch / generated analysis artifacts
+.github/prompts/
+artifacts/
+diff_files.txt
+tmp_*
+temp_*
+*.out
+
+# Local strategy-rewrite experiments
+configs/strategy_rewrite_aggressive.toml
+configs/strategy_rewrite_baseline.toml
+configs/strategy_rewrite_defensive.toml
+scripts/kline_live_monitor.py
+scripts/plot_official_kline_5m.py
+scripts/plot_official_kline_5m_linear_1s.py
+scripts/run_kline_with_monitor.ps1
+scripts/run_strategy_rewrite_test.ps1

@@ -38,6 +38,7 @@ interface HistoryRaw {
   samples: Array<{
     ts_ireland_sample_ms: number;
     delta_pct: number | null;
+    delta_pct_smooth?: number | null;
     bid_yes: number | null;
     ask_yes: number | null;
     bid_no: number | null;
@@ -47,6 +48,9 @@ interface HistoryRaw {
     binance_price: number | null;
     target_price: number | null;
     mid_yes: number | null;
+    mid_yes_smooth?: number | null;
+    mid_no: number | null;
+    mid_no_smooth?: number | null;
     symbol: string;
     timeframe: string;
   }>;
@@ -207,9 +211,19 @@ function normalizeChartPoint(p: ChartPoint): ChartPoint {
   return {
     ...p,
     timestamp_ms: Number.isFinite(p.timestamp_ms) ? p.timestamp_ms : 0,
-    delta_pct: computeDeltaPct(p.delta_pct, p.btc_price, p.target_price),
-    mid_yes: finiteOrNull(p.mid_yes) ?? midpointProb(bestBidUp, bestAskUp),
-    mid_no: finiteOrNull(p.mid_no) ?? midpointProb(bestBidDown, bestAskDown),
+    delta_pct: computeDeltaPct(
+      finiteOrNull(p.delta_pct_smooth) ?? p.delta_pct,
+      p.btc_price,
+      p.target_price
+    ),
+    mid_yes:
+      finiteOrNull(p.mid_yes_smooth) ??
+      finiteOrNull(p.mid_yes) ??
+      midpointProb(bestBidUp, bestAskUp),
+    mid_no:
+      finiteOrNull(p.mid_no_smooth) ??
+      finiteOrNull(p.mid_no) ??
+      midpointProb(bestBidDown, bestAskDown),
     best_bid_up: bestBidUp,
     best_ask_up: bestAskUp,
     best_bid_down: bestBidDown,
@@ -313,13 +327,18 @@ export interface LatestRawRow {
   chainlink_price?: number | null;
   mid_yes: number | null;
   mid_no: number | null;
+  mid_yes_smooth?: number | null;
+  mid_no_smooth?: number | null;
   bid_yes?: number | null;
   ask_yes?: number | null;
   bid_no?: number | null;
   ask_no?: number | null;
   delta_price: number | null;
   delta_pct: number | null;
+  delta_pct_smooth?: number | null;
   remaining_ms: number;
+  velocity_bps_per_sec?: number | null;
+  acceleration?: number | null;
 }
 
 export async function getLatestAllRaw(): Promise<LatestRawRow[]> {
@@ -358,8 +377,11 @@ export async function getChart(marketType: MarketType, view: WindowType): Promis
         normalizeChartPoint({
           timestamp_ms: s.ts_ireland_sample_ms,
           delta_pct: s.delta_pct,
+          delta_pct_smooth: s.delta_pct_smooth ?? null,
           mid_yes: s.mid_yes,
+          mid_yes_smooth: s.mid_yes_smooth ?? null,
           mid_no: s.mid_no,
+          mid_no_smooth: s.mid_no_smooth ?? null,
           best_bid_up: s.bid_yes,
           best_ask_up: s.ask_yes,
           best_bid_down: s.bid_no,
@@ -528,8 +550,11 @@ export async function getRoundChart(
         normalizeChartPoint({
           timestamp_ms: s.ts_ireland_sample_ms,
           delta_pct: s.delta_pct,
+          delta_pct_smooth: s.delta_pct_smooth ?? null,
           mid_yes: s.mid_yes,
+          mid_yes_smooth: s.mid_yes_smooth ?? null,
           mid_no: s.mid_no,
+          mid_no_smooth: s.mid_no_smooth ?? null,
           best_bid_up: s.bid_yes,
           best_ask_up: s.ask_yes,
           best_bid_down: s.bid_no,
@@ -577,13 +602,11 @@ export async function getHeatmap(
 
 export async function getAccuracySeries(
   marketType: MarketType,
-  window = 20,
-  limit = 500
+  lookbackHours = 24,
 ): Promise<AccuracySeriesResponse> {
   const qs = new URLSearchParams({
     market_type: marketType,
-    window: String(window),
-    limit: String(limit)
+    lookback_hours: String(lookbackHours),
   });
   const data = await requestJson<AccuracySeriesResponse>(`/api/accuracy_series?${qs.toString()}`);
   apiSupport.accuracy = true;

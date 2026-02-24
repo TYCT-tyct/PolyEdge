@@ -599,6 +599,23 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                         market.symbol, market.timeframe, market.start_ts_ms, v
                                     ),
                                 );
+                            } else if let Some(v) = pick_official_chainlink_target(
+                                chainlink,
+                                market.start_ts_ms,
+                                &market.timeframe,
+                            ) {
+                                target_cache.insert(cache_key.clone(), (now_ms, v));
+                                target_retry_after_ms.remove(&cache_key);
+                                target_price = Some(v);
+                                log_ingest(
+                                    &persist_tx,
+                                    "warn",
+                                    "target_price",
+                                    &format!(
+                                        "source=chainlink_official_fallback symbol={} tf={} start_ms={} target={}",
+                                        market.symbol, market.timeframe, market.start_ts_ms, v
+                                    ),
+                                );
                             } else if let Some(v) =
                                 fetch_target_from_official_binance(&market.symbol, market.start_ts_ms)
                                     .await
@@ -1253,6 +1270,31 @@ fn symbol_to_asset(symbol: &str) -> String {
         .strip_suffix("USDT")
         .unwrap_or(symbol)
         .to_ascii_lowercase()
+}
+
+fn is_chainlink_backed_timeframe(timeframe: &str) -> bool {
+    matches!(timeframe, "5m" | "15m" | "4h")
+}
+
+fn pick_official_chainlink_target(
+    chainlink: Option<&ChainlinkLocal>,
+    round_start_ms: i64,
+    timeframe: &str,
+) -> Option<f64> {
+    if !is_chainlink_backed_timeframe(timeframe) {
+        return None;
+    }
+    let cl = chainlink?;
+    let px = cl.price;
+    if !(px.is_finite() && px > 0.0) {
+        return None;
+    }
+    // Accept Chainlink prints close to round boundary as official fallback target.
+    let dt = cl.ts_exchange_ms.saturating_sub(round_start_ms).abs();
+    if dt <= 120_000 {
+        return Some(px);
+    }
+    None
 }
 
 async fn fetch_target_from_vatic_market(
