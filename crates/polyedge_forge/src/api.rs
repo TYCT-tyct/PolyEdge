@@ -2991,6 +2991,11 @@ fn score_with_rolling(
         && rs.latest_win_rate_pct >= target_win_rate
         && run.avg_pnl_cents > 0.0
         && run.trade_count >= window_trades;
+    let non_positive_pnl_penalty = if run.avg_pnl_cents <= 0.0 || run.total_pnl_cents <= 0.0 {
+        280.0 + run.avg_pnl_cents.abs() * 240.0 + run.total_pnl_cents.abs() * 0.02
+    } else {
+        0.0
+    };
     let objective = if rs.windows > 0 {
         (rs.latest_win_rate_pct * 3.2
             + rs.avg_win_rate_pct * 1.8
@@ -3002,6 +3007,7 @@ fn score_with_rolling(
             - run.execution_penalty_cents_total * 0.4
             - run.blocked_exits as f64 * 18.0
             - shortfall * shortfall * 1.6
+            - non_positive_pnl_penalty
             + if target_hit { 160.0 } else { 0.0 })
             * (0.60 + 0.40 * coverage_ratio)
             - trade_shortfall * 25.0
