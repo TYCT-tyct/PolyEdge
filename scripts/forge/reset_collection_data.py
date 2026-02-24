@@ -58,7 +58,13 @@ def table_exists(ch: CH, db: str, table: str) -> bool:
 
 
 def redis_delete_prefix(redis_url: str, prefix: str, apply: bool) -> Dict[str, Any]:
-    import redis
+    try:
+        import redis
+    except ImportError:
+        return {
+            "skipped": True,
+            "reason": "python redis package not installed",
+        }
 
     cli = redis.Redis.from_url(redis_url, decode_responses=False)
     cursor = 0
@@ -161,4 +167,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
