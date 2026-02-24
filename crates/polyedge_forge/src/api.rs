@@ -1789,6 +1789,32 @@ fn rolling_vol_absdiff(p_hist: &VecDeque<f64>) -> f64 {
     sum / n as f64
 }
 
+fn recent_sign_flips(score_hist: &VecDeque<f64>, lookback: usize) -> usize {
+    if score_hist.len() < 3 {
+        return 0;
+    }
+    let n = lookback.max(3).min(score_hist.len());
+    let mut prev_sign = 0_i8;
+    let mut flips = 0usize;
+    for v in score_hist.iter().rev().take(n).rev() {
+        let sign = if *v > 0.0 {
+            1
+        } else if *v < 0.0 {
+            -1
+        } else {
+            0
+        };
+        if sign == 0 {
+            continue;
+        }
+        if prev_sign != 0 && sign != prev_sign {
+            flips = flips.saturating_add(1);
+        }
+        prev_sign = sign;
+    }
+    flips
+}
+
 fn parse_strategy_rows(rows: Vec<Value>) -> Vec<StrategySample> {
     let mut out = Vec::<StrategySample>::new();
     for row in rows {
@@ -2381,6 +2407,13 @@ fn run_strategy_simulation(
             StrategySide::Down
         };
         let local_vol = rolling_vol_absdiff(&p_hist);
+        let choppy_flips = recent_sign_flips(&score_hist, 9);
+        let is_choppy = choppy_flips >= 4 && local_vol >= 0.012;
+        let delta_align = if side == StrategySide::Up {
+            sample.delta_pct >= -0.012
+        } else {
+            sample.delta_pct <= 0.012
+        };
         last_side = side.as_str();
 
         if let Some(pos) = position.as_mut() {
@@ -2511,12 +2544,15 @@ fn run_strategy_simulation(
                             cfg.entry_threshold_base,
                             cfg.entry_threshold_cap,
                         );
+                    let anti_chop_override = fair_confidence >= (confidence_floor + 0.08).min(0.95);
                     let round_entries =
                         entries_by_round.get(&sample.round_id).copied().unwrap_or(0);
                     let can_flip = score.abs() >= signal_required
                         && sample.spread_mid <= cfg.spread_limit_prob
                         && fair_confidence >= confidence_floor
                         && signal.edge_prob.abs() >= edge_required
+                        && delta_align
+                        && (!is_choppy || anti_chop_override)
                         && entry_price <= cfg.entry_max_price_cents
                         && entry_potential >= cfg.entry_min_potential_cents
                         && round_entries < cfg.max_entries_per_round;
@@ -2555,10 +2591,13 @@ fn run_strategy_simulation(
                     cfg.entry_threshold_base,
                     cfg.entry_threshold_cap,
                 );
+            let anti_chop_override = fair_confidence >= (confidence_floor + 0.08).min(0.95);
             let can_enter = signal.confirmed
                 && score.abs() >= signal_required
                 && signal.edge_prob.abs() >= edge_required
                 && fair_confidence >= confidence_floor
+                && delta_align
+                && (!is_choppy || anti_chop_override)
                 && sample.spread_mid <= cfg.spread_limit_prob
                 && entry_spread_cents <= cfg.max_exec_spread_cents
                 && entry_price <= cfg.entry_max_price_cents
@@ -3262,9 +3301,9 @@ fn clamp_runtime_cfg(cfg: &mut StrategyRuntimeConfig) {
     cfg.liquidity_widen_prob = cfg.liquidity_widen_prob.clamp(0.01, 0.2);
     cfg.cooldown_ms = cfg.cooldown_ms.clamp(0, 120_000);
     cfg.max_entries_per_round = cfg.max_entries_per_round.clamp(1, 8);
-    cfg.max_exec_spread_cents = cfg.max_exec_spread_cents.clamp(0.5, 12.0);
-    cfg.slippage_cents_per_side = cfg.slippage_cents_per_side.clamp(0.0, 4.0);
-    cfg.fee_cents_per_side = cfg.fee_cents_per_side.clamp(0.0, 4.0);
+    cfg.max_exec_spread_cents = cfg.max_exec_spread_cents.clamp(0.8, 12.0);
+    cfg.slippage_cents_per_side = cfg.slippage_cents_per_side.clamp(0.03, 4.0);
+    cfg.fee_cents_per_side = cfg.fee_cents_per_side.clamp(0.03, 4.0);
     cfg.emergency_wide_spread_penalty_ratio =
         cfg.emergency_wide_spread_penalty_ratio.clamp(0.0, 2.0);
 }
@@ -3481,7 +3520,7 @@ async fn strategy_optimize(
                 220.0
                     + train_run.avg_pnl_cents.abs() * 200.0
                     + train_run.total_pnl_cents.abs() * 0.015
-                    + (1.0 - pf_train).max(0.0) * 180.0
+                    + (1.0 - pf_train).max(0.0) * 320.0
             } else {
                 0.0
             };
