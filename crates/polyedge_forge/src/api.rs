@@ -2442,7 +2442,7 @@ fn run_strategy_simulation(
             (p_median - sample.p_up).max(0.0)
         };
         let overextension_limit =
-            (0.055 + local_vol * 1.8 + sample.spread_mid * 0.7).clamp(0.055, 0.14);
+            (0.085 + local_vol * 2.4 + sample.spread_mid * 1.1).clamp(0.085, 0.24);
         let is_overextended = overextension >= overextension_limit;
         let choppy_flips = recent_sign_flips(&score_hist, 9);
         let is_choppy = choppy_flips >= 4 && local_vol >= 0.012;
@@ -2482,9 +2482,10 @@ fn run_strategy_simulation(
             let fast_loss_guard = pnl <= -(cfg.stop_loss_cents * 0.40).max(1.8)
                 && trend_signed <= cfg.reverse_signal_threshold * 0.85
                 && pos.reverse_streak >= 1;
-            let early_adverse_exit = held_ms <= 8_000
-                && pnl <= -(cfg.stop_loss_cents * 0.52).max(2.4)
-                && trend_signed <= -0.02;
+            let early_adverse_exit = held_ms <= 7_000
+                && pnl <= -(cfg.stop_loss_cents * 0.72).max(3.2)
+                && trend_signed <= cfg.reverse_signal_threshold * 0.55
+                && pos.peak_pnl_cents <= 1.5;
             let first_reversal_take_profit = can_exit_now
                 && pnl >= (cfg.trail_drawdown_cents * 0.45).max(1.0)
                 && trend_signed <= -0.05
@@ -2612,7 +2613,7 @@ fn run_strategy_simulation(
                             cfg.entry_threshold_cap,
                         );
                     let anti_chop_override = fair_confidence >= (confidence_floor + 0.08).min(0.95);
-                    let strong_override = fair_confidence >= 0.92;
+                    let strong_override = fair_confidence >= 0.86;
                     let round_entries =
                         entries_by_round.get(&sample.round_id).copied().unwrap_or(0);
                     let can_flip = score.abs() >= signal_required
@@ -2667,7 +2668,7 @@ fn run_strategy_simulation(
                     cfg.entry_threshold_cap,
                 );
             let anti_chop_override = fair_confidence >= (confidence_floor + 0.08).min(0.95);
-            let strong_override = fair_confidence >= 0.92;
+            let strong_override = fair_confidence >= 0.86;
             let can_enter = signal.confirmed
                 && score.abs() >= signal_required
                 && signal.edge_prob.abs() >= edge_required
@@ -3477,11 +3478,11 @@ fn score_with_rolling(
     };
     let pf_bonus = ((pf.min(4.0) - 1.0).max(0.0)) * 22.0;
     let pf_penalty = ((1.0 - pf).max(0.0)) * 180.0;
-    let tail_penalty = (-run.worst_loss_cents - 14.0).max(0.0) * 10.0;
-    let crash_penalty = run.fast_loss_exit_count as f64 * 14.0
-        + run.stop_loss_exit_count as f64 * 7.0
-        + run.early_adverse_exit_count as f64 * 5.0
-        + run.loss_count as f64 * 1.2;
+    let tail_penalty = (-run.worst_loss_cents - 18.0).max(0.0) * 5.0;
+    let crash_penalty = run.fast_loss_exit_count as f64 * 8.0
+        + run.stop_loss_exit_count as f64 * 4.0
+        + run.early_adverse_exit_count as f64 * 2.0
+        + run.loss_count as f64 * 0.8;
     let churn_penalty = if run.avg_duration_s < 6.0 {
         (6.0 - run.avg_duration_s) * 5.0
     } else {
@@ -3626,16 +3627,16 @@ async fn strategy_optimize(
             let fill_risk_penalty = valid_run.blocked_exits as f64 * 18.0
                 + valid_run.execution_penalty_cents_total * 0.9
                 + valid_run.emergency_wide_exit_count as f64 * 3.0;
-            let tail_risk_penalty = (-valid_run.worst_loss_cents - 14.0).max(0.0) * 8.0
-                + valid_run.fast_loss_exit_count as f64 * 12.0
-                + valid_run.stop_loss_exit_count as f64 * 6.0
-                + valid_run.loss_count as f64 * 1.5;
+            let tail_risk_penalty = (-valid_run.worst_loss_cents - 18.0).max(0.0) * 4.0
+                + valid_run.fast_loss_exit_count as f64 * 7.0
+                + valid_run.stop_loss_exit_count as f64 * 3.0
+                + valid_run.loss_count as f64 * 0.9;
             let train_trade_shortfall = window_trades.saturating_sub(train_run.trade_count) as f64;
             let valid_trade_shortfall = window_trades.saturating_sub(valid_run.trade_count) as f64;
             let coverage_gate_penalty =
                 train_trade_shortfall * 800.0 + valid_trade_shortfall * 900.0;
 
-            let objective = train_obj * 0.12 + valid_obj * 1.05
+            let objective = train_obj * 0.15 + valid_obj * 1.08
                 - consistency_penalty
                 - validation_fail_penalty
                 - train_fail_penalty
