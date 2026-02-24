@@ -288,6 +288,7 @@ async fn fetch_latest_snapshot(
         );
     }
 
+    let mut fallback_direct: Option<Value> = None;
     let key_direct = format!(
         "{}:snapshot:latest:{}:{}",
         state.redis_prefix,
@@ -296,20 +297,29 @@ async fn fetch_latest_snapshot(
     );
     if let Some(v) = read_key_value(state, &key_direct).await? {
         if is_live_snapshot_fresh(&v, timeframe, now_ms) {
-            return Ok(Some(v));
+            if snapshot_remaining_ms(&v) > 0 {
+                return Ok(Some(v));
+            }
+            fallback_direct = Some(v);
         }
     }
 
     let tf_key = format!("{}:snapshot:latest:tf:{}", state.redis_prefix, timeframe);
     let Some(arr_val) = read_key_value(state, &tf_key).await? else {
+        if fallback_direct.is_some() {
+            return Ok(fallback_direct);
+        }
         return Ok(None);
     };
     let Some(arr) = arr_val.as_array() else {
+        if fallback_direct.is_some() {
+            return Ok(fallback_direct);
+        }
         return Ok(None);
     };
 
     let mut best: Option<Value> = None;
-    let mut best_ts = i64::MIN;
+    let mut best_priority: Option<(i64, i64, i64)> = None;
     for row in arr {
         let row_symbol = row
             .get("symbol")
@@ -324,18 +334,22 @@ async fn fetch_latest_snapshot(
         if row_symbol != symbol.to_ascii_uppercase() || row_tf != timeframe {
             continue;
         }
-        let ts = row
-            .get("ts_ireland_sample_ms")
-            .and_then(Value::as_i64)
-            .unwrap_or(i64::MIN);
-        if ts > best_ts && is_live_snapshot_fresh(row, timeframe, now_ms) {
-            best_ts = ts;
+        if !is_live_snapshot_fresh(row, timeframe, now_ms) {
+            continue;
+        }
+        let pri = snapshot_priority(row, timeframe, now_ms);
+        if best_priority.map(|v| pri > v).unwrap_or(true) {
+            best_priority = Some(pri);
             best = Some(row.clone());
         }
     }
 
     if best.is_some() {
         return Ok(best);
+    }
+
+    if fallback_direct.is_some() {
+        return Ok(fallback_direct);
     }
 
     let row = fetch_latest_snapshot_from_clickhouse(state, symbol, timeframe).await?;
@@ -379,7 +393,7 @@ async fn fetch_latest_snapshot_from_clickhouse(
             acceleration
         FROM polyedge_forge.snapshot_100ms
         WHERE symbol='{}' AND timeframe='{}'
-        ORDER BY ts_ireland_sample_ms DESC
+        ORDER BY (remaining_ms > 0) DESC, ts_ireland_sample_ms DESC
         LIMIT 1
         FORMAT JSON",
         symbol.to_ascii_uppercase(),
@@ -1043,6 +1057,52 @@ fn is_live_snapshot_fresh(snapshot: &Value, market_type: &str, now_ms: i64) -> b
     }
 
     true
+}
+
+fn snapshot_remaining_ms(snapshot: &Value) -> i64 {
+    snapshot
+        .get("remaining_ms")
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            snapshot
+                .get("time_remaining_s")
+                .and_then(Value::as_f64)
+                .map(|v| (v * 1000.0).round() as i64)
+        })
+        .unwrap_or(0)
+}
+
+fn snapshot_priority(snapshot: &Value, market_type: &str, now_ms: i64) -> (i64, i64, i64) {
+    let rem_ms = snapshot_remaining_ms(snapshot);
+    let active = if rem_ms > 0 {
+        1
+    } else {
+        let rid = snapshot
+            .get("round_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let start_ms = parse_round_start_ms(rid).unwrap_or(0);
+        if start_ms > 0 {
+            let end_ms = start_ms.saturating_add(market_type_to_ms(market_type));
+            if now_ms <= end_ms.saturating_add(LIVE_ROUND_END_GRACE_MS) {
+                1
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    };
+    let ts = snapshot
+        .get("ts_ireland_sample_ms")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let start_ms = snapshot
+        .get("round_id")
+        .and_then(Value::as_str)
+        .and_then(parse_round_start_ms)
+        .unwrap_or(0);
+    (active, ts, start_ms)
 }
 
 fn is_safe_identifier(v: &str) -> bool {

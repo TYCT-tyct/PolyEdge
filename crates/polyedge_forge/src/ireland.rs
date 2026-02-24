@@ -227,9 +227,15 @@ fn fused_up_probability(quote: &StableQuote, prev_up: Option<f64>) -> f64 {
     let up_from_yes = ((quote.bid_yes + quote.ask_yes) * 0.5).clamp(0.0, 1.0);
     let up_from_no = (1.0 - (quote.bid_no + quote.ask_no) * 0.5).clamp(0.0, 1.0);
     let diff = (up_from_yes - up_from_no).abs();
+    let spread_yes = (quote.ask_yes - quote.bid_yes).abs().clamp(0.0, 1.0);
+    let spread_no = (quote.ask_no - quote.bid_no).abs().clamp(0.0, 1.0);
 
-    let fused = if diff <= 0.16 {
+    let fused = if diff <= 0.10 {
         (up_from_yes + up_from_no) * 0.5
+    } else if spread_yes + 0.005 < spread_no {
+        up_from_yes
+    } else if spread_no + 0.005 < spread_yes {
+        up_from_no
     } else if let Some(prev) = prev_up {
         if (up_from_yes - prev).abs() <= (up_from_no - prev).abs() {
             up_from_yes
@@ -709,13 +715,27 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             let dt_ms = now_ms.saturating_sub(prev.ts_ms);
                             let dt_s_raw = (dt_ms as f64 / 1000.0).max(0.0);
                             let dt_s = dt_s_raw.clamp(MOTION_MIN_DT_SEC, MOTION_MAX_DT_SEC);
-                            let alpha_prob = ema_alpha_from_tau(dt_s, PROB_SMOOTH_TAU_SEC);
+                            let remaining_ms_now =
+                                market.end_ts_ms.saturating_sub(now_ms).max(0);
+                            let prob_tau = if remaining_ms_now <= 30_000 {
+                                0.9
+                            } else if remaining_ms_now <= 60_000 {
+                                1.8
+                            } else {
+                                PROB_SMOOTH_TAU_SEC
+                            };
+                            let delta_tau = if remaining_ms_now <= 30_000 {
+                                0.9
+                            } else {
+                                DELTA_SMOOTH_TAU_SEC
+                            };
+                            let alpha_prob = ema_alpha_from_tau(dt_s, prob_tau);
                             let ema_up =
                                 (prev.ema_up + alpha_prob * (raw_mid_yes_norm - prev.ema_up))
                                     .clamp(0.0, 1.0);
                             let ema_delta = match (delta_pct, prev.ema_delta_pct) {
                                 (Some(raw), Some(prev_d)) if raw.is_finite() && prev_d.is_finite() => {
-                                    let alpha_delta = ema_alpha_from_tau(dt_s, DELTA_SMOOTH_TAU_SEC);
+                                    let alpha_delta = ema_alpha_from_tau(dt_s, delta_tau);
                                     let mut next = prev_d + alpha_delta * (raw - prev_d);
                                     let max_step = DELTA_MAX_STEP_PCT_PER_SEC * dt_s;
                                     next = next.clamp(prev_d - max_step, prev_d + max_step);
