@@ -6,19 +6,11 @@ import type { AccuracyPoint } from "../types";
 
 interface AccuracyChartProps {
   points: AccuracyPoint[];
+  timeMode: "local" | "et";
 }
 
 const HALF_HOUR_SEC = 30 * 60;
 const LOOKBACK_SEC = 24 * 60 * 60;
-
-function formatAxisTs(sec: number): string {
-  const d = new Date(sec * 1000);
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mi = String(d.getMinutes()).padStart(2, "0");
-  return `${mm}-${dd} ${hh}:${mi}`;
-}
 
 function toData(points: AccuracyPoint[]): uPlot.AlignedData {
   const xs: number[] = [];
@@ -30,10 +22,22 @@ function toData(points: AccuracyPoint[]): uPlot.AlignedData {
   return [xs, ys];
 }
 
-function AccuracyChartImpl({ points }: AccuracyChartProps) {
+function AccuracyChartImpl({ points, timeMode }: AccuracyChartProps) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const plotRef = useRef<uPlot | null>(null);
   const data = useMemo(() => toData(points), [points]);
+  const axisTimeFormatter = useMemo(
+    () =>
+      new Intl.DateTimeFormat("en-US", {
+        timeZone: timeMode === "et" ? "America/New_York" : undefined,
+        hour12: false,
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit"
+      }),
+    [timeMode]
+  );
 
   useEffect(() => {
     const root = rootRef.current;
@@ -72,7 +76,7 @@ function AccuracyChartImpl({ points }: AccuracyChartProps) {
               }
               return out;
             },
-            values: (_u, vals) => vals.map((v) => formatAxisTs(v))
+            values: (_u, vals) => vals.map((v) => axisTimeFormatter.format(new Date(v * 1000)))
           },
           {
             scale: "acc",
@@ -112,7 +116,7 @@ function AccuracyChartImpl({ points }: AccuracyChartProps) {
       plot.destroy();
       plotRef.current = null;
     };
-  }, []);
+  }, [axisTimeFormatter]);
 
   useEffect(() => {
     plotRef.current?.setData(data);

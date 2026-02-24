@@ -44,6 +44,9 @@ const WINDOW_OPTIONS: Array<{ value: WindowType; label: string }> = [
 const LIVE_POLL_MS = 900;
 const WS_STALE_FALLBACK_MS = 3000;
 const LIVE_UI_MIN_INTERVAL_MS = 900;
+const ET_TIMEZONE = "America/New_York";
+
+type TimeMode = "local" | "et";
 
 function windowToMinutes(view: WindowType): number {
   switch (view) {
@@ -341,16 +344,21 @@ function formatCountdown(seconds: number | null | undefined): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
-function formatTime(ts: number | null | undefined): string {
+function formatTimeZoneLabel(mode: TimeMode): string {
+  return mode === "et" ? "ET" : "Local";
+}
+
+function formatTime(ts: number | null | undefined, mode: TimeMode): string {
   if (!ts) {
     return "--";
   }
-  return new Date(ts).toLocaleTimeString("zh-CN", {
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: mode === "et" ? ET_TIMEZONE : undefined,
     hour12: false,
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit"
-  });
+  }).format(new Date(ts));
 }
 
 function formatBps(v: number | null | undefined, unit = "bps/s"): string {
@@ -438,6 +446,7 @@ interface MarketSectionProps {
   title: string;
   marketType: MarketType;
   live: LiveSnapshot | null;
+  timeMode: TimeMode;
   windowType: WindowType;
   onWindowChange: (w: WindowType) => void;
   chart: ChartResponse | null;
@@ -448,6 +457,7 @@ function MarketSection({
   title,
   marketType,
   live,
+  timeMode,
   windowType,
   onWindowChange,
   chart,
@@ -491,7 +501,7 @@ function MarketSection({
         <span>速度 {formatBps(live?.velocity_bps_per_sec, "bps/s")}</span>
         <span>加速度 {formatBps(live?.acceleration, "bps/s²")}</span>
       </div>
-      <MarketChart points={chart?.points ?? []} rounds={chart?.rounds ?? []} height={360} />
+      <MarketChart points={chart?.points ?? []} rounds={chart?.rounds ?? []} timeMode={timeMode} height={360} />
       <div className="panel-foot">
         <span>
           {chart?.total_samples.toLocaleString() ?? "0"} 样本
@@ -540,9 +550,10 @@ interface AccuracyPanelProps {
   accuracyTab: MarketType;
   onTabChange: (v: MarketType) => void;
   points: AccuracyPoint[];
+  timeMode: TimeMode;
 }
 
-const AccuracyPanel = memo(function AccuracyPanel({ accuracyTab, onTabChange, points }: AccuracyPanelProps) {
+const AccuracyPanel = memo(function AccuracyPanel({ accuracyTab, onTabChange, points, timeMode }: AccuracyPanelProps) {
   const summary = useMemo(() => {
     if (points.length === 0) {
       return null;
@@ -598,7 +609,7 @@ const AccuracyPanel = memo(function AccuracyPanel({ accuracyTab, onTabChange, po
           <small>样本点：{summary?.samples ?? 0}</small>
         </article>
       </div>
-      <AccuracyChart points={points} />
+      <AccuracyChart points={points} timeMode={timeMode} />
     </section>
   );
 });
@@ -607,12 +618,14 @@ interface RoundHistoryPanelProps {
   roundHistoryTab: MarketType;
   onTabChange: (v: MarketType) => void;
   rows: RoundHistoryRow[];
+  timeMode: TimeMode;
 }
 
 const RoundHistoryPanel = memo(function RoundHistoryPanel({
   roundHistoryTab,
   onTabChange,
-  rows
+  rows,
+  timeMode
 }: RoundHistoryPanelProps) {
   return (
     <section className="panel">
@@ -645,7 +658,7 @@ const RoundHistoryPanel = memo(function RoundHistoryPanel({
           <tbody>
             {rows.slice(0, 20).map((r) => (
               <tr key={r.round_id}>
-                <td>{formatTime(r.end_time_ms)}</td>
+                <td>{formatTime(r.end_time_ms, timeMode)}</td>
                 <td>{formatUsd(r.target_price)}</td>
                 <td>{formatUsd(r.final_btc_price)}</td>
                 <td className={(r.delta_pct ?? 0) >= 0 ? "up" : "down"}>{formatPct(r.delta_pct)}</td>
@@ -701,6 +714,7 @@ export default function App() {
   const [accuracyTab, setAccuracyTab] = useState<MarketType>("5m");
   const [accuracy, setAccuracy] = useState<AccuracySeriesResponse | null>(null);
   const [errorText, setErrorText] = useState<string>("");
+  const [timeMode, setTimeMode] = useState<TimeMode>("local");
   const lastLiveTsRef = useRef<Record<MarketType, number>>({ "5m": 0, "15m": 0 });
   const liveUiCommitRef = useRef<Record<MarketType, { uiTs: number; roundId: string; remSec: number }>>({
     "5m": { uiTs: 0, roundId: "", remSec: -1 },
@@ -1256,9 +1270,18 @@ export default function App() {
             <span className={`dot ${wsStatus === "open" ? "ok" : ""}`} />
             {wsStatus === "open" ? "实时连接" : "重连中"}
           </div>
+          <div className="btn-group">
+            <button className={timeMode === "local" ? "active" : ""} onClick={() => setTimeMode("local")}>
+              本地时间
+            </button>
+            <button className={timeMode === "et" ? "active" : ""} onClick={() => setTimeMode("et")}>
+              PolyEdge ET
+            </button>
+          </div>
           <div className="hero-meta">
-            <span>5m: {formatTime(live["5m"]?.timestamp_ms)}</span>
-            <span>15m: {formatTime(live["15m"]?.timestamp_ms)}</span>
+            <span>时区: {formatTimeZoneLabel(timeMode)}</span>
+            <span>5m: {formatTime(live["5m"]?.timestamp_ms, timeMode)}</span>
+            <span>15m: {formatTime(live["15m"]?.timestamp_ms, timeMode)}</span>
           </div>
         </div>
       </header>
@@ -1272,6 +1295,7 @@ export default function App() {
         title="5分钟市场"
         marketType="5m"
         live={live["5m"]}
+        timeMode={timeMode}
         windowType={chartWindow["5m"]}
         onWindowChange={(v) => handleChartWindowChange("5m", v)}
         chart={charts["5m"]}
@@ -1282,6 +1306,7 @@ export default function App() {
         title="15分钟市场"
         marketType="15m"
         live={live["15m"]}
+        timeMode={timeMode}
         windowType={chartWindow["15m"]}
         onWindowChange={(v) => handleChartWindowChange("15m", v)}
         chart={charts["15m"]}
@@ -1333,7 +1358,7 @@ export default function App() {
               <option value="">选择轮次</option>
               {explorerDateRounds.map((r) => (
                 <option key={r.round_id} value={r.round_id}>
-                  {formatTime(r.start_time_ms)} · {r.round_id}
+                  {formatTime(r.start_time_ms, timeMode)} · {r.round_id}
                 </option>
               ))}
             </select>
@@ -1345,7 +1370,7 @@ export default function App() {
               <span>选中轮次</span>
               <strong>{selectedRoundMeta.roundId}</strong>
               <small>
-                {formatTime(selectedRoundMeta.start)} - {formatTime(selectedRoundMeta.end)}
+                {formatTime(selectedRoundMeta.start, timeMode)} - {formatTime(selectedRoundMeta.end, timeMode)}
               </small>
             </article>
             <article className="info-card">
@@ -1366,7 +1391,12 @@ export default function App() {
           </div>
         ) : null}
         {roundChart && roundChart.points.length > 0 ? (
-          <MarketChart points={roundChart.points} rounds={roundChart.round ? [roundChart.round] : []} height={320} />
+          <MarketChart
+            points={roundChart.points}
+            rounds={roundChart.round ? [roundChart.round] : []}
+            timeMode={timeMode}
+            height={320}
+          />
         ) : (
           <div className="empty-panel">请选择日期与轮次查看图表</div>
         )}
@@ -1403,14 +1433,21 @@ export default function App() {
         roundHistoryTab={roundHistoryTab}
         onTabChange={setRoundHistoryTab}
         rows={historyRows}
+        timeMode={timeMode}
       />
 
-      <AccuracyPanel accuracyTab={accuracyTab} onTabChange={setAccuracyTab} points={accuracyPoints} />
+      <AccuracyPanel
+        accuracyTab={accuracyTab}
+        onTabChange={setAccuracyTab}
+        points={accuracyPoints}
+        timeMode={timeMode}
+      />
 
       <footer className="status-row">
         <span>WS状态: {wsStatus}</span>
-        <span>5m最新Tick: {formatTime(live["5m"]?.timestamp_ms)}</span>
-        <span>15m最新Tick: {formatTime(live["15m"]?.timestamp_ms)}</span>
+        <span>时区: {formatTimeZoneLabel(timeMode)}</span>
+        <span>5m最新Tick: {formatTime(live["5m"]?.timestamp_ms, timeMode)}</span>
+        <span>15m最新Tick: {formatTime(live["15m"]?.timestamp_ms, timeMode)}</span>
         {errorText ? <span className="down">{errorText}</span> : null}
       </footer>
     </main>

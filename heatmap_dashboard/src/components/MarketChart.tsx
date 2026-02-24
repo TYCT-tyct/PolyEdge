@@ -11,6 +11,7 @@ import type { ChartPoint, ChartRound } from "../types";
 interface MarketChartProps {
   points: ChartPoint[];
   rounds: ChartRound[];
+  timeMode: "local" | "et";
   height?: number;
 }
 
@@ -425,32 +426,6 @@ function buildMiniPath(points: ChartPoint[], width: number, height: number): str
   return d.trim();
 }
 
-function formatMiniTs(tsMs: number): string {
-  if (!Number.isFinite(tsMs) || tsMs <= 0) {
-    return "--:--:--";
-  }
-  return new Date(tsMs).toLocaleTimeString("zh-CN", {
-    hour12: false,
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit"
-  });
-}
-
-function formatLegendTs(tsSec: number): string {
-  if (!Number.isFinite(tsSec) || tsSec <= 0) {
-    return "--";
-  }
-  const d = new Date(tsSec * 1000);
-  const y = d.getFullYear();
-  const mo = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  const ss = String(d.getSeconds()).padStart(2, "0");
-  return `${y}-${mo}-${day} ${hh}:${mm}:${ss}`;
-}
-
 function computeDomain(points: ChartPoint[]): DomainRange | null {
   if (points.length < 2) {
     return null;
@@ -490,7 +465,7 @@ function viewToBrush(domain: DomainRange, view: ViewRange): BrushState {
   };
 }
 
-function MarketChartImpl({ points, rounds, height = 420 }: MarketChartProps) {
+function MarketChartImpl({ points, rounds, timeMode, height = 420 }: MarketChartProps) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const miniCanvasRef = useRef<HTMLDivElement | null>(null);
   const plotRef = useRef<uPlot | null>(null);
@@ -508,6 +483,49 @@ function MarketChartImpl({ points, rounds, height = 420 }: MarketChartProps) {
   const miniPath = useMemo(() => buildMiniPath(prepared.bucketed, 1200, 38), [prepared.bucketed]);
   const domain = useMemo(() => computeDomain(prepared.bucketed), [prepared.bucketed]);
   const steppedPathBuilder = useMemo(() => uPlot.paths.stepped?.({ align: 1 }), []);
+  const axisTimeFormatter = useMemo(
+    () =>
+      new Intl.DateTimeFormat("zh-CN", {
+        timeZone: timeMode === "et" ? "America/New_York" : undefined,
+        hour12: false,
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit"
+      }),
+    [timeMode]
+  );
+  const legendTimeFormatter = useMemo(
+    () =>
+      new Intl.DateTimeFormat("zh-CN", {
+        timeZone: timeMode === "et" ? "America/New_York" : undefined,
+        hour12: false,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit"
+      }),
+    [timeMode]
+  );
+  const formatMiniTs = useCallback(
+    (tsMs: number): string => {
+      if (!Number.isFinite(tsMs) || tsMs <= 0) {
+        return "--:--:--";
+      }
+      return axisTimeFormatter.format(new Date(tsMs));
+    },
+    [axisTimeFormatter]
+  );
+  const formatLegendTs = useCallback(
+    (tsSec: number): string => {
+      if (!Number.isFinite(tsSec) || tsSec <= 0) {
+        return "--";
+      }
+      return legendTimeFormatter.format(new Date(tsSec * 1000));
+    },
+    [legendTimeFormatter]
+  );
 
   const [brush, setBrush] = useState<BrushState>({ leftPct: 0, widthPct: 100 });
 
@@ -606,14 +624,7 @@ function MarketChartImpl({ points, rounds, height = 420 }: MarketChartProps) {
             ticks: { stroke: "#706c5c" },
             space: 90,
             values: (_u, vals) =>
-              vals.map((v) =>
-                new Date(v * 1000).toLocaleTimeString("zh-CN", {
-                  hour12: false,
-                  hour: "2-digit",
-                  minute: "2-digit",
-                  second: "2-digit"
-                })
-              )
+              vals.map((v) => axisTimeFormatter.format(new Date(v * 1000)))
           },
           {
             scale: "pct",
@@ -818,7 +829,7 @@ function MarketChartImpl({ points, rounds, height = 420 }: MarketChartProps) {
       plot.destroy();
       plotRef.current = null;
     };
-  }, [height, steppedPathBuilder]);
+  }, [axisTimeFormatter, formatLegendTs, height, steppedPathBuilder]);
 
   useEffect(() => {
     const plot = plotRef.current;
