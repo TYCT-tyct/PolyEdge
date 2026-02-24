@@ -411,7 +411,7 @@ function roundCard(title: string, snapshot: LiveSnapshot | null) {
     <article className="round-card">
       <div className="card-head">
         <h3>{title}</h3>
-        <span className="countdown">⏱ {formatCountdown(snapshot?.time_remaining_s)}</span>
+        <span className="countdown">倒计时 {formatCountdown(snapshot?.time_remaining_s)}</span>
       </div>
       <div className="round-price">{formatUsd(snapshot?.btc_price)}</div>
       <div className="round-sub">
@@ -497,7 +497,7 @@ function MarketSection({
         <span>
           看跌 <b className="down">{formatCent(down)}</b>
         </span>
-        <span>⏱ {formatCountdown(live?.time_remaining_s)}</span>
+        <span>倒计时 {formatCountdown(live?.time_remaining_s)}</span>
         <span>速度 {formatBps(live?.velocity_bps_per_sec, "bps/s")}</span>
         <span>加速度 {formatBps(live?.acceleration, "bps/s²")}</span>
       </div>
