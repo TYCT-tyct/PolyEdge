@@ -359,6 +359,38 @@ def should_promote(
         reasons.append("challenger max param shift too large")
     if to_float(challenger.get("score")) < to_float(baseline.get("score")) + args.promote_score_margin:
         reasons.append("challenger score margin too small")
+
+    # Strict dominance gate: challenger must not regress on core metrics.
+    # This directly enforces "new params cannot replace current params unless better".
+    if parse_bool_arg(getattr(args, "promote_require_dominance", True), default=True):
+        eps = max(0.0, to_float(getattr(args, "promote_dominance_eps", 0.0)))
+        max_dd_regress = max(0.0, to_float(getattr(args, "promote_max_drawdown_regress", 0.0)))
+
+        dominant_checks = [
+            ("latest_win", True),
+            ("latest_avg_pnl", True),
+            ("latest_total_pnl", True),
+            ("latest_profit_factor", True),
+            ("full_win", True),
+            ("full_avg_pnl", True),
+            ("full_total_pnl", True),
+            ("full_net_pnl", True),
+            ("full_net_margin_pct", True),
+            ("latest_max_drawdown", False),
+            ("full_max_drawdown", False),
+        ]
+        for key, higher_is_better in dominant_checks:
+            c_val = to_float(challenger.get(key))
+            b_val = to_float(baseline.get(key))
+            if higher_is_better:
+                if c_val + eps < b_val:
+                    reasons.append(f"dominance fail: {key} regressed ({c_val:.6f} < {b_val:.6f})")
+            else:
+                if c_val > b_val + max_dd_regress:
+                    reasons.append(
+                        f"dominance fail: {key} worse ({c_val:.6f} > {b_val + max_dd_regress:.6f})"
+                    )
+
     detail = {
         "avg_param_shift": avg_shift,
         "max_param_shift": max_shift,
@@ -472,6 +504,23 @@ def main() -> None:
     ap.add_argument("--promote-max-avg-pnl-divergence", type=float, default=2.5)
     ap.add_argument("--promote-max-param-shift", type=float, default=0.40)
     ap.add_argument("--promote-score-margin", type=float, default=8.0)
+    ap.add_argument(
+        "--promote-require-dominance",
+        default="true",
+        help="TRUE/FALSE, require challenger to be non-regressive across core metrics",
+    )
+    ap.add_argument(
+        "--promote-dominance-eps",
+        type=float,
+        default=0.0,
+        help="Tolerance for dominance checks (higher-is-better metrics).",
+    )
+    ap.add_argument(
+        "--promote-max-drawdown-regress",
+        type=float,
+        default=0.0,
+        help="Allowed drawdown deterioration in dominance checks.",
+    )
     ap.add_argument("--promote-confirm-cycles", type=int, default=2)
     ap.add_argument("--promote-cooldown-sec", type=int, default=1800)
     ap.add_argument("--history-limit", type=int, default=8)
@@ -698,6 +747,43 @@ def main() -> None:
                 label="live_after_promote" if promoted else "live",
             )
 
+            # Post-promote live guard: if promoted config underperforms baseline immediately, rollback now.
+            immediate_guard_reasons: list[str] = []
+            immediate_guard_rollback = {"done": False, "response": {"ok": False}}
+            if promoted:
+                eps = max(0.0, to_float(args.promote_dominance_eps))
+                max_dd_regress = max(0.0, to_float(args.promote_max_drawdown_regress))
+
+                if to_float(live_eval.get("latest_win")) + eps < to_float(baseline_eval.get("latest_win")):
+                    immediate_guard_reasons.append("live latest_win regressed")
+                if to_float(live_eval.get("latest_avg_pnl")) + eps < to_float(baseline_eval.get("latest_avg_pnl")):
+                    immediate_guard_reasons.append("live latest_avg_pnl regressed")
+                if to_float(live_eval.get("latest_total_pnl")) + eps < to_float(baseline_eval.get("latest_total_pnl")):
+                    immediate_guard_reasons.append("live latest_total_pnl regressed")
+                if to_float(live_eval.get("latest_max_drawdown")) > to_float(baseline_eval.get("latest_max_drawdown")) + max_dd_regress:
+                    immediate_guard_reasons.append("live latest_max_drawdown worsened")
+
+                if immediate_guard_reasons and current_autotune_cfg:
+                    rollback_payload = {
+                        "market_type": args.market_type,
+                        "config": current_autotune_cfg,
+                        "ttl_sec": args.persist_ttl_sec,
+                        "source": "autotune_loop_immediate_guard",
+                        "note": f"cycle={cycle}; immediate_guard_reasons={';'.join(immediate_guard_reasons)}",
+                    }
+                    rollback_resp = post_json(
+                        build_url(args.base_url, "/api/strategy/autotune/set"),
+                        rollback_payload,
+                        args.timeout_sec,
+                    )
+                    immediate_guard_rollback = {
+                        "done": bool(rollback_resp.get("ok")),
+                        "response": rollback_resp,
+                    }
+                    if immediate_guard_rollback["done"]:
+                        promoted = False
+                        promote_streak = 0
+
             underperform = (
                 to_float(live_eval.get("latest_win")) < args.rollback_floor_win
                 or to_float(live_eval.get("latest_avg_pnl")) <= args.rollback_floor_avg_pnl
@@ -796,6 +882,11 @@ def main() -> None:
                     "cooldown_remaining_ms": cooldown_remaining_ms,
                     "detail": promote_detail,
                     "response": promote_resp,
+                },
+                "post_promote_guard": {
+                    "triggered": bool(immediate_guard_reasons),
+                    "reasons": immediate_guard_reasons,
+                    "rollback": immediate_guard_rollback,
                 },
                 "current_autotune": {
                     "found": bool((autotune_latest or {}).get("found")),
