@@ -85,7 +85,9 @@ def _map_tif(tif: str, ttl_ms: int) -> Tuple[OrderType, Optional[str]]:
 
 
 def _expiration_s(ttl_ms: int) -> int:
-    ttl_s = max(1, int(math.ceil(max(0.0, float(ttl_ms)) / 1000.0)))
+    # Polymarket enforces a safety threshold: GTD expiration must be sufficiently in the future.
+    # Keep a >=61s floor to avoid immediate exchange rejects on short maker windows.
+    ttl_s = max(61, int(math.ceil(max(0.0, float(ttl_ms)) / 1000.0)))
     return int(time.time()) + ttl_s
 
 
