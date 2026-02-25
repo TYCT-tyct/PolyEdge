@@ -738,6 +738,7 @@ export async function getAccuracySeries(
 }
 
 export interface StrategyPaperQueryOptions {
+  source?: "replay" | "live" | "auto";
   lookbackMinutes?: number;
   maxTrades?: number;
   fullHistory?: boolean;
@@ -756,6 +757,7 @@ export async function getStrategyPaper(
   options: StrategyPaperQueryOptions = {}
 ): Promise<StrategyPaperResponse> {
   const qs = new URLSearchParams({
+    source: options.source ?? "replay",
     market_type: marketType,
     lookback_minutes: String(options.lookbackMinutes ?? 360),
     max_trades: String(options.maxTrades ?? 120),

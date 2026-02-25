@@ -52,6 +52,7 @@ const ET_TIMEZONE = "America/New_York";
 const COLLECTOR_POLL_MS = 5_000;
 const STRATEGY_POLL_MS = 5_000;
 const STRATEGY_PAPER_PROFILE = Object.freeze({
+  source: "live" as const,
   lookbackMinutes: 24 * 60,
   maxTrades: 320,
   fullHistory: false,

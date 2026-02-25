@@ -203,9 +203,14 @@ export interface StrategyPaperTrade {
 }
 
 export interface StrategyPaperResponse {
+  source?: "replay" | "live" | "auto" | string;
+  source_fallback_error?: string | null;
   market_type: string;
   lookback_minutes: number;
   samples: number;
+  config_source?: string;
+  baseline_profile?: string;
+  autotune?: unknown;
   config: {
     entry_threshold_base: number;
     entry_threshold_cap: number;

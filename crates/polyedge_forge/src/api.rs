@@ -137,6 +137,7 @@ struct AccuracyQueryParams {
 
 #[derive(Debug, Deserialize)]
 struct StrategyPaperQueryParams {
+    source: Option<String>,
     market_type: Option<String>,
     lookback_minutes: Option<u32>,
     max_points: Option<u32>,
@@ -165,6 +166,25 @@ struct StrategyPaperQueryParams {
     slippage_cents_per_side: Option<f64>,
     fee_cents_per_side: Option<f64>,
     emergency_wide_spread_penalty_ratio: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrategyPaperSource {
+    Replay,
+    Live,
+    Auto,
+}
+
+fn parse_strategy_paper_source(raw: Option<&str>) -> StrategyPaperSource {
+    match raw
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "replay".to_string())
+        .as_str()
+    {
+        "live" => StrategyPaperSource::Live,
+        "auto" => StrategyPaperSource::Auto,
+        _ => StrategyPaperSource::Replay,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1298,6 +1318,42 @@ async fn query_clickhouse_json(ch_url: &str, query: &str) -> Result<Value, ApiEr
 
     serde_json::from_str::<Value>(&body)
         .map_err(|e| ApiError::internal(format!("clickhouse json parse failed: {}", e)))
+}
+
+fn app_runner_base_url() -> String {
+    if let Ok(v) = std::env::var("POLYEDGE_CONTROL_BASE_URL") {
+        let trimmed = v.trim().trim_end_matches('/').to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+    let port = std::env::var("POLYEDGE_CONTROL_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(8080);
+    format!("http://127.0.0.1:{port}")
+}
+
+async fn query_http_json(url: &str) -> Result<Value, ApiError> {
+    let resp = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| ApiError::internal(format!("http request failed: {}", e)))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| ApiError::internal(format!("http body read failed: {}", e)))?;
+    if !status.is_success() {
+        return Err(ApiError::internal(format!(
+            "http endpoint returned {} for {}: {}",
+            status,
+            url,
+            body.chars().take(180).collect::<String>()
+        )));
+    }
+    serde_json::from_str(&body).map_err(|e| ApiError::internal(format!("http json parse failed: {}", e)))
 }
 
 fn is_live_snapshot_fresh(snapshot: &Value, market_type: &str, now_ms: i64) -> bool {
@@ -2551,6 +2607,257 @@ fn strategy_cfg_from_payload(base: StrategyRuntimeConfig, payload: &Value) -> St
     c
 }
 
+fn json_num(v: &Value, key: &str) -> f64 {
+    v.get(key).and_then(Value::as_f64).unwrap_or(0.0)
+}
+
+fn json_i64(v: &Value, key: &str) -> i64 {
+    v.get(key).and_then(Value::as_i64).unwrap_or(0)
+}
+
+fn json_u64(v: &Value, key: &str) -> u64 {
+    v.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn json_text(v: &Value, key: &str) -> String {
+    v.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn normalize_side_from_direction(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "up" => "UP",
+        "down" => "DOWN",
+        _ => "DOWN",
+    }
+}
+
+fn map_live_trade_to_strategy_trade(row: &Value, idx: usize) -> Value {
+    let ts_ms = json_i64(row, "ts_ms");
+    let duration_ms = json_i64(row, "trade_duration_ms").max(0);
+    let entry_ts_ms = ts_ms.saturating_sub(duration_ms);
+    let direction = json_text(row, "direction");
+    let side = normalize_side_from_direction(direction.as_str());
+    let market_id = json_text(row, "market_id");
+    let entry_price_raw_cents = (json_num(row, "entry_price") * 100.0).max(0.0);
+    let exit_price_raw_cents = (json_num(row, "fill_price") * 100.0).max(0.0);
+    let fee_total_cents = (json_num(row, "fee_usdc") * 100.0).max(0.0);
+    let entry_fee_cents = fee_total_cents * 0.5;
+    let exit_fee_cents = fee_total_cents - entry_fee_cents;
+    let pnl_net_cents = json_num(row, "realized_pnl_usdc") * 100.0;
+    let total_cost_cents = fee_total_cents;
+    let pnl_gross_cents = pnl_net_cents + total_cost_cents;
+    let confidence = json_num(row, "confidence").clamp(0.0, 1.0);
+    let action = json_text(row, "action");
+    let stage = json_text(row, "stage");
+    let entry_reason = if stage.is_empty() {
+        "paper_live".to_string()
+    } else {
+        format!("paper_live_{stage}")
+    };
+    let exit_reason = if action.is_empty() {
+        "paper_live_exit".to_string()
+    } else {
+        action
+    };
+
+    json!({
+        "id": format!("live-{idx}-{}", ts_ms),
+        "side": side,
+        "entry_round_id": market_id,
+        "entry_ts_ms": entry_ts_ms,
+        "exit_ts_ms": ts_ms,
+        "entry_remaining_ms": 0,
+        "exit_remaining_ms": 0,
+        "entry_price_cents": (entry_price_raw_cents + entry_fee_cents).max(0.0),
+        "entry_price_raw_cents": entry_price_raw_cents,
+        "entry_fee_cents": entry_fee_cents,
+        "entry_slippage_cents": 0.0,
+        "exit_price_cents": (exit_price_raw_cents - exit_fee_cents).max(0.0),
+        "exit_price_raw_cents": exit_price_raw_cents,
+        "exit_slippage_cents": 0.0,
+        "exit_emergency_penalty_cents": 0.0,
+        "pnl_gross_cents": pnl_gross_cents,
+        "total_cost_cents": total_cost_cents,
+        "pnl_net_cents": pnl_net_cents,
+        "pnl_cents": pnl_net_cents,
+        "peak_pnl_cents": pnl_net_cents.max(0.0),
+        "duration_s": (duration_ms as f64) / 1000.0,
+        "entry_score": confidence,
+        "exit_score": confidence,
+        "entry_reason": entry_reason,
+        "exit_reason": exit_reason,
+        "exec_fill_ok": true,
+        "exit_spread_cents": 0.0,
+        "exit_fee_cents": exit_fee_cents,
+    })
+}
+
+async fn load_latest_strategy_sample(
+    state: &ApiState,
+    market_type: &str,
+) -> Result<Option<StrategySample>, ApiError> {
+    let Some(ch_url) = state.ch_url.as_deref() else {
+        return Ok(None);
+    };
+    let q = format!(
+        "SELECT
+            ts_ireland_sample_ms AS ts_ms,
+            round_id,
+            remaining_ms,
+            if(isNaN(mid_yes_smooth) OR mid_yes_smooth <= 0, mid_yes, mid_yes_smooth) AS p_up,
+            if(isNaN(delta_pct_smooth), delta_pct, delta_pct_smooth) AS delta_pct,
+            acceleration,
+            velocity_bps_per_sec,
+            bid_yes,
+            ask_yes,
+            bid_no,
+            ask_no
+        FROM polyedge_forge.snapshot_100ms
+        WHERE symbol='BTCUSDT'
+          AND timeframe='{market_type}'
+        ORDER BY ts_ireland_sample_ms DESC
+        LIMIT 1
+        FORMAT JSON"
+    );
+    let rows = rows_from_json(query_clickhouse_json(ch_url, &q).await?);
+    Ok(parse_strategy_rows(rows).into_iter().next())
+}
+
+async fn strategy_paper_live(
+    state: &ApiState,
+    market_type: &str,
+    lookback_minutes: u32,
+    max_trades: usize,
+    cfg: &StrategyRuntimeConfig,
+) -> Result<Value, ApiError> {
+    let base_url = app_runner_base_url();
+    let live_url = format!("{base_url}/report/paper/live");
+    let history_url = format!(
+        "{base_url}/report/paper/history?limit={}",
+        max_trades.clamp(20, 5000)
+    );
+
+    let (live_payload, history_payload, latest_sample) = tokio::try_join!(
+        query_http_json(&live_url),
+        query_http_json(&history_url),
+        load_latest_strategy_sample(state, market_type)
+    )?;
+
+    let live = if live_payload.is_object() {
+        live_payload
+    } else {
+        return Err(ApiError::internal("invalid /report/paper/live payload"));
+    };
+    let mut history_rows = history_payload
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    history_rows.reverse();
+    let trades = history_rows
+        .iter()
+        .enumerate()
+        .map(|(idx, row)| map_live_trade_to_strategy_trade(row, idx + 1))
+        .collect::<Vec<_>>();
+
+    let trade_count = json_u64(&live, "trades") as usize;
+    let wins = json_u64(&live, "wins") as usize;
+    let win_rate_pct = if trade_count > 0 {
+        (wins as f64) * 100.0 / trade_count as f64
+    } else {
+        json_num(&live, "win_rate") * 100.0
+    };
+    let total_pnl_cents = json_num(&live, "pnl_total_usdc") * 100.0;
+    let total_cost_cents = json_num(&live, "fee_total_usdc") * 100.0;
+    let gross_pnl_cents = total_pnl_cents + total_cost_cents;
+    let avg_pnl_cents = if trade_count > 0 {
+        total_pnl_cents / trade_count as f64
+    } else {
+        0.0
+    };
+    let avg_duration_s = json_num(&live, "avg_trade_duration_ms") / 1000.0;
+    let initial_capital = json_num(&live, "initial_capital");
+    let max_drawdown_pct = json_num(&live, "max_drawdown_pct").max(0.0);
+    let max_drawdown_cents = initial_capital.max(0.0) * max_drawdown_pct;
+    let net_margin_pct = if gross_pnl_cents.abs() > 1e-9 {
+        total_pnl_cents / gross_pnl_cents.abs() * 100.0
+    } else {
+        0.0
+    };
+    let max_profit_trade_cents = trades
+        .iter()
+        .filter_map(|t| t.get("pnl_net_cents").and_then(Value::as_f64))
+        .fold(0.0_f64, f64::max);
+
+    let open_positions_count = json_u64(&live, "open_positions_count") as usize;
+    let current = if let Some(sample) = latest_sample {
+        let suggested_side = if sample.p_up > 0.505 {
+            "UP"
+        } else if sample.p_up < 0.495 {
+            "DOWN"
+        } else {
+            "WAIT"
+        };
+        let action = if open_positions_count > 0 {
+            "HOLD"
+        } else {
+            "WAIT"
+        };
+        json!({
+            "timestamp_ms": sample.ts_ms,
+            "round_id": sample.round_id,
+            "remaining_s": (sample.remaining_ms.max(0) as f64) / 1000.0,
+            "score": 0.0,
+            "entry_threshold": cfg.entry_threshold_base,
+            "confirmed": open_positions_count > 0,
+            "suggested_side": suggested_side,
+            "suggested_action": action,
+            "confidence": json_num(&live, "win_rate").clamp(0.0, 1.0),
+            "p_up_pct": (sample.p_up * 100.0).clamp(0.0, 100.0),
+            "delta_pct": sample.delta_pct,
+            "spread_up_cents": (sample.spread_up * 100.0).max(0.0),
+            "spread_down_cents": (sample.spread_down * 100.0).max(0.0)
+        })
+    } else {
+        Value::Null
+    };
+
+    Ok(json!({
+        "source": "live",
+        "market_type": market_type,
+        "lookback_minutes": lookback_minutes,
+        "full_history": false,
+        "samples": json_u64(&live, "trades") as usize,
+        "config_source": "live_report",
+        "baseline_profile": STRATEGY_BASELINE_PROFILE,
+        "autotune": Value::Null,
+        "config": strategy_cfg_json(cfg),
+        "current": current,
+        "summary": {
+            "trade_count": trade_count,
+            "win_rate_pct": win_rate_pct,
+            "avg_pnl_cents": avg_pnl_cents,
+            "avg_duration_s": avg_duration_s,
+            "total_pnl_cents": total_pnl_cents,
+            "net_pnl_cents": total_pnl_cents,
+            "gross_pnl_cents": gross_pnl_cents,
+            "total_cost_cents": total_cost_cents,
+            "total_entry_fee_cents": total_cost_cents * 0.5,
+            "total_exit_fee_cents": total_cost_cents * 0.5,
+            "total_slippage_cents": 0.0,
+            "net_margin_pct": net_margin_pct,
+            "max_drawdown_cents": max_drawdown_cents,
+            "max_profit_trade_cents": max_profit_trade_cents,
+            "blocked_exits": 0,
+            "emergency_wide_exit_count": 0,
+            "execution_penalty_cents_total": 0.0,
+        },
+        "trades": trades,
+    }))
+}
+
 fn profit_factor(pnls: &[f64]) -> f64 {
     let mut gross_win = 0.0_f64;
     let mut gross_loss = 0.0_f64;
@@ -3342,6 +3649,7 @@ async fn strategy_paper(
     State(state): State<ApiState>,
     Query(params): Query<StrategyPaperQueryParams>,
 ) -> Result<Json<Value>, ApiError> {
+    let source_mode = parse_strategy_paper_source(params.source.as_deref());
     let market_type = if let Some(mt) = params.market_type.as_deref() {
         normalize_market_type(mt).ok_or_else(|| ApiError::bad_request("invalid market_type"))?
     } else {
@@ -3440,6 +3748,17 @@ async fn strategy_paper(
         .clamp(20_000, 5_000_000);
     let max_trades = params.max_trades.unwrap_or(200).clamp(20, 1000) as usize;
 
+    let mut source_fallback_error: Option<String> = None;
+    if matches!(source_mode, StrategyPaperSource::Live | StrategyPaperSource::Auto) {
+        match strategy_paper_live(&state, market_type, lookback_minutes, max_trades, &cfg).await {
+            Ok(payload) => return Ok(Json(payload)),
+            Err(err) if matches!(source_mode, StrategyPaperSource::Live) => return Err(err),
+            Err(err) => {
+                source_fallback_error = Some(err.message);
+            }
+        }
+    }
+
     let samples = load_strategy_samples(
         &state,
         market_type,
@@ -3450,6 +3769,8 @@ async fn strategy_paper(
     .await?;
     if samples.len() < 20 {
         return Ok(Json(json!({
+            "source": "replay",
+            "source_fallback_error": source_fallback_error,
             "market_type": market_type,
             "lookback_minutes": lookback_minutes,
             "samples": samples.len(),
@@ -3476,6 +3797,8 @@ async fn strategy_paper(
     let run = run_strategy_simulation(&samples, &cfg, max_trades);
 
     Ok(Json(json!({
+        "source": "replay",
+        "source_fallback_error": source_fallback_error,
         "market_type": market_type,
         "lookback_minutes": lookback_minutes,
         "full_history": full_history,
