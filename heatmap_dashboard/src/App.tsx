@@ -735,9 +735,10 @@ interface StrategyPanelProps {
   data: StrategyPaperResponse | null;
   loading: boolean;
   timeMode: TimeMode;
+  updatedAt: number | null;
 }
 
-const StrategyPanel = memo(function StrategyPanel({ data, loading, timeMode }: StrategyPanelProps) {
+const StrategyPanel = memo(function StrategyPanel({ data, loading, timeMode, updatedAt }: StrategyPanelProps) {
   const current = data?.current ?? null;
   return (
     <section className="panel">
@@ -772,6 +773,13 @@ const StrategyPanel = memo(function StrategyPanel({ data, loading, timeMode }: S
           </strong>
           <small>
             交易 {data?.summary.trade_count ?? 0} · 胜率 {data ? `${data.summary.win_rate_pct.toFixed(1)}%` : "--"}
+          </small>
+        </article>
+        <article className="info-card">
+          <span>刷新状态</span>
+          <strong>{updatedAt ? formatTime(updatedAt, timeMode) : "--"}</strong>
+          <small>
+            样本 {data?.samples ?? 0} · 来源 {data?.config_source ?? "--"}
           </small>
         </article>
       </div>
@@ -899,6 +907,7 @@ export default function App() {
   const [accuracy, setAccuracy] = useState<AccuracySeriesResponse | null>(null);
   const [strategyPaper, setStrategyPaper] = useState<StrategyPaperResponse | null>(null);
   const [strategyLoading, setStrategyLoading] = useState<boolean>(false);
+  const [strategyUpdatedAt, setStrategyUpdatedAt] = useState<number | null>(null);
   const [errorText, setErrorText] = useState<string>("");
   const [timeMode, setTimeMode] = useState<TimeMode>("local");
   const lastLiveTsRef = useRef<Record<MarketType, number>>({ "5m": 0, "15m": 0 });
@@ -912,6 +921,7 @@ export default function App() {
   const pushLivePointRef = useRef<(marketType: MarketType, livePoint: LiveSnapshot | null) => void>(() => {});
   const chartReqSeqRef = useRef<Record<MarketType, number>>({ "5m": 0, "15m": 0 });
   const chartInFlightRef = useRef<Record<MarketType, boolean>>({ "5m": false, "15m": false });
+  const strategyInFlightRef = useRef<boolean>(false);
   const stableLiveRef = useRef<Record<MarketType, LiveSnapshot | null>>({ "5m": null, "15m": null });
   const boundaryRefreshRef = useRef<Record<MarketType, number>>({ "5m": 0, "15m": 0 });
   const accuracyTabRef = useRef<MarketType>("5m");
@@ -1453,30 +1463,34 @@ export default function App() {
   useEffect(() => {
     let alive = true;
     const load = async () => {
-      if (document.visibilityState !== "visible") {
+      if (strategyInFlightRef.current) {
         return;
       }
+      strategyInFlightRef.current = true;
       setStrategyLoading(true);
       try {
         const data = await getStrategyPaper("5m", 240, 120);
         if (alive) {
           setStrategyPaper(data);
+          setStrategyUpdatedAt(Date.now());
         }
       } catch (err) {
         if (alive) {
           setErrorText(err instanceof Error ? err.message : String(err));
         }
       } finally {
+        strategyInFlightRef.current = false;
         if (alive) {
           setStrategyLoading(false);
         }
       }
     };
-    const first = window.setTimeout(load, 3_000);
-    const id = window.setInterval(load, 25_000);
+    void load();
+    const id = window.setInterval(() => {
+      void load();
+    }, 10_000);
     return () => {
       alive = false;
-      window.clearTimeout(first);
       window.clearInterval(id);
     };
   }, []);
@@ -1602,7 +1616,12 @@ export default function App() {
         loading={chartLoading["15m"]}
       />
 
-      <StrategyPanel data={strategyPaper} loading={strategyLoading} timeMode={timeMode} />
+      <StrategyPanel
+        data={strategyPaper}
+        loading={strategyLoading}
+        timeMode={timeMode}
+        updatedAt={strategyUpdatedAt}
+      />
 
       <section className="panel">
         <header className="panel-head">
