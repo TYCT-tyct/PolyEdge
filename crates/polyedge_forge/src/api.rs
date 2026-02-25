@@ -2755,32 +2755,64 @@ async fn strategy_paper_live(
         .as_array()
         .cloned()
         .unwrap_or_default();
-    history_rows.reverse();
-    let trades = history_rows
+    history_rows.reverse(); // oldest -> newest
+    let timeframe_key = market_type.to_ascii_lowercase();
+    let filtered_rows = history_rows
+        .into_iter()
+        .filter(|row| {
+            row.get("timeframe")
+                .and_then(Value::as_str)
+                .map(|v| v.trim().to_ascii_lowercase() == timeframe_key)
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    let trades = filtered_rows
         .iter()
         .enumerate()
         .map(|(idx, row)| map_live_trade_to_strategy_trade(row, idx + 1))
         .collect::<Vec<_>>();
 
-    let trade_count = json_u64(&live, "trades") as usize;
-    let wins = json_u64(&live, "wins") as usize;
+    let trade_count = filtered_rows.len();
+    let wins = filtered_rows
+        .iter()
+        .filter(|row| json_num(row, "realized_pnl_usdc") >= 0.0)
+        .count();
     let win_rate_pct = if trade_count > 0 {
         (wins as f64) * 100.0 / trade_count as f64
     } else {
-        json_num(&live, "win_rate") * 100.0
+        0.0
     };
-    let total_pnl_cents = json_num(&live, "pnl_total_usdc") * 100.0;
-    let total_cost_cents = json_num(&live, "fee_total_usdc") * 100.0;
+    let total_pnl_cents = filtered_rows
+        .iter()
+        .map(|row| json_num(row, "realized_pnl_usdc") * 100.0)
+        .sum::<f64>();
+    let total_cost_cents = filtered_rows
+        .iter()
+        .map(|row| (json_num(row, "fee_usdc") * 100.0).max(0.0))
+        .sum::<f64>();
     let gross_pnl_cents = total_pnl_cents + total_cost_cents;
     let avg_pnl_cents = if trade_count > 0 {
         total_pnl_cents / trade_count as f64
     } else {
         0.0
     };
-    let avg_duration_s = json_num(&live, "avg_trade_duration_ms") / 1000.0;
-    let initial_capital = json_num(&live, "initial_capital");
-    let max_drawdown_pct = json_num(&live, "max_drawdown_pct").max(0.0);
-    let max_drawdown_cents = initial_capital.max(0.0) * max_drawdown_pct;
+    let avg_duration_s = if trade_count > 0 {
+        filtered_rows
+            .iter()
+            .map(|row| json_i64(row, "trade_duration_ms").max(0) as f64 / 1000.0)
+            .sum::<f64>()
+            / trade_count as f64
+    } else {
+        0.0
+    };
+    let mut peak = 0.0_f64;
+    let mut cum = 0.0_f64;
+    let mut max_drawdown_cents = 0.0_f64;
+    for row in &filtered_rows {
+        cum += json_num(row, "realized_pnl_usdc") * 100.0;
+        peak = peak.max(cum);
+        max_drawdown_cents = max_drawdown_cents.max((peak - cum).max(0.0));
+    }
     let net_margin_pct = if gross_pnl_cents.abs() > 1e-9 {
         total_pnl_cents / gross_pnl_cents.abs() * 100.0
     } else {
@@ -2829,7 +2861,7 @@ async fn strategy_paper_live(
         "market_type": market_type,
         "lookback_minutes": lookback_minutes,
         "full_history": false,
-        "samples": json_u64(&live, "trades") as usize,
+        "samples": trade_count,
         "config_source": "live_report",
         "baseline_profile": STRATEGY_BASELINE_PROFILE,
         "autotune": Value::Null,

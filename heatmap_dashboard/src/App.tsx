@@ -51,8 +51,8 @@ const LIVE_UI_MIN_INTERVAL_MS = 900;
 const ET_TIMEZONE = "America/New_York";
 const COLLECTOR_POLL_MS = 5_000;
 const STRATEGY_POLL_MS = 5_000;
+type StrategyPaperSource = "replay" | "live";
 const STRATEGY_PAPER_PROFILE = Object.freeze({
-  source: "live" as const,
   lookbackMinutes: 24 * 60,
   maxTrades: 320,
   fullHistory: false,
@@ -750,23 +750,54 @@ interface StrategyPanelProps {
   data: StrategyPaperResponse | null;
   loading: boolean;
   timeMode: TimeMode;
-  updatedAt: number | null;
+  marketType: MarketType;
+  source: StrategyPaperSource;
+  onMarketTypeChange: (marketType: MarketType) => void;
+  onSourceChange: (source: StrategyPaperSource) => void;
 }
 
-const StrategyPanel = memo(function StrategyPanel({ data, loading, timeMode, updatedAt }: StrategyPanelProps) {
+const StrategyPanel = memo(function StrategyPanel({
+  data,
+  loading,
+  timeMode,
+  marketType,
+  source,
+  onMarketTypeChange,
+  onSourceChange
+}: StrategyPanelProps) {
   const current = data?.current ?? null;
   return (
     <section className="panel">
       <header className="panel-head">
         <div>
-          <h2>策略 Paper（5m全时段）</h2>
+          <h2>策略 Paper（{marketType} 全时段）</h2>
           <p className="muted">单模型双向策略：自动判断 UP/DOWN，只验证入场与出场，不做加仓和反向。</p>
         </div>
-        <div className="btn-group">
-          {loading ? <span className="loading-chip">计算中...</span> : <span className="loading-chip">实时策略</span>}
+        <div className="panel-actions">
+          <div className="btn-group">
+            <button className={marketType === "5m" ? "active" : ""} onClick={() => onMarketTypeChange("5m")}>
+              5m
+            </button>
+            <button className={marketType === "15m" ? "active" : ""} onClick={() => onMarketTypeChange("15m")}>
+              15m
+            </button>
+          </div>
+          <div className="btn-group">
+            <button className={source === "replay" ? "active" : ""} onClick={() => onSourceChange("replay")}>
+              Paper模拟
+            </button>
+            <button className={source === "live" ? "active" : ""} onClick={() => onSourceChange("live")}>
+              真实交易
+            </button>
+          </div>
+          {loading ? (
+            <span className="loading-chip">计算中...</span>
+          ) : (
+            <span className="loading-chip">{source === "live" ? "实时策略" : "模拟策略"}</span>
+          )}
         </div>
       </header>
-      <div className="info-cards compact">
+      <div className="info-cards compact strategy-matrix">
         <article className="info-card">
           <span>当前动作</span>
           <strong className={current?.suggested_action?.includes("UP") ? "up" : current?.suggested_action?.includes("DOWN") ? "down" : ""}>
@@ -791,15 +822,6 @@ const StrategyPanel = memo(function StrategyPanel({ data, loading, timeMode, upd
           </small>
         </article>
         <article className="info-card">
-          <span>刷新状态</span>
-          <strong>{updatedAt ? formatTime(updatedAt, timeMode) : "--"}</strong>
-          <small>
-            样本 {data?.samples ?? 0} · 来源 {data?.config_source ?? "--"}
-          </small>
-        </article>
-      </div>
-      <div className="info-cards compact">
-        <article className="info-card">
           <span>均值 / 回撤</span>
           <strong>
             {data ? `${data.summary.avg_pnl_cents.toFixed(2)}¢ / ${data.summary.max_drawdown_cents.toFixed(2)}¢` : "--"}
@@ -816,19 +838,12 @@ const StrategyPanel = memo(function StrategyPanel({ data, loading, timeMode, upd
           </small>
         </article>
         <article className="info-card">
-          <span>盘口状态</span>
-          <strong>
-            {current ? `${current.spread_up_cents.toFixed(2)}¢ / ${current.spread_down_cents.toFixed(2)}¢` : "--"}
-          </strong>
-          <small>UP / DOWN 点差</small>
-        </article>
-        <article className="info-card">
           <span>市场状态</span>
           <strong>
             {current ? `UP ${current.p_up_pct.toFixed(1)}%` : "--"}
           </strong>
           <small>
-            Δ {current ? `${current.delta_pct.toFixed(4)}%` : "--"} · 剩余 {current ? `${current.remaining_s.toFixed(1)}s` : "--"}
+            Δ {current ? `${current.delta_pct.toFixed(4)}%` : "--"} · 剩余 {current ? `${current.remaining_s.toFixed(1)}s` : "--"} · 样本 {data?.samples ?? 0}
           </small>
         </article>
       </div>
@@ -922,7 +937,8 @@ export default function App() {
   const [accuracy, setAccuracy] = useState<AccuracySeriesResponse | null>(null);
   const [strategyPaper, setStrategyPaper] = useState<StrategyPaperResponse | null>(null);
   const [strategyLoading, setStrategyLoading] = useState<boolean>(false);
-  const [strategyUpdatedAt, setStrategyUpdatedAt] = useState<number | null>(null);
+  const [strategyMarketType, setStrategyMarketType] = useState<MarketType>("5m");
+  const [strategySource, setStrategySource] = useState<StrategyPaperSource>("replay");
   const [errorText, setErrorText] = useState<string>("");
   const [timeMode, setTimeMode] = useState<TimeMode>("local");
   const lastLiveTsRef = useRef<Record<MarketType, number>>({ "5m": 0, "15m": 0 });
@@ -1484,10 +1500,12 @@ export default function App() {
       strategyInFlightRef.current = true;
       setStrategyLoading(true);
       try {
-        const data = await getStrategyPaper("5m", STRATEGY_PAPER_PROFILE);
+        const data = await getStrategyPaper(strategyMarketType, {
+          ...STRATEGY_PAPER_PROFILE,
+          source: strategySource
+        });
         if (alive) {
           setStrategyPaper(data);
-          setStrategyUpdatedAt(Date.now());
         }
       } catch (err) {
         if (alive) {
@@ -1508,7 +1526,7 @@ export default function App() {
       alive = false;
       window.clearInterval(id);
     };
-  }, []);
+  }, [strategyMarketType, strategySource]);
 
   useEffect(() => {
     let alive = true;
@@ -1635,7 +1653,10 @@ export default function App() {
         data={strategyPaper}
         loading={strategyLoading}
         timeMode={timeMode}
-        updatedAt={strategyUpdatedAt}
+        marketType={strategyMarketType}
+        source={strategySource}
+        onMarketTypeChange={setStrategyMarketType}
+        onSourceChange={setStrategySource}
       />
 
       <section className="panel">

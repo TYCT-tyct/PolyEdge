@@ -325,6 +325,14 @@ body {
   flex-wrap: wrap;
 }
 
+.panel-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .loading-chip {
   border: 1px solid var(--panel-border);
   background: rgba(20, 31, 52, 0.82);
@@ -580,6 +588,10 @@ body {
 
 .info-cards.compact {
   margin-bottom: 8px;
+}
+
+.strategy-matrix {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .info-card {
@@ -898,6 +910,10 @@ select:focus {
   .round-grid {
     grid-template-columns: 1fr;
   }
+
+  .strategy-matrix {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 760px) {
@@ -913,6 +929,10 @@ select:focus {
   .panel-head {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .panel-actions {
+    justify-content: flex-start;
   }
 
   .stats-grid {
