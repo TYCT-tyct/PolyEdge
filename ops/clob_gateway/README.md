@@ -7,8 +7,12 @@ engine does not need to implement EIP-712 signing + CLOB auth.
 
 - `GET /health`
 - `POST /orders`
+- `POST /prebuild_order`
 - `DELETE /orders/{order_id}`
 - `POST /flatten`
+- `GET /reports/orders`
+- `GET /cache/prebuild`
+- `WS /ws/reports/orders`
 
 ## Environment Variables (required)
 
@@ -26,6 +30,15 @@ API creds (recommended; if missing we try to derive on startup):
 - `CLOB_API_KEY`
 - `CLOB_API_SECRET`
 - `CLOB_API_PASSPHRASE`
+
+Optional tuning:
+
+- `CLOB_PREBUILD_CACHE_ENABLED=true|false` (default `true`)
+- `CLOB_PREBUILD_CACHE_POOL` (default `4`)
+- `CLOB_PREBUILD_CACHE_TTL_MS` (default `90000`)
+- `CLOB_ORDER_TIMEOUT_MS` (default `6500`)
+- `CLOB_ORDER_POLL_INTERVAL_MS` (default `700`)
+- `CLOB_ORDER_WATCH_INTERVAL_MS` (default `220`)
 
 ## Run (dev)
 
