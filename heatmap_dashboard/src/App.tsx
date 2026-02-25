@@ -20,6 +20,7 @@ import type {
   AccuracyPoint,
   AvailableRoundsResponse,
   ChartPoint,
+  ChartTradeMarker,
   ChartResponse,
   HeatmapCell,
   HeatmapResponse,
@@ -28,6 +29,7 @@ import type {
   RoundHistoryRow,
   RoundChartResponse,
   RoundsResponse,
+  StrategyPaperTrade,
   StrategyPaperResponse,
   StatsResponse,
   WindowType
@@ -47,8 +49,80 @@ const LIVE_POLL_MS = 900;
 const WS_STALE_FALLBACK_MS = 3000;
 const LIVE_UI_MIN_INTERVAL_MS = 900;
 const ET_TIMEZONE = "America/New_York";
+const STRATEGY_TITLE: Record<MarketType, string> = {
+  "5m": "策略 Paper（5m）",
+  "15m": "策略 Paper（15m）"
+};
+const DEFAULT_STRATEGY_ID = "paper-main";
+const DEFAULT_STRATEGY_LABEL = "主策略";
 
 type TimeMode = "local" | "et";
+
+interface MarkerFilters {
+  enabled: boolean;
+  showEntry: boolean;
+  showExit: boolean;
+  showPaper: boolean;
+  showLive: boolean;
+}
+
+function normalizeStrategyId(v: string | null | undefined): string {
+  const id = (v ?? "").trim();
+  return id.length > 0 ? id : DEFAULT_STRATEGY_ID;
+}
+
+function deriveStrategyLabel(trade: StrategyPaperTrade): string {
+  const explicit = (trade.strategy_label ?? "").trim();
+  if (explicit.length > 0) {
+    return explicit;
+  }
+  const fromId = (trade.strategy_id ?? "").trim();
+  if (fromId.length > 0) {
+    return fromId;
+  }
+  return DEFAULT_STRATEGY_LABEL;
+}
+
+function buildTradeMarkers(marketType: MarketType, trades: StrategyPaperTrade[]): ChartTradeMarker[] {
+  const out: ChartTradeMarker[] = [];
+  for (const trade of trades) {
+    const strategyId = normalizeStrategyId(trade.strategy_id);
+    const strategyLabel = deriveStrategyLabel(trade);
+    const mode = trade.mode === "live" ? "live" : "paper";
+    const tradeId = `${marketType}-${strategyId}-${trade.id}`;
+    out.push({
+      id: `${tradeId}-entry`,
+      market_type: marketType,
+      mode,
+      strategy_id: strategyId,
+      strategy_label: strategyLabel,
+      action: "entry",
+      side: trade.side,
+      timestamp_ms: trade.entry_ts_ms,
+      round_id: trade.round_id ?? null,
+      price_cents: trade.entry_price_cents,
+      pnl_cents: null,
+      reason: trade.entry_reason ?? null,
+      detail: null
+    });
+    out.push({
+      id: `${tradeId}-exit`,
+      market_type: marketType,
+      mode,
+      strategy_id: strategyId,
+      strategy_label: strategyLabel,
+      action: "exit",
+      side: trade.side,
+      timestamp_ms: trade.exit_ts_ms,
+      round_id: trade.round_id ?? null,
+      price_cents: trade.exit_price_cents,
+      pnl_cents: trade.pnl_cents,
+      reason: trade.exit_reason ?? null,
+      detail: null
+    });
+  }
+  return out;
+}
 
 function windowToMinutes(view: WindowType): number {
   switch (view) {
@@ -451,6 +525,7 @@ interface MarketSectionProps {
   windowType: WindowType;
   onWindowChange: (w: WindowType) => void;
   chart: ChartResponse | null;
+  tradeMarkers: ChartTradeMarker[];
   loading: boolean;
 }
 
@@ -462,6 +537,7 @@ function MarketSection({
   windowType,
   onWindowChange,
   chart,
+  tradeMarkers,
   loading
 }: MarketSectionProps) {
   const gapInfo = useMemo(() => summarizeGaps(chart?.points ?? []), [chart?.points]);
@@ -505,6 +581,7 @@ function MarketSection({
       <MarketChart
         points={chart?.points ?? []}
         rounds={chart?.rounds ?? []}
+        tradeMarkers={tradeMarkers}
         windowType={windowType}
         timeMode={timeMode}
         height={360}
@@ -515,7 +592,9 @@ function MarketSection({
           {chart?.downsampled ? ` (downsample x${chart.step})` : ""}
           {gapInfo.count > 0 ? ` | 缺口 ${gapInfo.count} (max ${(gapInfo.maxGapMs / 1000).toFixed(1)}s)` : ""}
         </span>
-        <span>{chart?.rounds.length.toLocaleString() ?? "0"} 轮</span>
+        <span>
+          {chart?.rounds.length.toLocaleString() ?? "0"} 轮 · 标记 {tradeMarkers.length.toLocaleString()}
+        </span>
       </div>
     </section>
   );
@@ -685,107 +764,198 @@ const RoundHistoryPanel = memo(function RoundHistoryPanel({
 });
 
 interface StrategyPanelProps {
-  data: StrategyPaperResponse | null;
+  dataByMarket: Record<MarketType, StrategyPaperResponse | null>;
+  selectedMarket: MarketType;
+  onMarketChange: (market: MarketType) => void;
   loading: boolean;
   timeMode: TimeMode;
+  reportVisible: boolean;
+  onReportVisibleChange: (next: boolean) => void;
+  markerFilters: MarkerFilters;
+  onMarkerFiltersChange: (next: MarkerFilters) => void;
+  availableStrategies: Array<{ id: string; label: string; count: number }>;
+  selectedStrategies: string[];
+  onSelectedStrategiesChange: (next: string[]) => void;
 }
 
-const StrategyPanel = memo(function StrategyPanel({ data, loading, timeMode }: StrategyPanelProps) {
+const StrategyPanel = memo(function StrategyPanel({
+  dataByMarket,
+  selectedMarket,
+  onMarketChange,
+  loading,
+  timeMode,
+  reportVisible,
+  onReportVisibleChange,
+  markerFilters,
+  onMarkerFiltersChange,
+  availableStrategies,
+  selectedStrategies,
+  onSelectedStrategiesChange
+}: StrategyPanelProps) {
+  const data = dataByMarket[selectedMarket];
   const current = data?.current ?? null;
+  const toggleStrategy = (id: string) => {
+    const exists = selectedStrategies.includes(id);
+    if (exists) {
+      const next = selectedStrategies.filter((s) => s !== id);
+      onSelectedStrategiesChange(next.length > 0 ? next : [id]);
+      return;
+    }
+    onSelectedStrategiesChange([...selectedStrategies, id]);
+  };
+
+  const toggleFilter = (key: keyof MarkerFilters) => {
+    onMarkerFiltersChange({ ...markerFilters, [key]: !markerFilters[key] });
+  };
+
   return (
     <section className="panel">
       <header className="panel-head">
         <div>
-          <h2>策略 Paper（5m全时段）</h2>
-          <p className="muted">单模型双向策略：自动判断 UP/DOWN，只验证入场与出场，不做加仓和反向。</p>
+          <h2>{STRATEGY_TITLE[selectedMarket]}</h2>
+          <p className="muted">可视化策略信号层：进场三角、出场叉号，支持按策略/模式筛选。</p>
         </div>
         <div className="btn-group">
           {loading ? <span className="loading-chip">计算中...</span> : <span className="loading-chip">实时策略</span>}
+          <button
+            className={selectedMarket === "5m" ? "active" : ""}
+            onClick={() => onMarketChange("5m")}
+          >
+            5m
+          </button>
+          <button
+            className={selectedMarket === "15m" ? "active" : ""}
+            onClick={() => onMarketChange("15m")}
+          >
+            15m
+          </button>
+          <button className={reportVisible ? "active" : ""} onClick={() => onReportVisibleChange(!reportVisible)}>
+            {reportVisible ? "隐藏报告" : "显示报告"}
+          </button>
         </div>
       </header>
-      <div className="info-cards compact">
-        <article className="info-card">
-          <span>当前动作</span>
-          <strong className={current?.suggested_action?.includes("UP") ? "up" : current?.suggested_action?.includes("DOWN") ? "down" : ""}>
-            {current?.suggested_action ?? "--"}
-          </strong>
-          <small>
-            {current ? `${formatTime(current.timestamp_ms, timeMode)} · ${current.round_id}` : "等待数据"}
-          </small>
-        </article>
-        <article className="info-card">
-          <span>信号强度 / 阈值</span>
-          <strong>{current ? `${current.score.toFixed(3)} / ${current.entry_threshold.toFixed(3)}` : "--"}</strong>
-          <small>置信度：{current ? `${(current.confidence * 100).toFixed(1)}%` : "--"}</small>
-        </article>
-        <article className="info-card">
-          <span>累计收益</span>
-          <strong className={(data?.summary.total_pnl_cents ?? 0) >= 0 ? "up" : "down"}>
-            {data ? `${data.summary.total_pnl_cents.toFixed(2)}¢` : "--"}
-          </strong>
-          <small>
-            交易 {data?.summary.trade_count ?? 0} · 胜率 {data ? `${data.summary.win_rate_pct.toFixed(1)}%` : "--"}
-          </small>
-        </article>
+
+      <div className="strategy-toolbar">
+        <div className="strategy-toggle-group">
+          <button className={markerFilters.enabled ? "active" : ""} onClick={() => toggleFilter("enabled")}>
+            角标层
+          </button>
+          <button className={markerFilters.showEntry ? "active" : ""} onClick={() => toggleFilter("showEntry")}>
+            进场
+          </button>
+          <button className={markerFilters.showExit ? "active" : ""} onClick={() => toggleFilter("showExit")}>
+            出场
+          </button>
+          <button className={markerFilters.showPaper ? "active" : ""} onClick={() => toggleFilter("showPaper")}>
+            测试
+          </button>
+          <button className={markerFilters.showLive ? "active" : ""} onClick={() => toggleFilter("showLive")}>
+            实盘
+          </button>
+        </div>
+        <div className="strategy-tags">
+          {availableStrategies.map((s) => (
+            <button
+              key={s.id}
+              className={selectedStrategies.includes(s.id) ? "active" : ""}
+              onClick={() => toggleStrategy(s.id)}
+            >
+              {s.label}
+              <span>{s.count}</span>
+            </button>
+          ))}
+        </div>
       </div>
-      <div className="info-cards compact">
-        <article className="info-card">
-          <span>均值 / 回撤</span>
-          <strong>
-            {data ? `${data.summary.avg_pnl_cents.toFixed(2)}¢ / ${data.summary.max_drawdown_cents.toFixed(2)}¢` : "--"}
-          </strong>
-          <small>平均每笔 / 最大回撤</small>
-        </article>
-        <article className="info-card">
-          <span>盘口状态</span>
-          <strong>
-            {current ? `${current.spread_up_cents.toFixed(2)}¢ / ${current.spread_down_cents.toFixed(2)}¢` : "--"}
-          </strong>
-          <small>UP / DOWN 点差</small>
-        </article>
-        <article className="info-card">
-          <span>市场状态</span>
-          <strong>
-            {current ? `UP ${current.p_up_pct.toFixed(1)}%` : "--"}
-          </strong>
-          <small>
-            Δ {current ? `${current.delta_pct.toFixed(4)}%` : "--"} · 剩余 {current ? `${current.remaining_s.toFixed(1)}s` : "--"}
-          </small>
-        </article>
-      </div>
-      <div className="table-wrap">
-        <table className="history-table">
-          <thead>
-            <tr>
-              <th>方向</th>
-              <th>入场</th>
-              <th>出场</th>
-              <th>价格(¢)</th>
-              <th>盈亏</th>
-              <th>时长</th>
-              <th>原因</th>
-            </tr>
-          </thead>
-          <tbody>
-            {(data?.trades ?? []).slice(-12).reverse().map((t) => (
-              <tr key={t.id}>
-                <td><span className={`chip ${t.side === "UP" ? "up" : "down"}`}>{t.side}</span></td>
-                <td>{formatTime(t.entry_ts_ms, timeMode)}</td>
-                <td>{formatTime(t.exit_ts_ms, timeMode)}</td>
-                <td>{t.entry_price_cents.toFixed(2)} → {t.exit_price_cents.toFixed(2)}</td>
-                <td className={t.pnl_cents >= 0 ? "up" : "down"}>{t.pnl_cents.toFixed(2)}¢</td>
-                <td>{t.duration_s.toFixed(1)}s</td>
-                <td>{t.entry_reason} / {t.exit_reason}</td>
-              </tr>
-            ))}
-            {(data?.trades?.length ?? 0) === 0 ? (
-              <tr>
-                <td colSpan={7}>暂无交易样本，等待策略信号触发。</td>
-              </tr>
-            ) : null}
-          </tbody>
-        </table>
-      </div>
+
+      {reportVisible ? (
+        <>
+          <div className="info-cards compact">
+            <article className="info-card">
+              <span>当前动作</span>
+              <strong className={current?.suggested_action?.includes("UP") ? "up" : current?.suggested_action?.includes("DOWN") ? "down" : ""}>
+                {current?.suggested_action ?? "--"}
+              </strong>
+              <small>
+                {current ? `${formatTime(current.timestamp_ms, timeMode)} · ${current.round_id}` : "等待数据"}
+              </small>
+            </article>
+            <article className="info-card">
+              <span>信号强度 / 阈值</span>
+              <strong>{current ? `${current.score.toFixed(3)} / ${current.entry_threshold.toFixed(3)}` : "--"}</strong>
+              <small>置信度：{current ? `${(current.confidence * 100).toFixed(1)}%` : "--"}</small>
+            </article>
+            <article className="info-card">
+              <span>累计收益</span>
+              <strong className={(data?.summary.total_pnl_cents ?? 0) >= 0 ? "up" : "down"}>
+                {data ? `${data.summary.total_pnl_cents.toFixed(2)}¢` : "--"}
+              </strong>
+              <small>
+                交易 {data?.summary.trade_count ?? 0} · 胜率 {data ? `${data.summary.win_rate_pct.toFixed(1)}%` : "--"}
+              </small>
+            </article>
+          </div>
+          <div className="info-cards compact">
+            <article className="info-card">
+              <span>均值 / 回撤</span>
+              <strong>
+                {data ? `${data.summary.avg_pnl_cents.toFixed(2)}¢ / ${data.summary.max_drawdown_cents.toFixed(2)}¢` : "--"}
+              </strong>
+              <small>平均每笔 / 最大回撤</small>
+            </article>
+            <article className="info-card">
+              <span>盘口状态</span>
+              <strong>
+                {current ? `${current.spread_up_cents.toFixed(2)}¢ / ${current.spread_down_cents.toFixed(2)}¢` : "--"}
+              </strong>
+              <small>UP / DOWN 点差</small>
+            </article>
+            <article className="info-card">
+              <span>市场状态</span>
+              <strong>
+                {current ? `UP ${current.p_up_pct.toFixed(1)}%` : "--"}
+              </strong>
+              <small>
+                Δ {current ? `${current.delta_pct.toFixed(4)}%` : "--"} · 剩余 {current ? `${current.remaining_s.toFixed(1)}s` : "--"}
+              </small>
+            </article>
+          </div>
+          <div className="table-wrap">
+            <table className="history-table">
+              <thead>
+                <tr>
+                  <th>方向</th>
+                  <th>入场</th>
+                  <th>出场</th>
+                  <th>价格(¢)</th>
+                  <th>盈亏</th>
+                  <th>时长</th>
+                  <th>原因</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(data?.trades ?? []).slice(-12).reverse().map((t) => (
+                  <tr key={`${selectedMarket}-${t.id}`}>
+                    <td><span className={`chip ${t.side === "UP" ? "up" : "down"}`}>{t.side}</span></td>
+                    <td>{formatTime(t.entry_ts_ms, timeMode)}</td>
+                    <td>{formatTime(t.exit_ts_ms, timeMode)}</td>
+                    <td>{t.entry_price_cents.toFixed(2)} → {t.exit_price_cents.toFixed(2)}</td>
+                    <td className={t.pnl_cents >= 0 ? "up" : "down"}>{t.pnl_cents.toFixed(2)}¢</td>
+                    <td>{t.duration_s.toFixed(1)}s</td>
+                    <td>{t.entry_reason} / {t.exit_reason}</td>
+                  </tr>
+                ))}
+                {(data?.trades?.length ?? 0) === 0 ? (
+                  <tr>
+                    <td colSpan={7}>暂无交易样本，等待策略信号触发。</td>
+                  </tr>
+                ) : null}
+              </tbody>
+            </table>
+          </div>
+        </>
+      ) : (
+        <div className="empty-panel">报告已隐藏，仅保留图上进出场标记筛选。</div>
+      )}
     </section>
   );
 });
@@ -826,8 +996,21 @@ export default function App() {
   const [heatmap, setHeatmap] = useState<HeatmapResponse | null>(null);
   const [accuracyTab, setAccuracyTab] = useState<MarketType>("5m");
   const [accuracy, setAccuracy] = useState<AccuracySeriesResponse | null>(null);
-  const [strategyPaper, setStrategyPaper] = useState<StrategyPaperResponse | null>(null);
+  const [strategyMarket, setStrategyMarket] = useState<MarketType>("5m");
+  const [strategyPaper, setStrategyPaper] = useState<Record<MarketType, StrategyPaperResponse | null>>({
+    "5m": null,
+    "15m": null
+  });
   const [strategyLoading, setStrategyLoading] = useState<boolean>(false);
+  const [strategyReportVisible, setStrategyReportVisible] = useState<boolean>(true);
+  const [markerFilters, setMarkerFilters] = useState<MarkerFilters>({
+    enabled: true,
+    showEntry: true,
+    showExit: true,
+    showPaper: true,
+    showLive: true
+  });
+  const [selectedStrategyIds, setSelectedStrategyIds] = useState<string[]>([DEFAULT_STRATEGY_ID]);
   const [errorText, setErrorText] = useState<string>("");
   const [timeMode, setTimeMode] = useState<TimeMode>("local");
   const lastLiveTsRef = useRef<Record<MarketType, number>>({ "5m": 0, "15m": 0 });
@@ -1355,9 +1538,19 @@ export default function App() {
       }
       setStrategyLoading(true);
       try {
-        const data = await getStrategyPaper("5m", 360, 180);
+        const [s5, s15] = await Promise.allSettled([
+          getStrategyPaper("5m", 360, 180),
+          getStrategyPaper("15m", 360, 180)
+        ]);
         if (alive) {
-          setStrategyPaper(data);
+          setStrategyPaper((prev) => ({
+            "5m": s5.status === "fulfilled" ? s5.value : prev["5m"],
+            "15m": s15.status === "fulfilled" ? s15.value : prev["15m"]
+          }));
+          if (s5.status !== "fulfilled" && s15.status !== "fulfilled") {
+            const reason = s5.reason instanceof Error ? s5.reason.message : String(s5.reason);
+            setErrorText(reason);
+          }
         }
       } catch (err) {
         if (alive) {
@@ -1376,6 +1569,76 @@ export default function App() {
       window.clearInterval(id);
     };
   }, []);
+
+  const strategyMarkers = useMemo<Record<MarketType, ChartTradeMarker[]>>(
+    () => ({
+      "5m": buildTradeMarkers("5m", strategyPaper["5m"]?.trades ?? []),
+      "15m": buildTradeMarkers("15m", strategyPaper["15m"]?.trades ?? [])
+    }),
+    [strategyPaper]
+  );
+
+  const availableStrategies = useMemo(() => {
+    const countById = new Map<string, { id: string; label: string; count: number }>();
+    const all = [...strategyMarkers["5m"], ...strategyMarkers["15m"]];
+    for (const marker of all) {
+      const existing = countById.get(marker.strategy_id);
+      if (existing) {
+        existing.count += 1;
+      } else {
+        countById.set(marker.strategy_id, {
+          id: marker.strategy_id,
+          label: marker.strategy_label,
+          count: 1
+        });
+      }
+    }
+    const values = [...countById.values()].sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+    if (values.length === 0) {
+      return [{ id: DEFAULT_STRATEGY_ID, label: DEFAULT_STRATEGY_LABEL, count: 0 }];
+    }
+    return values;
+  }, [strategyMarkers]);
+
+  useEffect(() => {
+    if (selectedStrategyIds.length === 0) {
+      setSelectedStrategyIds([availableStrategies[0]?.id ?? DEFAULT_STRATEGY_ID]);
+      return;
+    }
+    const valid = selectedStrategyIds.filter((id) => availableStrategies.some((s) => s.id === id));
+    if (valid.length === selectedStrategyIds.length && valid.length > 0) {
+      return;
+    }
+    setSelectedStrategyIds(valid.length > 0 ? valid : [availableStrategies[0]?.id ?? DEFAULT_STRATEGY_ID]);
+  }, [availableStrategies, selectedStrategyIds]);
+
+  const filteredMarkers = useMemo<Record<MarketType, ChartTradeMarker[]>>(() => {
+    const include = (marker: ChartTradeMarker): boolean => {
+      if (!markerFilters.enabled) {
+        return false;
+      }
+      if (marker.action === "entry" && !markerFilters.showEntry) {
+        return false;
+      }
+      if (marker.action === "exit" && !markerFilters.showExit) {
+        return false;
+      }
+      if (marker.mode === "paper" && !markerFilters.showPaper) {
+        return false;
+      }
+      if (marker.mode === "live" && !markerFilters.showLive) {
+        return false;
+      }
+      if (!selectedStrategyIds.includes(marker.strategy_id)) {
+        return false;
+      }
+      return true;
+    };
+    return {
+      "5m": strategyMarkers["5m"].filter(include),
+      "15m": strategyMarkers["15m"].filter(include)
+    };
+  }, [markerFilters, selectedStrategyIds, strategyMarkers]);
 
   const currentHistory = roundHistory[roundHistoryTab];
   const historyRows = useMemo(() => currentHistory?.rounds ?? [], [currentHistory]);
@@ -1444,6 +1707,7 @@ export default function App() {
         windowType={chartWindow["5m"]}
         onWindowChange={(v) => handleChartWindowChange("5m", v)}
         chart={charts["5m"]}
+        tradeMarkers={filteredMarkers["5m"]}
         loading={chartLoading["5m"]}
       />
 
@@ -1455,10 +1719,24 @@ export default function App() {
         windowType={chartWindow["15m"]}
         onWindowChange={(v) => handleChartWindowChange("15m", v)}
         chart={charts["15m"]}
+        tradeMarkers={filteredMarkers["15m"]}
         loading={chartLoading["15m"]}
       />
 
-      <StrategyPanel data={strategyPaper} loading={strategyLoading} timeMode={timeMode} />
+      <StrategyPanel
+        dataByMarket={strategyPaper}
+        selectedMarket={strategyMarket}
+        onMarketChange={setStrategyMarket}
+        loading={strategyLoading}
+        timeMode={timeMode}
+        reportVisible={strategyReportVisible}
+        onReportVisibleChange={setStrategyReportVisible}
+        markerFilters={markerFilters}
+        onMarkerFiltersChange={setMarkerFilters}
+        availableStrategies={availableStrategies}
+        selectedStrategies={selectedStrategyIds}
+        onSelectedStrategiesChange={setSelectedStrategyIds}
+      />
 
       <section className="panel">
         <header className="panel-head">

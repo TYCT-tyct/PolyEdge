@@ -1,5 +1,7 @@
 export type MarketType = "5m" | "15m";
 export type WindowType = "5m" | "15m" | "30m" | "1h" | "2h" | "4h" | "all";
+export type TradeMarkerAction = "entry" | "exit";
+export type TradeMarkerMode = "paper" | "live";
 
 export interface LiveSnapshot {
   timestamp_ms: number | null;
@@ -172,6 +174,26 @@ export interface StrategyPaperTrade {
   exit_score: number;
   entry_reason: string;
   exit_reason: string;
+  strategy_id?: string | null;
+  strategy_label?: string | null;
+  mode?: TradeMarkerMode | null;
+  round_id?: string | null;
+}
+
+export interface ChartTradeMarker {
+  id: string;
+  market_type: MarketType;
+  mode: TradeMarkerMode;
+  strategy_id: string;
+  strategy_label: string;
+  action: TradeMarkerAction;
+  side: "UP" | "DOWN";
+  timestamp_ms: number;
+  round_id: string | null;
+  price_cents: number | null;
+  pnl_cents: number | null;
+  reason: string | null;
+  detail: string | null;
 }
 
 export interface StrategyPaperResponse {
