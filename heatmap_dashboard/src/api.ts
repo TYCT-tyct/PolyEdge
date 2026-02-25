@@ -146,22 +146,38 @@ function windowToMinutes(view: WindowType): number {
   }
 }
 
+const CHART_LOOKBACK_MAX_MINUTES = 480;
+
+function computeChartLookbackMinutes(view: WindowType): number {
+  if (view === "all") {
+    return CHART_LOOKBACK_MAX_MINUTES;
+  }
+  const viewMinutes = windowToMinutes(view);
+  if (viewMinutes <= 0) {
+    return 180;
+  }
+  // Keep enough history for context while avoiding backend hard-cap truncation
+  // that can return stale segments (flat old data + sudden jump at tail).
+  const withContext = Math.round(viewMinutes * 3);
+  return Math.min(CHART_LOOKBACK_MAX_MINUTES, Math.max(45, withContext));
+}
+
 function maxPointsForView(view: WindowType): number {
   switch (view) {
     case "5m":
-      return 5_000;
+      return 4_000;
     case "15m":
-      return 12_000;
+      return 7_000;
     case "30m":
-      return 24_000;
+      return 10_000;
     case "1h":
-      return 48_000;
+      return 14_000;
     case "2h":
-      return 50_000;
+      return 18_000;
     case "4h":
-      return 50_000;
+      return 22_000;
     default:
-      return 60_000;
+      return 24_000;
   }
 }
 
@@ -383,8 +399,7 @@ export async function getLatestAllRaw(): Promise<LatestRawRow[]> {
 }
 
 export async function getChart(marketType: MarketType, view: WindowType): Promise<ChartResponse> {
-  const viewMinutes = windowToMinutes(view);
-  const minutes = view === "all" ? 12 * 60 : Math.max(6 * 60, viewMinutes * 12);
+  const minutes = computeChartLookbackMinutes(view);
   const maxPoints = maxPointsForView(view);
   const qs = new URLSearchParams({
     market_type: marketType,
