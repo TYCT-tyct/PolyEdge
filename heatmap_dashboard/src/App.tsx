@@ -767,6 +767,7 @@ const StrategyPanel = memo(function StrategyPanel({ data, loading, timeMode }: S
           <thead>
             <tr>
               <th>方向</th>
+              <th>轮次</th>
               <th>入场</th>
               <th>出场</th>
               <th>价格(¢)</th>
@@ -780,18 +781,29 @@ const StrategyPanel = memo(function StrategyPanel({ data, loading, timeMode }: S
             {(data?.trades ?? []).slice(-12).reverse().map((t) => (
               <tr key={t.id}>
                 <td><span className={`chip ${t.side === "UP" ? "up" : "down"}`}>{t.side}</span></td>
+                <td>{t.entry_round_id.length > 20 ? `${t.entry_round_id.slice(0, 20)}…` : t.entry_round_id}</td>
                 <td>{formatTime(t.entry_ts_ms, timeMode)}</td>
                 <td>{formatTime(t.exit_ts_ms, timeMode)}</td>
-                <td>{t.entry_price_cents.toFixed(2)} → {t.exit_price_cents.toFixed(2)}</td>
-                <td className={t.pnl_cents >= 0 ? "up" : "down"}>{t.pnl_cents.toFixed(2)}¢</td>
-                <td>{(t.total_cost_cents ?? 0).toFixed(2)}¢</td>
+                <td>
+                  <div>{t.entry_price_raw_cents.toFixed(2)} → {t.exit_price_raw_cents.toFixed(2)}</div>
+                  <small className="muted">exec {t.entry_price_cents.toFixed(2)} → {t.exit_price_cents.toFixed(2)}</small>
+                </td>
+                <td className={(t.pnl_net_cents ?? t.pnl_cents) >= 0 ? "up" : "down"}>
+                  {(t.pnl_net_cents ?? t.pnl_cents).toFixed(2)}¢
+                </td>
+                <td>
+                  <div>{(t.total_cost_cents ?? 0).toFixed(2)}¢</div>
+                  <small className="muted">
+                    fee {(t.entry_fee_cents + t.exit_fee_cents).toFixed(2)} · slip {(t.entry_slippage_cents + t.exit_slippage_cents).toFixed(2)}
+                  </small>
+                </td>
                 <td>{t.duration_s.toFixed(1)}s</td>
                 <td>{t.entry_reason} / {t.exit_reason}</td>
               </tr>
             ))}
             {(data?.trades?.length ?? 0) === 0 ? (
               <tr>
-                <td colSpan={8}>暂无交易样本，等待策略信号触发。</td>
+                <td colSpan={9}>暂无交易样本，等待策略信号触发。</td>
               </tr>
             ) : null}
           </tbody>

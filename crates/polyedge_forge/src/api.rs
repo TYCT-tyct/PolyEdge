@@ -1761,7 +1761,7 @@ impl Default for StrategyRuntimeConfig {
             endgame_remaining_ms: 13_670,
             liquidity_widen_prob: 0.08860501062699792,
             cooldown_ms: 0,
-            max_entries_per_round: 2,
+            max_entries_per_round: 8,
             max_exec_spread_cents: 1.8976549355450667,
             slippage_cents_per_side: 0.06918614011422781,
             fee_cents_per_side: 0.03270800007174326,
@@ -1796,6 +1796,20 @@ fn side_spread(sample: &StrategySample, side: StrategySide) -> f64 {
         StrategySide::Up => sample.spread_up,
         StrategySide::Down => sample.spread_down,
     }
+}
+
+fn estimate_exit_total_cost_cents(
+    entry_price_raw_cents: f64,
+    cfg: &StrategyRuntimeConfig,
+) -> f64 {
+    // Conservative estimate for the eventual exit cost:
+    // - taker fee around midpoint between entry raw price and upper payout zone
+    // - one-side slippage
+    // - a small reserve for spread deterioration
+    let exit_ref_price_cents = ((entry_price_raw_cents + 99.0) * 0.5).clamp(1.0, 99.0);
+    let est_exit_fee_cents = cfg.fee_cents_per_side + dynamic_taker_fee_cents(exit_ref_price_cents);
+    let spread_reserve_cents = cfg.max_exec_spread_cents * 0.15;
+    cfg.slippage_cents_per_side + est_exit_fee_cents + spread_reserve_cents
 }
 
 fn dynamic_taker_fee_cents(price_cents: f64) -> f64 {
@@ -2701,6 +2715,7 @@ fn run_strategy_simulation(
                 trades.push(json!({
                     "id": trade_id,
                     "side": pos.side.as_str(),
+                    "entry_round_id": pos.entry_round_id,
                     "entry_ts_ms": pos.entry_ts_ms,
                     "exit_ts_ms": sample.ts_ms,
                     "entry_remaining_ms": pos.entry_remaining_ms,
@@ -2737,6 +2752,10 @@ fn run_strategy_simulation(
                     let entry_price =
                         entry_price_raw + cfg.slippage_cents_per_side + entry_fee_cents;
                     let entry_potential = (99.0 - entry_price).max(0.0);
+                    let expected_exit_cost_cents =
+                        estimate_exit_total_cost_cents(entry_price_raw, cfg);
+                    let expected_net_potential =
+                        (entry_potential - expected_exit_cost_cents).max(0.0);
                     let fair_confidence = if side == StrategySide::Up {
                         signal.p_fair_up
                     } else {
@@ -2793,7 +2812,7 @@ fn run_strategy_simulation(
                         && (!is_choppy || anti_chop_override)
                         && entry_price <= cfg.entry_max_price_cents
                         && side_spread(sample, side) * 100.0 <= entry_spread_guard
-                        && entry_potential >= cfg.entry_min_potential_cents
+                        && expected_net_potential >= cfg.entry_min_potential_cents
                         && round_entries < cfg.max_entries_per_round;
                     if can_flip {
                         position = Some(StrategyPosition {
@@ -2819,6 +2838,8 @@ fn run_strategy_simulation(
             let entry_fee_cents = cfg.fee_cents_per_side + dynamic_taker_fee_cents(entry_price_raw);
             let entry_price = entry_price_raw + cfg.slippage_cents_per_side + entry_fee_cents;
             let entry_potential = (99.0 - entry_price).max(0.0);
+            let expected_exit_cost_cents = estimate_exit_total_cost_cents(entry_price_raw, cfg);
+            let expected_net_potential = (entry_potential - expected_exit_cost_cents).max(0.0);
             let fair_confidence = if side == StrategySide::Up {
                 signal.p_fair_up
             } else {
@@ -2876,7 +2897,7 @@ fn run_strategy_simulation(
                 && entry_spread_cents <= cfg.max_exec_spread_cents
                 && entry_spread_cents <= entry_spread_guard
                 && entry_price <= cfg.entry_max_price_cents
-                && entry_potential >= cfg.entry_min_potential_cents;
+                && expected_net_potential >= cfg.entry_min_potential_cents;
             let cooled_down = last_exit_ts_ms <= 0
                 || sample.ts_ms.saturating_sub(last_exit_ts_ms) >= cfg.cooldown_ms;
             if can_enter && cooled_down && round_entries < cfg.max_entries_per_round {
@@ -2928,6 +2949,7 @@ fn run_strategy_simulation(
         trades.push(json!({
             "id": trade_id,
             "side": pos.side.as_str(),
+            "entry_round_id": pos.entry_round_id,
             "entry_ts_ms": pos.entry_ts_ms,
             "exit_ts_ms": last.ts_ms,
             "entry_remaining_ms": pos.entry_remaining_ms,
@@ -3222,7 +3244,7 @@ async fn strategy_paper(
         cfg.cooldown_ms = v.clamp(0, 120_000);
     }
     if let Some(v) = params.max_entries_per_round {
-        cfg.max_entries_per_round = v.clamp(1, 8) as usize;
+        cfg.max_entries_per_round = v.clamp(1, 16) as usize;
     }
     if let Some(v) = params.max_exec_spread_cents {
         cfg.max_exec_spread_cents = v.clamp(0.2, 30.0);
@@ -3769,7 +3791,7 @@ fn clamp_runtime_cfg(cfg: &mut StrategyRuntimeConfig) {
     cfg.endgame_remaining_ms = cfg.endgame_remaining_ms.clamp(1_000, 180_000);
     cfg.liquidity_widen_prob = cfg.liquidity_widen_prob.clamp(0.01, 0.2);
     cfg.cooldown_ms = cfg.cooldown_ms.clamp(0, 120_000);
-    cfg.max_entries_per_round = cfg.max_entries_per_round.clamp(1, 8);
+    cfg.max_entries_per_round = cfg.max_entries_per_round.clamp(1, 16);
     cfg.max_exec_spread_cents = cfg.max_exec_spread_cents.clamp(0.8, 12.0);
     cfg.slippage_cents_per_side = cfg.slippage_cents_per_side.clamp(0.03, 4.0);
     cfg.fee_cents_per_side = cfg.fee_cents_per_side.clamp(0.03, 4.0);

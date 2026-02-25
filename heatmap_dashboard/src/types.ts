@@ -161,6 +161,7 @@ export interface AccuracySeriesResponse {
 export interface StrategyPaperTrade {
   id: number;
   side: "UP" | "DOWN";
+  entry_round_id: string;
   entry_ts_ms: number;
   exit_ts_ms: number;
   entry_price_cents: number;
