@@ -2647,6 +2647,9 @@ fn run_strategy_simulation(
                 && pnl >= (cfg.trail_activate_profit_cents * 0.50).max(0.9)
                 && drawdown >= (pos.peak_pnl_cents * 0.35).max(cfg.trail_drawdown_cents * 0.90)
                 && trend_signed <= 0.02;
+            let endgame_risk_off = sample.remaining_ms <= (cfg.endgame_remaining_ms / 2).max(2_000)
+                && pnl <= -(cfg.stop_loss_cents * 0.45).max(1.2)
+                && trend_signed <= -0.03;
             let first_reversal_take_profit = can_exit_now
                 && pnl >= (cfg.trail_drawdown_cents * 0.45).max(1.0)
                 && trend_signed <= -0.05
@@ -2664,6 +2667,8 @@ fn run_strategy_simulation(
                 && bid_cents_exec >= cfg.endgame_take_profit_cents
             {
                 exit_reason = Some("endgame_take_profit");
+            } else if endgame_risk_off {
+                exit_reason = Some("endgame_risk_off");
             } else if peak_retrace_lock {
                 exit_reason = Some("peak_retrace_lock");
             } else if profit_lock_reversal {
@@ -2699,6 +2704,7 @@ fn run_strategy_simulation(
                     "round_rollover"
                         | "stop_loss"
                         | "endgame_take_profit"
+                        | "endgame_risk_off"
                         | "fast_loss_guard"
                         | "early_hard_stop"
                         | "profit_flip_negative"
