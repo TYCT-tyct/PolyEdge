@@ -1,0 +1,13 @@
+{
+  "entry_threshold_base": 0.599103,
+  "entry_threshold_cap": 0.828918,
+  "entry_edge_prob": 0.03,
+  "entry_min_potential_cents": 10.32355,
+  "entry_max_price_cents": 72.915692,
+  "min_hold_ms": 3702,
+  "stop_loss_cents": 4.369163,
+  "trail_activate_profit_cents": 2.2,
+  "trail_drawdown_cents": 2.265089,
+  "spread_limit_prob": 0.022381,
+  "max_exec_spread_cents": 1.48597
+}
