@@ -5,6 +5,7 @@ import {
   getAccuracySeries,
   getAvailableRounds,
   getChart,
+  getCollectorStatus,
   getHeatmap,
   getLatestAllRaw,
   getRoundChart,
@@ -21,6 +22,7 @@ import type {
   AvailableRoundsResponse,
   ChartPoint,
   ChartResponse,
+  CollectorStatusResponse,
   HeatmapCell,
   HeatmapResponse,
   LiveSnapshot,
@@ -47,6 +49,7 @@ const LIVE_POLL_MS = 900;
 const WS_STALE_FALLBACK_MS = 3000;
 const LIVE_UI_MIN_INTERVAL_MS = 900;
 const ET_TIMEZONE = "America/New_York";
+const COLLECTOR_POLL_MS = 5_000;
 
 type TimeMode = "local" | "et";
 
@@ -69,9 +72,43 @@ function windowToMinutes(view: WindowType): number {
   }
 }
 
-function trimPointsToWindow(points: ChartPoint[], view: WindowType, _nowMs: number): ChartPoint[] {
+function maxLocalPointsForView(view: WindowType): number {
+  switch (view) {
+    case "5m":
+      return 3_500;
+    case "15m":
+      return 5_500;
+    case "30m":
+      return 7_500;
+    case "1h":
+      return 10_000;
+    case "2h":
+      return 14_000;
+    case "4h":
+      return 18_000;
+    default:
+      return 26_000;
+  }
+}
+
+function trimPointsToWindow(points: ChartPoint[], view: WindowType, nowMs: number): ChartPoint[] {
+  if (points.length === 0) {
+    return points;
+  }
   let next = points;
-  const cap = view === "all" ? 36_000 : 24_000;
+  const viewMinutes = windowToMinutes(view);
+  if (viewMinutes > 0) {
+    const latestTs = points[points.length - 1]?.timestamp_ms ?? nowMs;
+    const anchorTs = Math.max(nowMs, latestTs);
+    const cutoffTs = anchorTs - viewMinutes * 60_000;
+    const start = points.findIndex((p) => p.timestamp_ms >= cutoffTs);
+    if (start >= 0) {
+      next = points.slice(start);
+    } else {
+      next = points.slice(-1);
+    }
+  }
+  const cap = maxLocalPointsForView(view);
   if (next.length > cap) {
     next = next.slice(next.length - cap);
   }
@@ -360,6 +397,16 @@ function formatTime(ts: number | null | undefined, mode: TimeMode): string {
     minute: "2-digit",
     second: "2-digit"
   }).format(new Date(ts));
+}
+
+function formatAgeMs(v: number | null | undefined): string {
+  if (v == null || !Number.isFinite(v) || v < 0) {
+    return "--";
+  }
+  if (v < 1_000) {
+    return `${Math.round(v)}ms`;
+  }
+  return `${(v / 1_000).toFixed(v >= 10_000 ? 0 : 1)}s`;
 }
 
 function formatBps(v: number | null | undefined, unit = "bps/s"): string {
@@ -820,6 +867,7 @@ export default function App() {
     "15m": null
   });
   const [stats, setStats] = useState<StatsResponse | null>(null);
+  const [collectorStatus, setCollectorStatus] = useState<CollectorStatusResponse | null>(null);
   const [chartWindow, setChartWindow] = useState<Record<MarketType, WindowType>>({
     "5m": "30m",
     "15m": "30m"
@@ -1129,6 +1177,20 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") {
+        return;
+      }
+      void loadChartFor("5m", chartWindowRef.current["5m"]);
+      void loadChartFor("15m", chartWindowRef.current["15m"]);
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [loadChartFor]);
+
+  useEffect(() => {
     let alive = true;
     const run = async () => {
       try {
@@ -1163,14 +1225,21 @@ export default function App() {
       }
       const currentWindow = chartWindowRef.current["5m"];
       const rem = stableLiveRef.current["5m"]?.time_remaining_s ?? 999;
+      const wsFresh =
+        wsStatusRef.current === "open" &&
+        Date.now() - (lastWsTickMsRef.current || 0) < WS_STALE_FALLBACK_MS;
       const delay =
         rem <= 1
           ? 900
           : rem <= 8
             ? 2_000
-            : currentWindow === "all"
-              ? 12_000
-              : 7_500;
+            : wsFresh
+              ? currentWindow === "all"
+                ? 18_000
+                : 12_000
+              : currentWindow === "all"
+                ? 12_000
+                : 7_500;
       timer = window.setTimeout(loop, delay);
     };
     void loop();
@@ -1194,14 +1263,21 @@ export default function App() {
       }
       const currentWindow = chartWindowRef.current["15m"];
       const rem = stableLiveRef.current["15m"]?.time_remaining_s ?? 999;
+      const wsFresh =
+        wsStatusRef.current === "open" &&
+        Date.now() - (lastWsTickMsRef.current || 0) < WS_STALE_FALLBACK_MS;
       const delay =
         rem <= 1
           ? 900
           : rem <= 10
             ? 2_200
-            : currentWindow === "all"
-              ? 16_000
-              : 9_500;
+            : wsFresh
+              ? currentWindow === "all"
+                ? 20_000
+                : 14_000
+              : currentWindow === "all"
+                ? 16_000
+                : 9_500;
       timer = window.setTimeout(loop, delay);
     };
     void loop();
@@ -1238,10 +1314,11 @@ export default function App() {
         }
       }
     };
-    void load();
-    const id = window.setInterval(load, 12_000);
+    const first = window.setTimeout(load, 1_200);
+    const id = window.setInterval(load, 20_000);
     return () => {
       alive = false;
+      window.clearTimeout(first);
       window.clearInterval(id);
     };
   }, []);
@@ -1268,10 +1345,11 @@ export default function App() {
         }
       }
     };
-    void load();
+    const first = window.setTimeout(load, 1_600);
     const id = window.setInterval(load, 60000);
     return () => {
       alive = false;
+      window.clearTimeout(first);
       window.clearInterval(id);
     };
   }, [explorerTab]);
@@ -1337,10 +1415,11 @@ export default function App() {
         }
       }
     };
-    void load();
-    const id = window.setInterval(load, 45_000);
+    const first = window.setTimeout(load, 2_200);
+    const id = window.setInterval(load, 60_000);
     return () => {
       alive = false;
+      window.clearTimeout(first);
       window.clearInterval(id);
     };
   }, [heatmapTab]);
@@ -1362,10 +1441,11 @@ export default function App() {
         }
       }
     };
-    void load();
-    const id = window.setInterval(load, 45_000);
+    const first = window.setTimeout(load, 2_600);
+    const id = window.setInterval(load, 60_000);
     return () => {
       alive = false;
+      window.clearTimeout(first);
       window.clearInterval(id);
     };
   }, [accuracyTab]);
@@ -1378,7 +1458,7 @@ export default function App() {
       }
       setStrategyLoading(true);
       try {
-        const data = await getStrategyPaper("5m", 360, 180);
+        const data = await getStrategyPaper("5m", 240, 120);
         if (alive) {
           setStrategyPaper(data);
         }
@@ -1392,10 +1472,35 @@ export default function App() {
         }
       }
     };
-    void load();
-    const id = window.setInterval(load, 6_000);
+    const first = window.setTimeout(load, 3_000);
+    const id = window.setInterval(load, 25_000);
     return () => {
       alive = false;
+      window.clearTimeout(first);
+      window.clearInterval(id);
+    };
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      if (document.visibilityState !== "visible") {
+        return;
+      }
+      try {
+        const value = await getCollectorStatus();
+        if (alive) {
+          setCollectorStatus(value);
+        }
+      } catch {
+        // keep silent; collector status is advisory.
+      }
+    };
+    const first = window.setTimeout(load, 800);
+    const id = window.setInterval(load, COLLECTOR_POLL_MS);
+    return () => {
+      alive = false;
+      window.clearTimeout(first);
       window.clearInterval(id);
     };
   }, []);
@@ -1405,6 +1510,13 @@ export default function App() {
   const heatmapCells = useMemo(() => heatmap?.cells ?? [], [heatmap]);
   const accuracyPoints = useMemo(() => accuracy?.series ?? [], [accuracy]);
   const explorerDays = useMemo(() => availableRounds[explorerTab]?.days ?? [], [availableRounds, explorerTab]);
+  const collector5m = collectorStatus?.timeframes["5m"] ?? null;
+  const collector15m = collectorStatus?.timeframes["15m"] ?? null;
+  const collectorOverallText = collectorStatus
+    ? collectorStatus.ok
+      ? "采集正常"
+      : "采集中断"
+    : "采集未知";
   const selectedRoundMeta = useMemo(() => {
     const round = roundChart?.round;
     if (!round) {
@@ -1450,6 +1562,15 @@ export default function App() {
             <span>时区: {formatTimeZoneLabel(timeMode)}</span>
             <span>5m: {formatTime(live["5m"]?.timestamp_ms, timeMode)}</span>
             <span>15m: {formatTime(live["15m"]?.timestamp_ms, timeMode)}</span>
+            <span className={collectorStatus ? (collectorStatus.ok ? "up" : "down") : ""}>
+              {collectorOverallText}
+            </span>
+            <span>
+              5m采集: {collector5m?.status ?? "--"} · {formatAgeMs(collector5m?.age_ms ?? null)}
+            </span>
+            <span>
+              15m采集: {collector15m?.status ?? "--"} · {formatAgeMs(collector15m?.age_ms ?? null)}
+            </span>
           </div>
         </div>
       </header>
@@ -1619,6 +1740,17 @@ export default function App() {
         <span>时区: {formatTimeZoneLabel(timeMode)}</span>
         <span>5m最新Tick: {formatTime(live["5m"]?.timestamp_ms, timeMode)}</span>
         <span>15m最新Tick: {formatTime(live["15m"]?.timestamp_ms, timeMode)}</span>
+        <span className={collectorStatus ? (collectorStatus.ok ? "up" : "down") : ""}>
+          {collectorOverallText}
+        </span>
+        <span>
+          5m采集延迟: {formatAgeMs(collector5m?.age_ms ?? null)} · 轮次{" "}
+          {collector5m?.round_id || "--"}
+        </span>
+        <span>
+          15m采集延迟: {formatAgeMs(collector15m?.age_ms ?? null)} · 轮次{" "}
+          {collector15m?.round_id || "--"}
+        </span>
         {errorText ? <span className="down">{errorText}</span> : null}
       </footer>
     </main>

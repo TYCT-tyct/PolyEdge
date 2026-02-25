@@ -78,6 +78,23 @@ export interface StatsResponse {
   market_accuracy_n: number;
 }
 
+export interface CollectorTimeframeStatus {
+  status: "ok" | "lagging" | "stalled" | "missing";
+  timestamp_ms: number | null;
+  age_ms: number | null;
+  remaining_ms: number | null;
+  round_id: string;
+}
+
+export interface CollectorStatusResponse {
+  ok: boolean;
+  ts_ms: number;
+  timeframes: {
+    "5m": CollectorTimeframeStatus;
+    "15m": CollectorTimeframeStatus;
+  };
+}
+
 export interface RoundHistoryRow {
   round_id: string;
   market_id: string;

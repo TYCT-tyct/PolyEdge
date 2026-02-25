@@ -2,6 +2,7 @@ use std::cmp::min;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -15,6 +16,7 @@ use chrono::{DateTime, Utc};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::RwLock;
 use tower_http::services::{ServeDir, ServeFile};
 
 #[derive(Debug, Clone)]
@@ -31,6 +33,54 @@ struct ApiState {
     ch_url: Option<String>,
     redis_prefix: String,
     redis_client: Option<redis::Client>,
+    chart_cache: Arc<RwLock<HashMap<String, ChartCacheEntry>>>,
+}
+
+#[derive(Clone)]
+struct ChartCacheEntry {
+    created_at: Instant,
+    payload: Value,
+}
+
+const CHART_CACHE_TTL_MS: u64 = 900;
+const CHART_CACHE_MAX_ENTRIES: usize = 120;
+
+impl ApiState {
+    async fn chart_cache_get(&self, key: &str) -> Option<Value> {
+        let now = Instant::now();
+        let cache = self.chart_cache.read().await;
+        let entry = cache.get(key)?;
+        if now.duration_since(entry.created_at) > Duration::from_millis(CHART_CACHE_TTL_MS) {
+            return None;
+        }
+        Some(entry.payload.clone())
+    }
+
+    async fn chart_cache_put(&self, key: String, payload: Value) {
+        let now = Instant::now();
+        let mut cache = self.chart_cache.write().await;
+        if cache.len() >= CHART_CACHE_MAX_ENTRIES {
+            cache.retain(|_, v| now.duration_since(v.created_at) <= Duration::from_secs(15));
+            if cache.len() >= CHART_CACHE_MAX_ENTRIES {
+                let mut oldest: Vec<(String, Instant)> = cache
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.created_at))
+                    .collect();
+                oldest.sort_by_key(|(_, ts)| *ts);
+                let remove_n = cache.len().saturating_sub(CHART_CACHE_MAX_ENTRIES / 2);
+                for (k, _) in oldest.into_iter().take(remove_n) {
+                    cache.remove(&k);
+                }
+            }
+        }
+        cache.insert(
+            key,
+            ChartCacheEntry {
+                created_at: now,
+                payload,
+            },
+        );
+    }
 }
 
 const LIVE_SNAPSHOT_MAX_AGE_MS: i64 = 4_000;
@@ -241,6 +291,7 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         ch_url: cfg.clickhouse_url,
         redis_prefix: cfg.redis_prefix,
         redis_client,
+        chart_cache: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let mut app = Router::new()
@@ -261,6 +312,7 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
             get(history_symbol_timeframe),
         )
         .route("/api/stats", get(stats))
+        .route("/api/collector/status", get(collector_status))
         .route("/api/chart", get(chart))
         .route("/api/chart/round", get(chart_round))
         .route("/api/rounds", get(rounds))
@@ -844,6 +896,68 @@ async fn stats(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
     })))
 }
 
+async fn collector_status(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    let now_ms = Utc::now().timestamp_millis();
+    let mut tf_map = serde_json::Map::new();
+    let mut overall_ok = true;
+
+    for tf in ["5m", "15m"] {
+        let snapshot = match fetch_latest_snapshot(&state, "BTCUSDT", tf).await? {
+            Some(v) => Some(v),
+            None => fetch_latest_snapshot_from_clickhouse(&state, "BTCUSDT", tf).await?,
+        };
+
+        let status_value = if let Some(row) = snapshot {
+            let ts_ms = row
+                .get("ts_ireland_sample_ms")
+                .or_else(|| row.get("timestamp_ms"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let age_ms = if ts_ms > 0 {
+                now_ms.saturating_sub(ts_ms)
+            } else {
+                i64::MAX
+            };
+            let remaining_ms = snapshot_remaining_ms(&row);
+            let status = if ts_ms <= 0 {
+                overall_ok = false;
+                "missing"
+            } else if age_ms <= LIVE_SNAPSHOT_MAX_AGE_MS {
+                "ok"
+            } else if age_ms <= LIVE_SNAPSHOT_MAX_AGE_MS * 3 {
+                overall_ok = false;
+                "lagging"
+            } else {
+                overall_ok = false;
+                "stalled"
+            };
+            json!({
+                "status": status,
+                "timestamp_ms": if ts_ms > 0 { Some(ts_ms) } else { None::<i64> },
+                "age_ms": if ts_ms > 0 { Some(age_ms) } else { None::<i64> },
+                "remaining_ms": remaining_ms,
+                "round_id": row.get("round_id").and_then(Value::as_str).unwrap_or_default(),
+            })
+        } else {
+            overall_ok = false;
+            json!({
+                "status": "missing",
+                "timestamp_ms": Value::Null,
+                "age_ms": Value::Null,
+                "remaining_ms": Value::Null,
+                "round_id": "",
+            })
+        };
+        tf_map.insert(tf.to_string(), status_value);
+    }
+
+    Ok(Json(json!({
+        "ok": overall_ok,
+        "ts_ms": now_ms,
+        "timeframes": Value::Object(tf_map),
+    })))
+}
+
 async fn chart(
     State(state): State<ApiState>,
     Query(params): Query<ChartQueryParams>,
@@ -852,6 +966,20 @@ async fn chart(
         .ok_or_else(|| ApiError::bad_request("invalid market_type"))?;
     let minutes = params.minutes.unwrap_or(30).min(7 * 24 * 60);
     let max_points = params.max_points.unwrap_or(1500).clamp(200, 20_000) as usize;
+    let cache_key = format!("{}:{}:{}", market_type, minutes, max_points);
+    if let Some(cached) = state.chart_cache_get(&cache_key).await {
+        return Ok(Json(cached));
+    }
+    let raw_limit = (max_points.saturating_mul(12)).clamp(6_000, 120_000);
+    let round_limit = {
+        let tf_minutes = if market_type == "5m" { 5usize } else { 15usize };
+        let round_span_minutes = if minutes == 0 {
+            2 * 24 * 60
+        } else {
+            minutes as usize
+        };
+        (round_span_minutes / tf_minutes + 128).clamp(300, 4000)
+    };
 
     let Some(ch_url) = state.ch_url.as_deref() else {
         return Err(ApiError::internal("clickhouse not configured"));
@@ -866,7 +994,9 @@ async fn chart(
     };
 
     let point_query = format!(
-        "SELECT
+        "SELECT *
+        FROM (
+            SELECT
             ts_ireland_sample_ms AS timestamp_ms,
             delta_pct,
             delta_pct_smooth,
@@ -886,13 +1016,17 @@ async fn chart(
         WHERE symbol='BTCUSDT'
           AND timeframe='{market_type}'
           {from_clause}
-        ORDER BY ts_ireland_sample_ms ASC
-        LIMIT 300000
+        ORDER BY ts_ireland_sample_ms DESC
+        LIMIT {raw_limit}
+        )
+        ORDER BY timestamp_ms ASC
         FORMAT JSON"
     );
 
     let round_query = format!(
-        "SELECT
+        "SELECT *
+        FROM (
+            SELECT
             round_id,
             start_ts_ms,
             end_ts_ms,
@@ -902,8 +1036,10 @@ async fn chart(
         WHERE symbol='BTCUSDT'
           AND timeframe='{market_type}'
           {}
+        ORDER BY end_ts_ms DESC
+        LIMIT {round_limit}
+        )
         ORDER BY end_ts_ms ASC
-        LIMIT 4000
         FORMAT JSON",
         if minutes == 0 {
             "".to_string()
@@ -929,13 +1065,15 @@ async fn chart(
         points = stride_downsample(points, step);
     }
 
-    Ok(Json(json!({
+    let payload = json!({
         "points": points,
         "rounds": rounds,
         "total_samples": total_samples,
         "downsampled": step > 1,
         "step": step,
-    })))
+    });
+    state.chart_cache_put(cache_key, payload.clone()).await;
+    Ok(Json(payload))
 }
 
 async fn chart_round(
@@ -1744,25 +1882,25 @@ struct StrategyRuntimeConfig {
 impl Default for StrategyRuntimeConfig {
     fn default() -> Self {
         Self {
-            entry_threshold_base: 0.5939352595230849,
-            entry_threshold_cap: 0.7985663865236549,
-            spread_limit_prob: 0.017797835094784734,
-            entry_edge_prob: 0.03795892066323482,
-            entry_min_potential_cents: 9.989605484915419,
-            entry_max_price_cents: 75.80606349403007,
-            min_hold_ms: 5_200,
-            stop_loss_cents: 3.3,
+            entry_threshold_base: 0.599103,
+            entry_threshold_cap: 0.828918,
+            spread_limit_prob: 0.022381,
+            entry_edge_prob: 0.03,
+            entry_min_potential_cents: 10.32355,
+            entry_max_price_cents: 72.915692,
+            min_hold_ms: 3_702,
+            stop_loss_cents: 4.369163,
             reverse_signal_threshold: -0.6368297565445915,
             reverse_signal_ticks: 1,
-            trail_activate_profit_cents: 2.8974573714314817,
-            trail_drawdown_cents: 2.9359444862875725,
+            trail_activate_profit_cents: 2.2,
+            trail_drawdown_cents: 2.265089,
             take_profit_near_max_cents: 87.74805411830562,
             endgame_take_profit_cents: 86.18788390856207,
             endgame_remaining_ms: 13_670,
             liquidity_widen_prob: 0.08860501062699792,
             cooldown_ms: 0,
-            max_entries_per_round: 8,
-            max_exec_spread_cents: 1.8976549355450667,
+            max_entries_per_round: 10,
+            max_exec_spread_cents: 1.48597,
             slippage_cents_per_side: 0.06918614011422781,
             fee_cents_per_side: 0.03270800007174326,
             emergency_wide_spread_penalty_ratio: 0.27217322622042583,
@@ -2806,18 +2944,20 @@ fn run_strategy_simulation(
                     let round_entries =
                         entries_by_round.get(&sample.round_id).copied().unwrap_or(0);
                     let is_reentry = round_entries > 0;
+                    let reentry_extra = round_entries.saturating_sub(1) as f64;
                     let signal_required_effective = if is_reentry {
-                        (signal_required + 0.12 + local_vol * 1.8).min(0.995)
+                        (signal_required + 0.06 + local_vol * 0.9 + reentry_extra * 0.015)
+                            .min(0.992)
                     } else {
                         signal_required
                     };
                     let edge_required_effective = if is_reentry {
-                        edge_required * 1.55
+                        edge_required * (1.20 + reentry_extra * 0.06)
                     } else {
                         edge_required
                     };
                     let confidence_required = if is_reentry {
-                        (confidence_floor + 0.04).min(0.985)
+                        (confidence_floor + 0.02 + reentry_extra * 0.01).min(0.98)
                     } else {
                         confidence_floor
                     };
@@ -2889,18 +3029,19 @@ fn run_strategy_simulation(
             let anti_chop_override = fair_confidence >= (confidence_floor + 0.08).min(0.95);
             let round_entries = entries_by_round.get(&sample.round_id).copied().unwrap_or(0);
             let is_reentry = round_entries > 0;
+            let reentry_extra = round_entries.saturating_sub(1) as f64;
             let signal_required_effective = if is_reentry {
-                (signal_required + 0.12 + local_vol * 1.8).min(0.995)
+                (signal_required + 0.06 + local_vol * 0.9 + reentry_extra * 0.015).min(0.992)
             } else {
                 signal_required
             };
             let edge_required_effective = if is_reentry {
-                edge_required * 1.55
+                edge_required * (1.20 + reentry_extra * 0.06)
             } else {
                 edge_required
             };
             let confidence_required = if is_reentry {
-                (confidence_floor + 0.04).min(0.985)
+                (confidence_floor + 0.02 + reentry_extra * 0.01).min(0.98)
             } else {
                 confidence_floor
             };

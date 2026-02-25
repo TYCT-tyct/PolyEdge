@@ -3,6 +3,7 @@ import type {
   AvailableRoundsResponse,
   ChartPoint,
   ChartResponse,
+  CollectorStatusResponse,
   HeatmapResponse,
   MarketType,
   RoundChartResponse,
@@ -18,8 +19,10 @@ const REQUEST_TIMEOUT_MS = 10_000;
 const RESOLVED_UP_PRICE_CENTS = 99.0;
 const RESOLVED_DOWN_PRICE_CENTS = 0.0;
 const inflightRequests = new Map<string, Promise<unknown>>();
+const responseCache = new Map<string, { expiresAt: number; value: unknown }>();
 const apiSupport: {
   stats: boolean | null;
+  collectorStatus: boolean | null;
   chart: boolean | null;
   rounds: boolean | null;
   roundsAvailable: boolean | null;
@@ -28,6 +31,7 @@ const apiSupport: {
   accuracy: boolean | null;
 } = {
   stats: null,
+  collectorStatus: null,
   chart: null,
   rounds: null,
   roundsAvailable: null,
@@ -35,6 +39,22 @@ const apiSupport: {
   heatmap: null,
   accuracy: null
 };
+
+function responseCacheTtlMs(path: string): number {
+  if (path.startsWith("/api/chart?")) {
+    return 1_200;
+  }
+  if (path === "/api/latest/all") {
+    return 700;
+  }
+  if (path === "/api/stats") {
+    return 2_000;
+  }
+  if (path === "/api/collector/status") {
+    return 1_500;
+  }
+  return 0;
+}
 
 interface HistoryRaw {
   sample_count: number;
@@ -103,6 +123,13 @@ function buildWsUrl(path: string): string {
 
 async function requestJson<T>(path: string): Promise<T> {
   const key = buildHttpUrl(path);
+  const ttlMs = responseCacheTtlMs(path);
+  if (ttlMs > 0) {
+    const cached = responseCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.value as T;
+    }
+  }
   const existing = inflightRequests.get(key);
   if (existing) {
     return (await existing) as T;
@@ -117,7 +144,19 @@ async function requestJson<T>(path: string): Promise<T> {
       const text = await resp.text();
       throw new HttpError(resp.status, `HTTP ${resp.status}: ${text}`);
     }
-    return (await resp.json()) as T;
+    const value = (await resp.json()) as T;
+    if (ttlMs > 0) {
+      if (responseCache.size >= 256) {
+        const now = Date.now();
+        for (const [cacheKey, entry] of responseCache.entries()) {
+          if (entry.expiresAt <= now) {
+            responseCache.delete(cacheKey);
+          }
+        }
+      }
+      responseCache.set(key, { expiresAt: Date.now() + ttlMs, value });
+    }
+    return value;
   })();
   inflightRequests.set(key, req as Promise<unknown>);
   try {
@@ -146,7 +185,7 @@ function windowToMinutes(view: WindowType): number {
   }
 }
 
-const CHART_LOOKBACK_MAX_MINUTES = 480;
+const CHART_LOOKBACK_MAX_MINUTES = 360;
 
 function computeChartLookbackMinutes(view: WindowType): number {
   if (view === "all") {
@@ -154,30 +193,30 @@ function computeChartLookbackMinutes(view: WindowType): number {
   }
   const viewMinutes = windowToMinutes(view);
   if (viewMinutes <= 0) {
-    return 180;
+    return 120;
   }
-  // Keep enough history for context while avoiding backend hard-cap truncation
-  // that can return stale segments (flat old data + sudden jump at tail).
-  const withContext = Math.round(viewMinutes * 3);
-  return Math.min(CHART_LOOKBACK_MAX_MINUTES, Math.max(45, withContext));
+  // Keep modest context for bucket/indicator stability, but avoid loading
+  // significantly more than the selected display window.
+  const withContext = Math.round(viewMinutes * 2);
+  return Math.min(CHART_LOOKBACK_MAX_MINUTES, Math.max(30, withContext));
 }
 
 function maxPointsForView(view: WindowType): number {
   switch (view) {
     case "5m":
-      return 4_000;
+      return 2_500;
     case "15m":
-      return 7_000;
+      return 4_500;
     case "30m":
-      return 10_000;
+      return 6_500;
     case "1h":
-      return 14_000;
+      return 9_000;
     case "2h":
-      return 18_000;
+      return 12_000;
     case "4h":
-      return 22_000;
+      return 15_000;
     default:
-      return 24_000;
+      return 18_000;
   }
 }
 
@@ -365,6 +404,55 @@ export async function getStats(): Promise<StatsResponse> {
     uptime_hours: uptimeHours,
     market_accuracy: null,
     market_accuracy_n: 0
+  };
+}
+
+export async function getCollectorStatus(): Promise<CollectorStatusResponse> {
+  if (apiSupport.collectorStatus !== false) {
+    try {
+      const data = await requestJson<CollectorStatusResponse>("/api/collector/status");
+      apiSupport.collectorStatus = true;
+      return data;
+    } catch (err) {
+      if (!(err instanceof HttpError) || err.status !== 404) {
+        throw err;
+      }
+      apiSupport.collectorStatus = false;
+    }
+  }
+  const nowMs = Date.now();
+  const rows = await getLatestAllRaw();
+  const makeRow = (tf: MarketType) => {
+    const latest = rows
+      .filter((r) => r.timeframe === tf)
+      .sort((a, b) => b.ts_ireland_sample_ms - a.ts_ireland_sample_ms)[0];
+    if (!latest) {
+      return {
+        status: "missing",
+        timestamp_ms: null,
+        age_ms: null,
+        remaining_ms: null,
+        round_id: ""
+      } as const;
+    }
+    const age = Math.max(0, nowMs - latest.ts_ireland_sample_ms);
+    return {
+      status: age <= 4_000 ? "ok" : age <= 12_000 ? "lagging" : "stalled",
+      timestamp_ms: latest.ts_ireland_sample_ms,
+      age_ms: age,
+      remaining_ms: latest.remaining_ms,
+      round_id: latest.round_id
+    } as const;
+  };
+  const r5 = makeRow("5m");
+  const r15 = makeRow("15m");
+  return {
+    ok: r5.status === "ok" && r15.status === "ok",
+    ts_ms: nowMs,
+    timeframes: {
+      "5m": r5,
+      "15m": r15
+    }
   };
 }
 

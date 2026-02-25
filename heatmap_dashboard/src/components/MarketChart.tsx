@@ -267,6 +267,41 @@ function slicePointsByDomain(points: ChartPoint[], domain: DomainRange | null): 
   return points.filter((p) => p.timestamp_ms >= domain.minMs && p.timestamp_ms <= domain.maxMs);
 }
 
+function maxRenderPointsForWindow(windowType: WindowType): number {
+  switch (windowType) {
+    case "5m":
+      return 2_400;
+    case "15m":
+      return 3_200;
+    case "30m":
+      return 4_000;
+    case "1h":
+      return 5_000;
+    case "2h":
+      return 6_000;
+    case "4h":
+      return 8_000;
+    default:
+      return 10_000;
+  }
+}
+
+function sampleEvenly(points: ChartPoint[], maxPoints: number): ChartPoint[] {
+  if (points.length <= maxPoints) {
+    return points;
+  }
+  const step = Math.ceil(points.length / maxPoints);
+  const out: ChartPoint[] = [];
+  for (let i = 0; i < points.length; i += step) {
+    out.push(points[i]!);
+  }
+  const last = points[points.length - 1];
+  if (out[out.length - 1] !== last) {
+    out.push(last!);
+  }
+  return out;
+}
+
 function sortAndDedupePoints(points: ChartPoint[]): ChartPoint[] {
   if (points.length < 2) {
     return points.filter((p) => Number.isFinite(p.timestamp_ms) && p.timestamp_ms > 0);
@@ -575,7 +610,11 @@ function MarketChartImpl({ points, rounds, windowType = "all", timeMode, height 
   const userAdjustedRef = useRef(false);
   const lastRoundIdRef = useRef<string>("");
 
-  const prepared = useMemo(() => preparePlot(points), [points]);
+  const renderPoints = useMemo(
+    () => sampleEvenly(points, maxRenderPointsForWindow(windowType)),
+    [points, windowType]
+  );
+  const prepared = useMemo(() => preparePlot(renderPoints), [renderPoints]);
   const domain = useMemo(
     () => computeWindowDomain(prepared.bucketed, windowType),
     [prepared.bucketed, windowType]
@@ -585,7 +624,10 @@ function MarketChartImpl({ points, rounds, windowType = "all", timeMode, height 
     [prepared.bucketed, domain]
   );
   const data = prepared.data;
-  const miniPath = useMemo(() => buildMiniPath(miniPoints, 1200, 38), [miniPoints]);
+  const miniPath = useMemo(
+    () => buildMiniPath(sampleEvenly(miniPoints, 1400), 1200, 38),
+    [miniPoints]
+  );
   const steppedPathBuilder = useMemo(() => uPlot.paths.stepped?.({ align: 1 }), []);
   const axisTimeFormatter = useMemo(
     () =>
