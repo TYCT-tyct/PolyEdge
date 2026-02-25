@@ -29,13 +29,10 @@ import json
 
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
-# Polymarket CLOB enforces probability bounds for order prices.
-# Using a strict clamp here makes the gateway resilient to small slippage widening and
-# prevents avoidable "price out of range" rejects during canaries / micro-live.
-#
-# Note: CLOB books commonly show prices as low as 0.001 and as high as 0.999.
-MIN_PRICE = 0.001
-MAX_PRICE = 0.999
+# py-clob-client enforces this bound in create_order.
+# Keep gateway bounds aligned to avoid avoidable 500s in prebuild/post.
+MIN_PRICE = 0.01
+MAX_PRICE = 0.99
 
 
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -65,6 +62,11 @@ def _ms_now() -> int:
 
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
+
+
+def _normalize_price(v: float) -> float:
+    # Keep deterministic precision for signatures and avoid 0.9900000000002 drift.
+    return round(_clamp(v, MIN_PRICE, MAX_PRICE), 6)
 
 
 def _map_side(side: str) -> Tuple[str, Optional[str]]:
@@ -261,9 +263,11 @@ def post_order(payload: dict = Body(...)) -> JSONResponse:
     if max_slippage_bps > 0:
         slip = max_slippage_bps / 10_000.0
         if side == BUY:
-            price = _clamp(price * (1.0 + slip), MIN_PRICE, MAX_PRICE)
+            price = _normalize_price(price * (1.0 + slip))
         else:
-            price = _clamp(price * (1.0 - slip), MIN_PRICE, MAX_PRICE)
+            price = _normalize_price(price * (1.0 - slip))
+    else:
+        price = _normalize_price(price)
 
     try:
         fee_rate_bps = float(payload.get("fee_rate_bps") or 0.0)
@@ -368,9 +372,11 @@ def prebuild_order(payload: dict = Body(...)) -> JSONResponse:
     if max_slippage_bps > 0:
         slip = max_slippage_bps / 10_000.0
         if side == BUY:
-            price = _clamp(price * (1.0 + slip), MIN_PRICE, MAX_PRICE)
+            price = _normalize_price(price * (1.0 + slip))
         else:
-            price = _clamp(price * (1.0 - slip), MIN_PRICE, MAX_PRICE)
+            price = _normalize_price(price * (1.0 - slip))
+    else:
+        price = _normalize_price(price)
 
     try:
         fee_rate_bps = float(payload.get("fee_rate_bps") or 0.0)
