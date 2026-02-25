@@ -9,6 +9,19 @@ from pathlib import Path
 from urllib import error, parse, request
 
 
+def parse_bool_arg(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    return default
+
+
 def fetch_json(url: str, timeout_sec: int, retries: int = 2) -> dict:
     last_exc: Exception | None = None
     for attempt in range(retries + 1):
@@ -424,6 +437,12 @@ def run_seed_batch_parallel(
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Continuous strategy autotune loop for polyedge_forge")
+    ap.add_argument("--strategy1-enabled", default="true", help="TRUE/FALSE, master switch for strategy-1")
+    ap.add_argument(
+        "--strategy1-autotune-enabled",
+        default="true",
+        help="TRUE/FALSE, autotune switch under strategy-1",
+    )
     ap.add_argument("--base-url", default="http://127.0.0.1:9810")
     ap.add_argument("--market-type", default="5m")
     ap.add_argument("--target-win-rate", type=float, default=90.0)
@@ -467,6 +486,15 @@ def main() -> None:
     ap.add_argument("--max-cycles", type=int, default=0, help="0 means run forever")
     ap.add_argument("--report-file", default="tmp/autotune_loop/report.jsonl")
     args = ap.parse_args()
+
+    strategy1_enabled = parse_bool_arg(args.strategy1_enabled, default=True)
+    strategy1_autotune_enabled = parse_bool_arg(args.strategy1_autotune_enabled, default=True)
+    if not strategy1_enabled:
+        print("[skip] strategy1_enabled=FALSE, autotune loop will not run.", flush=True)
+        return
+    if not strategy1_autotune_enabled:
+        print("[skip] strategy1_autotune_enabled=FALSE, autotune loop will not run.", flush=True)
+        return
 
     report_path = Path(args.report_file)
     report_path.parent.mkdir(parents=True, exist_ok=True)
