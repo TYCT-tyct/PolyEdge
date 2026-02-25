@@ -1,10 +1,13 @@
 [execution]
 mode = "live"
-rate_limit_rps = 2
-http_timeout_ms = 3000
+# Higher per-process send budget for fast micro-live; still bounded by risk limits.
+rate_limit_rps = 8
+# Keep request timeout tight to avoid blocking on stale route.
+http_timeout_ms = 1500
 clob_endpoint = "https://clob.polymarket.com"
 # Optional: separate endpoint for authenticated order operations (typically a localhost gateway).
 # If omitted, the engine uses `clob_endpoint` for both reads and order writes.
 order_endpoint = "http://127.0.0.1:9001"
 order_backup_endpoint = "http://127.0.0.1:9002"
-order_failover_timeout_ms = 200
+# Fast failover to backup local gateway process.
+order_failover_timeout_ms = 120

@@ -25,6 +25,7 @@ mod seat_runtime;
 mod seat_types;
 mod state;
 mod stats_utils;
+mod strategy_live;
 mod strategy_policy;
 mod strategy_runtime;
 mod toxicity_report;

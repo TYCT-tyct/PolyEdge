@@ -112,6 +112,8 @@ class GatewayState:
         self.client_lock = threading.Lock()
         self.tracked_orders: set[str] = set()
         self.tracked_lock = threading.Lock()
+        self.signature_type: Optional[int] = None
+        self.funder: Optional[str] = None
 
         # For debugging readiness without leaking secrets.
         self.ready: bool = False
@@ -128,6 +130,10 @@ def _startup() -> None:
     host = _env("CLOB_HOST", "https://clob.polymarket.com")
     chain_id = int(_env("CLOB_CHAIN_ID", "137") or "137")
     private_key = _env_required("CLOB_PRIVATE_KEY")
+    signature_type = int(_env("CLOB_SIGNATURE_TYPE", "0") or "0")
+    if signature_type < 0:
+        raise RuntimeError("invalid CLOB_SIGNATURE_TYPE: must be >= 0")
+    funder = _env("CLOB_FUNDER")
 
     api_key = _env("CLOB_API_KEY")
     api_secret = _env("CLOB_API_SECRET")
@@ -142,7 +148,16 @@ def _startup() -> None:
                 api_passphrase=api_passphrase,
             )
 
-        client = ClobClient(host=host, chain_id=chain_id, key=private_key, creds=creds)
+        client_kwargs = {
+            "host": host,
+            "chain_id": chain_id,
+            "key": private_key,
+            "creds": creds,
+            "signature_type": signature_type,
+        }
+        if funder:
+            client_kwargs["funder"] = funder
+        client = ClobClient(**client_kwargs)
         if creds is None:
             # Prefer deriving first to avoid creating a new API key on every restart.
             # If none exists yet, fall back to creating one.
@@ -158,6 +173,8 @@ def _startup() -> None:
             client.set_api_creds(derived)
 
         STATE.client = client
+        STATE.signature_type = signature_type
+        STATE.funder = funder
         STATE.ready = True
         STATE.ready_error = ""
     except Exception:
@@ -177,6 +194,8 @@ def health() -> dict:
         "ready_error": STATE.ready_error,
         "ts_ms": _ms_now(),
         "address": addr,
+        "signature_type": STATE.signature_type,
+        "funder": STATE.funder,
     }
 
 

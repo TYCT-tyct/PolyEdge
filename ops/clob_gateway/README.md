@@ -15,6 +15,11 @@ engine does not need to implement EIP-712 signing + CLOB auth.
 - `CLOB_HOST` (default: `https://clob.polymarket.com`)
 - `CLOB_CHAIN_ID` (default: `137`)
 - `CLOB_PRIVATE_KEY`
+- `CLOB_SIGNATURE_TYPE` (default: `0`)
+  - `0`: standard EOA wallet flow
+  - `1`: proxy/Magic wallet flow (commonly used by email/Google login)
+- `CLOB_FUNDER` (recommended when `CLOB_SIGNATURE_TYPE=1`)
+  - For proxy wallets, set this to the funder address used by Polymarket.
 
 API creds (recommended; if missing we try to derive on startup):
 
@@ -44,4 +49,3 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now clob_gateway.service
 curl -fsS http://127.0.0.1:9001/health
 ```
-

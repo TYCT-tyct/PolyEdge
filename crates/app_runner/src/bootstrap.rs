@@ -382,7 +382,7 @@ pub(super) async fn async_main() -> Result<()> {
     if shared.fusion_cfg.read().await.udp_trigger_enabled {
         crate::engine_loop::spawn_udp_ghost_receiver(execution.clone(), shared.clone());
     }
-    crate::engine_loop::spawn_presign_worker(shared.clone());
+    crate::strategy_live::spawn_presign_worker(shared.clone());
     orchestration::spawn_periodic_report_persistor(
         shared.shadow_stats.clone(),
         shared.tox_state.clone(),

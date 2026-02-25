@@ -21,8 +21,7 @@ use taker_sniper::{FireChunk, FirePlan, TakerAction};
 use crate::engine_core::{classify_execution_error_reason, normalize_reject_code};
 use crate::execution_eval::{
     aggressive_price_for_side, calculate_dynamic_taker_fee_bps, edge_gross_bps_for_side,
-    get_fee_rate_bps_cached, get_rebate_bps_cached, mid_for_side, prebuild_order_payload,
-    spread_for_side,
+    get_fee_rate_bps_cached, get_rebate_bps_cached, mid_for_side, spread_for_side,
 };
 use crate::feed_runtime::settlement_prob_yes_for_symbol;
 use crate::fusion_engine::TokenBucket;
@@ -34,6 +33,7 @@ use crate::state::{
     V52TimePhaseConfig,
 };
 use crate::stats_utils::{freshness_ms, now_ns};
+use crate::strategy_live::prepare_live_intent_fastpath;
 use crate::strategy_policy::{
     adaptive_size_scale, edge_gate_bps, inventory_for_market, timeframe_weight,
 };
@@ -3084,44 +3084,7 @@ pub(super) async fn predator_execute_opportunity(
         prebuilt_auth: None,
     };
     let mut v2_intent = v2_intent;
-    if execution.is_live() {
-        let is_taker = execution_style == ExecutionStyle::Taker;
-        let mut cache_hit = false;
-        if is_taker {
-            let side_str = match intent.side {
-                OrderSide::BuyYes => "buy_yes",
-                OrderSide::BuyNo => "buy_no",
-                OrderSide::SellYes => "sell_yes",
-                OrderSide::SellNo => "sell_no",
-            };
-            let key = format!("{}:{}", intent.market_id, side_str);
-            if let Some(mut cached) = shared.presign_cache.write().await.remove(&key) {
-                let age = cached.fetched_at.elapsed();
-                // 45s is safely within the 60s time_window
-                if age < std::time::Duration::from_secs(45) {
-                    v2_intent.price = cached.price;
-                    v2_intent.size = cached.size;
-                    v2_intent.prebuilt_payload = Some(cached.payload_bytes.clone());
-
-                    let t_sec = chrono::Utc::now().timestamp().to_string();
-                    if let Some(hmac) = cached.hmac_signatures.remove(&t_sec) {
-                        cached.auth.timestamp_sec = t_sec;
-                        cached.auth.hmac_signature = hmac;
-                        v2_intent.prebuilt_auth = Some(cached.auth);
-                        cache_hit = true;
-                        tracing::info!(
-                            "🚀 OMEGA-R3 PHASE 2: Cache Hit! Pre-signed EIP712 & HMAC ripped from memory for {} latency bypass.",
-                            key
-                        );
-                    }
-                }
-            }
-        }
-
-        if !cache_hit {
-            v2_intent.prebuilt_payload = prebuild_order_payload(&v2_intent);
-        }
-    }
+    let _cache_hit = prepare_live_intent_fastpath(shared, execution, &mut v2_intent).await;
     let order_build_ms = order_build_start.elapsed().as_secs_f64() * 1_000.0;
     let place_start = Instant::now();
 

@@ -430,7 +430,7 @@ pub(super) struct PrebuiltOrderPayload<'a> {
     hold_to_resolution: bool,
 }
 
-pub(super) fn prebuild_order_payload(intent: &OrderIntentV2) -> Option<Vec<u8>> {
+pub(crate) fn prebuild_order_payload(intent: &OrderIntentV2) -> Option<Vec<u8>> {
     let side = intent.side.to_string();
     let style = intent.style.to_string();
     let tif = intent.tif.to_string();
