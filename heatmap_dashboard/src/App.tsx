@@ -719,9 +719,9 @@ const StrategyPanel = memo(function StrategyPanel({ data, loading, timeMode }: S
           <small>置信度：{current ? `${(current.confidence * 100).toFixed(1)}%` : "--"}</small>
         </article>
         <article className="info-card">
-          <span>累计收益</span>
-          <strong className={(data?.summary.total_pnl_cents ?? 0) >= 0 ? "up" : "down"}>
-            {data ? `${data.summary.total_pnl_cents.toFixed(2)}¢` : "--"}
+          <span>累计净收益</span>
+          <strong className={(data?.summary.net_pnl_cents ?? data?.summary.total_pnl_cents ?? 0) >= 0 ? "up" : "down"}>
+            {data ? `${(data.summary.net_pnl_cents ?? data.summary.total_pnl_cents).toFixed(2)}¢` : "--"}
           </strong>
           <small>
             交易 {data?.summary.trade_count ?? 0} · 胜率 {data ? `${data.summary.win_rate_pct.toFixed(1)}%` : "--"}
@@ -735,6 +735,15 @@ const StrategyPanel = memo(function StrategyPanel({ data, loading, timeMode }: S
             {data ? `${data.summary.avg_pnl_cents.toFixed(2)}¢ / ${data.summary.max_drawdown_cents.toFixed(2)}¢` : "--"}
           </strong>
           <small>平均每笔 / 最大回撤</small>
+        </article>
+        <article className="info-card">
+          <span>毛收益 / 总成本</span>
+          <strong>
+            {data ? `${(data.summary.gross_pnl_cents ?? 0).toFixed(2)}¢ / ${(data.summary.total_cost_cents ?? 0).toFixed(2)}¢` : "--"}
+          </strong>
+          <small>
+            净利润率 {data ? `${(data.summary.net_margin_pct ?? 0).toFixed(2)}%` : "--"}
+          </small>
         </article>
         <article className="info-card">
           <span>盘口状态</span>
@@ -761,7 +770,8 @@ const StrategyPanel = memo(function StrategyPanel({ data, loading, timeMode }: S
               <th>入场</th>
               <th>出场</th>
               <th>价格(¢)</th>
-              <th>盈亏</th>
+              <th>净盈亏</th>
+              <th>成本</th>
               <th>时长</th>
               <th>原因</th>
             </tr>
@@ -774,13 +784,14 @@ const StrategyPanel = memo(function StrategyPanel({ data, loading, timeMode }: S
                 <td>{formatTime(t.exit_ts_ms, timeMode)}</td>
                 <td>{t.entry_price_cents.toFixed(2)} → {t.exit_price_cents.toFixed(2)}</td>
                 <td className={t.pnl_cents >= 0 ? "up" : "down"}>{t.pnl_cents.toFixed(2)}¢</td>
+                <td>{(t.total_cost_cents ?? 0).toFixed(2)}¢</td>
                 <td>{t.duration_s.toFixed(1)}s</td>
                 <td>{t.entry_reason} / {t.exit_reason}</td>
               </tr>
             ))}
             {(data?.trades?.length ?? 0) === 0 ? (
               <tr>
-                <td colSpan={7}>暂无交易样本，等待策略信号触发。</td>
+                <td colSpan={8}>暂无交易样本，等待策略信号触发。</td>
               </tr>
             ) : null}
           </tbody>

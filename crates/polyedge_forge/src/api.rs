@@ -1761,7 +1761,7 @@ impl Default for StrategyRuntimeConfig {
             endgame_remaining_ms: 13_670,
             liquidity_widen_prob: 0.08860501062699792,
             cooldown_ms: 0,
-            max_entries_per_round: 1,
+            max_entries_per_round: 2,
             max_exec_spread_cents: 1.8976549355450667,
             slippage_cents_per_side: 0.06918614011422781,
             fee_cents_per_side: 0.03270800007174326,
@@ -2090,6 +2090,13 @@ struct StrategySimulationResult {
     blocked_exits: usize,
     emergency_wide_exit_count: usize,
     execution_penalty_cents_total: f64,
+    gross_pnl_cents: f64,
+    net_pnl_cents: f64,
+    total_entry_fee_cents: f64,
+    total_exit_fee_cents: f64,
+    total_slippage_cents: f64,
+    total_cost_cents: f64,
+    net_margin_pct: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2185,6 +2192,13 @@ fn run_summary_json(run: &StrategySimulationResult) -> Value {
         "avg_pnl_cents": run.avg_pnl_cents,
         "avg_duration_s": run.avg_duration_s,
         "total_pnl_cents": run.total_pnl_cents,
+        "net_pnl_cents": run.net_pnl_cents,
+        "gross_pnl_cents": run.gross_pnl_cents,
+        "total_cost_cents": run.total_cost_cents,
+        "total_entry_fee_cents": run.total_entry_fee_cents,
+        "total_exit_fee_cents": run.total_exit_fee_cents,
+        "total_slippage_cents": run.total_slippage_cents,
+        "net_margin_pct": run.net_margin_pct,
         "max_drawdown_cents": run.max_drawdown_cents,
         "max_profit_trade_cents": run.max_profit_trade_cents,
         "blocked_exits": run.blocked_exits,
@@ -2675,6 +2689,14 @@ fn run_strategy_simulation(
                     emergency_wide_exit_count = emergency_wide_exit_count.saturating_add(1);
                 }
                 let net_pnl = exit_price_cents - pos.entry_price_cents;
+                let gross_pnl = bid_cents_raw - pos.entry_price_raw_cents;
+                let total_cost_cents = (gross_pnl - net_pnl).max(0.0);
+                let emergency_penalty_cents = if can_fill {
+                    0.0
+                } else {
+                    (spread_side_cents - cfg.max_exec_spread_cents).max(0.0)
+                        * cfg.emergency_wide_spread_penalty_ratio
+                };
                 let duration_s = ((sample.ts_ms - pos.entry_ts_ms).max(0) as f64) / 1000.0;
                 trades.push(json!({
                     "id": trade_id,
@@ -2690,6 +2712,10 @@ fn run_strategy_simulation(
                     "exit_price_cents": exit_price_cents,
                     "exit_price_raw_cents": bid_cents_raw,
                     "exit_slippage_cents": cfg.slippage_cents_per_side,
+                    "exit_emergency_penalty_cents": emergency_penalty_cents,
+                    "pnl_gross_cents": gross_pnl,
+                    "total_cost_cents": total_cost_cents,
+                    "pnl_net_cents": net_pnl,
                     "pnl_cents": net_pnl,
                     "peak_pnl_cents": pos.peak_pnl_cents,
                     "duration_s": duration_s,
@@ -2739,10 +2765,26 @@ fn run_strategy_simulation(
                     let anti_chop_override = fair_confidence >= (confidence_floor + 0.08).min(0.95);
                     let round_entries =
                         entries_by_round.get(&sample.round_id).copied().unwrap_or(0);
-                    let can_flip = score.abs() >= signal_required
+                    let is_reentry = round_entries > 0;
+                    let signal_required_effective = if is_reentry {
+                        (signal_required + 0.12 + local_vol * 1.8).min(0.995)
+                    } else {
+                        signal_required
+                    };
+                    let edge_required_effective = if is_reentry {
+                        edge_required * 1.55
+                    } else {
+                        edge_required
+                    };
+                    let confidence_required = if is_reentry {
+                        (confidence_floor + 0.04).min(0.985)
+                    } else {
+                        confidence_floor
+                    };
+                    let can_flip = score.abs() >= signal_required_effective
                         && sample.spread_mid <= cfg.spread_limit_prob
-                        && fair_confidence >= confidence_floor
-                        && signal.edge_prob.abs() >= edge_required
+                        && fair_confidence >= confidence_required
+                        && signal.edge_prob.abs() >= edge_required_effective
                         && edge_align
                         && delta_align
                         && trend_consistent
@@ -2803,11 +2845,28 @@ fn run_strategy_simulation(
                     && signal.edge_prob.abs() >= edge_required + early_noise * 0.010
                     && score.abs() >= (signal_required + early_noise * 0.08).min(0.99));
             let anti_chop_override = fair_confidence >= (confidence_floor + 0.08).min(0.95);
+            let round_entries = entries_by_round.get(&sample.round_id).copied().unwrap_or(0);
+            let is_reentry = round_entries > 0;
+            let signal_required_effective = if is_reentry {
+                (signal_required + 0.12 + local_vol * 1.8).min(0.995)
+            } else {
+                signal_required
+            };
+            let edge_required_effective = if is_reentry {
+                edge_required * 1.55
+            } else {
+                edge_required
+            };
+            let confidence_required = if is_reentry {
+                (confidence_floor + 0.04).min(0.985)
+            } else {
+                confidence_floor
+            };
             let can_enter = signal.confirmed
-                && score.abs() >= signal_required
-                && signal.edge_prob.abs() >= edge_required
+                && score.abs() >= signal_required_effective
+                && signal.edge_prob.abs() >= edge_required_effective
                 && edge_align
-                && fair_confidence >= confidence_floor
+                && fair_confidence >= confidence_required
                 && delta_align
                 && trend_consistent
                 && momentum_align
@@ -2818,7 +2877,6 @@ fn run_strategy_simulation(
                 && entry_spread_cents <= entry_spread_guard
                 && entry_price <= cfg.entry_max_price_cents
                 && entry_potential >= cfg.entry_min_potential_cents;
-            let round_entries = entries_by_round.get(&sample.round_id).copied().unwrap_or(0);
             let cooled_down = last_exit_ts_ms <= 0
                 || sample.ts_ms.saturating_sub(last_exit_ts_ms) >= cfg.cooldown_ms;
             if can_enter && cooled_down && round_entries < cfg.max_entries_per_round {
@@ -2855,14 +2913,18 @@ fn run_strategy_simulation(
         let exit_fee_cents = cfg.fee_cents_per_side + dynamic_taker_fee_cents(bid_cents_raw);
         let mut bid_cents = bid_cents_raw - cfg.slippage_cents_per_side - exit_fee_cents;
         let can_fill = spread_side_cents <= cfg.max_exec_spread_cents;
+        let mut emergency_penalty_cents = 0.0_f64;
         if !can_fill {
             let extra_penalty = (spread_side_cents - cfg.max_exec_spread_cents).max(0.0)
                 * cfg.emergency_wide_spread_penalty_ratio;
             bid_cents -= extra_penalty;
             execution_penalty_cents_total += extra_penalty;
+            emergency_penalty_cents = extra_penalty;
             emergency_wide_exit_count = emergency_wide_exit_count.saturating_add(1);
         }
         let pnl = bid_cents - pos.entry_price_cents;
+        let pnl_gross = bid_cents_raw - pos.entry_price_raw_cents;
+        let total_cost_cents = (pnl_gross - pnl).max(0.0);
         trades.push(json!({
             "id": trade_id,
             "side": pos.side.as_str(),
@@ -2877,6 +2939,10 @@ fn run_strategy_simulation(
             "exit_price_cents": bid_cents,
             "exit_price_raw_cents": bid_cents_raw,
             "exit_slippage_cents": cfg.slippage_cents_per_side,
+            "exit_emergency_penalty_cents": emergency_penalty_cents,
+            "pnl_gross_cents": pnl_gross,
+            "total_cost_cents": total_cost_cents,
+            "pnl_net_cents": pnl,
             "pnl_cents": pnl,
             "peak_pnl_cents": pos.peak_pnl_cents.max(pnl),
             "duration_s": ((last.ts_ms - pos.entry_ts_ms).max(0) as f64) / 1000.0,
@@ -2896,9 +2962,26 @@ fn run_strategy_simulation(
     let mut peak_equity = 0.0_f64;
     let mut max_drawdown = 0.0_f64;
     let mut total_duration_s = 0.0_f64;
+    let mut gross_pnl_cents_total = 0.0_f64;
+    let mut total_entry_fee_cents = 0.0_f64;
+    let mut total_exit_fee_cents = 0.0_f64;
+    let mut total_slippage_cents = 0.0_f64;
+    let mut total_cost_cents = 0.0_f64;
     for t in &trades {
         let pnl = row_f64(t, "pnl_cents").unwrap_or(0.0);
+        let pnl_gross = row_f64(t, "pnl_gross_cents").unwrap_or(0.0);
+        let entry_fee = row_f64(t, "entry_fee_cents").unwrap_or(0.0);
+        let exit_fee = row_f64(t, "exit_fee_cents").unwrap_or(0.0);
+        let entry_slippage = row_f64(t, "entry_slippage_cents").unwrap_or(0.0);
+        let exit_slippage = row_f64(t, "exit_slippage_cents").unwrap_or(0.0);
+        let cost = row_f64(t, "total_cost_cents")
+            .unwrap_or_else(|| (pnl_gross - pnl).max(0.0));
         total_duration_s += row_f64(t, "duration_s").unwrap_or(0.0);
+        gross_pnl_cents_total += pnl_gross;
+        total_entry_fee_cents += entry_fee;
+        total_exit_fee_cents += exit_fee;
+        total_slippage_cents += entry_slippage + exit_slippage;
+        total_cost_cents += cost;
         total_pnl += pnl;
         if pnl > 0.0 {
             wins += 1;
@@ -2925,6 +3008,11 @@ fn run_strategy_simulation(
     };
     let avg_duration_s = if trade_count > 0 {
         total_duration_s / trade_count as f64
+    } else {
+        0.0
+    };
+    let net_margin_pct = if gross_pnl_cents_total.abs() > 1e-9 {
+        (total_pnl / gross_pnl_cents_total) * 100.0
     } else {
         0.0
     };
@@ -3000,6 +3088,13 @@ fn run_strategy_simulation(
         blocked_exits,
         emergency_wide_exit_count,
         execution_penalty_cents_total,
+        gross_pnl_cents: gross_pnl_cents_total,
+        net_pnl_cents: total_pnl,
+        total_entry_fee_cents,
+        total_exit_fee_cents,
+        total_slippage_cents,
+        total_cost_cents,
+        net_margin_pct,
     }
 }
 
@@ -3175,6 +3270,13 @@ async fn strategy_paper(
                 "avg_pnl_cents": 0.0,
                 "avg_duration_s": 0.0,
                 "total_pnl_cents": 0.0,
+                "net_pnl_cents": 0.0,
+                "gross_pnl_cents": 0.0,
+                "total_cost_cents": 0.0,
+                "total_entry_fee_cents": 0.0,
+                "total_exit_fee_cents": 0.0,
+                "total_slippage_cents": 0.0,
+                "net_margin_pct": 0.0,
                 "max_drawdown_cents": 0.0,
             },
             "trades": [],
@@ -3219,6 +3321,13 @@ async fn strategy_paper(
             "avg_pnl_cents": run.avg_pnl_cents,
             "avg_duration_s": run.avg_duration_s,
             "total_pnl_cents": run.total_pnl_cents,
+            "net_pnl_cents": run.net_pnl_cents,
+            "gross_pnl_cents": run.gross_pnl_cents,
+            "total_cost_cents": run.total_cost_cents,
+            "total_entry_fee_cents": run.total_entry_fee_cents,
+            "total_exit_fee_cents": run.total_exit_fee_cents,
+            "total_slippage_cents": run.total_slippage_cents,
+            "net_margin_pct": run.net_margin_pct,
             "max_drawdown_cents": run.max_drawdown_cents,
             "max_profit_trade_cents": run.max_profit_trade_cents,
             "blocked_exits": run.blocked_exits,
