@@ -49,10 +49,33 @@ interface MarkerLayout {
   left: number;
   top: number;
   visible: boolean;
+  snappedPriceCents: number | null;
 }
 
 function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
+}
+
+function nearestIndex(xs: number[], target: number): number {
+  if (xs.length === 0) {
+    return -1;
+  }
+  let lo = 0;
+  let hi = xs.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    const value = xs[mid]!;
+    if (value < target) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  const right = lo;
+  const left = Math.max(0, right - 1);
+  const rightDist = Math.abs((xs[right] ?? Number.POSITIVE_INFINITY) - target);
+  const leftDist = Math.abs((xs[left] ?? Number.POSITIVE_INFINITY) - target);
+  return leftDist <= rightDist ? left : right;
 }
 
 function windowToMs(view: WindowType | undefined): number {
@@ -75,7 +98,8 @@ function windowToMs(view: WindowType | undefined): number {
 }
 
 const ONE_SECOND_MS = 1_000;
-const HOLD_LAST_MAX_GAP_MS = 3_000;
+const HOLD_LAST_MAX_GAP_MS = 8_000;
+const FORCE_GAP_AFTER_MS = 25_000;
 const PAIR_SUM_TOLERANCE_CENTS = 6;
 const DISPLAY_CENT_STEP = 1.0;
 const DELTA_AXIS_HEADROOM_PCT = 0.05;
@@ -412,7 +436,11 @@ function bucketizePoints(points: ChartPoint[]): ChartPoint[] {
         bucket += ONE_SECOND_MS
       ) {
         const ts = bucket + ONE_SECOND_MS - 1;
-        if (bucket - lastObs.sourceTsMs <= HOLD_LAST_MAX_GAP_MS) {
+        const holeMs = bucket - lastObs.sourceTsMs;
+        if (holeMs <= HOLD_LAST_MAX_GAP_MS) {
+          out.push(synthPoint(lastObs.source, ts, lastObs.delta, lastObs.up, lastObs.down));
+        } else if (holeMs <= FORCE_GAP_AFTER_MS) {
+          // Keep continuity for short/medium transport hiccups.
           out.push(synthPoint(lastObs.source, ts, lastObs.delta, lastObs.up, lastObs.down));
         } else {
           // Long feed holes should be visible as gaps instead of synthetic continuity.
@@ -738,15 +766,40 @@ function MarketChartImpl({
     const xScale = plot.scales.x;
     const xMin = Number(xScale.min ?? Number.NEGATIVE_INFINITY);
     const xMax = Number(xScale.max ?? Number.POSITIVE_INFINITY);
+    const xs = (plot.data[0] as number[]) ?? [];
+    const upSeries = (plot.data[2] as Array<number | null>) ?? [];
+    const downSeries = (plot.data[3] as Array<number | null>) ?? [];
     const layouts: MarkerLayout[] = [];
     for (const marker of tradeMarkers) {
       const tsSec = marker.timestamp_ms / 1000;
       if (!Number.isFinite(tsSec) || tsSec < xMin - 1 || tsSec > xMax + 1) {
         continue;
       }
-      const px = Math.round(plot.valToPos(tsSec, "x", true));
-      const yVal = marker.price_cents ?? (marker.side === "UP" ? 75 : 25);
-      const py = Math.round(plot.valToPos(clamp(yVal, 0, 100), "prob", true));
+      let snappedTsSec = tsSec;
+      let snappedPrice: number | null = null;
+      const idx = nearestIndex(xs, tsSec);
+      if (idx >= 0 && idx < xs.length) {
+        const nearestTs = xs[idx]!;
+        if (Number.isFinite(nearestTs) && Math.abs(nearestTs - tsSec) <= 120) {
+          snappedTsSec = nearestTs;
+          const preferred = marker.side === "UP" ? upSeries[idx] : downSeries[idx];
+          if (preferred != null && Number.isFinite(preferred)) {
+            snappedPrice = preferred;
+          } else {
+            const opposite = marker.side === "UP" ? downSeries[idx] : upSeries[idx];
+            if (opposite != null && Number.isFinite(opposite)) {
+              snappedPrice = clamp(100 - opposite, 0, 100);
+            }
+          }
+        }
+      }
+      const resolvedPrice = clamp(
+        snappedPrice ?? marker.price_cents ?? (marker.side === "UP" ? 75 : 25),
+        0,
+        100
+      );
+      const px = Math.round(plot.valToPos(snappedTsSec, "x", true));
+      const py = Math.round(plot.valToPos(resolvedPrice, "prob", true));
       const visible =
         px >= box.left - 16 &&
         px <= box.left + box.width + 16 &&
@@ -756,7 +809,8 @@ function MarketChartImpl({
         marker,
         left: px,
         top: py,
-        visible
+        visible,
+        snappedPriceCents: snappedPrice
       });
     }
     setMarkerLayout(layouts);
@@ -1246,7 +1300,7 @@ function MarketChartImpl({
         <div className="trade-marker-layer">
           {markerLayout
             .filter((m) => m.visible)
-            .map(({ marker, left, top }) => (
+            .map(({ marker, left, top, snappedPriceCents }) => (
               <button
                 key={marker.id}
                 type="button"
@@ -1273,7 +1327,13 @@ function MarketChartImpl({
                   </div>
                   <div className="tip-row">
                     <span>价格</span>
-                    <strong>{marker.price_cents != null ? `${marker.price_cents.toFixed(2)}¢` : "--"}</strong>
+                    <strong>
+                      {snappedPriceCents != null
+                        ? `${snappedPriceCents.toFixed(2)}¢`
+                        : marker.price_cents != null
+                          ? `${marker.price_cents.toFixed(2)}¢`
+                          : "--"}
+                    </strong>
                   </div>
                   {marker.pnl_cents != null ? (
                     <div className="tip-row">
