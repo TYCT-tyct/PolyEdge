@@ -24,6 +24,7 @@ ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 MIN_PRICE = 0.01
 MAX_PRICE = 0.99
 TERMINAL_STATES = {"filled", "cancelled", "canceled", "rejected", "expired", "executed", "matched"}
+DEFAULT_FEE_RATE_BPS = int((os.environ.get("CLOB_FEE_RATE_BPS") or "1000").strip() or "1000")
 
 
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -326,9 +327,11 @@ def _build_order(payload: dict) -> Tuple[dict, Optional[str]]:
         price = _normalize_price(price * (1.0 + slip if side == BUY else 1.0 - slip))
     else:
         price = _normalize_price(price)
-    fee_bps = int(round(max(0.0, float(payload.get("fee_rate_bps") or 0.0))))
+    # Polymarket currently expects a market-specific fee rate (1000 for our target flow).
+    # We keep this fixed to avoid exchange-side hard rejects from stale client payload values.
+    fee_bps = DEFAULT_FEE_RATE_BPS
     nonce = int(payload.get("nonce") or time.time_ns())
-    expiration = _expiration_s(ttl_ms)
+    expiration = _expiration_s(ttl_ms) if order_type == OrderType.GTD else 0
     client: Optional[ClobClient] = STATE["client"]
     if client is None:
         return {}, "gateway_not_ready"
