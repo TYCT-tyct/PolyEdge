@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import math
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -165,6 +166,12 @@ def compute_window_metrics(trades: list[dict], window: int) -> dict:
         dd = peak - equity
         if dd > max_drawdown:
             max_drawdown = dd
+    gains = sum(p for p in pnls if p > 0.0)
+    losses = -sum(p for p in pnls if p < 0.0)
+    if losses > 0.0:
+        profit_factor = gains / losses
+    else:
+        profit_factor = 99.0 if gains > 0.0 else 1.0
 
     return {
         "latest_trade_count": trade_count,
@@ -172,6 +179,7 @@ def compute_window_metrics(trades: list[dict], window: int) -> dict:
         "latest_avg_pnl": avg_pnl,
         "latest_total_pnl": total_pnl,
         "latest_max_drawdown": max_drawdown,
+        "latest_profit_factor": profit_factor,
     }
 
 
@@ -184,6 +192,7 @@ def score_eval(metrics: dict, target_win_rate: float, window_trades: int) -> flo
     full_win = to_float(metrics.get("full_win"))
     full_avg = to_float(metrics.get("full_avg_pnl"))
     latest_dd = to_float(metrics.get("latest_max_drawdown"))
+    latest_pf = to_float(metrics.get("latest_profit_factor"), 1.0)
     blocked = to_float(metrics.get("blocked_exits"))
     emergency = to_float(metrics.get("emergency_wide_exit_count"))
     exec_penalty = to_float(metrics.get("execution_penalty_cents_total"))
@@ -192,6 +201,8 @@ def score_eval(metrics: dict, target_win_rate: float, window_trades: int) -> flo
     neg_pnl_penalty = max(0.0, -latest_avg) * 140.0 + max(0.0, -latest_total) * 1.0
     drawdown_penalty = latest_dd * 0.85
     fill_penalty = blocked * 4.0 + emergency * 6.0 + exec_penalty * 1.1
+    pf_penalty = max(0.0, 1.0 - latest_pf) * 120.0
+    pf_bonus = max(0.0, min(latest_pf, 3.0) - 1.0) * 18.0
 
     base = (
         latest_win * 2.0
@@ -200,7 +211,15 @@ def score_eval(metrics: dict, target_win_rate: float, window_trades: int) -> flo
         + full_win * 0.40
         + full_avg * 30.0
     )
-    score = base * (0.55 + 0.45 * coverage) - win_gap_penalty - neg_pnl_penalty - drawdown_penalty - fill_penalty
+    score = (
+        base * (0.55 + 0.45 * coverage)
+        - win_gap_penalty
+        - neg_pnl_penalty
+        - drawdown_penalty
+        - fill_penalty
+        - pf_penalty
+        + pf_bonus
+    )
     if latest_count < max(8, int(window_trades * 0.5)):
         score -= 120.0
     return score
@@ -243,13 +262,42 @@ def evaluate_config(
             "blocked_exits": to_int(summary.get("blocked_exits")),
             "emergency_wide_exit_count": to_int(summary.get("emergency_wide_exit_count")),
             "execution_penalty_cents_total": to_float(summary.get("execution_penalty_cents_total")),
+            "full_max_drawdown": to_float(summary.get("max_drawdown_cents")),
+            "full_net_pnl": to_float(summary.get("net_pnl_cents")),
+            "full_total_cost": to_float(summary.get("total_cost_cents")),
+            "full_net_margin_pct": to_float(summary.get("net_margin_pct")),
         }
     )
     metrics["score"] = score_eval(metrics, target_win_rate, window_trades)
     return metrics
 
 
-def should_promote(challenger: dict, baseline: dict, args: argparse.Namespace) -> tuple[bool, list[str]]:
+def config_shift_ratio(current_cfg: dict | None, challenger_cfg: dict | None) -> tuple[float, float]:
+    current_cfg = current_cfg or {}
+    challenger_cfg = challenger_cfg or {}
+    keys = [k for k in CONFIG_KEYS if k in current_cfg and k in challenger_cfg]
+    if not keys:
+        return (0.0, 0.0)
+    diffs: list[float] = []
+    for k in keys:
+        a = current_cfg.get(k)
+        b = challenger_cfg.get(k)
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            denom = max(1.0, abs(float(a)), abs(float(b)))
+            diffs.append(abs(float(a) - float(b)) / denom)
+    if not diffs:
+        return (0.0, 0.0)
+    return (sum(diffs) / len(diffs), max(diffs))
+
+
+def should_promote(
+    challenger: dict,
+    baseline: dict,
+    args: argparse.Namespace,
+    current_cfg: dict | None,
+    challenger_cfg: dict | None,
+    cooldown_ok: bool,
+) -> tuple[bool, list[str], dict]:
     reasons: list[str] = []
     min_trade_count = max(10, int(args.window_trades * args.promote_min_coverage))
     if to_int(challenger.get("latest_trade_count")) < min_trade_count:
@@ -271,9 +319,39 @@ def should_promote(challenger: dict, baseline: dict, args: argparse.Namespace) -
         < to_float(baseline.get("latest_total_pnl")) + args.promote_min_total_pnl_lift
     ):
         reasons.append("challenger latest_total_pnl lift too small")
+    if (
+        to_float(challenger.get("latest_max_drawdown"))
+        > to_float(baseline.get("latest_max_drawdown")) + args.promote_max_drawdown_lift
+    ):
+        reasons.append("challenger drawdown deterioration too large")
+    if to_float(challenger.get("latest_profit_factor")) < args.promote_min_profit_factor:
+        reasons.append("challenger latest_profit_factor below floor")
+    if (
+        to_float(challenger.get("latest_profit_factor"))
+        < to_float(baseline.get("latest_profit_factor")) + args.promote_min_profit_factor_lift
+    ):
+        reasons.append("challenger latest_profit_factor lift too small")
+    if abs(to_float(challenger.get("latest_win")) - to_float(challenger.get("full_win"))) > args.promote_max_win_divergence:
+        reasons.append("challenger win divergence too large (overfit risk)")
+    if abs(to_float(challenger.get("latest_avg_pnl")) - to_float(challenger.get("full_avg_pnl"))) > args.promote_max_avg_pnl_divergence:
+        reasons.append("challenger avg_pnl divergence too large (overfit risk)")
+    if not cooldown_ok:
+        reasons.append("promote cooldown not elapsed")
+    if normalize_config(current_cfg or {}) == normalize_config(challenger_cfg or {}):
+        reasons.append("challenger config equals current config")
+    avg_shift, max_shift = config_shift_ratio(current_cfg, challenger_cfg)
+    if avg_shift > args.promote_max_param_shift:
+        reasons.append("challenger avg param shift too large")
+    if max_shift > args.promote_max_param_shift * 2.0:
+        reasons.append("challenger max param shift too large")
     if to_float(challenger.get("score")) < to_float(baseline.get("score")) + args.promote_score_margin:
         reasons.append("challenger score margin too small")
-    return (len(reasons) == 0, reasons)
+    detail = {
+        "avg_param_shift": avg_shift,
+        "max_param_shift": max_shift,
+        "cooldown_ok": cooldown_ok,
+    }
+    return (len(reasons) == 0, reasons, detail)
 
 
 def extract_best(payload: dict) -> dict:
@@ -368,7 +446,15 @@ def main() -> None:
     ap.add_argument("--promote-min-win-lift", type=float, default=2.0)
     ap.add_argument("--promote-min-avg-pnl-lift", type=float, default=0.35)
     ap.add_argument("--promote-min-total-pnl-lift", type=float, default=10.0)
+    ap.add_argument("--promote-max-drawdown-lift", type=float, default=2.5)
+    ap.add_argument("--promote-min-profit-factor", type=float, default=1.03)
+    ap.add_argument("--promote-min-profit-factor-lift", type=float, default=0.02)
+    ap.add_argument("--promote-max-win-divergence", type=float, default=12.0)
+    ap.add_argument("--promote-max-avg-pnl-divergence", type=float, default=2.5)
+    ap.add_argument("--promote-max-param-shift", type=float, default=0.40)
     ap.add_argument("--promote-score-margin", type=float, default=8.0)
+    ap.add_argument("--promote-confirm-cycles", type=int, default=2)
+    ap.add_argument("--promote-cooldown-sec", type=int, default=1800)
     ap.add_argument("--history-limit", type=int, default=8)
     ap.add_argument("--rollback-consecutive-cycles", type=int, default=2)
     ap.add_argument("--rollback-floor-win", type=float, default=74.0)
@@ -398,6 +484,7 @@ def main() -> None:
 
     cycle = 0
     underperform_streak = 0
+    promote_streak = 0
     while True:
         cycle += 1
         started = int(time.time() * 1000)
@@ -474,6 +561,23 @@ def main() -> None:
                 config=None,
                 label="baseline_autotune",
             )
+            autotune_latest = fetch_json(
+                build_url(
+                    args.base_url,
+                    "/api/strategy/autotune/latest",
+                    {"market_type": args.market_type},
+                ),
+                args.timeout_sec,
+            )
+            autotune_doc = ((autotune_latest or {}).get("data") or {}) if isinstance(autotune_latest, dict) else {}
+            current_autotune_cfg = normalize_config((autotune_doc or {}).get("config") or {})
+            current_saved_at_ms = to_int((autotune_doc or {}).get("saved_at_ms"))
+            now_ms = int(time.time() * 1000)
+            cooldown_remaining_ms = max(
+                0,
+                current_saved_at_ms + args.promote_cooldown_sec * 1000 - now_ms,
+            )
+            cooldown_ok = cooldown_remaining_ms <= 0
 
             challenger_candidates = []
             for idx, cand in enumerate(deep_rows_sorted):
@@ -516,7 +620,21 @@ def main() -> None:
             challenger_eval = chosen.get("eval") or {}
             challenger_config = (chosen_opt.get("config") or {})
 
-            promote_ok, promote_reasons = should_promote(challenger_eval, baseline_eval, args)
+            promote_candidate_ok, promote_reasons, promote_detail = should_promote(
+                challenger_eval,
+                baseline_eval,
+                args,
+                current_autotune_cfg,
+                challenger_config,
+                cooldown_ok,
+            )
+            promote_streak = (promote_streak + 1) if promote_candidate_ok else 0
+            promote_ok = promote_candidate_ok and promote_streak >= args.promote_confirm_cycles
+            if promote_candidate_ok and not promote_ok:
+                promote_reasons = [
+                    *promote_reasons,
+                    f"promote confirmation not reached ({promote_streak}/{args.promote_confirm_cycles})",
+                ]
             promote_resp = {"ok": False}
             promoted = False
             if promote_ok:
@@ -536,6 +654,8 @@ def main() -> None:
                     args.timeout_sec,
                 )
                 promoted = bool(promote_resp.get("ok"))
+                if promoted:
+                    promote_streak = 0
 
             live_eval = evaluate_config(
                 base_url=args.base_url,
@@ -638,10 +758,21 @@ def main() -> None:
                 "challenger_candidates": challenger_candidates,
                 "live_eval": live_eval,
                 "promote": {
+                    "candidate_ok": promote_candidate_ok,
                     "ok": promote_ok,
                     "reasons": promote_reasons,
                     "promoted": promoted,
+                    "streak": promote_streak,
+                    "confirm_cycles": args.promote_confirm_cycles,
+                    "cooldown_sec": args.promote_cooldown_sec,
+                    "cooldown_remaining_ms": cooldown_remaining_ms,
+                    "detail": promote_detail,
                     "response": promote_resp,
+                },
+                "current_autotune": {
+                    "found": bool((autotune_latest or {}).get("found")),
+                    "saved_at_ms": current_saved_at_ms,
+                    "config": current_autotune_cfg,
                 },
                 "underperform": underperform,
                 "underperform_streak": underperform_streak,
@@ -660,7 +791,9 @@ def main() -> None:
                 f"[cycle={cycle}] best_seed={best['seed']} chosen={chosen_seed} "
                 f"base_win={to_float(baseline_eval.get('latest_win')):.2f} "
                 f"chal_win={to_float(challenger_eval.get('latest_win')):.2f} "
-                f"promoted={promoted} rollback={rollback_done} "
+                f"promote_ok={promote_ok} promoted={promoted} "
+                f"cooldown_ms={cooldown_remaining_ms} confirm={promote_streak}/{args.promote_confirm_cycles} "
+                f"rollback={rollback_done} "
                 f"live_win={to_float(live_eval.get('latest_win')):.2f} "
                 f"streak={underperform_streak}",
                 flush=True,
