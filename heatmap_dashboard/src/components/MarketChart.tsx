@@ -6,12 +6,12 @@ import type {
 import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
 
-import type { ChartPoint, ChartRound, ChartTradeMarker, WindowType } from "../types";
+import type { ChartPoint, ChartRound } from "../types";
+import type { WindowType } from "../types";
 
 interface MarketChartProps {
   points: ChartPoint[];
   rounds: ChartRound[];
-  tradeMarkers?: ChartTradeMarker[];
   windowType?: WindowType;
   timeMode: "local" | "et";
   height?: number;
@@ -42,13 +42,6 @@ interface DragState {
 interface PreparedPlot {
   data: uPlot.AlignedData;
   bucketed: ChartPoint[];
-}
-
-interface MarkerLayout {
-  marker: ChartTradeMarker;
-  left: number;
-  top: number;
-  visible: boolean;
 }
 
 function clamp(v: number, lo: number, hi: number): number {
@@ -569,19 +562,11 @@ function viewToBrush(domain: DomainRange, view: ViewRange): BrushState {
   };
 }
 
-function MarketChartImpl({
-  points,
-  rounds,
-  tradeMarkers = [],
-  windowType = "all",
-  timeMode,
-  height = 420
-}: MarketChartProps) {
+function MarketChartImpl({ points, rounds, windowType = "all", timeMode, height = 420 }: MarketChartProps) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const miniCanvasRef = useRef<HTMLDivElement | null>(null);
   const plotRef = useRef<uPlot | null>(null);
   const tooltipRef = useRef<HTMLDivElement | null>(null);
-  const markerSyncRafRef = useRef<number | null>(null);
   const bucketedRef = useRef<ChartPoint[]>([]);
   const roundsRef = useRef<ChartRound[]>(rounds);
   const domainRef = useRef<DomainRange | null>(null);
@@ -647,7 +632,6 @@ function MarketChartImpl({
   );
 
   const [brush, setBrush] = useState<BrushState>({ leftPct: 0, widthPct: 100 });
-  const [markerLayout, setMarkerLayout] = useState<MarkerLayout[]>([]);
 
   const syncPctScaleToView = useCallback((startMs: number, endMs: number) => {
     const plot = plotRef.current;
@@ -713,75 +697,14 @@ function MarketChartImpl({
     applyView(d.minMs, d.maxMs, false);
   }, [applyView]);
 
-  const markerTimeFormatter = useMemo(
-    () =>
-      new Intl.DateTimeFormat("zh-CN", {
-        timeZone: timeMode === "et" ? "America/New_York" : undefined,
-        hour12: false,
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit"
-      }),
-    [timeMode]
-  );
-
-  const syncMarkerLayout = useCallback(() => {
-    const plot = plotRef.current;
-    if (!plot || tradeMarkers.length === 0) {
-      setMarkerLayout([]);
-      return;
-    }
-    const box = plot.bbox;
-    const xScale = plot.scales.x;
-    const xMin = Number(xScale.min ?? Number.NEGATIVE_INFINITY);
-    const xMax = Number(xScale.max ?? Number.POSITIVE_INFINITY);
-    const layouts: MarkerLayout[] = [];
-    for (const marker of tradeMarkers) {
-      const tsSec = marker.timestamp_ms / 1000;
-      if (!Number.isFinite(tsSec) || tsSec < xMin - 1 || tsSec > xMax + 1) {
-        continue;
-      }
-      const px = Math.round(plot.valToPos(tsSec, "x", true));
-      const yVal = marker.price_cents ?? (marker.side === "UP" ? 75 : 25);
-      const py = Math.round(plot.valToPos(clamp(yVal, 0, 100), "prob", true));
-      const visible =
-        px >= box.left - 16 &&
-        px <= box.left + box.width + 16 &&
-        py >= box.top - 16 &&
-        py <= box.top + box.height + 16;
-      layouts.push({
-        marker,
-        left: px,
-        top: py,
-        visible
-      });
-    }
-    setMarkerLayout(layouts);
-  }, [tradeMarkers]);
-
-  const requestMarkerSync = useCallback(() => {
-    if (markerSyncRafRef.current != null) {
-      return;
-    }
-    markerSyncRafRef.current = window.requestAnimationFrame(() => {
-      markerSyncRafRef.current = null;
-      syncMarkerLayout();
-    });
-  }, [syncMarkerLayout]);
-
   useEffect(() => {
     roundsRef.current = rounds;
     plotRef.current?.redraw();
-    requestMarkerSync();
-  }, [requestMarkerSync, rounds]);
+  }, [rounds]);
 
   useEffect(() => {
     bucketedRef.current = prepared.bucketed;
-    requestMarkerSync();
-  }, [prepared.bucketed, requestMarkerSync]);
+  }, [prepared.bucketed]);
 
   useEffect(() => {
     const root = rootRef.current;
@@ -869,11 +792,6 @@ function MarketChartImpl({
           }
         ],
         hooks: {
-          setScale: [
-            () => {
-              requestMarkerSync();
-            }
-          ],
           setCursor: [
             (u) => {
               const tip = tooltipRef.current;
@@ -1017,7 +935,6 @@ function MarketChartImpl({
         return;
       }
       current.setSize({ width: Math.max(640, host.clientWidth), height });
-      requestMarkerSync();
     };
     window.addEventListener("resize", onResize);
     return () => {
@@ -1026,12 +943,8 @@ function MarketChartImpl({
       tooltipEl.remove();
       plot.destroy();
       plotRef.current = null;
-      if (markerSyncRafRef.current != null) {
-        window.cancelAnimationFrame(markerSyncRafRef.current);
-        markerSyncRafRef.current = null;
-      }
     };
-  }, [axisTimeFormatter, formatLegendTs, height, requestMarkerSync, steppedPathBuilder]);
+  }, [axisTimeFormatter, formatLegendTs, height, steppedPathBuilder]);
 
   useEffect(() => {
     const plot = plotRef.current;
@@ -1048,8 +961,7 @@ function MarketChartImpl({
     if (d) {
       syncPctScaleToView(d.minMs, d.maxMs);
     }
-    requestMarkerSync();
-  }, [data, requestMarkerSync, syncPctScaleToView]);
+  }, [data, syncPctScaleToView]);
 
   useEffect(() => {
     domainRef.current = domain;
@@ -1106,10 +1018,6 @@ function MarketChartImpl({
     }
     applyView(d.minMs, d.maxMs, false);
   }, [prepared.bucketed, applyView]);
-
-  useEffect(() => {
-    requestMarkerSync();
-  }, [tradeMarkers, requestMarkerSync]);
 
   useEffect(() => {
     const onPointerMove = (ev: PointerEvent) => {
@@ -1241,57 +1149,7 @@ function MarketChartImpl({
 
   return (
     <div className="chart-wrap">
-      <div className="chart-root">
-        <div ref={rootRef} className="chart-canvas-host" />
-        <div className="trade-marker-layer">
-          {markerLayout
-            .filter((m) => m.visible)
-            .map(({ marker, left, top }) => (
-              <button
-                key={marker.id}
-                type="button"
-                className={`trade-marker ${marker.action} ${marker.side.toLowerCase()} ${marker.mode}`}
-                style={{ left, top }}
-                aria-label={`${marker.strategy_label} ${marker.mode} ${marker.action}`}
-              >
-                <span className="trade-marker-icon" />
-                <div className="trade-marker-tip">
-                  <div className="tip-title">
-                    {marker.action === "entry" ? "进场" : "出场"} · {marker.side}
-                  </div>
-                  <div className="tip-row">
-                    <span>策略</span>
-                    <strong>{marker.strategy_label}</strong>
-                  </div>
-                  <div className="tip-row">
-                    <span>模式</span>
-                    <strong>{marker.mode === "live" ? "实盘" : "测试"}</strong>
-                  </div>
-                  <div className="tip-row">
-                    <span>时间</span>
-                    <strong>{markerTimeFormatter.format(new Date(marker.timestamp_ms))}</strong>
-                  </div>
-                  <div className="tip-row">
-                    <span>价格</span>
-                    <strong>{marker.price_cents != null ? `${marker.price_cents.toFixed(2)}¢` : "--"}</strong>
-                  </div>
-                  {marker.pnl_cents != null ? (
-                    <div className="tip-row">
-                      <span>盈亏</span>
-                      <strong className={marker.pnl_cents >= 0 ? "up" : "down"}>{marker.pnl_cents.toFixed(2)}¢</strong>
-                    </div>
-                  ) : null}
-                  {marker.reason ? (
-                    <div className="tip-row reason">
-                      <span>原因</span>
-                      <strong>{marker.reason}</strong>
-                    </div>
-                  ) : null}
-                </div>
-              </button>
-            ))}
-        </div>
-      </div>
+      <div ref={rootRef} className="chart-root" />
       <div className="mini-strip">
         <div className="mini-ts">{formatMiniTs(miniStart)}</div>
         <div
