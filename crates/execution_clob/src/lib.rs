@@ -278,8 +278,11 @@ impl ClobExecution {
                     .max(5),
             )))
             .tcp_nodelay(true)
-            // Force HTTP/2 without negotiation (Polymarket CLOB supports it)
-            .http2_prior_knowledge()
+            // Do NOT force h2c prior-knowledge globally.
+            // This client is shared by both remote CLOB HTTPS endpoints and local
+            // gateway HTTP/1.1 endpoints (127.0.0.1:9001). Forcing prior knowledge
+            // causes HTTP/2 preface frames ("PRI * HTTP/2.0") against uvicorn and
+            // leads to intermittent network errors on live order paths.
             // If the peer supports it (ALPN), this can cut head-of-line blocking.
             .http2_keep_alive_interval(Some(Duration::from_secs(
                 std::env::var("POLYEDGE_HTTP2_KEEPALIVE_INTERVAL_SEC")
