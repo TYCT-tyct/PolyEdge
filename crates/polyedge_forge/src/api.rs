@@ -178,7 +178,7 @@ enum StrategyPaperSource {
 fn parse_strategy_paper_source(raw: Option<&str>) -> StrategyPaperSource {
     match raw
         .map(|v| v.trim().to_ascii_lowercase())
-        .unwrap_or_else(|| "replay".to_string())
+        .unwrap_or_else(|| "live".to_string())
         .as_str()
     {
         "live" => StrategyPaperSource::Live,
@@ -1935,8 +1935,9 @@ struct StrategyRuntimeConfig {
     emergency_wide_spread_penalty_ratio: f64,
 }
 
-const STRATEGY_BASELINE_PROFILE: &str = "backup_2026_02_25";
+const STRATEGY_BASELINE_PROFILE: &str = "strict_no_autotune_2026_02_26";
 
+#[allow(dead_code)]
 fn strategy_backup_baseline_config() -> StrategyRuntimeConfig {
     StrategyRuntimeConfig {
         entry_threshold_base: 0.599103,
@@ -1964,9 +1965,38 @@ fn strategy_backup_baseline_config() -> StrategyRuntimeConfig {
     }
 }
 
+fn strategy_current_default_config() -> StrategyRuntimeConfig {
+    // Derived from constrained 5m replay search:
+    // win-rate >= baseline, drawdown <= baseline, participation and net pnl improved.
+    StrategyRuntimeConfig {
+        entry_threshold_base: 0.5974897596832403,
+        entry_threshold_cap: 0.8445281582196084,
+        spread_limit_prob: 0.023219988756074554,
+        entry_edge_prob: 0.03139843811607734,
+        entry_min_potential_cents: 10.14705380694935,
+        entry_max_price_cents: 75.93741099259525,
+        min_hold_ms: 3_475,
+        stop_loss_cents: 4.094248266919752,
+        reverse_signal_threshold: -0.68824813079899,
+        reverse_signal_ticks: 1,
+        trail_activate_profit_cents: 2.693031061201522,
+        trail_drawdown_cents: 2.791041275329463,
+        take_profit_near_max_cents: 89.6868393303587,
+        endgame_take_profit_cents: 88.69503839734718,
+        endgame_remaining_ms: 17_270,
+        liquidity_widen_prob: 0.1108363526508022,
+        cooldown_ms: 0,
+        max_entries_per_round: 10,
+        max_exec_spread_cents: 1.6193923581847693,
+        slippage_cents_per_side: 0.07264891978079893,
+        fee_cents_per_side: 0.03502784311015152,
+        emergency_wide_spread_penalty_ratio: 0.25277914857787637,
+    }
+}
+
 impl Default for StrategyRuntimeConfig {
     fn default() -> Self {
-        strategy_backup_baseline_config()
+        strategy_current_default_config()
     }
 }
 
@@ -3691,7 +3721,7 @@ async fn strategy_paper(
     let mut cfg = StrategyRuntimeConfig::default();
     let mut config_source = "default";
     let mut autotune_info = Value::Null;
-    if use_autotune {
+    if use_autotune && !matches!(source_mode, StrategyPaperSource::Live) {
         let key = strategy_autotune_key(&state.redis_prefix, market_type);
         if let Some(saved) = read_key_value(&state, &key).await? {
             let tuned_cfg = strategy_cfg_from_payload(cfg, &saved);
@@ -3700,74 +3730,76 @@ async fn strategy_paper(
             autotune_info = saved;
         }
     }
-    if let Some(v) = params.entry_threshold_base {
-        cfg.entry_threshold_base = v.clamp(0.40, 0.95);
-    }
-    if let Some(v) = params.entry_threshold_cap {
-        cfg.entry_threshold_cap = v.clamp(cfg.entry_threshold_base, 0.99);
-    }
-    if let Some(v) = params.spread_limit_prob {
-        cfg.spread_limit_prob = v.clamp(0.005, 0.12);
-    }
-    if let Some(v) = params.entry_edge_prob {
-        cfg.entry_edge_prob = v.clamp(0.002, 0.25);
-    }
-    if let Some(v) = params.entry_min_potential_cents {
-        cfg.entry_min_potential_cents = v.clamp(1.0, 70.0);
-    }
-    if let Some(v) = params.entry_max_price_cents {
-        cfg.entry_max_price_cents = v.clamp(45.0, 98.5);
-    }
-    if let Some(v) = params.min_hold_ms {
-        cfg.min_hold_ms = v.clamp(0, 240_000);
-    }
-    if let Some(v) = params.stop_loss_cents {
-        cfg.stop_loss_cents = v.clamp(2.0, 60.0);
-    }
-    if let Some(v) = params.reverse_signal_threshold {
-        cfg.reverse_signal_threshold = v.clamp(-0.95, -0.02);
-    }
-    if let Some(v) = params.reverse_signal_ticks {
-        cfg.reverse_signal_ticks = v.clamp(1, 12) as usize;
-    }
-    if let Some(v) = params.trail_activate_profit_cents {
-        cfg.trail_activate_profit_cents = v.clamp(2.0, 80.0);
-    }
-    if let Some(v) = params.trail_drawdown_cents {
-        cfg.trail_drawdown_cents = v.clamp(1.0, 50.0);
-    }
-    if let Some(v) = params.take_profit_near_max_cents {
-        cfg.take_profit_near_max_cents = v.clamp(70.0, 99.5);
-    }
-    if let Some(v) = params.endgame_take_profit_cents {
-        cfg.endgame_take_profit_cents = v.clamp(50.0, 99.0);
-    }
-    if let Some(v) = params.endgame_remaining_ms {
-        cfg.endgame_remaining_ms = v.clamp(1_000, 180_000);
-    }
-    if let Some(v) = params.liquidity_widen_prob {
-        cfg.liquidity_widen_prob = v.clamp(0.01, 0.2);
-    }
-    if let Some(v) = params.cooldown_ms {
-        cfg.cooldown_ms = v.clamp(0, 120_000);
-    }
-    if let Some(v) = params.max_entries_per_round {
-        cfg.max_entries_per_round = v.clamp(1, 16) as usize;
-    }
-    if let Some(v) = params.max_exec_spread_cents {
-        cfg.max_exec_spread_cents = v.clamp(0.2, 30.0);
-    }
-    if let Some(v) = params.slippage_cents_per_side {
-        cfg.slippage_cents_per_side = v.clamp(0.0, 10.0);
-    }
-    if let Some(v) = params.fee_cents_per_side {
-        cfg.fee_cents_per_side = v.clamp(0.0, 12.0);
-    }
-    if let Some(v) = params.emergency_wide_spread_penalty_ratio {
-        cfg.emergency_wide_spread_penalty_ratio = v.clamp(0.2, 3.0);
-    }
-    if cfg.entry_threshold_cap < cfg.entry_threshold_base {
-        cfg.entry_threshold_cap = cfg.entry_threshold_base;
+    if !matches!(source_mode, StrategyPaperSource::Live) {
+        if let Some(v) = params.entry_threshold_base {
+            cfg.entry_threshold_base = v.clamp(0.40, 0.95);
+        }
+        if let Some(v) = params.entry_threshold_cap {
+            cfg.entry_threshold_cap = v.clamp(cfg.entry_threshold_base, 0.99);
+        }
+        if let Some(v) = params.spread_limit_prob {
+            cfg.spread_limit_prob = v.clamp(0.005, 0.12);
+        }
+        if let Some(v) = params.entry_edge_prob {
+            cfg.entry_edge_prob = v.clamp(0.002, 0.25);
+        }
+        if let Some(v) = params.entry_min_potential_cents {
+            cfg.entry_min_potential_cents = v.clamp(1.0, 70.0);
+        }
+        if let Some(v) = params.entry_max_price_cents {
+            cfg.entry_max_price_cents = v.clamp(45.0, 98.5);
+        }
+        if let Some(v) = params.min_hold_ms {
+            cfg.min_hold_ms = v.clamp(0, 240_000);
+        }
+        if let Some(v) = params.stop_loss_cents {
+            cfg.stop_loss_cents = v.clamp(2.0, 60.0);
+        }
+        if let Some(v) = params.reverse_signal_threshold {
+            cfg.reverse_signal_threshold = v.clamp(-0.95, -0.02);
+        }
+        if let Some(v) = params.reverse_signal_ticks {
+            cfg.reverse_signal_ticks = v.clamp(1, 12) as usize;
+        }
+        if let Some(v) = params.trail_activate_profit_cents {
+            cfg.trail_activate_profit_cents = v.clamp(2.0, 80.0);
+        }
+        if let Some(v) = params.trail_drawdown_cents {
+            cfg.trail_drawdown_cents = v.clamp(1.0, 50.0);
+        }
+        if let Some(v) = params.take_profit_near_max_cents {
+            cfg.take_profit_near_max_cents = v.clamp(70.0, 99.5);
+        }
+        if let Some(v) = params.endgame_take_profit_cents {
+            cfg.endgame_take_profit_cents = v.clamp(50.0, 99.0);
+        }
+        if let Some(v) = params.endgame_remaining_ms {
+            cfg.endgame_remaining_ms = v.clamp(1_000, 180_000);
+        }
+        if let Some(v) = params.liquidity_widen_prob {
+            cfg.liquidity_widen_prob = v.clamp(0.01, 0.2);
+        }
+        if let Some(v) = params.cooldown_ms {
+            cfg.cooldown_ms = v.clamp(0, 120_000);
+        }
+        if let Some(v) = params.max_entries_per_round {
+            cfg.max_entries_per_round = v.clamp(1, 16) as usize;
+        }
+        if let Some(v) = params.max_exec_spread_cents {
+            cfg.max_exec_spread_cents = v.clamp(0.2, 30.0);
+        }
+        if let Some(v) = params.slippage_cents_per_side {
+            cfg.slippage_cents_per_side = v.clamp(0.0, 10.0);
+        }
+        if let Some(v) = params.fee_cents_per_side {
+            cfg.fee_cents_per_side = v.clamp(0.0, 12.0);
+        }
+        if let Some(v) = params.emergency_wide_spread_penalty_ratio {
+            cfg.emergency_wide_spread_penalty_ratio = v.clamp(0.2, 3.0);
+        }
+        if cfg.entry_threshold_cap < cfg.entry_threshold_base {
+            cfg.entry_threshold_cap = cfg.entry_threshold_base;
+        }
     }
     let full_history = params.full_history.unwrap_or(false);
     let lookback_minutes = params

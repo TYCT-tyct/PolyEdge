@@ -56,14 +56,7 @@ const STRATEGY_PAPER_PROFILE = Object.freeze({
   lookbackMinutes: 24 * 60,
   maxTrades: 320,
   fullHistory: false,
-  useAutotune: false,
-  entryThresholdBase: 0.595,
-  entryThresholdCap: 0.825,
-  entryEdgeProb: 0.024,
-  entryMinPotentialCents: 9.5,
-  minHoldMs: 2_200,
-  maxEntriesPerRound: 16,
-  cooldownMs: 0
+  useAutotune: false
 });
 
 type TimeMode = "local" | "et";
@@ -1502,7 +1495,7 @@ export default function App() {
       try {
         const data = await getStrategyPaper(strategyMarketType, {
           ...STRATEGY_PAPER_PROFILE,
-          source: strategySource
+          source: strategySource,
         });
         if (alive) {
           setStrategyPaper(data);
