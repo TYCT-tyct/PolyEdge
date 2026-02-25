@@ -737,17 +737,52 @@ export async function getAccuracySeries(
   return data;
 }
 
+export interface StrategyPaperQueryOptions {
+  lookbackMinutes?: number;
+  maxTrades?: number;
+  fullHistory?: boolean;
+  useAutotune?: boolean;
+  entryThresholdBase?: number;
+  entryThresholdCap?: number;
+  entryEdgeProb?: number;
+  entryMinPotentialCents?: number;
+  minHoldMs?: number;
+  maxEntriesPerRound?: number;
+  cooldownMs?: number;
+}
+
 export async function getStrategyPaper(
   marketType: MarketType = "5m",
-  lookbackMinutes = 360,
-  maxTrades = 120
+  options: StrategyPaperQueryOptions = {}
 ): Promise<StrategyPaperResponse> {
   const qs = new URLSearchParams({
     market_type: marketType,
-    lookback_minutes: String(lookbackMinutes),
-    max_trades: String(maxTrades),
-    use_autotune: "false",
+    lookback_minutes: String(options.lookbackMinutes ?? 360),
+    max_trades: String(options.maxTrades ?? 120),
+    full_history: options.fullHistory ? "true" : "false",
+    use_autotune: options.useAutotune ? "true" : "false",
   });
+  if (options.entryThresholdBase != null) {
+    qs.set("entry_threshold_base", String(options.entryThresholdBase));
+  }
+  if (options.entryThresholdCap != null) {
+    qs.set("entry_threshold_cap", String(options.entryThresholdCap));
+  }
+  if (options.entryEdgeProb != null) {
+    qs.set("entry_edge_prob", String(options.entryEdgeProb));
+  }
+  if (options.entryMinPotentialCents != null) {
+    qs.set("entry_min_potential_cents", String(options.entryMinPotentialCents));
+  }
+  if (options.minHoldMs != null) {
+    qs.set("min_hold_ms", String(options.minHoldMs));
+  }
+  if (options.maxEntriesPerRound != null) {
+    qs.set("max_entries_per_round", String(options.maxEntriesPerRound));
+  }
+  if (options.cooldownMs != null) {
+    qs.set("cooldown_ms", String(options.cooldownMs));
+  }
   return requestJson<StrategyPaperResponse>(`/api/strategy/paper?${qs.toString()}`);
 }
 

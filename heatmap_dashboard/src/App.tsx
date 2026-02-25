@@ -50,6 +50,20 @@ const WS_STALE_FALLBACK_MS = 3000;
 const LIVE_UI_MIN_INTERVAL_MS = 900;
 const ET_TIMEZONE = "America/New_York";
 const COLLECTOR_POLL_MS = 5_000;
+const STRATEGY_POLL_MS = 5_000;
+const STRATEGY_PAPER_PROFILE = Object.freeze({
+  lookbackMinutes: 24 * 60,
+  maxTrades: 320,
+  fullHistory: false,
+  useAutotune: false,
+  entryThresholdBase: 0.595,
+  entryThresholdCap: 0.825,
+  entryEdgeProb: 0.024,
+  entryMinPotentialCents: 9.5,
+  minHoldMs: 2_200,
+  maxEntriesPerRound: 16,
+  cooldownMs: 0
+});
 
 type TimeMode = "local" | "et";
 
@@ -772,7 +786,7 @@ const StrategyPanel = memo(function StrategyPanel({ data, loading, timeMode, upd
             {data ? `${(data.summary.net_pnl_cents ?? data.summary.total_pnl_cents).toFixed(2)}¢` : "--"}
           </strong>
           <small>
-            交易 {data?.summary.trade_count ?? 0} · 胜率 {data ? `${data.summary.win_rate_pct.toFixed(1)}%` : "--"}
+            交易 {data?.summary.trade_count ?? 0} · 胜率 {data ? `${data.summary.win_rate_pct.toFixed(1)}%` : "--"} · 窗口 {data?.lookback_minutes ?? "--"}m
           </small>
         </article>
         <article className="info-card">
@@ -1469,7 +1483,7 @@ export default function App() {
       strategyInFlightRef.current = true;
       setStrategyLoading(true);
       try {
-        const data = await getStrategyPaper("5m", 240, 120);
+        const data = await getStrategyPaper("5m", STRATEGY_PAPER_PROFILE);
         if (alive) {
           setStrategyPaper(data);
           setStrategyUpdatedAt(Date.now());
@@ -1488,7 +1502,7 @@ export default function App() {
     void load();
     const id = window.setInterval(() => {
       void load();
-    }, 10_000);
+    }, STRATEGY_POLL_MS);
     return () => {
       alive = false;
       window.clearInterval(id);
