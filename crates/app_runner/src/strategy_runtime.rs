@@ -2394,6 +2394,23 @@ async fn execute_fire_plan(
             break;
         }
     }
+    if plan_result.executed == 0 {
+        // Router capacity should only stay locked for opportunities that actually entered.
+        // If nothing was executed for this plan, release the pre-lock immediately so we don't
+        // accumulate phantom locks and starve subsequent opportunities.
+        let mut locked_by_tf_usdc: HashMap<String, f64> = HashMap::new();
+        {
+            let mut router = shared.predator_router.write().await;
+            let _ = router.unlock_market(&opp.market_id);
+            for (tf, v) in router.locked_by_tf_usdc(now_ms) {
+                locked_by_tf_usdc.insert(tf.to_string(), v);
+            }
+        }
+        shared
+            .shadow_stats
+            .set_predator_router_locked_by_tf_usdc(locked_by_tf_usdc)
+            .await;
+    }
     plan_result
 }
 
