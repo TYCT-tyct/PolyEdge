@@ -2614,6 +2614,11 @@ fn run_strategy_simulation(
             let drawdown = pos.peak_pnl_cents - pnl;
             let held_ms = (sample.ts_ms - pos.entry_ts_ms).max(0);
             let trend_signed = score * pos.side.dir();
+            let hold_side_confidence = if pos.side == StrategySide::Up {
+                signal.p_fair_up
+            } else {
+                1.0 - signal.p_fair_up
+            };
             if trend_signed <= cfg.reverse_signal_threshold {
                 pos.reverse_streak = pos.reverse_streak.saturating_add(1);
             } else {
@@ -2628,12 +2633,20 @@ fn run_strategy_simulation(
                 && trend_signed < 0.0;
             let had_realized_edge = pos.peak_pnl_cents >= (cfg.trail_drawdown_cents * 0.70).max(1.5);
             let flipped_to_net_negative = had_realized_edge && pnl <= -0.2;
+            let hard_reverse_confirm =
+                pos.reverse_streak >= 2 && hold_side_confidence <= 0.46 && trend_signed <= -0.10;
             let fast_loss_guard = pnl <= -(cfg.stop_loss_cents * 0.32).max(1.4)
                 && trend_signed <= cfg.reverse_signal_threshold * 0.85
-                && pos.reverse_streak >= 1;
+                && pos.reverse_streak >= 2
+                && hold_side_confidence <= 0.52;
             let early_hard_stop = held_ms <= 12_000
                 && pnl <= -(cfg.stop_loss_cents * 0.38).max(3.2)
-                && trend_signed <= -0.08;
+                && hard_reverse_confirm;
+            let peak_retrace_lock = can_exit_now
+                && pos.peak_pnl_cents >= cfg.trail_activate_profit_cents * 1.20
+                && pnl >= (cfg.trail_activate_profit_cents * 0.50).max(0.9)
+                && drawdown >= (pos.peak_pnl_cents * 0.35).max(cfg.trail_drawdown_cents * 0.90)
+                && trend_signed <= 0.02;
             let first_reversal_take_profit = can_exit_now
                 && pnl >= (cfg.trail_drawdown_cents * 0.45).max(1.0)
                 && trend_signed <= -0.05
@@ -2651,6 +2664,8 @@ fn run_strategy_simulation(
                 && bid_cents_exec >= cfg.endgame_take_profit_cents
             {
                 exit_reason = Some("endgame_take_profit");
+            } else if peak_retrace_lock {
+                exit_reason = Some("peak_retrace_lock");
             } else if profit_lock_reversal {
                 exit_reason = Some("profit_lock_reversal");
             } else if flipped_to_net_negative {
