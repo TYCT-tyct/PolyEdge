@@ -1935,7 +1935,7 @@ struct StrategyRuntimeConfig {
     emergency_wide_spread_penalty_ratio: f64,
 }
 
-const STRATEGY_BASELINE_PROFILE: &str = "high_win_risk_off_2026_02_26";
+const STRATEGY_BASELINE_PROFILE: &str = "strict_no_autotune_2026_02_26";
 
 #[allow(dead_code)]
 fn strategy_backup_baseline_config() -> StrategyRuntimeConfig {
@@ -1966,31 +1966,30 @@ fn strategy_backup_baseline_config() -> StrategyRuntimeConfig {
 }
 
 fn strategy_current_default_config() -> StrategyRuntimeConfig {
-    // Derived from constrained 5m replay search with risk-first objective:
-    // prioritize higher win-rate and materially lower drawdown / loss frequency.
+    // Revert to previous stable baseline (strict_no_autotune_2026_02_26).
     StrategyRuntimeConfig {
-        entry_threshold_base: 0.6652401208058705,
-        entry_threshold_cap: 0.9613192493233271,
-        spread_limit_prob: 0.019571928326548343,
-        entry_edge_prob: 0.0290695243363757,
-        entry_min_potential_cents: 10.559844468873615,
-        entry_max_price_cents: 83.16170632534005,
-        min_hold_ms: 3_471,
-        stop_loss_cents: 3.622327533092089,
-        reverse_signal_threshold: -0.6202686325933316,
+        entry_threshold_base: 0.5974897596832403,
+        entry_threshold_cap: 0.8445281582196084,
+        spread_limit_prob: 0.023219988756074554,
+        entry_edge_prob: 0.03139843811607734,
+        entry_min_potential_cents: 10.14705380694935,
+        entry_max_price_cents: 75.93741099259525,
+        min_hold_ms: 3_475,
+        stop_loss_cents: 4.094248266919752,
+        reverse_signal_threshold: -0.68824813079899,
         reverse_signal_ticks: 1,
-        trail_activate_profit_cents: 2.3077155984145343,
-        trail_drawdown_cents: 2.420339205323166,
-        take_profit_near_max_cents: 84.3389210067711,
-        endgame_take_profit_cents: 77.51360888900204,
-        endgame_remaining_ms: 14_324,
-        liquidity_widen_prob: 0.11151912007780494,
+        trail_activate_profit_cents: 2.693031061201522,
+        trail_drawdown_cents: 2.791041275329463,
+        take_profit_near_max_cents: 89.6868393303587,
+        endgame_take_profit_cents: 88.69503839734718,
+        endgame_remaining_ms: 17_270,
+        liquidity_widen_prob: 0.1108363526508022,
         cooldown_ms: 0,
-        max_entries_per_round: 12,
-        max_exec_spread_cents: 1.4223578909620542,
-        slippage_cents_per_side: 0.06513482446015549,
-        fee_cents_per_side: 0.036586933463111065,
-        emergency_wide_spread_penalty_ratio: 0.2202953671160862,
+        max_entries_per_round: 10,
+        max_exec_spread_cents: 1.6193923581847693,
+        slippage_cents_per_side: 0.07264891978079893,
+        fee_cents_per_side: 0.03502784311015152,
+        emergency_wide_spread_penalty_ratio: 0.25277914857787637,
     }
 }
 
