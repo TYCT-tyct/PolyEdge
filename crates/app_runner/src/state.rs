@@ -357,6 +357,7 @@ impl Default for V52TimePhaseConfig {
 pub(crate) struct V52ExecutionConfig {
     pub(crate) late_force_taker_remaining_ms: u64,
     pub(crate) maker_wait_ms_before_force: u64,
+    pub(crate) maker_first_ttl_fallback_enabled: bool,
     pub(crate) apply_force_taker_in_maturity: bool,
     pub(crate) apply_force_taker_in_late: bool,
     pub(crate) alpha_window_enabled: bool,
@@ -371,6 +372,7 @@ impl Default for V52ExecutionConfig {
         Self {
             late_force_taker_remaining_ms: 30_000,
             maker_wait_ms_before_force: 800,
+            maker_first_ttl_fallback_enabled: true,
             apply_force_taker_in_maturity: true,
             apply_force_taker_in_late: true,
             alpha_window_enabled: true,

@@ -244,30 +244,12 @@ fn spawn_force_taker_fallback_for_maker(
     maker_order_id: String,
     fee_rate_bps: f64,
     expected_edge_net_bps: f64,
-    timeframe: TimeframeClass,
-    force_remaining_ms: u64,
     maker_wait_ms: u64,
     taker_max_slippage_bps: f64,
 ) {
     spawn_detached("v52_force_taker_fallback", false, async move {
         if maker_wait_ms > 0 {
             tokio::time::sleep(Duration::from_millis(maker_wait_ms)).await;
-        }
-        let Some(frame_total_ms) = timeframe_total_ms(timeframe) else {
-            return;
-        };
-        let threshold = force_remaining_ms as i64;
-        loop {
-            if !execution.has_open_order(&maker_order_id) {
-                return;
-            }
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let remain_ms = (frame_total_ms - now_ms.rem_euclid(frame_total_ms)).max(0);
-            if remain_ms <= threshold {
-                break;
-            }
-            let sleep_ms = (remain_ms - threshold).clamp(25, 250) as u64;
-            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
         }
         if !execution.has_open_order(&maker_order_id) {
             return;
@@ -527,7 +509,11 @@ fn spawn_roll_v1_maker_ttl_fallback(
         if !execution.has_open_order(&maker_order_id) {
             return;
         }
-        if execution.cancel_order(&maker_order_id, &market_id).await.is_err() {
+        if execution
+            .cancel_order(&maker_order_id, &market_id)
+            .await
+            .is_err()
+        {
             return;
         }
         shadow.cancel(&maker_order_id);
@@ -702,8 +688,8 @@ fn spawn_roll_v1_position_lifecycle(
             let momentum_reversal_fallback = direction_neutral
                 && prob_velocity_bps <= tf_cfg.reverse_velocity_bps_per_sec
                 && drop_pct >= tf_cfg.reverse_drop_pct;
-            let reversal_condition =
-                drop_pct >= tf_cfg.reverse_drop_pct && (velocity_reversal || momentum_reversal_fallback);
+            let reversal_condition = drop_pct >= tf_cfg.reverse_drop_pct
+                && (velocity_reversal || momentum_reversal_fallback);
             if reversal_condition {
                 let started = reverse_start_ms.get_or_insert(now_ms);
                 if now_ms.saturating_sub(*started) < tf_cfg.reverse_persist_ms as i64 {
@@ -865,7 +851,10 @@ fn spawn_roll_v1_position_lifecycle(
                     )
                     .await;
                 }
-                shared.shadow_stats.record_exit_reason("roll_v1_reverse_weak").await;
+                shared
+                    .shadow_stats
+                    .record_exit_reason("roll_v1_reverse_weak")
+                    .await;
             } else {
                 shared
                     .shadow_stats
@@ -1261,8 +1250,8 @@ pub(super) async fn evaluate_and_route_roll_v1(
         };
         let remaining_ms = (frame_total_ms - now_ms.rem_euclid(frame_total_ms)).max(0);
         let tf_cfg = roll_cfg_for_timeframe(predator_cfg, &timeframe);
-        let too_early = tf_cfg.entry_start_remaining_ms > 0
-            && remaining_ms > tf_cfg.entry_start_remaining_ms;
+        let too_early =
+            tf_cfg.entry_start_remaining_ms > 0 && remaining_ms > tf_cfg.entry_start_remaining_ms;
         let too_late = remaining_ms < tf_cfg.entry_end_remaining_ms;
         if too_early || too_late {
             let reason = if too_early {
@@ -1335,11 +1324,7 @@ pub(super) async fn evaluate_and_route_roll_v1(
         let Some(frame_total_ms) = timeframe_total_ms(timeframe.clone()) else {
             shared
                 .shadow_stats
-                .mark_blocked_with_reason_ctx(
-                    "v52_blocked_timeframe",
-                    Some(symbol),
-                    Some(tf_label),
-                )
+                .mark_blocked_with_reason_ctx("v52_blocked_timeframe", Some(symbol), Some(tf_label))
                 .await;
             continue;
         };
@@ -1494,17 +1479,26 @@ pub(super) async fn evaluate_and_route_roll_v1(
                 // Fallback to taker price path (with taker fee model) to avoid missing early ramps.
                 let taker_yes_price = aggressive_price_for_side(&book, &OrderSide::BuyYes);
                 let taker_no_price = aggressive_price_for_side(&book, &OrderSide::BuyNo);
-                let taker_yes_gross =
-                    edge_gross_bps_for_side(probability.p_settle, &OrderSide::BuyYes, taker_yes_price);
-                let taker_no_gross =
-                    edge_gross_bps_for_side(probability.p_settle, &OrderSide::BuyNo, taker_no_price);
-                let taker_yes_net = taker_yes_gross - yes_fee_taker_bps - edge_model_cfg.fail_cost_bps;
+                let taker_yes_gross = edge_gross_bps_for_side(
+                    probability.p_settle,
+                    &OrderSide::BuyYes,
+                    taker_yes_price,
+                );
+                let taker_no_gross = edge_gross_bps_for_side(
+                    probability.p_settle,
+                    &OrderSide::BuyNo,
+                    taker_no_price,
+                );
+                let taker_yes_net =
+                    taker_yes_gross - yes_fee_taker_bps - edge_model_cfg.fail_cost_bps;
                 let taker_no_net = taker_no_gross - no_fee_taker_bps - edge_model_cfg.fail_cost_bps;
                 let choose_yes = taker_yes_price.is_finite()
                     && taker_yes_price > 0.0
                     && taker_yes_net > 0.0
-                    && (taker_yes_net >= taker_no_net || !(taker_no_price.is_finite() && taker_no_price > 0.0));
-                let choose_no = taker_no_price.is_finite() && taker_no_price > 0.0 && taker_no_net > 0.0;
+                    && (taker_yes_net >= taker_no_net
+                        || !(taker_no_price.is_finite() && taker_no_price > 0.0));
+                let choose_no =
+                    taker_no_price.is_finite() && taker_no_price > 0.0 && taker_no_net > 0.0;
                 if choose_yes {
                     side = OrderSide::BuyYes;
                     entry_price = taker_yes_price;
@@ -1520,7 +1514,11 @@ pub(super) async fn evaluate_and_route_roll_v1(
                 } else {
                     shared
                         .shadow_stats
-                        .mark_blocked_with_reason_ctx("no_quote_spread", Some(symbol), Some(tf_label))
+                        .mark_blocked_with_reason_ctx(
+                            "no_quote_spread",
+                            Some(symbol),
+                            Some(tf_label),
+                        )
                         .await;
                     if trace_scan {
                         record_roll_trace(serde_json::json!({
@@ -1634,7 +1632,11 @@ pub(super) async fn evaluate_and_route_roll_v1(
         if notional_usdc <= 0.0 {
             shared
                 .shadow_stats
-                .mark_blocked_with_reason_ctx("router_notional_cap_zero", Some(symbol), Some(tf_label))
+                .mark_blocked_with_reason_ctx(
+                    "router_notional_cap_zero",
+                    Some(symbol),
+                    Some(tf_label),
+                )
                 .await;
             continue;
         }
@@ -2862,11 +2864,6 @@ pub(super) async fn predator_execute_opportunity(
     let time_phase = classify_time_phase(remaining_ratio, &predator_cfg.v52.time_phase);
     let force_taker_now =
         should_force_taker_fallback(time_phase, time_to_expiry_ms, &predator_cfg.v52.execution);
-    let apply_force_taker_for_phase = match time_phase {
-        TimePhase::Early => false,
-        TimePhase::Maturity => predator_cfg.v52.execution.apply_force_taker_in_maturity,
-        TimePhase::Late => predator_cfg.v52.execution.apply_force_taker_in_late,
-    };
     if force_taker_now {
         shared.shadow_stats.mark_predator_last_30s_taker_fallback();
     }
@@ -3042,9 +3039,7 @@ pub(super) async fn predator_execute_opportunity(
         StrategyEngineMode::RollV1
     ) {
         match predator_cfg.priority {
-            PredatorCPriority::TakerOnly | PredatorCPriority::TakerFirst => {
-                ExecutionStyle::Taker
-            }
+            PredatorCPriority::TakerOnly | PredatorCPriority::TakerFirst => ExecutionStyle::Taker,
             PredatorCPriority::MakerFirst => {
                 if force_taker_now {
                     ExecutionStyle::Taker
@@ -3221,7 +3216,10 @@ pub(super) async fn predator_execute_opportunity(
                     predator_cfg.v52.execution.alpha_window_max_wait_ms,
                 );
             }
-            if execution_style == ExecutionStyle::Maker && apply_force_taker_for_phase {
+            if execution_style == ExecutionStyle::Maker
+                && predator_cfg.v52.execution.maker_first_ttl_fallback_enabled
+                && predator_cfg.v52.execution.maker_wait_ms_before_force > 0
+            {
                 spawn_force_taker_fallback_for_maker(
                     shared.clone(),
                     execution.clone(),
@@ -3234,8 +3232,6 @@ pub(super) async fn predator_execute_opportunity(
                     ack.order_id.clone(),
                     opp.fee_bps,
                     opp.edge_net_bps,
-                    opp.timeframe.clone(),
-                    predator_cfg.v52.execution.late_force_taker_remaining_ms,
                     predator_cfg.v52.execution.maker_wait_ms_before_force,
                     maker_cfg.taker_max_slippage_bps,
                 );

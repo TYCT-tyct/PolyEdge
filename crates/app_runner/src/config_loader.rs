@@ -1411,6 +1411,11 @@ pub(super) fn load_predator_c_config() -> PredatorCConfig {
                         cfg.v52.execution.maker_wait_ms_before_force = parsed;
                     }
                 }
+                "maker_first_ttl_fallback_enabled" => {
+                    if let Ok(parsed) = val.parse::<bool>() {
+                        cfg.v52.execution.maker_first_ttl_fallback_enabled = parsed;
+                    }
+                }
                 "apply_force_taker_in_maturity" => {
                     if let Ok(parsed) = val.parse::<bool>() {
                         cfg.v52.execution.apply_force_taker_in_maturity = parsed;
