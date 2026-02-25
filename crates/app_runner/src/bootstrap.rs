@@ -62,15 +62,20 @@ pub(super) async fn async_main() -> Result<()> {
     }
     let seat = SeatRuntimeHandle::spawn(seat_cfg);
     let seat_fill_counter = seat.live_fill_counter();
-    let paper_enabled = std::env::var("POLYEDGE_PAPER_ENABLED")
-        .ok()
-        .map(|v| {
-            !matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "off" | "no"
-            )
-        })
-        .unwrap_or(true);
+    // Paper runtime is always-on by design:
+    // live trading is gated by explicit arming, while paper keeps running for continuous visibility.
+    let paper_enabled = true;
+    if let Ok(v) = std::env::var("POLYEDGE_PAPER_ENABLED") {
+        let disabled = matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        );
+        if disabled {
+            tracing::warn!(
+                "POLYEDGE_PAPER_ENABLED is false, but paper runtime is forced on by design"
+            );
+        }
+    }
     let paper_initial_capital = std::env::var("POLYEDGE_PAPER_INITIAL_CAPITAL")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())

@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use core_types::{new_id, ExecutionVenue, OrderAck, OrderAckV2, OrderIntentV2, QuoteIntent};
 use parking_lot::{Mutex, RwLock};
-use reqwest::Client;
+use reqwest::{header::HeaderMap, header::RETRY_AFTER, Client, StatusCode};
 use serde::Serialize;
 
 pub mod wss_user_feed;
@@ -30,6 +30,7 @@ pub struct ClobExecution {
     open_orders: Arc<RwLock<HashMap<String, PaperOpenOrder>>>,
     last_prune: Mutex<Instant>,
     ack_probe: Option<Arc<AckProbe>>,
+    retry_cfg: RetryConfig,
 }
 
 fn env_flag_enabled(name: &str) -> bool {
@@ -54,6 +55,7 @@ impl Clone for ClobExecution {
             open_orders: self.open_orders.clone(),
             last_prune: Mutex::new(Instant::now()),
             ack_probe: self.ack_probe.clone(),
+            retry_cfg: self.retry_cfg,
         }
     }
 }
@@ -72,6 +74,108 @@ struct AckProbe {
 struct PaperOpenOrder {
     intent: QuoteIntent,
     created_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RetryConfig {
+    order_retry_attempts: u32,
+    order_retry_base_backoff: Duration,
+    order_retry_max_backoff: Duration,
+    cancel_retry_attempts: u32,
+    cancel_retry_base_backoff: Duration,
+    cancel_retry_max_backoff: Duration,
+    idempotency_header_enabled: bool,
+}
+
+impl RetryConfig {
+    fn from_env() -> Self {
+        Self {
+            order_retry_attempts: env_u32("POLYEDGE_ORDER_RETRY_ATTEMPTS", 2, 1, 6),
+            order_retry_base_backoff: Duration::from_millis(env_u64(
+                "POLYEDGE_ORDER_RETRY_BASE_BACKOFF_MS",
+                8,
+                0,
+                1_000,
+            )),
+            order_retry_max_backoff: Duration::from_millis(env_u64(
+                "POLYEDGE_ORDER_RETRY_MAX_BACKOFF_MS",
+                120,
+                1,
+                5_000,
+            )),
+            cancel_retry_attempts: env_u32("POLYEDGE_CANCEL_RETRY_ATTEMPTS", 2, 1, 6),
+            cancel_retry_base_backoff: Duration::from_millis(env_u64(
+                "POLYEDGE_CANCEL_RETRY_BASE_BACKOFF_MS",
+                20,
+                0,
+                2_000,
+            )),
+            cancel_retry_max_backoff: Duration::from_millis(env_u64(
+                "POLYEDGE_CANCEL_RETRY_MAX_BACKOFF_MS",
+                500,
+                1,
+                5_000,
+            )),
+            idempotency_header_enabled: std::env::var("POLYEDGE_IDEMPOTENCY_HEADER_ENABLED")
+                .ok()
+                .map(|v| {
+                    !matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "0" | "false" | "off" | "no"
+                    )
+                })
+                .unwrap_or(true),
+        }
+    }
+}
+
+fn env_u32(name: &str, default: u32, min: u32, max: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+fn env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+fn is_retryable_status(status: StatusCode) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn parse_retry_after_ms(headers: &HeaderMap) -> Option<u64> {
+    let raw = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Ok(seconds) = raw.parse::<f64>() {
+        if seconds.is_finite() && seconds >= 0.0 {
+            return Some((seconds * 1_000.0).round() as u64);
+        }
+    }
+    None
+}
+
+fn retry_backoff(attempt: u32, base: Duration, max_backoff: Duration) -> Duration {
+    let base_ms = base.as_millis() as u64;
+    let max_ms = max_backoff.as_millis() as u64;
+    if base_ms == 0 || max_ms == 0 {
+        return Duration::from_millis(0);
+    }
+    let exp = 1_u64.checked_shl(attempt.min(10)).unwrap_or(u64::MAX);
+    let mut delay = base_ms.saturating_mul(exp);
+    if delay > max_ms {
+        delay = max_ms;
+    }
+    // Small deterministic jitter to avoid synchronized retries.
+    let jitter = (attempt as u64).saturating_mul(3) % 17;
+    let delay = delay.saturating_add(jitter).min(max_ms);
+    Duration::from_millis(delay)
 }
 
 #[derive(Serialize)]
@@ -232,6 +336,7 @@ impl ClobExecution {
             open_orders: Arc::new(RwLock::new(HashMap::new())),
             last_prune: Mutex::new(Instant::now()),
             ack_probe,
+            retry_cfg: RetryConfig::from_env(),
         }
     }
 
@@ -391,16 +496,23 @@ impl ExecutionVenue for ClobExecution {
                     encode_live_order_payload(&intent)
                 };
 
-                const MAX_RETRIES: u32 = 2;
                 let mut last_network_error: Option<String> = None;
+                let max_attempts = self.retry_cfg.order_retry_attempts.max(1);
                 for (idx, endpoint) in self.order_endpoints().iter().enumerate() {
                     let primary_leg = idx == 0;
-                    for attempt in 0..MAX_RETRIES {
+                    for attempt in 0..max_attempts {
                         let mut req = self
                             .http
                             .post(format!("{endpoint}/orders"))
                             .header("content-type", "application/json")
                             .body(body_bytes.clone());
+                        if self.retry_cfg.idempotency_header_enabled {
+                            if let Some(ref id) = intent.client_order_id {
+                                req = req
+                                    .header("idempotency-key", id)
+                                    .header("x-idempotency-key", id);
+                            }
+                        }
                         if let Some(ref auth) = intent.prebuilt_auth {
                             req = req
                                 .header("poly-address", &auth.address)
@@ -416,7 +528,23 @@ impl ExecutionVenue for ClobExecution {
                             Ok(res) => res,
                             Err(err) => {
                                 last_network_error = Some(err.to_string());
-                                if attempt + 1 < MAX_RETRIES {
+                                if attempt + 1 < max_attempts {
+                                    let sleep_d = retry_backoff(
+                                        attempt,
+                                        self.retry_cfg.order_retry_base_backoff,
+                                        self.retry_cfg.order_retry_max_backoff,
+                                    );
+                                    tracing::debug!(
+                                        endpoint = endpoint,
+                                        attempt = attempt + 1,
+                                        max_attempts,
+                                        error = %err,
+                                        backoff_ms = sleep_d.as_millis(),
+                                        "place_order_v2 network retry"
+                                    );
+                                    if !sleep_d.is_zero() {
+                                        tokio::time::sleep(sleep_d).await;
+                                    }
                                     continue;
                                 }
                                 break;
@@ -424,6 +552,7 @@ impl ExecutionVenue for ClobExecution {
                         };
 
                         let status = res.status();
+                        let headers = res.headers().clone();
                         let raw = res.text().await.unwrap_or_default();
                         let payload_value = serde_json::from_str::<serde_json::Value>(&raw)
                             .unwrap_or_else(|_| {
@@ -470,7 +599,26 @@ impl ExecutionVenue for ClobExecution {
                         if accepted_size <= 0.0 {
                             accepted = false;
                         }
-                        if status.is_server_error() && attempt + 1 < MAX_RETRIES {
+                        if is_retryable_status(status) && attempt + 1 < max_attempts {
+                            let wait_ms = parse_retry_after_ms(&headers);
+                            let sleep_d = wait_ms.map(Duration::from_millis).unwrap_or_else(|| {
+                                retry_backoff(
+                                    attempt,
+                                    self.retry_cfg.order_retry_base_backoff,
+                                    self.retry_cfg.order_retry_max_backoff,
+                                )
+                            });
+                            tracing::debug!(
+                                endpoint = endpoint,
+                                attempt = attempt + 1,
+                                max_attempts,
+                                status = status.as_u16(),
+                                backoff_ms = sleep_d.as_millis(),
+                                "place_order_v2 retryable status retry"
+                            );
+                            if !sleep_d.is_zero() {
+                                tokio::time::sleep(sleep_d).await;
+                            }
                             continue;
                         }
                         if accepted {
@@ -495,6 +643,19 @@ impl ExecutionVenue for ClobExecution {
                                 accepted: true,
                                 accepted_size,
                                 reject_code: None,
+                                exchange_latency_ms: started.elapsed().as_secs_f64() * 1_000.0,
+                                ts_ms: Utc::now().timestamp_millis(),
+                            });
+                        }
+                        // Deterministic reject (client-side rule/validation or semantic reject)
+                        // should return immediately to avoid wasting time on backup endpoints.
+                        if status.is_client_error() || status.is_success() {
+                            return Ok(OrderAckV2 {
+                                order_id,
+                                market_id: intent.market_id,
+                                accepted: false,
+                                accepted_size: 0.0,
+                                reject_code,
                                 exchange_latency_ms: started.elapsed().as_secs_f64() * 1_000.0,
                                 ts_ms: Utc::now().timestamp_millis(),
                             });
@@ -541,24 +702,79 @@ impl ExecutionVenue for ClobExecution {
                     bail!("force_paper_guard: cancel blocked in live mode");
                 }
                 let mut last_status: Option<reqwest::StatusCode> = None;
+                let mut last_network_error: Option<String> = None;
+                let max_attempts = self.retry_cfg.cancel_retry_attempts.max(1);
                 for endpoint in self.order_endpoints() {
-                    let res = self
-                        .http
-                        .delete(format!("{endpoint}/orders/{order_id}"))
-                        .send()
-                        .await?;
-                    if res.status().is_success() {
-                        self.open_orders.write().remove(order_id);
-                        return Ok(());
+                    for attempt in 0..max_attempts {
+                        let res = match self
+                            .http
+                            .delete(format!("{endpoint}/orders/{order_id}"))
+                            .send()
+                            .await
+                        {
+                            Ok(v) => v,
+                            Err(err) => {
+                                last_network_error = Some(err.to_string());
+                                if attempt + 1 < max_attempts {
+                                    let sleep_d = retry_backoff(
+                                        attempt,
+                                        self.retry_cfg.cancel_retry_base_backoff,
+                                        self.retry_cfg.cancel_retry_max_backoff,
+                                    );
+                                    tracing::debug!(
+                                        endpoint = endpoint,
+                                        attempt = attempt + 1,
+                                        max_attempts,
+                                        error = %err,
+                                        backoff_ms = sleep_d.as_millis(),
+                                        "cancel_order network retry"
+                                    );
+                                    if !sleep_d.is_zero() {
+                                        tokio::time::sleep(sleep_d).await;
+                                    }
+                                    continue;
+                                }
+                                break;
+                            }
+                        };
+                        let status = res.status();
+                        if status.is_success() {
+                            self.open_orders.write().remove(order_id);
+                            return Ok(());
+                        }
+                        last_status = Some(status);
+                        if is_retryable_status(status) && attempt + 1 < max_attempts {
+                            let sleep_d = retry_backoff(
+                                attempt,
+                                self.retry_cfg.cancel_retry_base_backoff,
+                                self.retry_cfg.cancel_retry_max_backoff,
+                            );
+                            tracing::debug!(
+                                endpoint = endpoint,
+                                attempt = attempt + 1,
+                                max_attempts,
+                                status = status.as_u16(),
+                                backoff_ms = sleep_d.as_millis(),
+                                "cancel_order retryable status retry"
+                            );
+                            if !sleep_d.is_zero() {
+                                tokio::time::sleep(sleep_d).await;
+                            }
+                            continue;
+                        }
+                        break;
                     }
-                    last_status = Some(res.status());
                 }
-                bail!(
+                let mut reason = format!(
                     "cancel failed with status {}",
                     last_status
                         .map(|s| s.as_u16().to_string())
                         .unwrap_or_else(|| "unknown".to_string())
-                )
+                );
+                if let Some(err) = last_network_error {
+                    reason.push_str(&format!(" network_error={err}"));
+                }
+                bail!(reason)
             }
         }
     }
@@ -572,19 +788,73 @@ impl ExecutionVenue for ClobExecution {
                     bail!("force_paper_guard: flatten blocked in live mode");
                 }
                 let mut last_status: Option<reqwest::StatusCode> = None;
+                let mut last_network_error: Option<String> = None;
+                let max_attempts = self.retry_cfg.cancel_retry_attempts.max(1);
                 for endpoint in self.order_endpoints() {
-                    let res = self.http.post(format!("{endpoint}/flatten")).send().await?;
-                    if res.status().is_success() {
-                        return Ok(());
+                    for attempt in 0..max_attempts {
+                        let res = match self.http.post(format!("{endpoint}/flatten")).send().await {
+                            Ok(v) => v,
+                            Err(err) => {
+                                last_network_error = Some(err.to_string());
+                                if attempt + 1 < max_attempts {
+                                    let sleep_d = retry_backoff(
+                                        attempt,
+                                        self.retry_cfg.cancel_retry_base_backoff,
+                                        self.retry_cfg.cancel_retry_max_backoff,
+                                    );
+                                    tracing::debug!(
+                                        endpoint = endpoint,
+                                        attempt = attempt + 1,
+                                        max_attempts,
+                                        error = %err,
+                                        backoff_ms = sleep_d.as_millis(),
+                                        "flatten_all network retry"
+                                    );
+                                    if !sleep_d.is_zero() {
+                                        tokio::time::sleep(sleep_d).await;
+                                    }
+                                    continue;
+                                }
+                                break;
+                            }
+                        };
+                        let status = res.status();
+                        if status.is_success() {
+                            return Ok(());
+                        }
+                        last_status = Some(status);
+                        if is_retryable_status(status) && attempt + 1 < max_attempts {
+                            let sleep_d = retry_backoff(
+                                attempt,
+                                self.retry_cfg.cancel_retry_base_backoff,
+                                self.retry_cfg.cancel_retry_max_backoff,
+                            );
+                            tracing::debug!(
+                                endpoint = endpoint,
+                                attempt = attempt + 1,
+                                max_attempts,
+                                status = status.as_u16(),
+                                backoff_ms = sleep_d.as_millis(),
+                                "flatten_all retryable status retry"
+                            );
+                            if !sleep_d.is_zero() {
+                                tokio::time::sleep(sleep_d).await;
+                            }
+                            continue;
+                        }
+                        break;
                     }
-                    last_status = Some(res.status());
                 }
-                bail!(
+                let mut reason = format!(
                     "flatten failed with status {}",
                     last_status
                         .map(|s| s.as_u16().to_string())
                         .unwrap_or_else(|| "unknown".to_string())
-                )
+                );
+                if let Some(err) = last_network_error {
+                    reason.push_str(&format!(" network_error={err}"));
+                }
+                bail!(reason)
             }
         }
     }
@@ -593,6 +863,7 @@ impl ExecutionVenue for ClobExecution {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::header::HeaderValue;
 
     #[test]
     fn env_flag_enabled_parses_common_true_values() {
@@ -633,5 +904,21 @@ mod tests {
         let endpoints = exec.order_endpoints();
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0], "http://127.0.0.1:9001");
+    }
+
+    #[test]
+    fn retryable_status_rules() {
+        assert!(is_retryable_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_status(StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn parse_retry_after_ms_parses_seconds() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("2"));
+        assert_eq!(parse_retry_after_ms(&headers), Some(2_000));
     }
 }
