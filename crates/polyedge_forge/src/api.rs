@@ -6219,18 +6219,29 @@ async fn strategy_autotune_history(
     };
     let context = normalize_autotune_context(params.context.as_deref(), market_type);
     let limit = params.limit.unwrap_or(20).clamp(1, 200) as usize;
-    let key = strategy_autotune_history_key(&state.redis_prefix, &context);
-    let mut items = read_key_value(&state, &key)
+    let active_key = strategy_autotune_active_history_key(&state.redis_prefix, market_type);
+    let mut items = read_key_value(&state, &active_key)
         .await?
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
+    let candidate_key = strategy_autotune_history_key(&state.redis_prefix, &context);
+    let (key_used, source_used) = if items.is_empty() {
+        items = read_key_value(&state, &candidate_key)
+            .await?
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        (candidate_key, "candidate_context")
+    } else {
+        (active_key, "active_promotions")
+    };
     if items.len() > limit {
         items.truncate(limit);
     }
     Ok(Json(json!({
         "market_type": market_type,
         "context": context,
-        "key": key,
+        "key": key_used,
+        "source": source_used,
         "from_legacy": false,
         "limit": limit,
         "count": items.len(),
