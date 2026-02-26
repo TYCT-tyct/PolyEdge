@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/polyedge_cli",
   "crates/core_types",
   "crates/feed_polymarket",
   "crates/feed_reference",

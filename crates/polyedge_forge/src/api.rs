@@ -2,26 +2,30 @@ use std::cmp::min;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use market_discovery::{DiscoveryConfig, MarketDescriptor, MarketDiscovery};
 use polymarket_client_sdk::auth::state::Authenticated as PmAuthenticated;
 use polymarket_client_sdk::auth::Credentials as PmCredentials;
 use polymarket_client_sdk::auth::{
     LocalSigner as PmLocalSigner, Normal as PmNormal, Signer as PmSigner,
 };
-use polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest as PmOrderBookSummaryRequest;
+use polymarket_client_sdk::clob::types::request::{
+    BalanceAllowanceRequest as PmBalanceAllowanceRequest,
+    OrderBookSummaryRequest as PmOrderBookSummaryRequest,
+};
 use polymarket_client_sdk::clob::types::{
-    OrderStatusType as PmOrderStatusType, OrderType as PmOrderType,
+    AssetType as PmAssetType, OrderStatusType as PmOrderStatusType, OrderType as PmOrderType,
 };
 use polymarket_client_sdk::clob::types::{Side as PmSide, SignatureType as PmSignatureType};
 use polymarket_client_sdk::clob::{Client as PmClient, Config as PmConfig};
@@ -60,6 +64,9 @@ struct ApiState {
     live_runtime_snapshots: Arc<RwLock<HashMap<String, Value>>>,
     live_rust_executor: Arc<RwLock<Option<Arc<RustExecutorContext>>>>,
     live_rust_book_cache: Arc<RwLock<HashMap<String, RustBookCacheEntry>>>,
+    live_balance_cache: Arc<RwLock<Option<LiveBalanceSnapshot>>>,
+    runtime_alert_throttle: Arc<RwLock<HashMap<String, i64>>>,
+    runtime_daily_report_sent: Arc<RwLock<HashSet<String>>>,
     gateway_http_client: Arc<reqwest::Client>,
 }
 
@@ -77,6 +84,210 @@ const LIVE_RUST_BOOK_CACHE_TTL_MS: u64 = 260;
 const LIVE_RUST_BOOK_CACHE_MAX: usize = 512;
 const LIVE_CAPITAL_MAX_UTILIZATION: f64 = 0.92;
 const LIVE_CAPITAL_MIN_UTILIZATION: f64 = 0.12;
+const LIVE_ALERT_THROTTLE_DEFAULT_MS: i64 = 5 * 60_000;
+const LIVE_CAPITAL_RECENT_PNL_LIMIT: usize = 200;
+
+fn interpolate_piecewise(x: f64, points: &[(f64, f64)]) -> f64 {
+    if points.is_empty() {
+        return 1.0;
+    }
+    if x <= points[0].0 {
+        return points[0].1;
+    }
+    for win in points.windows(2) {
+        let (x0, y0) = win[0];
+        let (x1, y1) = win[1];
+        if x <= x1 {
+            let t = ((x - x0) / (x1 - x0)).clamp(0.0, 1.0);
+            return y0 + (y1 - y0) * t;
+        }
+    }
+    points.last().map(|(_, y)| *y).unwrap_or(1.0)
+}
+
+fn capital_stage_name(equity: f64) -> &'static str {
+    if equity < 50.0 {
+        "micro_10_50"
+    } else if equity < 100.0 {
+        "small_50_100"
+    } else if equity < 300.0 {
+        "starter_100_300"
+    } else if equity < 1_000.0 {
+        "growth_300_1k"
+    } else if equity < 5_000.0 {
+        "pro_1k_5k"
+    } else if equity < 10_000.0 {
+        "desk_5k_10k"
+    } else if equity < 50_000.0 {
+        "desk_10k_50k"
+    } else {
+        "institutional_50k_plus"
+    }
+}
+
+fn leg_ratio_stage_multiplier(equity: f64) -> f64 {
+    const POINTS: &[(f64, f64)] = &[
+        (10.0, 1.35),
+        (50.0, 1.18),
+        (100.0, 1.05),
+        (300.0, 0.90),
+        (1_000.0, 0.72),
+        (5_000.0, 0.52),
+        (10_000.0, 0.40),
+        (50_000.0, 0.26),
+    ];
+    interpolate_piecewise(equity, POINTS).clamp(0.2, 1.5)
+}
+
+fn add_scale_stage_multiplier(equity: f64) -> f64 {
+    const POINTS: &[(f64, f64)] = &[
+        (10.0, 1.10),
+        (50.0, 1.04),
+        (100.0, 1.00),
+        (300.0, 0.92),
+        (1_000.0, 0.82),
+        (5_000.0, 0.66),
+        (10_000.0, 0.56),
+        (50_000.0, 0.45),
+    ];
+    interpolate_piecewise(equity, POINTS).clamp(0.35, 1.2)
+}
+
+fn max_add_layers_by_equity(base_layers: u32, equity: f64) -> u32 {
+    let cap = if equity >= 10_000.0 {
+        2
+    } else if equity >= 5_000.0 {
+        3
+    } else if equity >= 1_000.0 {
+        4
+    } else {
+        base_layers
+    };
+    base_layers.min(cap).max(1)
+}
+
+fn decision_edge_score(decision: &Value) -> f64 {
+    decision
+        .get("entry_score")
+        .and_then(Value::as_f64)
+        .or_else(|| decision.get("edge_score").and_then(Value::as_f64))
+        .or_else(|| decision.get("score").and_then(Value::as_f64))
+        .unwrap_or(0.0)
+        .abs()
+}
+
+fn decision_remaining_ms(decision: &Value) -> i64 {
+    decision
+        .get("entry_remaining_ms")
+        .and_then(Value::as_i64)
+        .or_else(|| decision.get("remaining_ms").and_then(Value::as_i64))
+        .or_else(|| decision.get("ttl_ms").and_then(Value::as_i64))
+        .unwrap_or(0)
+        .max(0)
+}
+
+fn edge_time_boost(
+    edge_score: f64,
+    remaining_ms: i64,
+    alpha: f64,
+    beta: f64,
+    score_pivot: f64,
+    score_cap: f64,
+    tau_ms: i64,
+) -> f64 {
+    let denom = (score_cap - score_pivot).abs().max(1e-6);
+    let edge_norm = ((edge_score - score_pivot) / denom).clamp(0.0, 1.0);
+    let time_norm = (-(remaining_ms as f64) / (tau_ms as f64).max(1.0)).exp();
+    (1.0 + alpha * edge_norm) * (1.0 + beta * time_norm)
+}
+
+fn risk_add_multiplier(risk_state: &str) -> f64 {
+    match risk_state {
+        "lockdown" => 0.0,
+        "defensive" => 0.45,
+        "caution" => 0.75,
+        _ => 1.0,
+    }
+}
+
+fn dynamic_entry_quote(
+    decision: &Value,
+    base_quote: f64,
+    min_quote: f64,
+    capital: &LiveCapitalState,
+    cfg: &LiveCapitalConfig,
+) -> f64 {
+    let edge_score = decision_edge_score(decision);
+    let remaining_ms = decision_remaining_ms(decision);
+    let boost = edge_time_boost(
+        edge_score,
+        remaining_ms,
+        cfg.entry_edge_alpha,
+        cfg.entry_time_beta,
+        cfg.edge_score_pivot,
+        cfg.edge_score_cap,
+        cfg.edge_time_tau_ms,
+    );
+    let stage_mult = leg_ratio_stage_multiplier(capital.equity_estimate_usdc);
+    let risk_mult = risk_add_multiplier(&capital.risk_state);
+    let tuned = base_quote
+        * boost
+        * stage_mult.clamp(0.35, 1.4)
+        * capital.tune_factor.clamp(0.55, 1.45)
+        * risk_mult.clamp(0.0, 1.0);
+    tuned.clamp(min_quote, 2_000.0)
+}
+
+fn dynamic_add_scale(
+    decision: &Value,
+    base_scale: f64,
+    capital: &LiveCapitalState,
+    cfg: &LiveCapitalConfig,
+) -> f64 {
+    let edge_score = decision_edge_score(decision);
+    let remaining_ms = decision_remaining_ms(decision);
+    let boost = edge_time_boost(
+        edge_score,
+        remaining_ms,
+        cfg.add_edge_alpha,
+        cfg.add_time_beta,
+        cfg.edge_score_pivot,
+        cfg.edge_score_cap,
+        cfg.edge_time_tau_ms,
+    );
+    let stage_mult = add_scale_stage_multiplier(capital.equity_estimate_usdc);
+    let risk_mult = risk_add_multiplier(&capital.risk_state);
+    let adaptive_mult = capital.adaptive_add_mult.clamp(0.5, 1.45);
+    let scale = base_scale
+        * boost
+        * stage_mult
+        * adaptive_mult
+        * capital.tune_factor.clamp(0.55, 1.5)
+        * risk_mult;
+    scale.clamp(0.35, 3.0)
+}
+
+fn rolling_pnl_stats(pnls: &[f64]) -> (usize, f64, f64, f64) {
+    if pnls.is_empty() {
+        return (0, 0.0, 0.0, 0.0);
+    }
+    let n = pnls.len();
+    let wins = pnls.iter().filter(|v| **v > 0.0).count();
+    let mean = pnls.iter().sum::<f64>() / n as f64;
+    let var = if n > 1 {
+        pnls.iter()
+            .map(|v| {
+                let d = *v - mean;
+                d * d
+            })
+            .sum::<f64>()
+            / (n as f64)
+    } else {
+        0.0
+    };
+    let std = var.sqrt();
+    (n, wins as f64 / n as f64, mean, std)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LiveExecutorMode {
@@ -191,6 +402,16 @@ struct RustBookCacheEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct LiveBalanceSnapshot {
+    fetched_at_ms: i64,
+    source: String,
+    balance_usdc: f64,
+    allowance_usdc: f64,
+    spendable_usdc: f64,
+    raw: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct LivePositionState {
     market_type: String,
     state: String,
@@ -209,6 +430,8 @@ struct LivePositionState {
     total_exits: u64,
     #[serde(default)]
     total_adds: u64,
+    #[serde(default)]
+    open_add_layers: u32,
     #[serde(default)]
     total_reduces: u64,
     #[serde(default)]
@@ -235,6 +458,7 @@ impl LivePositionState {
             total_entries: 0,
             total_exits: 0,
             total_adds: 0,
+            open_add_layers: 0,
             total_reduces: 0,
             realized_pnl_usdc: 0.0,
             last_fill_pnl_usdc: 0.0,
@@ -259,6 +483,24 @@ struct LiveCapitalState {
     consecutive_losses: u32,
     last_realized_pnl_usdc: f64,
     last_quote_usdc: f64,
+    #[serde(default)]
+    recent_realized_pnls: Vec<f64>,
+    #[serde(default)]
+    rolling_trade_count: u32,
+    #[serde(default)]
+    rolling_win_rate: f64,
+    #[serde(default)]
+    rolling_avg_pnl_usdc: f64,
+    #[serde(default)]
+    rolling_pnl_std_usdc: f64,
+    #[serde(default)]
+    adaptive_leg_mult: f64,
+    #[serde(default)]
+    adaptive_add_mult: f64,
+    #[serde(default)]
+    kelly_fraction: f64,
+    #[serde(default)]
+    capital_stage: String,
     updated_ts_ms: i64,
 }
 
@@ -280,6 +522,15 @@ impl LiveCapitalState {
             consecutive_losses: 0,
             last_realized_pnl_usdc: 0.0,
             last_quote_usdc: 0.0,
+            recent_realized_pnls: Vec::new(),
+            rolling_trade_count: 0,
+            rolling_win_rate: 0.0,
+            rolling_avg_pnl_usdc: 0.0,
+            rolling_pnl_std_usdc: 0.0,
+            adaptive_leg_mult: 1.0,
+            adaptive_add_mult: 1.0,
+            kelly_fraction: 0.0,
+            capital_stage: "micro_10".to_string(),
             updated_ts_ms: now_ms,
         }
     }
@@ -288,8 +539,12 @@ impl LiveCapitalState {
 #[derive(Debug, Clone, Copy)]
 struct LiveCapitalConfig {
     enabled: bool,
+    use_real_balance: bool,
+    balance_refresh_ms: i64,
     equity_base_usdc: f64,
     reserve_usdc: f64,
+    reserve_ratio: f64,
+    reserve_min_usdc: f64,
     target_utilization: f64,
     small_threshold_usdc: f64,
     leg_ratio_small: f64,
@@ -297,6 +552,20 @@ struct LiveCapitalConfig {
     add_scale_small: f64,
     add_scale_large: f64,
     max_add_layers: u32,
+    disable_add_on_loss: bool,
+    add_edge_alpha: f64,
+    add_time_beta: f64,
+    entry_edge_alpha: f64,
+    entry_time_beta: f64,
+    edge_score_pivot: f64,
+    edge_score_cap: f64,
+    edge_time_tau_ms: i64,
+    kelly_enabled: bool,
+    kelly_lambda: f64,
+    kelly_max_fraction: f64,
+    kelly_payout_b: f64,
+    kelly_min_samples: usize,
+    reverse_two_phase: bool,
 }
 
 impl LiveCapitalConfig {
@@ -310,6 +579,20 @@ impl LiveCapitalConfig {
                 )
             })
             .unwrap_or(true);
+        let use_real_balance = std::env::var("FORGE_FEV1_CAPITAL_USE_REAL_BALANCE")
+            .ok()
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(true);
+        let balance_refresh_ms = std::env::var("FORGE_FEV1_CAPITAL_BALANCE_REFRESH_MS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(5_000)
+            .clamp(500, 120_000);
         let equity_base_usdc = std::env::var("FORGE_FEV1_CAPITAL_BASE_USDC")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
@@ -318,7 +601,17 @@ impl LiveCapitalConfig {
         let reserve_usdc = std::env::var("FORGE_FEV1_CAPITAL_RESERVE_USDC")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(10.0)
+            .unwrap_or(0.0)
+            .clamp(0.0, 1_000_000.0);
+        let reserve_ratio = std::env::var("FORGE_FEV1_CAPITAL_RESERVE_RATIO")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.20)
+            .clamp(0.0, 0.90);
+        let reserve_min_usdc = std::env::var("FORGE_FEV1_CAPITAL_RESERVE_MIN_USDC")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(1.0)
             .clamp(0.0, 1_000_000.0);
         let target_utilization = std::env::var("FORGE_FEV1_CAPITAL_TARGET_UTILIZATION")
             .ok()
@@ -355,10 +648,96 @@ impl LiveCapitalConfig {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(3)
             .clamp(1, 8);
+        let disable_add_on_loss = std::env::var("FORGE_FEV1_CAPITAL_DISABLE_ADD_ON_LOSS")
+            .ok()
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(true);
+        let add_edge_alpha = std::env::var("FORGE_FEV1_CAPITAL_ADD_EDGE_ALPHA")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.45)
+            .clamp(0.0, 2.0);
+        let add_time_beta = std::env::var("FORGE_FEV1_CAPITAL_ADD_TIME_BETA")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.30)
+            .clamp(0.0, 1.5);
+        let entry_edge_alpha = std::env::var("FORGE_FEV1_CAPITAL_ENTRY_EDGE_ALPHA")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.28)
+            .clamp(0.0, 1.5);
+        let entry_time_beta = std::env::var("FORGE_FEV1_CAPITAL_ENTRY_TIME_BETA")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.18)
+            .clamp(0.0, 1.0);
+        let edge_score_pivot = std::env::var("FORGE_FEV1_CAPITAL_EDGE_SCORE_PIVOT")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.55)
+            .clamp(0.01, 0.95);
+        let edge_score_cap = std::env::var("FORGE_FEV1_CAPITAL_EDGE_SCORE_CAP")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.90)
+            .clamp(0.05, 0.99);
+        let edge_time_tau_ms = std::env::var("FORGE_FEV1_CAPITAL_EDGE_TIME_TAU_MS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(90_000)
+            .clamp(5_000, 600_000);
+        let kelly_enabled = std::env::var("FORGE_FEV1_CAPITAL_KELLY_ENABLED")
+            .ok()
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(true);
+        let kelly_lambda = std::env::var("FORGE_FEV1_CAPITAL_KELLY_LAMBDA")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.25)
+            .clamp(0.0, 1.0);
+        let kelly_max_fraction = std::env::var("FORGE_FEV1_CAPITAL_KELLY_MAX_FRACTION")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.35)
+            .clamp(0.01, 0.90);
+        let kelly_payout_b = std::env::var("FORGE_FEV1_CAPITAL_KELLY_PAYOUT_B")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(1.0)
+            .clamp(0.2, 5.0);
+        let kelly_min_samples = std::env::var("FORGE_FEV1_CAPITAL_KELLY_MIN_SAMPLES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(24)
+            .clamp(8, 200);
+        let reverse_two_phase = std::env::var("FORGE_FEV1_REVERSE_TWO_PHASE")
+            .ok()
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(true);
         Self {
             enabled,
+            use_real_balance,
+            balance_refresh_ms,
             equity_base_usdc,
             reserve_usdc,
+            reserve_ratio,
+            reserve_min_usdc,
             target_utilization,
             small_threshold_usdc,
             leg_ratio_small,
@@ -366,6 +745,20 @@ impl LiveCapitalConfig {
             add_scale_small,
             add_scale_large,
             max_add_layers,
+            disable_add_on_loss,
+            add_edge_alpha,
+            add_time_beta,
+            entry_edge_alpha,
+            entry_time_beta,
+            edge_score_pivot,
+            edge_score_cap,
+            edge_time_tau_ms,
+            kelly_enabled,
+            kelly_lambda,
+            kelly_max_fraction,
+            kelly_payout_b,
+            kelly_min_samples,
+            reverse_two_phase,
         }
     }
 }
@@ -400,7 +793,7 @@ struct LiveRuntimeConfig {
     max_points: u32,
     max_trades: usize,
     max_orders: usize,
-    entry_only: bool,
+    drain_only: bool,
     quote_usdc: f64,
     markets: Vec<String>,
 }
@@ -450,7 +843,7 @@ impl LiveRuntimeConfig {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(1)
             .clamp(1, 6);
-        let entry_only = std::env::var("FORGE_FEV1_RUNTIME_ENTRY_ONLY")
+        let drain_only = std::env::var("FORGE_FEV1_RUNTIME_DRAIN_ONLY")
             .ok()
             .map(|v| {
                 matches!(
@@ -458,7 +851,7 @@ impl LiveRuntimeConfig {
                     "1" | "true" | "yes" | "on"
                 )
             })
-            .unwrap_or(true);
+            .unwrap_or(false);
         let quote_usdc = std::env::var("FORGE_FEV1_RUNTIME_QUOTE_USDC")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
@@ -482,9 +875,60 @@ impl LiveRuntimeConfig {
             max_points,
             max_trades,
             max_orders,
-            entry_only,
+            drain_only,
             quote_usdc,
             markets,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ServerChanConfig {
+    enabled: bool,
+    api_url: String,
+    request_timeout_ms: u64,
+    throttle_ms: i64,
+    daily_report_hour_utc: u32,
+}
+
+impl ServerChanConfig {
+    fn from_env() -> Self {
+        let api_url = std::env::var("FORGE_SC3_API_URL")
+            .ok()
+            .or_else(|| std::env::var("SC3_API_URL").ok())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let enabled = std::env::var("FORGE_SC3_ENABLED")
+            .ok()
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(!api_url.is_empty());
+        let request_timeout_ms = std::env::var("FORGE_SC3_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(4_000)
+            .clamp(800, 15_000);
+        let throttle_ms = std::env::var("FORGE_SC3_THROTTLE_MS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(LIVE_ALERT_THROTTLE_DEFAULT_MS)
+            .clamp(2_000, 3_600_000);
+        let daily_report_hour_utc = std::env::var("FORGE_SC3_DAILY_REPORT_HOUR_UTC")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(23);
+        Self {
+            enabled: enabled && !api_url.is_empty(),
+            api_url,
+            request_timeout_ms,
+            throttle_ms,
+            daily_report_hour_utc,
         }
     }
 }
@@ -581,6 +1025,37 @@ impl ApiState {
             .sum::<f64>()
     }
 
+    async fn get_live_balance_snapshot(
+        &self,
+        refresh_ms: i64,
+    ) -> Result<Option<LiveBalanceSnapshot>, String> {
+        let now_ms = Utc::now().timestamp_millis();
+        {
+            let cache = self.live_balance_cache.read().await;
+            if let Some(snapshot) = cache.as_ref() {
+                if now_ms.saturating_sub(snapshot.fetched_at_ms) <= refresh_ms {
+                    return Ok(Some(snapshot.clone()));
+                }
+            }
+        }
+        match fetch_live_balance_snapshot(self).await {
+            Ok(snapshot) => {
+                let mut cache = self.live_balance_cache.write().await;
+                *cache = Some(snapshot.clone());
+                Ok(Some(snapshot))
+            }
+            Err(err) => {
+                let cache = self.live_balance_cache.read().await;
+                if let Some(snapshot) = cache.as_ref() {
+                    tracing::warn!(error = %err, "live balance refresh failed, using cached snapshot");
+                    Ok(Some(snapshot.clone()))
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
     async fn update_capital_after_realized_pnl(
         &self,
         market_type: &str,
@@ -595,6 +1070,14 @@ impl ApiState {
             if cs.equity_estimate_usdc > cs.max_equity_usdc {
                 cs.max_equity_usdc = cs.equity_estimate_usdc;
             }
+            cs.recent_realized_pnls.push(pnl_usdc);
+            if cs.recent_realized_pnls.len() > LIVE_CAPITAL_RECENT_PNL_LIMIT {
+                let drop_n = cs
+                    .recent_realized_pnls
+                    .len()
+                    .saturating_sub(LIVE_CAPITAL_RECENT_PNL_LIMIT);
+                cs.recent_realized_pnls.drain(0..drop_n);
+            }
             if pnl_usdc > 0.0 {
                 cs.consecutive_wins = cs.consecutive_wins.saturating_add(1);
                 cs.consecutive_losses = 0;
@@ -605,6 +1088,27 @@ impl ApiState {
                 cs.tune_factor = (cs.tune_factor - 0.08).max(0.4);
             }
             cs.last_realized_pnl_usdc = pnl_usdc;
+        }
+        let (n, wr, avg, std) = rolling_pnl_stats(&cs.recent_realized_pnls);
+        cs.rolling_trade_count = n as u32;
+        cs.rolling_win_rate = wr;
+        cs.rolling_avg_pnl_usdc = avg;
+        cs.rolling_pnl_std_usdc = std;
+        if n >= 20 {
+            let win_score = ((wr - 0.50) * 1.8).clamp(-0.85, 0.85);
+            let pnl_score = (avg / 0.055_f64).tanh() * 0.65;
+            let vol_penalty = (std / 0.16_f64).tanh() * 0.30;
+            let target = (1.0 + win_score + pnl_score - vol_penalty).clamp(0.45, 1.70);
+            cs.tune_factor = (cs.tune_factor * 0.75 + target * 0.25).clamp(0.40, 1.80);
+            cs.adaptive_leg_mult = (0.72 + wr * 0.65 + (avg / 0.06_f64).tanh() * 0.30
+                - (std / 0.18_f64).tanh() * 0.16)
+                .clamp(0.45, 1.45);
+            cs.adaptive_add_mult = (0.78 + wr * 0.55 + (avg / 0.08_f64).tanh() * 0.24
+                - (std / 0.20_f64).tanh() * 0.12)
+                .clamp(0.50, 1.40);
+        } else {
+            cs.adaptive_leg_mult = 1.0;
+            cs.adaptive_add_mult = 1.0;
         }
         let dd_pct = if cs.max_equity_usdc > 1e-9 {
             ((cs.max_equity_usdc - cs.equity_estimate_usdc).max(0.0) / cs.max_equity_usdc)
@@ -621,6 +1125,7 @@ impl ApiState {
         } else {
             "normal".to_string()
         };
+        cs.capital_stage = capital_stage_name(cs.equity_estimate_usdc).to_string();
         cs.updated_ts_ms = now_ms;
         self.put_live_capital_state(market_type, cs.clone()).await;
         cs
@@ -641,6 +1146,27 @@ impl ApiState {
             return (cs.last_quote_usdc, cs);
         }
         let mut cs = self.get_live_capital_state(market_type, cfg).await;
+        if cfg.use_real_balance {
+            match self.get_live_balance_snapshot(cfg.balance_refresh_ms).await {
+                Ok(Some(snapshot)) => {
+                    let spendable = snapshot.spendable_usdc.max(0.0);
+                    if spendable.is_finite() {
+                        cs.equity_estimate_usdc = spendable;
+                        if cs.max_equity_usdc <= 0.0
+                            || cs.max_equity_usdc > (cs.equity_estimate_usdc * 3.0).max(50.0)
+                        {
+                            cs.max_equity_usdc = cs.equity_estimate_usdc;
+                        } else if cs.equity_estimate_usdc > cs.max_equity_usdc {
+                            cs.max_equity_usdc = cs.equity_estimate_usdc;
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(error = %err, "live balance sync failed; fallback to internal capital state");
+                }
+            }
+        }
         let reserved_pending = self.pending_reserved_quote_usdc(market_type).await.max(0.0);
         let risk_mult = match cs.risk_state.as_str() {
             "lockdown" => 0.0,
@@ -651,20 +1177,42 @@ impl ApiState {
         let util = (cfg.target_utilization * risk_mult * cs.tune_factor)
             .clamp(LIVE_CAPITAL_MIN_UTILIZATION, LIVE_CAPITAL_MAX_UTILIZATION);
         let equity = cs.equity_estimate_usdc.max(min_quote_usdc * 2.0);
-        let available = (equity * util - cfg.reserve_usdc - reserved_pending).max(0.0);
+        let effective_reserve = cfg
+            .reserve_usdc
+            .max(cfg.reserve_min_usdc)
+            .max(equity * cfg.reserve_ratio);
+        let available = (equity * util - effective_reserve - reserved_pending).max(0.0);
+        let stage_leg_mult = leg_ratio_stage_multiplier(equity);
+        cs.capital_stage = capital_stage_name(equity).to_string();
         let small_mode = equity <= cfg.small_threshold_usdc;
         let mut leg_ratio = if small_mode {
             cfg.leg_ratio_small
         } else {
             cfg.leg_ratio_large
         };
+        leg_ratio *= stage_leg_mult;
+        leg_ratio *= cs.adaptive_leg_mult.clamp(0.45, 1.45);
         if cs.risk_state == "defensive" {
             leg_ratio *= 0.7;
         } else if cs.risk_state == "lockdown" {
             leg_ratio *= 0.1;
         }
-        let quote_by_capital = (available * leg_ratio).max(0.0);
+        let mut quote_by_capital = (available * leg_ratio).max(0.0);
         let quote_floor = min_quote_usdc.max(0.5);
+        let (rolling_n, rolling_wr, _, _) = rolling_pnl_stats(&cs.recent_realized_pnls);
+        if cfg.kelly_enabled && rolling_n >= cfg.kelly_min_samples {
+            let p = rolling_wr.clamp(0.01, 0.99);
+            let b = cfg.kelly_payout_b.max(0.2);
+            let full_kelly = ((b * p) - (1.0 - p)) / b;
+            let kelly_fraction = full_kelly.max(0.0).min(cfg.kelly_max_fraction) * cfg.kelly_lambda;
+            cs.kelly_fraction = kelly_fraction;
+            let kelly_cap_quote = (equity * kelly_fraction).max(0.0);
+            if kelly_cap_quote.is_finite() && kelly_cap_quote > 0.0 {
+                quote_by_capital = quote_by_capital.min(kelly_cap_quote.max(quote_floor));
+            }
+        } else {
+            cs.kelly_fraction = 0.0;
+        }
         let quote = base_quote_usdc
             .max(quote_floor)
             .min(quote_by_capital.max(quote_floor))
@@ -764,6 +1312,28 @@ impl ApiState {
             .collect()
     }
 
+    async fn pending_flags_for_market(&self, market_type: &str) -> (bool, bool) {
+        let pending = self.live_pending_orders.read().await;
+        let mut has_enter_pending = false;
+        let mut has_exit_pending = false;
+        for row in pending.values() {
+            if !row.market_type.eq_ignore_ascii_case(market_type) {
+                continue;
+            }
+            if row.action.eq_ignore_ascii_case("enter") || row.action.eq_ignore_ascii_case("add") {
+                has_enter_pending = true;
+            }
+            if row.action.eq_ignore_ascii_case("exit") || row.action.eq_ignore_ascii_case("reduce")
+            {
+                has_exit_pending = true;
+            }
+            if has_enter_pending && has_exit_pending {
+                break;
+            }
+        }
+        (has_enter_pending, has_exit_pending)
+    }
+
     async fn get_gateway_report_seq(&self) -> i64 {
         *self.live_gateway_report_seq.read().await
     }
@@ -810,6 +1380,59 @@ impl ApiState {
                 snapshot,
             },
         );
+    }
+
+    async fn should_emit_alert(&self, key: &str, now_ms: i64, throttle_ms: i64) -> bool {
+        let mut slots = self.runtime_alert_throttle.write().await;
+        let last = slots.get(key).copied().unwrap_or(0);
+        if now_ms.saturating_sub(last) < throttle_ms {
+            return false;
+        }
+        slots.insert(key.to_string(), now_ms);
+        if slots.len() > 1024 {
+            let cutoff = now_ms.saturating_sub(24 * 3600_000);
+            slots.retain(|_, ts| *ts >= cutoff);
+        }
+        true
+    }
+
+    async fn should_emit_daily_report(&self, market_type: &str, day_key: &str) -> bool {
+        let key = format!("{market_type}:{day_key}");
+        let mut sent = self.runtime_daily_report_sent.write().await;
+        if sent.contains(&key) {
+            return false;
+        }
+        sent.insert(key);
+        if sent.len() > 256 {
+            let keep_prefix = format!("{}-", Utc::now().year());
+            sent.retain(|k| k.contains(&keep_prefix));
+        }
+        true
+    }
+
+    async fn emit_serverchan_markdown(
+        &self,
+        cfg: &ServerChanConfig,
+        title: &str,
+        markdown: &str,
+    ) -> Result<()> {
+        if !cfg.enabled {
+            return Ok(());
+        }
+        let res = self
+            .gateway_http_client
+            .post(&cfg.api_url)
+            .timeout(Duration::from_millis(cfg.request_timeout_ms))
+            .form(&[("title", title), ("desp", markdown)])
+            .send()
+            .await
+            .with_context(|| "serverchan request failed")?;
+        if !res.status().is_success() {
+            let status = res.status();
+            let body = res.text().await.unwrap_or_default();
+            bail!("serverchan status={} body={}", status, body);
+        }
+        Ok(())
     }
 }
 
@@ -1063,6 +1686,9 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         live_runtime_snapshots: Arc::new(RwLock::new(HashMap::new())),
         live_rust_executor: Arc::new(RwLock::new(None)),
         live_rust_book_cache: Arc::new(RwLock::new(HashMap::new())),
+        live_balance_cache: Arc::new(RwLock::new(None)),
+        runtime_alert_throttle: Arc::new(RwLock::new(HashMap::new())),
+        runtime_daily_report_sent: Arc::new(RwLock::new(HashSet::new())),
         gateway_http_client: Arc::new(gateway_http_client),
     };
 
@@ -1104,6 +1730,7 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         )
         .route("/api/strategy/autotune/set", post(strategy_autotune_set))
         .route("/api/strategy/live/reset", post(strategy_live_reset))
+        .route("/api/strategy/live/balance", get(strategy_live_balance))
         .with_state(state.clone());
 
     if let Some(dist) = cfg.dashboard_dist_dir {
@@ -1149,8 +1776,9 @@ fn live_capital_state_key(redis_prefix: &str, market_type: &str) -> String {
 fn start_live_runtime(state: ApiState) {
     let cfg = LiveRuntimeConfig::from_env();
     if !cfg.enabled {
-        tracing::info!("fev1 live runtime disabled by FORGE_FEV1_RUNTIME_ENABLED=false");
-        return;
+        tracing::info!(
+            "fev1 live runtime starts in paused mode (FORGE_FEV1_RUNTIME_ENABLED=false)"
+        );
     }
     tokio::spawn(async move {
         if let Err(err) = restore_live_runtime_state(&state, &cfg).await {
@@ -1232,14 +1860,21 @@ async fn persist_live_runtime_state(state: &ApiState, market_type: &str) {
     let _ = write_key_value(state, &seq_key, &json!({ "seq": seq }), Some(2 * 24 * 3600)).await;
 }
 
-async fn live_runtime_loop(state: ApiState, cfg: LiveRuntimeConfig) {
+async fn live_runtime_loop(state: ApiState, bootstrap: LiveRuntimeConfig) {
     tracing::info!(
-        markets = ?cfg.markets,
-        live_execute = cfg.live_execute,
-        loop_ms = cfg.loop_interval_ms,
+        markets = ?bootstrap.markets,
+        live_execute = bootstrap.live_execute,
+        loop_ms = bootstrap.loop_interval_ms,
         "fev1 live runtime started"
     );
     loop {
+        let cfg = LiveRuntimeConfig::from_env();
+        let push_cfg = ServerChanConfig::from_env();
+        if !cfg.enabled {
+            tokio::time::sleep(Duration::from_millis(cfg.loop_interval_ms)).await;
+            continue;
+        }
+
         for market in &cfg.markets {
             let market_type = market.as_str();
             let strategy_cfg = StrategyRuntimeConfig::default();
@@ -1254,16 +1889,111 @@ async fn live_runtime_loop(state: ApiState, cfg: LiveRuntimeConfig) {
                 cfg.live_execute,
                 cfg.quote_usdc,
                 cfg.max_orders,
-                cfg.entry_only,
+                cfg.drain_only,
             )
             .await
             {
                 Ok(payload) => {
+                    let now = Utc::now();
+                    let now_ms = now.timestamp_millis();
+                    let status = payload
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("ok")
+                        .to_string();
+                    let summary = payload.get("summary").cloned().unwrap_or(Value::Null);
                     state.set_runtime_snapshot(market_type, payload).await;
                     persist_live_runtime_state(&state, market_type).await;
+
+                    if push_cfg.enabled && cfg.live_execute && status != "ok" {
+                        let alert_key = format!("live-status:{market_type}:{status}");
+                        if state
+                            .should_emit_alert(&alert_key, now_ms, push_cfg.throttle_ms)
+                            .await
+                        {
+                            let trade_count = summary
+                                .get("trade_count")
+                                .and_then(Value::as_i64)
+                                .unwrap_or(0);
+                            let win_rate = summary
+                                .get("win_rate_pct")
+                                .and_then(Value::as_f64)
+                                .unwrap_or(0.0);
+                            let net = summary
+                                .get("net_pnl_cents")
+                                .and_then(Value::as_f64)
+                                .or_else(|| summary.get("total_pnl_cents").and_then(Value::as_f64))
+                                .unwrap_or(0.0);
+                            let md = format!(
+                                "### FEV1 Live状态异常\n\n- 市场: `{}`\n- 状态: `{}`\n- 时间(UTC): `{}`\n- 胜率: `{:.2}%`\n- 净收益: `{:.2}¢`\n- 交易数: `{}`\n",
+                                market_type,
+                                status,
+                                now.to_rfc3339(),
+                                win_rate,
+                                net,
+                                trade_count
+                            );
+                            if let Err(err) = state
+                                .emit_serverchan_markdown(
+                                    &push_cfg,
+                                    &format!("FEV1异常/{market_type}/{status}"),
+                                    &md,
+                                )
+                                .await
+                            {
+                                tracing::warn!(?err, "serverchan status alert failed");
+                            }
+                        }
+                    }
+
+                    if push_cfg.enabled && now.hour() >= push_cfg.daily_report_hour_utc {
+                        let day_key =
+                            format!("{:04}-{:02}-{:02}", now.year(), now.month(), now.day());
+                        if state.should_emit_daily_report(market_type, &day_key).await {
+                            let trade_count = summary
+                                .get("trade_count")
+                                .and_then(Value::as_i64)
+                                .unwrap_or(0);
+                            let win_rate = summary
+                                .get("win_rate_pct")
+                                .and_then(Value::as_f64)
+                                .unwrap_or(0.0);
+                            let net = summary
+                                .get("net_pnl_cents")
+                                .and_then(Value::as_f64)
+                                .or_else(|| summary.get("total_pnl_cents").and_then(Value::as_f64))
+                                .unwrap_or(0.0);
+                            let max_dd = summary
+                                .get("max_drawdown_cents")
+                                .and_then(Value::as_f64)
+                                .unwrap_or(0.0);
+                            let md = format!(
+                                "### FEV1 每日报告\n\n- 日期(UTC): `{}`\n- 市场: `{}`\n- 模式: `{}`\n- 胜率: `{:.2}%`\n- 净收益: `{:.2}¢`\n- 最大回撤: `{:.2}¢`\n- 交易数: `{}`\n",
+                                day_key,
+                                market_type,
+                                if cfg.live_execute { "live_execute" } else { "paper_replay" },
+                                win_rate,
+                                net,
+                                max_dd,
+                                trade_count
+                            );
+                            if let Err(err) = state
+                                .emit_serverchan_markdown(
+                                    &push_cfg,
+                                    &format!("FEV1日报/{market_type}/{day_key}"),
+                                    &md,
+                                )
+                                .await
+                            {
+                                tracing::warn!(?err, "serverchan daily report failed");
+                            }
+                        }
+                    }
                 }
                 Err(err) => {
-                    let now_ms = Utc::now().timestamp_millis();
+                    let now = Utc::now();
+                    let now_ms = now.timestamp_millis();
+                    let msg = format!("runtime_cycle_error:{}", err.message);
                     state
                         .append_live_event(
                             market_type,
@@ -1271,11 +2001,35 @@ async fn live_runtime_loop(state: ApiState, cfg: LiveRuntimeConfig) {
                                 "accepted": false,
                                 "action": "runtime",
                                 "side": "NONE",
-                                "reason": format!("runtime_cycle_error:{}", err.message),
+                                "reason": msg,
                                 "ts_ms": now_ms
                             }),
                         )
                         .await;
+                    if push_cfg.enabled {
+                        let alert_key = format!("runtime-error:{market_type}");
+                        if state
+                            .should_emit_alert(&alert_key, now_ms, push_cfg.throttle_ms)
+                            .await
+                        {
+                            let md = format!(
+                                "### FEV1 Runtime错误\n\n- 市场: `{}`\n- 时间(UTC): `{}`\n- 错误: `{}`\n",
+                                market_type,
+                                now.to_rfc3339(),
+                                err.message
+                            );
+                            if let Err(send_err) = state
+                                .emit_serverchan_markdown(
+                                    &push_cfg,
+                                    &format!("FEV1错误/{market_type}"),
+                                    &md,
+                                )
+                                .await
+                            {
+                                tracing::warn!(?send_err, "serverchan runtime error alert failed");
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2325,20 +3079,29 @@ fn should_promote_candidate(
     if c.avg_pnl_cents <= 0.0 {
         return (false, "candidate_avg_pnl_non_positive".to_string());
     }
-    if c.objective <= i.objective + 0.5 {
-        return (false, "objective_not_improved".to_string());
+    if c.trade_count + 1.0 < i.trade_count {
+        return (false, "trade_count_regression".to_string());
     }
-    if c.win_rate_pct + 0.2 < i.win_rate_pct {
+    if c.win_rate_pct + 1e-9 < i.win_rate_pct {
         return (false, "win_rate_regression".to_string());
     }
-    if c.avg_pnl_cents + 0.01 < i.avg_pnl_cents {
+    if c.avg_pnl_cents + 1e-9 < i.avg_pnl_cents {
         return (false, "avg_pnl_regression".to_string());
     }
-    let drawdown_limit = (i.max_drawdown_cents * 1.12 + 0.8).max(3.0);
-    if c.max_drawdown_cents > drawdown_limit {
+    if c.max_drawdown_cents > i.max_drawdown_cents + 1e-9 {
         return (false, "drawdown_regression".to_string());
     }
-    (true, "promote_better_candidate".to_string())
+    if c.objective + 1e-9 < i.objective {
+        return (false, "objective_regression".to_string());
+    }
+    let strictly_better = (c.win_rate_pct > i.win_rate_pct + 1e-9)
+        || (c.avg_pnl_cents > i.avg_pnl_cents + 1e-9)
+        || (c.max_drawdown_cents + 1e-9 < i.max_drawdown_cents)
+        || (c.objective > i.objective + 1e-9);
+    if !strictly_better {
+        return (false, "not_strictly_better".to_string());
+    }
+    (true, "promote_strictly_better_candidate".to_string())
 }
 
 async fn read_key_json(state: &ApiState, key: &str) -> Result<Json<Value>, ApiError> {
@@ -3436,7 +4199,7 @@ async fn strategy_paper_live(
     live_execute: bool,
     live_quote_usdc: f64,
     live_max_orders: usize,
-    live_entry_only: bool,
+    live_drain_only: bool,
 ) -> Result<Value, ApiError> {
     let exec_gate = fev1::ExecutionGate::from_env();
     if live_execute && !exec_gate.live_enabled {
@@ -3480,8 +4243,12 @@ async fn strategy_paper_live(
     handle_live_pending_timeouts(state, &live_gateway_cfg, live_executor_mode).await;
     let live_market = resolve_live_market_target(market_type).await.ok();
     let position_before_gate = state.get_live_position_state(market_type).await;
-    let prefer_action = if live_entry_only {
-        Some("enter")
+    let prefer_action = if live_drain_only {
+        if position_before_gate.side.is_some() {
+            Some("exit")
+        } else {
+            None
+        }
     } else if position_before_gate.side.is_some() {
         Some("exit")
     } else {
@@ -3491,21 +4258,42 @@ async fn strategy_paper_live(
         &dual.decisions,
         samples.last().map(|s| s.ts_ms).unwrap_or_default(),
         live_max_orders.max(1),
-        live_entry_only,
+        live_drain_only,
         prefer_action,
     );
     let mut selected_decisions = Vec::<Value>::new();
     let mut capital_skipped = Vec::<Value>::new();
     let mut capital_remaining = capital_before.available_to_trade_usdc.max(0.0);
-    let add_scale = if capital_before.equity_estimate_usdc <= capital_cfg.small_threshold_usdc {
+    let base_add_scale = if capital_before.equity_estimate_usdc <= capital_cfg.small_threshold_usdc
+    {
         capital_cfg.add_scale_small
     } else {
         capital_cfg.add_scale_large
     };
-    let max_add_layers = capital_cfg.max_add_layers;
-    let mut current_add_layers = position_before_gate.total_adds as u32;
+    let max_add_layers = max_add_layers_by_equity(
+        capital_cfg.max_add_layers,
+        capital_before.equity_estimate_usdc,
+    );
+    let mut current_add_layers = if position_before_gate.side.is_some() {
+        position_before_gate.open_add_layers
+    } else {
+        0
+    };
+    let in_loss_phase = capital_before.last_realized_pnl_usdc < 0.0
+        || capital_before.consecutive_losses > 0
+        || matches!(
+            capital_before.risk_state.as_str(),
+            "caution" | "defensive" | "lockdown"
+        );
+    let has_explicit_exit_candidate = selected_decisions_raw.iter().any(|v| {
+        v.get("action")
+            .and_then(Value::as_str)
+            .map(|a| a.eq_ignore_ascii_case("exit") || a.eq_ignore_ascii_case("reduce"))
+            .unwrap_or(false)
+    });
+    let mut reverse_exit_injected = false;
     for mut d in selected_decisions_raw {
-        let action = d
+        let mut action = d
             .get("action")
             .and_then(Value::as_str)
             .unwrap_or_default()
@@ -3515,14 +4303,137 @@ async fn strategy_paper_live(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_ascii_uppercase();
-        if action == "enter"
-            && position_before_gate.side.is_some()
-            && position_before_gate
-                .side
-                .as_deref()
-                .map(|s| s.eq_ignore_ascii_case(&side))
-                .unwrap_or(false)
-        {
+        if action == "enter" {
+            if let Some(state_side) = position_before_gate.side.as_deref() {
+                if state_side.eq_ignore_ascii_case(&side) {
+                    if capital_cfg.disable_add_on_loss && in_loss_phase {
+                        capital_skipped.push(json!({
+                            "reason": "add_disabled_on_loss_or_risk",
+                            "risk_state": capital_before.risk_state,
+                            "consecutive_losses": capital_before.consecutive_losses,
+                            "last_realized_pnl_usdc": capital_before.last_realized_pnl_usdc,
+                            "decision": d
+                        }));
+                        continue;
+                    }
+                    if current_add_layers >= max_add_layers {
+                        capital_skipped.push(json!({
+                            "reason": "max_add_layers_reached",
+                            "decision": d
+                        }));
+                        continue;
+                    }
+                    current_add_layers = current_add_layers.saturating_add(1);
+                    action = "add".to_string();
+                    let base_q = d
+                        .get("quote_size_usdc")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(dynamic_quote_usdc);
+                    let add_scale =
+                        dynamic_add_scale(&d, base_add_scale, &capital_before, &capital_cfg);
+                    let scaled_q = (base_q * add_scale).max(live_gateway_cfg.min_quote_usdc);
+                    let reason = d
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("fev1_signal_entry")
+                        .to_string();
+                    if let Some(obj) = d.as_object_mut() {
+                        obj.insert("action".to_string(), Value::String("add".to_string()));
+                        obj.insert("quote_size_usdc".to_string(), json!(scaled_q));
+                        obj.insert(
+                            "reason".to_string(),
+                            Value::String(format!("{}_auto_add", reason)),
+                        );
+                    }
+                } else if capital_cfg.reverse_two_phase {
+                    if !has_explicit_exit_candidate && !reverse_exit_injected {
+                        let close_side = state_side.to_ascii_uppercase();
+                        let close_quote = position_before_gate
+                            .net_quote_usdc
+                            .max(position_before_gate.entry_quote_usdc.unwrap_or(0.0))
+                            .max(dynamic_quote_usdc);
+                        let reverse_ts = d
+                            .get("ts_ms")
+                            .and_then(Value::as_i64)
+                            .unwrap_or_else(|| Utc::now().timestamp_millis())
+                            .saturating_sub(1);
+                        let reverse_round = d
+                            .get("round_id")
+                            .and_then(Value::as_str)
+                            .or(position_before_gate.entry_round_id.as_deref())
+                            .unwrap_or_default()
+                            .to_string();
+                        let reverse_price_cents = d
+                            .get("price_cents")
+                            .and_then(Value::as_f64)
+                            .or(position_before_gate.vwap_entry_cents)
+                            .or(position_before_gate.entry_price_cents)
+                            .unwrap_or(50.0);
+                        selected_decisions.push(json!({
+                            "action": "exit",
+                            "side": close_side,
+                            "round_id": reverse_round,
+                            "ts_ms": reverse_ts,
+                            "reason": "auto_reverse_exit_first",
+                            "quote_size_usdc": close_quote,
+                            "price_cents": reverse_price_cents,
+                            "tif": "FAK",
+                            "style": "taker",
+                            "ttl_ms": 900,
+                            "max_slippage_bps": live_gateway_cfg.exit_slippage_bps
+                        }));
+                        reverse_exit_injected = true;
+                    }
+                    capital_skipped.push(json!({
+                        "reason": "reverse_two_phase_wait_exit",
+                        "state_side": state_side,
+                        "decision": d
+                    }));
+                    continue;
+                }
+            } else {
+                let q = d
+                    .get("quote_size_usdc")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(dynamic_quote_usdc)
+                    .max(live_gateway_cfg.min_quote_usdc);
+                let tuned_q = dynamic_entry_quote(
+                    &d,
+                    q,
+                    live_gateway_cfg.min_quote_usdc,
+                    &capital_before,
+                    &capital_cfg,
+                );
+                if let Some(obj) = d.as_object_mut() {
+                    obj.insert("quote_size_usdc".to_string(), json!(tuned_q));
+                }
+            }
+        } else if action == "add" {
+            let Some(state_side) = position_before_gate.side.as_deref() else {
+                capital_skipped.push(json!({
+                    "reason": "add_without_open_position",
+                    "decision": d
+                }));
+                continue;
+            };
+            if !state_side.eq_ignore_ascii_case(&side) {
+                capital_skipped.push(json!({
+                    "reason": "add_side_mismatch",
+                    "state_side": state_side,
+                    "decision": d
+                }));
+                continue;
+            }
+            if capital_cfg.disable_add_on_loss && in_loss_phase {
+                capital_skipped.push(json!({
+                    "reason": "add_disabled_on_loss_or_risk",
+                    "risk_state": capital_before.risk_state,
+                    "consecutive_losses": capital_before.consecutive_losses,
+                    "last_realized_pnl_usdc": capital_before.last_realized_pnl_usdc,
+                    "decision": d
+                }));
+                continue;
+            }
             if current_add_layers >= max_add_layers {
                 capital_skipped.push(json!({
                     "reason": "max_add_layers_reached",
@@ -3531,24 +4442,14 @@ async fn strategy_paper_live(
                 continue;
             }
             current_add_layers = current_add_layers.saturating_add(1);
+            let base_q = d
+                .get("quote_size_usdc")
+                .and_then(Value::as_f64)
+                .unwrap_or(dynamic_quote_usdc);
+            let add_scale = dynamic_add_scale(&d, base_add_scale, &capital_before, &capital_cfg);
+            let scaled_q = (base_q * add_scale).max(live_gateway_cfg.min_quote_usdc);
             if let Some(obj) = d.as_object_mut() {
-                obj.insert("action".to_string(), Value::String("add".to_string()));
-                let q = obj
-                    .get("quote_size_usdc")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(dynamic_quote_usdc);
-                obj.insert(
-                    "quote_size_usdc".to_string(),
-                    json!((q * add_scale).max(live_gateway_cfg.min_quote_usdc)),
-                );
-                let reason = obj
-                    .get("reason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("fev1_signal_entry");
-                obj.insert(
-                    "reason".to_string(),
-                    Value::String(format!("{}_auto_add", reason)),
-                );
+                obj.insert("quote_size_usdc".to_string(), json!(scaled_q));
             }
         }
         let entry_like = d
@@ -3932,6 +4833,15 @@ async fn strategy_paper_live(
     let capital_state = state
         .get_live_capital_state(market_type, &capital_cfg)
         .await;
+    let live_balance_snapshot = if capital_cfg.use_real_balance {
+        state
+            .get_live_balance_snapshot(capital_cfg.balance_refresh_ms)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
     let market_pending_orders = state.list_pending_orders_for_market(market_type).await;
     let decisions_for_response = tail_slice(&dual.decisions, 120);
     let paper_records_for_response = tail_slice(&dual.paper_records, 120);
@@ -3950,6 +4860,7 @@ async fn strategy_paper_live(
         "executor_mode": "same_signal_dual_executor",
         "live_executor": if live_execute { live_executor_mode.as_str() } else { "dry_run" },
         "live_execute": live_execute,
+        "runtime_mode": if live_drain_only { "drain" } else { "normal" },
         "market_type": market_type,
         "lookback_minutes": lookback_minutes,
         "full_history": full_history,
@@ -3985,12 +4896,18 @@ async fn strategy_paper_live(
             },
             "capital": {
                 "auto_enabled": capital_cfg.enabled,
+                "use_real_balance": capital_cfg.use_real_balance,
                 "dynamic_quote_usdc": dynamic_quote_usdc,
                 "base_quote_usdc": live_quote_usdc,
                 "target_utilization": capital_cfg.target_utilization,
                 "reserve_usdc": capital_cfg.reserve_usdc,
+                "reserve_ratio": capital_cfg.reserve_ratio,
+                "reserve_min_usdc": capital_cfg.reserve_min_usdc,
                 "small_threshold_usdc": capital_cfg.small_threshold_usdc,
                 "max_add_layers": capital_cfg.max_add_layers,
+                "disable_add_on_loss": capital_cfg.disable_add_on_loss,
+                "balance_refresh_ms": capital_cfg.balance_refresh_ms,
+                "real_balance": live_balance_snapshot,
                 "state": capital_state,
                 "available_after_capital_guard_usdc": capital_remaining.max(0.0),
                 "capital_skipped_count": capital_skipped.len(),
@@ -4193,14 +5110,8 @@ async fn gate_live_decisions(
     let now_ms = Utc::now().timestamp_millis();
     let mut position_state = state.get_live_position_state(market_type).await;
     let mut virtual_side = position_state.side.clone();
-    let market_pending: Vec<LivePendingOrder> =
-        state.list_pending_orders_for_market(market_type).await;
-    let mut has_enter_pending = market_pending
-        .iter()
-        .any(|p| p.action.eq_ignore_ascii_case("enter") || p.action.eq_ignore_ascii_case("add"));
-    let mut has_exit_pending = market_pending
-        .iter()
-        .any(|p| p.action.eq_ignore_ascii_case("exit") || p.action.eq_ignore_ascii_case("reduce"));
+    let (mut has_enter_pending, mut has_exit_pending) =
+        state.pending_flags_for_market(market_type).await;
     let mut accepted = Vec::<LiveGatedDecision>::new();
     let mut skipped = Vec::<Value>::new();
 
@@ -4336,7 +5247,7 @@ fn select_live_decisions(
     decisions: &[Value],
     latest_ts_ms: i64,
     max_orders: usize,
-    entry_only: bool,
+    drain_only: bool,
     prefer_action: Option<&str>,
 ) -> Vec<Value> {
     if decisions.is_empty() {
@@ -4366,8 +5277,8 @@ fn select_live_decisions(
                 .and_then(Value::as_i64)
                 .map(|ts| ts >= latest_ts_ms.saturating_sub(90_000))
                 .unwrap_or(false);
-            let action_ok = if entry_only {
-                action == "enter" || action == "add"
+            let action_ok = if drain_only {
+                action == "exit" || action == "reduce"
             } else {
                 true
             };
@@ -4382,7 +5293,11 @@ fn select_live_decisions(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_ascii_lowercase();
-            !entry_only || action == "enter" || action == "add"
+            if drain_only {
+                action == "exit" || action == "reduce"
+            } else {
+                true
+            }
         }) {
             selected.push(last.clone());
         }
@@ -4472,7 +5387,6 @@ fn decision_to_live_payload(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_ascii_uppercase();
-    let is_entry_like = action == "enter" || action == "add";
     let is_exit_like = action == "exit" || action == "reduce";
     let (gateway_side, token_id, mut slippage_bps) = match (action.as_str(), side.as_str()) {
         ("enter", "UP") | ("add", "UP") => (
@@ -4967,6 +5881,7 @@ async fn apply_pending_confirmation(state: &ApiState, pending: &LivePendingOrder
         ps.entry_quote_usdc = Some(pending.quote_size_usdc);
         ps.net_quote_usdc = pending.quote_size_usdc.max(0.0);
         ps.vwap_entry_cents = Some(pending.price_cents.max(0.01));
+        ps.open_add_layers = 0;
         ps.total_entries = ps.total_entries.saturating_add(1);
         ps.last_fill_pnl_usdc = 0.0;
     } else if action == "add" {
@@ -4994,6 +5909,7 @@ async fn apply_pending_confirmation(state: &ApiState, pending: &LivePendingOrder
         ps.entry_quote_usdc = Some(next_quote);
         ps.net_quote_usdc = next_quote;
         ps.total_adds = ps.total_adds.saturating_add(1);
+        ps.open_add_layers = ps.open_add_layers.saturating_add(1);
         ps.last_fill_pnl_usdc = 0.0;
     } else if action == "reduce" || action == "exit" {
         let entry_price_cents = ps
@@ -5028,11 +5944,13 @@ async fn apply_pending_confirmation(state: &ApiState, pending: &LivePendingOrder
             ps.entry_quote_usdc = None;
             ps.net_quote_usdc = 0.0;
             ps.vwap_entry_cents = None;
+            ps.open_add_layers = 0;
             ps.total_exits = ps.total_exits.saturating_add(1);
         } else {
             ps.state = "in_position".to_string();
             ps.entry_quote_usdc = Some(remaining_quote);
             ps.net_quote_usdc = remaining_quote;
+            ps.open_add_layers = ps.open_add_layers.saturating_sub(1);
             ps.total_reduces = ps.total_reduces.saturating_add(1);
         }
     }
@@ -5070,6 +5988,7 @@ async fn apply_pending_revert(state: &ApiState, pending: &LivePendingOrder, reas
         ps.entry_quote_usdc = None;
         ps.net_quote_usdc = 0.0;
         ps.vwap_entry_cents = None;
+        ps.open_add_layers = 0;
     } else if action == "exit" || action == "reduce" {
         ps.state = "in_position".to_string();
         if ps.side.is_none() {
@@ -5515,6 +6434,67 @@ async fn execute_live_orders_via_gateway(
         }));
     }
     out
+}
+
+async fn fetch_live_balance_snapshot(state: &ApiState) -> Result<LiveBalanceSnapshot, String> {
+    const USDC_SCALE: f64 = 1_000_000.0;
+    let ctx = get_or_init_rust_executor(state).await?;
+    let req = PmBalanceAllowanceRequest::builder()
+        .asset_type(PmAssetType::Collateral)
+        .build();
+    let response = ctx
+        .client
+        .balance_allowance(req)
+        .await
+        .map_err(|e| format!("balance_allowance failed: {e}"))?;
+    let account = ctx.client.address().to_string();
+    let allowance_raw = response
+        .allowances
+        .iter()
+        .find_map(|(addr, amount)| {
+            if addr.to_string().eq_ignore_ascii_case(&account) {
+                amount.parse::<f64>().ok()
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            response
+                .allowances
+                .values()
+                .filter_map(|v| v.parse::<f64>().ok())
+                .fold(None, |acc, v| match acc {
+                    Some(prev) if prev >= v => Some(prev),
+                    _ => Some(v),
+                })
+        })
+        .unwrap_or(0.0);
+    let now_ms = Utc::now().timestamp_millis();
+    let balance_raw = pm_dec_to_f64(&response.balance).max(0.0);
+    let balance = (balance_raw / USDC_SCALE).max(0.0);
+    let allowance = (allowance_raw / USDC_SCALE).max(0.0);
+    let spendable = balance.min(allowance).max(0.0);
+    let raw_allowances = response
+        .allowances
+        .iter()
+        .map(|(addr, amount)| (addr.to_string(), amount.clone()))
+        .collect::<HashMap<String, String>>();
+    let raw = json!({
+        "balance_raw": balance_raw,
+        "balance": balance,
+        "allowance_raw": allowance_raw,
+        "allowances": raw_allowances,
+        "account": account,
+        "asset_type": "COLLATERAL"
+    });
+    Ok(LiveBalanceSnapshot {
+        fetched_at_ms: now_ms,
+        source: "clob_balance_allowance".to_string(),
+        balance_usdc: balance,
+        allowance_usdc: allowance,
+        spendable_usdc: spendable,
+        raw,
+    })
 }
 
 fn pm_dec_to_f64(v: &PmDecimal) -> f64 {
@@ -6683,6 +7663,10 @@ async fn strategy_live_reset(State(state): State<ApiState>) -> Result<Json<Value
         cache.clear();
     }
     {
+        let mut cache = state.live_balance_cache.write().await;
+        cache.take();
+    }
+    {
         let mut exec = state.live_rust_executor.write().await;
         exec.take();
     }
@@ -6713,6 +7697,51 @@ async fn strategy_live_reset(State(state): State<ApiState>) -> Result<Json<Value
         "ok": true,
         "reset_at_ms": now_ms,
         "deleted_redis_keys": deleted_keys
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct StrategyLiveBalanceQueryParams {
+    market_type: Option<String>,
+    refresh_ms: Option<i64>,
+}
+
+async fn strategy_live_balance(
+    State(state): State<ApiState>,
+    Query(params): Query<StrategyLiveBalanceQueryParams>,
+) -> Result<Json<Value>, ApiError> {
+    let market_type = if let Some(mt) = params.market_type.as_deref() {
+        normalize_market_type(mt).ok_or_else(|| ApiError::bad_request("invalid market_type"))?
+    } else {
+        "5m"
+    };
+    let capital_cfg = LiveCapitalConfig::from_env();
+    let refresh_ms = params
+        .refresh_ms
+        .unwrap_or(capital_cfg.balance_refresh_ms)
+        .clamp(500, 120_000);
+    let snapshot = state
+        .get_live_balance_snapshot(refresh_ms)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::internal("live balance unavailable"))?;
+    let capital_state = state
+        .get_live_capital_state(market_type, &capital_cfg)
+        .await;
+    Ok(Json(json!({
+        "ok": true,
+        "market_type": market_type,
+        "fetched_at_ms": snapshot.fetched_at_ms,
+        "fetched_at_iso": DateTime::<Utc>::from_timestamp_millis(snapshot.fetched_at_ms).map(|v| v.to_rfc3339()).unwrap_or_default(),
+        "source": snapshot.source,
+        "balance_usdc": snapshot.balance_usdc,
+        "allowance_usdc": snapshot.allowance_usdc,
+        "spendable_usdc": snapshot.spendable_usdc,
+        "capital_auto_enabled": capital_cfg.enabled,
+        "capital_use_real_balance": capital_cfg.use_real_balance,
+        "capital_state_equity_estimate_usdc": capital_state.equity_estimate_usdc,
+        "capital_state_available_to_trade_usdc": capital_state.available_to_trade_usdc,
+        "raw": snapshot.raw,
     })))
 }
 

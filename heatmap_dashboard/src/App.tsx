@@ -69,8 +69,55 @@ const STRATEGY_LIVE_PROFILE = Object.freeze({
   liveMaxOrders: 1,
   liveEntryOnly: true
 });
+const STRATEGY_PREFS_STORAGE_KEY = "polyedge.strategy.prefs.v1";
 
 type TimeMode = "local" | "et";
+type StrategyUiPrefs = {
+  marketType: MarketType;
+  source: StrategyPaperSource;
+  useAutotune: boolean;
+};
+
+function readStrategyUiPrefs(): Partial<StrategyUiPrefs> {
+  if (typeof window === "undefined" || !window.localStorage) {
+    return {};
+  }
+  try {
+    const raw = window.localStorage.getItem(STRATEGY_PREFS_STORAGE_KEY);
+    if (!raw) {
+      return {};
+    }
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const marketType =
+      parsed.marketType === "5m" || parsed.marketType === "15m"
+        ? (parsed.marketType as MarketType)
+        : undefined;
+    const source =
+      parsed.source === "replay" || parsed.source === "live"
+        ? (parsed.source as StrategyPaperSource)
+        : undefined;
+    const useAutotune =
+      typeof parsed.useAutotune === "boolean" ? parsed.useAutotune : undefined;
+    return {
+      marketType,
+      source,
+      useAutotune
+    };
+  } catch {
+    return {};
+  }
+}
+
+function writeStrategyUiPrefs(prefs: StrategyUiPrefs): void {
+  if (typeof window === "undefined" || !window.localStorage) {
+    return;
+  }
+  try {
+    window.localStorage.setItem(STRATEGY_PREFS_STORAGE_KEY, JSON.stringify(prefs));
+  } catch {
+    // ignore localStorage write failure
+  }
+}
 
 function windowToMinutes(view: WindowType): number {
   switch (view) {
@@ -1482,6 +1529,7 @@ const StrategyPanel = memo(function StrategyPanel({
 });
 
 export default function App() {
+  const strategyPrefs = useMemo(() => readStrategyUiPrefs(), []);
   const [wsStatus, setWsStatus] = useState<"connecting" | "open" | "closed" | "error">("connecting");
   const [live, setLive] = useState<Record<MarketType, LiveSnapshot | null>>({
     "5m": null,
@@ -1520,9 +1568,15 @@ export default function App() {
   const [accuracy, setAccuracy] = useState<AccuracySeriesResponse | null>(null);
   const [strategyPaper, setStrategyPaper] = useState<StrategyPaperResponse | null>(null);
   const [strategyLoading, setStrategyLoading] = useState<boolean>(false);
-  const [strategyMarketType, setStrategyMarketType] = useState<MarketType>("5m");
-  const [strategySource, setStrategySource] = useState<StrategyPaperSource>("replay");
-  const [strategyUseAutotune, setStrategyUseAutotune] = useState<boolean>(false);
+  const [strategyMarketType, setStrategyMarketType] = useState<MarketType>(
+    strategyPrefs.marketType ?? "5m"
+  );
+  const [strategySource, setStrategySource] = useState<StrategyPaperSource>(
+    strategyPrefs.source ?? "replay"
+  );
+  const [strategyUseAutotune, setStrategyUseAutotune] = useState<boolean>(
+    strategyPrefs.useAutotune ?? false
+  );
   const [strategyAutotuneLatest, setStrategyAutotuneLatest] = useState<Record<string, unknown> | null>(null);
   const [strategyAutotuneHistory, setStrategyAutotuneHistory] = useState<Array<Record<string, unknown>>>([]);
   const [strategyAutotuneLoading, setStrategyAutotuneLoading] = useState<boolean>(false);
@@ -1550,6 +1604,14 @@ export default function App() {
   const stableLiveRef = useRef<Record<MarketType, LiveSnapshot | null>>({ "5m": null, "15m": null });
   const boundaryRefreshRef = useRef<Record<MarketType, number>>({ "5m": 0, "15m": 0 });
   const accuracyTabRef = useRef<MarketType>("5m");
+
+  useEffect(() => {
+    writeStrategyUiPrefs({
+      marketType: strategyMarketType,
+      source: strategySource,
+      useAutotune: strategyUseAutotune
+    });
+  }, [strategyMarketType, strategySource, strategyUseAutotune]);
 
   useEffect(() => {
     chartWindowRef.current = chartWindow;

@@ -686,10 +686,12 @@ pub fn simulate_dual<G: LiveOrderGateway>(
     gateway: &G,
 ) -> DualExecutionResult {
     let run = simulate(samples, cfg, max_trades);
-    let quote = quote_size_usdc.max(0.01);
-    let mut decisions: Vec<Value> = Vec::new();
+    simulate_dual_from_run(&run, quote_size_usdc, gateway)
+}
 
-    for trade in &run.trades {
+fn build_decisions_from_trades(trades: &[Value], quote: f64) -> Vec<Value> {
+    let mut decisions: Vec<Value> = Vec::with_capacity(trades.len().saturating_mul(2));
+    for trade in trades {
         let side = trade
             .get("side")
             .and_then(Value::as_str)
@@ -774,6 +776,10 @@ pub fn simulate_dual<G: LiveOrderGateway>(
                 "reason": entry_reason,
                 "quote_size_usdc": quote,
                 "price_cents": entry_price_cents,
+                "entry_score": entry_score,
+                "edge_score": entry_score,
+                "entry_remaining_ms": entry_remaining_ms,
+                "remaining_ms": entry_remaining_ms,
                 "tif": entry_tif,
                 "style": entry_style,
                 "ttl_ms": entry_ttl_ms,
@@ -789,6 +795,7 @@ pub fn simulate_dual<G: LiveOrderGateway>(
                 "reason": exit_reason,
                 "quote_size_usdc": quote,
                 "price_cents": exit_price_cents,
+                "remaining_ms": exit_remaining_ms,
                 "tif": exit_tif,
                 "style": exit_style,
                 "ttl_ms": exit_ttl_ms,
@@ -796,10 +803,19 @@ pub fn simulate_dual<G: LiveOrderGateway>(
             }));
         }
     }
-
     decisions.sort_by_key(|d| d.get("ts_ms").and_then(Value::as_i64).unwrap_or(0));
+    decisions
+}
 
-    let mut live_records = Vec::<Value>::new();
+pub fn simulate_dual_from_run<G: LiveOrderGateway>(
+    run: &SimulationResult,
+    quote_size_usdc: f64,
+    gateway: &G,
+) -> DualExecutionResult {
+    let quote = quote_size_usdc.max(0.01);
+    let decisions = build_decisions_from_trades(&run.trades, quote);
+
+    let mut live_records = Vec::<Value>::with_capacity(decisions.len());
     for d in &decisions {
         let action_str = d
             .get("action")
