@@ -165,6 +165,28 @@ impl LiveOrderGateway for DisabledLiveGateway {
     }
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+pub struct ArmedSimulatedGateway;
+
+impl LiveOrderGateway for ArmedSimulatedGateway {
+    fn submit(&self, intent: &OrderIntent) -> OrderResult {
+        OrderResult {
+            accepted: true,
+            request_id: format!("sim-{}-{}", intent.action as u8, intent.ts_ms),
+            reason: "accepted".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DualExecutionResult {
+    pub summary: Value,
+    pub decisions: Vec<Value>,
+    pub paper_records: Vec<Value>,
+    pub live_records: Vec<Value>,
+}
+
 #[derive(Debug, Clone)]
 struct Position {
     side: Side,
@@ -638,5 +660,129 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
         total_slippage_cents,
         total_cost_cents,
         net_margin_pct,
+    }
+}
+
+pub fn simulate_dual<G: LiveOrderGateway>(
+    samples: &[Sample],
+    cfg: &RuntimeConfig,
+    max_trades: usize,
+    quote_size_usdc: f64,
+    gateway: &G,
+) -> DualExecutionResult {
+    let run = simulate(samples, cfg, max_trades);
+    let quote = quote_size_usdc.max(0.01);
+    let mut decisions: Vec<Value> = Vec::new();
+
+    for trade in &run.trades {
+        let side = trade
+            .get("side")
+            .and_then(Value::as_str)
+            .unwrap_or("UP")
+            .to_ascii_uppercase();
+        let round_id = trade
+            .get("entry_round_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let entry_ts_ms = trade.get("entry_ts_ms").and_then(Value::as_i64).unwrap_or(0);
+        let exit_ts_ms = trade.get("exit_ts_ms").and_then(Value::as_i64).unwrap_or(0);
+        let entry_reason = trade
+            .get("entry_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("fev1_edgeflow_entry");
+        let exit_reason = trade
+            .get("exit_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("strategy_exit");
+
+        if entry_ts_ms > 0 {
+            decisions.push(json!({
+                "action": "enter",
+                "side": side,
+                "round_id": round_id,
+                "ts_ms": entry_ts_ms,
+                "reason": entry_reason,
+                "quote_size_usdc": quote
+            }));
+        }
+        if exit_ts_ms > 0 {
+            decisions.push(json!({
+                "action": "exit",
+                "side": side,
+                "round_id": round_id,
+                "ts_ms": exit_ts_ms,
+                "reason": exit_reason,
+                "quote_size_usdc": quote
+            }));
+        }
+    }
+
+    decisions.sort_by_key(|d| d.get("ts_ms").and_then(Value::as_i64).unwrap_or(0));
+
+    let mut live_records = Vec::<Value>::new();
+    for d in &decisions {
+        let action_str = d
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let action = if action_str == "enter" {
+            OrderAction::Enter
+        } else {
+            OrderAction::Exit
+        };
+        let side_str = d
+            .get("side")
+            .and_then(Value::as_str)
+            .unwrap_or("UP")
+            .to_ascii_uppercase();
+        let side = if side_str == "DOWN" { Side::Down } else { Side::Up };
+        let intent = OrderIntent {
+            ts_ms: d.get("ts_ms").and_then(Value::as_i64).unwrap_or(0),
+            round_id: d
+                .get("round_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            side,
+            action,
+            price_cents: 0.0,
+            quote_size_usdc: d
+                .get("quote_size_usdc")
+                .and_then(Value::as_f64)
+                .unwrap_or(quote),
+            reason: d
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        };
+        let result = gateway.submit(&intent);
+        live_records.push(json!({
+            "ts_ms": intent.ts_ms,
+            "round_id": intent.round_id,
+            "action": action_str,
+            "side": side_str,
+            "accepted": result.accepted,
+            "request_id": result.request_id,
+            "reason": result.reason
+        }));
+    }
+
+    let accepted = live_records
+        .iter()
+        .filter(|r| r.get("accepted").and_then(Value::as_bool).unwrap_or(false))
+        .count();
+
+    DualExecutionResult {
+        summary: json!({
+            "decision_count": decisions.len(),
+            "live_accept_count": accepted,
+            "quote_size_usdc": quote
+        }),
+        decisions: decisions.clone(),
+        paper_records: decisions,
+        live_records,
     }
 }
