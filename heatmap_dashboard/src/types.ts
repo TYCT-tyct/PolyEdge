@@ -304,6 +304,9 @@ export interface StrategyPaperResponse {
         submitted_count?: number;
         submitted_entry_count?: number;
         submitted_exit_count?: number;
+        simulated_submitted_count?: number;
+        simulated_submitted_entry_count?: number;
+        simulated_submitted_exit_count?: number;
         accepted_count?: number;
         rejected_count?: number;
         skipped_count?: number;

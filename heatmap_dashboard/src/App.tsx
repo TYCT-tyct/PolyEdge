@@ -817,36 +817,43 @@ const StrategyPanel = memo(function StrategyPanel({
   const liveOrders = liveExec?.execution?.orders ?? [];
   const liveEvents = (liveExec?.events ?? []) as Array<Record<string, unknown>>;
   const parity = liveExec?.parity_check;
+  const isLiveDryRun = (liveExec?.execution?.mode ?? "dry_run") === "dry_run" || !data?.live_execute;
   const parityPaperDecisionCount =
     parity?.paper?.decision_count ?? parity?.paper?.decisions ?? 0;
   const parityPaperEntry =
     parity?.paper?.entry_count ?? parity?.paper?.entries ?? 0;
   const parityPaperExit =
     parity?.paper?.exit_count ?? parity?.paper?.exits ?? 0;
-  const parityLiveSubmitEntry =
-    parity?.live?.submitted_entry_count ?? parity?.live?.entries?.submitted ?? 0;
-  const parityLiveSubmitExit =
-    parity?.live?.submitted_exit_count ?? parity?.live?.exits?.submitted ?? 0;
+  const parityLiveSubmitEntry = isLiveDryRun
+    ? parity?.live?.simulated_submitted_entry_count ?? 0
+    : parity?.live?.submitted_entry_count ?? parity?.live?.entries?.submitted ?? 0;
+  const parityLiveSubmitExit = isLiveDryRun
+    ? parity?.live?.simulated_submitted_exit_count ?? 0
+    : parity?.live?.submitted_exit_count ?? parity?.live?.exits?.submitted ?? 0;
   const parityLiveAccepted =
     parity?.live?.accepted_count ?? parity?.live?.accepted ?? 0;
   const parityLiveRejected =
     parity?.live?.rejected_count ?? parity?.live?.rejected ?? 0;
   const parityLiveSkipped =
     parity?.live?.skipped_count ?? parity?.live?.skipped ?? 0;
-  const liveSubmittedTotal =
-    parity?.live?.submitted_count ??
+  const liveSubmittedTotal = isLiveDryRun
+    ? parity?.live?.simulated_submitted_count ??
+      (parityLiveSubmitEntry + parityLiveSubmitExit) ??
+      0
+    : parity?.live?.submitted_count ??
     (parityLiveSubmitEntry + parityLiveSubmitExit) ??
     0;
-  const liveNetPnl = data?.summary?.net_pnl_cents ?? data?.summary?.total_pnl_cents ?? 0;
-  const liveGrossPnl = data?.summary?.gross_pnl_cents ?? 0;
-  const liveTotalCost = data?.summary?.total_cost_cents ?? 0;
-  const liveWinRate = data?.summary?.win_rate_pct ?? 0;
-  const liveDrawdown = data?.summary?.max_drawdown_cents ?? 0;
-  const liveAcceptedRate = liveSubmittedTotal > 0 ? (parityLiveAccepted / liveSubmittedTotal) * 100 : 0;
+  const liveNetPnl = isLiveDryRun ? 0 : data?.summary?.net_pnl_cents ?? data?.summary?.total_pnl_cents ?? 0;
+  const liveGrossPnl = isLiveDryRun ? 0 : data?.summary?.gross_pnl_cents ?? 0;
+  const liveTotalCost = isLiveDryRun ? 0 : data?.summary?.total_cost_cents ?? 0;
+  const liveWinRate = isLiveDryRun ? 0 : data?.summary?.win_rate_pct ?? 0;
+  const liveDrawdown = isLiveDryRun ? 0 : data?.summary?.max_drawdown_cents ?? 0;
+  const liveAcceptedRate =
+    !isLiveDryRun && liveSubmittedTotal > 0 ? (parityLiveAccepted / liveSubmittedTotal) * 100 : 0;
   const parityRows = [
     { label: "Paper信号", value: parityPaperDecisionCount },
     { label: "门禁通过", value: liveExec?.gated?.selected_count ?? 0 },
-    { label: "提交网关", value: liveSubmittedTotal },
+    { label: isLiveDryRun ? "模拟提交" : "提交网关", value: liveSubmittedTotal },
     { label: "网关接受", value: parityLiveAccepted },
   ];
   const parityMax = Math.max(1, ...parityRows.map((r) => r.value));
@@ -976,7 +983,7 @@ const StrategyPanel = memo(function StrategyPanel({
               <span>执行模式</span>
               <strong>{liveExec?.execution?.mode ?? "--"}</strong>
               <small>
-                source={data?.source ?? "--"} · engine={data?.strategy_alias ?? "--"}
+                source={data?.source ?? "--"} · engine={data?.strategy_alias ?? "--"} · {isLiveDryRun ? "未开启实盘" : "实盘执行"}
               </small>
             </article>
             <article className="info-card">
@@ -993,10 +1000,12 @@ const StrategyPanel = memo(function StrategyPanel({
             <article className="info-card">
               <span>订单成功率</span>
               <strong className={liveAcceptedRate >= 70 ? "up" : liveAcceptedRate >= 40 ? "warn" : "down"}>
-                {liveSubmittedTotal > 0 ? `${liveAcceptedRate.toFixed(1)}%` : "--"}
+                {isLiveDryRun ? "--" : liveSubmittedTotal > 0 ? `${liveAcceptedRate.toFixed(1)}%` : "--"}
               </strong>
               <small>
-                提交 {liveSubmittedTotal} · 接受 {parityLiveAccepted} · 拒绝 {parityLiveRejected}
+                {isLiveDryRun
+                  ? `模拟提交 ${liveSubmittedTotal} · 非真实成交`
+                  : `提交 ${liveSubmittedTotal} · 接受 ${parityLiveAccepted} · 拒绝 ${parityLiveRejected}`}
               </small>
             </article>
             <article className="info-card">
@@ -1028,7 +1037,7 @@ const StrategyPanel = memo(function StrategyPanel({
                 ))}
               </div>
               <div className="parity-meta muted">
-                skipped {parityLiveSkipped} · rejected {parityLiveRejected}
+                skipped {parityLiveSkipped}{isLiveDryRun ? "" : ` · rejected ${parityLiveRejected}`}
               </div>
             </article>
 
@@ -1087,8 +1096,8 @@ const StrategyPanel = memo(function StrategyPanel({
                           ? Number(order.decision.price_cents).toFixed(2)
                           : "--"}
                       </td>
-                      <td className={order.accepted ? "up" : "down"}>
-                        {order.accepted ? "ACCEPTED" : "SKIP/REJECT"}
+                      <td className={isLiveDryRun ? "" : order.accepted ? "up" : "down"}>
+                        {isLiveDryRun ? "SIMULATED" : order.accepted ? "ACCEPTED" : "SKIP/REJECT"}
                       </td>
                       <td>{order.endpoint ?? "--"}</td>
                     </tr>

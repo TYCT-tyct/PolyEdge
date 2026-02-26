@@ -2982,7 +2982,7 @@ async fn strategy_paper_live(
         .iter()
         .filter(|d| d.get("action").and_then(Value::as_str).map(|v| v.eq_ignore_ascii_case("exit")).unwrap_or(false))
         .count();
-    let (gateway_accept_count, gateway_reject_count) = live_exec_payload
+    let (gateway_accept_count_raw, gateway_reject_count_raw) = live_exec_payload
         .get("orders")
         .and_then(Value::as_array)
         .map(|orders| {
@@ -2994,6 +2994,8 @@ async fn strategy_paper_live(
             (accepted, rejected)
         })
         .unwrap_or((0, 0));
+    let gateway_accept_count = if live_execute { gateway_accept_count_raw } else { 0 };
+    let gateway_reject_count = if live_execute { gateway_reject_count_raw } else { 0 };
     let no_live_market_target = live_exec_payload
         .get("error")
         .and_then(Value::as_str)
@@ -3031,6 +3033,21 @@ async fn strategy_paper_live(
             "fev1 paper-live parity mismatch"
         );
     }
+    let live_submitted_count = if live_execute {
+        submitted_decisions.len()
+    } else {
+        0
+    };
+    let live_submitted_entry_count = if live_execute { submitted_entry_count } else { 0 };
+    let live_submitted_exit_count = if live_execute { submitted_exit_count } else { 0 };
+    let simulated_submitted_count = if live_execute {
+        0
+    } else {
+        submitted_decisions.len()
+    };
+    let simulated_submitted_entry_count = if live_execute { 0 } else { submitted_entry_count };
+    let simulated_submitted_exit_count = if live_execute { 0 } else { submitted_exit_count };
+
     let parity_check = json!({
         "status": status,
         "level": level,
@@ -3040,13 +3057,16 @@ async fn strategy_paper_live(
             "exit_count": paper_exit_count
         },
         "live": {
-            "submitted_count": submitted_decisions.len(),
-            "submitted_entry_count": submitted_entry_count,
-            "submitted_exit_count": submitted_exit_count,
+            "submitted_count": live_submitted_count,
+            "submitted_entry_count": live_submitted_entry_count,
+            "submitted_exit_count": live_submitted_exit_count,
             "accepted_count": gateway_accept_count,
             "rejected_count": gateway_reject_count,
             "skipped_count": skipped_decisions.len(),
-            "no_live_market_target": no_live_market_target
+            "no_live_market_target": no_live_market_target,
+            "simulated_submitted_count": simulated_submitted_count,
+            "simulated_submitted_entry_count": simulated_submitted_entry_count,
+            "simulated_submitted_exit_count": simulated_submitted_exit_count
         }
     });
     let live_events = state.list_live_events(market_type, 60).await;
