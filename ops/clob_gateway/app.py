@@ -25,6 +25,7 @@ MIN_PRICE = 0.01
 MAX_PRICE = 0.99
 TERMINAL_STATES = {"filled", "cancelled", "canceled", "rejected", "expired", "executed", "matched"}
 DEFAULT_FEE_RATE_BPS = int((os.environ.get("CLOB_FEE_RATE_BPS") or "1000").strip() or "1000")
+MIN_MARKETABLE_BUY_USDC = float((os.environ.get("CLOB_MIN_MARKETABLE_BUY_USDC") or "1.0").strip() or "1.0")
 
 
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -329,6 +330,9 @@ def _build_order(payload: dict) -> Tuple[dict, Optional[str]]:
         price = _normalize_price(price * (1.0 + slip if side == BUY else 1.0 - slip))
     else:
         price = _normalize_price(price)
+    # For marketable BUY paths, Polymarket enforces a minimum notional amount.
+    if side == BUY and size * price < MIN_MARKETABLE_BUY_USDC:
+        size = round((MIN_MARKETABLE_BUY_USDC / max(price, MIN_PRICE)) + 1e-6, 6)
     # Polymarket currently expects a market-specific fee rate (1000 for our target flow).
     # We keep this fixed to avoid exchange-side hard rejects from stale client payload values.
     fee_bps = DEFAULT_FEE_RATE_BPS
@@ -467,6 +471,10 @@ def _order_response(started: float, payload_resp: dict, fallback_size: float, me
             "source": source,
         },
     )
+
+
+def _is_invalid_nonce_error(exc: BaseException) -> bool:
+    return "invalid_nonce" in _safe_error(exc).lower()
 
 
 @app.on_event("startup")
@@ -626,6 +634,18 @@ async def post_order(request: Request) -> JSONResponse:
             try:
                 res = _submit_raw(hit.body, {"POLY_ADDRESS": hit.address, "POLY_SIGNATURE": sig, "POLY_TIMESTAMP": str(now_s), "POLY_API_KEY": hit.api_key, "POLY_PASSPHRASE": hit.passphrase, "Content-Type": "application/json"})
             except Exception as exc:
+                # Cached pre-signed payload can occasionally hit nonce reuse under concurrent retries.
+                # Fallback once to a freshly signed order from payload.
+                if _is_invalid_nonce_error(exc):
+                    built_retry, err_retry = _build_order(payload)
+                    if not err_retry:
+                        client_retry: ClobClient = STATE["client"]
+                        try:
+                            with STATE["client_lock"]:
+                                res_retry = client_retry.post_order(built_retry["signed_order"], orderType=built_retry["order_type"])
+                            return _order_response(started, res_retry if isinstance(res_retry, dict) else {"raw": str(res_retry)}, built_retry["size"], built_retry, "cache_fallback_resign")
+                        except Exception as exc_retry:
+                            return JSONResponse(status_code=200, content={"accepted": False, "order_id": "", "accepted_size": 0.0, "reject_code": _safe_error(exc_retry), "exchange_latency_ms": float((time.perf_counter() - started) * 1000.0), "ts_ms": _ms_now(), "source": "cache_fallback_resign"})
                 return JSONResponse(status_code=200, content={"accepted": False, "order_id": "", "accepted_size": 0.0, "reject_code": _safe_error(exc), "exchange_latency_ms": float((time.perf_counter() - started) * 1000.0), "ts_ms": _ms_now(), "source": "cache_prebuilt"})
             return _order_response(started, res, float(payload.get("size") or 0.0), payload, "cache_prebuilt")
 
