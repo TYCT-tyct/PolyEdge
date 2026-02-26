@@ -2,30 +2,14 @@
 resolver = "2"
 members = [
   "crates/core_types",
-  "crates/infra_clock",
-  "crates/infra_bus",
   "crates/feed_polymarket",
   "crates/feed_reference",
   "crates/market_discovery",
-  "crates/fair_value",
-  "crates/strategy_maker",
   "crates/direction_detector",
-  "crates/taker_sniper",
-  "crates/exit_manager",
-  "crates/probability_engine",
-  "crates/timeframe_router",
-  "crates/settlement_compounder",
-  "crates/risk_engine",
-  "crates/execution_clob",
-  "crates/portfolio",
-  "crates/replay_engine",
-  "crates/paper_executor",
-  "crates/observability",
   "crates/poly_wire",
   "crates/feeder_tokyo",
-  "crates/feed_udp",
   "crates/polyedge_data_backend",
-  "crates/polyedge_cli", "crates/polyedge_forge",
+  "crates/polyedge_forge",
 ]
 
 [workspace.package]

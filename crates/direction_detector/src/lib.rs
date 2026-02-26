@@ -825,7 +825,7 @@ mod tests {
         out
     }
 
-    fn roll_v1_like_cfg() -> DirectionConfig {
+    fn baseline_test_cfg() -> DirectionConfig {
         DirectionConfig {
             threshold_15m_pct: 0.05,
             min_ticks_for_signal: 3,
@@ -844,7 +844,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_roll_case_1_monotonic_rise_detects_uptrend() {
+    fn synthetic_case_1_monotonic_rise_detects_uptrend() {
         // 用户给定曲线（5min）:
         // 12:35 54 -> 12:36 59.6 -> 12:37 90.5 -> 12:38 97.5 -> 12:39 99.5 -> 12:40 100
         let anchors = [
@@ -856,7 +856,7 @@ mod tests {
             (300_000, 1.0),
         ];
         let series = piecewise_linear_series(&anchors, 40);
-        let mut det = DirectionDetector::new(roll_v1_like_cfg());
+        let mut det = DirectionDetector::new(baseline_test_cfg());
         let symbol = "BTCUSDT";
         let base_ms = 10_000_000_i64;
 
@@ -878,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_roll_case_2_drawdown_then_recovery_detects_uptrend_after_rebound() {
+    fn synthetic_case_2_drawdown_then_recovery_detects_uptrend_after_rebound() {
         // 用户给定曲线（5min）:
         // 11:25 58 -> 11:26 38 -> 11:27 51 -> 11:28 80 -> 11:29 85 -> 11:30 100
         let anchors = [
@@ -890,7 +890,7 @@ mod tests {
             (300_000, 1.0),
         ];
         let series = piecewise_linear_series(&anchors, 40);
-        let mut det = DirectionDetector::new(roll_v1_like_cfg());
+        let mut det = DirectionDetector::new(baseline_test_cfg());
         let symbol = "ETHUSDT";
         let base_ms = 20_000_000_i64;
 

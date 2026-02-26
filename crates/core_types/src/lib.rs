@@ -804,7 +804,7 @@ pub struct ShadowShot {
     /// Execution venue request/ack duration only (real in live mode).
     #[serde(default)]
     pub ack_only_ms: f64,
-    /// End-to-end decision+execution latency (see app_runner for definition).
+    /// End-to-end decision+execution latency (runtime-defined).
     #[serde(default)]
     pub tick_to_ack_ms: f64,
     /// `book_top_lag_ms - tick_to_ack_ms`; positive means we likely had time to capture.

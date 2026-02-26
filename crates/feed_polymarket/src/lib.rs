@@ -170,7 +170,7 @@ impl PolymarketFeed {
         let this = self.clone();
 
         tokio::spawn(async move {
-            // NOTE: app_runner owns the reconnect lifecycle for market feed.
+            // Reconnect lifecycle is owned by the active runtime service.
             // Keep this worker single-shot to avoid nested reconnect loops that
             // can fan out into discovery storms (and trigger Gamma 429s).
             if let Err(err) = this.run_market_loop(&tx).await {
