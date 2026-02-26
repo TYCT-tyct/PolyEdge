@@ -6526,7 +6526,7 @@ async fn strategy_paper(
     let full_history = params.full_history.unwrap_or(false);
     let lookback_minutes = params
         .lookback_minutes
-        .unwrap_or(if full_history { 30 * 24 * 60 } else { 6 * 60 })
+        .unwrap_or(if full_history { 30 * 24 * 60 } else { 24 * 60 })
         .clamp(30, 365 * 24 * 60);
     let max_points = params
         .max_points

@@ -763,7 +763,7 @@ export async function getStrategyPaper(
   const qs = new URLSearchParams({
     source: options.source ?? "replay",
     market_type: marketType,
-    lookback_minutes: String(options.lookbackMinutes ?? 360),
+    lookback_minutes: String(options.lookbackMinutes ?? 1440),
     max_trades: String(options.maxTrades ?? 120),
     full_history: options.fullHistory ? "true" : "false",
     use_autotune: options.useAutotune ? "true" : "false",

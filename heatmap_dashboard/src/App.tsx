@@ -58,7 +58,7 @@ const AUTOTUNE_POLL_MIN_MS = 6_000;
 const AUTOTUNE_POLL_MAX_MS = 60_000;
 type StrategyPaperSource = "replay" | "live";
 const STRATEGY_PAPER_PROFILE = Object.freeze({
-  lookbackMinutes: 6 * 60,
+  lookbackMinutes: 24 * 60,
   maxTrades: 180,
   fullHistory: false,
   useAutotune: false
