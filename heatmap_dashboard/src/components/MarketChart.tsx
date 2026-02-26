@@ -270,19 +270,19 @@ function slicePointsByDomain(points: ChartPoint[], domain: DomainRange | null): 
 function maxRenderPointsForWindow(windowType: WindowType): number {
   switch (windowType) {
     case "5m":
-      return 2_400;
+      return 1_400;
     case "15m":
-      return 3_200;
+      return 2_000;
     case "30m":
-      return 4_000;
+      return 2_800;
     case "1h":
-      return 5_000;
+      return 3_800;
     case "2h":
-      return 6_000;
+      return 5_000;
     case "4h":
-      return 8_000;
+      return 6_500;
     default:
-      return 10_000;
+      return 8_000;
   }
 }
 
@@ -302,10 +302,48 @@ function sampleEvenly(points: ChartPoint[], maxPoints: number): ChartPoint[] {
   return out;
 }
 
+function dedupeSortedPoints(points: ChartPoint[]): ChartPoint[] {
+  const deduped: ChartPoint[] = [];
+  for (const p of points) {
+    if (!Number.isFinite(p.timestamp_ms) || p.timestamp_ms <= 0) {
+      continue;
+    }
+    const prev = deduped[deduped.length - 1];
+    if (prev && prev.timestamp_ms === p.timestamp_ms && (prev.round_id ?? "") === (p.round_id ?? "")) {
+      deduped[deduped.length - 1] = p;
+    } else {
+      deduped.push(p);
+    }
+  }
+  return deduped;
+}
+
 function sortAndDedupePoints(points: ChartPoint[]): ChartPoint[] {
   if (points.length < 2) {
     return points.filter((p) => Number.isFinite(p.timestamp_ms) && p.timestamp_ms > 0);
   }
+
+  // Fast path: incoming feed is already time-ordered in normal operation.
+  let monotonic = true;
+  let lastTs = Number.NEGATIVE_INFINITY;
+  let lastRound = "";
+  for (const p of points) {
+    const ts = p.timestamp_ms;
+    if (!Number.isFinite(ts) || ts <= 0) {
+      continue;
+    }
+    const round = p.round_id ?? "";
+    if (ts < lastTs || (ts === lastTs && round < lastRound)) {
+      monotonic = false;
+      break;
+    }
+    lastTs = ts;
+    lastRound = round;
+  }
+  if (monotonic) {
+    return dedupeSortedPoints(points);
+  }
+
   const sorted = points
     .filter((p) => Number.isFinite(p.timestamp_ms) && p.timestamp_ms > 0)
     .sort((a, b) => {
@@ -316,16 +354,7 @@ function sortAndDedupePoints(points: ChartPoint[]): ChartPoint[] {
       const br = b.round_id ?? "";
       return ar.localeCompare(br);
     });
-  const deduped: ChartPoint[] = [];
-  for (const p of sorted) {
-    const prev = deduped[deduped.length - 1];
-    if (prev && prev.timestamp_ms === p.timestamp_ms && (prev.round_id ?? "") === (p.round_id ?? "")) {
-      deduped[deduped.length - 1] = p;
-    } else {
-      deduped.push(p);
-    }
-  }
-  return deduped;
+  return dedupeSortedPoints(sorted);
 }
 
 function synthPoint(

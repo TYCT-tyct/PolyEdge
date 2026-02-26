@@ -204,19 +204,19 @@ function computeChartLookbackMinutes(view: WindowType): number {
 function maxPointsForView(view: WindowType): number {
   switch (view) {
     case "5m":
-      return 1_400;
+      return 1_200;
     case "15m":
-      return 2_200;
+      return 1_800;
     case "30m":
-      return 3_000;
+      return 2_400;
     case "1h":
-      return 4_200;
+      return 3_200;
     case "2h":
-      return 6_000;
+      return 4_500;
     case "4h":
-      return 8_000;
+      return 6_000;
     default:
-      return 12_000;
+      return 8_000;
   }
 }
 
@@ -508,7 +508,7 @@ export async function getChart(marketType: MarketType, view: WindowType): Promis
   }
   try {
     const lookback = minutes;
-    const estimatedLimit = Math.min(100_000, Math.max(12_000, lookback * 800));
+    const estimatedLimit = Math.min(50_000, Math.max(6_000, lookback * 600));
     const history = await getHistoryRaw(marketType, lookback, estimatedLimit);
     const points = history.samples
       .map((s) =>
@@ -652,7 +652,7 @@ export async function getRoundChart(
   const qs = new URLSearchParams({
     round_id: roundId,
     market_type: marketType,
-    max_points: "12000"
+    max_points: "6000"
   });
   if (apiSupport.roundChart !== false) {
     try {

@@ -47,7 +47,7 @@ const WINDOW_OPTIONS: Array<{ value: WindowType; label: string }> = [
   { value: "all", label: "All" }
 ];
 
-const LIVE_POLL_MS = 900;
+const LIVE_POLL_MS = 1_200;
 const WS_STALE_FALLBACK_MS = 3000;
 const LIVE_UI_MIN_INTERVAL_MS = 900;
 const ET_TIMEZONE = "America/New_York";
@@ -96,19 +96,19 @@ function windowToMinutes(view: WindowType): number {
 function maxLocalPointsForView(view: WindowType): number {
   switch (view) {
     case "5m":
-      return 1_600;
+      return 1_200;
     case "15m":
-      return 2_400;
+      return 1_800;
     case "30m":
-      return 3_200;
+      return 2_400;
     case "1h":
-      return 4_500;
+      return 3_200;
     case "2h":
-      return 6_500;
+      return 4_500;
     case "4h":
-      return 8_500;
+      return 6_000;
     default:
-      return 12_000;
+      return 8_000;
   }
 }
 
@@ -1476,7 +1476,10 @@ export default function App() {
   }, [strategyMarketType]);
 
   const loadChartFor = useCallback(
-    async (marketType: MarketType, windowType: WindowType) => {
+    async (marketType: MarketType, windowType: WindowType, force = false) => {
+      if (chartInFlightRef.current[marketType] && !force) {
+        return;
+      }
       chartInFlightRef.current[marketType] = true;
       const reqId = (chartReqSeqRef.current[marketType] ?? 0) + 1;
       chartReqSeqRef.current[marketType] = reqId;
@@ -1728,8 +1731,8 @@ export default function App() {
       if (document.visibilityState !== "visible") {
         return;
       }
-      void loadChartFor("5m", chartWindowRef.current["5m"]);
-      void loadChartFor("15m", chartWindowRef.current["15m"]);
+      void loadChartFor("5m", chartWindowRef.current["5m"], true);
+      void loadChartFor("15m", chartWindowRef.current["15m"], true);
     };
     document.addEventListener("visibilitychange", onVisible);
     return () => {
@@ -1841,7 +1844,7 @@ export default function App() {
       return;
     }
     setChartWindow((prev) => ({ ...prev, [marketType]: view }));
-    void loadChartFor(marketType, view);
+    void loadChartFor(marketType, view, true);
   };
 
   useEffect(() => {
@@ -2051,6 +2054,9 @@ export default function App() {
       };
     }
     const load = async () => {
+      if (document.visibilityState !== "visible") {
+        return;
+      }
       setStrategyAutotuneLoading(true);
       try {
         const [latest, history] = await Promise.all([
