@@ -2833,11 +2833,20 @@ async fn strategy_paper_live(
     reconcile_gateway_reports(state, &live_gateway_cfg).await;
     handle_pending_timeouts(state, &live_gateway_cfg).await;
     let live_market = resolve_live_market_target(market_type).await.ok();
+    let position_before_gate = state.get_live_position_state(market_type).await;
+    let prefer_action = if live_entry_only {
+        Some("enter")
+    } else if position_before_gate.side.is_some() {
+        Some("exit")
+    } else {
+        Some("enter")
+    };
     let selected_decisions = select_live_decisions(
         &dual.decisions,
         samples.last().map(|s| s.ts_ms).unwrap_or_default(),
         live_max_orders.max(1),
         live_entry_only,
+        prefer_action,
     );
     let (gated_decisions, skipped_decisions, mut live_position_state) =
         gate_live_decisions(state, market_type, &selected_decisions, live_execute).await;
@@ -3412,6 +3421,7 @@ fn select_live_decisions(
     latest_ts_ms: i64,
     max_orders: usize,
     entry_only: bool,
+    prefer_action: Option<&str>,
 ) -> Vec<Value> {
     if decisions.is_empty() {
         return Vec::new();
@@ -3459,7 +3469,23 @@ fn select_live_decisions(
     }
     selected.sort_by_key(|v| v.get("ts_ms").and_then(Value::as_i64).unwrap_or(0));
     if selected.len() > max_orders {
-        selected = selected[selected.len() - max_orders..].to_vec();
+        if max_orders <= 1 {
+            let preferred = prefer_action
+                .and_then(|want| {
+                    selected.iter().rev().find(|v| {
+                        v.get("action")
+                            .and_then(Value::as_str)
+                            .map(|a| a.eq_ignore_ascii_case(want))
+                            .unwrap_or(false)
+                    })
+                })
+                .cloned();
+            if let Some(v) = preferred.or_else(|| selected.last().cloned()) {
+                selected = vec![v];
+            }
+        } else {
+            selected = selected[selected.len() - max_orders..].to_vec();
+        }
     }
     selected
 }

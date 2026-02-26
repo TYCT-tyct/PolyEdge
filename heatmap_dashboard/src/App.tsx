@@ -193,6 +193,10 @@ function finiteOrNull(v: number | null | undefined): number | null {
   return v != null && Number.isFinite(v) ? v : null;
 }
 
+function asFiniteNumber(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
 function quoteFromPreferredMid(
   preferredMid: number | null | undefined,
   bid: number | null | undefined,
@@ -843,11 +847,35 @@ const StrategyPanel = memo(function StrategyPanel({
     : parity?.live?.submitted_count ??
     (parityLiveSubmitEntry + parityLiveSubmitExit) ??
     0;
-  const liveNetPnl = isLiveDryRun ? 0 : data?.summary?.net_pnl_cents ?? data?.summary?.total_pnl_cents ?? 0;
-  const liveGrossPnl = isLiveDryRun ? 0 : data?.summary?.gross_pnl_cents ?? 0;
-  const liveTotalCost = isLiveDryRun ? 0 : data?.summary?.total_cost_cents ?? 0;
-  const liveWinRate = isLiveDryRun ? 0 : data?.summary?.win_rate_pct ?? 0;
-  const liveDrawdown = isLiveDryRun ? 0 : data?.summary?.max_drawdown_cents ?? 0;
+  const liveSummary =
+    liveExec?.summary && typeof liveExec.summary === "object"
+      ? (liveExec.summary as Record<string, unknown>)
+      : null;
+  const hasLiveExecution =
+    !isLiveDryRun &&
+    (liveSubmittedTotal > 0 ||
+      parityLiveAccepted > 0 ||
+      (liveExec?.live_records?.length ?? 0) > 0);
+  const liveNetPnl = hasLiveExecution
+    ? asFiniteNumber(liveSummary?.net_pnl_cents) ??
+      asFiniteNumber(liveSummary?.total_pnl_cents) ??
+      0
+    : 0;
+  const liveGrossPnl = hasLiveExecution
+    ? asFiniteNumber(liveSummary?.gross_pnl_cents) ?? 0
+    : 0;
+  const liveTotalCost = hasLiveExecution
+    ? asFiniteNumber(liveSummary?.total_cost_cents) ?? 0
+    : 0;
+  const liveWinRate = hasLiveExecution
+    ? asFiniteNumber(liveSummary?.win_rate_pct) ?? 0
+    : 0;
+  const liveDrawdown = hasLiveExecution
+    ? asFiniteNumber(liveSummary?.max_drawdown_cents) ?? 0
+    : 0;
+  const liveNetMargin = hasLiveExecution
+    ? asFiniteNumber(liveSummary?.net_margin_pct) ?? 0
+    : 0;
   const liveAcceptedRate =
     !isLiveDryRun && liveSubmittedTotal > 0 ? (parityLiveAccepted / liveSubmittedTotal) * 100 : 0;
   const parityRows = [
@@ -976,7 +1004,7 @@ const StrategyPanel = memo(function StrategyPanel({
               <span>毛收益 / 总成本</span>
               <strong>{`${liveGrossPnl.toFixed(2)}¢ / ${liveTotalCost.toFixed(2)}¢`}</strong>
               <small>
-                净利润率 {(data?.summary?.net_margin_pct ?? 0).toFixed(2)}%
+                净利润率 {liveNetMargin.toFixed(2)}%
               </small>
             </article>
             <article className="info-card">
