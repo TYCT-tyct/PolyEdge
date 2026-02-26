@@ -817,22 +817,34 @@ const StrategyPanel = memo(function StrategyPanel({
   const liveOrders = liveExec?.execution?.orders ?? [];
   const liveEvents = (liveExec?.events ?? []) as Array<Record<string, unknown>>;
   const parity = liveExec?.parity_check;
+  const parityPaperDecisionCount =
+    parity?.paper?.decision_count ?? parity?.paper?.decisions ?? 0;
+  const parityPaperEntry =
+    parity?.paper?.entry_count ?? parity?.paper?.entries ?? 0;
+  const parityPaperExit =
+    parity?.paper?.exit_count ?? parity?.paper?.exits ?? 0;
+  const parityLiveSubmitEntry =
+    parity?.live?.submitted_entry_count ?? parity?.live?.entries?.submitted ?? 0;
+  const parityLiveSubmitExit =
+    parity?.live?.submitted_exit_count ?? parity?.live?.exits?.submitted ?? 0;
+  const parityLiveAccepted =
+    parity?.live?.accepted_count ?? parity?.live?.accepted ?? 0;
+  const parityLiveRejected =
+    parity?.live?.rejected_count ?? parity?.live?.rejected ?? 0;
+  const parityLiveSkipped =
+    parity?.live?.skipped_count ?? parity?.live?.skipped ?? 0;
+  const liveSubmittedTotal =
+    parity?.live?.submitted_count ??
+    (parityLiveSubmitEntry + parityLiveSubmitExit) ??
+    0;
   const liveNetPnl = data?.summary?.net_pnl_cents ?? data?.summary?.total_pnl_cents ?? 0;
   const liveGrossPnl = data?.summary?.gross_pnl_cents ?? 0;
   const liveTotalCost = data?.summary?.total_cost_cents ?? 0;
   const liveWinRate = data?.summary?.win_rate_pct ?? 0;
   const liveDrawdown = data?.summary?.max_drawdown_cents ?? 0;
-  const parityPaperEntry = parity?.paper?.entry_count ?? 0;
-  const parityPaperExit = parity?.paper?.exit_count ?? 0;
-  const parityLiveSubmitEntry = parity?.live?.submitted_entry_count ?? 0;
-  const parityLiveSubmitExit = parity?.live?.submitted_exit_count ?? 0;
-  const parityLiveAccepted = parity?.live?.accepted_count ?? 0;
-  const parityLiveRejected = parity?.live?.rejected_count ?? 0;
-  const parityLiveSkipped = parity?.live?.skipped_count ?? 0;
-  const liveSubmittedTotal = parity?.live?.submitted_count ?? 0;
   const liveAcceptedRate = liveSubmittedTotal > 0 ? (parityLiveAccepted / liveSubmittedTotal) * 100 : 0;
   const parityRows = [
-    { label: "Paper信号", value: parity?.paper?.decision_count ?? 0 },
+    { label: "Paper信号", value: parityPaperDecisionCount },
     { label: "门禁通过", value: liveExec?.gated?.selected_count ?? 0 },
     { label: "提交网关", value: liveSubmittedTotal },
     { label: "网关接受", value: parityLiveAccepted },
@@ -1148,29 +1160,56 @@ const StrategyPanel = memo(function StrategyPanel({
             </tr>
           </thead>
           <tbody>
-            {(data?.trades ?? []).slice(-12).reverse().map((t) => (
-              <tr key={t.id}>
-                <td><span className={`chip ${t.side === "UP" ? "up" : "down"}`}>{t.side}</span></td>
-                <td>{t.entry_round_id.length > 20 ? `${t.entry_round_id.slice(0, 20)}…` : t.entry_round_id}</td>
-                <td>{formatTime(t.entry_ts_ms, timeMode)}</td>
-                <td>{formatTime(t.exit_ts_ms, timeMode)}</td>
-                <td>
-                  <div>{t.entry_price_raw_cents.toFixed(2)} → {t.exit_price_raw_cents.toFixed(2)}</div>
-                  <small className="muted">exec {t.entry_price_cents.toFixed(2)} → {t.exit_price_cents.toFixed(2)}</small>
-                </td>
-                <td className={(t.pnl_net_cents ?? t.pnl_cents) >= 0 ? "up" : "down"}>
-                  {(t.pnl_net_cents ?? t.pnl_cents).toFixed(2)}¢
-                </td>
-                <td>
-                  <div>{(t.total_cost_cents ?? 0).toFixed(2)}¢</div>
-                  <small className="muted">
-                    fee {(t.entry_fee_cents + t.exit_fee_cents).toFixed(2)} · slip {(t.entry_slippage_cents + t.exit_slippage_cents).toFixed(2)}
-                  </small>
-                </td>
-                <td>{t.duration_s.toFixed(1)}s</td>
-                <td>{t.entry_reason} / {t.exit_reason}</td>
-              </tr>
-            ))}
+            {(data?.trades ?? []).slice(-12).reverse().map((t) => {
+              const num = (v: unknown): number | null =>
+                typeof v === "number" && Number.isFinite(v) ? v : null;
+              const txt = (v: unknown): string => (typeof v === "string" && v.length > 0 ? v : "--");
+              const row = t as unknown as Record<string, unknown>;
+              const side = txt(row.side);
+              const entryRoundId = txt(row.entry_round_id);
+              const entryTs = num(row.entry_ts_ms);
+              const exitTs = num(row.exit_ts_ms);
+              const entryRaw = num(row.entry_price_raw_cents);
+              const exitRaw = num(row.exit_price_raw_cents);
+              const entryExec = num(row.entry_price_cents);
+              const exitExec = num(row.exit_price_cents);
+              const pnl = num(row.pnl_net_cents) ?? num(row.pnl_cents);
+              const totalCost = num(row.total_cost_cents) ?? 0;
+              const entryFee = num(row.entry_fee_cents) ?? 0;
+              const exitFee = num(row.exit_fee_cents) ?? 0;
+              const entrySlip = num(row.entry_slippage_cents) ?? 0;
+              const exitSlip = num(row.exit_slippage_cents) ?? 0;
+              const durationS = num(row.duration_s);
+              const entryReason = txt(row.entry_reason);
+              const exitReason = txt(row.exit_reason);
+              return (
+                <tr key={txt(row.id)}>
+                  <td><span className={`chip ${side === "UP" ? "up" : "down"}`}>{side}</span></td>
+                  <td>{entryRoundId.length > 20 ? `${entryRoundId.slice(0, 20)}…` : entryRoundId}</td>
+                  <td>{formatTime(entryTs, timeMode)}</td>
+                  <td>{formatTime(exitTs, timeMode)}</td>
+                  <td>
+                    <div>
+                      {entryRaw != null ? entryRaw.toFixed(2) : "--"} → {exitRaw != null ? exitRaw.toFixed(2) : "--"}
+                    </div>
+                    <small className="muted">
+                      exec {entryExec != null ? entryExec.toFixed(2) : "--"} → {exitExec != null ? exitExec.toFixed(2) : "--"}
+                    </small>
+                  </td>
+                  <td className={(pnl ?? 0) >= 0 ? "up" : "down"}>
+                    {pnl != null ? `${pnl.toFixed(2)}¢` : "--"}
+                  </td>
+                  <td>
+                    <div>{totalCost.toFixed(2)}¢</div>
+                    <small className="muted">
+                      fee {(entryFee + exitFee).toFixed(2)} · slip {(entrySlip + exitSlip).toFixed(2)}
+                    </small>
+                  </td>
+                  <td>{durationS != null ? `${durationS.toFixed(1)}s` : "--"}</td>
+                  <td>{entryReason} / {exitReason}</td>
+                </tr>
+              );
+            })}
             {(data?.trades?.length ?? 0) === 0 ? (
               <tr>
                 <td colSpan={9}>暂无交易样本，等待策略信号触发。</td>

@@ -3051,6 +3051,12 @@ async fn strategy_paper_live(
     });
     let live_events = state.list_live_events(market_type, 60).await;
     let live_position_state = state.get_live_position_state(market_type).await;
+    let decisions_for_response = tail_slice(&dual.decisions, 120);
+    let paper_records_for_response = tail_slice(&dual.paper_records, 120);
+    let live_records_for_response = tail_slice(&dual.live_records, 120);
+    let submitted_for_response = tail_slice(&submitted_decisions, 120);
+    let skipped_for_response = tail_slice(&skipped_decisions, 120);
+    let trades_for_response = tail_slice(&run.trades, 80);
 
     Ok(json!({
         "source": "live",
@@ -3072,19 +3078,19 @@ async fn strategy_paper_live(
         "config": strategy_cfg_json(cfg),
         "current": run.current,
         "summary": run_summary_json(&map_simulation_result(run.clone())),
-        "trades": run.trades,
+        "trades": trades_for_response,
         "live_execution": {
             "summary": dual.summary,
-            "decisions": dual.decisions,
-            "paper_records": dual.paper_records,
-            "live_records": dual.live_records,
+            "decisions": decisions_for_response,
+            "paper_records": paper_records_for_response,
+            "live_records": live_records_for_response,
             "parity_check": parity_check,
             "gated": {
                 "selected_count": selected_decisions.len(),
                 "submitted_count": submitted_decisions.len(),
                 "skipped_count": skipped_decisions.len(),
-                "submitted_decisions": submitted_decisions,
-                "skipped_decisions": skipped_decisions
+                "submitted_decisions": submitted_for_response,
+                "skipped_decisions": skipped_for_response
             },
             "gateway": {
                 "primary_url": live_gateway_cfg.primary_url,
@@ -3099,6 +3105,15 @@ async fn strategy_paper_live(
             "events": live_events
         }
     }))
+}
+
+fn tail_slice<T: Clone>(items: &[T], limit: usize) -> Vec<T> {
+    let n = limit.max(1);
+    if items.len() <= n {
+        items.to_vec()
+    } else {
+        items[items.len() - n..].to_vec()
+    }
 }
 
 #[derive(Debug, Clone)]
