@@ -70,10 +70,6 @@ const STRATEGY_LIVE_PROFILE = Object.freeze({
   liveEntryOnly: true
 });
 
-function defaultAutotuneContext(marketType: MarketType): string {
-  return `btcusdt:${marketType}`;
-}
-
 type TimeMode = "local" | "et";
 
 function windowToMinutes(view: WindowType): number {
@@ -826,14 +822,12 @@ interface StrategyPanelProps {
   marketType: MarketType;
   source: StrategyPaperSource;
   autotuneEnabled: boolean;
-  autotuneContext: string;
   autotuneLatest: Record<string, unknown> | null;
   autotuneHistory: Array<Record<string, unknown>>;
   autotuneLoading: boolean;
   onMarketTypeChange: (marketType: MarketType) => void;
   onSourceChange: (source: StrategyPaperSource) => void;
   onAutotuneToggle: (enabled: boolean) => void;
-  onAutotuneContextChange: (context: string) => void;
 }
 
 const StrategyPanel = memo(function StrategyPanel({
@@ -843,14 +837,12 @@ const StrategyPanel = memo(function StrategyPanel({
   marketType,
   source,
   autotuneEnabled,
-  autotuneContext,
   autotuneLatest,
   autotuneHistory,
   autotuneLoading,
   onMarketTypeChange,
   onSourceChange,
-  onAutotuneToggle,
-  onAutotuneContextChange
+  onAutotuneToggle
 }: StrategyPanelProps) {
   const current = data?.current ?? null;
   const currentView = useMemo(() => {
@@ -1102,21 +1094,14 @@ const StrategyPanel = memo(function StrategyPanel({
       <div className="live-block autotune-block">
         <header>
           <h3>参数自调优（热加载）</h3>
-          <small>{autotuneEnabled ? "已启用，按上下文读取最新参数" : "已关闭，仅使用固定参数"}</small>
+          <small>{autotuneEnabled ? "已启用：自动对比并晋升到Live参数池" : "已关闭，仅使用固定参数"}</small>
         </header>
         <div className="autotune-toolbar">
-          <label>
-            <span>Context</span>
-            <input
-              value={autotuneContext}
-              onChange={(e) => onAutotuneContextChange(e.target.value)}
-              placeholder={`btcusdt:${marketType}`}
-            />
-          </label>
           <div className="autotune-meta">
             <span>source={data?.source ?? "--"}</span>
             <span>config={data?.config_source ?? "--"}</span>
-            <span>context={data?.autotune_context ?? autotuneContext}</span>
+            <span>context={data?.autotune_context ?? `btcusdt:${marketType}`}</span>
+            <span>activeKey={typeof data?.autotune_active_key === "string" ? data.autotune_active_key : "--"}</span>
           </div>
         </div>
         <div className="autotune-kpis">
@@ -1498,9 +1483,6 @@ export default function App() {
   const [strategyMarketType, setStrategyMarketType] = useState<MarketType>("5m");
   const [strategySource, setStrategySource] = useState<StrategyPaperSource>("replay");
   const [strategyUseAutotune, setStrategyUseAutotune] = useState<boolean>(false);
-  const [strategyAutotuneContext, setStrategyAutotuneContext] = useState<string>(
-    defaultAutotuneContext("5m")
-  );
   const [strategyAutotuneLatest, setStrategyAutotuneLatest] = useState<Record<string, unknown> | null>(null);
   const [strategyAutotuneHistory, setStrategyAutotuneHistory] = useState<Array<Record<string, unknown>>>([]);
   const [strategyAutotuneLoading, setStrategyAutotuneLoading] = useState<boolean>(false);
@@ -1540,10 +1522,6 @@ export default function App() {
   useEffect(() => {
     accuracyTabRef.current = accuracyTab;
   }, [accuracyTab]);
-
-  useEffect(() => {
-    setStrategyAutotuneContext(defaultAutotuneContext(strategyMarketType));
-  }, [strategyMarketType]);
 
   const loadChartFor = useCallback(
     async (marketType: MarketType, windowType: WindowType, force = false) => {
@@ -2119,7 +2097,6 @@ export default function App() {
         const data = await getStrategyPaper(strategyMarketType, {
           ...STRATEGY_PAPER_PROFILE,
           useAutotune: strategyUseAutotune,
-          autotuneContext: strategyAutotuneContext,
           source: strategySource,
           ...(strategySource === "live" ? STRATEGY_LIVE_PROFILE : {}),
         });
@@ -2153,7 +2130,7 @@ export default function App() {
         window.clearTimeout(timer);
       }
     };
-  }, [strategyAutotuneContext, strategyMarketType, strategySource, strategyUseAutotune]);
+  }, [strategyMarketType, strategySource, strategyUseAutotune]);
 
   useEffect(() => {
     let alive = true;
@@ -2211,13 +2188,13 @@ export default function App() {
       let changed = false;
       try {
         const [latest, history] = await Promise.all([
-          getStrategyAutotuneLatest(strategyMarketType, strategyAutotuneContext),
-          getStrategyAutotuneHistory(strategyMarketType, strategyAutotuneContext, 20),
+          getStrategyAutotuneLatest(strategyMarketType),
+          getStrategyAutotuneHistory(strategyMarketType, 20),
         ]);
         if (!alive) {
           return;
         }
-        const latestData = latest.data ?? null;
+        const latestData = latest.active_data ?? latest.data ?? null;
         const historyItems = history.items ?? [];
         const nextSig = autotuneSignature(latestData, historyItems);
         changed = nextSig !== strategyAutotuneSigRef.current;
@@ -2247,7 +2224,7 @@ export default function App() {
         window.clearTimeout(timer);
       }
     };
-  }, [strategyAutotuneContext, strategyMarketType, strategyUseAutotune]);
+  }, [strategyMarketType, strategyUseAutotune]);
 
   useEffect(() => {
     let alive = true;
@@ -2377,14 +2354,12 @@ export default function App() {
         marketType={strategyMarketType}
         source={strategySource}
         autotuneEnabled={strategyUseAutotune}
-        autotuneContext={strategyAutotuneContext}
         autotuneLatest={strategyAutotuneLatest}
         autotuneHistory={strategyAutotuneHistory}
         autotuneLoading={strategyAutotuneLoading}
         onMarketTypeChange={setStrategyMarketType}
         onSourceChange={setStrategySource}
         onAutotuneToggle={setStrategyUseAutotune}
-        onAutotuneContextChange={setStrategyAutotuneContext}
       />
 
       <section className="panel">

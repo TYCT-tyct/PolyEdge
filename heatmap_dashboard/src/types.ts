@@ -245,6 +245,7 @@ export interface StrategyPaperResponse {
   source_fallback_error?: string | null;
   market_type: string;
   autotune_context?: string;
+  autotune_active_key?: string;
   lookback_minutes: number;
   samples: number;
   config_source?: string;

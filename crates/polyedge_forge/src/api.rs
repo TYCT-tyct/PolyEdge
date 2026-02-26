@@ -1907,6 +1907,14 @@ fn strategy_autotune_history_key(redis_prefix: &str, context: &str) -> String {
     format!("{redis_prefix}:strategy:autotune:{context}:history")
 }
 
+fn strategy_autotune_active_key(redis_prefix: &str, market_type: &str) -> String {
+    format!("{redis_prefix}:strategy:autotune:active:{market_type}")
+}
+
+fn strategy_autotune_active_history_key(redis_prefix: &str, market_type: &str) -> String {
+    format!("{redis_prefix}:strategy:autotune:active:{market_type}:history")
+}
+
 async fn resolve_autotune_doc(
     state: &ApiState,
     context: &str,
@@ -1917,6 +1925,98 @@ async fn resolve_autotune_doc(
         return Ok((Some(payload), key, false));
     }
     Ok((None, key, false))
+}
+
+async fn resolve_autotune_active_doc(
+    state: &ApiState,
+    market_type: &str,
+) -> Result<(Option<Value>, String), ApiError> {
+    let key = strategy_autotune_active_key(&state.redis_prefix, market_type);
+    let payload = read_key_value(state, &key).await?;
+    Ok((payload, key))
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct ObjectiveMetrics {
+    objective: f64,
+    win_rate_pct: f64,
+    avg_pnl_cents: f64,
+    max_drawdown_cents: f64,
+    trade_count: f64,
+}
+
+fn payload_metrics(payload: &Value) -> ObjectiveMetrics {
+    let summary = payload
+        .get("summary_validation")
+        .or_else(|| payload.get("summary_recent"))
+        .or_else(|| payload.get("summary"))
+        .unwrap_or(&Value::Null);
+    ObjectiveMetrics {
+        objective: payload
+            .get("objective")
+            .and_then(Value::as_f64)
+            .unwrap_or(-1_000_000_000.0),
+        win_rate_pct: summary
+            .get("win_rate_pct")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0),
+        avg_pnl_cents: summary
+            .get("avg_pnl_cents")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0),
+        max_drawdown_cents: summary
+            .get("max_drawdown_cents")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0),
+        trade_count: summary
+            .get("trade_count")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0),
+    }
+}
+
+fn should_promote_candidate(
+    candidate: &Value,
+    incumbent: &Value,
+    has_incumbent: bool,
+) -> (bool, String) {
+    let c = payload_metrics(candidate);
+    if !has_incumbent {
+        if c.trade_count < 40.0 {
+            return (false, "candidate_trade_count_too_low".to_string());
+        }
+        if c.avg_pnl_cents <= 0.0 {
+            return (false, "candidate_avg_pnl_non_positive".to_string());
+        }
+        if c.win_rate_pct < 70.0 {
+            return (
+                false,
+                "candidate_win_rate_below_bootstrap_floor".to_string(),
+            );
+        }
+        return (true, "bootstrap_promote".to_string());
+    }
+    let i = payload_metrics(incumbent);
+    if c.trade_count < 35.0 {
+        return (false, "candidate_trade_count_too_low".to_string());
+    }
+    if c.avg_pnl_cents <= 0.0 {
+        return (false, "candidate_avg_pnl_non_positive".to_string());
+    }
+    if c.objective <= i.objective + 0.5 {
+        return (false, "objective_not_improved".to_string());
+    }
+    if c.win_rate_pct + 0.2 < i.win_rate_pct {
+        return (false, "win_rate_regression".to_string());
+    }
+    if c.avg_pnl_cents + 0.01 < i.avg_pnl_cents {
+        return (false, "avg_pnl_regression".to_string());
+    }
+    let drawdown_limit = (i.max_drawdown_cents * 1.12 + 0.8).max(3.0);
+    if c.max_drawdown_cents > drawdown_limit {
+        return (false, "drawdown_regression".to_string());
+    }
+    (true, "promote_better_candidate".to_string())
 }
 
 async fn read_key_json(state: &ApiState, key: &str) -> Result<Json<Value>, ApiError> {
@@ -5801,15 +5901,22 @@ async fn strategy_paper(
     let mut config_source = "default";
     let mut autotune_info = Value::Null;
     let mut autotune_key_used = Value::Null;
-    if use_autotune && !matches!(source_mode, StrategyPaperSource::Live) {
-        let (saved_opt, key_used, _) =
-            resolve_autotune_doc(&state, &autotune_context, market_type).await?;
-        if let Some(saved) = saved_opt {
-            let tuned_cfg = strategy_cfg_from_payload(cfg, &saved);
-            cfg = tuned_cfg;
-            config_source = "autotune";
-            autotune_info = saved;
-            autotune_key_used = Value::String(key_used);
+    let (active_opt, active_key_used) = resolve_autotune_active_doc(&state, market_type).await?;
+    if use_autotune {
+        if let Some(active) = active_opt {
+            cfg = strategy_cfg_from_payload(cfg, &active);
+            config_source = "autotune_active";
+            autotune_info = active;
+            autotune_key_used = Value::String(active_key_used.clone());
+        } else {
+            let (saved_opt, key_used, _) =
+                resolve_autotune_doc(&state, &autotune_context, market_type).await?;
+            if let Some(saved) = saved_opt {
+                cfg = strategy_cfg_from_payload(cfg, &saved);
+                config_source = "autotune_candidate";
+                autotune_info = saved;
+                autotune_key_used = Value::String(key_used);
+            }
         }
     }
     if !matches!(source_mode, StrategyPaperSource::Live) {
@@ -5931,6 +6038,7 @@ async fn strategy_paper(
             "source_fallback_error": source_fallback_error,
             "market_type": market_type,
             "autotune_context": autotune_context,
+            "autotune_active_key": active_key_used,
             "lookback_minutes": lookback_minutes,
             "samples": samples.len(),
             "current": Value::Null,
@@ -5965,6 +6073,7 @@ async fn strategy_paper(
         "source_fallback_error": source_fallback_error,
         "market_type": market_type,
         "autotune_context": autotune_context,
+        "autotune_active_key": active_key_used,
         "lookback_minutes": lookback_minutes,
         "full_history": full_history,
         "samples": samples.len(),
@@ -6085,6 +6194,7 @@ async fn strategy_autotune_latest(
     };
     let context = normalize_autotune_context(params.context.as_deref(), market_type);
     let (payload, key, from_legacy) = resolve_autotune_doc(&state, &context, market_type).await?;
+    let (active_payload, active_key) = resolve_autotune_active_doc(&state, market_type).await?;
     Ok(Json(json!({
         "market_type": market_type,
         "context": context,
@@ -6092,6 +6202,9 @@ async fn strategy_autotune_latest(
         "from_legacy": from_legacy,
         "found": payload.is_some(),
         "data": payload,
+        "active_key": active_key,
+        "active_found": active_payload.is_some(),
+        "active_data": active_payload,
     })))
 }
 
@@ -6892,11 +7005,35 @@ async fn strategy_optimize(
         }
     }
 
-    let persist_requested = params.persist_best.unwrap_or(false);
+    let persist_requested = params.persist_best.unwrap_or(true);
     let persist_ttl_sec = params.persist_ttl_sec.filter(|v| *v > 0);
     let persist_key = strategy_autotune_key(&state.redis_prefix, &autotune_context);
+    let active_key = strategy_autotune_active_key(&state.redis_prefix, market_type);
+    let active_history_key = strategy_autotune_active_history_key(&state.redis_prefix, market_type);
     let mut persist_error: Option<String> = None;
     let mut persisted = false;
+    let (active_before_opt, _) = resolve_autotune_active_doc(&state, market_type).await?;
+    let incumbent_payload = if let Some(active_before) = active_before_opt.as_ref() {
+        if let Some(best) = active_before.get("best") {
+            best.clone()
+        } else {
+            let cfg = strategy_cfg_from_payload(base_cfg, active_before);
+            let (payload, _, _) = evaluate_candidate("incumbent_active".to_string(), &cfg);
+            payload
+        }
+    } else {
+        let (payload, _, _) = evaluate_candidate("incumbent_default".to_string(), &base_cfg);
+        payload
+    };
+    let (should_promote, promotion_reason) = should_promote_candidate(
+        &best_payload,
+        &incumbent_payload,
+        active_before_opt.is_some(),
+    );
+    let mut promoted = false;
+    let mut promotion_error: Option<String> = None;
+    let mut active_saved_doc = Value::Null;
+
     if persist_requested {
         if best_payload.is_null() {
             persist_error = Some("best payload is null".to_string());
@@ -6918,6 +7055,43 @@ async fn strategy_optimize(
                 persist_error = Some(e.message);
             } else {
                 persisted = true;
+                if should_promote {
+                    let promote_doc = json!({
+                        "saved_at_ms": Utc::now().timestamp_millis(),
+                        "market_type": market_type,
+                        "context": autotune_context.clone(),
+                        "source": "autotune_pipeline",
+                        "note": format!("promoted:{promotion_reason}"),
+                        "target_win_rate_pct": target_win_rate,
+                        "window_trades": window_trades,
+                        "config": best_payload.get("config").cloned().unwrap_or(Value::Null),
+                        "best": best_payload.clone(),
+                        "incumbent": incumbent_payload.clone(),
+                    });
+                    if let Err(e) =
+                        write_key_value(&state, &active_key, &promote_doc, persist_ttl_sec).await
+                    {
+                        promotion_error = Some(e.message);
+                    } else {
+                        promoted = true;
+                        active_saved_doc = promote_doc.clone();
+                        let mut history: Vec<Value> = read_key_value(&state, &active_history_key)
+                            .await?
+                            .and_then(|v| v.as_array().cloned())
+                            .unwrap_or_default();
+                        history.insert(0, promote_doc);
+                        if history.len() > 40 {
+                            history.truncate(40);
+                        }
+                        let _ = write_key_value(
+                            &state,
+                            &active_history_key,
+                            &Value::Array(history),
+                            None,
+                        )
+                        .await;
+                    }
+                }
             }
         }
     }
@@ -6947,7 +7121,21 @@ async fn strategy_optimize(
             "ttl_sec": persist_ttl_sec,
             "error": persist_error,
         },
+        "promotion": {
+            "checked": true,
+            "should_promote": should_promote,
+            "promoted": promoted,
+            "reason": promotion_reason,
+            "error": promotion_error,
+            "active_key": active_key,
+            "active_history_key": active_history_key,
+            "active_before_found": active_before_opt.is_some(),
+            "active_saved": active_saved_doc,
+            "candidate_metrics": payload_metrics(&best_payload),
+            "incumbent_metrics": payload_metrics(&incumbent_payload),
+        },
         "best": best_payload,
+        "incumbent": incumbent_payload,
         "leaderboard": leaderboard,
     })))
 }
