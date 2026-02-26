@@ -816,6 +816,46 @@ const StrategyPanel = memo(function StrategyPanel({
   const liveState = liveExec?.state_machine;
   const liveOrders = liveExec?.execution?.orders ?? [];
   const liveEvents = (liveExec?.events ?? []) as Array<Record<string, unknown>>;
+  const parity = liveExec?.parity_check;
+  const liveNetPnl = data?.summary?.net_pnl_cents ?? data?.summary?.total_pnl_cents ?? 0;
+  const liveGrossPnl = data?.summary?.gross_pnl_cents ?? 0;
+  const liveTotalCost = data?.summary?.total_cost_cents ?? 0;
+  const liveWinRate = data?.summary?.win_rate_pct ?? 0;
+  const liveDrawdown = data?.summary?.max_drawdown_cents ?? 0;
+  const parityPaperEntry = parity?.paper?.entry_count ?? 0;
+  const parityPaperExit = parity?.paper?.exit_count ?? 0;
+  const parityLiveSubmitEntry = parity?.live?.submitted_entry_count ?? 0;
+  const parityLiveSubmitExit = parity?.live?.submitted_exit_count ?? 0;
+  const parityLiveAccepted = parity?.live?.accepted_count ?? 0;
+  const parityLiveRejected = parity?.live?.rejected_count ?? 0;
+  const parityLiveSkipped = parity?.live?.skipped_count ?? 0;
+  const liveSubmittedTotal = parity?.live?.submitted_count ?? 0;
+  const liveAcceptedRate = liveSubmittedTotal > 0 ? (parityLiveAccepted / liveSubmittedTotal) * 100 : 0;
+  const parityRows = [
+    { label: "Paper信号", value: parity?.paper?.decision_count ?? 0 },
+    { label: "门禁通过", value: liveExec?.gated?.selected_count ?? 0 },
+    { label: "提交网关", value: liveSubmittedTotal },
+    { label: "网关接受", value: parityLiveAccepted },
+  ];
+  const parityMax = Math.max(1, ...parityRows.map((r) => r.value));
+  const issueReasons = useMemo(() => {
+    const buckets = new Map<string, number>();
+    for (const row of liveExec?.gated?.skipped_decisions ?? []) {
+      const reason = row?.reason?.trim() || "gate_unknown";
+      buckets.set(reason, (buckets.get(reason) ?? 0) + 1);
+    }
+    for (const ev of liveEvents) {
+      const accepted = typeof ev.accepted === "boolean" ? ev.accepted : null;
+      if (accepted === false) {
+        const reason = typeof ev.reason === "string" && ev.reason.trim() ? ev.reason.trim() : "event_rejected";
+        buckets.set(reason, (buckets.get(reason) ?? 0) + 1);
+      }
+    }
+    return [...buckets.entries()]
+      .map(([reason, count]) => ({ reason, count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 6);
+  }, [liveExec?.gated?.skipped_decisions, liveEvents]);
   const liveStateLabel = liveState?.state === "in_position" ? "持仓中" : "空仓";
   return (
     <section className="panel">
@@ -905,13 +945,26 @@ const StrategyPanel = memo(function StrategyPanel({
       </div>
       {source === "live" ? (
         <div className="live-execution-wrap">
-          <div className="info-cards compact live-matrix">
+          <div className="info-cards compact live-kpi-grid">
+            <article className="info-card">
+              <span>Live净收益</span>
+              <strong className={liveNetPnl >= 0 ? "up" : "down"}>{`${liveNetPnl.toFixed(2)}¢`}</strong>
+              <small>
+                胜率 {liveWinRate.toFixed(1)}% · 回撤 {liveDrawdown.toFixed(2)}¢
+              </small>
+            </article>
+            <article className="info-card">
+              <span>毛收益 / 总成本</span>
+              <strong>{`${liveGrossPnl.toFixed(2)}¢ / ${liveTotalCost.toFixed(2)}¢`}</strong>
+              <small>
+                净利润率 {(data?.summary?.net_margin_pct ?? 0).toFixed(2)}%
+              </small>
+            </article>
             <article className="info-card">
               <span>执行模式</span>
               <strong>{liveExec?.execution?.mode ?? "--"}</strong>
               <small>
-                提交 {liveExec?.gated?.submitted_count ?? 0} / 选中 {liveExec?.gated?.selected_count ?? 0} · 跳过{" "}
-                {liveExec?.gated?.skipped_count ?? 0}
+                source={data?.source ?? "--"} · engine={data?.strategy_alias ?? "--"}
               </small>
             </article>
             <article className="info-card">
@@ -926,100 +979,160 @@ const StrategyPanel = memo(function StrategyPanel({
               </small>
             </article>
             <article className="info-card">
-              <span>状态机计数</span>
-              <strong>
-                入场 {liveState?.total_entries ?? 0} / 出场 {liveState?.total_exits ?? 0}
+              <span>订单成功率</span>
+              <strong className={liveAcceptedRate >= 70 ? "up" : liveAcceptedRate >= 40 ? "warn" : "down"}>
+                {liveSubmittedTotal > 0 ? `${liveAcceptedRate.toFixed(1)}%` : "--"}
               </strong>
               <small>
-                最近动作 {liveState?.last_action ?? "--"} · 原因 {liveState?.last_reason ?? "--"}
+                提交 {liveSubmittedTotal} · 接受 {parityLiveAccepted} · 拒绝 {parityLiveRejected}
+              </small>
+            </article>
+            <article className="info-card">
+              <span>同策略一致性</span>
+              <strong className={parity?.level === "critical" ? "down" : parity?.level === "warn" ? "warn" : "up"}>
+                {parity?.status ?? "--"}
+              </strong>
+              <small>
+                Paper 入/出 {parityPaperEntry}/{parityPaperExit} · Live 入/出 {parityLiveSubmitEntry}/{parityLiveSubmitExit}
               </small>
             </article>
           </div>
-          <div className="table-wrap">
-            <table className="history-table live-exec-table">
-              <thead>
-                <tr>
-                  <th>时间</th>
-                  <th>动作</th>
-                  <th>方向</th>
-                  <th>轮次</th>
-                  <th>价格(¢)</th>
-                  <th>结果</th>
-                  <th>端点</th>
-                </tr>
-              </thead>
-              <tbody>
-                {liveOrders.slice(-8).reverse().map((order, idx) => (
-                  <tr key={`${order.decision_key ?? "k"}-${idx}`}>
-                    <td>
-                      {formatTime(
-                        typeof order.decision?.ts_ms === "number" ? order.decision.ts_ms : null,
-                        timeMode
-                      )}
-                    </td>
-                    <td>{order.decision?.action ?? "--"}</td>
-                    <td>{order.decision?.side ?? "--"}</td>
-                    <td>{order.decision?.round_id ?? "--"}</td>
-                    <td>
-                      {order.decision?.price_cents != null && Number.isFinite(order.decision.price_cents)
-                        ? Number(order.decision.price_cents).toFixed(2)
-                        : "--"}
-                    </td>
-                    <td className={order.accepted ? "up" : "down"}>
-                      {order.accepted ? "ACCEPTED" : "SKIP/REJECT"}
-                    </td>
-                    <td>{order.endpoint ?? "--"}</td>
-                  </tr>
+
+          <div className="live-block-grid">
+            <article className="live-block parity-block">
+              <header>
+                <h3>同策略执行漏斗</h3>
+                <small>Paper 信号到 Live 成交链路</small>
+              </header>
+              <div className="parity-funnel">
+                {parityRows.map((row) => (
+                  <div key={row.label} className="parity-row">
+                    <label>{row.label}</label>
+                    <div className="parity-bar">
+                      <span style={{ width: `${Math.max(4, (row.value / parityMax) * 100)}%` }} />
+                    </div>
+                    <strong>{row.value}</strong>
+                  </div>
                 ))}
-                {liveOrders.length === 0 ? (
-                  <tr>
-                    <td colSpan={7}>暂无执行记录（当前可能为空仓或未触发有效信号）。</td>
-                  </tr>
-                ) : null}
-              </tbody>
-            </table>
+              </div>
+              <div className="parity-meta muted">
+                skipped {parityLiveSkipped} · rejected {parityLiveRejected}
+              </div>
+            </article>
+
+            <article className="live-block diag-block">
+              <header>
+                <h3>差异诊断</h3>
+                <small>为什么 Paper 有信号但 Live 可能没成交</small>
+              </header>
+              <div className="diag-main">
+                <span className="muted">当前状态</span>
+                <strong className={parity?.level === "critical" ? "down" : parity?.level === "warn" ? "warn" : "up"}>
+                  {parity?.status ?? "--"}
+                </strong>
+              </div>
+              <ul className="diag-list">
+                {issueReasons.map((item) => (
+                  <li key={item.reason}>
+                    <span>{item.reason}</span>
+                    <strong>{item.count}</strong>
+                  </li>
+                ))}
+                {issueReasons.length === 0 ? <li><span>暂无异常</span><strong>0</strong></li> : null}
+              </ul>
+            </article>
           </div>
-          <div className="table-wrap">
-            <table className="history-table live-event-table">
-              <thead>
-                <tr>
-                  <th>时间</th>
-                  <th>动作</th>
-                  <th>方向</th>
-                  <th>原因</th>
-                  <th>状态</th>
-                </tr>
-              </thead>
-              <tbody>
-                {liveEvents.slice(-8).reverse().map((ev, idx) => {
-                  const tsMs = typeof ev.ts_ms === "number" ? ev.ts_ms : null;
-                  const accepted = typeof ev.accepted === "boolean" ? ev.accepted : null;
-                  const action = typeof ev.action === "string" ? ev.action : "--";
-                  const side = typeof ev.side === "string" ? ev.side : "--";
-                  const reason = typeof ev.reason === "string" ? ev.reason : "--";
-                  return (
-                    <tr key={`event-${idx}-${tsMs ?? "na"}`}>
-                      <td>{formatTime(tsMs, timeMode)}</td>
-                      <td>{action}</td>
-                      <td>{side}</td>
-                      <td>{reason}</td>
-                      <td className={accepted === true ? "up" : accepted === false ? "down" : ""}>
-                        {accepted === true ? "accepted" : accepted === false ? "rejected" : "--"}
-                      </td>
-                    </tr>
-                  );
-                })}
-                {liveEvents.length === 0 ? (
+
+          <div className="live-tables-grid">
+            <div className="table-wrap">
+              <h3 className="table-title">Live执行明细（最近8条）</h3>
+              <table className="history-table live-exec-table">
+                <thead>
                   <tr>
-                    <td colSpan={5}>暂无状态机事件。</td>
+                    <th>时间</th>
+                    <th>动作</th>
+                    <th>方向</th>
+                    <th>轮次</th>
+                    <th>价格(¢)</th>
+                    <th>结果</th>
+                    <th>端点</th>
                   </tr>
-                ) : null}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {liveOrders.slice(-8).reverse().map((order, idx) => (
+                    <tr key={`${order.decision_key ?? "k"}-${idx}`}>
+                      <td>
+                        {formatTime(
+                          typeof order.decision?.ts_ms === "number" ? order.decision.ts_ms : null,
+                          timeMode
+                        )}
+                      </td>
+                      <td>{order.decision?.action ?? "--"}</td>
+                      <td>{order.decision?.side ?? "--"}</td>
+                      <td>{order.decision?.round_id ?? "--"}</td>
+                      <td>
+                        {order.decision?.price_cents != null && Number.isFinite(order.decision.price_cents)
+                          ? Number(order.decision.price_cents).toFixed(2)
+                          : "--"}
+                      </td>
+                      <td className={order.accepted ? "up" : "down"}>
+                        {order.accepted ? "ACCEPTED" : "SKIP/REJECT"}
+                      </td>
+                      <td>{order.endpoint ?? "--"}</td>
+                    </tr>
+                  ))}
+                  {liveOrders.length === 0 ? (
+                    <tr>
+                      <td colSpan={7}>暂无执行记录（当前可能为空仓或未触发有效信号）。</td>
+                    </tr>
+                  ) : null}
+                </tbody>
+              </table>
+            </div>
+            <div className="table-wrap">
+              <h3 className="table-title">状态机事件（最近8条）</h3>
+              <table className="history-table live-event-table">
+                <thead>
+                  <tr>
+                    <th>时间</th>
+                    <th>动作</th>
+                    <th>方向</th>
+                    <th>原因</th>
+                    <th>状态</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {liveEvents.slice(-8).reverse().map((ev, idx) => {
+                    const tsMs = typeof ev.ts_ms === "number" ? ev.ts_ms : null;
+                    const accepted = typeof ev.accepted === "boolean" ? ev.accepted : null;
+                    const action = typeof ev.action === "string" ? ev.action : "--";
+                    const side = typeof ev.side === "string" ? ev.side : "--";
+                    const reason = typeof ev.reason === "string" ? ev.reason : "--";
+                    return (
+                      <tr key={`event-${idx}-${tsMs ?? "na"}`}>
+                        <td>{formatTime(tsMs, timeMode)}</td>
+                        <td>{action}</td>
+                        <td>{side}</td>
+                        <td>{reason}</td>
+                        <td className={accepted === true ? "up" : accepted === false ? "down" : ""}>
+                          {accepted === true ? "accepted" : accepted === false ? "rejected" : "--"}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  {liveEvents.length === 0 ? (
+                    <tr>
+                      <td colSpan={5}>暂无状态机事件。</td>
+                    </tr>
+                  ) : null}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       ) : null}
       <div className="table-wrap">
+        <h3 className="table-title">{source === "live" ? "Paper对照交易（同参数回放）" : "交易记录"}</h3>
         <table className="history-table">
           <thead>
             <tr>

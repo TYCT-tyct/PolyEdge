@@ -2766,7 +2766,7 @@ async fn strategy_paper_live(
     live_entry_only: bool,
 ) -> Result<Value, ApiError> {
     let exec_gate = fev1::ExecutionGate::from_env();
-    if !exec_gate.live_enabled {
+    if live_execute && !exec_gate.live_enabled {
         return Err(ApiError::bad_request(
             "live execution disabled (set FORGE_FEV1_LIVE_ENABLED=true to enable)",
         ));
@@ -2964,6 +2964,91 @@ async fn strategy_paper_live(
             "orders": submitted_decisions.clone()
         })
     };
+    let paper_entry_count = dual
+        .decisions
+        .iter()
+        .filter(|d| d.get("action").and_then(Value::as_str).map(|v| v.eq_ignore_ascii_case("enter")).unwrap_or(false))
+        .count();
+    let paper_exit_count = dual
+        .decisions
+        .iter()
+        .filter(|d| d.get("action").and_then(Value::as_str).map(|v| v.eq_ignore_ascii_case("exit")).unwrap_or(false))
+        .count();
+    let submitted_entry_count = submitted_decisions
+        .iter()
+        .filter(|d| d.get("action").and_then(Value::as_str).map(|v| v.eq_ignore_ascii_case("enter")).unwrap_or(false))
+        .count();
+    let submitted_exit_count = submitted_decisions
+        .iter()
+        .filter(|d| d.get("action").and_then(Value::as_str).map(|v| v.eq_ignore_ascii_case("exit")).unwrap_or(false))
+        .count();
+    let (gateway_accept_count, gateway_reject_count) = live_exec_payload
+        .get("orders")
+        .and_then(Value::as_array)
+        .map(|orders| {
+            let accepted = orders
+                .iter()
+                .filter(|o| o.get("accepted").and_then(Value::as_bool).unwrap_or(false))
+                .count();
+            let rejected = orders.len().saturating_sub(accepted);
+            (accepted, rejected)
+        })
+        .unwrap_or((0, 0));
+    let no_live_market_target = live_exec_payload
+        .get("error")
+        .and_then(Value::as_str)
+        .map(|v| v == "no_live_market_target")
+        .unwrap_or(false);
+    let paper_has_signal = paper_entry_count > 0 || paper_exit_count > 0;
+    let submitted_has_signal = submitted_entry_count > 0 || submitted_exit_count > 0;
+    let status = if !live_execute {
+        "dry_run"
+    } else if no_live_market_target {
+        "blocked_no_market_target"
+    } else if paper_has_signal && !submitted_has_signal {
+        "blocked_by_gate_or_state"
+    } else if submitted_has_signal && gateway_accept_count == 0 {
+        "gateway_rejected_all"
+    } else {
+        "ok"
+    };
+    let level = match status {
+        "ok" | "dry_run" => "ok",
+        "blocked_by_gate_or_state" | "blocked_no_market_target" => "warn",
+        _ => "critical",
+    };
+    if live_execute && !matches!(status, "ok") {
+        tracing::warn!(
+            market_type = market_type,
+            status = status,
+            paper_entry_count = paper_entry_count,
+            paper_exit_count = paper_exit_count,
+            submitted_entry_count = submitted_entry_count,
+            submitted_exit_count = submitted_exit_count,
+            gateway_accept_count = gateway_accept_count,
+            gateway_reject_count = gateway_reject_count,
+            skipped_count = skipped_decisions.len(),
+            "fev1 paper-live parity mismatch"
+        );
+    }
+    let parity_check = json!({
+        "status": status,
+        "level": level,
+        "paper": {
+            "decision_count": dual.decisions.len(),
+            "entry_count": paper_entry_count,
+            "exit_count": paper_exit_count
+        },
+        "live": {
+            "submitted_count": submitted_decisions.len(),
+            "submitted_entry_count": submitted_entry_count,
+            "submitted_exit_count": submitted_exit_count,
+            "accepted_count": gateway_accept_count,
+            "rejected_count": gateway_reject_count,
+            "skipped_count": skipped_decisions.len(),
+            "no_live_market_target": no_live_market_target
+        }
+    });
     let live_events = state.list_live_events(market_type, 60).await;
     let live_position_state = state.get_live_position_state(market_type).await;
 
@@ -2993,6 +3078,7 @@ async fn strategy_paper_live(
             "decisions": dual.decisions,
             "paper_records": dual.paper_records,
             "live_records": dual.live_records,
+            "parity_check": parity_check,
             "gated": {
                 "selected_count": selected_decisions.len(),
                 "submitted_count": submitted_decisions.len(),

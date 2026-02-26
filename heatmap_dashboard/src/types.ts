@@ -292,6 +292,24 @@ export interface StrategyPaperResponse {
     decisions?: StrategyLiveDecision[];
     paper_records?: Record<string, unknown>[];
     live_records?: Record<string, unknown>[];
+    parity_check?: {
+      status?: "ok" | "dry_run" | "blocked_no_market_target" | "blocked_by_gate_or_state" | "gateway_rejected_all" | string;
+      level?: "ok" | "warn" | "critical" | string;
+      paper?: {
+        decision_count?: number;
+        entry_count?: number;
+        exit_count?: number;
+      };
+      live?: {
+        submitted_count?: number;
+        submitted_entry_count?: number;
+        submitted_exit_count?: number;
+        accepted_count?: number;
+        rejected_count?: number;
+        skipped_count?: number;
+        no_live_market_target?: boolean;
+      };
+    };
     gated?: {
       selected_count?: number;
       submitted_count?: number;
