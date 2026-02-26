@@ -96,9 +96,9 @@ quiet_min_edge_multiplier = 1.05
 quiet_chunk_scale = 0.50
 
 [predator_c.cross_symbol]
-enabled = true
+enabled = false
 leader_symbol = "BTCUSDT"
-follower_symbols = ["ETHUSDT", "SOLUSDT"]
+follower_symbols = []
 min_leader_confidence = 0.80
 min_leader_magnitude_pct = 0.12
 follower_stale_confidence_max = 0.65
@@ -205,7 +205,7 @@ same_market_opposite_first = true
 
 [strategy_engine]
 engine_mode = "roll_v1"
-enabled_symbols = ["BTC", "ETH", "SOL", "XRP"]
+enabled_symbols = ["BTC"]
 enabled_timeframes = ["5m"]
 market_scope = "near_expiry_active_only"
 
