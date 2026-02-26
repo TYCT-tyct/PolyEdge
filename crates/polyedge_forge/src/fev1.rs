@@ -742,16 +742,28 @@ pub fn simulate_dual<G: LiveOrderGateway>(
             .max(0);
         let (entry_tif, entry_style, entry_ttl_ms, entry_slippage_bps) =
             if entry_remaining_ms <= 95_000 || entry_score >= 0.82 {
-                ("FAK", "taker", 1_200_i64, 24.0_f64)
+                ("FAK", "taker", 900_i64, 24.0_f64)
             } else {
-                ("GTD", "maker", 2_200_i64, 12.0_f64)
+                ("GTD", "maker", 1_300_i64, 12.0_f64)
             };
-        let (exit_tif, exit_style, exit_ttl_ms, exit_slippage_bps) = if exit_remaining_ms <= 30_000
-        {
-            ("FAK", "taker", 1_000_i64, 30.0_f64)
-        } else {
-            ("FAK", "taker", 1_100_i64, 22.0_f64)
-        };
+        let exit_reason_lc = exit_reason.to_ascii_lowercase();
+        let take_profit_exit = exit_reason_lc.contains("take_profit");
+        let emergency_exit = matches!(
+            exit_reason_lc.as_str(),
+            "stop_loss"
+                | "signal_reverse"
+                | "trail_drawdown"
+                | "liquidity_widen"
+                | "round_rollover"
+        );
+        let (exit_tif, exit_style, exit_ttl_ms, exit_slippage_bps) =
+            if take_profit_exit && !emergency_exit && exit_remaining_ms > 30_000 {
+                ("GTD", "maker", 1_100_i64, 10.0_f64)
+            } else if exit_remaining_ms <= 30_000 {
+                ("FAK", "taker", 900_i64, 30.0_f64)
+            } else {
+                ("FAK", "taker", 1_000_i64, 22.0_f64)
+            };
 
         if entry_ts_ms > 0 {
             decisions.push(json!({

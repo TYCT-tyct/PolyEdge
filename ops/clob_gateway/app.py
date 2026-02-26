@@ -301,6 +301,40 @@ def _best_price(rows: Any, side: str) -> Optional[float]:
     return max(prices) if side == "bid" else min(prices)
 
 
+def _extract_book_levels(rows: Any) -> list[tuple[float, float]]:
+    if not isinstance(rows, list) or not rows:
+        return []
+    levels: list[tuple[float, float]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        p = _safe_float(row.get("price"))
+        if p is None:
+            continue
+        size = (
+            _safe_float(row.get("size"))
+            or _safe_float(row.get("quantity"))
+            or _safe_float(row.get("amount"))
+            or _safe_float(row.get("shares"))
+        )
+        if size is None or size <= 0.0:
+            continue
+        levels.append((float(p), float(size)))
+    return levels
+
+
+def _book_depth_metrics(rows: Any, side: str, top_n: int = 3) -> tuple[Optional[float], Optional[float]]:
+    levels = _extract_book_levels(rows)
+    if not levels:
+        return None, None
+    reverse = side == "bid"
+    levels.sort(key=lambda x: x[0], reverse=reverse)
+    top = levels[: max(1, top_n)]
+    best_size = top[0][1] if top else None
+    depth_sum = float(sum(x[1] for x in top)) if top else None
+    return best_size, depth_sum
+
+
 def _quantize_price(price: float, tick_size: float, side: str) -> float:
     tick = max(0.0001, tick_size)
     steps = price / tick
@@ -702,6 +736,48 @@ def health() -> dict:
         "market_meta_cache_keys": meta_keys,
         "market_meta_ttl_ms": MARKET_META_TTL_MS,
     }
+
+
+@app.get("/book")
+def get_book(token_id: str) -> JSONResponse:
+    client: Optional[ClobClient] = STATE["client"]
+    if client is None or not STATE["ready"]:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "gateway_not_ready"})
+    token_id = str(token_id or "").strip()
+    if not token_id:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "missing_token_id"})
+
+    meta = _get_market_meta(token_id)
+    best_bid_size: Optional[float] = None
+    best_ask_size: Optional[float] = None
+    bid_depth_top3: Optional[float] = None
+    ask_depth_top3: Optional[float] = None
+
+    try:
+        with STATE["client_lock"]:
+            book = client.get_order_book(token_id)
+        best_bid_size, bid_depth_top3 = _book_depth_metrics(getattr(book, "bids", None), "bid", 3)
+        best_ask_size, ask_depth_top3 = _book_depth_metrics(getattr(book, "asks", None), "ask", 3)
+    except Exception as exc:
+        _emit("book_snapshot_error", token_id=token_id, reason=_safe_error(exc))
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "ok": True,
+            "token_id": token_id,
+            "min_order_size": float(meta.min_order_size),
+            "tick_size": float(meta.tick_size),
+            "best_bid": meta.best_bid,
+            "best_ask": meta.best_ask,
+            "best_bid_size": best_bid_size,
+            "best_ask_size": best_ask_size,
+            "bid_depth_top3": bid_depth_top3,
+            "ask_depth_top3": ask_depth_top3,
+            "fee_rate_bps": int(meta.fee_rate_bps),
+            "fetched_ms": _ms_now(),
+        },
+    )
 
 
 @app.get("/reports/orders")

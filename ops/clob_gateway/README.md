@@ -6,6 +6,7 @@ engine does not need to implement EIP-712 signing + CLOB auth.
 ## Endpoints
 
 - `GET /health`
+- `GET /book?token_id=...`
 - `POST /orders`
 - `POST /prebuild_order`
 - `DELETE /orders/{order_id}`

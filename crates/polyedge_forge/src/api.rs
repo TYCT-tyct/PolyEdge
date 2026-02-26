@@ -101,6 +101,12 @@ struct LivePendingOrder {
     decision_key: String,
     price_cents: f64,
     quote_size_usdc: f64,
+    #[serde(default)]
+    tif: String,
+    #[serde(default)]
+    style: String,
+    #[serde(default)]
+    submit_reason: String,
     submitted_ts_ms: i64,
     cancel_after_ms: i64,
     retry_count: u8,
@@ -2857,8 +2863,13 @@ async fn strategy_paper_live(
         match live_market.as_ref() {
             Some(target) => {
                 let execution_orders =
-                    execute_live_orders_via_gateway(&live_gateway_cfg, target, &gated_decisions)
-                        .await;
+                    execute_live_orders_via_gateway(
+                        &live_gateway_cfg,
+                        target,
+                        &live_position_state,
+                        &gated_decisions,
+                    )
+                    .await;
                 for record in &execution_orders {
                     let decision = record.get("decision").cloned().unwrap_or(Value::Null);
                     let action = decision
@@ -2900,6 +2911,31 @@ async fn strategy_paper_live(
                         }
                         let order_id = extract_order_id_from_gateway_record(record);
                         if let Some(order_id) = order_id {
+                            let filled_size = record
+                                .get("response")
+                                .and_then(|v| v.get("accepted_size"))
+                                .and_then(Value::as_f64)
+                                .unwrap_or(0.0)
+                                .max(0.0);
+                            let exec_price = record
+                                .get("final_request")
+                                .and_then(|v| v.get("price"))
+                                .and_then(Value::as_f64)
+                                .or_else(|| record.get("request").and_then(|v| v.get("price")).and_then(Value::as_f64))
+                                .unwrap_or_else(|| {
+                                    decision
+                                        .get("price_cents")
+                                        .and_then(Value::as_f64)
+                                        .unwrap_or(0.0)
+                                        / 100.0
+                                })
+                                .max(0.0001);
+                            let effective_notional = record
+                                .get("response")
+                                .and_then(|v| v.get("effective_notional"))
+                                .and_then(Value::as_f64)
+                                .unwrap_or_else(|| filled_size * exec_price)
+                                .max(0.0);
                             let pending = LivePendingOrder {
                                 market_type: market_type.to_string(),
                                 order_id,
@@ -2915,10 +2951,29 @@ async fn strategy_paper_live(
                                     .get("price_cents")
                                     .and_then(Value::as_f64)
                                     .unwrap_or(0.0),
-                                quote_size_usdc: decision
-                                    .get("quote_size_usdc")
-                                    .and_then(Value::as_f64)
-                                    .unwrap_or(0.0),
+                                quote_size_usdc: if effective_notional > 0.0 {
+                                    effective_notional
+                                } else {
+                                    decision
+                                        .get("quote_size_usdc")
+                                        .and_then(Value::as_f64)
+                                        .unwrap_or(0.0)
+                                },
+                                tif: decision
+                                    .get("tif")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                style: decision
+                                    .get("style")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                submit_reason: decision
+                                    .get("reason")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
                                 submitted_ts_ms: ts_ms,
                                 cancel_after_ms: if action == "exit" { 2200 } else { 3600 },
                                 retry_count: 0,
@@ -3272,6 +3327,64 @@ impl LiveGatewayConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct GatewayBookSnapshot {
+    token_id: String,
+    min_order_size: f64,
+    tick_size: f64,
+    best_bid: Option<f64>,
+    best_ask: Option<f64>,
+    best_bid_size: Option<f64>,
+    best_ask_size: Option<f64>,
+    bid_depth_top3: Option<f64>,
+    ask_depth_top3: Option<f64>,
+}
+
+impl GatewayBookSnapshot {
+    fn from_value(v: &Value) -> Option<Self> {
+        let token_id = v
+            .get("token_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if token_id.is_empty() {
+            return None;
+        }
+        let min_order_size = v
+            .get("min_order_size")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.01)
+            .max(0.0001);
+        let tick_size = v
+            .get("tick_size")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.01)
+            .max(0.0001);
+        Some(Self {
+            token_id,
+            min_order_size,
+            tick_size,
+            best_bid: v.get("best_bid").and_then(Value::as_f64),
+            best_ask: v.get("best_ask").and_then(Value::as_f64),
+            best_bid_size: v.get("best_bid_size").and_then(Value::as_f64),
+            best_ask_size: v.get("best_ask_size").and_then(Value::as_f64),
+            bid_depth_top3: v.get("bid_depth_top3").and_then(Value::as_f64),
+            ask_depth_top3: v.get("ask_depth_top3").and_then(Value::as_f64),
+        })
+    }
+}
+
+fn round_to_tick(price: f64, tick_size: f64, is_buy: bool) -> f64 {
+    let tick = tick_size.max(0.0001);
+    let steps = price / tick;
+    let aligned = if is_buy {
+        steps.ceil() * tick
+    } else {
+        steps.floor() * tick
+    };
+    aligned.clamp(0.01, 0.99)
+}
+
 #[derive(Debug, Clone)]
 struct LiveMarketTarget {
     market_id: String,
@@ -3326,6 +3439,14 @@ async fn gate_live_decisions(
     let now_ms = Utc::now().timestamp_millis();
     let mut position_state = state.get_live_position_state(market_type).await;
     let mut virtual_side = position_state.side.clone();
+    let market_pending: Vec<LivePendingOrder> = state
+        .list_pending_orders()
+        .await
+        .into_iter()
+        .filter(|p| p.market_type.eq_ignore_ascii_case(market_type))
+        .collect();
+    let mut has_enter_pending = market_pending.iter().any(|p| p.action == "enter");
+    let mut has_exit_pending = market_pending.iter().any(|p| p.action == "exit");
     let mut accepted = Vec::<LiveGatedDecision>::new();
     let mut skipped = Vec::<Value>::new();
 
@@ -3350,6 +3471,27 @@ async fn gate_live_decisions(
         if side != "UP" && side != "DOWN" {
             skipped.push(json!({
                 "reason": "invalid_side",
+                "decision": decision
+            }));
+            continue;
+        }
+        if action == "enter" && (has_enter_pending || has_exit_pending) {
+            skipped.push(json!({
+                "reason": if has_enter_pending { "enter_pending_exists" } else { "exit_pending_exists" },
+                "decision": decision
+            }));
+            continue;
+        }
+        if action == "exit" && has_exit_pending {
+            skipped.push(json!({
+                "reason": "exit_pending_exists",
+                "decision": decision
+            }));
+            continue;
+        }
+        if action == "exit" && has_enter_pending {
+            skipped.push(json!({
+                "reason": "entry_pending_not_filled",
                 "decision": decision
             }));
             continue;
@@ -3403,8 +3545,10 @@ async fn gate_live_decisions(
         }
         if action == "enter" {
             virtual_side = Some(side.clone());
+            has_enter_pending = true;
         } else {
             virtual_side = None;
+            has_exit_pending = true;
         }
         accepted.push(LiveGatedDecision {
             decision: decision.clone(),
@@ -3539,6 +3683,8 @@ fn decision_to_live_payload(
     decision: &Value,
     target: &LiveMarketTarget,
     gateway_cfg: &LiveGatewayConfig,
+    book: Option<&GatewayBookSnapshot>,
+    quote_size_override: Option<f64>,
 ) -> Option<Value> {
     let action = decision
         .get("action")
@@ -3550,7 +3696,7 @@ fn decision_to_live_payload(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_ascii_uppercase();
-    let (gateway_side, token_id, max_slippage_bps) = match (action.as_str(), side.as_str()) {
+    let (gateway_side, token_id, mut slippage_bps) = match (action.as_str(), side.as_str()) {
         ("enter", "UP") => (
             "buy_yes",
             target.token_id_yes.as_str(),
@@ -3581,14 +3727,55 @@ fn decision_to_live_payload(
         price_cents = 50.0;
     }
     price_cents = price_cents.clamp(1.0, 99.0);
-    let price = (price_cents / 100.0).clamp(0.01, 0.99);
-    let quote_size = decision
-        .get("quote_size_usdc")
-        .and_then(Value::as_f64)
-        .unwrap_or(gateway_cfg.min_quote_usdc)
-        .max(gateway_cfg.min_quote_usdc);
-    let size = (quote_size / price).max(0.01);
-    let tif = decision
+    let mut price = (price_cents / 100.0).clamp(0.01, 0.99);
+    let mut quote_size = quote_size_override.unwrap_or_else(|| {
+        decision
+            .get("quote_size_usdc")
+            .and_then(Value::as_f64)
+            .unwrap_or(gateway_cfg.min_quote_usdc)
+    });
+    quote_size = quote_size.max(gateway_cfg.min_quote_usdc);
+    let mut size = (quote_size / price).max(0.01);
+    let mut notes: Vec<String> = Vec::new();
+    let is_buy = gateway_side.starts_with("buy_");
+    let mut min_order_size = 0.01_f64;
+    if let Some(book) = book {
+        min_order_size = book.min_order_size.max(0.0001);
+        let tick_size = book.tick_size.max(0.0001);
+        price = round_to_tick(price, tick_size, is_buy);
+        size = (quote_size / price).max(min_order_size);
+
+        let depth_top1 = if is_buy {
+            book.best_ask_size.unwrap_or(0.0)
+        } else {
+            book.best_bid_size.unwrap_or(0.0)
+        };
+        let depth_top3 = if is_buy {
+            book.ask_depth_top3.unwrap_or(0.0)
+        } else {
+            book.bid_depth_top3.unwrap_or(0.0)
+        };
+        if depth_top1.is_finite() && depth_top1 > 0.0 && size > depth_top1 * 1.12 {
+            let capped = (depth_top1 * 0.95).max(min_order_size);
+            if capped < size {
+                size = capped;
+                notes.push("depth_cap_top1".to_string());
+            }
+        }
+        if depth_top3.is_finite() && depth_top3 > 0.0 && size > depth_top3 * 1.25 {
+            if action == "exit" {
+                slippage_bps = (slippage_bps + 12.0).min(500.0);
+                notes.push("depth_thin_exit_force_taker".to_string());
+            } else {
+                slippage_bps = (slippage_bps + 8.0).min(500.0);
+                notes.push("depth_thin_entry_boost_slippage".to_string());
+            }
+        }
+    }
+    size = size.max(min_order_size).max(0.01);
+    size = (size * 10_000.0).round() / 10_000.0;
+
+    let mut tif = decision
         .get("tif")
         .and_then(Value::as_str)
         .map(|v| v.trim().to_ascii_uppercase())
@@ -3600,7 +3787,7 @@ fn decision_to_live_payload(
                 "FAK".to_string()
             }
         });
-    let style = decision
+    let mut style = decision
         .get("style")
         .and_then(Value::as_str)
         .map(|v| v.trim().to_ascii_lowercase())
@@ -3612,20 +3799,23 @@ fn decision_to_live_payload(
                 "taker".to_string()
             }
         });
+    if action == "exit" && notes.iter().any(|n| n == "depth_thin_exit_force_taker") {
+        tif = "FAK".to_string();
+        style = "taker".to_string();
+    }
     let ttl_ms = decision
         .get("ttl_ms")
         .and_then(Value::as_i64)
         .unwrap_or(if action == "exit" { 900 } else { 1400 })
         .clamp(300, 30_000);
-    let max_slippage_bps = decision
+    slippage_bps = decision
         .get("max_slippage_bps")
         .and_then(Value::as_f64)
-        .unwrap_or(max_slippage_bps)
+        .unwrap_or(slippage_bps)
         .clamp(0.0, 500.0);
-    let max_slippage_bps = gateway_cfg
-        .force_slippage_bps
-        .unwrap_or(max_slippage_bps)
-        .clamp(0.0, 500.0);
+    if let Some(force) = gateway_cfg.force_slippage_bps {
+        slippage_bps = force.clamp(0.0, 500.0);
+    }
     let cache_key = format!(
         "fev1:{}:{}:{}:{:.4}:{:.4}",
         target.market_id, gateway_side, action, price, size
@@ -3639,10 +3829,26 @@ fn decision_to_live_payload(
         "tif": tif,
         "style": style,
         "ttl_ms": ttl_ms,
-        "max_slippage_bps": max_slippage_bps,
+        "max_slippage_bps": slippage_bps,
+        "execution_notes": notes,
         "cache_key": cache_key,
         "action": action,
-        "signal_side": side
+        "signal_side": side,
+        "book_meta": if let Some(book) = book {
+            json!({
+                "token_id": book.token_id,
+                "min_order_size": book.min_order_size,
+                "tick_size": book.tick_size,
+                "best_bid": book.best_bid,
+                "best_ask": book.best_ask,
+                "best_bid_size": book.best_bid_size,
+                "best_ask_size": book.best_ask_size,
+                "bid_depth_top3": book.bid_depth_top3,
+                "ask_depth_top3": book.ask_depth_top3
+            })
+        } else {
+            Value::Null
+        }
     }))
 }
 
@@ -3671,6 +3877,62 @@ async fn post_gateway(
         Ok(parsed)
     } else {
         Err(format!("status_{}:{}", status.as_u16(), parsed))
+    }
+}
+
+async fn get_gateway(
+    client: &reqwest::Client,
+    endpoint: &str,
+    path: &str,
+    query: &[(&str, &str)],
+) -> Result<Value, String> {
+    let url = format!(
+        "{}/{}",
+        endpoint.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
+    let resp = client
+        .get(&url)
+        .query(query)
+        .send()
+        .await
+        .map_err(|e| format!("http_error:{e}"))?;
+    let status = resp.status();
+    let body = resp.text().await.map_err(|e| format!("read_error:{e}"))?;
+    let parsed = serde_json::from_str::<Value>(&body).unwrap_or_else(|_| json!({"raw": body}));
+    if status.is_success() {
+        Ok(parsed)
+    } else {
+        Err(format!("status_{}:{}", status.as_u16(), parsed))
+    }
+}
+
+async fn fetch_gateway_book_snapshot(
+    client: &reqwest::Client,
+    gateway_cfg: &LiveGatewayConfig,
+    token_id: &str,
+) -> Option<GatewayBookSnapshot> {
+    let mut endpoint = gateway_cfg.primary_url.clone();
+    let mut resp = get_gateway(client, &endpoint, "/book", &[("token_id", token_id)]).await;
+    if resp.is_err() {
+        if let Some(backup) = gateway_cfg.backup_url.as_deref() {
+            endpoint = backup.to_string();
+            resp = get_gateway(client, &endpoint, "/book", &[("token_id", token_id)]).await;
+        }
+    }
+    match resp {
+        Ok(v) => GatewayBookSnapshot::from_value(&v).or_else(|| {
+            tracing::warn!(
+                token_id = token_id,
+                endpoint = %endpoint,
+                "gateway /book response missing required fields"
+            );
+            None
+        }),
+        Err(err) => {
+            tracing::warn!(token_id = token_id, endpoint = %endpoint, error = %err, "gateway /book fetch failed");
+            None
+        }
     }
 }
 
@@ -3730,6 +3992,12 @@ fn build_retry_payload(current: &Value, reason: &str, attempt: usize) -> Option<
         .and_then(Value::as_i64)
         .unwrap_or(1200)
         .clamp(300, 30_000);
+    let current_tif = current
+        .get("tif")
+        .and_then(Value::as_str)
+        .unwrap_or("FAK")
+        .to_ascii_uppercase();
+    let maker_mode = matches!(current_tif.as_str(), "GTD" | "GTC" | "POST_ONLY");
 
     if attempt == 0 {
         let boosted_slippage = if action == "exit" {
@@ -3745,12 +4013,16 @@ fn build_retry_payload(current: &Value, reason: &str, attempt: usize) -> Option<
         return Some(next);
     }
 
-    if action == "enter" {
+    if maker_mode {
         if let Some(obj) = next.as_object_mut() {
-            obj.insert("tif".to_string(), json!("GTD"));
-            obj.insert("style".to_string(), json!("maker"));
-            obj.insert("ttl_ms".to_string(), json!(2_400));
-            obj.insert("retry_tag".to_string(), json!("maker_fallback"));
+            obj.insert("tif".to_string(), json!("FAK"));
+            obj.insert("style".to_string(), json!("taker"));
+            obj.insert("ttl_ms".to_string(), json!((current_ttl / 2).clamp(600, 2_000)));
+            obj.insert(
+                "max_slippage_bps".to_string(),
+                json!((current_slippage + if action == "exit" { 20.0 } else { 14.0 }).min(140.0)),
+            );
+            obj.insert("retry_tag".to_string(), json!("maker_timeout_to_fak"));
         }
         return Some(next);
     }
@@ -4021,6 +4293,97 @@ async fn handle_pending_timeouts(state: &ApiState, gateway_cfg: &LiveGatewayConf
         match cancel_res {
             Ok(v) => {
                 let _ = state.remove_pending_order(&row.order_id).await;
+                let maker_tif = matches!(row.tif.to_ascii_uppercase().as_str(), "GTD" | "GTC" | "POST_ONLY");
+                if maker_tif && row.retry_count < 1 {
+                    let maybe_target = resolve_live_market_target(&row.market_type).await.ok();
+                    if let Some(target) = maybe_target {
+                        let decision = json!({
+                            "action": row.action,
+                            "side": row.side,
+                            "round_id": row.round_id,
+                            "price_cents": row.price_cents,
+                            "quote_size_usdc": row.quote_size_usdc,
+                            "reason": format!("{}_timeout_fallback_fak", row.submit_reason),
+                            "tif": "FAK",
+                            "style": "taker",
+                            "ttl_ms": 900,
+                            "max_slippage_bps": gateway_cfg.exit_slippage_bps.max(gateway_cfg.entry_slippage_bps) + 10.0
+                        });
+                        let token_id = token_id_for_decision(&decision, &target).map(str::to_string);
+                        let book_snapshot = if let Some(token_id) = token_id {
+                            fetch_gateway_book_snapshot(&client, gateway_cfg, &token_id).await
+                        } else {
+                            None
+                        };
+                        if let Some(payload) = decision_to_live_payload(
+                            &decision,
+                            &target,
+                            gateway_cfg,
+                            book_snapshot.as_ref(),
+                            Some(row.quote_size_usdc),
+                        ) {
+                            let (submit_res, submit_endpoint) =
+                                submit_gateway_order(&client, gateway_cfg, &payload).await;
+                            if let Ok(resp) = submit_res {
+                                let accepted = resp
+                                    .get("accepted")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+                                if accepted {
+                                    let order_id = extract_order_id_from_gateway_record(&resp).or_else(|| {
+                                        extract_order_id_from_gateway_record(
+                                            &json!({ "response": resp.clone() }),
+                                        )
+                                    });
+                                    if let Some(order_id) = order_id {
+                                        let mut pending = row.clone();
+                                        pending.order_id = order_id;
+                                        pending.retry_count = pending.retry_count.saturating_add(1);
+                                        pending.tif = "FAK".to_string();
+                                        pending.style = "taker".to_string();
+                                        pending.submitted_ts_ms = now_ms;
+                                        pending.cancel_after_ms = 1500;
+                                        state.upsert_pending_order(pending).await;
+                                        state
+                                            .append_live_event(
+                                                &row.market_type,
+                                                json!({
+                                                    "accepted": true,
+                                                    "action": row.action,
+                                                    "side": row.side,
+                                                    "round_id": row.round_id,
+                                                    "reason": "local_timeout_cancelled_resubmitted_fak",
+                                                    "order_id": row.order_id,
+                                                    "gateway_endpoint": submit_endpoint,
+                                                    "cancel_response": v.clone(),
+                                                    "submit_response": resp,
+                                                    "book_snapshot": book_snapshot
+                                                }),
+                                            )
+                                            .await;
+                                        continue;
+                                    }
+                                }
+                                state
+                                    .append_live_event(
+                                        &row.market_type,
+                                        json!({
+                                            "accepted": false,
+                                            "action": row.action,
+                                            "side": row.side,
+                                            "round_id": row.round_id,
+                                            "reason": "local_timeout_cancelled_fak_resubmit_rejected",
+                                            "order_id": row.order_id,
+                                            "gateway_endpoint": submit_endpoint,
+                                            "cancel_response": v.clone(),
+                                            "submit_response": resp
+                                        }),
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+                }
                 apply_pending_revert(state, &row, "local_timeout_cancel").await;
                 state
                     .append_live_event(
@@ -4059,9 +4422,28 @@ async fn handle_pending_timeouts(state: &ApiState, gateway_cfg: &LiveGatewayConf
     }
 }
 
+fn token_id_for_decision<'a>(decision: &Value, target: &'a LiveMarketTarget) -> Option<&'a str> {
+    let action = decision
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let side = decision
+        .get("side")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    match (action.as_str(), side.as_str()) {
+        ("enter", "UP") | ("exit", "UP") => Some(target.token_id_yes.as_str()),
+        ("enter", "DOWN") | ("exit", "DOWN") => Some(target.token_id_no.as_str()),
+        _ => None,
+    }
+}
+
 async fn execute_live_orders_via_gateway(
     gateway_cfg: &LiveGatewayConfig,
     target: &LiveMarketTarget,
+    position_state: &LivePositionState,
     decisions: &[LiveGatedDecision],
 ) -> Vec<Value> {
     let client = reqwest::Client::builder()
@@ -4069,14 +4451,49 @@ async fn execute_live_orders_via_gateway(
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
     let mut out = Vec::<Value>::new();
+    let mut book_cache: HashMap<String, Option<GatewayBookSnapshot>> = HashMap::new();
+    let exit_quote_override = position_state
+        .entry_quote_usdc
+        .and_then(|v| if v > 0.0 { Some(v) } else { None });
     for gated in decisions {
-        let decision = &gated.decision;
-        let Some(payload) = decision_to_live_payload(decision, target, gateway_cfg) else {
+        let mut decision = gated.decision.clone();
+        let action = decision
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if action == "exit" {
+            if let Some(q) = exit_quote_override {
+                if let Some(obj) = decision.as_object_mut() {
+                    obj.insert("quote_size_usdc".to_string(), json!(q));
+                }
+            }
+        }
+        let token_id = token_id_for_decision(&decision, target).map(str::to_string);
+        let book_snapshot = if let Some(token_id) = token_id.clone() {
+            if let Some(cached) = book_cache.get(&token_id) {
+                cached.clone()
+            } else {
+                let fetched = fetch_gateway_book_snapshot(&client, gateway_cfg, &token_id).await;
+                book_cache.insert(token_id.clone(), fetched.clone());
+                fetched
+            }
+        } else {
+            None
+        };
+        let Some(payload) = decision_to_live_payload(
+            &decision,
+            target,
+            gateway_cfg,
+            book_snapshot.as_ref(),
+            None,
+        ) else {
             out.push(json!({
                 "ok": false,
                 "reason": "decision_to_payload_failed",
                 "decision_key": gated.decision_key,
-                "decision": decision
+                "decision": decision,
+                "book_snapshot": book_snapshot
             }));
             continue;
         };
@@ -4148,7 +4565,8 @@ async fn execute_live_orders_via_gateway(
             "final_request": attempt_payload.clone(),
             "response": final_response,
             "error": final_error,
-            "attempts": attempts
+            "attempts": attempts,
+            "book_snapshot": book_snapshot
         }));
     }
     out
@@ -5713,7 +6131,8 @@ mod tests {
             exit_slippage_bps: 22.0,
             force_slippage_bps: None,
         };
-        let payload = decision_to_live_payload(&decision, &target, &cfg).expect("payload");
+        let payload =
+            decision_to_live_payload(&decision, &target, &cfg, None, None).expect("payload");
         assert_eq!(payload.get("tif").and_then(Value::as_str), Some("GTD"));
         assert_eq!(payload.get("style").and_then(Value::as_str), Some("maker"));
         assert_eq!(payload.get("ttl_ms").and_then(Value::as_i64), Some(2300));
