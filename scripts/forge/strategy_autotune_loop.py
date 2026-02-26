@@ -241,6 +241,7 @@ def score_eval(metrics: dict, target_win_rate: float, window_trades: int) -> flo
 def evaluate_config(
     base_url: str,
     market_type: str,
+    autotune_context: str,
     timeout_sec: int,
     target_win_rate: float,
     window_trades: int,
@@ -252,6 +253,7 @@ def evaluate_config(
 ) -> dict:
     query = {
         "market_type": market_type,
+        "autotune_context": autotune_context,
         "full_history": "true",
         "lookback_minutes": lookback_minutes,
         "max_trades": max_trades,
@@ -477,6 +479,11 @@ def main() -> None:
     )
     ap.add_argument("--base-url", default="http://127.0.0.1:9810")
     ap.add_argument("--market-type", default="5m")
+    ap.add_argument(
+        "--autotune-context",
+        default="",
+        help="Autotune context key, e.g. btcusdt:5m. Default derives from market-type.",
+    )
     ap.add_argument("--target-win-rate", type=float, default=90.0)
     ap.add_argument("--window-trades", type=int, default=50)
     ap.add_argument("--recent-lookback-minutes", type=int, default=720)
@@ -538,6 +545,9 @@ def main() -> None:
 
     strategy1_enabled = parse_bool_arg(args.strategy1_enabled, default=True)
     strategy1_autotune_enabled = parse_bool_arg(args.strategy1_autotune_enabled, default=True)
+    autotune_context = (args.autotune_context or "").strip().lower()
+    if not autotune_context:
+        autotune_context = f"btcusdt:{args.market_type}".lower()
     if not strategy1_enabled:
         print("[skip] strategy1_enabled=FALSE, autotune loop will not run.", flush=True)
         return
@@ -550,6 +560,7 @@ def main() -> None:
 
     base_query = {
         "market_type": args.market_type,
+        "autotune_context": autotune_context,
         "target_win_rate": args.target_win_rate,
         "window_trades": args.window_trades,
         "max_arms": args.max_arms,
@@ -629,6 +640,7 @@ def main() -> None:
             baseline_eval = evaluate_config(
                 base_url=args.base_url,
                 market_type=args.market_type,
+                autotune_context=autotune_context,
                 timeout_sec=args.timeout_sec,
                 target_win_rate=args.target_win_rate,
                 window_trades=args.window_trades,
@@ -642,7 +654,7 @@ def main() -> None:
                 build_url(
                     args.base_url,
                     "/api/strategy/autotune/latest",
-                    {"market_type": args.market_type},
+                    {"market_type": args.market_type, "context": autotune_context},
                 ),
                 args.timeout_sec,
             )
@@ -664,6 +676,7 @@ def main() -> None:
                 eval_row = evaluate_config(
                     base_url=args.base_url,
                     market_type=args.market_type,
+                    autotune_context=autotune_context,
                     timeout_sec=args.timeout_sec,
                     target_win_rate=args.target_win_rate,
                     window_trades=args.window_trades,
@@ -717,6 +730,7 @@ def main() -> None:
             if promote_ok:
                 promote_payload = {
                     "market_type": args.market_type,
+                    "context": autotune_context,
                     "config": challenger_config,
                     "ttl_sec": args.persist_ttl_sec,
                     "source": "autotune_loop_challenger",
@@ -737,6 +751,7 @@ def main() -> None:
             live_eval = evaluate_config(
                 base_url=args.base_url,
                 market_type=args.market_type,
+                autotune_context=autotune_context,
                 timeout_sec=args.timeout_sec,
                 target_win_rate=args.target_win_rate,
                 window_trades=args.window_trades,
@@ -766,6 +781,7 @@ def main() -> None:
                 if immediate_guard_reasons and current_autotune_cfg:
                     rollback_payload = {
                         "market_type": args.market_type,
+                        "context": autotune_context,
                         "config": current_autotune_cfg,
                         "ttl_sec": args.persist_ttl_sec,
                         "source": "autotune_loop_immediate_guard",
@@ -801,7 +817,11 @@ def main() -> None:
                     build_url(
                         args.base_url,
                         "/api/strategy/autotune/history",
-                        {"market_type": args.market_type, "limit": args.history_limit},
+                        {
+                            "market_type": args.market_type,
+                            "context": autotune_context,
+                            "limit": args.history_limit,
+                        },
                     ),
                     args.timeout_sec,
                 )
@@ -815,6 +835,7 @@ def main() -> None:
                     hist_eval = evaluate_config(
                         base_url=args.base_url,
                         market_type=args.market_type,
+                        autotune_context=autotune_context,
                         timeout_sec=args.timeout_sec,
                         target_win_rate=args.target_win_rate,
                         window_trades=args.window_trades,
@@ -842,6 +863,7 @@ def main() -> None:
                     if rollback_ok:
                         rollback_payload = {
                             "market_type": args.market_type,
+                            "context": autotune_context,
                             "config": normalize_config(best_hist_item.get("config") or {}),
                             "ttl_sec": args.persist_ttl_sec,
                             "source": "autotune_loop_rollback",
@@ -863,6 +885,7 @@ def main() -> None:
                 "finished_ms": finished,
                 "duration_ms": finished - started,
                 "best_seed_sweep": best,
+                "autotune_context": autotune_context,
                 "top_seed_rows": top_seed_rows,
                 "deep_rows": deep_rows_sorted,
                 "chosen_challenger_seed": chosen_seed,

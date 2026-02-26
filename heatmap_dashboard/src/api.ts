@@ -743,6 +743,7 @@ export interface StrategyPaperQueryOptions {
   maxTrades?: number;
   fullHistory?: boolean;
   useAutotune?: boolean;
+  autotuneContext?: string;
   entryThresholdBase?: number;
   entryThresholdCap?: number;
   entryEdgeProb?: number;
@@ -768,6 +769,9 @@ export async function getStrategyPaper(
     full_history: options.fullHistory ? "true" : "false",
     use_autotune: options.useAutotune ? "true" : "false",
   });
+  if (options.autotuneContext && options.autotuneContext.trim()) {
+    qs.set("autotune_context", options.autotuneContext.trim());
+  }
   if (options.entryThresholdBase != null) {
     qs.set("entry_threshold_base", String(options.entryThresholdBase));
   }
@@ -809,6 +813,51 @@ export async function getStrategyPaper(
     throw new Error("strategy paper response missing summary");
   }
   return payload as StrategyPaperResponse;
+}
+
+export interface StrategyAutotuneLatestResponse {
+  market_type: MarketType | string;
+  context: string;
+  key: string;
+  from_legacy: boolean;
+  found: boolean;
+  data: Record<string, unknown> | null;
+}
+
+export interface StrategyAutotuneHistoryResponse {
+  market_type: MarketType | string;
+  context: string;
+  key: string;
+  from_legacy: boolean;
+  limit: number;
+  count: number;
+  items: Array<Record<string, unknown>>;
+}
+
+export async function getStrategyAutotuneLatest(
+  marketType: MarketType,
+  context?: string
+): Promise<StrategyAutotuneLatestResponse> {
+  const qs = new URLSearchParams({ market_type: marketType });
+  if (context && context.trim()) {
+    qs.set("context", context.trim());
+  }
+  return requestJson<StrategyAutotuneLatestResponse>(`/api/strategy/autotune/latest?${qs.toString()}`);
+}
+
+export async function getStrategyAutotuneHistory(
+  marketType: MarketType,
+  context?: string,
+  limit = 20
+): Promise<StrategyAutotuneHistoryResponse> {
+  const qs = new URLSearchParams({
+    market_type: marketType,
+    limit: String(Math.max(1, Math.min(200, Math.floor(limit))))
+  });
+  if (context && context.trim()) {
+    qs.set("context", context.trim());
+  }
+  return requestJson<StrategyAutotuneHistoryResponse>(`/api/strategy/autotune/history?${qs.toString()}`);
 }
 
 export function connectLiveWs(

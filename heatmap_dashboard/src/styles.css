@@ -643,6 +643,60 @@ body {
   font-size: 11px;
 }
 
+.autotune-block {
+  margin: 10px 0;
+}
+
+.autotune-toolbar {
+  display: grid;
+  grid-template-columns: 1.3fr 1fr;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.autotune-toolbar label {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.autotune-toolbar input {
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: rgba(10, 16, 29, 0.92);
+  color: #eaf2ff;
+  padding: 8px 10px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 12px;
+  outline: none;
+}
+
+.autotune-toolbar input:focus {
+  border-color: rgba(56, 189, 248, 0.72);
+  box-shadow: var(--ring);
+}
+
+.autotune-meta {
+  display: grid;
+  gap: 6px;
+  align-content: center;
+  color: var(--muted);
+  font-size: 11px;
+  font-family: "JetBrains Mono", monospace;
+}
+
+.autotune-kpis {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.autotune-history-table td {
+  font-size: 12px;
+}
+
 .parity-funnel {
   display: grid;
   gap: 8px;
@@ -1077,7 +1131,9 @@ select:focus {
   }
 
   .live-block-grid,
-  .live-tables-grid {
+  .live-tables-grid,
+  .autotune-toolbar,
+  .autotune-kpis {
     grid-template-columns: 1fr;
   }
 }

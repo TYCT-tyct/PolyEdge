@@ -244,6 +244,7 @@ export interface StrategyPaperResponse {
   source?: "replay" | "live" | "auto" | string;
   source_fallback_error?: string | null;
   market_type: string;
+  autotune_context?: string;
   lookback_minutes: number;
   samples: number;
   config_source?: string;

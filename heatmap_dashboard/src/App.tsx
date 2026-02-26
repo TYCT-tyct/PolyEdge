@@ -3,6 +3,8 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   connectLiveWs,
   getAccuracySeries,
+  getStrategyAutotuneHistory,
+  getStrategyAutotuneLatest,
   getAvailableRounds,
   getChart,
   getCollectorStatus,
@@ -51,6 +53,7 @@ const LIVE_UI_MIN_INTERVAL_MS = 900;
 const ET_TIMEZONE = "America/New_York";
 const COLLECTOR_POLL_MS = 5_000;
 const STRATEGY_POLL_MS = 5_000;
+const AUTOTUNE_POLL_MS = 6_000;
 type StrategyPaperSource = "replay" | "live";
 const STRATEGY_PAPER_PROFILE = Object.freeze({
   lookbackMinutes: 24 * 60,
@@ -64,6 +67,10 @@ const STRATEGY_LIVE_PROFILE = Object.freeze({
   liveMaxOrders: 1,
   liveEntryOnly: true
 });
+
+function defaultAutotuneContext(marketType: MarketType): string {
+  return `btcusdt:${marketType}`;
+}
 
 type TimeMode = "local" | "et";
 
@@ -755,8 +762,15 @@ interface StrategyPanelProps {
   timeMode: TimeMode;
   marketType: MarketType;
   source: StrategyPaperSource;
+  autotuneEnabled: boolean;
+  autotuneContext: string;
+  autotuneLatest: Record<string, unknown> | null;
+  autotuneHistory: Array<Record<string, unknown>>;
+  autotuneLoading: boolean;
   onMarketTypeChange: (marketType: MarketType) => void;
   onSourceChange: (source: StrategyPaperSource) => void;
+  onAutotuneToggle: (enabled: boolean) => void;
+  onAutotuneContextChange: (context: string) => void;
 }
 
 const StrategyPanel = memo(function StrategyPanel({
@@ -765,8 +779,15 @@ const StrategyPanel = memo(function StrategyPanel({
   timeMode,
   marketType,
   source,
+  autotuneEnabled,
+  autotuneContext,
+  autotuneLatest,
+  autotuneHistory,
+  autotuneLoading,
   onMarketTypeChange,
-  onSourceChange
+  onSourceChange,
+  onAutotuneToggle,
+  onAutotuneContextChange
 }: StrategyPanelProps) {
   const current = data?.current ?? null;
   const currentView = useMemo(() => {
@@ -816,6 +837,25 @@ const StrategyPanel = memo(function StrategyPanel({
       roundId,
     };
   }, [current]);
+  const autotuneLatestDoc = useMemo(() => {
+    if (!autotuneLatest || typeof autotuneLatest !== "object") {
+      return null;
+    }
+    const savedAt =
+      asFiniteNumber(autotuneLatest.saved_at_ms) ??
+      asFiniteNumber(autotuneLatest.updated_at_ms) ??
+      asFiniteNumber(autotuneLatest.created_at_ms) ??
+      null;
+    const sourceTag =
+      typeof autotuneLatest.source === "string" && autotuneLatest.source.trim()
+        ? autotuneLatest.source.trim()
+        : "--";
+    const note =
+      typeof autotuneLatest.note === "string" && autotuneLatest.note.trim()
+        ? autotuneLatest.note.trim()
+        : "";
+    return { savedAt, sourceTag, note };
+  }, [autotuneLatest]);
   const liveExec = data?.live_execution;
   const liveState = liveExec?.state_machine;
   const liveOrders = liveExec?.execution?.orders ?? [];
@@ -853,9 +893,7 @@ const StrategyPanel = memo(function StrategyPanel({
       : null;
   const hasLiveExecution =
     !isLiveDryRun &&
-    (liveSubmittedTotal > 0 ||
-      parityLiveAccepted > 0 ||
-      (liveExec?.live_records?.length ?? 0) > 0);
+    (parityLiveAccepted > 0 || (liveExec?.live_records?.length ?? 0) > 0);
   const liveNetPnl = hasLiveExecution
     ? asFiniteNumber(liveSummary?.net_pnl_cents) ??
       asFiniteNumber(liveSummary?.total_pnl_cents) ??
@@ -928,6 +966,14 @@ const StrategyPanel = memo(function StrategyPanel({
               真实交易
             </button>
           </div>
+          <div className="btn-group">
+            <button className={autotuneEnabled ? "active" : ""} onClick={() => onAutotuneToggle(true)}>
+              AutoTune 开
+            </button>
+            <button className={!autotuneEnabled ? "active" : ""} onClick={() => onAutotuneToggle(false)}>
+              AutoTune 关
+            </button>
+          </div>
           {loading ? (
             <span className="loading-chip">计算中...</span>
           ) : (
@@ -989,6 +1035,94 @@ const StrategyPanel = memo(function StrategyPanel({
             {currentView.remainingS != null ? `${currentView.remainingS.toFixed(1)}s` : "--"} · 样本 {data?.samples ?? 0}
           </small>
         </article>
+      </div>
+      <div className="live-block autotune-block">
+        <header>
+          <h3>参数自调优（热加载）</h3>
+          <small>{autotuneEnabled ? "已启用，按上下文读取最新参数" : "已关闭，仅使用固定参数"}</small>
+        </header>
+        <div className="autotune-toolbar">
+          <label>
+            <span>Context</span>
+            <input
+              value={autotuneContext}
+              onChange={(e) => onAutotuneContextChange(e.target.value)}
+              placeholder={`btcusdt:${marketType}`}
+            />
+          </label>
+          <div className="autotune-meta">
+            <span>source={data?.source ?? "--"}</span>
+            <span>config={data?.config_source ?? "--"}</span>
+            <span>context={data?.autotune_context ?? autotuneContext}</span>
+          </div>
+        </div>
+        <div className="autotune-kpis">
+          <article className="info-card">
+            <span>最新参数时间</span>
+            <strong>{autotuneLatestDoc?.savedAt ? formatTime(autotuneLatestDoc.savedAt, timeMode) : "--"}</strong>
+            <small>source {autotuneLatestDoc?.sourceTag ?? "--"}</small>
+          </article>
+          <article className="info-card">
+            <span>调优记录数</span>
+            <strong>{autotuneHistory.length}</strong>
+            <small>{autotuneLoading ? "刷新中..." : "最近历史"}</small>
+          </article>
+          <article className="info-card">
+            <span>备注</span>
+            <strong>{autotuneLatestDoc?.note || "--"}</strong>
+            <small>用于快速判断参数变更原因</small>
+          </article>
+        </div>
+        <div className="table-wrap">
+          <h3 className="table-title">参数调整历史（最近8条）</h3>
+          <table className="history-table autotune-history-table">
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>来源</th>
+                <th>阈值(base/cap)</th>
+                <th>edge</th>
+                <th>止损</th>
+                <th>回撤</th>
+                <th>备注</th>
+              </tr>
+            </thead>
+            <tbody>
+              {autotuneHistory.slice(0, 8).map((item, idx) => {
+                const cfg =
+                  item.config && typeof item.config === "object"
+                    ? (item.config as Record<string, unknown>)
+                    : null;
+                const num = (v: unknown): number | null =>
+                  typeof v === "number" && Number.isFinite(v) ? v : null;
+                const text = (v: unknown): string =>
+                  typeof v === "string" && v.trim() ? v.trim() : "--";
+                const ts = num(item.saved_at_ms) ?? num(item.updated_at_ms) ?? null;
+                const base = num(cfg?.entry_threshold_base);
+                const cap = num(cfg?.entry_threshold_cap);
+                const edge = num(cfg?.entry_edge_prob);
+                const stop = num(cfg?.stop_loss_cents);
+                const trail = num(cfg?.trail_drawdown_cents);
+                return (
+                  <tr key={`autotune-${idx}-${ts ?? "na"}`}>
+                    <td>{formatTime(ts, timeMode)}</td>
+                    <td>{text(item.source)}</td>
+                    <td>{base != null && cap != null ? `${base.toFixed(3)} / ${cap.toFixed(3)}` : "--"}</td>
+                    <td>{edge != null ? edge.toFixed(3) : "--"}</td>
+                    <td>{stop != null ? `${stop.toFixed(2)}¢` : "--"}</td>
+                    <td>{trail != null ? `${trail.toFixed(2)}¢` : "--"}</td>
+                    <td>{text(item.note)}</td>
+                  </tr>
+                );
+              })}
+              {autotuneHistory.length === 0 ? (
+                <tr>
+                  <td colSpan={7}>暂无调优历史。</td>
+                </tr>
+              ) : null}
+            </tbody>
+          </table>
+        </div>
       </div>
       {source === "live" ? (
         <div className="live-execution-wrap">
@@ -1300,6 +1434,13 @@ export default function App() {
   const [strategyLoading, setStrategyLoading] = useState<boolean>(false);
   const [strategyMarketType, setStrategyMarketType] = useState<MarketType>("5m");
   const [strategySource, setStrategySource] = useState<StrategyPaperSource>("replay");
+  const [strategyUseAutotune, setStrategyUseAutotune] = useState<boolean>(false);
+  const [strategyAutotuneContext, setStrategyAutotuneContext] = useState<string>(
+    defaultAutotuneContext("5m")
+  );
+  const [strategyAutotuneLatest, setStrategyAutotuneLatest] = useState<Record<string, unknown> | null>(null);
+  const [strategyAutotuneHistory, setStrategyAutotuneHistory] = useState<Array<Record<string, unknown>>>([]);
+  const [strategyAutotuneLoading, setStrategyAutotuneLoading] = useState<boolean>(false);
   const [errorText, setErrorText] = useState<string>("");
   const [timeMode, setTimeMode] = useState<TimeMode>("local");
   const lastLiveTsRef = useRef<Record<MarketType, number>>({ "5m": 0, "15m": 0 });
@@ -1329,6 +1470,10 @@ export default function App() {
   useEffect(() => {
     accuracyTabRef.current = accuracyTab;
   }, [accuracyTab]);
+
+  useEffect(() => {
+    setStrategyAutotuneContext(defaultAutotuneContext(strategyMarketType));
+  }, [strategyMarketType]);
 
   const loadChartFor = useCallback(
     async (marketType: MarketType, windowType: WindowType) => {
@@ -1863,6 +2008,8 @@ export default function App() {
       try {
         const data = await getStrategyPaper(strategyMarketType, {
           ...STRATEGY_PAPER_PROFILE,
+          useAutotune: strategyUseAutotune,
+          autotuneContext: strategyAutotuneContext,
           source: strategySource,
           ...(strategySource === "live" ? STRATEGY_LIVE_PROFILE : {}),
         });
@@ -1888,7 +2035,49 @@ export default function App() {
       alive = false;
       window.clearInterval(id);
     };
-  }, [strategyMarketType, strategySource]);
+  }, [strategyAutotuneContext, strategyMarketType, strategySource, strategyUseAutotune]);
+
+  useEffect(() => {
+    let alive = true;
+    if (!strategyUseAutotune) {
+      setStrategyAutotuneLatest(null);
+      setStrategyAutotuneHistory([]);
+      setStrategyAutotuneLoading(false);
+      return () => {
+        alive = false;
+      };
+    }
+    const load = async () => {
+      setStrategyAutotuneLoading(true);
+      try {
+        const [latest, history] = await Promise.all([
+          getStrategyAutotuneLatest(strategyMarketType, strategyAutotuneContext),
+          getStrategyAutotuneHistory(strategyMarketType, strategyAutotuneContext, 20),
+        ]);
+        if (!alive) {
+          return;
+        }
+        setStrategyAutotuneLatest(latest.data ?? null);
+        setStrategyAutotuneHistory(history.items ?? []);
+      } catch (err) {
+        if (alive) {
+          setErrorText(err instanceof Error ? err.message : String(err));
+        }
+      } finally {
+        if (alive) {
+          setStrategyAutotuneLoading(false);
+        }
+      }
+    };
+    void load();
+    const id = window.setInterval(() => {
+      void load();
+    }, AUTOTUNE_POLL_MS);
+    return () => {
+      alive = false;
+      window.clearInterval(id);
+    };
+  }, [strategyAutotuneContext, strategyMarketType, strategyUseAutotune]);
 
   useEffect(() => {
     let alive = true;
@@ -2017,8 +2206,15 @@ export default function App() {
         timeMode={timeMode}
         marketType={strategyMarketType}
         source={strategySource}
+        autotuneEnabled={strategyUseAutotune}
+        autotuneContext={strategyAutotuneContext}
+        autotuneLatest={strategyAutotuneLatest}
+        autotuneHistory={strategyAutotuneHistory}
+        autotuneLoading={strategyAutotuneLoading}
         onMarketTypeChange={setStrategyMarketType}
         onSourceChange={setStrategySource}
+        onAutotuneToggle={setStrategyUseAutotune}
+        onAutotuneContextChange={setStrategyAutotuneContext}
       />
 
       <section className="panel">
