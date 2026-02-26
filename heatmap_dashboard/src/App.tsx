@@ -1100,7 +1100,6 @@ const StrategyPanel = memo(function StrategyPanel({
           <div className="autotune-meta">
             <span>source={data?.source ?? "--"}</span>
             <span>config={data?.config_source ?? "--"}</span>
-            <span>context={data?.autotune_context ?? `btcusdt:${marketType}`}</span>
             <span>activeKey={typeof data?.autotune_active_key === "string" ? data.autotune_active_key : "--"}</span>
           </div>
         </div>
