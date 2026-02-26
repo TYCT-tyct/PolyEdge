@@ -26,6 +26,8 @@ MAX_PRICE = 0.99
 TERMINAL_STATES = {"filled", "cancelled", "canceled", "rejected", "expired", "executed", "matched"}
 DEFAULT_FEE_RATE_BPS = int((os.environ.get("CLOB_FEE_RATE_BPS") or "1000").strip() or "1000")
 MIN_MARKETABLE_BUY_USDC = float((os.environ.get("CLOB_MIN_MARKETABLE_BUY_USDC") or "1.0").strip() or "1.0")
+MARKETABLE_BUY_BUFFER_TRIGGER_USDC = float((os.environ.get("CLOB_MARKETABLE_BUY_BUFFER_TRIGGER_USDC") or "1.0").strip() or "1.0")
+MARKETABLE_BUY_BUFFER_USDC = float((os.environ.get("CLOB_MARKETABLE_BUY_BUFFER_USDC") or "1.02").strip() or "1.02")
 MIN_ORDER_SIZE_SHARES = float((os.environ.get("CLOB_MIN_ORDER_SIZE_SHARES") or "5.0").strip() or "5.0")
 
 
@@ -316,6 +318,9 @@ def _build_order(payload: dict) -> Tuple[dict, Optional[str]]:
         size = float(payload.get("size"))
     except Exception:
         return {}, "invalid_price_or_size"
+    requested_price = price
+    requested_size = size
+    requested_notional = requested_size * requested_price
     if not (MIN_PRICE <= price <= MAX_PRICE):
         return {}, "price_out_of_range"
     if size <= 0.0:
@@ -334,9 +339,13 @@ def _build_order(payload: dict) -> Tuple[dict, Optional[str]]:
         price = _normalize_price(price * (1.0 + slip if side == BUY else 1.0 - slip))
     else:
         price = _normalize_price(price)
-    # For marketable BUY paths, Polymarket enforces a minimum notional amount.
-    if side == BUY and size * price < MIN_MARKETABLE_BUY_USDC:
-        size = round((MIN_MARKETABLE_BUY_USDC / max(price, MIN_PRICE)) + 1e-6, 4)
+    # For marketable BUY paths, apply a small notional buffer when request is around/below $1.
+    if side == BUY:
+        target_notional = MIN_MARKETABLE_BUY_USDC
+        if requested_notional <= MARKETABLE_BUY_BUFFER_TRIGGER_USDC:
+            target_notional = max(target_notional, MARKETABLE_BUY_BUFFER_USDC)
+        if size * price < target_notional:
+            size = round((target_notional / max(price, MIN_PRICE)) + 1e-6, 4)
     # Polymarket currently expects a market-specific fee rate (1000 for our target flow).
     # We keep this fixed to avoid exchange-side hard rejects from stale client payload values.
     fee_bps = DEFAULT_FEE_RATE_BPS
@@ -374,6 +383,10 @@ def _build_order(payload: dict) -> Tuple[dict, Optional[str]]:
         "timeout_ms": int(payload.get("cancel_after_ms") or 0),
         "cache_key": str(payload.get("cache_key") or "").strip(),
         "price": price,
+        "requested_price": requested_price,
+        "requested_size": requested_size,
+        "requested_notional": requested_notional,
+        "effective_notional": size * price,
         "fee_bps": fee_bps,
         "tif": tif_raw,
         "signed_order": signed,
@@ -465,6 +478,18 @@ def _order_response(started: float, payload_resp: dict, fallback_size: float, me
     if order_id:
         _track(order_id, meta.get("token_id", ""), meta.get("market_id", ""), meta.get("side", ""), source, int(meta.get("timeout_ms") or 0))
     _emit("order_submit", accepted=accepted, order_id=order_id, accepted_size=size, reject=reject, source=source)
+    requested_notional = meta.get("requested_notional")
+    if requested_notional is None:
+        try:
+            requested_notional = float(meta.get("requested_size")) * float(meta.get("requested_price"))
+        except Exception:
+            requested_notional = None
+    effective_notional = meta.get("effective_notional")
+    if effective_notional is None:
+        try:
+            effective_notional = float(meta.get("size")) * float(meta.get("price"))
+        except Exception:
+            effective_notional = None
     return JSONResponse(
         status_code=200,
         content={
@@ -472,6 +497,8 @@ def _order_response(started: float, payload_resp: dict, fallback_size: float, me
             "order_id": order_id,
             "accepted_size": float(size),
             "reject_code": reject,
+            "requested_notional": float(requested_notional) if requested_notional is not None else None,
+            "effective_notional": float(effective_notional) if effective_notional is not None else None,
             "exchange_latency_ms": float((time.perf_counter() - started) * 1000.0),
             "ts_ms": _ms_now(),
             "source": source,
