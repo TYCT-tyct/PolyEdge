@@ -336,7 +336,9 @@ def _build_order(payload: dict) -> Tuple[dict, Optional[str]]:
     # Polymarket currently expects a market-specific fee rate (1000 for our target flow).
     # We keep this fixed to avoid exchange-side hard rejects from stale client payload values.
     fee_bps = DEFAULT_FEE_RATE_BPS
-    nonce = int(payload.get("nonce") or time.time_ns())
+    # For proxy-wallet flow, arbitrary large nonces are frequently rejected.
+    # Default to 0 unless caller explicitly provides a nonce.
+    nonce = int(payload.get("nonce") or 0)
     expiration = _expiration_s(ttl_ms) if order_type == OrderType.GTD else 0
     client: Optional[ClobClient] = STATE["client"]
     if client is None:
