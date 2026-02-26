@@ -204,19 +204,19 @@ function computeChartLookbackMinutes(view: WindowType): number {
 function maxPointsForView(view: WindowType): number {
   switch (view) {
     case "5m":
-      return 2_500;
+      return 1_400;
     case "15m":
-      return 4_500;
+      return 2_200;
     case "30m":
-      return 6_500;
+      return 3_000;
     case "1h":
-      return 9_000;
+      return 4_200;
     case "2h":
-      return 12_000;
+      return 6_000;
     case "4h":
-      return 15_000;
+      return 8_000;
     default:
-      return 18_000;
+      return 12_000;
   }
 }
 

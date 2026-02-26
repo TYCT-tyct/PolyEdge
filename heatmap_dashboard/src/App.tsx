@@ -96,19 +96,19 @@ function windowToMinutes(view: WindowType): number {
 function maxLocalPointsForView(view: WindowType): number {
   switch (view) {
     case "5m":
-      return 3_500;
+      return 1_600;
     case "15m":
-      return 5_500;
+      return 2_400;
     case "30m":
-      return 7_500;
+      return 3_200;
     case "1h":
-      return 10_000;
+      return 4_500;
     case "2h":
-      return 14_000;
+      return 6_500;
     case "4h":
-      return 18_000;
+      return 8_500;
     default:
-      return 26_000;
+      return 12_000;
   }
 }
 
