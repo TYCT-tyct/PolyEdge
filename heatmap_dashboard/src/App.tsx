@@ -52,8 +52,10 @@ const WS_STALE_FALLBACK_MS = 3000;
 const LIVE_UI_MIN_INTERVAL_MS = 900;
 const ET_TIMEZONE = "America/New_York";
 const COLLECTOR_POLL_MS = 5_000;
-const STRATEGY_POLL_MS = 6_000;
-const AUTOTUNE_POLL_MS = 6_000;
+const STRATEGY_POLL_MIN_MS = 3_500;
+const STRATEGY_POLL_MAX_MS = 20_000;
+const AUTOTUNE_POLL_MIN_MS = 6_000;
+const AUTOTUNE_POLL_MAX_MS = 60_000;
 type StrategyPaperSource = "replay" | "live";
 const STRATEGY_PAPER_PROFILE = Object.freeze({
   lookbackMinutes: 6 * 60,
@@ -202,6 +204,67 @@ function finiteOrNull(v: number | null | undefined): number | null {
 
 function asFiniteNumber(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+function strategyPaperSignature(payload: StrategyPaperResponse): string {
+  const summary = payload.summary;
+  const current = payload.current;
+  const last = payload.trades[payload.trades.length - 1];
+  const liveState = payload.live_execution?.state_machine;
+  return [
+    payload.source ?? "",
+    payload.market_type,
+    payload.samples,
+    summary.trade_count,
+    summary.win_rate_pct.toFixed(4),
+    summary.total_pnl_cents.toFixed(4),
+    summary.net_pnl_cents.toFixed(4),
+    current?.round_id ?? "",
+    current?.timestamp_ms ?? 0,
+    current?.suggested_action ?? "",
+    last?.id ?? -1,
+    last?.exit_ts_ms ?? 0,
+    liveState?.state ?? "",
+    liveState?.updated_ts_ms ?? 0
+  ].join("|");
+}
+
+function autotuneTs(v: Record<string, unknown> | null | undefined): number {
+  if (!v) {
+    return 0;
+  }
+  const keys = ["saved_at_ms", "updated_at_ms", "created_at_ms", "ts_ms", "timestamp_ms"];
+  for (const key of keys) {
+    const n = asFiniteNumber(v[key]);
+    if (n != null) {
+      return n;
+    }
+  }
+  return 0;
+}
+
+function autotuneSource(v: Record<string, unknown> | null | undefined): string {
+  if (!v) {
+    return "";
+  }
+  const source = v.source;
+  return typeof source === "string" ? source : "";
+}
+
+function autotuneSignature(
+  latest: Record<string, unknown> | null,
+  history: Array<Record<string, unknown>>
+): string {
+  const head = history[0] ?? null;
+  const tail = history[history.length - 1] ?? null;
+  return [
+    autotuneTs(latest),
+    autotuneSource(latest),
+    history.length,
+    autotuneTs(head),
+    autotuneSource(head),
+    autotuneTs(tail)
+  ].join("|");
 }
 
 function quoteFromPreferredMid(
@@ -1455,6 +1518,13 @@ export default function App() {
   const chartReqSeqRef = useRef<Record<MarketType, number>>({ "5m": 0, "15m": 0 });
   const chartInFlightRef = useRef<Record<MarketType, boolean>>({ "5m": false, "15m": false });
   const strategyInFlightRef = useRef<boolean>(false);
+  const strategySigRef = useRef<string>("");
+  const strategyUnchangedRef = useRef<number>(0);
+  const strategyAutotuneInFlightRef = useRef<boolean>(false);
+  const strategyAutotuneSigRef = useRef<string>("");
+  const strategyAutotuneUnchangedRef = useRef<number>(0);
+  const strategyHasLoadedRef = useRef<boolean>(false);
+  const strategyAutotuneHasLoadedRef = useRef<boolean>(false);
   const stableLiveRef = useRef<Record<MarketType, LiveSnapshot | null>>({ "5m": null, "15m": null });
   const boundaryRefreshRef = useRef<Record<MarketType, number>>({ "5m": 0, "15m": 0 });
   const accuracyTabRef = useRef<MarketType>("5m");
@@ -2002,15 +2072,49 @@ export default function App() {
 
   useEffect(() => {
     let alive = true;
-    const load = async () => {
+    let timer: number | null = null;
+
+    const nextDelayMs = (changed: boolean): number => {
       if (document.visibilityState !== "visible") {
+        return STRATEGY_POLL_MAX_MS;
+      }
+      if (changed) {
+        strategyUnchangedRef.current = 0;
+        return STRATEGY_POLL_MIN_MS;
+      }
+      strategyUnchangedRef.current += 1;
+      return Math.min(
+        STRATEGY_POLL_MAX_MS,
+        STRATEGY_POLL_MIN_MS + strategyUnchangedRef.current * 2_000
+      );
+    };
+
+    const schedule = (delay: number) => {
+      if (!alive) {
+        return;
+      }
+      timer = window.setTimeout(() => {
+        void loop();
+      }, delay);
+    };
+
+    const loop = async () => {
+      if (!alive) {
+        return;
+      }
+      if (document.visibilityState !== "visible") {
+        schedule(STRATEGY_POLL_MAX_MS);
         return;
       }
       if (strategyInFlightRef.current) {
+        schedule(1_000);
         return;
       }
       strategyInFlightRef.current = true;
-      setStrategyLoading(true);
+      if (!strategyHasLoadedRef.current) {
+        setStrategyLoading(true);
+      }
+      let changed = false;
       try {
         const data = await getStrategyPaper(strategyMarketType, {
           ...STRATEGY_PAPER_PROFILE,
@@ -2020,7 +2124,14 @@ export default function App() {
           ...(strategySource === "live" ? STRATEGY_LIVE_PROFILE : {}),
         });
         if (alive) {
-          setStrategyPaper(data);
+          const nextSig = strategyPaperSignature(data);
+          changed = nextSig !== strategySigRef.current;
+          if (changed) {
+            strategySigRef.current = nextSig;
+            setStrategyPaper(data);
+          }
+          strategyHasLoadedRef.current = true;
+          setErrorText("");
         }
       } catch (err) {
         if (alive) {
@@ -2030,16 +2141,17 @@ export default function App() {
         strategyInFlightRef.current = false;
         if (alive) {
           setStrategyLoading(false);
+          schedule(nextDelayMs(changed));
         }
       }
     };
-    void load();
-    const id = window.setInterval(() => {
-      void load();
-    }, STRATEGY_POLL_MS);
+
+    void loop();
     return () => {
       alive = false;
-      window.clearInterval(id);
+      if (timer != null) {
+        window.clearTimeout(timer);
+      }
     };
   }, [strategyAutotuneContext, strategyMarketType, strategySource, strategyUseAutotune]);
 
@@ -2049,15 +2161,54 @@ export default function App() {
       setStrategyAutotuneLatest(null);
       setStrategyAutotuneHistory([]);
       setStrategyAutotuneLoading(false);
+      strategyAutotuneHasLoadedRef.current = false;
       return () => {
         alive = false;
       };
     }
-    const load = async () => {
+    let timer: number | null = null;
+
+    const nextDelayMs = (changed: boolean): number => {
       if (document.visibilityState !== "visible") {
+        return AUTOTUNE_POLL_MAX_MS;
+      }
+      if (changed) {
+        strategyAutotuneUnchangedRef.current = 0;
+        return AUTOTUNE_POLL_MIN_MS;
+      }
+      strategyAutotuneUnchangedRef.current += 1;
+      return Math.min(
+        AUTOTUNE_POLL_MAX_MS,
+        AUTOTUNE_POLL_MIN_MS + strategyAutotuneUnchangedRef.current * 6_000
+      );
+    };
+
+    const schedule = (delay: number) => {
+      if (!alive) {
         return;
       }
-      setStrategyAutotuneLoading(true);
+      timer = window.setTimeout(() => {
+        void loop();
+      }, delay);
+    };
+
+    const loop = async () => {
+      if (!alive) {
+        return;
+      }
+      if (document.visibilityState !== "visible") {
+        schedule(AUTOTUNE_POLL_MAX_MS);
+        return;
+      }
+      if (strategyAutotuneInFlightRef.current) {
+        schedule(1_500);
+        return;
+      }
+      strategyAutotuneInFlightRef.current = true;
+      if (!strategyAutotuneHasLoadedRef.current) {
+        setStrategyAutotuneLoading(true);
+      }
+      let changed = false;
       try {
         const [latest, history] = await Promise.all([
           getStrategyAutotuneLatest(strategyMarketType, strategyAutotuneContext),
@@ -2066,25 +2217,35 @@ export default function App() {
         if (!alive) {
           return;
         }
-        setStrategyAutotuneLatest(latest.data ?? null);
-        setStrategyAutotuneHistory(history.items ?? []);
+        const latestData = latest.data ?? null;
+        const historyItems = history.items ?? [];
+        const nextSig = autotuneSignature(latestData, historyItems);
+        changed = nextSig !== strategyAutotuneSigRef.current;
+        if (changed) {
+          strategyAutotuneSigRef.current = nextSig;
+          setStrategyAutotuneLatest(latestData);
+          setStrategyAutotuneHistory(historyItems);
+        }
+        strategyAutotuneHasLoadedRef.current = true;
       } catch (err) {
         if (alive) {
           setErrorText(err instanceof Error ? err.message : String(err));
         }
       } finally {
+        strategyAutotuneInFlightRef.current = false;
         if (alive) {
           setStrategyAutotuneLoading(false);
+          schedule(nextDelayMs(changed));
         }
       }
     };
-    void load();
-    const id = window.setInterval(() => {
-      void load();
-    }, AUTOTUNE_POLL_MS);
+
+    void loop();
     return () => {
       alive = false;
-      window.clearInterval(id);
+      if (timer != null) {
+        window.clearTimeout(timer);
+      }
     };
   }, [strategyAutotuneContext, strategyMarketType, strategyUseAutotune]);
 
