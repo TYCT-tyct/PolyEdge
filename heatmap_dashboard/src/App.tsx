@@ -52,12 +52,12 @@ const WS_STALE_FALLBACK_MS = 3000;
 const LIVE_UI_MIN_INTERVAL_MS = 900;
 const ET_TIMEZONE = "America/New_York";
 const COLLECTOR_POLL_MS = 5_000;
-const STRATEGY_POLL_MS = 5_000;
+const STRATEGY_POLL_MS = 6_000;
 const AUTOTUNE_POLL_MS = 6_000;
 type StrategyPaperSource = "replay" | "live";
 const STRATEGY_PAPER_PROFILE = Object.freeze({
-  lookbackMinutes: 24 * 60,
-  maxTrades: 320,
+  lookbackMinutes: 6 * 60,
+  maxTrades: 180,
   fullHistory: false,
   useAutotune: false
 });
@@ -2000,6 +2000,9 @@ export default function App() {
   useEffect(() => {
     let alive = true;
     const load = async () => {
+      if (document.visibilityState !== "visible") {
+        return;
+      }
       if (strategyInFlightRef.current) {
         return;
       }
