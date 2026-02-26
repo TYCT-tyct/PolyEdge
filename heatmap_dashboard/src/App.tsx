@@ -913,6 +913,11 @@ const StrategyPanel = memo(function StrategyPanel({
   }, [autotuneLatest]);
   const liveExec = data?.live_execution;
   const liveState = liveExec?.state_machine;
+  const liveCapital = liveExec?.capital;
+  const capitalState =
+    liveCapital?.state && typeof liveCapital.state === "object"
+      ? (liveCapital.state as Record<string, unknown>)
+      : null;
   const liveOrders = liveExec?.execution?.orders ?? [];
   const liveEvents = (liveExec?.events ?? []) as Array<Record<string, unknown>>;
   const parity = liveExec?.parity_check;
@@ -921,11 +926,19 @@ const StrategyPanel = memo(function StrategyPanel({
     parity?.paper?.decision_count ?? parity?.paper?.decisions ?? 0;
   const parityPaperEntry =
     parity?.paper?.entry_count ?? parity?.paper?.entries ?? 0;
+  const parityPaperAdd = parity?.paper?.add_count ?? 0;
+  const parityPaperReduce = parity?.paper?.reduce_count ?? 0;
   const parityPaperExit =
     parity?.paper?.exit_count ?? parity?.paper?.exits ?? 0;
   const parityLiveSubmitEntry = isLiveDryRun
     ? parity?.live?.simulated_submitted_entry_count ?? 0
     : parity?.live?.submitted_entry_count ?? parity?.live?.entries?.submitted ?? 0;
+  const parityLiveSubmitAdd = isLiveDryRun
+    ? parity?.live?.simulated_submitted_add_count ?? 0
+    : parity?.live?.submitted_add_count ?? 0;
+  const parityLiveSubmitReduce = isLiveDryRun
+    ? parity?.live?.simulated_submitted_reduce_count ?? 0
+    : parity?.live?.submitted_reduce_count ?? 0;
   const parityLiveSubmitExit = isLiveDryRun
     ? parity?.live?.simulated_submitted_exit_count ?? 0
     : parity?.live?.submitted_exit_count ?? parity?.live?.exits?.submitted ?? 0;
@@ -971,6 +984,15 @@ const StrategyPanel = memo(function StrategyPanel({
     : 0;
   const liveAcceptedRate =
     !isLiveDryRun && liveSubmittedTotal > 0 ? (parityLiveAccepted / liveSubmittedTotal) * 100 : 0;
+  const riskState = typeof capitalState?.risk_state === "string" ? capitalState.risk_state : "--";
+  const dynamicQuote = asFiniteNumber(liveCapital?.dynamic_quote_usdc);
+  const availableToTrade = asFiniteNumber(capitalState?.available_to_trade_usdc);
+  const reservedPending = asFiniteNumber(capitalState?.reserved_pending_usdc);
+  const equityEstimate = asFiniteNumber(capitalState?.equity_estimate_usdc);
+  const utilizationPct = asFiniteNumber(capitalState?.utilization_ratio);
+  const tuneFactor = asFiniteNumber(capitalState?.tune_factor);
+  const capitalSkipped = asFiniteNumber(liveCapital?.capital_skipped_count) ?? 0;
+  const openPendingOrders = asFiniteNumber(liveCapital?.open_pending_orders) ?? 0;
   const parityRows = [
     { label: "Paper信号", value: parityPaperDecisionCount },
     { label: "门禁通过", value: liveExec?.gated?.selected_count ?? 0 },
@@ -1002,7 +1024,7 @@ const StrategyPanel = memo(function StrategyPanel({
       <header className="panel-head">
         <div>
           <h2>策略 Paper（{marketType} 全时段）</h2>
-          <p className="muted">单模型双向策略：自动判断 UP/DOWN，只验证入场与出场，不做加仓和反向。</p>
+          <p className="muted">单模型双向策略：自动判断 UP/DOWN，支持入仓、加仓、减仓与出场的全自动执行。</p>
         </div>
         <div className="panel-actions">
           <div className="btn-group">
@@ -1202,8 +1224,8 @@ const StrategyPanel = memo(function StrategyPanel({
                 {liveState?.side ? ` · ${liveState.side}` : ""}
               </strong>
               <small>
-                入场 {liveState?.entry_price_cents != null ? `${liveState.entry_price_cents.toFixed(2)}¢` : "--"} ·
-                轮次 {liveState?.entry_round_id ?? "--"}
+                均价 {liveState?.vwap_entry_cents != null ? `${liveState.vwap_entry_cents.toFixed(2)}¢` : liveState?.entry_price_cents != null ? `${liveState.entry_price_cents.toFixed(2)}¢` : "--"} ·
+                净仓 {liveState?.net_quote_usdc != null ? `$${liveState.net_quote_usdc.toFixed(2)}` : "--"}
               </small>
             </article>
             <article className="info-card">
@@ -1214,7 +1236,7 @@ const StrategyPanel = memo(function StrategyPanel({
               <small>
                 {isLiveDryRun
                   ? `模拟提交 ${liveSubmittedTotal} · 非真实成交`
-                  : `提交 ${liveSubmittedTotal} · 接受 ${parityLiveAccepted} · 拒绝 ${parityLiveRejected}`}
+                  : `提交 ${liveSubmittedTotal} · 接受 ${parityLiveAccepted} · 拒绝 ${parityLiveRejected} · 风险拦截 ${capitalSkipped}`}
               </small>
             </article>
             <article className="info-card">
@@ -1223,7 +1245,26 @@ const StrategyPanel = memo(function StrategyPanel({
                 {parity?.status ?? "--"}
               </strong>
               <small>
-                Paper 入/出 {parityPaperEntry}/{parityPaperExit} · Live 入/出 {parityLiveSubmitEntry}/{parityLiveSubmitExit}
+                Paper 入/加/减/出 {parityPaperEntry}/{parityPaperAdd}/{parityPaperReduce}/{parityPaperExit} ·
+                Live 入/加/减/出 {parityLiveSubmitEntry}/{parityLiveSubmitAdd}/{parityLiveSubmitReduce}/{parityLiveSubmitExit}
+              </small>
+            </article>
+            <article className="info-card">
+              <span>资金引擎</span>
+              <strong className={riskState === "normal" ? "up" : riskState === "caution" ? "warn" : "down"}>
+                {riskState.toUpperCase()}
+              </strong>
+              <small>
+                动态单笔 {dynamicQuote != null ? `$${dynamicQuote.toFixed(2)}` : "--"} · 可用 {availableToTrade != null ? `$${availableToTrade.toFixed(2)}` : "--"}
+              </small>
+            </article>
+            <article className="info-card">
+              <span>资金利用率</span>
+              <strong>
+                {utilizationPct != null ? `${(utilizationPct * 100).toFixed(1)}%` : "--"}
+              </strong>
+              <small>
+                估算权益 {equityEstimate != null ? `$${equityEstimate.toFixed(2)}` : "--"} · 挂单占用 {reservedPending != null ? `$${reservedPending.toFixed(2)}` : "--"} · 未完成订单 {openPendingOrders.toFixed(0)} · 调优系数 {tuneFactor != null ? tuneFactor.toFixed(2) : "--"}
               </small>
             </article>
           </div>

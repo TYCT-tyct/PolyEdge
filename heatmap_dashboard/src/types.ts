@@ -206,7 +206,7 @@ export interface StrategyLiveDecision {
   decision_id?: string;
   ts_ms?: number;
   round_id?: string;
-  action?: "enter" | "exit" | string;
+  action?: "enter" | "add" | "reduce" | "exit" | string;
   side?: "UP" | "DOWN" | string;
   price_cents?: number;
   quote_size_usdc?: number;
@@ -233,10 +233,16 @@ export interface StrategyLivePositionState {
   entry_ts_ms?: number | null;
   entry_price_cents?: number | null;
   entry_quote_usdc?: number | null;
+  net_quote_usdc?: number;
+  vwap_entry_cents?: number | null;
   last_action?: string | null;
   last_reason?: string | null;
   total_entries?: number;
+  total_adds?: number;
+  total_reduces?: number;
   total_exits?: number;
+  realized_pnl_usdc?: number;
+  last_fill_pnl_usdc?: number;
   updated_ts_ms?: number;
 }
 
@@ -300,14 +306,20 @@ export interface StrategyPaperResponse {
       paper?: {
         decision_count?: number;
         entry_count?: number;
+        add_count?: number;
+        reduce_count?: number;
         exit_count?: number;
       };
       live?: {
         submitted_count?: number;
         submitted_entry_count?: number;
+        submitted_add_count?: number;
+        submitted_reduce_count?: number;
         submitted_exit_count?: number;
         simulated_submitted_count?: number;
         simulated_submitted_entry_count?: number;
+        simulated_submitted_add_count?: number;
+        simulated_submitted_reduce_count?: number;
         simulated_submitted_exit_count?: number;
         accepted_count?: number;
         rejected_count?: number;
@@ -332,6 +344,35 @@ export interface StrategyPaperResponse {
       entry_slippage_bps?: number;
       exit_slippage_bps?: number;
       min_quote_usdc?: number;
+    };
+    capital?: {
+      auto_enabled?: boolean;
+      dynamic_quote_usdc?: number;
+      base_quote_usdc?: number;
+      target_utilization?: number;
+      reserve_usdc?: number;
+      small_threshold_usdc?: number;
+      max_add_layers?: number;
+      available_after_capital_guard_usdc?: number;
+      capital_skipped_count?: number;
+      open_pending_orders?: number;
+      state?: {
+        market_type?: string;
+        equity_base_usdc?: number;
+        equity_estimate_usdc?: number;
+        max_equity_usdc?: number;
+        realized_pnl_usdc?: number;
+        reserved_pending_usdc?: number;
+        available_to_trade_usdc?: number;
+        utilization_ratio?: number;
+        tune_factor?: number;
+        risk_state?: string;
+        consecutive_wins?: number;
+        consecutive_losses?: number;
+        last_realized_pnl_usdc?: number;
+        last_quote_usdc?: number;
+        updated_ts_ms?: number;
+      };
     };
     execution?: {
       mode?: "dry_run" | "real_gateway" | string;
