@@ -39,6 +39,10 @@ Optional tuning:
 - `CLOB_ORDER_TIMEOUT_MS` (default `6500`)
 - `CLOB_ORDER_POLL_INTERVAL_MS` (default `700`)
 - `CLOB_ORDER_WATCH_INTERVAL_MS` (default `220`)
+- `CLOB_MARKET_META_TTL_MS` (default `1500`) market rules/orderbook cache TTL
+- `CLOB_MIN_ORDER_SIZE_SHARES` (default `1.0`) fallback only when market meta unavailable
+- `CLOB_ENFORCE_MARKETABLE_BUY_MIN=true|false` (default `false`) enforce notional floor for buy orders
+- `CLOB_FEE_RATE_BPS` (default `1000`) fallback fee rate, overridden by market fee lookup when available
 
 ## Run (dev)
 

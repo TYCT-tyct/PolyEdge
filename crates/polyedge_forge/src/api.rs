@@ -124,11 +124,21 @@ impl LiveRuntimeConfig {
     fn from_env() -> Self {
         let enabled = std::env::var("FORGE_FEV1_RUNTIME_ENABLED")
             .ok()
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
             .unwrap_or(true);
         let live_execute = std::env::var("FORGE_FEV1_LIVE_EXECUTE")
             .ok()
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
             .unwrap_or(false);
         let loop_interval_ms = std::env::var("FORGE_FEV1_RUNTIME_LOOP_MS")
             .ok()
@@ -157,7 +167,12 @@ impl LiveRuntimeConfig {
             .clamp(1, 6);
         let entry_only = std::env::var("FORGE_FEV1_RUNTIME_ENTRY_ONLY")
             .ok()
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
             .unwrap_or(true);
         let quote_usdc = std::env::var("FORGE_FEV1_RUNTIME_QUOTE_USDC")
             .ok()
@@ -592,8 +607,14 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         .route("/api/strategy/paper", get(strategy_paper))
         .route("/api/strategy/full", get(strategy_full))
         .route("/api/strategy/optimize", get(strategy_optimize))
-        .route("/api/strategy/autotune/latest", get(strategy_autotune_latest))
-        .route("/api/strategy/autotune/history", get(strategy_autotune_history))
+        .route(
+            "/api/strategy/autotune/latest",
+            get(strategy_autotune_latest),
+        )
+        .route(
+            "/api/strategy/autotune/history",
+            get(strategy_autotune_history),
+        )
         .route("/api/strategy/autotune/set", post(strategy_autotune_set))
         .route("/api/strategy/live/reset", post(strategy_live_reset))
         .with_state(state.clone());
@@ -648,7 +669,10 @@ fn start_live_runtime(state: ApiState) {
     });
 }
 
-async fn restore_live_runtime_state(state: &ApiState, cfg: &LiveRuntimeConfig) -> Result<(), ApiError> {
+async fn restore_live_runtime_state(
+    state: &ApiState,
+    cfg: &LiveRuntimeConfig,
+) -> Result<(), ApiError> {
     for market in &cfg.markets {
         let key = live_position_state_key(&state.redis_prefix, market);
         if let Some(v) = read_key_value(state, &key).await? {
@@ -682,7 +706,13 @@ async fn persist_live_runtime_state(state: &ApiState, market_type: &str) {
 
     let pending_rows = state.list_pending_orders().await;
     let pending_key = live_pending_orders_key(&state.redis_prefix);
-    let _ = write_key_value(state, &pending_key, &json!(pending_rows), Some(2 * 24 * 3600)).await;
+    let _ = write_key_value(
+        state,
+        &pending_key,
+        &json!(pending_rows),
+        Some(2 * 24 * 3600),
+    )
+    .await;
 
     let seq = state.get_gateway_report_seq().await;
     let seq_key = live_gateway_seq_key(&state.redis_prefix);
@@ -2312,7 +2342,6 @@ impl Default for StrategyRuntimeConfig {
     }
 }
 
-
 fn parse_strategy_rows(rows: Vec<Value>) -> Vec<StrategySample> {
     let mut out = Vec::<StrategySample>::new();
     for row in rows {
@@ -2593,7 +2622,10 @@ fn strategy_cfg_json(cfg: &StrategyRuntimeConfig) -> Value {
     })
 }
 
-fn strategy_cfg_from_payload(base: StrategyRuntimeConfig, payload: &Value) -> StrategyRuntimeConfig {
+fn strategy_cfg_from_payload(
+    base: StrategyRuntimeConfig,
+    payload: &Value,
+) -> StrategyRuntimeConfig {
     let mut c = base;
     if let Some(v) = payload
         .get("config")
@@ -2807,17 +2839,10 @@ async fn strategy_paper_live(
         live_max_orders.max(1),
         live_entry_only,
     );
-    let (gated_decisions, skipped_decisions, mut live_position_state) = gate_live_decisions(
-        state,
-        market_type,
-        &selected_decisions,
-        live_execute,
-    )
-    .await;
-    let submitted_decisions: Vec<Value> = gated_decisions
-        .iter()
-        .map(|v| v.decision.clone())
-        .collect();
+    let (gated_decisions, skipped_decisions, mut live_position_state) =
+        gate_live_decisions(state, market_type, &selected_decisions, live_execute).await;
+    let submitted_decisions: Vec<Value> =
+        gated_decisions.iter().map(|v| v.decision.clone()).collect();
 
     let live_exec_payload = if live_execute {
         match live_market.as_ref() {
@@ -2967,20 +2992,40 @@ async fn strategy_paper_live(
     let paper_entry_count = dual
         .decisions
         .iter()
-        .filter(|d| d.get("action").and_then(Value::as_str).map(|v| v.eq_ignore_ascii_case("enter")).unwrap_or(false))
+        .filter(|d| {
+            d.get("action")
+                .and_then(Value::as_str)
+                .map(|v| v.eq_ignore_ascii_case("enter"))
+                .unwrap_or(false)
+        })
         .count();
     let paper_exit_count = dual
         .decisions
         .iter()
-        .filter(|d| d.get("action").and_then(Value::as_str).map(|v| v.eq_ignore_ascii_case("exit")).unwrap_or(false))
+        .filter(|d| {
+            d.get("action")
+                .and_then(Value::as_str)
+                .map(|v| v.eq_ignore_ascii_case("exit"))
+                .unwrap_or(false)
+        })
         .count();
     let submitted_entry_count = submitted_decisions
         .iter()
-        .filter(|d| d.get("action").and_then(Value::as_str).map(|v| v.eq_ignore_ascii_case("enter")).unwrap_or(false))
+        .filter(|d| {
+            d.get("action")
+                .and_then(Value::as_str)
+                .map(|v| v.eq_ignore_ascii_case("enter"))
+                .unwrap_or(false)
+        })
         .count();
     let submitted_exit_count = submitted_decisions
         .iter()
-        .filter(|d| d.get("action").and_then(Value::as_str).map(|v| v.eq_ignore_ascii_case("exit")).unwrap_or(false))
+        .filter(|d| {
+            d.get("action")
+                .and_then(Value::as_str)
+                .map(|v| v.eq_ignore_ascii_case("exit"))
+                .unwrap_or(false)
+        })
         .count();
     let (gateway_accept_count_raw, gateway_reject_count_raw) = live_exec_payload
         .get("orders")
@@ -2994,8 +3039,16 @@ async fn strategy_paper_live(
             (accepted, rejected)
         })
         .unwrap_or((0, 0));
-    let gateway_accept_count = if live_execute { gateway_accept_count_raw } else { 0 };
-    let gateway_reject_count = if live_execute { gateway_reject_count_raw } else { 0 };
+    let gateway_accept_count = if live_execute {
+        gateway_accept_count_raw
+    } else {
+        0
+    };
+    let gateway_reject_count = if live_execute {
+        gateway_reject_count_raw
+    } else {
+        0
+    };
     let no_live_market_target = live_exec_payload
         .get("error")
         .and_then(Value::as_str)
@@ -3038,15 +3091,31 @@ async fn strategy_paper_live(
     } else {
         0
     };
-    let live_submitted_entry_count = if live_execute { submitted_entry_count } else { 0 };
-    let live_submitted_exit_count = if live_execute { submitted_exit_count } else { 0 };
+    let live_submitted_entry_count = if live_execute {
+        submitted_entry_count
+    } else {
+        0
+    };
+    let live_submitted_exit_count = if live_execute {
+        submitted_exit_count
+    } else {
+        0
+    };
     let simulated_submitted_count = if live_execute {
         0
     } else {
         submitted_decisions.len()
     };
-    let simulated_submitted_entry_count = if live_execute { 0 } else { submitted_entry_count };
-    let simulated_submitted_exit_count = if live_execute { 0 } else { submitted_exit_count };
+    let simulated_submitted_entry_count = if live_execute {
+        0
+    } else {
+        submitted_entry_count
+    };
+    let simulated_submitted_exit_count = if live_execute {
+        0
+    } else {
+        submitted_exit_count
+    };
 
     let parity_check = json!({
         "status": status,
@@ -3219,7 +3288,10 @@ fn live_decision_key(market_type: &str, decision: &Value) -> String {
         .get("round_id")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let ts = decision.get("ts_ms").and_then(Value::as_i64).unwrap_or_default();
+    let ts = decision
+        .get("ts_ms")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
     let price_cents = decision
         .get("price_cents")
         .and_then(Value::as_f64)
@@ -3447,10 +3519,26 @@ fn decision_to_live_payload(
         .unwrap_or_default()
         .to_ascii_uppercase();
     let (gateway_side, token_id, max_slippage_bps) = match (action.as_str(), side.as_str()) {
-        ("enter", "UP") => ("buy_yes", target.token_id_yes.as_str(), gateway_cfg.entry_slippage_bps),
-        ("exit", "UP") => ("sell_yes", target.token_id_yes.as_str(), gateway_cfg.exit_slippage_bps),
-        ("enter", "DOWN") => ("buy_no", target.token_id_no.as_str(), gateway_cfg.entry_slippage_bps),
-        ("exit", "DOWN") => ("sell_no", target.token_id_no.as_str(), gateway_cfg.exit_slippage_bps),
+        ("enter", "UP") => (
+            "buy_yes",
+            target.token_id_yes.as_str(),
+            gateway_cfg.entry_slippage_bps,
+        ),
+        ("exit", "UP") => (
+            "sell_yes",
+            target.token_id_yes.as_str(),
+            gateway_cfg.exit_slippage_bps,
+        ),
+        ("enter", "DOWN") => (
+            "buy_no",
+            target.token_id_no.as_str(),
+            gateway_cfg.entry_slippage_bps,
+        ),
+        ("exit", "DOWN") => (
+            "sell_no",
+            target.token_id_no.as_str(),
+            gateway_cfg.exit_slippage_bps,
+        ),
         _ => return None,
     };
     let mut price_cents = decision
@@ -3467,8 +3555,41 @@ fn decision_to_live_payload(
         .and_then(Value::as_f64)
         .unwrap_or(gateway_cfg.min_quote_usdc)
         .max(gateway_cfg.min_quote_usdc);
-    let size = (quote_size / price).max(5.0);
-    let ttl_ms = if action == "exit" { 900 } else { 1400 };
+    let size = (quote_size / price).max(0.01);
+    let tif = decision
+        .get("tif")
+        .and_then(Value::as_str)
+        .map(|v| v.trim().to_ascii_uppercase())
+        .filter(|v| matches!(v.as_str(), "FAK" | "FOK" | "GTC" | "GTD" | "POST_ONLY"))
+        .unwrap_or_else(|| {
+            if action == "exit" {
+                "FAK".to_string()
+            } else {
+                "FAK".to_string()
+            }
+        });
+    let style = decision
+        .get("style")
+        .and_then(Value::as_str)
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| matches!(v.as_str(), "maker" | "taker"))
+        .unwrap_or_else(|| {
+            if tif == "GTC" || tif == "GTD" || tif == "POST_ONLY" {
+                "maker".to_string()
+            } else {
+                "taker".to_string()
+            }
+        });
+    let ttl_ms = decision
+        .get("ttl_ms")
+        .and_then(Value::as_i64)
+        .unwrap_or(if action == "exit" { 900 } else { 1400 })
+        .clamp(300, 30_000);
+    let max_slippage_bps = decision
+        .get("max_slippage_bps")
+        .and_then(Value::as_f64)
+        .unwrap_or(max_slippage_bps)
+        .clamp(0.0, 500.0);
     let cache_key = format!(
         "fev1:{}:{}:{}:{:.4}:{:.4}",
         target.market_id, gateway_side, action, price, size
@@ -3479,11 +3600,13 @@ fn decision_to_live_payload(
         "side": gateway_side,
         "price": price,
         "size": size,
-        "tif": "FAK",
-        "style": "taker",
+        "tif": tif,
+        "style": style,
         "ttl_ms": ttl_ms,
         "max_slippage_bps": max_slippage_bps,
-        "cache_key": cache_key
+        "cache_key": cache_key,
+        "action": action,
+        "signal_side": side
     }))
 }
 
@@ -3493,7 +3616,11 @@ async fn post_gateway(
     path: &str,
     payload: &Value,
 ) -> Result<Value, String> {
-    let url = format!("{}/{}", endpoint.trim_end_matches('/'), path.trim_start_matches('/'));
+    let url = format!(
+        "{}/{}",
+        endpoint.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
     let resp = client
         .post(&url)
         .header("content-type", "application/json")
@@ -3509,6 +3636,90 @@ async fn post_gateway(
     } else {
         Err(format!("status_{}:{}", status.as_u16(), parsed))
     }
+}
+
+async fn submit_gateway_order(
+    client: &reqwest::Client,
+    gateway_cfg: &LiveGatewayConfig,
+    payload: &Value,
+) -> (Result<Value, String>, String) {
+    let mut used_endpoint = gateway_cfg.primary_url.clone();
+    let _ = post_gateway(client, &gateway_cfg.primary_url, "/prebuild_order", payload).await;
+    let mut result = post_gateway(client, &gateway_cfg.primary_url, "/orders", payload).await;
+    if result.is_err() {
+        if let Some(backup) = gateway_cfg.backup_url.as_deref() {
+            used_endpoint = backup.to_string();
+            let _ = post_gateway(client, backup, "/prebuild_order", payload).await;
+            result = post_gateway(client, backup, "/orders", payload).await;
+        }
+    }
+    (result, used_endpoint)
+}
+
+fn extract_gateway_reject_reason(payload: &Value) -> String {
+    payload
+        .get("reject_code")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("error").and_then(Value::as_str))
+        .or_else(|| payload.get("reason").and_then(Value::as_str))
+        .unwrap_or("unknown_reject")
+        .to_string()
+}
+
+fn can_retry_on_liquidity(reason: &str) -> bool {
+    let r = reason.to_ascii_lowercase();
+    r.contains("no orders found to match")
+        || r.contains("insufficient liquidity")
+        || r.contains("cannot be matched")
+        || r.contains("would not fill")
+}
+
+fn build_retry_payload(current: &Value, reason: &str, attempt: usize) -> Option<Value> {
+    if attempt >= 2 || !can_retry_on_liquidity(reason) {
+        return None;
+    }
+    let action = current
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mut next = current.clone();
+    let current_slippage = current
+        .get("max_slippage_bps")
+        .and_then(Value::as_f64)
+        .unwrap_or(20.0)
+        .clamp(0.0, 500.0);
+    let current_ttl = current
+        .get("ttl_ms")
+        .and_then(Value::as_i64)
+        .unwrap_or(1200)
+        .clamp(300, 30_000);
+
+    if attempt == 0 {
+        let boosted_slippage = if action == "exit" {
+            (current_slippage + 16.0).min(120.0)
+        } else {
+            (current_slippage + 12.0).min(90.0)
+        };
+        if let Some(obj) = next.as_object_mut() {
+            obj.insert("max_slippage_bps".to_string(), json!(boosted_slippage));
+            obj.insert("ttl_ms".to_string(), json!((current_ttl + 400).min(5_000)));
+            obj.insert("retry_tag".to_string(), json!("slippage_retry"));
+        }
+        return Some(next);
+    }
+
+    if action == "enter" {
+        if let Some(obj) = next.as_object_mut() {
+            obj.insert("tif".to_string(), json!("GTD"));
+            obj.insert("style".to_string(), json!("maker"));
+            obj.insert("ttl_ms".to_string(), json!(2_400));
+            obj.insert("retry_tag".to_string(), json!("maker_fallback"));
+        }
+        return Some(next);
+    }
+
+    None
 }
 
 async fn get_gateway_reports(
@@ -3572,14 +3783,14 @@ fn extract_order_id_from_gateway_record(row: &Value) -> Option<String> {
                 .and_then(|v| v.get("id").and_then(Value::as_str))
                 .map(str::to_string)
         })
-        .or_else(|| row.get("order_id").and_then(Value::as_str).map(str::to_string))
+        .or_else(|| {
+            row.get("order_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
 }
 
-async fn apply_pending_confirmation(
-    state: &ApiState,
-    pending: &LivePendingOrder,
-    reason: &str,
-) {
+async fn apply_pending_confirmation(state: &ApiState, pending: &LivePendingOrder, reason: &str) {
     let now_ms = Utc::now().timestamp_millis();
     let mut ps = state.get_live_position_state(&pending.market_type).await;
     if pending.action == "enter" {
@@ -3602,14 +3813,12 @@ async fn apply_pending_confirmation(
     ps.last_action = Some(format!("{}_{}", pending.action, pending.side));
     ps.last_reason = Some(reason.to_string());
     ps.updated_ts_ms = now_ms;
-    state.put_live_position_state(&pending.market_type, ps).await;
+    state
+        .put_live_position_state(&pending.market_type, ps)
+        .await;
 }
 
-async fn apply_pending_revert(
-    state: &ApiState,
-    pending: &LivePendingOrder,
-    reason: &str,
-) {
+async fn apply_pending_revert(state: &ApiState, pending: &LivePendingOrder, reason: &str) {
     let now_ms = Utc::now().timestamp_millis();
     let mut ps = state.get_live_position_state(&pending.market_type).await;
     if pending.action == "enter" {
@@ -3628,7 +3837,9 @@ async fn apply_pending_revert(
     ps.last_action = Some(format!("{}_{}", pending.action, pending.side));
     ps.last_reason = Some(reason.to_string());
     ps.updated_ts_ms = now_ms;
-    state.put_live_position_state(&pending.market_type, ps).await;
+    state
+        .put_live_position_state(&pending.market_type, ps)
+        .await;
 }
 
 async fn reconcile_gateway_reports(state: &ApiState, gateway_cfg: &LiveGatewayConfig) {
@@ -3833,40 +4044,76 @@ async fn execute_live_orders_via_gateway(
             }));
             continue;
         };
-        let _ = post_gateway(&client, &gateway_cfg.primary_url, "/prebuild_order", &payload).await;
-        let mut result = post_gateway(&client, &gateway_cfg.primary_url, "/orders", &payload).await;
-        let mut used_endpoint = gateway_cfg.primary_url.clone();
-        if result.is_err() {
-            if let Some(backup) = gateway_cfg.backup_url.as_deref() {
-                let _ = post_gateway(&client, backup, "/prebuild_order", &payload).await;
-                result = post_gateway(&client, backup, "/orders", &payload).await;
-                used_endpoint = backup.to_string();
+        let mut attempt_payload = payload.clone();
+        let mut attempts = Vec::<Value>::new();
+        let mut accepted = false;
+        let mut final_endpoint = gateway_cfg.primary_url.clone();
+        let mut final_response: Option<Value> = None;
+        let mut final_error: Option<String> = None;
+
+        for attempt in 0..3usize {
+            let (result, used_endpoint) =
+                submit_gateway_order(&client, gateway_cfg, &attempt_payload).await;
+            final_endpoint = used_endpoint.clone();
+            match result {
+                Ok(v) => {
+                    let accept = v.get("accepted").and_then(Value::as_bool).unwrap_or(false);
+                    let reject_reason = if accept {
+                        String::new()
+                    } else {
+                        extract_gateway_reject_reason(&v)
+                    };
+                    attempts.push(json!({
+                        "attempt": attempt + 1,
+                        "endpoint": used_endpoint,
+                        "request": attempt_payload.clone(),
+                        "accepted": accept,
+                        "reject_reason": if reject_reason.is_empty() { Value::Null } else { json!(reject_reason.clone()) },
+                        "response": v
+                    }));
+                    final_response = Some(v.clone());
+                    if accept {
+                        accepted = true;
+                        break;
+                    }
+                    if let Some(next_payload) =
+                        build_retry_payload(&attempt_payload, &reject_reason, attempt)
+                    {
+                        attempt_payload = next_payload;
+                        continue;
+                    }
+                    break;
+                }
+                Err(err) => {
+                    attempts.push(json!({
+                        "attempt": attempt + 1,
+                        "endpoint": used_endpoint,
+                        "request": attempt_payload.clone(),
+                        "accepted": false,
+                        "error": err
+                    }));
+                    final_error = Some(err.clone());
+                    if let Some(next_payload) = build_retry_payload(&attempt_payload, &err, attempt)
+                    {
+                        attempt_payload = next_payload;
+                        continue;
+                    }
+                    break;
+                }
             }
         }
-        match result {
-            Ok(v) => {
-                let accepted = v.get("accepted").and_then(Value::as_bool).unwrap_or(false);
-                out.push(json!({
-                    "ok": accepted,
-                    "accepted": accepted,
-                    "decision_key": gated.decision_key,
-                    "decision": decision,
-                    "endpoint": used_endpoint,
-                    "request": payload,
-                    "response": v
-                }));
-            }
-            Err(err) => {
-                out.push(json!({
-                    "ok": false,
-                    "decision_key": gated.decision_key,
-                    "decision": decision,
-                    "endpoint": used_endpoint,
-                    "request": payload,
-                    "error": err
-                }));
-            }
-        }
+        out.push(json!({
+            "ok": accepted,
+            "accepted": accepted,
+            "decision_key": gated.decision_key,
+            "decision": decision,
+            "endpoint": final_endpoint,
+            "request": payload,
+            "final_request": attempt_payload.clone(),
+            "response": final_response,
+            "error": final_error,
+            "attempts": attempts
+        }));
     }
     out
 }
@@ -4065,7 +4312,6 @@ fn run_strategy_simulation(
     map_simulation_result(fev1::simulate(&mapped_samples, &mapped_cfg, max_trades))
 }
 
-
 async fn load_strategy_samples(
     state: &ApiState,
     market_type: &str,
@@ -4226,7 +4472,10 @@ async fn strategy_paper(
     let _live_entry_only = params.live_entry_only.unwrap_or(true);
 
     let mut source_fallback_error: Option<String> = None;
-    if matches!(source_mode, StrategyPaperSource::Live | StrategyPaperSource::Auto) {
+    if matches!(
+        source_mode,
+        StrategyPaperSource::Live | StrategyPaperSource::Auto
+    ) {
         if let Some(payload) = state.get_runtime_snapshot(market_type).await {
             return Ok(Json(payload));
         }
@@ -4935,8 +5184,7 @@ fn score_with_rolling(
             * (0.60 + 0.40 * coverage_ratio)
             - trade_shortfall * 25.0
     } else {
-        run.win_rate_pct * 0.3
-            + run.avg_pnl_cents * 0.2
+        run.win_rate_pct * 0.3 + run.avg_pnl_cents * 0.2
             - run.max_drawdown_cents * 0.03
             - run.execution_penalty_cents_total * 0.6
             - run.blocked_exits as f64 * 25.0
@@ -5011,8 +5259,7 @@ async fn strategy_optimize(
     let valid_target_win_rate = (target_win_rate - 6.0).clamp(40.0, 99.9);
     let valid_max_trades = std::cmp::max(std::cmp::max(160, window_trades * 3), max_trades);
     let latest_ts_ms = samples.last().map(|s| s.ts_ms).unwrap_or(0);
-    let recent_from_ms =
-        latest_ts_ms.saturating_sub(i64::from(recent_lookback_minutes) * 60_000);
+    let recent_from_ms = latest_ts_ms.saturating_sub(i64::from(recent_lookback_minutes) * 60_000);
     let mut recent_samples_buf: Vec<StrategySample> = samples
         .iter()
         .filter(|s| s.ts_ms >= recent_from_ms)
@@ -5035,108 +5282,103 @@ async fn strategy_optimize(
     let mut best_payload = Value::Null;
     let mut reached_target = false;
 
-    let evaluate_candidate =
-        |name: String, cfg: &StrategyRuntimeConfig| -> (Value, f64, bool) {
-            let train_run = run_strategy_simulation(train_samples, cfg, max_trades);
-            let valid_run = run_strategy_simulation(valid_samples, cfg, valid_max_trades);
-            let recent_run = run_strategy_simulation(recent_samples, cfg, recent_max_trades);
+    let evaluate_candidate = |name: String, cfg: &StrategyRuntimeConfig| -> (Value, f64, bool) {
+        let train_run = run_strategy_simulation(train_samples, cfg, max_trades);
+        let valid_run = run_strategy_simulation(valid_samples, cfg, valid_max_trades);
+        let recent_run = run_strategy_simulation(recent_samples, cfg, recent_max_trades);
 
-            let (train_rs, train_obj, _train_hit) =
-                score_with_rolling(&train_run, window_trades, target_win_rate);
-            let (valid_rs, valid_obj, valid_hit) =
-                score_with_rolling(&valid_run, valid_window_trades, valid_target_win_rate);
-            let (recent_rs, recent_obj, recent_hit) =
-                score_with_rolling(&recent_run, valid_window_trades, recent_target_win_rate);
+        let (train_rs, train_obj, _train_hit) =
+            score_with_rolling(&train_run, window_trades, target_win_rate);
+        let (valid_rs, valid_obj, valid_hit) =
+            score_with_rolling(&valid_run, valid_window_trades, valid_target_win_rate);
+        let (recent_rs, recent_obj, recent_hit) =
+            score_with_rolling(&recent_run, valid_window_trades, recent_target_win_rate);
 
-            let pf_train = profit_factor(&train_run.all_trade_pnls);
-            let pf_valid = profit_factor(&valid_run.all_trade_pnls);
-            let pf_recent = profit_factor(&recent_run.all_trade_pnls);
-            let wr_gap = (train_rs.latest_win_rate_pct - valid_rs.latest_win_rate_pct).abs();
-            let pnl_gap = (train_run.avg_pnl_cents - valid_run.avg_pnl_cents).abs();
-            let pf_gap = (pf_train - pf_valid).abs();
-            let recent_wr_gap = (recent_rs.latest_win_rate_pct - valid_rs.latest_win_rate_pct).abs();
-            let consistency_penalty =
-                wr_gap * 1.1 + pnl_gap * 1.6 + pf_gap * 8.0 + recent_wr_gap * 1.8;
-            let validation_fail_penalty =
-                if valid_run.avg_pnl_cents <= 0.0 || valid_run.total_pnl_cents <= 0.0 {
-                    300.0
-                        + valid_run.avg_pnl_cents.abs() * 260.0
-                        + valid_run.total_pnl_cents.abs() * 0.03
-                } else {
-                    0.0
-                };
-            let train_fail_penalty = if train_run.avg_pnl_cents <= 0.0
-                || train_run.total_pnl_cents <= 0.0
-                || pf_train < 0.90
-            {
-                80.0
-                    + train_run.avg_pnl_cents.abs() * 80.0
-                    + train_run.total_pnl_cents.abs() * 0.004
-                    + (0.90 - pf_train).max(0.0) * 160.0
-            } else {
-                0.0
-            };
-            let recent_fail_penalty = if recent_run.avg_pnl_cents <= 0.0
-                || recent_run.total_pnl_cents <= 0.0
-                || pf_recent < 1.0
-            {
-                260.0
-                    + recent_run.avg_pnl_cents.abs() * 240.0
-                    + recent_run.total_pnl_cents.abs() * 0.02
-                    + (1.0 - pf_recent).max(0.0) * 220.0
-            } else {
-                0.0
-            };
-            let fill_risk_penalty = valid_run.blocked_exits as f64 * 18.0
-                + valid_run.execution_penalty_cents_total * 0.9
-                + valid_run.emergency_wide_exit_count as f64 * 3.0;
-            let train_trade_shortfall = window_trades.saturating_sub(train_run.trade_count) as f64;
-            let valid_trade_shortfall = window_trades.saturating_sub(valid_run.trade_count) as f64;
-            let recent_trade_shortfall =
-                window_trades.saturating_sub(recent_run.trade_count) as f64;
-            let coverage_gate_penalty =
-                train_trade_shortfall * 800.0
-                    + valid_trade_shortfall * 900.0
-                    + recent_trade_shortfall * 1100.0;
+        let pf_train = profit_factor(&train_run.all_trade_pnls);
+        let pf_valid = profit_factor(&valid_run.all_trade_pnls);
+        let pf_recent = profit_factor(&recent_run.all_trade_pnls);
+        let wr_gap = (train_rs.latest_win_rate_pct - valid_rs.latest_win_rate_pct).abs();
+        let pnl_gap = (train_run.avg_pnl_cents - valid_run.avg_pnl_cents).abs();
+        let pf_gap = (pf_train - pf_valid).abs();
+        let recent_wr_gap = (recent_rs.latest_win_rate_pct - valid_rs.latest_win_rate_pct).abs();
+        let consistency_penalty = wr_gap * 1.1 + pnl_gap * 1.6 + pf_gap * 8.0 + recent_wr_gap * 1.8;
+        let validation_fail_penalty = if valid_run.avg_pnl_cents <= 0.0
+            || valid_run.total_pnl_cents <= 0.0
+        {
+            300.0 + valid_run.avg_pnl_cents.abs() * 260.0 + valid_run.total_pnl_cents.abs() * 0.03
+        } else {
+            0.0
+        };
+        let train_fail_penalty = if train_run.avg_pnl_cents <= 0.0
+            || train_run.total_pnl_cents <= 0.0
+            || pf_train < 0.90
+        {
+            80.0 + train_run.avg_pnl_cents.abs() * 80.0
+                + train_run.total_pnl_cents.abs() * 0.004
+                + (0.90 - pf_train).max(0.0) * 160.0
+        } else {
+            0.0
+        };
+        let recent_fail_penalty = if recent_run.avg_pnl_cents <= 0.0
+            || recent_run.total_pnl_cents <= 0.0
+            || pf_recent < 1.0
+        {
+            260.0
+                + recent_run.avg_pnl_cents.abs() * 240.0
+                + recent_run.total_pnl_cents.abs() * 0.02
+                + (1.0 - pf_recent).max(0.0) * 220.0
+        } else {
+            0.0
+        };
+        let fill_risk_penalty = valid_run.blocked_exits as f64 * 18.0
+            + valid_run.execution_penalty_cents_total * 0.9
+            + valid_run.emergency_wide_exit_count as f64 * 3.0;
+        let train_trade_shortfall = window_trades.saturating_sub(train_run.trade_count) as f64;
+        let valid_trade_shortfall = window_trades.saturating_sub(valid_run.trade_count) as f64;
+        let recent_trade_shortfall = window_trades.saturating_sub(recent_run.trade_count) as f64;
+        let coverage_gate_penalty = train_trade_shortfall * 800.0
+            + valid_trade_shortfall * 900.0
+            + recent_trade_shortfall * 1100.0;
 
-            let objective = train_obj * 0.14 + valid_obj * valid_weight + recent_obj * recent_weight * 1.15
+        let objective =
+            train_obj * 0.14 + valid_obj * valid_weight + recent_obj * recent_weight * 1.15
                 - consistency_penalty
                 - validation_fail_penalty
                 - train_fail_penalty
                 - recent_fail_penalty
                 - fill_risk_penalty
                 - coverage_gate_penalty;
-            let hit = (valid_hit || valid_rs.latest_win_rate_pct >= (target_win_rate - 3.0))
-                && (recent_hit || recent_rs.latest_win_rate_pct >= (target_win_rate - 2.0))
-                && valid_run.avg_pnl_cents > 0.0
-                && recent_run.avg_pnl_cents > 0.0
-                && pf_valid >= 1.05
-                && pf_recent >= 1.02;
+        let hit = (valid_hit || valid_rs.latest_win_rate_pct >= (target_win_rate - 3.0))
+            && (recent_hit || recent_rs.latest_win_rate_pct >= (target_win_rate - 2.0))
+            && valid_run.avg_pnl_cents > 0.0
+            && recent_run.avg_pnl_cents > 0.0
+            && pf_valid >= 1.05
+            && pf_recent >= 1.02;
 
-            let payload = json!({
-                "name": name,
-                "objective": objective,
-                "rolling_window": rolling_stats_json(valid_rs),
-                "rolling_window_train": rolling_stats_json(train_rs),
-                "rolling_window_validation": rolling_stats_json(valid_rs),
-                "rolling_window_recent": rolling_stats_json(recent_rs),
-                "summary": run_summary_json(&valid_run),
-                "summary_train": run_summary_json(&train_run),
-                "summary_validation": run_summary_json(&valid_run),
-                "summary_recent": run_summary_json(&recent_run),
-                "profit_factor_train": pf_train,
-                "profit_factor_validation": pf_valid,
-                "profit_factor_recent": pf_recent,
-                "consistency": {
-                    "win_rate_gap_pct": wr_gap,
-                    "avg_pnl_gap_cents": pnl_gap,
-                    "profit_factor_gap": pf_gap,
-                    "recent_win_rate_gap_pct": recent_wr_gap
-                },
-                "config": strategy_cfg_json(cfg),
-            });
-            (payload, objective, hit)
-        };
+        let payload = json!({
+            "name": name,
+            "objective": objective,
+            "rolling_window": rolling_stats_json(valid_rs),
+            "rolling_window_train": rolling_stats_json(train_rs),
+            "rolling_window_validation": rolling_stats_json(valid_rs),
+            "rolling_window_recent": rolling_stats_json(recent_rs),
+            "summary": run_summary_json(&valid_run),
+            "summary_train": run_summary_json(&train_run),
+            "summary_validation": run_summary_json(&valid_run),
+            "summary_recent": run_summary_json(&recent_run),
+            "profit_factor_train": pf_train,
+            "profit_factor_validation": pf_valid,
+            "profit_factor_recent": pf_recent,
+            "consistency": {
+                "win_rate_gap_pct": wr_gap,
+                "avg_pnl_gap_cents": pnl_gap,
+                "profit_factor_gap": pf_gap,
+                "recent_win_rate_gap_pct": recent_wr_gap
+            },
+            "config": strategy_cfg_json(cfg),
+        });
+        (payload, objective, hit)
+    };
 
     // warmup evaluate initial arms
     for (name, cfg) in &pool {
@@ -5219,7 +5461,8 @@ async fn strategy_optimize(
                 "best": best_payload.clone(),
                 "leaderboard_top": leaderboard.iter().take(5).cloned().collect::<Vec<Value>>(),
             });
-            if let Err(e) = write_key_value(&state, &persist_key, &save_doc, persist_ttl_sec).await {
+            if let Err(e) = write_key_value(&state, &persist_key, &save_doc, persist_ttl_sec).await
+            {
                 persist_error = Some(e.message);
             } else {
                 persisted = true;
@@ -5404,5 +5647,71 @@ mod tests {
         });
         assert!(is_live_snapshot_fresh(&snap, "5m", start + 100_500));
     }
-}
 
+    #[test]
+    fn decision_payload_uses_decision_execution_fields() {
+        let decision = json!({
+            "action": "enter",
+            "side": "UP",
+            "price_cents": 63.2,
+            "quote_size_usdc": 1.0,
+            "tif": "GTD",
+            "style": "maker",
+            "ttl_ms": 2300,
+            "max_slippage_bps": 17.0
+        });
+        let target = LiveMarketTarget {
+            market_id: "mkt1".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            timeframe: "5m".to_string(),
+            token_id_yes: "yes_token".to_string(),
+            token_id_no: "no_token".to_string(),
+            end_date: None,
+        };
+        let cfg = LiveGatewayConfig {
+            primary_url: "http://127.0.0.1:9001".to_string(),
+            backup_url: None,
+            timeout_ms: 500,
+            min_quote_usdc: 1.0,
+            entry_slippage_bps: 18.0,
+            exit_slippage_bps: 22.0,
+        };
+        let payload = decision_to_live_payload(&decision, &target, &cfg).expect("payload");
+        assert_eq!(payload.get("tif").and_then(Value::as_str), Some("GTD"));
+        assert_eq!(payload.get("style").and_then(Value::as_str), Some("maker"));
+        assert_eq!(payload.get("ttl_ms").and_then(Value::as_i64), Some(2300));
+        assert_eq!(payload.get("action").and_then(Value::as_str), Some("enter"));
+        assert_eq!(
+            payload.get("signal_side").and_then(Value::as_str),
+            Some("UP")
+        );
+        assert_eq!(
+            payload.get("token_id").and_then(Value::as_str),
+            Some("yes_token")
+        );
+    }
+
+    #[test]
+    fn retry_payload_escalates_to_maker_fallback_for_entry() {
+        let payload = json!({
+            "action": "enter",
+            "tif": "FAK",
+            "style": "taker",
+            "ttl_ms": 1200,
+            "max_slippage_bps": 18.0
+        });
+        let reason = "no orders found to match with FAK order";
+        let first = build_retry_payload(&payload, reason, 0).expect("first retry");
+        assert_eq!(
+            first.get("retry_tag").and_then(Value::as_str),
+            Some("slippage_retry")
+        );
+        let second = build_retry_payload(&first, reason, 1).expect("second retry");
+        assert_eq!(second.get("tif").and_then(Value::as_str), Some("GTD"));
+        assert_eq!(second.get("style").and_then(Value::as_str), Some("maker"));
+        assert_eq!(
+            second.get("retry_tag").and_then(Value::as_str),
+            Some("maker_fallback")
+        );
+    }
+}

@@ -28,7 +28,9 @@ DEFAULT_FEE_RATE_BPS = int((os.environ.get("CLOB_FEE_RATE_BPS") or "1000").strip
 MIN_MARKETABLE_BUY_USDC = float((os.environ.get("CLOB_MIN_MARKETABLE_BUY_USDC") or "1.0").strip() or "1.0")
 MARKETABLE_BUY_BUFFER_TRIGGER_USDC = float((os.environ.get("CLOB_MARKETABLE_BUY_BUFFER_TRIGGER_USDC") or "1.0").strip() or "1.0")
 MARKETABLE_BUY_BUFFER_USDC = float((os.environ.get("CLOB_MARKETABLE_BUY_BUFFER_USDC") or "1.02").strip() or "1.02")
-MIN_ORDER_SIZE_SHARES = float((os.environ.get("CLOB_MIN_ORDER_SIZE_SHARES") or "5.0").strip() or "5.0")
+MIN_ORDER_SIZE_SHARES = float((os.environ.get("CLOB_MIN_ORDER_SIZE_SHARES") or "1.0").strip() or "1.0")
+ENFORCE_MARKETABLE_BUY_MIN = str(os.environ.get("CLOB_ENFORCE_MARKETABLE_BUY_MIN") or "").strip().lower() in {"1", "true", "yes", "on", "y"}
+MARKET_META_TTL_MS = int((os.environ.get("CLOB_MARKET_META_TTL_MS") or "1500").strip() or "1500")
 
 
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -83,6 +85,8 @@ def _map_tif(tif: str, ttl_ms: int) -> Tuple[OrderType, Optional[str]]:
         return OrderType.FOK, None
     if t == "GTC":
         return OrderType.GTC, None
+    if t == "GTD":
+        return OrderType.GTD, None
     if t == "POST_ONLY":
         return (OrderType.GTD if ttl_ms > 0 else OrderType.GTC), None
     return OrderType.FAK, f"invalid_tif:{tif}"
@@ -118,6 +122,17 @@ class TrackedOrder:
     source: str
 
 
+@dataclass
+class MarketMeta:
+    token_id: str
+    min_order_size: float
+    tick_size: float
+    best_bid: Optional[float]
+    best_ask: Optional[float]
+    fee_rate_bps: int
+    fetched_ms: int
+
+
 app = FastAPI(title="PolyEdge CLOB Gateway", version="0.2.0")
 
 STATE: Dict[str, Any] = {
@@ -141,6 +156,8 @@ STATE: Dict[str, Any] = {
     "report_lock": threading.Lock(),
     "reports": deque(maxlen=int(_env("CLOB_REPORT_MAX_EVENTS", "2000") or "2000")),
     "report_seq": 0,
+    "market_meta_lock": threading.Lock(),
+    "market_meta": {},
     "stop_event": threading.Event(),
     "watcher": None,
 }
@@ -259,6 +276,96 @@ def _cache_stats() -> dict:
         }
 
 
+def _safe_float(v: Any) -> Optional[float]:
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def _best_price(rows: Any, side: str) -> Optional[float]:
+    if not isinstance(rows, list) or not rows:
+        return None
+    prices: list[float] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        p = _safe_float(row.get("price"))
+        if p is None:
+            continue
+        prices.append(p)
+    if not prices:
+        return None
+    return max(prices) if side == "bid" else min(prices)
+
+
+def _quantize_price(price: float, tick_size: float, side: str) -> float:
+    tick = max(0.0001, tick_size)
+    steps = price / tick
+    if side == BUY:
+        q = math.ceil(steps - 1e-9) * tick
+    else:
+        q = math.floor(steps + 1e-9) * tick
+    return _normalize_price(q)
+
+
+def _get_market_meta(token_id: str) -> MarketMeta:
+    now = _ms_now()
+    with STATE["market_meta_lock"]:
+        cached: Optional[MarketMeta] = STATE["market_meta"].get(token_id)
+        if cached is not None and (now - cached.fetched_ms) <= max(200, MARKET_META_TTL_MS):
+            return cached
+
+    client: Optional[ClobClient] = STATE["client"]
+    if client is None:
+        return MarketMeta(
+            token_id=token_id,
+            min_order_size=max(0.01, MIN_ORDER_SIZE_SHARES),
+            tick_size=0.01,
+            best_bid=None,
+            best_ask=None,
+            fee_rate_bps=max(0, DEFAULT_FEE_RATE_BPS),
+            fetched_ms=now,
+        )
+
+    min_order_size = max(0.01, MIN_ORDER_SIZE_SHARES)
+    tick_size = 0.01
+    best_bid = None
+    best_ask = None
+    fee_rate_bps = max(0, DEFAULT_FEE_RATE_BPS)
+
+    try:
+        with STATE["client_lock"]:
+            book = client.get_order_book(token_id)
+        min_order_size = max(0.01, _safe_float(getattr(book, "min_order_size", None)) or min_order_size)
+        tick_size = max(0.0001, _safe_float(getattr(book, "tick_size", None)) or tick_size)
+        best_bid = _best_price(getattr(book, "bids", None), "bid")
+        best_ask = _best_price(getattr(book, "asks", None), "ask")
+    except Exception as exc:
+        _emit("market_meta_book_error", token_id=token_id, reason=_safe_error(exc))
+
+    try:
+        with STATE["client_lock"]:
+            fee_rate_bps = int(client.get_fee_rate_bps(token_id))
+    except Exception as exc:
+        _emit("market_meta_fee_error", token_id=token_id, reason=_safe_error(exc))
+
+    meta = MarketMeta(
+        token_id=token_id,
+        min_order_size=min_order_size,
+        tick_size=tick_size,
+        best_bid=best_bid,
+        best_ask=best_ask,
+        fee_rate_bps=max(0, fee_rate_bps),
+        fetched_ms=now,
+    )
+    with STATE["market_meta_lock"]:
+        STATE["market_meta"][token_id] = meta
+    return meta
+
+
 def _build_hmac_window(secret: str, body: str, sec: int) -> Dict[str, str]:
     now_s = int(time.time())
     out: Dict[str, str] = {}
@@ -325,8 +432,11 @@ def _build_order(payload: dict) -> Tuple[dict, Optional[str]]:
         return {}, "price_out_of_range"
     if size <= 0.0:
         return {}, "size_non_positive"
-    # Exchange-side minimum order size for current up/down markets is typically >= 5 shares.
-    size = max(size, MIN_ORDER_SIZE_SHARES)
+    style = str(payload.get("style") or "taker").strip().lower()
+    if style not in {"maker", "taker"}:
+        style = "taker"
+    market_meta = _get_market_meta(token_id)
+    size = max(size, market_meta.min_order_size)
     size = round(size, 4)
     ttl_ms = int(payload.get("ttl_ms") or 0)
     tif_raw = str(payload.get("tif") or "FAK")
@@ -334,21 +444,29 @@ def _build_order(payload: dict) -> Tuple[dict, Optional[str]]:
     if tif_err:
         return {}, tif_err
     slippage_bps = max(0.0, float(payload.get("max_slippage_bps") or 0.0))
-    if slippage_bps > 0:
-        slip = slippage_bps / 10_000.0
-        price = _normalize_price(price * (1.0 + slip if side == BUY else 1.0 - slip))
+    if style == "maker":
+        if side == BUY and market_meta.best_bid is not None:
+            price = min(price, float(market_meta.best_bid))
+        elif side == SELL and market_meta.best_ask is not None:
+            price = max(price, float(market_meta.best_ask))
     else:
-        price = _normalize_price(price)
+        if slippage_bps > 0:
+            slip = slippage_bps / 10_000.0
+            price = _normalize_price(price * (1.0 + slip if side == BUY else 1.0 - slip))
+        if side == BUY and market_meta.best_ask is not None:
+            price = max(price, float(market_meta.best_ask))
+        elif side == SELL and market_meta.best_bid is not None:
+            price = min(price, float(market_meta.best_bid))
+    price = _quantize_price(price, market_meta.tick_size, side)
     # For marketable BUY paths, apply a small notional buffer when request is around/below $1.
-    if side == BUY:
+    if side == BUY and ENFORCE_MARKETABLE_BUY_MIN:
         target_notional = MIN_MARKETABLE_BUY_USDC
         if requested_notional <= MARKETABLE_BUY_BUFFER_TRIGGER_USDC:
             target_notional = max(target_notional, MARKETABLE_BUY_BUFFER_USDC)
         if size * price < target_notional:
             size = round((target_notional / max(price, MIN_PRICE)) + 1e-6, 4)
-    # Polymarket currently expects a market-specific fee rate (1000 for our target flow).
-    # We keep this fixed to avoid exchange-side hard rejects from stale client payload values.
-    fee_bps = DEFAULT_FEE_RATE_BPS
+    fee_bps = int(payload.get("fee_rate_bps") or market_meta.fee_rate_bps or DEFAULT_FEE_RATE_BPS)
+    fee_bps = max(0, min(10_000, fee_bps))
     # For proxy-wallet flow, arbitrary large nonces are frequently rejected.
     # Default to 0 unless caller explicitly provides a nonce.
     nonce = int(payload.get("nonce") or 0)
@@ -387,6 +505,14 @@ def _build_order(payload: dict) -> Tuple[dict, Optional[str]]:
         "requested_size": requested_size,
         "requested_notional": requested_notional,
         "effective_notional": size * price,
+        "style": style,
+        "market_meta": {
+            "min_order_size": market_meta.min_order_size,
+            "tick_size": market_meta.tick_size,
+            "best_bid": market_meta.best_bid,
+            "best_ask": market_meta.best_ask,
+            "fee_rate_bps": market_meta.fee_rate_bps,
+        },
         "fee_bps": fee_bps,
         "tif": tif_raw,
         "signed_order": signed,
@@ -560,6 +686,8 @@ def health() -> dict:
             addr = None
     with STATE["tracked_lock"]:
         tracked_count = len(STATE["tracked"])
+    with STATE["market_meta_lock"]:
+        meta_keys = len(STATE["market_meta"])
     return {
         "status": "ok",
         "ready": bool(STATE["ready"] and client is not None),
@@ -571,6 +699,8 @@ def health() -> dict:
         "tracked_orders": tracked_count,
         "watcher_running": bool(STATE["watcher"] and STATE["watcher"].is_alive()),
         "prebuild_cache": _cache_stats(),
+        "market_meta_cache_keys": meta_keys,
+        "market_meta_ttl_ms": MARKET_META_TTL_MS,
     }
 
 

@@ -140,7 +140,12 @@ impl ExecutionGate {
     pub fn from_env() -> Self {
         let live_enabled = std::env::var("FORGE_FEV1_LIVE_ENABLED")
             .ok()
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
             .unwrap_or(false);
         Self { live_enabled }
     }
@@ -304,7 +309,8 @@ fn compute_signal(
     let edge_prob = p_fair_up - sample.p_up.clamp(0.0, 1.0);
     let edge_component = tanh_norm(edge_prob, cfg.entry_edge_prob.max(0.008));
     let spread_penalty = (sample.spread_mid / cfg.spread_limit_prob.max(0.008)).clamp(0.0, 3.0);
-    let score = (0.72 * edge_component + 0.28 * trend_component - 0.08 * spread_penalty).clamp(-1.0, 1.0);
+    let score =
+        (0.72 * edge_component + 0.28 * trend_component - 0.08 * spread_penalty).clamp(-1.0, 1.0);
     let entry_threshold = (cfg.entry_threshold_base + local_vol * 1.2 + sample.spread_mid * 0.6)
         .clamp(cfg.entry_threshold_base, cfg.entry_threshold_cap);
     let confirmed = confirm_direction(score_hist, score);
@@ -388,7 +394,9 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
                 exit_reason = Some("round_rollover");
             } else if bid_raw >= cfg.take_profit_near_max_cents {
                 exit_reason = Some("near_max_take_profit");
-            } else if sample.remaining_ms <= cfg.endgame_remaining_ms && bid_raw >= cfg.endgame_take_profit_cents {
+            } else if sample.remaining_ms <= cfg.endgame_remaining_ms
+                && bid_raw >= cfg.endgame_take_profit_cents
+            {
                 exit_reason = Some("endgame_take_profit");
             } else if can_exit_now && pnl <= -cfg.stop_loss_cents {
                 exit_reason = Some("stop_loss");
@@ -464,7 +472,8 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
         } else {
             let ask_raw = side_ask(sample, side) * 100.0;
             let spread_side_cents = side_spread(sample, side) * 100.0;
-            let cooldown_ok = last_exit_ts_ms <= 0 || sample.ts_ms.saturating_sub(last_exit_ts_ms) >= cfg.cooldown_ms;
+            let cooldown_ok = last_exit_ts_ms <= 0
+                || sample.ts_ms.saturating_sub(last_exit_ts_ms) >= cfg.cooldown_ms;
             let round_entries = entries_by_round.get(&sample.round_id).copied().unwrap_or(0);
             let within_limit = round_entries < cfg.max_entries_per_round;
             let edge_ok = signal.edge_prob.abs() >= cfg.entry_edge_prob;
@@ -585,12 +594,21 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
     let total_slippage_cents: f64 = trades
         .iter()
         .filter_map(|t| {
-            let a = t.get("entry_slippage_cents").and_then(Value::as_f64).unwrap_or(0.0);
-            let b = t.get("exit_slippage_cents").and_then(Value::as_f64).unwrap_or(0.0);
+            let a = t
+                .get("entry_slippage_cents")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            let b = t
+                .get("exit_slippage_cents")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
             Some(a + b)
         })
         .sum();
-    let total_cost_cents = total_entry_fee_cents + total_exit_fee_cents + total_slippage_cents + execution_penalty_cents_total;
+    let total_cost_cents = total_entry_fee_cents
+        + total_exit_fee_cents
+        + total_slippage_cents
+        + execution_penalty_cents_total;
     let avg_pnl_cents = if trade_count > 0 {
         total_pnl_cents / trade_count as f64
     } else {
@@ -606,10 +624,7 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
         0.0
     };
     let max_drawdown_cents = max_drawdown_from_pnls(&all_trade_pnls);
-    let max_profit_trade_cents = all_trade_pnls
-        .iter()
-        .copied()
-        .fold(0.0_f64, f64::max);
+    let max_profit_trade_cents = all_trade_pnls.iter().copied().fold(0.0_f64, f64::max);
     let net_margin_pct = if gross_pnl_cents.abs() > 1e-9 {
         total_pnl_cents / gross_pnl_cents.abs() * 100.0
     } else {
@@ -685,7 +700,10 @@ pub fn simulate_dual<G: LiveOrderGateway>(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let entry_ts_ms = trade.get("entry_ts_ms").and_then(Value::as_i64).unwrap_or(0);
+        let entry_ts_ms = trade
+            .get("entry_ts_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
         let exit_ts_ms = trade.get("exit_ts_ms").and_then(Value::as_i64).unwrap_or(0);
         let entry_reason = trade
             .get("entry_reason")
@@ -695,6 +713,45 @@ pub fn simulate_dual<G: LiveOrderGateway>(
             .get("exit_reason")
             .and_then(Value::as_str)
             .unwrap_or("strategy_exit");
+        let entry_price_cents = trade
+            .get("entry_price_raw_cents")
+            .and_then(Value::as_f64)
+            .or_else(|| trade.get("entry_price_cents").and_then(Value::as_f64))
+            .unwrap_or(50.0)
+            .clamp(1.0, 99.0);
+        let exit_price_cents = trade
+            .get("exit_price_raw_cents")
+            .and_then(Value::as_f64)
+            .or_else(|| trade.get("exit_price_cents").and_then(Value::as_f64))
+            .unwrap_or(50.0)
+            .clamp(1.0, 99.0);
+        let entry_score = trade
+            .get("entry_score")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0)
+            .abs();
+        let entry_remaining_ms = trade
+            .get("entry_remaining_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .max(0);
+        let exit_remaining_ms = trade
+            .get("exit_remaining_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .max(0);
+        let (entry_tif, entry_style, entry_ttl_ms, entry_slippage_bps) =
+            if entry_remaining_ms <= 95_000 || entry_score >= 0.82 {
+                ("FAK", "taker", 1_200_i64, 24.0_f64)
+            } else {
+                ("GTD", "maker", 2_200_i64, 12.0_f64)
+            };
+        let (exit_tif, exit_style, exit_ttl_ms, exit_slippage_bps) = if exit_remaining_ms <= 30_000
+        {
+            ("FAK", "taker", 1_000_i64, 30.0_f64)
+        } else {
+            ("FAK", "taker", 1_100_i64, 22.0_f64)
+        };
 
         if entry_ts_ms > 0 {
             decisions.push(json!({
@@ -703,7 +760,12 @@ pub fn simulate_dual<G: LiveOrderGateway>(
                 "round_id": round_id,
                 "ts_ms": entry_ts_ms,
                 "reason": entry_reason,
-                "quote_size_usdc": quote
+                "quote_size_usdc": quote,
+                "price_cents": entry_price_cents,
+                "tif": entry_tif,
+                "style": entry_style,
+                "ttl_ms": entry_ttl_ms,
+                "max_slippage_bps": entry_slippage_bps
             }));
         }
         if exit_ts_ms > 0 {
@@ -713,7 +775,12 @@ pub fn simulate_dual<G: LiveOrderGateway>(
                 "round_id": round_id,
                 "ts_ms": exit_ts_ms,
                 "reason": exit_reason,
-                "quote_size_usdc": quote
+                "quote_size_usdc": quote,
+                "price_cents": exit_price_cents,
+                "tif": exit_tif,
+                "style": exit_style,
+                "ttl_ms": exit_ttl_ms,
+                "max_slippage_bps": exit_slippage_bps
             }));
         }
     }
@@ -737,7 +804,11 @@ pub fn simulate_dual<G: LiveOrderGateway>(
             .and_then(Value::as_str)
             .unwrap_or("UP")
             .to_ascii_uppercase();
-        let side = if side_str == "DOWN" { Side::Down } else { Side::Up };
+        let side = if side_str == "DOWN" {
+            Side::Down
+        } else {
+            Side::Up
+        };
         let intent = OrderIntent {
             ts_ms: d.get("ts_ms").and_then(Value::as_i64).unwrap_or(0),
             round_id: d
