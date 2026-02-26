@@ -2,6 +2,7 @@ mod api;
 mod cli;
 mod common;
 mod db_sink;
+mod fev1;
 mod ireland;
 mod models;
 mod persist;
