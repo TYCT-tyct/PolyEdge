@@ -21,10 +21,9 @@ members = [
   "crates/replay_engine",
   "crates/paper_executor",
   "crates/observability",
-  "crates/app_runner",
   "crates/poly_wire",
   "crates/feeder_tokyo",
-  "crates/feed_udp", "crates/app_tokyo_brain",
+  "crates/feed_udp",
   "crates/polyedge_data_backend",
   "crates/polyedge_cli", "crates/polyedge_forge",
 ]
