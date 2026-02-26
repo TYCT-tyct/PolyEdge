@@ -3213,6 +3213,7 @@ struct LiveGatewayConfig {
     min_quote_usdc: f64,
     entry_slippage_bps: f64,
     exit_slippage_bps: f64,
+    force_slippage_bps: Option<f64>,
 }
 
 impl LiveGatewayConfig {
@@ -3246,6 +3247,10 @@ impl LiveGatewayConfig {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(22.0)
             .clamp(0.0, 500.0);
+        let force_slippage_bps = std::env::var("FORGE_FEV1_FORCE_SLIPPAGE_BPS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|v| v.clamp(0.0, 500.0));
         Self {
             primary_url,
             backup_url,
@@ -3253,6 +3258,7 @@ impl LiveGatewayConfig {
             min_quote_usdc,
             entry_slippage_bps,
             exit_slippage_bps,
+            force_slippage_bps,
         }
     }
 }
@@ -3588,6 +3594,10 @@ fn decision_to_live_payload(
     let max_slippage_bps = decision
         .get("max_slippage_bps")
         .and_then(Value::as_f64)
+        .unwrap_or(max_slippage_bps)
+        .clamp(0.0, 500.0);
+    let max_slippage_bps = gateway_cfg
+        .force_slippage_bps
         .unwrap_or(max_slippage_bps)
         .clamp(0.0, 500.0);
     let cache_key = format!(
@@ -5675,6 +5685,7 @@ mod tests {
             min_quote_usdc: 1.0,
             entry_slippage_bps: 18.0,
             exit_slippage_bps: 22.0,
+            force_slippage_bps: None,
         };
         let payload = decision_to_live_payload(&decision, &target, &cfg).expect("payload");
         assert_eq!(payload.get("tif").and_then(Value::as_str), Some("GTD"));
