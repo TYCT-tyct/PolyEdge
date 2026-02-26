@@ -460,7 +460,7 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
                     "duration_s": duration_s,
                     "entry_score": pos.entry_score,
                     "exit_score": score,
-                    "entry_reason": "fev1_edgeflow_entry",
+                    "entry_reason": "fev1_signal_entry",
                     "exit_reason": reason,
                     "exec_fill_ok": can_fill,
                     "exit_spread_cents": spread_side_cents
@@ -560,7 +560,7 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
             "duration_s": ((last.ts_ms - pos.entry_ts_ms).max(0) as f64) / 1000.0,
             "entry_score": pos.entry_score,
             "exit_score": last_score,
-            "entry_reason": "fev1_edgeflow_entry",
+            "entry_reason": "fev1_signal_entry",
             "exit_reason": "end_of_samples_force_close",
             "exec_fill_ok": true,
             "exit_spread_cents": side_spread(last, pos.side) * 100.0
@@ -708,7 +708,7 @@ pub fn simulate_dual<G: LiveOrderGateway>(
         let entry_reason = trade
             .get("entry_reason")
             .and_then(Value::as_str)
-            .unwrap_or("fev1_edgeflow_entry");
+            .unwrap_or("fev1_signal_entry");
         let exit_reason = trade
             .get("exit_reason")
             .and_then(Value::as_str)
