@@ -765,6 +765,53 @@ const StrategyPanel = memo(function StrategyPanel({
   onSourceChange
 }: StrategyPanelProps) {
   const current = data?.current ?? null;
+  const currentView = useMemo(() => {
+    if (!current) {
+      return {
+        score: null as number | null,
+        entryThreshold: null as number | null,
+        confidencePct: null as number | null,
+        pUpPct: null as number | null,
+        deltaPct: null as number | null,
+        remainingS: null as number | null,
+        timestampMs: null as number | null,
+        roundId: null as string | null,
+      };
+    }
+    const raw = current as Record<string, unknown>;
+    const asNum = (v: unknown): number | null =>
+      typeof v === "number" && Number.isFinite(v) ? v : null;
+    const asStr = (v: unknown): string | null => (typeof v === "string" && v.trim() ? v : null);
+    const score = asNum(raw.score);
+    const entryThreshold = asNum(raw.entry_threshold);
+    const pFairUp = asNum(raw.p_fair_up);
+    const confidence = asNum(raw.confidence);
+    const pUpPctRaw = asNum(raw.p_up_pct);
+    const deltaPctRaw = asNum(raw.delta_pct);
+    const remainingSRaw = asNum(raw.remaining_s);
+    const remainingMsRaw = asNum(raw.remaining_ms);
+    const timestampMs = asNum(raw.timestamp_ms);
+    const roundId = asStr(raw.round_id);
+    const confidencePct =
+      confidence != null
+        ? confidence * 100
+        : pFairUp != null
+        ? Math.max(pFairUp, 1 - pFairUp) * 100
+        : null;
+    const pUpPct = pUpPctRaw != null ? pUpPctRaw : pFairUp != null ? pFairUp * 100 : null;
+    const deltaPct = deltaPctRaw != null ? deltaPctRaw : asNum(raw.edge_prob);
+    const remainingS = remainingSRaw != null ? remainingSRaw : remainingMsRaw != null ? remainingMsRaw / 1000 : null;
+    return {
+      score,
+      entryThreshold,
+      confidencePct,
+      pUpPct,
+      deltaPct,
+      remainingS,
+      timestampMs,
+      roundId,
+    };
+  }, [current]);
   const liveExec = data?.live_execution;
   const liveState = liveExec?.state_machine;
   const liveOrders = liveExec?.execution?.orders ?? [];
@@ -808,13 +855,17 @@ const StrategyPanel = memo(function StrategyPanel({
             {current?.suggested_action ?? "--"}
           </strong>
           <small>
-            {current ? `${formatTime(current.timestamp_ms, timeMode)} · ${current.round_id}` : "等待数据"}
+            {current ? `${formatTime(currentView.timestampMs, timeMode)} · ${currentView.roundId ?? "--"}` : "等待数据"}
           </small>
         </article>
         <article className="info-card">
           <span>信号强度 / 阈值</span>
-          <strong>{current ? `${current.score.toFixed(3)} / ${current.entry_threshold.toFixed(3)}` : "--"}</strong>
-          <small>置信度：{current ? `${(current.confidence * 100).toFixed(1)}%` : "--"}</small>
+          <strong>
+            {current && currentView.score != null && currentView.entryThreshold != null
+              ? `${currentView.score.toFixed(3)} / ${currentView.entryThreshold.toFixed(3)}`
+              : "--"}
+          </strong>
+          <small>置信度：{currentView.confidencePct != null ? `${currentView.confidencePct.toFixed(1)}%` : "--"}</small>
         </article>
         <article className="info-card">
           <span>累计净收益</span>
@@ -844,10 +895,11 @@ const StrategyPanel = memo(function StrategyPanel({
         <article className="info-card">
           <span>市场状态</span>
           <strong>
-            {current ? `UP ${current.p_up_pct.toFixed(1)}%` : "--"}
+            {currentView.pUpPct != null ? `UP ${currentView.pUpPct.toFixed(1)}%` : "--"}
           </strong>
           <small>
-            Δ {current ? `${current.delta_pct.toFixed(4)}%` : "--"} · 剩余 {current ? `${current.remaining_s.toFixed(1)}s` : "--"} · 样本 {data?.samples ?? 0}
+            Δ {currentView.deltaPct != null ? `${currentView.deltaPct.toFixed(4)}%` : "--"} · 剩余{" "}
+            {currentView.remainingS != null ? `${currentView.remainingS.toFixed(1)}s` : "--"} · 样本 {data?.samples ?? 0}
           </small>
         </article>
       </div>
