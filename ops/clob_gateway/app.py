@@ -26,6 +26,7 @@ MAX_PRICE = 0.99
 TERMINAL_STATES = {"filled", "cancelled", "canceled", "rejected", "expired", "executed", "matched"}
 DEFAULT_FEE_RATE_BPS = int((os.environ.get("CLOB_FEE_RATE_BPS") or "1000").strip() or "1000")
 MIN_MARKETABLE_BUY_USDC = float((os.environ.get("CLOB_MIN_MARKETABLE_BUY_USDC") or "1.0").strip() or "1.0")
+MIN_ORDER_SIZE_SHARES = float((os.environ.get("CLOB_MIN_ORDER_SIZE_SHARES") or "5.0").strip() or "5.0")
 
 
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -319,6 +320,9 @@ def _build_order(payload: dict) -> Tuple[dict, Optional[str]]:
         return {}, "price_out_of_range"
     if size <= 0.0:
         return {}, "size_non_positive"
+    # Exchange-side minimum order size for current up/down markets is typically >= 5 shares.
+    size = max(size, MIN_ORDER_SIZE_SHARES)
+    size = round(size, 4)
     ttl_ms = int(payload.get("ttl_ms") or 0)
     tif_raw = str(payload.get("tif") or "FAK")
     order_type, tif_err = _map_tif(tif_raw, ttl_ms)
@@ -332,7 +336,7 @@ def _build_order(payload: dict) -> Tuple[dict, Optional[str]]:
         price = _normalize_price(price)
     # For marketable BUY paths, Polymarket enforces a minimum notional amount.
     if side == BUY and size * price < MIN_MARKETABLE_BUY_USDC:
-        size = round((MIN_MARKETABLE_BUY_USDC / max(price, MIN_PRICE)) + 1e-6, 6)
+        size = round((MIN_MARKETABLE_BUY_USDC / max(price, MIN_PRICE)) + 1e-6, 4)
     # Polymarket currently expects a market-specific fee rate (1000 for our target flow).
     # We keep this fixed to avoid exchange-side hard rejects from stale client payload values.
     fee_bps = DEFAULT_FEE_RATE_BPS
