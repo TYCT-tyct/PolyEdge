@@ -801,7 +801,14 @@ export async function getStrategyPaper(
   if (options.liveEntryOnly != null) {
     qs.set("live_entry_only", options.liveEntryOnly ? "true" : "false");
   }
-  return requestJson<StrategyPaperResponse>(`/api/strategy/paper?${qs.toString()}`);
+  const payload = await requestJson<Record<string, unknown>>(`/api/strategy/paper?${qs.toString()}`);
+  if (typeof payload.error === "string" && payload.error.trim()) {
+    throw new Error(payload.error);
+  }
+  if (typeof payload.summary !== "object" || payload.summary == null) {
+    throw new Error("strategy paper response missing summary");
+  }
+  return payload as StrategyPaperResponse;
 }
 
 export function connectLiveWs(
