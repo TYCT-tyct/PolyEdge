@@ -202,6 +202,44 @@ export interface StrategyPaperTrade {
   exit_reason: string;
 }
 
+export interface StrategyLiveDecision {
+  decision_id?: string;
+  ts_ms?: number;
+  round_id?: string;
+  action?: "enter" | "exit" | string;
+  side?: "UP" | "DOWN" | string;
+  price_cents?: number;
+  quote_size_usdc?: number;
+  reason?: string;
+}
+
+export interface StrategyLiveExecutionOrder {
+  ok: boolean;
+  accepted?: boolean;
+  endpoint?: string;
+  decision_key?: string;
+  request?: Record<string, unknown>;
+  response?: Record<string, unknown>;
+  error?: string;
+  reason?: string;
+  decision?: StrategyLiveDecision;
+}
+
+export interface StrategyLivePositionState {
+  market_type: string;
+  state: "flat" | "in_position" | string;
+  side?: "UP" | "DOWN" | string | null;
+  entry_round_id?: string | null;
+  entry_ts_ms?: number | null;
+  entry_price_cents?: number | null;
+  entry_quote_usdc?: number | null;
+  last_action?: string | null;
+  last_reason?: string | null;
+  total_entries?: number;
+  total_exits?: number;
+  updated_ts_ms?: number;
+}
+
 export interface StrategyPaperResponse {
   source?: "replay" | "live" | "auto" | string;
   source_fallback_error?: string | null;
@@ -248,6 +286,38 @@ export interface StrategyPaperResponse {
     total_slippage_cents: number;
     net_margin_pct: number;
     max_drawdown_cents: number;
+  };
+  live_execution?: {
+    summary?: Record<string, unknown>;
+    decisions?: StrategyLiveDecision[];
+    paper_records?: Record<string, unknown>[];
+    live_records?: Record<string, unknown>[];
+    gated?: {
+      selected_count?: number;
+      submitted_count?: number;
+      skipped_count?: number;
+      submitted_decisions?: StrategyLiveDecision[];
+      skipped_decisions?: Array<{
+        reason?: string;
+        decision?: StrategyLiveDecision;
+      }>;
+    };
+    gateway?: {
+      primary_url?: string;
+      backup_url?: string | null;
+      timeout_ms?: number;
+      entry_slippage_bps?: number;
+      exit_slippage_bps?: number;
+      min_quote_usdc?: number;
+    };
+    execution?: {
+      mode?: "dry_run" | "real_gateway" | string;
+      error?: string;
+      target?: Record<string, unknown> | null;
+      orders?: StrategyLiveExecutionOrder[];
+    };
+    state_machine?: StrategyLivePositionState;
+    events?: Record<string, unknown>[];
   };
   trades: StrategyPaperTrade[];
 }

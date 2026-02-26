@@ -750,6 +750,10 @@ export interface StrategyPaperQueryOptions {
   minHoldMs?: number;
   maxEntriesPerRound?: number;
   cooldownMs?: number;
+  liveExecute?: boolean;
+  liveQuoteUsdc?: number;
+  liveMaxOrders?: number;
+  liveEntryOnly?: boolean;
 }
 
 export async function getStrategyPaper(
@@ -784,6 +788,18 @@ export async function getStrategyPaper(
   }
   if (options.cooldownMs != null) {
     qs.set("cooldown_ms", String(options.cooldownMs));
+  }
+  if (options.liveExecute != null) {
+    qs.set("live_execute", options.liveExecute ? "true" : "false");
+  }
+  if (options.liveQuoteUsdc != null) {
+    qs.set("live_quote_usdc", String(options.liveQuoteUsdc));
+  }
+  if (options.liveMaxOrders != null) {
+    qs.set("live_max_orders", String(options.liveMaxOrders));
+  }
+  if (options.liveEntryOnly != null) {
+    qs.set("live_entry_only", options.liveEntryOnly ? "true" : "false");
   }
   return requestJson<StrategyPaperResponse>(`/api/strategy/paper?${qs.toString()}`);
 }

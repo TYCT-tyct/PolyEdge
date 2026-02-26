@@ -594,6 +594,23 @@ body {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.live-execution-wrap {
+  margin: 6px 0 10px;
+  border: 1px solid rgba(56, 189, 248, 0.24);
+  border-radius: 12px;
+  background: linear-gradient(180deg, rgba(11, 23, 44, 0.72) 0%, rgba(9, 18, 34, 0.72) 100%);
+  padding: 10px;
+}
+
+.live-matrix {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.live-exec-table td,
+.live-event-table td {
+  font-size: 12px;
+}
+
 .info-card {
   border: 1px solid var(--panel-border);
   border-radius: 10px;
@@ -912,6 +929,10 @@ select:focus {
   }
 
   .strategy-matrix {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .live-matrix {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }

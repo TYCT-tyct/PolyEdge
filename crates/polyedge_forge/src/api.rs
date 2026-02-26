@@ -1,5 +1,5 @@
 use std::cmp::min;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -13,6 +13,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
+use market_discovery::{DiscoveryConfig, MarketDescriptor, MarketDiscovery};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -36,6 +37,12 @@ struct ApiState {
     redis_prefix: String,
     redis_client: Option<redis::Client>,
     chart_cache: Arc<RwLock<HashMap<String, ChartCacheEntry>>>,
+    live_position_states: Arc<RwLock<HashMap<String, LivePositionState>>>,
+    live_decision_guard: Arc<RwLock<HashMap<String, i64>>>,
+    live_events: Arc<RwLock<VecDeque<Value>>>,
+    live_pending_orders: Arc<RwLock<HashMap<String, LivePendingOrder>>>,
+    live_gateway_report_seq: Arc<RwLock<i64>>,
+    live_runtime_snapshots: Arc<RwLock<HashMap<String, Value>>>,
 }
 
 #[derive(Clone)]
@@ -46,6 +53,141 @@ struct ChartCacheEntry {
 
 const CHART_CACHE_TTL_MS: u64 = 900;
 const CHART_CACHE_MAX_ENTRIES: usize = 120;
+const LIVE_DECISION_GUARD_TTL_MS: i64 = 45_000;
+const LIVE_EVENT_LOG_MAX: usize = 240;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LivePositionState {
+    market_type: String,
+    state: String,
+    side: Option<String>,
+    entry_round_id: Option<String>,
+    entry_ts_ms: Option<i64>,
+    entry_price_cents: Option<f64>,
+    entry_quote_usdc: Option<f64>,
+    last_action: Option<String>,
+    last_reason: Option<String>,
+    total_entries: u64,
+    total_exits: u64,
+    updated_ts_ms: i64,
+}
+
+impl LivePositionState {
+    fn flat(market_type: &str, now_ms: i64) -> Self {
+        Self {
+            market_type: market_type.to_string(),
+            state: "flat".to_string(),
+            side: None,
+            entry_round_id: None,
+            entry_ts_ms: None,
+            entry_price_cents: None,
+            entry_quote_usdc: None,
+            last_action: None,
+            last_reason: None,
+            total_entries: 0,
+            total_exits: 0,
+            updated_ts_ms: now_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LivePendingOrder {
+    market_type: String,
+    order_id: String,
+    action: String,
+    side: String,
+    round_id: String,
+    decision_key: String,
+    price_cents: f64,
+    quote_size_usdc: f64,
+    submitted_ts_ms: i64,
+    cancel_after_ms: i64,
+    retry_count: u8,
+}
+
+#[derive(Debug, Clone)]
+struct LiveRuntimeConfig {
+    enabled: bool,
+    live_execute: bool,
+    loop_interval_ms: u64,
+    lookback_minutes: u32,
+    max_points: u32,
+    max_trades: usize,
+    max_orders: usize,
+    entry_only: bool,
+    quote_usdc: f64,
+    markets: Vec<String>,
+}
+
+impl LiveRuntimeConfig {
+    fn from_env() -> Self {
+        let enabled = std::env::var("FORGE_FEV1_RUNTIME_ENABLED")
+            .ok()
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(true);
+        let live_execute = std::env::var("FORGE_FEV1_LIVE_EXECUTE")
+            .ok()
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        let loop_interval_ms = std::env::var("FORGE_FEV1_RUNTIME_LOOP_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1200)
+            .clamp(300, 10_000);
+        let lookback_minutes = std::env::var("FORGE_FEV1_RUNTIME_LOOKBACK_MINUTES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(360)
+            .clamp(30, 24 * 60 * 7);
+        let max_points = std::env::var("FORGE_FEV1_RUNTIME_MAX_POINTS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(220_000)
+            .clamp(20_000, 1_000_000);
+        let max_trades = std::env::var("FORGE_FEV1_RUNTIME_MAX_TRADES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(160)
+            .clamp(20, 500);
+        let max_orders = std::env::var("FORGE_FEV1_RUNTIME_MAX_ORDERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 6);
+        let entry_only = std::env::var("FORGE_FEV1_RUNTIME_ENTRY_ONLY")
+            .ok()
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(true);
+        let quote_usdc = std::env::var("FORGE_FEV1_RUNTIME_QUOTE_USDC")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(1.0)
+            .clamp(0.5, 500.0);
+        let markets = std::env::var("FORGE_FEV1_RUNTIME_MARKETS")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(|v| v.trim().to_ascii_lowercase())
+                    .filter(|v| v == "5m" || v == "15m")
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec!["5m".to_string(), "15m".to_string()]);
+        Self {
+            enabled,
+            live_execute,
+            loop_interval_ms,
+            lookback_minutes,
+            max_points,
+            max_trades,
+            max_orders,
+            entry_only,
+            quote_usdc,
+            markets,
+        }
+    }
+}
 
 impl ApiState {
     async fn chart_cache_get(&self, key: &str) -> Option<Value> {
@@ -82,6 +224,105 @@ impl ApiState {
                 payload,
             },
         );
+    }
+
+    async fn get_live_position_state(&self, market_type: &str) -> LivePositionState {
+        let now_ms = Utc::now().timestamp_millis();
+        {
+            let states = self.live_position_states.read().await;
+            if let Some(v) = states.get(market_type) {
+                return v.clone();
+            }
+        }
+        let mut states = self.live_position_states.write().await;
+        let entry = states
+            .entry(market_type.to_string())
+            .or_insert_with(|| LivePositionState::flat(market_type, now_ms));
+        entry.clone()
+    }
+
+    async fn put_live_position_state(&self, market_type: &str, next: LivePositionState) {
+        let mut states = self.live_position_states.write().await;
+        states.insert(market_type.to_string(), next);
+    }
+
+    async fn should_skip_live_decision(&self, key: &str, now_ms: i64) -> bool {
+        let mut guard = self.live_decision_guard.write().await;
+        guard.retain(|_, ts| now_ms.saturating_sub(*ts) <= LIVE_DECISION_GUARD_TTL_MS);
+        guard.contains_key(key)
+    }
+
+    async fn mark_live_decision_seen(&self, key: String, now_ms: i64) {
+        let mut guard = self.live_decision_guard.write().await;
+        guard.insert(key, now_ms);
+    }
+
+    async fn append_live_event(&self, market_type: &str, mut event: Value) {
+        let now_ms = Utc::now().timestamp_millis();
+        if event.get("market_type").is_none() {
+            event["market_type"] = Value::String(market_type.to_string());
+        }
+        if event.get("ts_ms").is_none() {
+            event["ts_ms"] = Value::from(now_ms);
+        }
+        let mut events = self.live_events.write().await;
+        events.push_back(event);
+        while events.len() > LIVE_EVENT_LOG_MAX {
+            events.pop_front();
+        }
+    }
+
+    async fn list_live_events(&self, market_type: &str, limit: usize) -> Vec<Value> {
+        let events = self.live_events.read().await;
+        events
+            .iter()
+            .rev()
+            .filter(|v| {
+                v.get("market_type")
+                    .and_then(Value::as_str)
+                    .map(|s| s == market_type)
+                    .unwrap_or(false)
+            })
+            .take(limit.max(1))
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    }
+
+    async fn get_runtime_snapshot(&self, market_type: &str) -> Option<Value> {
+        let store = self.live_runtime_snapshots.read().await;
+        store.get(market_type).cloned()
+    }
+
+    async fn set_runtime_snapshot(&self, market_type: &str, payload: Value) {
+        let mut store = self.live_runtime_snapshots.write().await;
+        store.insert(market_type.to_string(), payload);
+    }
+
+    async fn upsert_pending_order(&self, row: LivePendingOrder) {
+        let mut pending = self.live_pending_orders.write().await;
+        pending.insert(row.order_id.clone(), row);
+    }
+
+    async fn remove_pending_order(&self, order_id: &str) -> Option<LivePendingOrder> {
+        let mut pending = self.live_pending_orders.write().await;
+        pending.remove(order_id)
+    }
+
+    async fn list_pending_orders(&self) -> Vec<LivePendingOrder> {
+        let pending = self.live_pending_orders.read().await;
+        pending.values().cloned().collect()
+    }
+
+    async fn get_gateway_report_seq(&self) -> i64 {
+        *self.live_gateway_report_seq.read().await
+    }
+
+    async fn set_gateway_report_seq(&self, seq: i64) {
+        let mut current = self.live_gateway_report_seq.write().await;
+        *current = seq;
     }
 }
 
@@ -165,6 +406,10 @@ struct StrategyPaperQueryParams {
     slippage_cents_per_side: Option<f64>,
     fee_cents_per_side: Option<f64>,
     emergency_wide_spread_penalty_ratio: Option<f64>,
+    live_execute: Option<bool>,
+    live_quote_usdc: Option<f64>,
+    live_max_orders: Option<u32>,
+    live_entry_only: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,6 +556,12 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         redis_prefix: cfg.redis_prefix,
         redis_client,
         chart_cache: Arc::new(RwLock::new(HashMap::new())),
+        live_position_states: Arc::new(RwLock::new(HashMap::new())),
+        live_decision_guard: Arc::new(RwLock::new(HashMap::new())),
+        live_events: Arc::new(RwLock::new(VecDeque::new())),
+        live_pending_orders: Arc::new(RwLock::new(HashMap::new())),
+        live_gateway_report_seq: Arc::new(RwLock::new(0)),
+        live_runtime_snapshots: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let mut app = Router::new()
@@ -344,7 +595,8 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         .route("/api/strategy/autotune/latest", get(strategy_autotune_latest))
         .route("/api/strategy/autotune/history", get(strategy_autotune_history))
         .route("/api/strategy/autotune/set", post(strategy_autotune_set))
-        .with_state(state);
+        .route("/api/strategy/live/reset", post(strategy_live_reset))
+        .with_state(state.clone());
 
     if let Some(dist) = cfg.dashboard_dist_dir {
         let index_path = format!("{}/index.html", dist);
@@ -362,10 +614,130 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         }
     }
 
+    start_live_runtime(state.clone());
+
     tracing::info!(bind = %bind, "forge api server started");
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn live_position_state_key(redis_prefix: &str, market_type: &str) -> String {
+    format!("{redis_prefix}:fev1:live:position:{market_type}")
+}
+
+fn live_pending_orders_key(redis_prefix: &str) -> String {
+    format!("{redis_prefix}:fev1:live:pending")
+}
+
+fn live_gateway_seq_key(redis_prefix: &str) -> String {
+    format!("{redis_prefix}:fev1:live:gateway_seq")
+}
+
+fn start_live_runtime(state: ApiState) {
+    let cfg = LiveRuntimeConfig::from_env();
+    if !cfg.enabled {
+        tracing::info!("fev1 live runtime disabled by FORGE_FEV1_RUNTIME_ENABLED=false");
+        return;
+    }
+    tokio::spawn(async move {
+        if let Err(err) = restore_live_runtime_state(&state, &cfg).await {
+            tracing::warn!(?err, "restore live runtime state failed");
+        }
+        live_runtime_loop(state, cfg).await;
+    });
+}
+
+async fn restore_live_runtime_state(state: &ApiState, cfg: &LiveRuntimeConfig) -> Result<(), ApiError> {
+    for market in &cfg.markets {
+        let key = live_position_state_key(&state.redis_prefix, market);
+        if let Some(v) = read_key_value(state, &key).await? {
+            if let Ok(parsed) = serde_json::from_value::<LivePositionState>(v) {
+                state.put_live_position_state(market, parsed).await;
+            }
+        }
+    }
+    let pending_key = live_pending_orders_key(&state.redis_prefix);
+    if let Some(v) = read_key_value(state, &pending_key).await? {
+        if let Ok(rows) = serde_json::from_value::<Vec<LivePendingOrder>>(v) {
+            let mut map = state.live_pending_orders.write().await;
+            map.clear();
+            for row in rows {
+                map.insert(row.order_id.clone(), row);
+            }
+        }
+    }
+    let seq_key = live_gateway_seq_key(&state.redis_prefix);
+    if let Some(v) = read_key_value(state, &seq_key).await? {
+        let seq = v.get("seq").and_then(Value::as_i64).unwrap_or(0);
+        state.set_gateway_report_seq(seq).await;
+    }
+    Ok(())
+}
+
+async fn persist_live_runtime_state(state: &ApiState, market_type: &str) {
+    let position = state.get_live_position_state(market_type).await;
+    let pos_key = live_position_state_key(&state.redis_prefix, market_type);
+    let _ = write_key_value(state, &pos_key, &json!(position), Some(2 * 24 * 3600)).await;
+
+    let pending_rows = state.list_pending_orders().await;
+    let pending_key = live_pending_orders_key(&state.redis_prefix);
+    let _ = write_key_value(state, &pending_key, &json!(pending_rows), Some(2 * 24 * 3600)).await;
+
+    let seq = state.get_gateway_report_seq().await;
+    let seq_key = live_gateway_seq_key(&state.redis_prefix);
+    let _ = write_key_value(state, &seq_key, &json!({ "seq": seq }), Some(2 * 24 * 3600)).await;
+}
+
+async fn live_runtime_loop(state: ApiState, cfg: LiveRuntimeConfig) {
+    tracing::info!(
+        markets = ?cfg.markets,
+        live_execute = cfg.live_execute,
+        loop_ms = cfg.loop_interval_ms,
+        "fev1 live runtime started"
+    );
+    loop {
+        for market in &cfg.markets {
+            let market_type = market.as_str();
+            let strategy_cfg = StrategyRuntimeConfig::default();
+            match strategy_paper_live(
+                &state,
+                market_type,
+                false,
+                cfg.lookback_minutes,
+                cfg.max_points,
+                cfg.max_trades,
+                &strategy_cfg,
+                cfg.live_execute,
+                cfg.quote_usdc,
+                cfg.max_orders,
+                cfg.entry_only,
+            )
+            .await
+            {
+                Ok(payload) => {
+                    state.set_runtime_snapshot(market_type, payload).await;
+                    persist_live_runtime_state(&state, market_type).await;
+                }
+                Err(err) => {
+                    let now_ms = Utc::now().timestamp_millis();
+                    state
+                        .append_live_event(
+                            market_type,
+                            json!({
+                                "accepted": false,
+                                "action": "runtime",
+                                "side": "NONE",
+                                "reason": format!("runtime_cycle_error:{}", err.message),
+                                "ts_ms": now_ms
+                            }),
+                        )
+                        .await;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(cfg.loop_interval_ms)).await;
+    }
 }
 
 async fn root_redirect() -> Redirect {
@@ -1275,6 +1647,21 @@ async fn write_key_value(
     Ok(())
 }
 
+async fn delete_key(state: &ApiState, key: &str) -> Result<(), ApiError> {
+    let Some(client) = state.redis_client.as_ref() else {
+        return Ok(());
+    };
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .map_err(|e| ApiError::internal(format!("redis connect failed: {}", e)))?;
+    let _: usize = conn
+        .del(key)
+        .await
+        .map_err(|e| ApiError::internal(format!("redis del failed: {}", e)))?;
+    Ok(())
+}
+
 fn strategy_autotune_key(redis_prefix: &str, market_type: &str) -> String {
     format!("{redis_prefix}:strategy:autotune:{market_type}")
 }
@@ -1317,42 +1704,6 @@ async fn query_clickhouse_json(ch_url: &str, query: &str) -> Result<Value, ApiEr
 
     serde_json::from_str::<Value>(&body)
         .map_err(|e| ApiError::internal(format!("clickhouse json parse failed: {}", e)))
-}
-
-fn app_runner_base_url() -> String {
-    if let Ok(v) = std::env::var("POLYEDGE_CONTROL_BASE_URL") {
-        let trimmed = v.trim().trim_end_matches('/').to_string();
-        if !trimmed.is_empty() {
-            return trimmed;
-        }
-    }
-    let port = std::env::var("POLYEDGE_CONTROL_PORT")
-        .ok()
-        .and_then(|v| v.parse::<u16>().ok())
-        .unwrap_or(8080);
-    format!("http://127.0.0.1:{port}")
-}
-
-async fn query_http_json(url: &str) -> Result<Value, ApiError> {
-    let resp = reqwest::Client::new()
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| ApiError::internal(format!("http request failed: {}", e)))?;
-    let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| ApiError::internal(format!("http body read failed: {}", e)))?;
-    if !status.is_success() {
-        return Err(ApiError::internal(format!(
-            "http endpoint returned {} for {}: {}",
-            status,
-            url,
-            body.chars().take(180).collect::<String>()
-        )));
-    }
-    serde_json::from_str(&body).map_err(|e| ApiError::internal(format!("http json parse failed: {}", e)))
 }
 
 fn is_live_snapshot_fresh(snapshot: &Value, market_type: &str, now_ms: i64) -> bool {
@@ -2401,131 +2752,18 @@ fn strategy_cfg_from_payload(base: StrategyRuntimeConfig, payload: &Value) -> St
     c
 }
 
-fn json_num(v: &Value, key: &str) -> f64 {
-    v.get(key).and_then(Value::as_f64).unwrap_or(0.0)
-}
-
-fn json_i64(v: &Value, key: &str) -> i64 {
-    v.get(key).and_then(Value::as_i64).unwrap_or(0)
-}
-
-fn json_u64(v: &Value, key: &str) -> u64 {
-    v.get(key).and_then(Value::as_u64).unwrap_or(0)
-}
-
-fn json_text(v: &Value, key: &str) -> String {
-    v.get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
-}
-
-fn normalize_side_from_direction(raw: &str) -> &'static str {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "up" => "UP",
-        "down" => "DOWN",
-        _ => "DOWN",
-    }
-}
-
-fn map_live_trade_to_strategy_trade(row: &Value, idx: usize) -> Value {
-    let ts_ms = json_i64(row, "ts_ms");
-    let duration_ms = json_i64(row, "trade_duration_ms").max(0);
-    let entry_ts_ms = ts_ms.saturating_sub(duration_ms);
-    let direction = json_text(row, "direction");
-    let side = normalize_side_from_direction(direction.as_str());
-    let market_id = json_text(row, "market_id");
-    let entry_price_raw_cents = (json_num(row, "entry_price") * 100.0).max(0.0);
-    let exit_price_raw_cents = (json_num(row, "fill_price") * 100.0).max(0.0);
-    let fee_total_cents = (json_num(row, "fee_usdc") * 100.0).max(0.0);
-    let entry_fee_cents = fee_total_cents * 0.5;
-    let exit_fee_cents = fee_total_cents - entry_fee_cents;
-    let pnl_net_cents = json_num(row, "realized_pnl_usdc") * 100.0;
-    let total_cost_cents = fee_total_cents;
-    let pnl_gross_cents = pnl_net_cents + total_cost_cents;
-    let confidence = json_num(row, "confidence").clamp(0.0, 1.0);
-    let action = json_text(row, "action");
-    let stage = json_text(row, "stage");
-    let entry_reason = if stage.is_empty() {
-        "paper_live".to_string()
-    } else {
-        format!("paper_live_{stage}")
-    };
-    let exit_reason = if action.is_empty() {
-        "paper_live_exit".to_string()
-    } else {
-        action
-    };
-
-    json!({
-        "id": format!("live-{idx}-{}", ts_ms),
-        "side": side,
-        "entry_round_id": market_id,
-        "entry_ts_ms": entry_ts_ms,
-        "exit_ts_ms": ts_ms,
-        "entry_remaining_ms": 0,
-        "exit_remaining_ms": 0,
-        "entry_price_cents": (entry_price_raw_cents + entry_fee_cents).max(0.0),
-        "entry_price_raw_cents": entry_price_raw_cents,
-        "entry_fee_cents": entry_fee_cents,
-        "entry_slippage_cents": 0.0,
-        "exit_price_cents": (exit_price_raw_cents - exit_fee_cents).max(0.0),
-        "exit_price_raw_cents": exit_price_raw_cents,
-        "exit_slippage_cents": 0.0,
-        "exit_emergency_penalty_cents": 0.0,
-        "pnl_gross_cents": pnl_gross_cents,
-        "total_cost_cents": total_cost_cents,
-        "pnl_net_cents": pnl_net_cents,
-        "pnl_cents": pnl_net_cents,
-        "peak_pnl_cents": pnl_net_cents.max(0.0),
-        "duration_s": (duration_ms as f64) / 1000.0,
-        "entry_score": confidence,
-        "exit_score": confidence,
-        "entry_reason": entry_reason,
-        "exit_reason": exit_reason,
-        "exec_fill_ok": true,
-        "exit_spread_cents": 0.0,
-        "exit_fee_cents": exit_fee_cents,
-    })
-}
-
-async fn load_latest_strategy_sample(
-    state: &ApiState,
-    market_type: &str,
-) -> Result<Option<StrategySample>, ApiError> {
-    let Some(ch_url) = state.ch_url.as_deref() else {
-        return Ok(None);
-    };
-    let q = format!(
-        "SELECT
-            ts_ireland_sample_ms AS ts_ms,
-            round_id,
-            remaining_ms,
-            if(isNaN(mid_yes_smooth) OR mid_yes_smooth <= 0, mid_yes, mid_yes_smooth) AS p_up,
-            if(isNaN(delta_pct_smooth), delta_pct, delta_pct_smooth) AS delta_pct,
-            acceleration,
-            velocity_bps_per_sec,
-            bid_yes,
-            ask_yes,
-            bid_no,
-            ask_no
-        FROM polyedge_forge.snapshot_100ms
-        WHERE symbol='BTCUSDT'
-          AND timeframe='{market_type}'
-        ORDER BY ts_ireland_sample_ms DESC
-        LIMIT 1
-        FORMAT JSON"
-    );
-    let rows = rows_from_json(query_clickhouse_json(ch_url, &q).await?);
-    Ok(parse_strategy_rows(rows).into_iter().next())
-}
-
 async fn strategy_paper_live(
     state: &ApiState,
     market_type: &str,
+    full_history: bool,
     lookback_minutes: u32,
+    max_points: u32,
     max_trades: usize,
     cfg: &StrategyRuntimeConfig,
+    live_execute: bool,
+    live_quote_usdc: f64,
+    live_max_orders: usize,
+    live_entry_only: bool,
 ) -> Result<Value, ApiError> {
     let exec_gate = fev1::ExecutionGate::from_env();
     if !exec_gate.live_enabled {
@@ -2534,163 +2772,982 @@ async fn strategy_paper_live(
         ));
     }
 
-    let base_url = app_runner_base_url();
-    let live_url = format!("{base_url}/report/paper/live");
-    let history_url = format!(
-        "{base_url}/report/paper/history?limit={}",
-        max_trades.clamp(20, 5000)
-    );
-
-    let (live_payload, history_payload, latest_sample) = tokio::try_join!(
-        query_http_json(&live_url),
-        query_http_json(&history_url),
-        load_latest_strategy_sample(state, market_type)
-    )?;
-
-    let live = if live_payload.is_object() {
-        live_payload
-    } else {
-        return Err(ApiError::internal("invalid /report/paper/live payload"));
-    };
-    let mut history_rows = history_payload
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    history_rows.reverse(); // oldest -> newest
-    let timeframe_key = market_type.to_ascii_lowercase();
-    let filtered_rows = history_rows
-        .into_iter()
-        .filter(|row| {
-            row.get("timeframe")
-                .and_then(Value::as_str)
-                .map(|v| v.trim().to_ascii_lowercase() == timeframe_key)
-                .unwrap_or(false)
-        })
-        .collect::<Vec<_>>();
-    let trades = filtered_rows
-        .iter()
-        .enumerate()
-        .map(|(idx, row)| map_live_trade_to_strategy_trade(row, idx + 1))
-        .collect::<Vec<_>>();
-
-    let trade_count = filtered_rows.len();
-    let wins = filtered_rows
-        .iter()
-        .filter(|row| json_num(row, "realized_pnl_usdc") >= 0.0)
-        .count();
-    let win_rate_pct = if trade_count > 0 {
-        (wins as f64) * 100.0 / trade_count as f64
-    } else {
-        0.0
-    };
-    let total_pnl_cents = filtered_rows
-        .iter()
-        .map(|row| json_num(row, "realized_pnl_usdc") * 100.0)
-        .sum::<f64>();
-    let total_cost_cents = filtered_rows
-        .iter()
-        .map(|row| (json_num(row, "fee_usdc") * 100.0).max(0.0))
-        .sum::<f64>();
-    let gross_pnl_cents = total_pnl_cents + total_cost_cents;
-    let avg_pnl_cents = if trade_count > 0 {
-        total_pnl_cents / trade_count as f64
-    } else {
-        0.0
-    };
-    let avg_duration_s = if trade_count > 0 {
-        filtered_rows
-            .iter()
-            .map(|row| json_i64(row, "trade_duration_ms").max(0) as f64 / 1000.0)
-            .sum::<f64>()
-            / trade_count as f64
-    } else {
-        0.0
-    };
-    let mut peak = 0.0_f64;
-    let mut cum = 0.0_f64;
-    let mut max_drawdown_cents = 0.0_f64;
-    for row in &filtered_rows {
-        cum += json_num(row, "realized_pnl_usdc") * 100.0;
-        peak = peak.max(cum);
-        max_drawdown_cents = max_drawdown_cents.max((peak - cum).max(0.0));
+    let samples = load_strategy_samples(
+        state,
+        market_type,
+        full_history,
+        lookback_minutes,
+        max_points,
+    )
+    .await?;
+    if samples.len() < 20 {
+        return Err(ApiError::bad_request(
+            "not enough samples for live execution",
+        ));
     }
-    let net_margin_pct = if gross_pnl_cents.abs() > 1e-9 {
-        total_pnl_cents / gross_pnl_cents.abs() * 100.0
-    } else {
-        0.0
-    };
-    let max_profit_trade_cents = trades
-        .iter()
-        .filter_map(|t| t.get("pnl_net_cents").and_then(Value::as_f64))
-        .fold(0.0_f64, f64::max);
 
-    let open_positions_count = json_u64(&live, "open_positions_count") as usize;
-    let current = if let Some(sample) = latest_sample {
-        let suggested_side = if sample.p_up > 0.505 {
-            "UP"
-        } else if sample.p_up < 0.495 {
-            "DOWN"
-        } else {
-            "WAIT"
-        };
-        let action = if open_positions_count > 0 {
-            "HOLD"
-        } else {
-            "WAIT"
-        };
-        json!({
-            "timestamp_ms": sample.ts_ms,
-            "round_id": sample.round_id,
-            "remaining_s": (sample.remaining_ms.max(0) as f64) / 1000.0,
-            "score": 0.0,
-            "entry_threshold": cfg.entry_threshold_base,
-            "confirmed": open_positions_count > 0,
-            "suggested_side": suggested_side,
-            "suggested_action": action,
-            "confidence": json_num(&live, "win_rate").clamp(0.0, 1.0),
-            "p_up_pct": (sample.p_up * 100.0).clamp(0.0, 100.0),
-            "delta_pct": sample.delta_pct,
-            "spread_up_cents": (sample.spread_up * 100.0).max(0.0),
-            "spread_down_cents": (sample.spread_down * 100.0).max(0.0)
-        })
+    let mapped_samples = map_samples_to_fev1(&samples);
+    let mapped_cfg = map_cfg_to_fev1(cfg);
+    let run = fev1::simulate(&mapped_samples, &mapped_cfg, max_trades);
+    let gateway = fev1::ArmedSimulatedGateway;
+    let dual = fev1::simulate_dual(
+        &mapped_samples,
+        &mapped_cfg,
+        max_trades,
+        live_quote_usdc.max(0.01),
+        &gateway,
+    );
+    let live_gateway_cfg = LiveGatewayConfig::from_env();
+    reconcile_gateway_reports(state, &live_gateway_cfg).await;
+    handle_pending_timeouts(state, &live_gateway_cfg).await;
+    let live_market = resolve_live_market_target(market_type).await.ok();
+    let selected_decisions = select_live_decisions(
+        &dual.decisions,
+        samples.last().map(|s| s.ts_ms).unwrap_or_default(),
+        live_max_orders.max(1),
+        live_entry_only,
+    );
+    let (gated_decisions, skipped_decisions, mut live_position_state) = gate_live_decisions(
+        state,
+        market_type,
+        &selected_decisions,
+        live_execute,
+    )
+    .await;
+    let submitted_decisions: Vec<Value> = gated_decisions
+        .iter()
+        .map(|v| v.decision.clone())
+        .collect();
+
+    let live_exec_payload = if live_execute {
+        match live_market.as_ref() {
+            Some(target) => {
+                let execution_orders =
+                    execute_live_orders_via_gateway(&live_gateway_cfg, target, &gated_decisions)
+                        .await;
+                for record in &execution_orders {
+                    let decision = record.get("decision").cloned().unwrap_or(Value::Null);
+                    let action = decision
+                        .get("action")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    let side = decision
+                        .get("side")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_ascii_uppercase();
+                    let round_id = decision
+                        .get("round_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let ts_ms = decision
+                        .get("ts_ms")
+                        .and_then(Value::as_i64)
+                        .unwrap_or_else(|| Utc::now().timestamp_millis());
+                    let accepted = record
+                        .get("accepted")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let event_reason = if accepted {
+                        "submit_accepted_pending_confirm".to_string()
+                    } else {
+                        record
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("rejected")
+                            .to_string()
+                    };
+                    if accepted {
+                        if action == "enter" {
+                            live_position_state.state = "enter_pending".to_string();
+                        } else if action == "exit" {
+                            live_position_state.state = "exit_pending".to_string();
+                        }
+                        let order_id = extract_order_id_from_gateway_record(record);
+                        if let Some(order_id) = order_id {
+                            let pending = LivePendingOrder {
+                                market_type: market_type.to_string(),
+                                order_id,
+                                action: action.clone(),
+                                side: side.clone(),
+                                round_id: round_id.to_string(),
+                                decision_key: record
+                                    .get("decision_key")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                price_cents: decision
+                                    .get("price_cents")
+                                    .and_then(Value::as_f64)
+                                    .unwrap_or(0.0),
+                                quote_size_usdc: decision
+                                    .get("quote_size_usdc")
+                                    .and_then(Value::as_f64)
+                                    .unwrap_or(0.0),
+                                submitted_ts_ms: ts_ms,
+                                cancel_after_ms: if action == "exit" { 2200 } else { 3600 },
+                                retry_count: 0,
+                            };
+                            state.upsert_pending_order(pending).await;
+                        }
+                    }
+                    live_position_state.last_action = Some(format!("{}_{}", action, side));
+                    live_position_state.last_reason = Some(event_reason.clone());
+                    live_position_state.updated_ts_ms = Utc::now().timestamp_millis();
+                    state
+                        .append_live_event(
+                            market_type,
+                            json!({
+                                "decision_key": record.get("decision_key"),
+                                "accepted": accepted,
+                                "action": action,
+                                "side": side,
+                                "round_id": round_id,
+                                "price_cents": decision.get("price_cents").and_then(Value::as_f64),
+                                "quote_size_usdc": decision.get("quote_size_usdc").and_then(Value::as_f64),
+                                "reason": event_reason,
+                                "gateway_endpoint": record.get("endpoint"),
+                                "response": record.get("response"),
+                                "error": record.get("error")
+                            }),
+                        )
+                        .await;
+                }
+                state
+                    .put_live_position_state(market_type, live_position_state.clone())
+                    .await;
+                reconcile_gateway_reports(state, &live_gateway_cfg).await;
+                json!({
+                    "mode": "real_gateway",
+                    "target": {
+                        "market_id": target.market_id,
+                        "symbol": target.symbol,
+                        "timeframe": target.timeframe,
+                        "token_id_yes": target.token_id_yes,
+                        "token_id_no": target.token_id_no,
+                        "end_date": target.end_date
+                    },
+                    "orders": execution_orders
+                })
+            }
+            None => {
+                state
+                    .append_live_event(
+                        market_type,
+                        json!({
+                            "accepted": false,
+                            "action": "none",
+                            "side": "NONE",
+                            "reason": "no_live_market_target"
+                        }),
+                    )
+                    .await;
+                json!({
+                    "mode": "real_gateway",
+                    "error": "no_live_market_target",
+                    "orders": []
+                })
+            }
+        }
     } else {
-        Value::Null
+        json!({
+            "mode": "dry_run",
+            "target": live_market.as_ref().map(|target| json!({
+                "market_id": target.market_id,
+                "symbol": target.symbol,
+                "timeframe": target.timeframe,
+                "token_id_yes": target.token_id_yes,
+                "token_id_no": target.token_id_no,
+                "end_date": target.end_date
+            })),
+            "orders": submitted_decisions.clone()
+        })
     };
+    let live_events = state.list_live_events(market_type, 60).await;
+    let live_position_state = state.get_live_position_state(market_type).await;
 
     Ok(json!({
         "source": "live",
         "execution_target": "live",
         "live_enabled": exec_gate.live_enabled,
+        "strategy_engine": "forge_fev1",
+        "strategy_alias": "FEV1",
+        "engine_version": "v1",
+        "executor_mode": "same_signal_dual_executor",
+        "live_executor": if live_execute { "clob_gateway" } else { "dry_run" },
+        "live_execute": live_execute,
         "market_type": market_type,
         "lookback_minutes": lookback_minutes,
-        "full_history": false,
-        "samples": trade_count,
-        "config_source": "live_report",
+        "full_history": full_history,
+        "samples": samples.len(),
+        "config_source": "live_gate",
         "baseline_profile": STRATEGY_BASELINE_PROFILE,
         "autotune": Value::Null,
         "config": strategy_cfg_json(cfg),
-        "current": current,
-        "summary": {
-            "trade_count": trade_count,
-            "win_rate_pct": win_rate_pct,
-            "avg_pnl_cents": avg_pnl_cents,
-            "avg_duration_s": avg_duration_s,
-            "total_pnl_cents": total_pnl_cents,
-            "net_pnl_cents": total_pnl_cents,
-            "gross_pnl_cents": gross_pnl_cents,
-            "total_cost_cents": total_cost_cents,
-            "total_entry_fee_cents": total_cost_cents * 0.5,
-            "total_exit_fee_cents": total_cost_cents * 0.5,
-            "total_slippage_cents": 0.0,
-            "net_margin_pct": net_margin_pct,
-            "max_drawdown_cents": max_drawdown_cents,
-            "max_profit_trade_cents": max_profit_trade_cents,
-            "blocked_exits": 0,
-            "emergency_wide_exit_count": 0,
-            "execution_penalty_cents_total": 0.0,
-        },
-        "trades": trades,
+        "current": run.current,
+        "summary": run_summary_json(&map_simulation_result(run.clone())),
+        "trades": run.trades,
+        "live_execution": {
+            "summary": dual.summary,
+            "decisions": dual.decisions,
+            "paper_records": dual.paper_records,
+            "live_records": dual.live_records,
+            "gated": {
+                "selected_count": selected_decisions.len(),
+                "submitted_count": submitted_decisions.len(),
+                "skipped_count": skipped_decisions.len(),
+                "submitted_decisions": submitted_decisions,
+                "skipped_decisions": skipped_decisions
+            },
+            "gateway": {
+                "primary_url": live_gateway_cfg.primary_url,
+                "backup_url": live_gateway_cfg.backup_url,
+                "timeout_ms": live_gateway_cfg.timeout_ms,
+                "entry_slippage_bps": live_gateway_cfg.entry_slippage_bps,
+                "exit_slippage_bps": live_gateway_cfg.exit_slippage_bps,
+                "min_quote_usdc": live_gateway_cfg.min_quote_usdc
+            },
+            "execution": live_exec_payload,
+            "state_machine": live_position_state,
+            "events": live_events
+        }
     }))
+}
+
+#[derive(Debug, Clone)]
+struct LiveGatewayConfig {
+    primary_url: String,
+    backup_url: Option<String>,
+    timeout_ms: u64,
+    min_quote_usdc: f64,
+    entry_slippage_bps: f64,
+    exit_slippage_bps: f64,
+}
+
+impl LiveGatewayConfig {
+    fn from_env() -> Self {
+        let primary_url = std::env::var("FORGE_FEV1_GATEWAY_PRIMARY")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "http://127.0.0.1:9001".to_string());
+        let backup_url = std::env::var("FORGE_FEV1_GATEWAY_BACKUP")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty() && v != &primary_url);
+        let timeout_ms = std::env::var("FORGE_FEV1_GATEWAY_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(500)
+            .clamp(100, 10_000);
+        let min_quote_usdc = std::env::var("FORGE_FEV1_MIN_QUOTE_USDC")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(1.0)
+            .clamp(0.5, 1000.0);
+        let entry_slippage_bps = std::env::var("FORGE_FEV1_ENTRY_SLIPPAGE_BPS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(18.0)
+            .clamp(0.0, 500.0);
+        let exit_slippage_bps = std::env::var("FORGE_FEV1_EXIT_SLIPPAGE_BPS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(22.0)
+            .clamp(0.0, 500.0);
+        Self {
+            primary_url,
+            backup_url,
+            timeout_ms,
+            min_quote_usdc,
+            entry_slippage_bps,
+            exit_slippage_bps,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LiveMarketTarget {
+    market_id: String,
+    symbol: String,
+    timeframe: String,
+    token_id_yes: String,
+    token_id_no: String,
+    end_date: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LiveGatedDecision {
+    decision: Value,
+    decision_key: String,
+}
+
+fn live_decision_key(market_type: &str, decision: &Value) -> String {
+    let action = decision
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let side = decision
+        .get("side")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let round = decision
+        .get("round_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let ts = decision.get("ts_ms").and_then(Value::as_i64).unwrap_or_default();
+    let price_cents = decision
+        .get("price_cents")
+        .and_then(Value::as_f64)
+        .unwrap_or_default();
+    format!(
+        "{}:{}:{}:{}:{}:{:.4}",
+        market_type, action, side, round, ts, price_cents
+    )
+}
+
+async fn gate_live_decisions(
+    state: &ApiState,
+    market_type: &str,
+    decisions: &[Value],
+    mark_attempts: bool,
+) -> (Vec<LiveGatedDecision>, Vec<Value>, LivePositionState) {
+    let now_ms = Utc::now().timestamp_millis();
+    let mut position_state = state.get_live_position_state(market_type).await;
+    let mut virtual_side = position_state.side.clone();
+    let mut accepted = Vec::<LiveGatedDecision>::new();
+    let mut skipped = Vec::<Value>::new();
+
+    for decision in decisions {
+        let action = decision
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let side = decision
+            .get("side")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        if action != "enter" && action != "exit" {
+            skipped.push(json!({
+                "reason": "invalid_action",
+                "decision": decision
+            }));
+            continue;
+        }
+        if side != "UP" && side != "DOWN" {
+            skipped.push(json!({
+                "reason": "invalid_side",
+                "decision": decision
+            }));
+            continue;
+        }
+        let decision_key = live_decision_key(market_type, decision);
+        if mark_attempts && state.should_skip_live_decision(&decision_key, now_ms).await {
+            skipped.push(json!({
+                "reason": "duplicate_recent",
+                "decision_key": decision_key,
+                "decision": decision
+            }));
+            continue;
+        }
+        let side_match = virtual_side
+            .as_deref()
+            .map(|s| s.eq_ignore_ascii_case(&side))
+            .unwrap_or(false);
+        let should_submit = if action == "enter" {
+            if virtual_side.is_none() {
+                true
+            } else {
+                skipped.push(json!({
+                    "reason": "already_in_position",
+                    "state_side": virtual_side,
+                    "decision": decision
+                }));
+                false
+            }
+        } else if side_match {
+            true
+        } else {
+            let reason = if virtual_side.is_none() {
+                "no_open_position"
+            } else {
+                "side_mismatch"
+            };
+            skipped.push(json!({
+                "reason": reason,
+                "state_side": virtual_side,
+                "decision": decision
+            }));
+            false
+        };
+        if !should_submit {
+            continue;
+        }
+        if mark_attempts {
+            state
+                .mark_live_decision_seen(decision_key.clone(), now_ms)
+                .await;
+        }
+        if action == "enter" {
+            virtual_side = Some(side.clone());
+        } else {
+            virtual_side = None;
+        }
+        accepted.push(LiveGatedDecision {
+            decision: decision.clone(),
+            decision_key,
+        });
+    }
+
+    position_state.updated_ts_ms = now_ms;
+    (accepted, skipped, position_state)
+}
+
+fn select_live_decisions(
+    decisions: &[Value],
+    latest_ts_ms: i64,
+    max_orders: usize,
+    entry_only: bool,
+) -> Vec<Value> {
+    if decisions.is_empty() {
+        return Vec::new();
+    }
+    let latest_round = decisions
+        .iter()
+        .rev()
+        .find_map(|d| d.get("round_id").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_string();
+    let mut selected: Vec<Value> = decisions
+        .iter()
+        .filter(|d| {
+            let action = d
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let round_ok = d
+                .get("round_id")
+                .and_then(Value::as_str)
+                .map(|r| r == latest_round)
+                .unwrap_or(false);
+            let ts_ok = d
+                .get("ts_ms")
+                .and_then(Value::as_i64)
+                .map(|ts| ts >= latest_ts_ms.saturating_sub(90_000))
+                .unwrap_or(false);
+            let action_ok = if entry_only { action == "enter" } else { true };
+            (round_ok || ts_ok) && action_ok
+        })
+        .cloned()
+        .collect();
+    if selected.is_empty() {
+        if let Some(last) = decisions.iter().rev().find(|d| {
+            let action = d
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            !entry_only || action == "enter"
+        }) {
+            selected.push(last.clone());
+        }
+    }
+    selected.sort_by_key(|v| v.get("ts_ms").and_then(Value::as_i64).unwrap_or(0));
+    if selected.len() > max_orders {
+        selected = selected[selected.len() - max_orders..].to_vec();
+    }
+    selected
+}
+
+async fn resolve_live_market_target(market_type: &str) -> Result<LiveMarketTarget, ApiError> {
+    let discovery = MarketDiscovery::new(DiscoveryConfig {
+        symbols: vec!["BTCUSDT".to_string()],
+        market_types: vec!["updown".to_string()],
+        timeframes: vec![market_type.to_string()],
+        ..DiscoveryConfig::default()
+    });
+    let now_ms = Utc::now().timestamp_millis();
+    let mut markets: Vec<MarketDescriptor> = discovery
+        .discover()
+        .await
+        .map_err(|e| ApiError::internal(format!("market discovery failed: {e}")))?
+        .into_iter()
+        .filter(|m| {
+            m.symbol.eq_ignore_ascii_case("BTCUSDT")
+                && m.timeframe
+                    .as_deref()
+                    .map(|tf| tf.eq_ignore_ascii_case(market_type))
+                    .unwrap_or(false)
+                && m.token_id_yes.is_some()
+                && m.token_id_no.is_some()
+        })
+        .collect();
+    if markets.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "no active BTC {market_type} market with token ids"
+        )));
+    }
+    markets.sort_by_key(|m| {
+        let end_ms = parse_end_date_ms(m.end_date.as_deref()).unwrap_or(i64::MAX / 4);
+        let ended_penalty = if end_ms < now_ms { 1_i64 } else { 0_i64 };
+        let distance = end_ms.saturating_sub(now_ms).abs();
+        (ended_penalty, distance)
+    });
+    let best = markets.remove(0);
+    Ok(LiveMarketTarget {
+        market_id: best.market_id,
+        symbol: best.symbol,
+        timeframe: best.timeframe.unwrap_or_else(|| market_type.to_string()),
+        token_id_yes: best.token_id_yes.unwrap_or_default(),
+        token_id_no: best.token_id_no.unwrap_or_default(),
+        end_date: best.end_date,
+    })
+}
+
+fn decision_to_live_payload(
+    decision: &Value,
+    target: &LiveMarketTarget,
+    gateway_cfg: &LiveGatewayConfig,
+) -> Option<Value> {
+    let action = decision
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let side = decision
+        .get("side")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let (gateway_side, token_id, max_slippage_bps) = match (action.as_str(), side.as_str()) {
+        ("enter", "UP") => ("buy_yes", target.token_id_yes.as_str(), gateway_cfg.entry_slippage_bps),
+        ("exit", "UP") => ("sell_yes", target.token_id_yes.as_str(), gateway_cfg.exit_slippage_bps),
+        ("enter", "DOWN") => ("buy_no", target.token_id_no.as_str(), gateway_cfg.entry_slippage_bps),
+        ("exit", "DOWN") => ("sell_no", target.token_id_no.as_str(), gateway_cfg.exit_slippage_bps),
+        _ => return None,
+    };
+    let mut price_cents = decision
+        .get("price_cents")
+        .and_then(Value::as_f64)
+        .unwrap_or(50.0);
+    if !price_cents.is_finite() {
+        price_cents = 50.0;
+    }
+    price_cents = price_cents.clamp(1.0, 99.0);
+    let price = (price_cents / 100.0).clamp(0.01, 0.99);
+    let quote_size = decision
+        .get("quote_size_usdc")
+        .and_then(Value::as_f64)
+        .unwrap_or(gateway_cfg.min_quote_usdc)
+        .max(gateway_cfg.min_quote_usdc);
+    let size = (quote_size / price).max(5.0);
+    let ttl_ms = if action == "exit" { 900 } else { 1400 };
+    let cache_key = format!(
+        "fev1:{}:{}:{}:{:.4}:{:.4}",
+        target.market_id, gateway_side, action, price, size
+    );
+    Some(json!({
+        "market_id": target.market_id,
+        "token_id": token_id,
+        "side": gateway_side,
+        "price": price,
+        "size": size,
+        "tif": "FAK",
+        "style": "taker",
+        "ttl_ms": ttl_ms,
+        "max_slippage_bps": max_slippage_bps,
+        "cache_key": cache_key
+    }))
+}
+
+async fn post_gateway(
+    client: &reqwest::Client,
+    endpoint: &str,
+    path: &str,
+    payload: &Value,
+) -> Result<Value, String> {
+    let url = format!("{}/{}", endpoint.trim_end_matches('/'), path.trim_start_matches('/'));
+    let resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .json(payload)
+        .send()
+        .await
+        .map_err(|e| format!("http_error:{e}"))?;
+    let status = resp.status();
+    let body = resp.text().await.map_err(|e| format!("read_error:{e}"))?;
+    let parsed = serde_json::from_str::<Value>(&body).unwrap_or_else(|_| json!({"raw": body}));
+    if status.is_success() {
+        Ok(parsed)
+    } else {
+        Err(format!("status_{}:{}", status.as_u16(), parsed))
+    }
+}
+
+async fn get_gateway_reports(
+    client: &reqwest::Client,
+    endpoint: &str,
+    since_seq: i64,
+    limit: usize,
+) -> Result<Value, String> {
+    let url = format!(
+        "{}/reports/orders?since_seq={}&limit={}",
+        endpoint.trim_end_matches('/'),
+        since_seq.max(0),
+        limit.clamp(1, 1000)
+    );
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("http_error:{e}"))?;
+    let status = resp.status();
+    let body = resp.text().await.map_err(|e| format!("read_error:{e}"))?;
+    let parsed = serde_json::from_str::<Value>(&body).unwrap_or_else(|_| json!({"raw": body}));
+    if status.is_success() {
+        Ok(parsed)
+    } else {
+        Err(format!("status_{}:{}", status.as_u16(), parsed))
+    }
+}
+
+async fn delete_gateway_order(
+    client: &reqwest::Client,
+    endpoint: &str,
+    order_id: &str,
+) -> Result<Value, String> {
+    let url = format!(
+        "{}/orders/{}",
+        endpoint.trim_end_matches('/'),
+        order_id.trim()
+    );
+    let resp = client
+        .delete(&url)
+        .send()
+        .await
+        .map_err(|e| format!("http_error:{e}"))?;
+    let status = resp.status();
+    let body = resp.text().await.map_err(|e| format!("read_error:{e}"))?;
+    let parsed = serde_json::from_str::<Value>(&body).unwrap_or_else(|_| json!({"raw": body}));
+    if status.is_success() {
+        Ok(parsed)
+    } else {
+        Err(format!("status_{}:{}", status.as_u16(), parsed))
+    }
+}
+
+fn extract_order_id_from_gateway_record(row: &Value) -> Option<String> {
+    row.get("response")
+        .and_then(|v| v.get("order_id").and_then(Value::as_str))
+        .map(str::to_string)
+        .or_else(|| {
+            row.get("response")
+                .and_then(|v| v.get("id").and_then(Value::as_str))
+                .map(str::to_string)
+        })
+        .or_else(|| row.get("order_id").and_then(Value::as_str).map(str::to_string))
+}
+
+async fn apply_pending_confirmation(
+    state: &ApiState,
+    pending: &LivePendingOrder,
+    reason: &str,
+) {
+    let now_ms = Utc::now().timestamp_millis();
+    let mut ps = state.get_live_position_state(&pending.market_type).await;
+    if pending.action == "enter" {
+        ps.state = "in_position".to_string();
+        ps.side = Some(pending.side.clone());
+        ps.entry_round_id = Some(pending.round_id.clone());
+        ps.entry_ts_ms = Some(pending.submitted_ts_ms);
+        ps.entry_price_cents = Some(pending.price_cents);
+        ps.entry_quote_usdc = Some(pending.quote_size_usdc);
+        ps.total_entries = ps.total_entries.saturating_add(1);
+    } else if pending.action == "exit" {
+        ps.state = "flat".to_string();
+        ps.side = None;
+        ps.entry_round_id = None;
+        ps.entry_ts_ms = None;
+        ps.entry_price_cents = None;
+        ps.entry_quote_usdc = None;
+        ps.total_exits = ps.total_exits.saturating_add(1);
+    }
+    ps.last_action = Some(format!("{}_{}", pending.action, pending.side));
+    ps.last_reason = Some(reason.to_string());
+    ps.updated_ts_ms = now_ms;
+    state.put_live_position_state(&pending.market_type, ps).await;
+}
+
+async fn apply_pending_revert(
+    state: &ApiState,
+    pending: &LivePendingOrder,
+    reason: &str,
+) {
+    let now_ms = Utc::now().timestamp_millis();
+    let mut ps = state.get_live_position_state(&pending.market_type).await;
+    if pending.action == "enter" {
+        ps.state = "flat".to_string();
+        ps.side = None;
+        ps.entry_round_id = None;
+        ps.entry_ts_ms = None;
+        ps.entry_price_cents = None;
+        ps.entry_quote_usdc = None;
+    } else if pending.action == "exit" {
+        ps.state = "in_position".to_string();
+        if ps.side.is_none() {
+            ps.side = Some(pending.side.clone());
+        }
+    }
+    ps.last_action = Some(format!("{}_{}", pending.action, pending.side));
+    ps.last_reason = Some(reason.to_string());
+    ps.updated_ts_ms = now_ms;
+    state.put_live_position_state(&pending.market_type, ps).await;
+}
+
+async fn reconcile_gateway_reports(state: &ApiState, gateway_cfg: &LiveGatewayConfig) {
+    let since_seq = state.get_gateway_report_seq().await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(gateway_cfg.timeout_ms))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let mut endpoint = gateway_cfg.primary_url.clone();
+    let mut response = get_gateway_reports(&client, &endpoint, since_seq, 240).await;
+    if response.is_err() {
+        if let Some(backup) = gateway_cfg.backup_url.as_deref() {
+            endpoint = backup.to_string();
+            response = get_gateway_reports(&client, &endpoint, since_seq, 240).await;
+        }
+    }
+    let Ok(payload) = response else {
+        return;
+    };
+    let latest_seq = payload
+        .get("latest_seq")
+        .and_then(Value::as_i64)
+        .unwrap_or(since_seq);
+    let events = payload
+        .get("events")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for ev in events {
+        let event_name = ev
+            .get("event")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let order_id = ev
+            .get("order_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if order_id.is_empty() {
+            continue;
+        }
+        let pending = state.remove_pending_order(&order_id).await;
+        let Some(pending) = pending else {
+            continue;
+        };
+        let state_text = ev
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let filled_terminal = matches!(state_text.as_str(), "filled" | "executed" | "matched");
+        let canceled_terminal = matches!(
+            state_text.as_str(),
+            "cancelled" | "canceled" | "rejected" | "expired"
+        );
+        if event_name == "order_terminal" && filled_terminal {
+            apply_pending_confirmation(state, &pending, "order_terminal_filled").await;
+        } else if event_name == "order_terminal" && canceled_terminal {
+            apply_pending_revert(state, &pending, "order_terminal_canceled").await;
+        } else if event_name == "order_timeout_cancelled" {
+            apply_pending_revert(state, &pending, "timeout_cancelled").await;
+        } else if event_name == "order_timeout_cancel_failed" {
+            let mut retry = pending.clone();
+            retry.retry_count = retry.retry_count.saturating_add(1);
+            state.upsert_pending_order(retry.clone()).await;
+            state
+                .append_live_event(
+                    &retry.market_type,
+                    json!({
+                        "accepted": false,
+                        "action": retry.action,
+                        "side": retry.side,
+                        "round_id": retry.round_id,
+                        "reason": "timeout_cancel_failed_requeued",
+                        "order_id": retry.order_id,
+                        "gateway_endpoint": endpoint
+                    }),
+                )
+                .await;
+            continue;
+        } else {
+            let retry = pending.clone();
+            state.upsert_pending_order(retry.clone()).await;
+            state
+                .append_live_event(
+                    &retry.market_type,
+                    json!({
+                        "accepted": false,
+                        "action": retry.action,
+                        "side": retry.side,
+                        "round_id": retry.round_id,
+                        "reason": format!("gateway_event_ignored:{event_name}"),
+                        "order_id": retry.order_id,
+                        "gateway_endpoint": endpoint
+                    }),
+                )
+                .await;
+            continue;
+        }
+        state
+            .append_live_event(
+                &pending.market_type,
+                json!({
+                    "accepted": true,
+                    "action": pending.action,
+                    "side": pending.side,
+                    "round_id": pending.round_id,
+                    "reason": format!("gateway_event:{event_name}"),
+                    "order_id": pending.order_id,
+                    "gateway_endpoint": endpoint,
+                    "event": ev
+                }),
+            )
+            .await;
+    }
+    state.set_gateway_report_seq(latest_seq).await;
+}
+
+async fn handle_pending_timeouts(state: &ApiState, gateway_cfg: &LiveGatewayConfig) {
+    let now_ms = Utc::now().timestamp_millis();
+    let pending = state.list_pending_orders().await;
+    if pending.is_empty() {
+        return;
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(gateway_cfg.timeout_ms))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    for row in pending {
+        let elapsed = now_ms.saturating_sub(row.submitted_ts_ms);
+        if elapsed < row.cancel_after_ms.max(500) {
+            continue;
+        }
+        let mut endpoint = gateway_cfg.primary_url.clone();
+        let mut cancel_res = delete_gateway_order(&client, &endpoint, &row.order_id).await;
+        if cancel_res.is_err() {
+            if let Some(backup) = gateway_cfg.backup_url.as_deref() {
+                endpoint = backup.to_string();
+                cancel_res = delete_gateway_order(&client, &endpoint, &row.order_id).await;
+            }
+        }
+        match cancel_res {
+            Ok(v) => {
+                let _ = state.remove_pending_order(&row.order_id).await;
+                apply_pending_revert(state, &row, "local_timeout_cancel").await;
+                state
+                    .append_live_event(
+                        &row.market_type,
+                        json!({
+                            "accepted": false,
+                            "action": row.action,
+                            "side": row.side,
+                            "round_id": row.round_id,
+                            "reason": "local_timeout_cancelled",
+                            "order_id": row.order_id,
+                            "gateway_endpoint": endpoint,
+                            "response": v
+                        }),
+                    )
+                    .await;
+            }
+            Err(err) => {
+                state
+                    .append_live_event(
+                        &row.market_type,
+                        json!({
+                            "accepted": false,
+                            "action": row.action,
+                            "side": row.side,
+                            "round_id": row.round_id,
+                            "reason": "local_timeout_cancel_failed",
+                            "order_id": row.order_id,
+                            "gateway_endpoint": endpoint,
+                            "error": err
+                        }),
+                    )
+                    .await;
+            }
+        }
+    }
+}
+
+async fn execute_live_orders_via_gateway(
+    gateway_cfg: &LiveGatewayConfig,
+    target: &LiveMarketTarget,
+    decisions: &[LiveGatedDecision],
+) -> Vec<Value> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(gateway_cfg.timeout_ms))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let mut out = Vec::<Value>::new();
+    for gated in decisions {
+        let decision = &gated.decision;
+        let Some(payload) = decision_to_live_payload(decision, target, gateway_cfg) else {
+            out.push(json!({
+                "ok": false,
+                "reason": "decision_to_payload_failed",
+                "decision_key": gated.decision_key,
+                "decision": decision
+            }));
+            continue;
+        };
+        let _ = post_gateway(&client, &gateway_cfg.primary_url, "/prebuild_order", &payload).await;
+        let mut result = post_gateway(&client, &gateway_cfg.primary_url, "/orders", &payload).await;
+        let mut used_endpoint = gateway_cfg.primary_url.clone();
+        if result.is_err() {
+            if let Some(backup) = gateway_cfg.backup_url.as_deref() {
+                let _ = post_gateway(&client, backup, "/prebuild_order", &payload).await;
+                result = post_gateway(&client, backup, "/orders", &payload).await;
+                used_endpoint = backup.to_string();
+            }
+        }
+        match result {
+            Ok(v) => {
+                let accepted = v.get("accepted").and_then(Value::as_bool).unwrap_or(false);
+                out.push(json!({
+                    "ok": accepted,
+                    "accepted": accepted,
+                    "decision_key": gated.decision_key,
+                    "decision": decision,
+                    "endpoint": used_endpoint,
+                    "request": payload,
+                    "response": v
+                }));
+            }
+            Err(err) => {
+                out.push(json!({
+                    "ok": false,
+                    "decision_key": gated.decision_key,
+                    "decision": decision,
+                    "endpoint": used_endpoint,
+                    "request": payload,
+                    "error": err
+                }));
+            }
+        }
+    }
+    out
 }
 
 fn profit_factor(pnls: &[f64]) -> f64 {
@@ -2802,31 +3859,31 @@ fn split_samples_by_round(
     (train, valid)
 }
 
-fn run_strategy_simulation(
-    samples: &[StrategySample],
-    cfg: &StrategyRuntimeConfig,
-    max_trades: usize,
-) -> StrategySimulationResult {
-    let mapped_samples: Vec<fev1::Sample> = samples
-        .iter()
-        .map(|s| fev1::Sample {
-            ts_ms: s.ts_ms,
-            round_id: s.round_id.clone(),
-            remaining_ms: s.remaining_ms,
-            p_up: s.p_up,
-            delta_pct: s.delta_pct,
-            velocity: s.velocity,
-            acceleration: s.acceleration,
-            bid_yes: s.bid_yes,
-            ask_yes: s.ask_yes,
-            bid_no: s.bid_no,
-            ask_no: s.ask_no,
-            spread_up: s.spread_up,
-            spread_down: s.spread_down,
-            spread_mid: s.spread_mid,
-        })
-        .collect();
-    let mapped_cfg = fev1::RuntimeConfig {
+fn map_sample_to_fev1(s: &StrategySample) -> fev1::Sample {
+    fev1::Sample {
+        ts_ms: s.ts_ms,
+        round_id: s.round_id.clone(),
+        remaining_ms: s.remaining_ms,
+        p_up: s.p_up,
+        delta_pct: s.delta_pct,
+        velocity: s.velocity,
+        acceleration: s.acceleration,
+        bid_yes: s.bid_yes,
+        ask_yes: s.ask_yes,
+        bid_no: s.bid_no,
+        ask_no: s.ask_no,
+        spread_up: s.spread_up,
+        spread_down: s.spread_down,
+        spread_mid: s.spread_mid,
+    }
+}
+
+fn map_samples_to_fev1(samples: &[StrategySample]) -> Vec<fev1::Sample> {
+    samples.iter().map(map_sample_to_fev1).collect()
+}
+
+fn map_cfg_to_fev1(cfg: &StrategyRuntimeConfig) -> fev1::RuntimeConfig {
+    fev1::RuntimeConfig {
         entry_threshold_base: cfg.entry_threshold_base,
         entry_threshold_cap: cfg.entry_threshold_cap,
         spread_limit_prob: cfg.spread_limit_prob,
@@ -2849,9 +3906,10 @@ fn run_strategy_simulation(
         slippage_cents_per_side: cfg.slippage_cents_per_side,
         fee_cents_per_side: cfg.fee_cents_per_side,
         emergency_wide_spread_penalty_ratio: cfg.emergency_wide_spread_penalty_ratio,
-    };
+    }
+}
 
-    let run = fev1::simulate(&mapped_samples, &mapped_cfg, max_trades);
+fn map_simulation_result(run: fev1::SimulationResult) -> StrategySimulationResult {
     StrategySimulationResult {
         current: run.current,
         trades: run.trades,
@@ -2874,6 +3932,16 @@ fn run_strategy_simulation(
         total_cost_cents: run.total_cost_cents,
         net_margin_pct: run.net_margin_pct,
     }
+}
+
+fn run_strategy_simulation(
+    samples: &[StrategySample],
+    cfg: &StrategyRuntimeConfig,
+    max_trades: usize,
+) -> StrategySimulationResult {
+    let mapped_samples = map_samples_to_fev1(samples);
+    let mapped_cfg = map_cfg_to_fev1(cfg);
+    map_simulation_result(fev1::simulate(&mapped_samples, &mapped_cfg, max_trades))
 }
 
 
@@ -3031,16 +4099,21 @@ async fn strategy_paper(
         .unwrap_or(if full_history { 2_400_000 } else { 220_000 })
         .clamp(20_000, 5_000_000);
     let max_trades = params.max_trades.unwrap_or(200).clamp(20, 1000) as usize;
+    let _live_execute = params.live_execute.unwrap_or(false);
+    let _live_quote_usdc = params.live_quote_usdc.unwrap_or(1.0).clamp(0.5, 1000.0);
+    let _live_max_orders = params.live_max_orders.unwrap_or(1).clamp(1, 8) as usize;
+    let _live_entry_only = params.live_entry_only.unwrap_or(true);
 
     let mut source_fallback_error: Option<String> = None;
     if matches!(source_mode, StrategyPaperSource::Live | StrategyPaperSource::Auto) {
-        match strategy_paper_live(&state, market_type, lookback_minutes, max_trades, &cfg).await {
-            Ok(payload) => return Ok(Json(payload)),
-            Err(err) if matches!(source_mode, StrategyPaperSource::Live) => return Err(err),
-            Err(err) => {
-                source_fallback_error = Some(err.message);
-            }
+        if let Some(payload) = state.get_runtime_snapshot(market_type).await {
+            return Ok(Json(payload));
         }
+        let warmup_msg = "live runtime warming up (no snapshot yet)";
+        if matches!(source_mode, StrategyPaperSource::Live) {
+            return Err(ApiError::bad_request(warmup_msg));
+        }
+        source_fallback_error = Some(warmup_msg.to_string());
     }
 
     let samples = load_strategy_samples(
@@ -3056,7 +4129,7 @@ async fn strategy_paper(
             "source": "replay",
             "execution_target": "paper",
             "live_enabled": fev1::ExecutionGate::from_env().live_enabled,
-            "strategy_engine": "forge_edgeflow_v1",
+            "strategy_engine": "forge_fev1",
             "strategy_alias": "FEV1",
             "source_fallback_error": source_fallback_error,
             "market_type": market_type,
@@ -3088,7 +4161,7 @@ async fn strategy_paper(
         "source": "replay",
         "execution_target": "paper",
         "live_enabled": fev1::ExecutionGate::from_env().live_enabled,
-        "strategy_engine": "forge_edgeflow_v1",
+        "strategy_engine": "forge_fev1",
         "strategy_alias": "FEV1",
         "engine_version": "v1",
         "source_fallback_error": source_fallback_error,
@@ -3142,6 +4215,54 @@ async fn strategy_paper(
             "execution_penalty_cents_total": run.execution_penalty_cents_total,
         },
         "trades": run.trades,
+    })))
+}
+
+async fn strategy_live_reset(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    let now_ms = Utc::now().timestamp_millis();
+    {
+        let mut events = state.live_events.write().await;
+        events.clear();
+    }
+    {
+        let mut pending = state.live_pending_orders.write().await;
+        pending.clear();
+    }
+    {
+        let mut guard = state.live_decision_guard.write().await;
+        guard.clear();
+    }
+    {
+        let mut snapshots = state.live_runtime_snapshots.write().await;
+        snapshots.clear();
+    }
+    state.set_gateway_report_seq(0).await;
+    for market in ["5m", "15m"] {
+        state
+            .put_live_position_state(market, LivePositionState::flat(market, now_ms))
+            .await;
+    }
+
+    let mut deleted_keys = Vec::<String>::new();
+    for market in ["5m", "15m"] {
+        let key = live_position_state_key(&state.redis_prefix, market);
+        if delete_key(&state, &key).await.is_ok() {
+            deleted_keys.push(key);
+        }
+    }
+    let pending_key = live_pending_orders_key(&state.redis_prefix);
+    if delete_key(&state, &pending_key).await.is_ok() {
+        deleted_keys.push(pending_key);
+    }
+    let seq_key = live_gateway_seq_key(&state.redis_prefix);
+    if delete_key(&state, &seq_key).await.is_ok() {
+        deleted_keys.push(seq_key);
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "reset_at_ms": now_ms,
+        "deleted_redis_keys": deleted_keys
     })))
 }
 
@@ -4100,6 +5221,16 @@ fn parse_round_start_ms(round_id: &str) -> Option<i64> {
     raw.parse::<i64>().ok().filter(|v| *v > 0)
 }
 
+fn parse_end_date_ms(raw: Option<&str>) -> Option<i64> {
+    let value = raw?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
 fn is_safe_round_id(v: &str) -> bool {
     !v.is_empty()
         && v.len() <= 128
@@ -4153,3 +5284,4 @@ mod tests {
         assert!(is_live_snapshot_fresh(&snap, "5m", start + 100_500));
     }
 }
+
