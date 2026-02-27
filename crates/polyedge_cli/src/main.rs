@@ -482,6 +482,9 @@ fn ssh_exec(cfg: &PolyedgeConfig, target: HostTarget, remote_cmd: &str) -> Resul
         HostTarget::Ireland => (&cfg.ireland_host, &cfg.ireland_key),
         HostTarget::Tokyo => (&cfg.tokyo_host, &cfg.tokyo_key),
     };
+    if should_use_local_exec(target, key) {
+        return local_exec(remote_cmd);
+    }
     let remote = format!("{}@{}", cfg.ssh_user, host);
     let quoted = shell_single_quote(remote_cmd);
     let full = format!("bash -lc {quoted}");
@@ -506,6 +509,41 @@ fn ssh_exec(cfg: &PolyedgeConfig, target: HostTarget, remote_cmd: &str) -> Resul
         let detail = if !stderr.is_empty() { stderr } else { stdout };
         Err(anyhow!(
             "ssh command failed on {host}: {}",
+            if detail.is_empty() {
+                "unknown error".to_string()
+            } else {
+                detail
+            }
+        ))
+    }
+}
+
+fn should_use_local_exec(target: HostTarget, key_path: &str) -> bool {
+    if std::env::var("POLYEDGE_CLI_LOCAL")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    matches!(target, HostTarget::Ireland) && !Path::new(key_path).exists()
+}
+
+fn local_exec(cmd: &str) -> Result<String> {
+    let output = Command::new("bash")
+        .arg("-lc")
+        .arg(cmd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("failed to execute local command")?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        Err(anyhow!(
+            "local command failed: {}",
             if detail.is_empty() {
                 "unknown error".to_string()
             } else {
