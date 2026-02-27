@@ -26,6 +26,7 @@ Paper and Live use the same signal engine; execution path differs by switch.
 - `FORGE_FEV1_MIN_QUOTE_USDC=1.0`
 - `FORGE_FEV1_ENTRY_SLIPPAGE_BPS=18`
 - `FORGE_FEV1_EXIT_SLIPPAGE_BPS=22`
+- `FORGE_FEV1_RUNTIME_LOOP_MS=700`
 
 ### Notes
 

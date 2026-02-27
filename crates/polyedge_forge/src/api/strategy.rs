@@ -44,7 +44,7 @@ pub(super) struct StrategyRuntimeConfig {
     emergency_wide_spread_penalty_ratio: f64,
 }
 
-const STRATEGY_BASELINE_PROFILE: &str = "fev1_balanced_2026_02_26";
+const STRATEGY_BASELINE_PROFILE: &str = "fev1_manual_guarded_2026_02_27";
 
 #[allow(dead_code)]
 pub(super) fn strategy_backup_baseline_config() -> StrategyRuntimeConfig {
@@ -75,30 +75,31 @@ pub(super) fn strategy_backup_baseline_config() -> StrategyRuntimeConfig {
 }
 
 pub(super) fn strategy_current_default_config() -> StrategyRuntimeConfig {
-    // FEV1 balanced profile (high net efficiency with low drawdown under current 5m replay window).
+    // Manual guarded profile tuned on 2026-02-27 replay window (5m, 1440m lookback, max_trades=900, autotune off).
+    // Goal: higher win-rate + tighter drawdown while keeping participation and positive net pnl.
     StrategyRuntimeConfig {
-        entry_threshold_base: 0.86,
-        entry_threshold_cap: 0.98,
-        spread_limit_prob: 0.0246,
-        entry_edge_prob: 0.08,
-        entry_min_potential_cents: 18.0,
-        entry_max_price_cents: 82.0,
-        min_hold_ms: 12_000,
-        stop_loss_cents: 15.74,
-        reverse_signal_threshold: -0.608,
+        entry_threshold_base: 0.845,
+        entry_threshold_cap: 0.99,
+        spread_limit_prob: 0.0157,
+        entry_edge_prob: 0.0721,
+        entry_min_potential_cents: 20.73,
+        entry_max_price_cents: 80.75,
+        min_hold_ms: 14_112,
+        stop_loss_cents: 13.21,
+        reverse_signal_threshold: -0.3695,
         reverse_signal_ticks: 5,
-        trail_activate_profit_cents: 28.46,
-        trail_drawdown_cents: 12.38,
-        take_profit_near_max_cents: 98.3,
-        endgame_take_profit_cents: 90.3,
-        endgame_remaining_ms: 16_638,
-        liquidity_widen_prob: 0.074,
-        cooldown_ms: 354,
+        trail_activate_profit_cents: 29.88,
+        trail_drawdown_cents: 11.01,
+        take_profit_near_max_cents: 99.5,
+        endgame_take_profit_cents: 97.53,
+        endgame_remaining_ms: 19_107,
+        liquidity_widen_prob: 0.0727,
+        cooldown_ms: 0,
         max_entries_per_round: 1,
-        max_exec_spread_cents: 1.67,
-        slippage_cents_per_side: 0.079,
-        fee_cents_per_side: 0.0316,
-        emergency_wide_spread_penalty_ratio: 0.279,
+        max_exec_spread_cents: 1.01,
+        slippage_cents_per_side: 0.0945,
+        fee_cents_per_side: 0.0386,
+        emergency_wide_spread_penalty_ratio: 0.2903,
     }
 }
 
@@ -1569,7 +1570,7 @@ pub(super) async fn strategy_paper(
     };
     let autotune_context =
         normalize_autotune_context(params.autotune_context.as_deref(), market_type);
-    let use_autotune = params.use_autotune.unwrap_or(true);
+    let use_autotune = params.use_autotune.unwrap_or(false);
     let mut cfg = StrategyRuntimeConfig::default();
     let mut config_source = "default";
     let mut autotune_info = Value::Null;

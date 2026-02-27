@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 
 const OFFICIAL_TAKER_FEE_MAX_RATE: f64 = 0.25;
 const OFFICIAL_TAKER_FEE_EXPONENT: f64 = 2.0;
+const MAX_BLOCKED_EXIT_STREAK: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
@@ -205,6 +206,7 @@ struct Position {
     entry_remaining_ms: i64,
     peak_pnl_cents: f64,
     reverse_streak: usize,
+    blocked_exit_streak: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -410,6 +412,9 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
             } else if can_exit_now && side_spread(sample, pos.side) >= cfg.liquidity_widen_prob {
                 exit_reason = Some("liquidity_widen");
             }
+            if exit_reason.is_none() {
+                pos.blocked_exit_streak = 0;
+            }
 
             if let Some(reason) = exit_reason {
                 let emergency = matches!(
@@ -417,10 +422,16 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
                     "round_rollover" | "stop_loss" | "endgame_take_profit" | "signal_reverse"
                 );
                 let can_fill = spread_side_cents <= cfg.max_exec_spread_cents;
+                let mut escalated_for_blocked_exit = false;
                 if !can_fill && !emergency {
                     blocked_exits = blocked_exits.saturating_add(1);
-                    continue;
+                    pos.blocked_exit_streak = pos.blocked_exit_streak.saturating_add(1);
+                    if pos.blocked_exit_streak < MAX_BLOCKED_EXIT_STREAK {
+                        continue;
+                    }
+                    escalated_for_blocked_exit = true;
                 }
+                pos.blocked_exit_streak = 0;
                 let emergency_penalty_cents = if !can_fill {
                     emergency_wide_exit_count = emergency_wide_exit_count.saturating_add(1);
                     (spread_side_cents - cfg.max_exec_spread_cents).max(0.0)
@@ -461,7 +472,7 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
                     "entry_score": pos.entry_score,
                     "exit_score": score,
                     "entry_reason": "fev1_signal_entry",
-                    "exit_reason": reason,
+                    "exit_reason": if escalated_for_blocked_exit { "blocked_exit_escalation" } else { reason },
                     "exec_fill_ok": can_fill,
                     "exit_spread_cents": spread_side_cents
                 }));
@@ -513,6 +524,7 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
                     entry_remaining_ms: sample.remaining_ms,
                     peak_pnl_cents: 0.0,
                     reverse_streak: 0,
+                    blocked_exit_streak: 0,
                 });
                 *entries_by_round.entry(sample.round_id.clone()).or_insert(0) += 1;
             }
@@ -887,7 +899,7 @@ pub fn build_gateway_execution<G: LiveOrderGateway>(
 mod tests {
     use serde_json::json;
 
-    use super::build_decisions_from_trades;
+    use super::{build_decisions_from_trades, simulate, RuntimeConfig, Sample};
 
     #[test]
     fn replay_only_force_close_is_filtered_out_from_execution_decisions() {
@@ -941,5 +953,115 @@ mod tests {
             decisions[1].get("action").and_then(|v| v.as_str()),
             Some("exit")
         );
+    }
+
+    #[test]
+    fn blocked_non_emergency_exits_are_escalated() {
+        let cfg = RuntimeConfig {
+            entry_threshold_base: 0.40,
+            entry_threshold_cap: 0.55,
+            spread_limit_prob: 0.02,
+            entry_edge_prob: 0.01,
+            entry_min_potential_cents: 1.0,
+            entry_max_price_cents: 95.0,
+            min_hold_ms: 0,
+            stop_loss_cents: 99.0,
+            reverse_signal_threshold: -0.95,
+            reverse_signal_ticks: 12,
+            trail_activate_profit_cents: 99.0,
+            trail_drawdown_cents: 99.0,
+            take_profit_near_max_cents: 99.9,
+            endgame_take_profit_cents: 99.9,
+            endgame_remaining_ms: 1_000,
+            liquidity_widen_prob: 0.02,
+            cooldown_ms: 0,
+            max_entries_per_round: 1,
+            max_exec_spread_cents: 1.0,
+            slippage_cents_per_side: 0.0,
+            fee_cents_per_side: 0.0,
+            emergency_wide_spread_penalty_ratio: 0.5,
+        };
+        let mut samples = vec![
+            // Build confirmation history and open one UP position.
+            Sample {
+                ts_ms: 1_000,
+                round_id: "r-1".to_string(),
+                remaining_ms: 200_000,
+                p_up: 0.18,
+                delta_pct: 0.8,
+                velocity: 6.0,
+                acceleration: 2.0,
+                bid_yes: 0.49,
+                ask_yes: 0.50,
+                bid_no: 0.50,
+                ask_no: 0.51,
+                spread_up: 0.005,
+                spread_down: 0.005,
+                spread_mid: 0.005,
+            },
+            Sample {
+                ts_ms: 2_000,
+                round_id: "r-1".to_string(),
+                remaining_ms: 199_000,
+                p_up: 0.18,
+                delta_pct: 0.8,
+                velocity: 6.0,
+                acceleration: 2.0,
+                bid_yes: 0.49,
+                ask_yes: 0.50,
+                bid_no: 0.50,
+                ask_no: 0.51,
+                spread_up: 0.005,
+                spread_down: 0.005,
+                spread_mid: 0.005,
+            },
+            Sample {
+                ts_ms: 3_000,
+                round_id: "r-1".to_string(),
+                remaining_ms: 198_000,
+                p_up: 0.18,
+                delta_pct: 0.8,
+                velocity: 6.0,
+                acceleration: 2.0,
+                bid_yes: 0.50,
+                ask_yes: 0.51,
+                bid_no: 0.49,
+                ask_no: 0.50,
+                spread_up: 0.005,
+                spread_down: 0.005,
+                spread_mid: 0.005,
+            },
+        ];
+        for ts in [4_000_i64, 5_000_i64, 6_000_i64] {
+            samples.push(Sample {
+                ts_ms: ts,
+                round_id: "r-1".to_string(),
+                remaining_ms: 197_000 - (ts - 4_000),
+                p_up: 0.35,
+                delta_pct: 0.4,
+                velocity: 2.0,
+                acceleration: 0.5,
+                bid_yes: 0.53,
+                ask_yes: 0.56,
+                bid_no: 0.44,
+                ask_no: 0.47,
+                spread_up: 0.03,
+                spread_down: 0.03,
+                spread_mid: 0.03,
+            });
+        }
+
+        let run = simulate(&samples, &cfg, 16);
+        assert!(
+            run.blocked_exits >= 2,
+            "expected blocked exits before escalation"
+        );
+        let has_escalation = run.trades.iter().any(|t| {
+            t.get("exit_reason")
+                .and_then(|v| v.as_str())
+                .map(|v| v == "blocked_exit_escalation")
+                .unwrap_or(false)
+        });
+        assert!(has_escalation, "expected blocked_exit_escalation trade");
     }
 }

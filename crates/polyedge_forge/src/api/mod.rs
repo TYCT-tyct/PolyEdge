@@ -751,8 +751,8 @@ impl LiveRuntimeConfig {
         let loop_interval_ms = std::env::var("FORGE_FEV1_RUNTIME_LOOP_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(1200)
-            .clamp(300, 10_000);
+            .unwrap_or(700)
+            .clamp(200, 10_000);
         let lookback_minutes = std::env::var("FORGE_FEV1_RUNTIME_LOOKBACK_MINUTES")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
@@ -1809,20 +1809,12 @@ async fn live_runtime_loop(state: ApiState, bootstrap: LiveRuntimeConfig) {
 
         for market in &cfg.markets {
             let market_type = market.as_str();
-            let mut strategy_cfg = StrategyRuntimeConfig::default();
-            let mut runtime_cfg_source = "live_default";
-            let mut runtime_autotune_doc = Value::Null;
-            let mut runtime_autotune_live_key = Value::Null;
-            if let Ok((live_doc_opt, live_key)) =
-                resolve_autotune_live_doc(&state, market_type).await
-            {
-                runtime_autotune_live_key = Value::String(live_key);
-                if let Some(live_doc) = live_doc_opt {
-                    strategy_cfg = strategy_cfg_from_payload(strategy_cfg, &live_doc);
-                    runtime_cfg_source = "live_pinned_autotune";
-                    runtime_autotune_doc = live_doc;
-                }
-            }
+            let strategy_cfg = StrategyRuntimeConfig::default();
+            let runtime_cfg_source = "live_default";
+            let runtime_autotune_doc = Value::Null;
+            let runtime_autotune_live_key = Value::Null;
+            // Live runtime intentionally stays on manual/default strategy params.
+            // Autotune docs are not injected into runtime execution path.
             match strategy_paper_live(StrategyPaperLiveReq {
                 state: &state,
                 market_type,

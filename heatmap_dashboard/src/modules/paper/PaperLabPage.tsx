@@ -9,19 +9,20 @@ import type { MarketSymbol, MarketType, StrategyPaperResponse } from "../../type
 
 type TimeMode = "local" | "et";
 type StrategyPaperSource = "replay" | "live";
+const PAPER_AUTOTUNE_DISABLED = true;
 
 const ET_TIMEZONE = "America/New_York";
 const STRATEGY_POLL_MIN_MS = 3_500;
 const STRATEGY_POLL_MAX_MS = 20_000;
 const AUTOTUNE_POLL_MIN_MS = 6_000;
 const AUTOTUNE_POLL_MAX_MS = 60_000;
-const STRATEGY_PREFS_STORAGE_KEY = "polyedge.strategy.prefs.v3";
+const STRATEGY_PREFS_STORAGE_KEY = "polyedge.strategy.prefs.v4";
 
 const STRATEGY_PAPER_PROFILE = Object.freeze({
   lookbackMinutes: 24 * 60,
   maxTrades: 180,
   fullHistory: false,
-  useAutotune: true
+  useAutotune: false
 });
 
 const STRATEGY_LIVE_PROFILE = Object.freeze({
@@ -169,9 +170,7 @@ export function PaperLabPage({
   const [strategySource, setStrategySource] = useState<StrategyPaperSource>(
     prefs.source ?? "replay"
   );
-  const [strategyUseAutotune, setStrategyUseAutotune] = useState<boolean>(
-    prefs.useAutotune ?? true
-  );
+  const [strategyUseAutotune] = useState<boolean>(false);
   const [strategyAutotuneLatest, setStrategyAutotuneLatest] = useState<Record<string, unknown> | null>(null);
   const [strategyAutotuneHistory, setStrategyAutotuneHistory] = useState<Array<Record<string, unknown>>>([]);
   const [strategyAutotuneLoading, setStrategyAutotuneLoading] = useState<boolean>(false);
@@ -425,10 +424,10 @@ export function PaperLabPage({
             </button>
           </div>
           <div className="btn-group">
-            <button className={strategyUseAutotune ? "active" : ""} onClick={() => setStrategyUseAutotune(true)}>
+            <button className={strategyUseAutotune ? "active" : ""} disabled>
               AutoTune 开
             </button>
-            <button className={!strategyUseAutotune ? "active" : ""} onClick={() => setStrategyUseAutotune(false)}>
+            <button className={!strategyUseAutotune ? "active" : ""} disabled>
               AutoTune 关
             </button>
           </div>
@@ -461,50 +460,72 @@ export function PaperLabPage({
           <strong>{summary?.trade_count ?? 0}</strong>
           <small>样本 {strategyPaper?.samples ?? 0}</small>
         </article>
+        <article className="info-card">
+          <span>毛收益 / 总成本</span>
+          <strong>
+            {summary
+              ? `${summary.gross_pnl_cents.toFixed(2)}¢ / ${summary.total_cost_cents.toFixed(2)}¢`
+              : "--"}
+          </strong>
+          <small>净利润率 {summary ? `${summary.net_margin_pct.toFixed(2)}%` : "--"}</small>
+        </article>
+        <article className="info-card">
+          <span>均值 / 最大回撤</span>
+          <strong>
+            {summary
+              ? `${summary.avg_pnl_cents.toFixed(2)}¢ / ${summary.max_drawdown_cents.toFixed(2)}¢`
+              : "--"}
+          </strong>
+          <small>
+            市场 {current ? `${current.suggested_side} ${(current.p_up_pct * 100).toFixed(1)}%` : "--"}
+          </small>
+        </article>
       </div>
 
-      <div className="table-wrap">
-        <h3 className="table-title">AutoTune 历史（最近 8 条）</h3>
-        <table className="history-table">
-          <thead>
-            <tr>
-              <th>时间</th>
-              <th>来源</th>
-              <th>entry_base</th>
-              <th>entry_cap</th>
-              <th>止损</th>
-              <th>备注</th>
-            </tr>
-          </thead>
-          <tbody>
-            {strategyAutotuneHistory.slice(0, 8).map((row, idx) => {
-              const cfg =
-                row.config && typeof row.config === "object"
-                  ? (row.config as Record<string, unknown>)
-                  : null;
-              const ts =
-                numCell(row.saved_at_ms) ??
-                numCell(row.updated_at_ms) ??
-                numCell(row.created_at_ms);
-              return (
-                <tr key={`auto-${idx}-${ts ?? 0}`}>
-                  <td>{formatTime(ts, timeMode)}</td>
-                  <td>{textCell(row.source)}</td>
-                  <td>{numCell(cfg?.entry_threshold_base)?.toFixed(3) ?? "--"}</td>
-                  <td>{numCell(cfg?.entry_threshold_cap)?.toFixed(3) ?? "--"}</td>
-                  <td>{numCell(cfg?.stop_loss_cents)?.toFixed(2) ?? "--"}</td>
-                  <td>{textCell(row.note)}</td>
-                </tr>
-              );
-            })}
-            {strategyAutotuneHistory.length === 0 ? (
+      {!PAPER_AUTOTUNE_DISABLED ? (
+        <div className="table-wrap">
+          <h3 className="table-title">AutoTune 历史（最近 8 条）</h3>
+          <table className="history-table">
+            <thead>
               <tr>
-                <td colSpan={6}>{strategyAutotuneLoading ? "加载中..." : "暂无历史"}</td>
+                <th>时间</th>
+                <th>来源</th>
+                <th>entry_base</th>
+                <th>entry_cap</th>
+                <th>止损</th>
+                <th>备注</th>
               </tr>
-            ) : null}
-          </tbody>
-        </table>
-      </div>
+            </thead>
+            <tbody>
+              {strategyAutotuneHistory.slice(0, 8).map((row, idx) => {
+                const cfg =
+                  row.config && typeof row.config === "object"
+                    ? (row.config as Record<string, unknown>)
+                    : null;
+                const ts =
+                  numCell(row.saved_at_ms) ??
+                  numCell(row.updated_at_ms) ??
+                  numCell(row.created_at_ms);
+                return (
+                  <tr key={`auto-${idx}-${ts ?? 0}`}>
+                    <td>{formatTime(ts, timeMode)}</td>
+                    <td>{textCell(row.source)}</td>
+                    <td>{numCell(cfg?.entry_threshold_base)?.toFixed(3) ?? "--"}</td>
+                    <td>{numCell(cfg?.entry_threshold_cap)?.toFixed(3) ?? "--"}</td>
+                    <td>{numCell(cfg?.stop_loss_cents)?.toFixed(2) ?? "--"}</td>
+                    <td>{textCell(row.note)}</td>
+                  </tr>
+                );
+              })}
+              {strategyAutotuneHistory.length === 0 ? (
+                <tr>
+                  <td colSpan={6}>{strategyAutotuneLoading ? "加载中..." : "暂无历史"}</td>
+                </tr>
+              ) : null}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
 
       <div className="table-wrap">
         <h3 className="table-title">交易记录（最近 20 条）</h3>
@@ -548,7 +569,7 @@ export function PaperLabPage({
         <span>market: {strategyMarketType}</span>
         <span>activeKey: {strategyPaper?.autotune_active_key ?? "--"}</span>
         <span>liveKey: {strategyPaper?.autotune_live_key ?? "--"}</span>
-        {strategyAutotuneLatest ? <span>autotune: on</span> : <span>autotune: off/empty</span>}
+        <span>autotune: forced_off</span>
         {errorText ? <span className="down">{errorText}</span> : null}
       </footer>
     </section>
