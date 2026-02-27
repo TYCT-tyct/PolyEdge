@@ -87,35 +87,15 @@ pub struct IrelandRecorderArgs {
     pub sink_flush_ms: u64,
     #[arg(long, env = "FORGE_SINK_QUEUE_CAP", default_value_t = 20000)]
     pub sink_queue_cap: usize,
-    #[arg(
-        long,
-        env = "FORGE_ROUND_MIN_COVERAGE_RATIO",
-        default_value_t = 0.90
-    )]
+    #[arg(long, env = "FORGE_ROUND_MIN_COVERAGE_RATIO", default_value_t = 0.90)]
     pub round_min_coverage_ratio: f64,
-    #[arg(
-        long,
-        env = "FORGE_ROUND_MIN_SAMPLE_RATIO",
-        default_value_t = 0.85
-    )]
+    #[arg(long, env = "FORGE_ROUND_MIN_SAMPLE_RATIO", default_value_t = 0.85)]
     pub round_min_sample_ratio: f64,
-    #[arg(
-        long,
-        env = "FORGE_ROUND_MAX_GAP_MS",
-        default_value_t = 2500
-    )]
+    #[arg(long, env = "FORGE_ROUND_MAX_GAP_MS", default_value_t = 2500)]
     pub round_max_gap_ms: i64,
-    #[arg(
-        long,
-        env = "FORGE_ROUND_START_TOLERANCE_MS",
-        default_value_t = 35_000
-    )]
+    #[arg(long, env = "FORGE_ROUND_START_TOLERANCE_MS", default_value_t = 35_000)]
     pub round_start_tolerance_ms: i64,
-    #[arg(
-        long,
-        env = "FORGE_ROUND_END_TOLERANCE_MS",
-        default_value_t = 10_000
-    )]
+    #[arg(long, env = "FORGE_ROUND_END_TOLERANCE_MS", default_value_t = 10_000)]
     pub round_end_tolerance_ms: i64,
     #[arg(long, env = "FORGE_API_BIND", default_value = "0.0.0.0:9810")]
     pub api_bind: String,

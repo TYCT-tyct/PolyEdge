@@ -593,7 +593,7 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
         .sum();
     let total_slippage_cents: f64 = trades
         .iter()
-        .filter_map(|t| {
+        .map(|t| {
             let a = t
                 .get("entry_slippage_cents")
                 .and_then(Value::as_f64)
@@ -602,7 +602,7 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
                 .get("exit_slippage_cents")
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0);
-            Some(a + b)
+            a + b
         })
         .sum();
     let total_cost_cents = total_entry_fee_cents
@@ -676,31 +676,6 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
         total_cost_cents,
         net_margin_pct,
     }
-}
-
-/// 在回放模拟结果上叠加 gateway 提交记录，生成 paper/live 双视图。
-/// 注意：这不是两套独立策略的对照执行，signal 来自同一次 simulate()。
-pub fn simulate_with_gateway<G: LiveOrderGateway>(
-    samples: &[Sample],
-    cfg: &RuntimeConfig,
-    max_trades: usize,
-    quote_size_usdc: f64,
-    gateway: &G,
-) -> DualExecutionResult {
-    let run = simulate(samples, cfg, max_trades);
-    build_gateway_execution(&run, quote_size_usdc, gateway)
-}
-
-/// 向后兼容别名，新代码应使用 `simulate_with_gateway`。
-#[inline]
-pub fn simulate_dual<G: LiveOrderGateway>(
-    samples: &[Sample],
-    cfg: &RuntimeConfig,
-    max_trades: usize,
-    quote_size_usdc: f64,
-    gateway: &G,
-) -> DualExecutionResult {
-    simulate_with_gateway(samples, cfg, max_trades, quote_size_usdc, gateway)
 }
 
 fn build_decisions_from_trades(trades: &[Value], quote: f64) -> Vec<Value> {
@@ -800,7 +775,7 @@ fn build_decisions_from_trades(trades: &[Value], quote: f64) -> Vec<Value> {
                 "max_slippage_bps": entry_slippage_bps
             }));
         }
-        if exit_ts_ms > 0 {
+        if exit_ts_ms > 0 && !is_replay_only_exit_reason(exit_reason) {
             decisions.push(json!({
                 "action": "exit",
                 "side": side,
@@ -819,6 +794,13 @@ fn build_decisions_from_trades(trades: &[Value], quote: f64) -> Vec<Value> {
     }
     decisions.sort_by_key(|d| d.get("ts_ms").and_then(Value::as_i64).unwrap_or(0));
     decisions
+}
+
+#[inline]
+fn is_replay_only_exit_reason(reason: &str) -> bool {
+    reason
+        .trim()
+        .eq_ignore_ascii_case("end_of_samples_force_close")
 }
 
 /// 对已有 SimulationResult 附加 gateway 执行记录，生成完整的双视图输出。
@@ -898,5 +880,66 @@ pub fn build_gateway_execution<G: LiveOrderGateway>(
         decisions: decisions.clone(),
         paper_records: decisions,
         live_records,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::build_decisions_from_trades;
+
+    #[test]
+    fn replay_only_force_close_is_filtered_out_from_execution_decisions() {
+        let trades = vec![json!({
+            "id": 1,
+            "side": "UP",
+            "entry_round_id": "r-1",
+            "entry_ts_ms": 1000_i64,
+            "exit_ts_ms": 1300_i64,
+            "entry_reason": "fev1_signal_entry",
+            "exit_reason": "end_of_samples_force_close",
+            "entry_price_raw_cents": 52.0,
+            "exit_price_raw_cents": 54.0,
+            "entry_remaining_ms": 120_000_i64,
+            "exit_remaining_ms": 85_000_i64
+        })];
+        let decisions = build_decisions_from_trades(&trades, 1.0);
+        assert_eq!(
+            decisions.len(),
+            1,
+            "replay-only exit should not generate live decision"
+        );
+        assert_eq!(
+            decisions[0].get("action").and_then(|v| v.as_str()),
+            Some("enter")
+        );
+    }
+
+    #[test]
+    fn normal_exit_is_kept_for_live_execution_decisions() {
+        let trades = vec![json!({
+            "id": 2,
+            "side": "DOWN",
+            "entry_round_id": "r-2",
+            "entry_ts_ms": 2000_i64,
+            "exit_ts_ms": 2800_i64,
+            "entry_reason": "fev1_signal_entry",
+            "exit_reason": "signal_reverse",
+            "entry_price_raw_cents": 48.0,
+            "exit_price_raw_cents": 44.0,
+            "entry_remaining_ms": 150_000_i64,
+            "exit_remaining_ms": 110_000_i64
+        })];
+        let decisions = build_decisions_from_trades(&trades, 1.0);
+        assert_eq!(decisions.len(), 2);
+        assert_eq!(
+            decisions[0].get("action").and_then(|v| v.as_str()),
+            Some("enter")
+        );
+        assert_eq!(
+            decisions[1].get("action").and_then(|v| v.as_str()),
+            Some("exit")
+        );
     }
 }

@@ -31,7 +31,11 @@ pub enum DbEvent {
 
 pub fn normalize_opt_url(raw: &str) -> Option<String> {
     let v = raw.trim();
-    if v.is_empty() { None } else { Some(v.to_string()) }
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.to_string())
+    }
 }
 
 // ------------------------------------------------------------------ //
@@ -116,10 +120,7 @@ pub async fn run_db_sink(cfg: DbSinkConfig, mut rx: mpsc::Receiver<DbEvent>) {
 
     // Redis 连接在此提升为持久连接，整个 sink 生命周期内复用
     let redis_conn = if let Some(redis_url) = cfg.redis_url.as_deref() {
-        match redis::Client::open(redis_url)
-            .and_then(|c| Ok(c))
-            .map_err(|e| anyhow!("{e}"))
-        {
+        match redis::Client::open(redis_url).map_err(|e| anyhow!("{e}")) {
             Ok(client) => match client.get_multiplexed_tokio_connection().await {
                 Ok(conn) => {
                     tracing::info!("redis persistent connection established");
@@ -200,7 +201,11 @@ async fn flush_batches(
     if let Some(ch_url) = cfg.clickhouse_url.as_deref() {
         if !snapshots.is_empty() {
             if let Err(err) = flush_clickhouse_snapshots(ch_url, cfg, &snapshots).await {
-                tracing::warn!(?err, rows = snapshots.len(), "clickhouse snapshot flush failed");
+                tracing::warn!(
+                    ?err,
+                    rows = snapshots.len(),
+                    "clickhouse snapshot flush failed"
+                );
             }
         }
         if !rounds.is_empty() {
@@ -267,7 +272,11 @@ async fn execute_clickhouse_query(ch_url: &str, sql: &str) -> Result<()> {
     }
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
-    Err(anyhow!("clickhouse query failed status={} body={}", status, body))
+    Err(anyhow!(
+        "clickhouse query failed status={} body={}",
+        status,
+        body
+    ))
 }
 
 async fn init_clickhouse(ch_url: &str, cfg: &DbSinkConfig) -> Result<()> {
@@ -497,10 +506,18 @@ async fn flush_clickhouse_snapshots(
         }
         let st2 = resp2.status();
         let b2 = resp2.text().await.unwrap_or_default();
-        return Err(anyhow!("clickhouse insert retry failed status={} body={}", st2, b2));
+        return Err(anyhow!(
+            "clickhouse insert retry failed status={} body={}",
+            st2,
+            b2
+        ));
     }
 
-    Err(anyhow!("clickhouse insert failed status={} body={}", status, body_err))
+    Err(anyhow!(
+        "clickhouse insert failed status={} body={}",
+        status,
+        body_err
+    ))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -577,10 +594,18 @@ async fn flush_clickhouse_rounds(
         }
         let st2 = resp2.status();
         let b2 = resp2.text().await.unwrap_or_default();
-        return Err(anyhow!("clickhouse insert retry failed status={} body={}", st2, b2));
+        return Err(anyhow!(
+            "clickhouse insert retry failed status={} body={}",
+            st2,
+            b2
+        ));
     }
 
-    Err(anyhow!("clickhouse insert failed status={} body={}", status, body_err))
+    Err(anyhow!(
+        "clickhouse insert failed status={} body={}",
+        status,
+        body_err
+    ))
 }
 
 async fn flush_redis_latest(
@@ -592,12 +617,15 @@ async fn flush_redis_latest(
     // 更新聚合索引
     for row in rows {
         let snap = RedisSnapshot::from_row(row);
-        state.by_symbol_tf.insert(
-            (snap.symbol.clone(), snap.timeframe.clone()),
-            snap.clone(),
-        );
+        state
+            .by_symbol_tf
+            .insert((snap.symbol.clone(), snap.timeframe.clone()), snap.clone());
         state.by_market.insert(
-            (snap.symbol.clone(), snap.timeframe.clone(), snap.market_id.clone()),
+            (
+                snap.symbol.clone(),
+                snap.timeframe.clone(),
+                snap.market_id.clone(),
+            ),
             snap,
         );
     }
@@ -605,19 +633,29 @@ async fn flush_redis_latest(
     // 过期清理
     let ttl_ms = (cfg.redis_ttl_sec.min(i64::MAX as u64) as i64).saturating_mul(1000);
     let cutoff_ms = chrono::Utc::now().timestamp_millis().saturating_sub(ttl_ms);
-    state.by_symbol_tf.retain(|_, s| s.ts_ireland_sample_ms >= cutoff_ms);
-    state.by_market.retain(|_, s| s.ts_ireland_sample_ms >= cutoff_ms);
+    state
+        .by_symbol_tf
+        .retain(|_, s| s.ts_ireland_sample_ms >= cutoff_ms);
+    state
+        .by_market
+        .retain(|_, s| s.ts_ireland_sample_ms >= cutoff_ms);
 
     // symbol+tf 级别最新快照
     for ((symbol, timeframe), snap) in &state.by_symbol_tf {
-        let key = format!("{}:snapshot:latest:{}:{}", cfg.redis_prefix, symbol, timeframe);
+        let key = format!(
+            "{}:snapshot:latest:{}:{}",
+            cfg.redis_prefix, symbol, timeframe
+        );
         let payload = serde_json::to_string(snap)?;
         let _: () = conn.set_ex(key, payload, cfg.redis_ttl_sec).await?;
     }
 
     // market 级别最新快照
     for ((symbol, timeframe, market_id), snap) in &state.by_market {
-        let key = format!("{}:snapshot:latest:{}:{}:{}", cfg.redis_prefix, symbol, timeframe, market_id);
+        let key = format!(
+            "{}:snapshot:latest:{}:{}:{}",
+            cfg.redis_prefix, symbol, timeframe, market_id
+        );
         let payload = serde_json::to_string(snap)?;
         let _: () = conn.set_ex(key, payload, cfg.redis_ttl_sec).await?;
     }
@@ -649,7 +687,11 @@ async fn flush_redis_latest(
 
     let updated_key = format!("{}:snapshot:latest:updated_ms", cfg.redis_prefix);
     let _: () = conn
-        .set_ex(updated_key, chrono::Utc::now().timestamp_millis().to_string(), cfg.redis_ttl_sec)
+        .set_ex(
+            updated_key,
+            chrono::Utc::now().timestamp_millis().to_string(),
+            cfg.redis_ttl_sec,
+        )
         .await?;
 
     Ok(())

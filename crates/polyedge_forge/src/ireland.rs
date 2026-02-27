@@ -16,9 +16,7 @@ use tokio::sync::mpsc;
 
 use crate::api::{run_api_server, ApiConfig};
 use crate::cli::IrelandRecorderArgs;
-use crate::common::{
-    parse_lower_csv, parse_timestamp_ms, parse_upper_csv, timeframe_to_ms,
-};
+use crate::common::{parse_lower_csv, parse_timestamp_ms, parse_upper_csv, timeframe_to_ms};
 use crate::db_sink::{normalize_opt_url, run_db_sink, DbEvent, DbSinkConfig};
 use crate::models::{
     ChainlinkLocal, MarketMeta, MotionState, PersistEvent, RoundRow, SnapshotRow,
@@ -29,7 +27,6 @@ use crate::persist::{log_ingest, persist_event};
 // --- 后台 Target Fetch 请求/响应定义 ---
 struct TargetFetchReq {
     cache_key: String,
-    round_id: String,
     symbol: String,
     timeframe: String,
     start_ts_ms: i64,
@@ -39,7 +36,6 @@ struct TargetFetchRes {
     cache_key: String,
     target_price: Option<f64>,
 }
-
 
 const MARKET_FUTURE_GUARD_MS: i64 = 500;
 const MARKET_STALE_GUARD_MS: i64 = 5_000;
@@ -306,7 +302,10 @@ fn normalize_side_quotes(
     Some((bid.clamp(0.0, 1.0), ask.clamp(0.0, 1.0)))
 }
 
-fn stabilize_book_quotes(book: &BookTop, cached: Option<(f64, f64, f64, f64)>) -> Option<StableQuote> {
+fn stabilize_book_quotes(
+    book: &BookTop,
+    cached: Option<(f64, f64, f64, f64)>,
+) -> Option<StableQuote> {
     let cached_by = cached.map(|v| v.0);
     let cached_ay = cached.map(|v| v.1);
     let cached_bn = cached.map(|v| v.2);
@@ -480,21 +479,87 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
             let round_start_sec = aligned_round_timestamp_sec(req.start_ts_ms, &req.timeframe);
             let mut resolved_price = None;
 
-            if let Some(v) = fetch_target_from_vatic_market(&vatic_http, &req.symbol, &req.timeframe, round_start_sec).await {
+            if let Some(v) = fetch_target_from_vatic_market(
+                &vatic_http,
+                &req.symbol,
+                &req.timeframe,
+                round_start_sec,
+            )
+            .await
+            {
                 resolved_price = Some(v);
-                log_ingest(&bg_persist_tx, "info", "target_price", &format!("source=vatic_market symbol={} tf={} start_ms={} target={}", req.symbol, req.timeframe, req.start_ts_ms, v));
-            } else if let Some(v) = fetch_target_from_vatic(&vatic_http, &req.symbol, &req.timeframe, round_start_sec).await {
+                log_ingest(
+                    &bg_persist_tx,
+                    "info",
+                    "target_price",
+                    &format!(
+                        "source=vatic_market symbol={} tf={} start_ms={} target={}",
+                        req.symbol, req.timeframe, req.start_ts_ms, v
+                    ),
+                );
+            } else if let Some(v) =
+                fetch_target_from_vatic(&vatic_http, &req.symbol, &req.timeframe, round_start_sec)
+                    .await
+            {
                 resolved_price = Some(v);
-                log_ingest(&bg_persist_tx, "warn", "target_price", &format!("source=vatic_timestamp_fallback symbol={} tf={} start_ms={} target={}", req.symbol, req.timeframe, req.start_ts_ms, v));
-            } else if let Some(v) = fetch_target_from_vatic_active(&vatic_http, &req.symbol, &req.timeframe, round_start_sec).await {
+                log_ingest(
+                    &bg_persist_tx,
+                    "warn",
+                    "target_price",
+                    &format!(
+                        "source=vatic_timestamp_fallback symbol={} tf={} start_ms={} target={}",
+                        req.symbol, req.timeframe, req.start_ts_ms, v
+                    ),
+                );
+            } else if let Some(v) = fetch_target_from_vatic_active(
+                &vatic_http,
+                &req.symbol,
+                &req.timeframe,
+                round_start_sec,
+            )
+            .await
+            {
                 resolved_price = Some(v);
-                log_ingest(&bg_persist_tx, "warn", "target_price", &format!("source=vatic_active_fallback symbol={} tf={} start_ms={} target={}", req.symbol, req.timeframe, req.start_ts_ms, v));
-            } else if let Some(v) = fetch_target_from_vatic_chainlink(&vatic_http, &req.symbol, &req.timeframe, round_start_sec).await {
+                log_ingest(
+                    &bg_persist_tx,
+                    "warn",
+                    "target_price",
+                    &format!(
+                        "source=vatic_active_fallback symbol={} tf={} start_ms={} target={}",
+                        req.symbol, req.timeframe, req.start_ts_ms, v
+                    ),
+                );
+            } else if let Some(v) = fetch_target_from_vatic_chainlink(
+                &vatic_http,
+                &req.symbol,
+                &req.timeframe,
+                round_start_sec,
+            )
+            .await
+            {
                 resolved_price = Some(v);
-                log_ingest(&bg_persist_tx, "warn", "target_price", &format!("source=vatic_chainlink_fallback symbol={} tf={} start_ms={} target={}", req.symbol, req.timeframe, req.start_ts_ms, v));
-            } else if let Some(v) = fetch_target_from_official_binance(&req.symbol, req.start_ts_ms).await {
+                log_ingest(
+                    &bg_persist_tx,
+                    "warn",
+                    "target_price",
+                    &format!(
+                        "source=vatic_chainlink_fallback symbol={} tf={} start_ms={} target={}",
+                        req.symbol, req.timeframe, req.start_ts_ms, v
+                    ),
+                );
+            } else if let Some(v) =
+                fetch_target_from_official_binance(&req.symbol, req.start_ts_ms).await
+            {
                 resolved_price = Some(v);
-                log_ingest(&bg_persist_tx, "warn", "target_price", &format!("source=binance_official_fallback symbol={} tf={} start_ms={} target={}", req.symbol, req.timeframe, req.start_ts_ms, v));
+                log_ingest(
+                    &bg_persist_tx,
+                    "warn",
+                    "target_price",
+                    &format!(
+                        "source=binance_official_fallback symbol={} tf={} start_ms={} target={}",
+                        req.symbol, req.timeframe, req.start_ts_ms, v
+                    ),
+                );
             }
 
             let _ = target_res_tx.send(TargetFetchRes {
@@ -532,9 +597,6 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
     let mut target_cache: HashMap<String, (i64, f64)> = HashMap::new();
     let mut target_retry_after_ms: HashMap<String, i64> = HashMap::new();
     let mut target_anchor_by_round: HashMap<String, f64> = HashMap::new();
-    let vatic_http = Client::builder()
-        .timeout(Duration::from_millis(1500))
-        .build()?;
 
     let mut ingest_seq: u64 = 0;
 
@@ -655,7 +717,6 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                 // 发送到后台异步获取，防止阻塞 ticker
                                 let _ = target_req_tx.send(TargetFetchReq {
                                     cache_key: cache_key.clone(),
-                                    round_id: round_id.clone(),
                                     symbol: market.symbol.clone(),
                                     timeframe: market.timeframe.clone(),
                                     start_ts_ms: market.start_ts_ms,

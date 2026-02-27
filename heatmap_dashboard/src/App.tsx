@@ -10,14 +10,12 @@ import {
     getLatestAllRaw,
     getRoundChart,
     getRoundHistory,
-    getStats,
-    getStrategyAutotuneHistory,
-    getStrategyAutotuneLatest,
-    getStrategyPaper
+    getStats
 } from "./api";
 import { AccuracyChart } from "./components/AccuracyChart";
 import { HeatmapGrid } from "./components/HeatmapGrid";
 import { MarketChart } from "./components/MarketChart";
+import { PaperLabPage } from "./modules/paper/PaperLabPage";
 import type {
     AccuracyPoint,
     AccuracySeriesResponse,
@@ -34,7 +32,6 @@ import type {
     RoundHistoryRow,
     RoundsResponse,
     StatsResponse,
-    StrategyPaperResponse,
     WindowType
 } from "./types";
 
@@ -53,78 +50,15 @@ const WS_STALE_FALLBACK_MS = 3000;
 const LIVE_UI_MIN_INTERVAL_MS = 900;
 const ET_TIMEZONE = "America/New_York";
 const COLLECTOR_POLL_MS = 5_000;
-const STRATEGY_POLL_MIN_MS = 3_500;
-const STRATEGY_POLL_MAX_MS = 20_000;
-const AUTOTUNE_POLL_MIN_MS = 6_000;
-const AUTOTUNE_POLL_MAX_MS = 60_000;
-type StrategyPaperSource = "replay" | "live";
 const SYMBOL_OPTIONS: Array<{ value: MarketSymbol; label: string }> = [
   { value: "BTCUSDT", label: "Bitcoin" },
   { value: "ETHUSDT", label: "Ethereum" },
   { value: "SOLUSDT", label: "Solana" },
   { value: "XRPUSDT", label: "XRP" }
 ];
-const STRATEGY_PAPER_PROFILE = Object.freeze({
-  lookbackMinutes: 24 * 60,
-  maxTrades: 180,
-  fullHistory: false,
-  useAutotune: true
-});
-const STRATEGY_LIVE_PROFILE = Object.freeze({
-  liveExecute: false,
-  liveQuoteUsdc: 1,
-  liveMaxOrders: 1,
-  liveEntryOnly: true
-});
-const STRATEGY_PREFS_STORAGE_KEY = "polyedge.strategy.prefs.v2";
 
 type TimeMode = "local" | "et";
-type StrategyUiPrefs = {
-  marketType: MarketType;
-  source: StrategyPaperSource;
-  useAutotune: boolean;
-};
-
-function readStrategyUiPrefs(): Partial<StrategyUiPrefs> {
-  if (typeof window === "undefined" || !window.localStorage) {
-    return {};
-  }
-  try {
-    const raw = window.localStorage.getItem(STRATEGY_PREFS_STORAGE_KEY);
-    if (!raw) {
-      return {};
-    }
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    const marketType =
-      parsed.marketType === "5m" || parsed.marketType === "15m"
-        ? (parsed.marketType as MarketType)
-        : undefined;
-    const source =
-      parsed.source === "replay" || parsed.source === "live"
-        ? (parsed.source as StrategyPaperSource)
-        : undefined;
-    const useAutotune =
-      typeof parsed.useAutotune === "boolean" ? parsed.useAutotune : undefined;
-    return {
-      marketType,
-      source,
-      useAutotune
-    };
-  } catch {
-    return {};
-  }
-}
-
-function writeStrategyUiPrefs(prefs: StrategyUiPrefs): void {
-  if (typeof window === "undefined" || !window.localStorage) {
-    return;
-  }
-  try {
-    window.localStorage.setItem(STRATEGY_PREFS_STORAGE_KEY, JSON.stringify(prefs));
-  } catch {
-    // ignore localStorage write failure
-  }
-}
+type DashboardView = "market" | "paper";
 
 import { windowToMinutes } from "./utils";
 
@@ -238,67 +172,6 @@ function finiteOrNull(v: number | null | undefined): number | null {
 
 function asFiniteNumber(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
-}
-
-function strategyPaperSignature(payload: StrategyPaperResponse): string {
-  const summary = payload.summary;
-  const current = payload.current;
-  const last = payload.trades[payload.trades.length - 1];
-  const liveState = payload.live_execution?.state_machine;
-  return [
-    payload.source ?? "",
-    payload.market_type,
-    payload.samples,
-    summary.trade_count,
-    summary.win_rate_pct.toFixed(4),
-    summary.total_pnl_cents.toFixed(4),
-    summary.net_pnl_cents.toFixed(4),
-    current?.round_id ?? "",
-    current?.timestamp_ms ?? 0,
-    current?.suggested_action ?? "",
-    last?.id ?? -1,
-    last?.exit_ts_ms ?? 0,
-    liveState?.state ?? "",
-    liveState?.updated_ts_ms ?? 0
-  ].join("|");
-}
-
-function autotuneTs(v: Record<string, unknown> | null | undefined): number {
-  if (!v) {
-    return 0;
-  }
-  const keys = ["saved_at_ms", "updated_at_ms", "created_at_ms", "ts_ms", "timestamp_ms"];
-  for (const key of keys) {
-    const n = asFiniteNumber(v[key]);
-    if (n != null) {
-      return n;
-    }
-  }
-  return 0;
-}
-
-function autotuneSource(v: Record<string, unknown> | null | undefined): string {
-  if (!v) {
-    return "";
-  }
-  const source = v.source;
-  return typeof source === "string" ? source : "";
-}
-
-function autotuneSignature(
-  latest: Record<string, unknown> | null,
-  history: Array<Record<string, unknown>>
-): string {
-  const head = history[0] ?? null;
-  const tail = history[history.length - 1] ?? null;
-  return [
-    autotuneTs(latest),
-    autotuneSource(latest),
-    history.length,
-    autotuneTs(head),
-    autotuneSource(head),
-    autotuneTs(tail)
-  ].join("|");
 }
 
 function quoteFromPreferredMid(
@@ -853,744 +726,8 @@ const RoundHistoryPanel = memo(function RoundHistoryPanel({
   );
 });
 
-interface StrategyPanelProps {
-  data: StrategyPaperResponse | null;
-  loading: boolean;
-  timeMode: TimeMode;
-  marketType: MarketType;
-  source: StrategyPaperSource;
-  autotuneEnabled: boolean;
-  autotuneLatest: Record<string, unknown> | null;
-  autotuneHistory: Array<Record<string, unknown>>;
-  autotuneLoading: boolean;
-  onMarketTypeChange: (marketType: MarketType) => void;
-  onSourceChange: (source: StrategyPaperSource) => void;
-  onAutotuneToggle: (enabled: boolean) => void;
-}
-
-const StrategyPanel = memo(function StrategyPanel({
-  data,
-  loading,
-  timeMode,
-  marketType,
-  source,
-  autotuneEnabled,
-  autotuneLatest,
-  autotuneHistory,
-  autotuneLoading,
-  onMarketTypeChange,
-  onSourceChange,
-  onAutotuneToggle
-}: StrategyPanelProps) {
-  const current = data?.current ?? null;
-  const currentView = useMemo(() => {
-    if (!current) {
-      return {
-        score: null as number | null,
-        entryThreshold: null as number | null,
-        confidencePct: null as number | null,
-        pUpPct: null as number | null,
-        deltaPct: null as number | null,
-        remainingS: null as number | null,
-        timestampMs: null as number | null,
-        roundId: null as string | null,
-      };
-    }
-    const raw = current as Record<string, unknown>;
-    const asNum = (v: unknown): number | null =>
-      typeof v === "number" && Number.isFinite(v) ? v : null;
-    const asStr = (v: unknown): string | null => (typeof v === "string" && v.trim() ? v : null);
-    const score = asNum(raw.score);
-    const entryThreshold = asNum(raw.entry_threshold);
-    const pFairUp = asNum(raw.p_fair_up);
-    const confidence = asNum(raw.confidence);
-    const pUpPctRaw = asNum(raw.p_up_pct);
-    const deltaPctRaw = asNum(raw.delta_pct);
-    const remainingSRaw = asNum(raw.remaining_s);
-    const remainingMsRaw = asNum(raw.remaining_ms);
-    const timestampMs = asNum(raw.timestamp_ms);
-    const roundId = asStr(raw.round_id);
-    const confidencePct =
-      confidence != null
-        ? confidence * 100
-        : pFairUp != null
-        ? Math.max(pFairUp, 1 - pFairUp) * 100
-        : null;
-    const pUpPct = pUpPctRaw != null ? pUpPctRaw : pFairUp != null ? pFairUp * 100 : null;
-    const deltaPct = deltaPctRaw != null ? deltaPctRaw : asNum(raw.edge_prob);
-    const remainingS = remainingSRaw != null ? remainingSRaw : remainingMsRaw != null ? remainingMsRaw / 1000 : null;
-    return {
-      score,
-      entryThreshold,
-      confidencePct,
-      pUpPct,
-      deltaPct,
-      remainingS,
-      timestampMs,
-      roundId,
-    };
-  }, [current]);
-  const autotuneLatestDoc = useMemo(() => {
-    if (!autotuneLatest || typeof autotuneLatest !== "object") {
-      return null;
-    }
-    const savedAt =
-      asFiniteNumber(autotuneLatest.saved_at_ms) ??
-      asFiniteNumber(autotuneLatest.updated_at_ms) ??
-      asFiniteNumber(autotuneLatest.created_at_ms) ??
-      null;
-    const sourceTag =
-      typeof autotuneLatest.source === "string" && autotuneLatest.source.trim()
-        ? autotuneLatest.source.trim()
-        : "--";
-    const note =
-      typeof autotuneLatest.note === "string" && autotuneLatest.note.trim()
-        ? autotuneLatest.note.trim()
-        : "";
-    return { savedAt, sourceTag, note };
-  }, [autotuneLatest]);
-  const effectiveConfigRows = useMemo(() => {
-    const rawCfg = data?.config && typeof data.config === "object"
-      ? (data.config as Record<string, unknown>)
-      : null;
-    if (!rawCfg) {
-      return [];
-    }
-    const preferredOrder = [
-      "entry_threshold_base",
-      "entry_threshold_cap",
-      "entry_edge_prob",
-      "entry_min_potential_cents",
-      "entry_max_price_cents",
-      "spread_limit_prob",
-      "min_hold_ms",
-      "stop_loss_cents",
-      "trail_activate_profit_cents",
-      "trail_drawdown_cents",
-      "reverse_signal_threshold",
-      "reverse_signal_ticks",
-      "max_exec_spread_cents",
-      "slippage_cents_per_side",
-      "fee_cents_per_side",
-      "cooldown_ms",
-      "max_entries_per_round",
-      "liquidity_widen_prob",
-      "take_profit_near_max_cents",
-      "endgame_take_profit_cents",
-      "endgame_remaining_ms",
-      "emergency_wide_spread_penalty_ratio",
-    ];
-    const allKeys = Object.keys(rawCfg);
-    const orderedKeys = [
-      ...preferredOrder.filter((k) => allKeys.includes(k)),
-      ...allKeys.filter((k) => !preferredOrder.includes(k)).sort(),
-    ];
-    return orderedKeys.map((key) => {
-      const value = rawCfg[key];
-      let rendered = "--";
-      if (typeof value === "number" && Number.isFinite(value)) {
-        rendered = Number.isInteger(value) ? value.toString() : value.toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
-      } else if (typeof value === "boolean") {
-        rendered = value ? "true" : "false";
-      } else if (typeof value === "string" && value.length > 0) {
-        rendered = value;
-      }
-      return { key, rendered };
-    });
-  }, [data?.config]);
-  const liveExec = data?.live_execution;
-  const liveState = liveExec?.state_machine;
-  const liveCapital = liveExec?.capital;
-  const capitalState =
-    liveCapital?.state && typeof liveCapital.state === "object"
-      ? (liveCapital.state as Record<string, unknown>)
-      : null;
-  const liveOrders = liveExec?.execution?.orders ?? [];
-  const liveEvents = (liveExec?.events ?? []) as Array<Record<string, unknown>>;
-  const parity = liveExec?.parity_check;
-  const isLiveDryRun = (liveExec?.execution?.mode ?? "dry_run") === "dry_run" || !data?.live_execute;
-  const parityPaperDecisionCount =
-    parity?.paper?.decision_count ?? parity?.paper?.decisions ?? 0;
-  const parityPaperEntry =
-    parity?.paper?.entry_count ?? parity?.paper?.entries ?? 0;
-  const parityPaperAdd = parity?.paper?.add_count ?? 0;
-  const parityPaperReduce = parity?.paper?.reduce_count ?? 0;
-  const parityPaperExit =
-    parity?.paper?.exit_count ?? parity?.paper?.exits ?? 0;
-  const parityLiveSubmitEntry = isLiveDryRun
-    ? parity?.live?.simulated_submitted_entry_count ?? 0
-    : parity?.live?.submitted_entry_count ?? parity?.live?.entries?.submitted ?? 0;
-  const parityLiveSubmitAdd = isLiveDryRun
-    ? parity?.live?.simulated_submitted_add_count ?? 0
-    : parity?.live?.submitted_add_count ?? 0;
-  const parityLiveSubmitReduce = isLiveDryRun
-    ? parity?.live?.simulated_submitted_reduce_count ?? 0
-    : parity?.live?.submitted_reduce_count ?? 0;
-  const parityLiveSubmitExit = isLiveDryRun
-    ? parity?.live?.simulated_submitted_exit_count ?? 0
-    : parity?.live?.submitted_exit_count ?? parity?.live?.exits?.submitted ?? 0;
-  const parityLiveAccepted =
-    parity?.live?.accepted_count ?? parity?.live?.accepted ?? 0;
-  const parityLiveRejected =
-    parity?.live?.rejected_count ?? parity?.live?.rejected ?? 0;
-  const parityLiveSkipped =
-    parity?.live?.skipped_count ?? parity?.live?.skipped ?? 0;
-  const liveSubmittedTotal = isLiveDryRun
-    ? parity?.live?.simulated_submitted_count ?? (parityLiveSubmitEntry + parityLiveSubmitExit)
-    : parity?.live?.submitted_count ?? (parityLiveSubmitEntry + parityLiveSubmitExit);
-  const liveSummary =
-    liveExec?.summary && typeof liveExec.summary === "object"
-      ? (liveExec.summary as Record<string, unknown>)
-      : null;
-  const hasLiveExecution =
-    !isLiveDryRun &&
-    (parityLiveAccepted > 0 || (liveExec?.live_records?.length ?? 0) > 0);
-  const liveNetPnl = hasLiveExecution
-    ? asFiniteNumber(liveSummary?.net_pnl_cents) ??
-      asFiniteNumber(liveSummary?.total_pnl_cents) ??
-      0
-    : 0;
-  const liveGrossPnl = hasLiveExecution
-    ? asFiniteNumber(liveSummary?.gross_pnl_cents) ?? 0
-    : 0;
-  const liveTotalCost = hasLiveExecution
-    ? asFiniteNumber(liveSummary?.total_cost_cents) ?? 0
-    : 0;
-  const liveWinRate = hasLiveExecution
-    ? asFiniteNumber(liveSummary?.win_rate_pct) ?? 0
-    : 0;
-  const liveDrawdown = hasLiveExecution
-    ? asFiniteNumber(liveSummary?.max_drawdown_cents) ?? 0
-    : 0;
-  const liveNetMargin = hasLiveExecution
-    ? asFiniteNumber(liveSummary?.net_margin_pct) ?? 0
-    : 0;
-  const liveAcceptedRate =
-    !isLiveDryRun && liveSubmittedTotal > 0 ? (parityLiveAccepted / liveSubmittedTotal) * 100 : 0;
-  const riskState = typeof capitalState?.risk_state === "string" ? capitalState.risk_state : "--";
-  const dynamicQuote = asFiniteNumber(liveCapital?.dynamic_quote_usdc);
-  const availableToTrade = asFiniteNumber(capitalState?.available_to_trade_usdc);
-  const reservedPending = asFiniteNumber(capitalState?.reserved_pending_usdc);
-  const equityEstimate = asFiniteNumber(capitalState?.equity_estimate_usdc);
-  const utilizationPct = asFiniteNumber(capitalState?.utilization_ratio);
-  const tuneFactor = asFiniteNumber(capitalState?.tune_factor);
-  const capitalSkipped = asFiniteNumber(liveCapital?.capital_skipped_count) ?? 0;
-  const openPendingOrders = asFiniteNumber(liveCapital?.open_pending_orders) ?? 0;
-  const parityRows = [
-    { label: "Paper信号", value: parityPaperDecisionCount },
-    { label: "门禁通过", value: liveExec?.gated?.selected_count ?? 0 },
-    { label: isLiveDryRun ? "模拟提交" : "提交网关", value: liveSubmittedTotal },
-    { label: "网关接受", value: parityLiveAccepted },
-  ];
-  const parityMax = Math.max(1, ...parityRows.map((r) => r.value));
-  const issueReasons = useMemo(() => {
-    const buckets = new Map<string, number>();
-    for (const row of liveExec?.gated?.skipped_decisions ?? []) {
-      const reason = row?.reason?.trim() || "gate_unknown";
-      buckets.set(reason, (buckets.get(reason) ?? 0) + 1);
-    }
-    for (const ev of liveEvents) {
-      const accepted = typeof ev.accepted === "boolean" ? ev.accepted : null;
-      if (accepted === false) {
-        const reason = typeof ev.reason === "string" && ev.reason.trim() ? ev.reason.trim() : "event_rejected";
-        buckets.set(reason, (buckets.get(reason) ?? 0) + 1);
-      }
-    }
-    return [...buckets.entries()]
-      .map(([reason, count]) => ({ reason, count }))
-      .sort((a, b) => b.count - a.count)
-      .slice(0, 6);
-  }, [liveExec?.gated?.skipped_decisions, liveEvents]);
-  const liveStateLabel = liveState?.state === "in_position" ? "持仓中" : "空仓";
-  return (
-    <section className="panel">
-      <header className="panel-head">
-        <div>
-          <h2>策略 Paper（{marketType} 全时段）</h2>
-          <p className="muted">单模型双向策略：自动判断 UP/DOWN，支持入仓、加仓、减仓与出场的全自动执行。</p>
-        </div>
-        <div className="panel-actions">
-          <div className="btn-group">
-            <button className={marketType === "5m" ? "active" : ""} onClick={() => onMarketTypeChange("5m")}>
-              5m
-            </button>
-            <button className={marketType === "15m" ? "active" : ""} onClick={() => onMarketTypeChange("15m")}>
-              15m
-            </button>
-          </div>
-          <div className="btn-group">
-            <button className={source === "replay" ? "active" : ""} onClick={() => onSourceChange("replay")}>
-              Paper模拟
-            </button>
-            <button className={source === "live" ? "active" : ""} onClick={() => onSourceChange("live")}>
-              真实交易
-            </button>
-          </div>
-          <div className="btn-group">
-            <button className={autotuneEnabled ? "active" : ""} onClick={() => onAutotuneToggle(true)}>
-              AutoTune 开
-            </button>
-            <button className={!autotuneEnabled ? "active" : ""} onClick={() => onAutotuneToggle(false)}>
-              AutoTune 关
-            </button>
-          </div>
-          {loading ? (
-            <span className="loading-chip">计算中...</span>
-          ) : (
-            <span className="loading-chip">{source === "live" ? "实时策略" : "模拟策略"}</span>
-          )}
-        </div>
-      </header>
-      <div className="info-cards compact strategy-matrix">
-        <article className="info-card">
-          <span>当前动作</span>
-          <strong className={current?.suggested_action?.includes("UP") ? "up" : current?.suggested_action?.includes("DOWN") ? "down" : ""}>
-            {current?.suggested_action ?? "--"}
-          </strong>
-          <small>
-            {current ? `${formatTime(currentView.timestampMs, timeMode)} · ${currentView.roundId ?? "--"}` : "等待数据"}
-          </small>
-        </article>
-        <article className="info-card">
-          <span>信号强度 / 阈值</span>
-          <strong>
-            {current && currentView.score != null && currentView.entryThreshold != null
-              ? `${currentView.score.toFixed(3)} / ${currentView.entryThreshold.toFixed(3)}`
-              : "--"}
-          </strong>
-          <small>置信度：{currentView.confidencePct != null ? `${currentView.confidencePct.toFixed(1)}%` : "--"}</small>
-        </article>
-        <article className="info-card">
-          <span>累计净收益</span>
-          <strong className={(data?.summary.net_pnl_cents ?? data?.summary.total_pnl_cents ?? 0) >= 0 ? "up" : "down"}>
-            {data ? `${(data.summary.net_pnl_cents ?? data.summary.total_pnl_cents).toFixed(2)}¢` : "--"}
-          </strong>
-          <small>
-            交易 {data?.summary.trade_count ?? 0} · 胜率 {data ? `${data.summary.win_rate_pct.toFixed(1)}%` : "--"} · 窗口 {data?.lookback_minutes ?? "--"}m
-          </small>
-        </article>
-        <article className="info-card">
-          <span>均值 / 回撤</span>
-          <strong>
-            {data ? `${data.summary.avg_pnl_cents.toFixed(2)}¢ / ${data.summary.max_drawdown_cents.toFixed(2)}¢` : "--"}
-          </strong>
-          <small>平均每笔 / 最大回撤</small>
-        </article>
-        <article className="info-card">
-          <span>毛收益 / 总成本</span>
-          <strong>
-            {data ? `${(data.summary.gross_pnl_cents ?? 0).toFixed(2)}¢ / ${(data.summary.total_cost_cents ?? 0).toFixed(2)}¢` : "--"}
-          </strong>
-          <small>
-            净利润率 {data ? `${(data.summary.net_margin_pct ?? 0).toFixed(2)}%` : "--"}
-          </small>
-        </article>
-        <article className="info-card">
-          <span>市场状态</span>
-          <strong>
-            {currentView.pUpPct != null ? `UP ${currentView.pUpPct.toFixed(1)}%` : "--"}
-          </strong>
-          <small>
-            Δ {currentView.deltaPct != null ? `${currentView.deltaPct.toFixed(4)}%` : "--"} · 剩余{" "}
-            {currentView.remainingS != null ? `${currentView.remainingS.toFixed(1)}s` : "--"} · 样本 {data?.samples ?? 0}
-          </small>
-        </article>
-      </div>
-      <div className="live-block autotune-block">
-        <header>
-          <h3>参数自调优（热加载）</h3>
-          <small>{autotuneEnabled ? "已启用：自动对比并晋升到Live参数池" : "已关闭，仅使用固定参数"}</small>
-        </header>
-        <div className="autotune-toolbar">
-          <div className="autotune-meta">
-            <span>source={data?.source ?? "--"}</span>
-            <span>config={data?.config_source ?? "--"}</span>
-            <span>activeKey={typeof data?.autotune_active_key === "string" ? data.autotune_active_key : "--"}</span>
-            <span>liveKey={typeof data?.autotune_live_key === "string" ? data.autotune_live_key : "--"}</span>
-          </div>
-        </div>
-        <div className="autotune-kpis">
-          <article className="info-card">
-            <span>最新参数时间</span>
-            <strong>{autotuneLatestDoc?.savedAt ? formatTime(autotuneLatestDoc.savedAt, timeMode) : "--"}</strong>
-            <small>source {autotuneLatestDoc?.sourceTag ?? "--"}</small>
-          </article>
-          <article className="info-card">
-            <span>调优记录数</span>
-            <strong>{autotuneHistory.length}</strong>
-            <small>{autotuneLoading ? "刷新中..." : "最近历史"}</small>
-          </article>
-          <article className="info-card">
-            <span>备注</span>
-            <strong>{autotuneLatestDoc?.note || "--"}</strong>
-            <small>用于快速判断参数变更原因</small>
-          </article>
-        </div>
-        <div className="table-wrap">
-          <h3 className="table-title">当前生效参数（本次计算）</h3>
-          <table className="history-table autotune-history-table">
-            <thead>
-              <tr>
-                <th>参数</th>
-                <th>值</th>
-              </tr>
-            </thead>
-            <tbody>
-              {effectiveConfigRows.map((row) => (
-                <tr key={`cfg-${row.key}`}>
-                  <td>{row.key}</td>
-                  <td>{row.rendered}</td>
-                </tr>
-              ))}
-              {effectiveConfigRows.length === 0 ? (
-                <tr>
-                  <td colSpan={2}>暂无参数快照。</td>
-                </tr>
-              ) : null}
-            </tbody>
-          </table>
-        </div>
-        <div className="table-wrap">
-          <h3 className="table-title">参数调整历史（最近8条）</h3>
-          <table className="history-table autotune-history-table">
-            <thead>
-              <tr>
-                <th>时间</th>
-                <th>来源</th>
-                <th>阈值(base/cap)</th>
-                <th>edge</th>
-                <th>止损</th>
-                <th>回撤</th>
-                <th>备注</th>
-              </tr>
-            </thead>
-            <tbody>
-              {autotuneHistory.slice(0, 8).map((item, idx) => {
-                const cfg =
-                  item.config && typeof item.config === "object"
-                    ? (item.config as Record<string, unknown>)
-                    : null;
-                const num = (v: unknown): number | null =>
-                  typeof v === "number" && Number.isFinite(v) ? v : null;
-                const text = (v: unknown): string =>
-                  typeof v === "string" && v.trim() ? v.trim() : "--";
-                const ts = num(item.saved_at_ms) ?? num(item.updated_at_ms) ?? null;
-                const base = num(cfg?.entry_threshold_base);
-                const cap = num(cfg?.entry_threshold_cap);
-                const edge = num(cfg?.entry_edge_prob);
-                const stop = num(cfg?.stop_loss_cents);
-                const trail = num(cfg?.trail_drawdown_cents);
-                return (
-                  <tr key={`autotune-${idx}-${ts ?? "na"}`}>
-                    <td>{formatTime(ts, timeMode)}</td>
-                    <td>{text(item.source)}</td>
-                    <td>{base != null && cap != null ? `${base.toFixed(3)} / ${cap.toFixed(3)}` : "--"}</td>
-                    <td>{edge != null ? edge.toFixed(3) : "--"}</td>
-                    <td>{stop != null ? `${stop.toFixed(2)}¢` : "--"}</td>
-                    <td>{trail != null ? `${trail.toFixed(2)}¢` : "--"}</td>
-                    <td>{text(item.note)}</td>
-                  </tr>
-                );
-              })}
-              {autotuneHistory.length === 0 ? (
-                <tr>
-                  <td colSpan={7}>暂无调优历史。</td>
-                </tr>
-              ) : null}
-            </tbody>
-          </table>
-        </div>
-      </div>
-      {source === "live" ? (
-        <div className="live-execution-wrap">
-          <div className="info-cards compact live-kpi-grid">
-            <article className="info-card">
-              <span>Live净收益</span>
-              <strong className={liveNetPnl >= 0 ? "up" : "down"}>{`${liveNetPnl.toFixed(2)}¢`}</strong>
-              <small>
-                胜率 {liveWinRate.toFixed(1)}% · 回撤 {liveDrawdown.toFixed(2)}¢
-              </small>
-            </article>
-            <article className="info-card">
-              <span>毛收益 / 总成本</span>
-              <strong>{`${liveGrossPnl.toFixed(2)}¢ / ${liveTotalCost.toFixed(2)}¢`}</strong>
-              <small>
-                净利润率 {liveNetMargin.toFixed(2)}%
-              </small>
-            </article>
-            <article className="info-card">
-              <span>执行模式</span>
-              <strong>{liveExec?.execution?.mode ?? "--"}</strong>
-              <small>
-                source={data?.source ?? "--"} · engine={data?.strategy_alias ?? "--"} · {isLiveDryRun ? "未开启实盘" : "实盘执行"}
-              </small>
-            </article>
-            <article className="info-card">
-              <span>持仓状态机</span>
-              <strong className={liveState?.state === "in_position" ? "up" : ""}>
-                {liveStateLabel}
-                {liveState?.side ? ` · ${liveState.side}` : ""}
-              </strong>
-              <small>
-                均价 {liveState?.vwap_entry_cents != null ? `${liveState.vwap_entry_cents.toFixed(2)}¢` : liveState?.entry_price_cents != null ? `${liveState.entry_price_cents.toFixed(2)}¢` : "--"} ·
-                净仓 {liveState?.net_quote_usdc != null ? `$${liveState.net_quote_usdc.toFixed(2)}` : "--"}
-              </small>
-            </article>
-            <article className="info-card">
-              <span>订单成功率</span>
-              <strong className={liveAcceptedRate >= 70 ? "up" : liveAcceptedRate >= 40 ? "warn" : "down"}>
-                {isLiveDryRun ? "--" : liveSubmittedTotal > 0 ? `${liveAcceptedRate.toFixed(1)}%` : "--"}
-              </strong>
-              <small>
-                {isLiveDryRun
-                  ? `模拟提交 ${liveSubmittedTotal} · 非真实成交`
-                  : `提交 ${liveSubmittedTotal} · 接受 ${parityLiveAccepted} · 拒绝 ${parityLiveRejected} · 风险拦截 ${capitalSkipped}`}
-              </small>
-            </article>
-            <article className="info-card">
-              <span>同策略一致性</span>
-              <strong className={parity?.level === "critical" ? "down" : parity?.level === "warn" ? "warn" : "up"}>
-                {parity?.status ?? "--"}
-              </strong>
-              <small>
-                Paper 入/加/减/出 {parityPaperEntry}/{parityPaperAdd}/{parityPaperReduce}/{parityPaperExit} ·
-                Live 入/加/减/出 {parityLiveSubmitEntry}/{parityLiveSubmitAdd}/{parityLiveSubmitReduce}/{parityLiveSubmitExit}
-              </small>
-            </article>
-            <article className="info-card">
-              <span>资金引擎</span>
-              <strong className={riskState === "normal" ? "up" : riskState === "caution" ? "warn" : "down"}>
-                {riskState.toUpperCase()}
-              </strong>
-              <small>
-                动态单笔 {dynamicQuote != null ? `$${dynamicQuote.toFixed(2)}` : "--"} · 可用 {availableToTrade != null ? `$${availableToTrade.toFixed(2)}` : "--"}
-              </small>
-            </article>
-            <article className="info-card">
-              <span>资金利用率</span>
-              <strong>
-                {utilizationPct != null ? `${(utilizationPct * 100).toFixed(1)}%` : "--"}
-              </strong>
-              <small>
-                估算权益 {equityEstimate != null ? `$${equityEstimate.toFixed(2)}` : "--"} · 挂单占用 {reservedPending != null ? `$${reservedPending.toFixed(2)}` : "--"} · 未完成订单 {openPendingOrders.toFixed(0)} · 调优系数 {tuneFactor != null ? tuneFactor.toFixed(2) : "--"}
-              </small>
-            </article>
-          </div>
-
-          <div className="live-block-grid">
-            <article className="live-block parity-block">
-              <header>
-                <h3>同策略执行漏斗</h3>
-                <small>Paper 信号到 Live 成交链路</small>
-              </header>
-              <div className="parity-funnel">
-                {parityRows.map((row) => (
-                  <div key={row.label} className="parity-row">
-                    <label>{row.label}</label>
-                    <div className="parity-bar">
-                      <span style={{ width: `${Math.max(4, (row.value / parityMax) * 100)}%` }} />
-                    </div>
-                    <strong>{row.value}</strong>
-                  </div>
-                ))}
-              </div>
-              <div className="parity-meta muted">
-                skipped {parityLiveSkipped}{isLiveDryRun ? "" : ` · rejected ${parityLiveRejected}`}
-              </div>
-            </article>
-
-            <article className="live-block diag-block">
-              <header>
-                <h3>差异诊断</h3>
-                <small>为什么 Paper 有信号但 Live 可能没成交</small>
-              </header>
-              <div className="diag-main">
-                <span className="muted">当前状态</span>
-                <strong className={parity?.level === "critical" ? "down" : parity?.level === "warn" ? "warn" : "up"}>
-                  {parity?.status ?? "--"}
-                </strong>
-              </div>
-              <ul className="diag-list">
-                {issueReasons.map((item) => (
-                  <li key={item.reason}>
-                    <span>{item.reason}</span>
-                    <strong>{item.count}</strong>
-                  </li>
-                ))}
-                {issueReasons.length === 0 ? <li><span>暂无异常</span><strong>0</strong></li> : null}
-              </ul>
-            </article>
-          </div>
-
-          <div className="live-tables-grid">
-            <div className="table-wrap">
-              <h3 className="table-title">Live执行明细（最近8条）</h3>
-              <table className="history-table live-exec-table">
-                <thead>
-                  <tr>
-                    <th>时间</th>
-                    <th>动作</th>
-                    <th>方向</th>
-                    <th>轮次</th>
-                    <th>价格(¢)</th>
-                    <th>结果</th>
-                    <th>端点</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {liveOrders.slice(-8).reverse().map((order, idx) => (
-                    <tr key={`${order.decision_key ?? "k"}-${idx}`}>
-                      <td>
-                        {formatTime(
-                          typeof order.decision?.ts_ms === "number" ? order.decision.ts_ms : null,
-                          timeMode
-                        )}
-                      </td>
-                      <td>{order.decision?.action ?? "--"}</td>
-                      <td>{order.decision?.side ?? "--"}</td>
-                      <td>{order.decision?.round_id ?? "--"}</td>
-                      <td>
-                        {order.decision?.price_cents != null && Number.isFinite(order.decision.price_cents)
-                          ? Number(order.decision.price_cents).toFixed(2)
-                          : "--"}
-                      </td>
-                      <td className={isLiveDryRun ? "" : order.accepted ? "up" : "down"}>
-                        {isLiveDryRun ? "SIMULATED" : order.accepted ? "ACCEPTED" : "SKIP/REJECT"}
-                      </td>
-                      <td>{order.endpoint ?? "--"}</td>
-                    </tr>
-                  ))}
-                  {liveOrders.length === 0 ? (
-                    <tr>
-                      <td colSpan={7}>暂无执行记录（当前可能为空仓或未触发有效信号）。</td>
-                    </tr>
-                  ) : null}
-                </tbody>
-              </table>
-            </div>
-            <div className="table-wrap">
-              <h3 className="table-title">状态机事件（最近8条）</h3>
-              <table className="history-table live-event-table">
-                <thead>
-                  <tr>
-                    <th>时间</th>
-                    <th>动作</th>
-                    <th>方向</th>
-                    <th>原因</th>
-                    <th>状态</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {liveEvents.slice(-8).reverse().map((ev, idx) => {
-                    const tsMs = typeof ev.ts_ms === "number" ? ev.ts_ms : null;
-                    const accepted = typeof ev.accepted === "boolean" ? ev.accepted : null;
-                    const action = typeof ev.action === "string" ? ev.action : "--";
-                    const side = typeof ev.side === "string" ? ev.side : "--";
-                    const reason = typeof ev.reason === "string" ? ev.reason : "--";
-                    return (
-                      <tr key={`event-${idx}-${tsMs ?? "na"}`}>
-                        <td>{formatTime(tsMs, timeMode)}</td>
-                        <td>{action}</td>
-                        <td>{side}</td>
-                        <td>{reason}</td>
-                        <td className={accepted === true ? "up" : accepted === false ? "down" : ""}>
-                          {accepted === true ? "accepted" : accepted === false ? "rejected" : "--"}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                  {liveEvents.length === 0 ? (
-                    <tr>
-                      <td colSpan={5}>暂无状态机事件。</td>
-                    </tr>
-                  ) : null}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      ) : null}
-      <div className="table-wrap">
-        <h3 className="table-title">{source === "live" ? "Paper对照交易（同参数回放）" : "交易记录"}</h3>
-        <table className="history-table">
-          <thead>
-            <tr>
-              <th>方向</th>
-              <th>轮次</th>
-              <th>入场</th>
-              <th>出场</th>
-              <th>价格(¢)</th>
-              <th>净盈亏</th>
-              <th>成本</th>
-              <th>时长</th>
-              <th>原因</th>
-            </tr>
-          </thead>
-          <tbody>
-            {(data?.trades ?? []).slice(-12).reverse().map((t) => {
-              const num = (v: unknown): number | null =>
-                typeof v === "number" && Number.isFinite(v) ? v : null;
-              const txt = (v: unknown): string => (typeof v === "string" && v.length > 0 ? v : "--");
-              const row = t as unknown as Record<string, unknown>;
-              const side = txt(row.side);
-              const entryRoundId = txt(row.entry_round_id);
-              const entryTs = num(row.entry_ts_ms);
-              const exitTs = num(row.exit_ts_ms);
-              const entryRaw = num(row.entry_price_raw_cents);
-              const exitRaw = num(row.exit_price_raw_cents);
-              const entryExec = num(row.entry_price_cents);
-              const exitExec = num(row.exit_price_cents);
-              const pnl = num(row.pnl_net_cents) ?? num(row.pnl_cents);
-              const totalCost = num(row.total_cost_cents) ?? 0;
-              const entryFee = num(row.entry_fee_cents) ?? 0;
-              const exitFee = num(row.exit_fee_cents) ?? 0;
-              const entrySlip = num(row.entry_slippage_cents) ?? 0;
-              const exitSlip = num(row.exit_slippage_cents) ?? 0;
-              const durationS = num(row.duration_s);
-              const entryReason = txt(row.entry_reason);
-              const exitReason = txt(row.exit_reason);
-              return (
-                <tr key={txt(row.id)}>
-                  <td><span className={`chip ${side === "UP" ? "up" : "down"}`}>{side}</span></td>
-                  <td>{entryRoundId.length > 20 ? `${entryRoundId.slice(0, 20)}…` : entryRoundId}</td>
-                  <td>{formatTime(entryTs, timeMode)}</td>
-                  <td>{formatTime(exitTs, timeMode)}</td>
-                  <td>
-                    <div>
-                      {entryRaw != null ? entryRaw.toFixed(2) : "--"} → {exitRaw != null ? exitRaw.toFixed(2) : "--"}
-                    </div>
-                    <small className="muted">
-                      exec {entryExec != null ? entryExec.toFixed(2) : "--"} → {exitExec != null ? exitExec.toFixed(2) : "--"}
-                    </small>
-                  </td>
-                  <td className={(pnl ?? 0) >= 0 ? "up" : "down"}>
-                    {pnl != null ? `${pnl.toFixed(2)}¢` : "--"}
-                  </td>
-                  <td>
-                    <div>{totalCost.toFixed(2)}¢</div>
-                    <small className="muted">
-                      fee {(entryFee + exitFee).toFixed(2)} · slip {(entrySlip + exitSlip).toFixed(2)}
-                    </small>
-                  </td>
-                  <td>{durationS != null ? `${durationS.toFixed(1)}s` : "--"}</td>
-                  <td>{entryReason} / {exitReason}</td>
-                </tr>
-              );
-            })}
-            {(data?.trades?.length ?? 0) === 0 ? (
-              <tr>
-                <td colSpan={9}>暂无交易样本，等待策略信号触发。</td>
-              </tr>
-            ) : null}
-          </tbody>
-        </table>
-      </div>
-    </section>
-  );
-});
-
 export default function App() {
-  const strategyPrefs = useMemo(() => readStrategyUiPrefs(), []);
+  const [viewMode, setViewMode] = useState<DashboardView>("market");
   const [selectedSymbol, setSelectedSymbol] = useState<MarketSymbol>("BTCUSDT");
   const [wsStatus, setWsStatus] = useState<"connecting" | "open" | "closed" | "error">("connecting");
   const [live, setLive] = useState<Record<MarketType, LiveSnapshot | null>>({
@@ -1628,23 +765,8 @@ export default function App() {
   const [heatmap, setHeatmap] = useState<HeatmapResponse | null>(null);
   const [accuracyTab, setAccuracyTab] = useState<MarketType>("5m");
   const [accuracy, setAccuracy] = useState<AccuracySeriesResponse | null>(null);
-  const [strategyPaper, setStrategyPaper] = useState<StrategyPaperResponse | null>(null);
-  const [strategyLoading, setStrategyLoading] = useState<boolean>(false);
-  const [strategyMarketType, setStrategyMarketType] = useState<MarketType>(
-    strategyPrefs.marketType ?? "5m"
-  );
-  const [strategySource, setStrategySource] = useState<StrategyPaperSource>(
-    strategyPrefs.source ?? "replay"
-  );
-  const [strategyUseAutotune, setStrategyUseAutotune] = useState<boolean>(
-    strategyPrefs.useAutotune ?? true
-  );
-  const [strategyAutotuneLatest, setStrategyAutotuneLatest] = useState<Record<string, unknown> | null>(null);
-  const [strategyAutotuneHistory, setStrategyAutotuneHistory] = useState<Array<Record<string, unknown>>>([]);
-  const [strategyAutotuneLoading, setStrategyAutotuneLoading] = useState<boolean>(false);
   const [errorText, setErrorText] = useState<string>("");
   const [timeMode, setTimeMode] = useState<TimeMode>("local");
-  const strategyEnabled = selectedSymbol === "BTCUSDT";
   const lastLiveTsRef = useRef<Record<MarketType, number>>({ "5m": 0, "15m": 0 });
   const liveUiCommitRef = useRef<Record<MarketType, { uiTs: number; roundId: string; remSec: number }>>({
     "5m": { uiTs: 0, roundId: "", remSec: -1 },
@@ -1656,26 +778,11 @@ export default function App() {
   const pushLivePointRef = useRef<(marketType: MarketType, livePoint: LiveSnapshot | null) => void>(() => {});
   const chartReqSeqRef = useRef<Record<MarketType, number>>({ "5m": 0, "15m": 0 });
   const chartInFlightRef = useRef<Record<MarketType, boolean>>({ "5m": false, "15m": false });
-  const strategyInFlightRef = useRef<boolean>(false);
-  const strategySigRef = useRef<string>("");
-  const strategyUnchangedRef = useRef<number>(0);
-  const strategyAutotuneInFlightRef = useRef<boolean>(false);
-  const strategyAutotuneSigRef = useRef<string>("");
-  const strategyAutotuneUnchangedRef = useRef<number>(0);
-  const strategyHasLoadedRef = useRef<boolean>(false);
-  const strategyAutotuneHasLoadedRef = useRef<boolean>(false);
   const selectedSymbolRef = useRef<MarketSymbol>("BTCUSDT");
   const stableLiveRef = useRef<Record<MarketType, LiveSnapshot | null>>({ "5m": null, "15m": null });
   const boundaryRefreshRef = useRef<Record<MarketType, number>>({ "5m": 0, "15m": 0 });
   const accuracyTabRef = useRef<MarketType>("5m");
-
-  useEffect(() => {
-    writeStrategyUiPrefs({
-      marketType: strategyMarketType,
-      source: strategySource,
-      useAutotune: strategyUseAutotune
-    });
-  }, [strategyMarketType, strategySource, strategyUseAutotune]);
+  const isMarketView = viewMode === "market";
 
   useEffect(() => {
     chartWindowRef.current = chartWindow;
@@ -1728,6 +835,9 @@ export default function App() {
   );
 
   useEffect(() => {
+    if (!isMarketView) {
+      return;
+    }
     stableLiveRef.current = { "5m": null, "15m": null };
     lastLiveTsRef.current = { "5m": 0, "15m": 0 };
     setLive({ "5m": null, "15m": null });
@@ -1739,7 +849,7 @@ export default function App() {
     setAccuracy(null);
     void loadChartFor("5m", chartWindowRef.current["5m"], true);
     void loadChartFor("15m", chartWindowRef.current["15m"], true);
-  }, [selectedSymbol, loadChartFor]);
+  }, [selectedSymbol, loadChartFor, isMarketView]);
 
   pushLivePointRef.current = (marketType: MarketType, livePoint: LiveSnapshot | null) => {
     if (!livePoint || !livePoint.timestamp_ms) {
@@ -1852,6 +962,9 @@ export default function App() {
   };
 
   useEffect(() => {
+    if (!isMarketView) {
+      return;
+    }
     let alive = true;
     let inFlight = false;
     const poll = async () => {
@@ -1946,9 +1059,13 @@ export default function App() {
       alive = false;
       window.clearInterval(id);
     };
-  }, []);
+  }, [isMarketView]);
 
   useEffect(() => {
+    if (!isMarketView) {
+      setWsStatus("closed");
+      return;
+    }
     const disconnect = connectLiveWs(
       (payload) => {
         if (selectedSymbolRef.current !== "BTCUSDT") {
@@ -1961,9 +1078,12 @@ export default function App() {
       setWsStatus
     );
     return disconnect;
-  }, []);
+  }, [isMarketView]);
 
   useEffect(() => {
+    if (!isMarketView) {
+      return;
+    }
     const onVisible = () => {
       if (document.visibilityState !== "visible") {
         return;
@@ -1975,9 +1095,12 @@ export default function App() {
     return () => {
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [loadChartFor]);
+  }, [loadChartFor, isMarketView]);
 
   useEffect(() => {
+    if (!isMarketView) {
+      return;
+    }
     let alive = true;
     const run = async () => {
       try {
@@ -1998,9 +1121,12 @@ export default function App() {
       alive = false;
       window.clearInterval(id);
     };
-  }, []);
+  }, [isMarketView, selectedSymbol]);
 
   useEffect(() => {
+    if (!isMarketView) {
+      return;
+    }
     let alive = true;
     let timer: number | null = null;
     const loop = async () => {
@@ -2036,9 +1162,12 @@ export default function App() {
         window.clearTimeout(timer);
       }
     };
-  }, [loadChartFor]);
+  }, [loadChartFor, isMarketView]);
 
   useEffect(() => {
+    if (!isMarketView) {
+      return;
+    }
     let alive = true;
     let timer: number | null = null;
     const loop = async () => {
@@ -2074,7 +1203,7 @@ export default function App() {
         window.clearTimeout(timer);
       }
     };
-  }, [loadChartFor]);
+  }, [loadChartFor, isMarketView]);
 
   const handleChartWindowChange = (marketType: MarketType, view: WindowType) => {
     if (chartWindowRef.current[marketType] === view) {
@@ -2085,6 +1214,9 @@ export default function App() {
   };
 
   useEffect(() => {
+    if (!isMarketView) {
+      return;
+    }
     let alive = true;
     const load = async () => {
       if (document.visibilityState !== "visible") {
@@ -2111,9 +1243,12 @@ export default function App() {
       window.clearTimeout(first);
       window.clearInterval(id);
     };
-  }, [selectedSymbol]);
+  }, [selectedSymbol, isMarketView]);
 
   useEffect(() => {
+    if (!isMarketView) {
+      return;
+    }
     let alive = true;
     const load = async () => {
       if (document.visibilityState !== "visible") {
@@ -2142,7 +1277,7 @@ export default function App() {
       window.clearTimeout(first);
       window.clearInterval(id);
     };
-  }, [explorerTab, selectedSymbol]);
+  }, [explorerTab, selectedSymbol, isMarketView]);
 
   const explorerDateRounds = useMemo(() => {
     const source = availableRounds[explorerTab];
@@ -2153,6 +1288,9 @@ export default function App() {
   }, [availableRounds, explorerTab, selectedDate]);
 
   useEffect(() => {
+    if (!isMarketView) {
+      return;
+    }
     if (explorerDateRounds.length === 0) {
       setSelectedRoundId("");
       return;
@@ -2160,9 +1298,12 @@ export default function App() {
     if (!explorerDateRounds.some((r) => r.round_id === selectedRoundId)) {
       setSelectedRoundId(explorerDateRounds[0]?.round_id ?? "");
     }
-  }, [explorerDateRounds, selectedRoundId]);
+  }, [explorerDateRounds, selectedRoundId, isMarketView]);
 
   useEffect(() => {
+    if (!isMarketView) {
+      return;
+    }
     let alive = true;
     if (!selectedRoundId) {
       setRoundChart(null);
@@ -2186,9 +1327,12 @@ export default function App() {
     return () => {
       alive = false;
     };
-  }, [selectedRoundId, explorerTab, selectedSymbol]);
+  }, [selectedRoundId, explorerTab, selectedSymbol, isMarketView]);
 
   useEffect(() => {
+    if (!isMarketView) {
+      return;
+    }
     let alive = true;
     const load = async () => {
       if (document.visibilityState !== "visible") {
@@ -2212,9 +1356,12 @@ export default function App() {
       window.clearTimeout(first);
       window.clearInterval(id);
     };
-  }, [heatmapTab, selectedSymbol]);
+  }, [heatmapTab, selectedSymbol, isMarketView]);
 
   useEffect(() => {
+    if (!isMarketView) {
+      return;
+    }
     let alive = true;
     const load = async () => {
       if (document.visibilityState !== "visible") {
@@ -2238,204 +1385,12 @@ export default function App() {
       window.clearTimeout(first);
       window.clearInterval(id);
     };
-  }, [accuracyTab, selectedSymbol]);
+  }, [accuracyTab, selectedSymbol, isMarketView]);
 
   useEffect(() => {
-    let alive = true;
-    let timer: number | null = null;
-    if (!strategyEnabled) {
-      setStrategyPaper(null);
-      setStrategyLoading(false);
-      strategyHasLoadedRef.current = false;
-      return () => {
-        alive = false;
-      };
+    if (!isMarketView) {
+      return;
     }
-
-    const nextDelayMs = (changed: boolean): number => {
-      if (document.visibilityState !== "visible") {
-        return STRATEGY_POLL_MAX_MS;
-      }
-      if (changed) {
-        strategyUnchangedRef.current = 0;
-        return STRATEGY_POLL_MIN_MS;
-      }
-      strategyUnchangedRef.current += 1;
-      return Math.min(
-        STRATEGY_POLL_MAX_MS,
-        STRATEGY_POLL_MIN_MS + strategyUnchangedRef.current * 2_000
-      );
-    };
-
-    const schedule = (delay: number) => {
-      if (!alive) {
-        return;
-      }
-      timer = window.setTimeout(() => {
-        void loop();
-      }, delay);
-    };
-
-    const loop = async () => {
-      if (!alive) {
-        return;
-      }
-      if (document.visibilityState !== "visible") {
-        schedule(STRATEGY_POLL_MAX_MS);
-        return;
-      }
-      if (strategyInFlightRef.current) {
-        schedule(1_000);
-        return;
-      }
-      strategyInFlightRef.current = true;
-      if (!strategyHasLoadedRef.current) {
-        setStrategyLoading(true);
-      }
-      let changed = false;
-      try {
-        const data = await getStrategyPaper(strategyMarketType, {
-          ...STRATEGY_PAPER_PROFILE,
-          useAutotune: strategyUseAutotune,
-          source: strategySource,
-          ...(strategySource === "live" ? STRATEGY_LIVE_PROFILE : {}),
-        });
-        if (alive) {
-          const nextSig = strategyPaperSignature(data);
-          changed = nextSig !== strategySigRef.current;
-          if (changed) {
-            strategySigRef.current = nextSig;
-            setStrategyPaper(data);
-          }
-          strategyHasLoadedRef.current = true;
-          setErrorText("");
-        }
-      } catch (err) {
-        if (alive) {
-          setErrorText(err instanceof Error ? err.message : String(err));
-        }
-      } finally {
-        strategyInFlightRef.current = false;
-        if (alive) {
-          setStrategyLoading(false);
-          schedule(nextDelayMs(changed));
-        }
-      }
-    };
-
-    void loop();
-    return () => {
-      alive = false;
-      if (timer != null) {
-        window.clearTimeout(timer);
-      }
-    };
-  }, [strategyMarketType, strategySource, strategyUseAutotune, strategyEnabled]);
-
-  useEffect(() => {
-    let alive = true;
-    if (!strategyEnabled) {
-      setStrategyAutotuneLatest(null);
-      setStrategyAutotuneHistory([]);
-      setStrategyAutotuneLoading(false);
-      strategyAutotuneHasLoadedRef.current = false;
-      return () => {
-        alive = false;
-      };
-    }
-    if (!strategyUseAutotune) {
-      setStrategyAutotuneLatest(null);
-      setStrategyAutotuneHistory([]);
-      setStrategyAutotuneLoading(false);
-      strategyAutotuneHasLoadedRef.current = false;
-      return () => {
-        alive = false;
-      };
-    }
-    let timer: number | null = null;
-
-    const nextDelayMs = (changed: boolean): number => {
-      if (document.visibilityState !== "visible") {
-        return AUTOTUNE_POLL_MAX_MS;
-      }
-      if (changed) {
-        strategyAutotuneUnchangedRef.current = 0;
-        return AUTOTUNE_POLL_MIN_MS;
-      }
-      strategyAutotuneUnchangedRef.current += 1;
-      return Math.min(
-        AUTOTUNE_POLL_MAX_MS,
-        AUTOTUNE_POLL_MIN_MS + strategyAutotuneUnchangedRef.current * 6_000
-      );
-    };
-
-    const schedule = (delay: number) => {
-      if (!alive) {
-        return;
-      }
-      timer = window.setTimeout(() => {
-        void loop();
-      }, delay);
-    };
-
-    const loop = async () => {
-      if (!alive) {
-        return;
-      }
-      if (document.visibilityState !== "visible") {
-        schedule(AUTOTUNE_POLL_MAX_MS);
-        return;
-      }
-      if (strategyAutotuneInFlightRef.current) {
-        schedule(1_500);
-        return;
-      }
-      strategyAutotuneInFlightRef.current = true;
-      if (!strategyAutotuneHasLoadedRef.current) {
-        setStrategyAutotuneLoading(true);
-      }
-      let changed = false;
-      try {
-        const [latest, history] = await Promise.all([
-          getStrategyAutotuneLatest(strategyMarketType),
-          getStrategyAutotuneHistory(strategyMarketType, 20),
-        ]);
-        if (!alive) {
-          return;
-        }
-        const latestData = latest.active_data ?? latest.data ?? null;
-        const historyItems = history.items ?? [];
-        const nextSig = autotuneSignature(latestData, historyItems);
-        changed = nextSig !== strategyAutotuneSigRef.current;
-        if (changed) {
-          strategyAutotuneSigRef.current = nextSig;
-          setStrategyAutotuneLatest(latestData);
-          setStrategyAutotuneHistory(historyItems);
-        }
-        strategyAutotuneHasLoadedRef.current = true;
-      } catch (err) {
-        if (alive) {
-          setErrorText(err instanceof Error ? err.message : String(err));
-        }
-      } finally {
-        strategyAutotuneInFlightRef.current = false;
-        if (alive) {
-          setStrategyAutotuneLoading(false);
-          schedule(nextDelayMs(changed));
-        }
-      }
-    };
-
-    void loop();
-    return () => {
-      alive = false;
-      if (timer != null) {
-        window.clearTimeout(timer);
-      }
-    };
-  }, [strategyMarketType, strategyUseAutotune, strategyEnabled]);
-
-  useEffect(() => {
     let alive = true;
     const load = async () => {
       if (document.visibilityState !== "visible") {
@@ -2457,7 +1412,7 @@ export default function App() {
       window.clearTimeout(first);
       window.clearInterval(id);
     };
-  }, [selectedSymbol]);
+  }, [selectedSymbol, isMarketView]);
 
   const currentHistory = roundHistory[roundHistoryTab];
   const historyRows = useMemo(() => currentHistory?.rounds ?? [], [currentHistory]);
@@ -2516,6 +1471,14 @@ export default function App() {
             ))}
           </div>
           <div className="btn-group">
+            <button className={viewMode === "market" ? "active" : ""} onClick={() => setViewMode("market")}>
+              市场监控
+            </button>
+            <button className={viewMode === "paper" ? "active" : ""} onClick={() => setViewMode("paper")}>
+              我的测试 Paper
+            </button>
+          </div>
+          <div className="btn-group">
             <button className={timeMode === "local" ? "active" : ""} onClick={() => setTimeMode("local")}>
               本地时间
             </button>
@@ -2541,6 +1504,8 @@ export default function App() {
         </div>
       </header>
 
+      {isMarketView ? (
+        <>
       <section className="round-grid">
         {roundCard(`${selectedSymbol.replace("USDT", "")} 5分钟轮次`, live["5m"])}
         {roundCard(`${selectedSymbol.replace("USDT", "")} 15分钟轮次`, live["15m"])}
@@ -2567,34 +1532,6 @@ export default function App() {
         chart={charts["15m"]}
         loading={chartLoading["15m"]}
       />
-
-      {strategyEnabled ? (
-        <StrategyPanel
-          data={strategyPaper}
-          loading={strategyLoading}
-          timeMode={timeMode}
-          marketType={strategyMarketType}
-          source={strategySource}
-          autotuneEnabled={strategyUseAutotune}
-          autotuneLatest={strategyAutotuneLatest}
-          autotuneHistory={strategyAutotuneHistory}
-          autotuneLoading={strategyAutotuneLoading}
-          onMarketTypeChange={setStrategyMarketType}
-          onSourceChange={setStrategySource}
-          onAutotuneToggle={setStrategyUseAutotune}
-        />
-      ) : (
-        <section className="panel">
-          <header className="panel-head">
-            <div>
-              <h2>策略执行</h2>
-              <p className="muted">
-                {selectedSymbol.replace("USDT", "")} 当前为采集模式，仅展示与收集数据；Paper/Live 交易已关闭。
-              </p>
-            </div>
-          </header>
-        </section>
-      )}
 
       <section className="panel">
         <header className="panel-head">
@@ -2726,6 +1663,10 @@ export default function App() {
         points={accuracyPoints}
         timeMode={timeMode}
       />
+      </>
+      ) : (
+        <PaperLabPage selectedSymbol={selectedSymbol} timeMode={timeMode} />
+      )}
 
       <footer className="status-row">
         <span>WS状态: {wsStatus}</span>

@@ -11,6 +11,7 @@ members = [
   "crates/feeder_tokyo",
   "crates/polyedge_data_backend",
   "crates/polyedge_forge",
+  "crates/polyedge_hyper_mesh",
 ]
 
 [workspace.package]

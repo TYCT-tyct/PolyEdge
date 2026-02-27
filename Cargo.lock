@@ -3218,6 +3218,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "polyedge_hyper_mesh"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "polymarket-client-sdk"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
