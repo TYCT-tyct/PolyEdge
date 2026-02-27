@@ -4,6 +4,11 @@ set -euo pipefail
 REPO_DIR="${REPO_DIR:-/home/ubuntu/PolyEdge}"
 DATA_ROOT="${DATA_ROOT:-/data/polyedge-forge}"
 USER_NAME="${USER_NAME:-ubuntu}"
+ACTIVE_TIMEFRAMES="${ACTIVE_TIMEFRAMES:-5m}"
+STRATEGY_MARKETS="${STRATEGY_MARKETS:-5m}"
+# Small-capital default: prioritize drawdown control and execution stability.
+STRATEGY_BASE_PROFILE="${STRATEGY_BASE_PROFILE:-fev1_manual_hi_win_2026_02_27}"
+CAPITAL_BASE_USDC="${CAPITAL_BASE_USDC:-10}"
 
 echo "[forge-ireland] repo=$REPO_DIR data_root=$DATA_ROOT user=$USER_NAME"
 
@@ -49,7 +54,7 @@ Type=simple
 User=$USER_NAME
 WorkingDirectory=$REPO_DIR
 Environment=RUST_LOG=info,polyedge_forge=debug
-ExecStart=$REPO_DIR/target/release/polyedge_forge ireland-recorder --data-root $DATA_ROOT --udp-bind 0.0.0.0:9801 --sample-ms 100 --supported-symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT --active-symbols BTCUSDT --active-timeframes 5m,15m --discovery-refresh-sec 5 --clickhouse-url http://127.0.0.1:8123 --clickhouse-database polyedge_forge --clickhouse-snapshot-table snapshot_100ms --clickhouse-round-table rounds --redis-url redis://127.0.0.1:6379/0 --redis-prefix forge --redis-ttl-sec 7200 --sink-batch-size 200 --sink-flush-ms 1000 --sink-queue-cap 20000 --disable-api --dashboard-dist /home/ubuntu/PolyEdge/heatmap_dashboard/dist
+ExecStart=$REPO_DIR/target/release/polyedge_forge ireland-recorder --data-root $DATA_ROOT --udp-bind 0.0.0.0:9801 --sample-ms 100 --supported-symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT --active-symbols BTCUSDT --active-timeframes $ACTIVE_TIMEFRAMES --discovery-refresh-sec 5 --clickhouse-url http://127.0.0.1:8123 --clickhouse-database polyedge_forge --clickhouse-snapshot-table snapshot_100ms --clickhouse-round-table rounds --redis-url redis://127.0.0.1:6379/0 --redis-prefix forge --redis-ttl-sec 7200 --sink-batch-size 200 --sink-flush-ms 1000 --sink-queue-cap 20000 --disable-api --dashboard-dist /home/ubuntu/PolyEdge/heatmap_dashboard/dist
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -71,9 +76,10 @@ Type=simple
 User=$USER_NAME
 WorkingDirectory=$REPO_DIR
 Environment=RUST_LOG=info,polyedge_forge=debug
-Environment=FORGE_FEV1_RUNTIME_MARKETS=5m
-Environment=FORGE_STRATEGY_MARKETS=5m
-Environment=FORGE_STRATEGY_BASE_PROFILE=auto
+Environment=FORGE_FEV1_RUNTIME_MARKETS=$STRATEGY_MARKETS
+Environment=FORGE_STRATEGY_MARKETS=$STRATEGY_MARKETS
+Environment=FORGE_STRATEGY_BASE_PROFILE=$STRATEGY_BASE_PROFILE
+Environment=FORGE_FEV1_CAPITAL_BASE_USDC=$CAPITAL_BASE_USDC
 Environment=FORGE_STRATEGY_MAX_POINTS_FULL=320000
 Environment=FORGE_STRATEGY_MAX_POINTS_SHORT=180000
 Environment=FORGE_STRATEGY_MAX_POINTS_HARD_CAP=600000
@@ -125,7 +131,7 @@ if [[ "${api_pid}" =~ ^[0-9]+$ ]] && [[ "${api_pid}" -gt 1 ]] && [[ -r "/proc/${
   fi
 fi
 
-latest_ms="$(clickhouse-client -q "SELECT max(ts_ireland_sample_ms) FROM polyedge_forge.snapshot_100ms WHERE symbol='BTCUSDT' AND timeframe IN ('5m','15m')" 2>/dev/null || echo 0)"
+latest_ms="$(clickhouse-client -q "SELECT max(ts_ireland_sample_ms) FROM polyedge_forge.snapshot_100ms WHERE symbol='BTCUSDT' AND timeframe='5m'" 2>/dev/null || echo 0)"
 if [[ -z "${latest_ms}" || "${latest_ms}" == "0" ]]; then
   # Recorder may just be starting; skip hard restart.
   exit 0
