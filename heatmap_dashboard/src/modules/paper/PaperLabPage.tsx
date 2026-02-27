@@ -17,6 +17,7 @@ const STRATEGY_POLL_MAX_MS = 20_000;
 const AUTOTUNE_POLL_MIN_MS = 6_000;
 const AUTOTUNE_POLL_MAX_MS = 60_000;
 const STRATEGY_PREFS_STORAGE_KEY = "polyedge.strategy.prefs.v4";
+const PAPER_LOOKBACK_MINUTES = 1440;
 
 const STRATEGY_PAPER_PROFILE = Object.freeze({
   fullHistory: false,
@@ -275,6 +276,7 @@ export function PaperLabPage({
       try {
         const data = await getStrategyPaper(strategyMarketType, {
           ...STRATEGY_PAPER_PROFILE,
+          lookbackMinutes: PAPER_LOOKBACK_MINUTES,
           useAutotune: strategyUseAutotune,
           source: strategySource === "live" ? "auto" : "replay",
           ...(strategySource === "live" ? STRATEGY_LIVE_PROFILE : {})
