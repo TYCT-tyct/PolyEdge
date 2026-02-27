@@ -11,11 +11,11 @@ use serde::Deserialize;
 #[command(
     name = "polyedge",
     version,
-    about = "PolyEdge ops CLI",
-    long_about = "Unified command entry for Paper/Live/Forge/Data control and health checks."
+    about = "PolyEdge 运维命令行",
+    long_about = "统一入口：Paper/Live/Forge/Data 控制与健康检查。"
 )]
 struct Cli {
-    /// Optional config path (default: configs/polyedge_cli.toml)
+    /// 配置文件路径（默认：configs/polyedge_cli.toml）
     #[arg(long)]
     config: Option<PathBuf>,
 
@@ -25,27 +25,27 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Control paper simulation runtime
+    /// 控制 Paper 模拟运行
     Paper {
         #[arg(value_enum)]
         action: ServiceAction,
     },
-    /// Control live execution gate
+    /// 控制 Live 实盘执行
     Live {
         #[arg(value_enum)]
         action: ServiceAction,
     },
-    /// Control forge service (dashboard/API)
+    /// 控制 Forge 服务（Dashboard/API）
     Forge {
         #[arg(value_enum)]
         action: ServiceAction,
     },
-    /// Control data collection (persistent + self-check timer)
+    /// 控制数据采集（持久化 + 自检定时器）
     Data {
         #[arg(value_enum)]
         action: ServiceAction,
     },
-    /// Health checks: local deps + SSH + remote service + port
+    /// 健康检查：本地依赖 + SSH + 远程服务 + 端口
     Docker,
 }
 
@@ -59,9 +59,9 @@ enum ServiceAction {
 impl Display for ServiceAction {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            ServiceAction::Start => "start",
-            ServiceAction::Stop => "stop",
-            ServiceAction::Restart => "restart",
+            ServiceAction::Start => "启动",
+            ServiceAction::Stop => "停止",
+            ServiceAction::Restart => "重启",
         };
         write!(f, "{s}")
     }
@@ -146,7 +146,7 @@ fn cmd_paper(cfg: &PolyedgeConfig, action: ServiceAction) -> Result<()> {
                 &[("FORGE_FEV1_RUNTIME_ENABLED", "true")],
                 true,
             )?;
-            ok("Paper simulation enabled (runtime loop ON).");
+            ok("Paper 模拟已开启（运行循环 ON）。");
         }
         ServiceAction::Stop => {
             set_ireland_env(
@@ -155,11 +155,11 @@ fn cmd_paper(cfg: &PolyedgeConfig, action: ServiceAction) -> Result<()> {
                 &[("FORGE_FEV1_RUNTIME_ENABLED", "false")],
                 true,
             )?;
-            ok("Paper simulation disabled (runtime loop OFF).");
+            ok("Paper 模拟已关闭（运行循环 OFF）。");
         }
         ServiceAction::Restart => {
             restart_ireland_forge(cfg)?;
-            ok("Paper runtime restarted.");
+            ok("Paper 运行已重启。");
         }
     }
     Ok(())
@@ -179,7 +179,7 @@ fn cmd_live(cfg: &PolyedgeConfig, action: ServiceAction) -> Result<()> {
                 ],
                 true,
             )?;
-            ok("Live trading enabled.");
+            ok("Live 实盘已开启。");
         }
         ServiceAction::Stop => {
             set_ireland_env(
@@ -192,11 +192,11 @@ fn cmd_live(cfg: &PolyedgeConfig, action: ServiceAction) -> Result<()> {
                 ],
                 true,
             )?;
-            warn("Live switched to DRAIN mode: no new entries, existing positions can exit.");
+            warn("Live 已切换为排空模式：不再开新仓，仅允许已有仓位退出。");
         }
         ServiceAction::Restart => {
             restart_ireland_forge(cfg)?;
-            ok("Live path restarted.");
+            ok("Live 链路已重启。");
         }
     }
     Ok(())
@@ -212,7 +212,7 @@ fn cmd_forge(cfg: &PolyedgeConfig, action: ServiceAction) -> Result<()> {
                 "start",
                 &[&cfg.forge_service_ireland, &cfg.forge_proxy_service_ireland],
             )?;
-            ok("Forge + dashboard proxy started.");
+            ok("Forge + Dashboard 代理已启动。");
         }
         ServiceAction::Stop => {
             ssh_systemctl(
@@ -221,7 +221,7 @@ fn cmd_forge(cfg: &PolyedgeConfig, action: ServiceAction) -> Result<()> {
                 "stop",
                 &[&cfg.forge_proxy_service_ireland, &cfg.forge_service_ireland],
             )?;
-            ok("Forge + dashboard proxy stopped.");
+            ok("Forge + Dashboard 代理已停止。");
         }
         ServiceAction::Restart => {
             ssh_systemctl(
@@ -230,7 +230,7 @@ fn cmd_forge(cfg: &PolyedgeConfig, action: ServiceAction) -> Result<()> {
                 "restart",
                 &[&cfg.forge_service_ireland, &cfg.forge_proxy_service_ireland],
             )?;
-            ok("Forge + dashboard proxy restarted.");
+            ok("Forge + Dashboard 代理已重启。");
         }
     }
     Ok(())
@@ -252,7 +252,7 @@ fn cmd_data(cfg: &PolyedgeConfig, action: ServiceAction) -> Result<()> {
                 "enable --now",
                 &[&cfg.data_health_timer_ireland],
             )?;
-            ok("Data collection started. Health timer enabled for self-heal.");
+            ok("数据采集已启动，自检定时器已开启。");
         }
         ServiceAction::Stop => {
             ssh_systemctl(
@@ -267,7 +267,7 @@ fn cmd_data(cfg: &PolyedgeConfig, action: ServiceAction) -> Result<()> {
                 "disable --now",
                 &[&cfg.data_health_timer_ireland],
             )?;
-            warn("Data collection stopped and health timer disabled.");
+            warn("数据采集已停止，自检定时器已关闭。");
         }
         ServiceAction::Restart => {
             ssh_systemctl(
@@ -282,7 +282,7 @@ fn cmd_data(cfg: &PolyedgeConfig, action: ServiceAction) -> Result<()> {
                 "restart",
                 &[&cfg.data_health_timer_ireland],
             )?;
-            ok("Data services restarted.");
+            ok("数据相关服务已重启。");
         }
     }
     Ok(())
@@ -296,8 +296,8 @@ fn cmd_docker(cfg: &PolyedgeConfig) -> Result<()> {
     check_local_cmd("git", &["--version"], &mut failures);
     check_local_cmd("cargo", &["-V"], &mut failures);
 
-    check_path("ireland key", &cfg.ireland_key, &mut failures);
-    check_path("tokyo key", &cfg.tokyo_key, &mut failures);
+    check_path("爱尔兰密钥", &cfg.ireland_key, &mut failures);
+    check_path("东京密钥", &cfg.tokyo_key, &mut failures);
 
     check_remote_echo(cfg, HostTarget::Ireland, &mut failures);
     check_remote_echo(cfg, HostTarget::Tokyo, &mut failures);
@@ -326,18 +326,18 @@ fn cmd_docker(cfg: &PolyedgeConfig) -> Result<()> {
         cfg.api_bind_port_ireland
     );
     match ssh_exec(cfg, HostTarget::Ireland, &health_cmd) {
-        Ok(_) => ok("ireland health endpoint OK"),
+        Ok(_) => ok("爱尔兰健康接口正常"),
         Err(err) => {
             failures += 1;
-            err_line(&format!("ireland health endpoint failed: {err}"));
+            err_line(&format!("爱尔兰健康接口检查失败: {err}"));
         }
     }
 
     if failures == 0 {
-        ok("All checks passed.");
+        ok("全部检查通过。");
         Ok(())
     } else {
-        bail!("{failures} checks failed");
+        bail!("共有 {failures} 项检查失败");
     }
 }
 
@@ -415,40 +415,40 @@ fn ssh_systemctl(
 fn check_local_cmd(name: &str, args: &[&str], failures: &mut u32) {
     let output = Command::new(name).args(args).output();
     match output {
-        Ok(out) if out.status.success() => ok(&format!("local dependency `{name}` OK")),
+        Ok(out) if out.status.success() => ok(&format!("本地依赖 `{name}` 正常")),
         Ok(out) => {
             *failures += 1;
             err_line(&format!(
-                "local dependency `{name}` failed: exit={}",
+                "本地依赖 `{name}` 检查失败: exit={}",
                 out.status.code().unwrap_or(-1)
             ));
         }
         Err(err) => {
             *failures += 1;
-            err_line(&format!("local dependency `{name}` missing: {err}"));
+            err_line(&format!("本地依赖 `{name}` 缺失: {err}"));
         }
     }
 }
 
 fn check_path(label: &str, path: &str, failures: &mut u32) {
     if Path::new(path).exists() {
-        ok(&format!("{label} found: {path}"));
+        ok(&format!("{label} 存在: {path}"));
     } else {
         *failures += 1;
-        err_line(&format!("{label} missing: {path}"));
+        err_line(&format!("{label} 不存在: {path}"));
     }
 }
 
 fn check_remote_echo(cfg: &PolyedgeConfig, target: HostTarget, failures: &mut u32) {
     let name = match target {
-        HostTarget::Ireland => "ireland ssh",
-        HostTarget::Tokyo => "tokyo ssh",
+        HostTarget::Ireland => "爱尔兰 SSH",
+        HostTarget::Tokyo => "东京 SSH",
     };
     match ssh_exec(cfg, target, "echo ok") {
-        Ok(_) => ok(&format!("{name} OK")),
+        Ok(_) => ok(&format!("{name} 正常")),
         Err(err) => {
             *failures += 1;
-            err_line(&format!("{name} failed: {err}"));
+            err_line(&format!("{name} 失败: {err}"));
         }
     }
 }
@@ -464,15 +464,15 @@ fn check_remote_service(
         Ok(out) => {
             let state = out.trim();
             if state == "active" {
-                ok(&format!("{service} active"));
+                ok(&format!("{service} 运行中"));
             } else {
                 *failures += 1;
-                err_line(&format!("{service} not active: {state}"));
+                err_line(&format!("{service} 非运行状态: {state}"));
             }
         }
         Err(err) => {
             *failures += 1;
-            err_line(&format!("{service} check failed: {err}"));
+            err_line(&format!("{service} 检查失败: {err}"));
         }
     }
 }
@@ -559,19 +559,27 @@ fn shell_single_quote(input: &str) -> String {
 }
 
 fn print_header(scope: &str, action: ServiceAction) {
+    let scope_zh = match scope {
+        "paper" => "模拟交易",
+        "live" => "实盘交易",
+        "forge" => "Forge 服务",
+        "data" => "数据采集",
+        "docker" => "环境体检",
+        _ => scope,
+    };
     println!("----------------------------------------");
-    println!("polyedge {scope} {action}");
+    println!("PolyEdge · {scope_zh} · {action}");
     println!("----------------------------------------");
 }
 
 fn ok(msg: &str) {
-    println!("[OK ] {msg}");
+    println!("[成功] {msg}");
 }
 
 fn warn(msg: &str) {
-    println!("[WARN] {msg}");
+    println!("[警告] {msg}");
 }
 
 fn err_line(msg: &str) {
-    eprintln!("[ERR] {msg}");
+    eprintln!("[失败] {msg}");
 }
