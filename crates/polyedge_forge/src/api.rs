@@ -7409,7 +7409,7 @@ async fn strategy_paper(
     };
     let autotune_context =
         normalize_autotune_context(params.autotune_context.as_deref(), market_type);
-    let use_autotune = params.use_autotune.unwrap_or(false);
+    let use_autotune = params.use_autotune.unwrap_or(true);
     let mut cfg = StrategyRuntimeConfig::default();
     let mut config_source = "default";
     let mut autotune_info = Value::Null;

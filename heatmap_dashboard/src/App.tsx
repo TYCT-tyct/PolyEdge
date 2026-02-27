@@ -61,7 +61,7 @@ const STRATEGY_PAPER_PROFILE = Object.freeze({
   lookbackMinutes: 24 * 60,
   maxTrades: 180,
   fullHistory: false,
-  useAutotune: false
+  useAutotune: true
 });
 const STRATEGY_LIVE_PROFILE = Object.freeze({
   liveExecute: false,
@@ -69,7 +69,7 @@ const STRATEGY_LIVE_PROFILE = Object.freeze({
   liveMaxOrders: 1,
   liveEntryOnly: true
 });
-const STRATEGY_PREFS_STORAGE_KEY = "polyedge.strategy.prefs.v1";
+const STRATEGY_PREFS_STORAGE_KEY = "polyedge.strategy.prefs.v2";
 
 type TimeMode = "local" | "et";
 type StrategyUiPrefs = {
@@ -1575,7 +1575,7 @@ export default function App() {
     strategyPrefs.source ?? "replay"
   );
   const [strategyUseAutotune, setStrategyUseAutotune] = useState<boolean>(
-    strategyPrefs.useAutotune ?? false
+    strategyPrefs.useAutotune ?? true
   );
   const [strategyAutotuneLatest, setStrategyAutotuneLatest] = useState<Record<string, unknown> | null>(null);
   const [strategyAutotuneHistory, setStrategyAutotuneHistory] = useState<Array<Record<string, unknown>>>([]);
