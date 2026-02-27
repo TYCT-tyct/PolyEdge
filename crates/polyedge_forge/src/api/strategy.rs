@@ -44,7 +44,7 @@ pub(super) struct StrategyRuntimeConfig {
     emergency_wide_spread_penalty_ratio: f64,
 }
 
-const STRATEGY_BASELINE_PROFILE: &str = "fev1_manual_guarded_2026_02_27";
+const STRATEGY_BASELINE_PROFILE: &str = "fev1_manual_profit_2026_02_27";
 
 #[allow(dead_code)]
 pub(super) fn strategy_backup_baseline_config() -> StrategyRuntimeConfig {
@@ -75,31 +75,31 @@ pub(super) fn strategy_backup_baseline_config() -> StrategyRuntimeConfig {
 }
 
 pub(super) fn strategy_current_default_config() -> StrategyRuntimeConfig {
-    // Manual guarded profile tuned on 2026-02-27 replay window (5m, 1440m lookback, max_trades=900, autotune off).
-    // Goal: higher win-rate + tighter drawdown while keeping participation and positive net pnl.
+    // Manual profit profile tuned on 2026-02-27 replay window (5m, 720/1440 lookback, max_trades=900, autotune off).
+    // Goal: significantly higher participation + net pnl with controlled drawdown.
     StrategyRuntimeConfig {
-        entry_threshold_base: 0.845,
-        entry_threshold_cap: 0.99,
-        spread_limit_prob: 0.0157,
-        entry_edge_prob: 0.0721,
-        entry_min_potential_cents: 20.73,
-        entry_max_price_cents: 80.75,
-        min_hold_ms: 14_112,
-        stop_loss_cents: 13.21,
-        reverse_signal_threshold: -0.3695,
-        reverse_signal_ticks: 5,
-        trail_activate_profit_cents: 29.88,
-        trail_drawdown_cents: 11.01,
-        take_profit_near_max_cents: 99.5,
-        endgame_take_profit_cents: 97.53,
-        endgame_remaining_ms: 19_107,
-        liquidity_widen_prob: 0.0727,
-        cooldown_ms: 0,
-        max_entries_per_round: 1,
-        max_exec_spread_cents: 1.01,
-        slippage_cents_per_side: 0.0945,
-        fee_cents_per_side: 0.0386,
-        emergency_wide_spread_penalty_ratio: 0.2903,
+        entry_threshold_base: 0.7648,
+        entry_threshold_cap: 0.9647,
+        spread_limit_prob: 0.0243,
+        entry_edge_prob: 0.0644,
+        entry_min_potential_cents: 17.10,
+        entry_max_price_cents: 69.48,
+        min_hold_ms: 3_605,
+        stop_loss_cents: 11.03,
+        reverse_signal_threshold: -0.1670,
+        reverse_signal_ticks: 2,
+        trail_activate_profit_cents: 25.09,
+        trail_drawdown_cents: 17.15,
+        take_profit_near_max_cents: 95.55,
+        endgame_take_profit_cents: 95.25,
+        endgame_remaining_ms: 23_370,
+        liquidity_widen_prob: 0.0714,
+        cooldown_ms: 1_071,
+        max_entries_per_round: 3,
+        max_exec_spread_cents: 1.3131,
+        slippage_cents_per_side: 0.1185,
+        fee_cents_per_side: 0.0431,
+        emergency_wide_spread_penalty_ratio: 0.2799,
     }
 }
 
