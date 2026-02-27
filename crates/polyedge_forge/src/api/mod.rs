@@ -82,6 +82,7 @@ struct ApiState {
     live_capital_states: Arc<RwLock<HashMap<String, LiveCapitalState>>>,
     live_gateway_report_seq: Arc<RwLock<i64>>,
     live_runtime_snapshots: Arc<RwLock<HashMap<String, Value>>>,
+    live_runtime_controls: Arc<RwLock<HashMap<String, LiveRuntimeControl>>>,
     live_rust_executor: Arc<RwLock<Option<Arc<RustExecutorContext>>>>,
     live_rust_book_cache: Arc<RwLock<HashMap<String, RustBookCacheEntry>>>,
     live_balance_cache: Arc<RwLock<Option<LiveBalanceSnapshot>>>,
@@ -874,6 +875,36 @@ impl LiveRuntimeConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+enum LiveRuntimeControlMode {
+    #[default]
+    Normal,
+    GracefulStop,
+    ForcePause,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LiveRuntimeControl {
+    mode: LiveRuntimeControlMode,
+    requested_at_ms: i64,
+    updated_at_ms: i64,
+    completed_at_ms: Option<i64>,
+    note: Option<String>,
+}
+
+impl LiveRuntimeControl {
+    fn normal(now_ms: i64) -> Self {
+        Self {
+            mode: LiveRuntimeControlMode::Normal,
+            requested_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            completed_at_ms: None,
+            note: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ServerChanConfig {
     enabled: bool,
@@ -980,6 +1011,26 @@ impl ApiState {
     async fn put_live_position_state(&self, market_type: &str, next: LivePositionState) {
         let mut states = self.live_position_states.write().await;
         states.insert(market_type.to_string(), next);
+    }
+
+    async fn get_live_runtime_control(&self, market_type: &str) -> LiveRuntimeControl {
+        let now_ms = Utc::now().timestamp_millis();
+        {
+            let controls = self.live_runtime_controls.read().await;
+            if let Some(v) = controls.get(market_type) {
+                return v.clone();
+            }
+        }
+        let mut controls = self.live_runtime_controls.write().await;
+        let entry = controls
+            .entry(market_type.to_string())
+            .or_insert_with(|| LiveRuntimeControl::normal(now_ms));
+        entry.clone()
+    }
+
+    async fn put_live_runtime_control(&self, market_type: &str, next: LiveRuntimeControl) {
+        let mut controls = self.live_runtime_controls.write().await;
+        controls.insert(market_type.to_string(), next);
     }
 
     async fn get_live_capital_state(
@@ -1759,6 +1810,7 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         live_capital_states: Arc::new(RwLock::new(HashMap::new())),
         live_gateway_report_seq: Arc::new(RwLock::new(0)),
         live_runtime_snapshots: Arc::new(RwLock::new(HashMap::new())),
+        live_runtime_controls: Arc::new(RwLock::new(HashMap::new())),
         live_rust_executor: Arc::new(RwLock::new(None)),
         live_rust_book_cache: Arc::new(RwLock::new(HashMap::new())),
         live_balance_cache: Arc::new(RwLock::new(None)),
@@ -1806,6 +1858,7 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         )
         .route("/api/strategy/autotune/set", post(strategy_autotune_set))
         .route("/api/strategy/live/reset", post(strategy_live_reset))
+        .route("/api/strategy/live/control", post(strategy_live_control))
         .route("/api/strategy/live/balance", get(strategy_live_balance))
         .with_state(state.clone());
 
@@ -1841,6 +1894,10 @@ fn live_pending_orders_key(redis_prefix: &str) -> String {
     format!("{redis_prefix}:fev1:live:pending")
 }
 
+fn live_runtime_control_key(redis_prefix: &str, market_type: &str) -> String {
+    format!("{redis_prefix}:fev1:live:runtime_control:{market_type}")
+}
+
 fn live_gateway_seq_key(redis_prefix: &str) -> String {
     format!("{redis_prefix}:fev1:live:gateway_seq")
 }
@@ -1874,6 +1931,12 @@ async fn restore_live_runtime_state(
         if let Some(v) = read_key_value(state, &key).await? {
             if let Ok(parsed) = serde_json::from_value::<LivePositionState>(v) {
                 state.put_live_position_state(market, parsed).await;
+            }
+        }
+        let control_key = live_runtime_control_key(&state.redis_prefix, market);
+        if let Some(v) = read_key_value(state, &control_key).await? {
+            if let Ok(parsed) = serde_json::from_value::<LiveRuntimeControl>(v) {
+                state.put_live_runtime_control(market, parsed).await;
             }
         }
         if !capital_cfg.portfolio_shared {
@@ -1922,6 +1985,15 @@ async fn persist_live_runtime_state(state: &ApiState, market_type: &str) {
     let position = state.get_live_position_state(market_type).await;
     let pos_key = live_position_state_key(&state.redis_prefix, market_type);
     let _ = write_key_value(state, &pos_key, &json!(position), Some(2 * 24 * 3600)).await;
+    let runtime_control = state.get_live_runtime_control(market_type).await;
+    let control_key = live_runtime_control_key(&state.redis_prefix, market_type);
+    let _ = write_key_value(
+        state,
+        &control_key,
+        &json!(runtime_control),
+        Some(2 * 24 * 3600),
+    )
+    .await;
     let capital_cfg = LiveCapitalConfig::from_env();
     let capital_scope = capital_scope_market(market_type, &capital_cfg);
     let capital_state = state
@@ -1968,6 +2040,36 @@ async fn live_runtime_loop(state: ApiState, bootstrap: LiveRuntimeConfig) {
 
         for market in &cfg.markets {
             let market_type = market.as_str();
+            let now_ms = Utc::now().timestamp_millis();
+            let position_before_cycle = state.get_live_position_state(market_type).await;
+            let pending_before_cycle = state.list_pending_orders_for_market(market_type).await;
+            let pending_before_count = pending_before_cycle.len();
+            let mut runtime_control = state.get_live_runtime_control(market_type).await;
+            let mut effective_live_execute = cfg.live_execute;
+            let mut effective_drain_only = cfg.drain_only;
+            match runtime_control.mode {
+                LiveRuntimeControlMode::Normal => {}
+                LiveRuntimeControlMode::ForcePause => {
+                    effective_live_execute = false;
+                    effective_drain_only = true;
+                }
+                LiveRuntimeControlMode::GracefulStop => {
+                    effective_drain_only = true;
+                    if position_before_cycle.side.is_none() && pending_before_count == 0 {
+                        effective_live_execute = false;
+                        if runtime_control.completed_at_ms.is_none() {
+                            runtime_control.completed_at_ms = Some(now_ms);
+                            runtime_control.updated_at_ms = now_ms;
+                            state
+                                .put_live_runtime_control(market_type, runtime_control.clone())
+                                .await;
+                        }
+                    } else {
+                        // Keep live execution enabled in drain mode until existing position is closed.
+                        effective_live_execute = true;
+                    }
+                }
+            }
             let strategy_cfg = StrategyRuntimeConfig::default();
             let runtime_cfg_source = "live_default";
             let runtime_autotune_doc = Value::Null;
@@ -1985,16 +2087,32 @@ async fn live_runtime_loop(state: ApiState, bootstrap: LiveRuntimeConfig) {
                 config_source: runtime_cfg_source,
                 autotune_doc: runtime_autotune_doc,
                 autotune_live_key: runtime_autotune_live_key,
-                live_execute: cfg.live_execute,
+                live_execute: effective_live_execute,
                 live_quote_usdc: cfg.quote_usdc,
                 live_max_orders: cfg.max_orders,
-                live_drain_only: cfg.drain_only,
+                live_drain_only: effective_drain_only,
             })
             .await
             {
-                Ok(payload) => {
+                Ok(mut payload) => {
                     let now = Utc::now();
                     let now_ms = now.timestamp_millis();
+                    if let Some(obj) = payload.as_object_mut() {
+                        obj.insert(
+                            "runtime_control".to_string(),
+                            json!({
+                                "mode": runtime_control.mode,
+                                "requested_at_ms": runtime_control.requested_at_ms,
+                                "updated_at_ms": runtime_control.updated_at_ms,
+                                "completed_at_ms": runtime_control.completed_at_ms,
+                                "note": runtime_control.note,
+                                "effective_live_execute": effective_live_execute,
+                                "effective_drain_only": effective_drain_only,
+                                "position_side_before_cycle": position_before_cycle.side,
+                                "pending_orders_before_cycle": pending_before_count,
+                            }),
+                        );
+                    }
                     let status = payload
                         .get("status")
                         .and_then(Value::as_str)
@@ -2004,7 +2122,7 @@ async fn live_runtime_loop(state: ApiState, bootstrap: LiveRuntimeConfig) {
                     state.set_runtime_snapshot(market_type, payload).await;
                     persist_live_runtime_state(&state, market_type).await;
 
-                    if push_cfg.enabled && cfg.live_execute && status != "ok" {
+                    if push_cfg.enabled && effective_live_execute && status != "ok" {
                         let alert_key = format!("live-status:{market_type}:{status}");
                         if state
                             .should_emit_alert(&alert_key, now_ms, push_cfg.throttle_ms)
@@ -2070,7 +2188,11 @@ async fn live_runtime_loop(state: ApiState, bootstrap: LiveRuntimeConfig) {
                                 "### FEV1 每日报告\n\n- 日期(UTC): `{}`\n- 市场: `{}`\n- 模式: `{}`\n- 胜率: `{:.2}%`\n- 净收益: `{:.2}¢`\n- 最大回撤: `{:.2}¢`\n- 交易数: `{}`\n",
                                 day_key,
                                 market_type,
-                                if cfg.live_execute { "live_execute" } else { "paper_replay" },
+                                if effective_live_execute {
+                                    "live_execute"
+                                } else {
+                                    "paper_replay"
+                                },
                                 win_rate,
                                 net,
                                 max_dd,

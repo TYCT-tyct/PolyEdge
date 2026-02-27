@@ -2066,18 +2066,30 @@ pub(super) async fn strategy_paper(
         }
     }
     let fixed_guard = strategy_fixed_guard_payload(&cfg);
+    let runtime_defaults = LiveRuntimeConfig::from_env();
     let full_history = params.full_history.unwrap_or(false);
     let lookback_minutes = params
         .lookback_minutes
-        .unwrap_or(if full_history { 30 * 24 * 60 } else { 24 * 60 })
+        .unwrap_or(if full_history {
+            30 * 24 * 60
+        } else {
+            runtime_defaults.lookback_minutes
+        })
         .clamp(30, 365 * 24 * 60);
     let max_points = strategy_resolve_max_points(
         full_history,
-        params.max_points,
+        params.max_points.or(if full_history {
+            None
+        } else {
+            Some(runtime_defaults.max_points)
+        }),
         params.max_samples,
     );
     let _heavy_permit = strategy_acquire_heavy_permit(&state, full_history, max_points).await;
-    let max_trades = params.max_trades.unwrap_or(200).clamp(20, 1000) as usize;
+    let max_trades = params
+        .max_trades
+        .unwrap_or(runtime_defaults.max_trades as u32)
+        .clamp(20, 1000) as usize;
     let _live_execute = params.live_execute.unwrap_or(false);
     let _live_quote_usdc = params.live_quote_usdc.unwrap_or(1.0).clamp(0.5, 1000.0);
     let _live_max_orders = params.live_max_orders.unwrap_or(1).clamp(1, 8) as usize;
@@ -2120,6 +2132,11 @@ pub(super) async fn strategy_paper(
             "autotune_live_key": live_key_used,
             "autotune_live_found": live_opt.is_some(),
             "fixed_guard": fixed_guard,
+            "runtime_defaults": {
+                "lookback_minutes": runtime_defaults.lookback_minutes,
+                "max_points": runtime_defaults.max_points,
+                "max_trades": runtime_defaults.max_trades,
+            },
             "lookback_minutes": lookback_minutes,
             "samples": samples.len(),
             "current": Value::Null,
@@ -2158,6 +2175,11 @@ pub(super) async fn strategy_paper(
         "autotune_live_key": live_key_used,
         "autotune_live_found": live_opt.is_some(),
         "lookback_minutes": lookback_minutes,
+        "runtime_defaults": {
+            "lookback_minutes": runtime_defaults.lookback_minutes,
+            "max_points": runtime_defaults.max_points,
+            "max_trades": runtime_defaults.max_trades,
+        },
         "full_history": full_history,
         "samples": samples.len(),
         "config_source": config_source,
@@ -2232,6 +2254,10 @@ pub(super) async fn strategy_live_reset(
         snapshots.clear();
     }
     {
+        let mut controls = state.live_runtime_controls.write().await;
+        controls.clear();
+    }
+    {
         let mut cache = state.live_rust_book_cache.write().await;
         cache.clear();
     }
@@ -2252,6 +2278,9 @@ pub(super) async fn strategy_live_reset(
         state
             .put_live_position_state(market, LivePositionState::flat(market, now_ms))
             .await;
+        state
+            .put_live_runtime_control(market, LiveRuntimeControl::normal(now_ms))
+            .await;
     }
 
     let mut deleted_keys = Vec::<String>::new();
@@ -2259,6 +2288,10 @@ pub(super) async fn strategy_live_reset(
         let key = live_position_state_key(&state.redis_prefix, market);
         if delete_key(&state, &key).await.is_ok() {
             deleted_keys.push(key);
+        }
+        let control_key = live_runtime_control_key(&state.redis_prefix, market);
+        if delete_key(&state, &control_key).await.is_ok() {
+            deleted_keys.push(control_key);
         }
     }
     let pending_key = live_pending_orders_key(&state.redis_prefix);
@@ -2280,6 +2313,110 @@ pub(super) async fn strategy_live_reset(
         "ok": true,
         "reset_at_ms": now_ms,
         "deleted_redis_keys": deleted_keys
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct StrategyLiveControlRequest {
+    market_type: Option<String>,
+    action: String,
+    note: Option<String>,
+}
+
+pub(super) async fn strategy_live_control(
+    State(state): State<ApiState>,
+    Json(body): Json<StrategyLiveControlRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let market_type = resolve_strategy_market_type(body.market_type.as_deref())?;
+    let action = body.action.trim().to_ascii_lowercase();
+    if action.is_empty() {
+        return Err(ApiError::bad_request("action is required"));
+    }
+    let now_ms = Utc::now().timestamp_millis();
+    let mut control = state.get_live_runtime_control(market_type).await;
+    let mut updated = false;
+    match action.as_str() {
+        "status" => {}
+        "graceful_stop" | "stop_graceful" | "stop" => {
+            control.mode = LiveRuntimeControlMode::GracefulStop;
+            control.requested_at_ms = now_ms;
+            control.updated_at_ms = now_ms;
+            control.completed_at_ms = None;
+            control.note = body
+                .note
+                .as_ref()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+            updated = true;
+        }
+        "resume_live" | "resume" | "start" => {
+            control = LiveRuntimeControl::normal(now_ms);
+            control.note = body
+                .note
+                .as_ref()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+            updated = true;
+        }
+        "force_pause" | "pause" => {
+            control.mode = LiveRuntimeControlMode::ForcePause;
+            control.requested_at_ms = now_ms;
+            control.updated_at_ms = now_ms;
+            control.completed_at_ms = None;
+            control.note = body
+                .note
+                .as_ref()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+            updated = true;
+        }
+        _ => {
+            return Err(ApiError::bad_request(
+                "invalid action (allowed: status|graceful_stop|resume_live|force_pause)",
+            ));
+        }
+    }
+
+    if updated {
+        state
+            .put_live_runtime_control(market_type, control.clone())
+            .await;
+        persist_live_runtime_state(&state, market_type).await;
+    }
+
+    let position = state.get_live_position_state(market_type).await;
+    let pending_count = state.list_pending_orders_for_market(market_type).await.len();
+    let flatten_done = position.side.is_none() && pending_count == 0;
+    if matches!(control.mode, LiveRuntimeControlMode::GracefulStop)
+        && flatten_done
+        && control.completed_at_ms.is_none()
+    {
+        control.completed_at_ms = Some(now_ms);
+        control.updated_at_ms = now_ms;
+        state
+            .put_live_runtime_control(market_type, control.clone())
+            .await;
+        persist_live_runtime_state(&state, market_type).await;
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "market_type": market_type,
+        "action": action,
+        "control": control,
+        "position_side": position.side,
+        "pending_orders": pending_count,
+        "flatten_done": flatten_done,
+        "runtime_effective": {
+            "drain_only": matches!(control.mode, LiveRuntimeControlMode::GracefulStop | LiveRuntimeControlMode::ForcePause),
+            "live_execute": if matches!(control.mode, LiveRuntimeControlMode::ForcePause) {
+                false
+            } else if matches!(control.mode, LiveRuntimeControlMode::GracefulStop) {
+                !flatten_done
+            } else {
+                LiveRuntimeConfig::from_env().live_execute
+            }
+        }
     })))
 }
 

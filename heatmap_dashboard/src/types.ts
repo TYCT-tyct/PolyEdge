@@ -255,6 +255,22 @@ export interface StrategyPaperResponse {
   autotune_active_key?: string;
   autotune_live_key?: string;
   autotune_live_found?: boolean;
+  runtime_defaults?: {
+    lookback_minutes?: number;
+    max_points?: number;
+    max_trades?: number;
+  };
+  runtime_control?: {
+    mode?: "normal" | "graceful_stop" | "force_pause" | string;
+    requested_at_ms?: number;
+    updated_at_ms?: number;
+    completed_at_ms?: number | null;
+    note?: string | null;
+    effective_live_execute?: boolean;
+    effective_drain_only?: boolean;
+    position_side_before_cycle?: "UP" | "DOWN" | null | string;
+    pending_orders_before_cycle?: number;
+  };
   lookback_minutes: number;
   samples: number;
   config_source?: string;

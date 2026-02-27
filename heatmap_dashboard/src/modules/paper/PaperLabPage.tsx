@@ -19,8 +19,6 @@ const AUTOTUNE_POLL_MAX_MS = 60_000;
 const STRATEGY_PREFS_STORAGE_KEY = "polyedge.strategy.prefs.v4";
 
 const STRATEGY_PAPER_PROFILE = Object.freeze({
-  lookbackMinutes: 24 * 60,
-  maxTrades: 180,
   fullHistory: false,
   useAutotune: false
 });
@@ -647,6 +645,16 @@ export function PaperLabPage({
       <footer className="status-row">
         <span>source: {strategyPaper?.source ?? "--"}</span>
         <span>market: {strategyMarketType}</span>
+        <span>
+          runtime:
+          {` ${
+            strategyPaper?.runtime_defaults?.lookback_minutes ?? "--"
+          }m / ${strategyPaper?.runtime_defaults?.max_trades ?? "--"} trades`}
+        </span>
+        <span>
+          liveCtrl: {strategyPaper?.runtime_control?.mode ?? "normal"}
+          {strategyPaper?.runtime_control?.effective_drain_only ? " (drain)" : ""}
+        </span>
         <span>activeKey: {strategyPaper?.autotune_active_key ?? "--"}</span>
         <span>liveKey: {strategyPaper?.autotune_live_key ?? "--"}</span>
         <span>autotune: forced_off</span>
