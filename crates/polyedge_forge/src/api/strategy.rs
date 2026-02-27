@@ -1,4 +1,5 @@
 use super::*;
+use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone)]
@@ -159,6 +160,68 @@ fn strategy_select_profile_name() -> &'static str {
 
 fn strategy_current_default_profile_name() -> &'static str {
     strategy_select_profile_name()
+}
+
+fn strategy_env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
+}
+
+fn strategy_cfg_hash(cfg: &StrategyRuntimeConfig) -> String {
+    let mut hasher = Sha256::new();
+    let profile = strategy_current_default_profile_name();
+    let canonical = serde_json::to_string(&strategy_cfg_json(cfg)).unwrap_or_default();
+    hasher.update(profile.as_bytes());
+    hasher.update(b"|");
+    hasher.update(canonical.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn strategy_fixed_guard_payload(cfg: &StrategyRuntimeConfig) -> Value {
+    let enabled = strategy_env_bool("FORGE_STRATEGY_FIXED_GUARD_ENABLED", true);
+    let enforce_live = strategy_env_bool("FORGE_STRATEGY_FIXED_GUARD_ENFORCE_LIVE", true);
+    let allow_mismatch = strategy_env_bool("FORGE_STRATEGY_FIXED_GUARD_ALLOW_MISMATCH", false);
+    let current_hash = strategy_cfg_hash(cfg);
+    let expected_hash = std::env::var("FORGE_STRATEGY_FIXED_GUARD_EXPECTED_HASH")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty());
+    let hash_match = match expected_hash.as_deref() {
+        Some(expected) if expected.len() < current_hash.len() => current_hash.starts_with(expected),
+        Some(expected) => expected == current_hash,
+        None => true,
+    };
+    let mismatch = expected_hash.is_some() && !hash_match;
+    let live_blocked = enabled && enforce_live && mismatch && !allow_mismatch;
+    let mode = if !enabled {
+        "disabled"
+    } else if expected_hash.is_none() {
+        "observe"
+    } else if mismatch && allow_mismatch {
+        "mismatch_allowed"
+    } else if mismatch {
+        "mismatch_blocking"
+    } else {
+        "locked_ok"
+    };
+    json!({
+        "enabled": enabled,
+        "enforce_live": enforce_live,
+        "allow_mismatch": allow_mismatch,
+        "mode": mode,
+        "profile": strategy_current_default_profile_name(),
+        "current_hash": current_hash,
+        "expected_hash": expected_hash,
+        "mismatch": mismatch,
+        "live_blocked": live_blocked
+    })
 }
 
 #[allow(dead_code)]
@@ -761,12 +824,24 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         live_drain_only,
     } = req;
     let live_execute_requested = live_execute;
-    let live_execute = live_execute_requested && live_execution_market_allowed(market_type);
-    let live_execute_block_reason = if live_execute_requested && !live_execute {
-        Some("market_not_enabled_for_live_execution")
+    let mut live_execute = live_execute_requested && live_execution_market_allowed(market_type);
+    let mut live_execute_block_reason = if live_execute_requested && !live_execute {
+        Some("market_not_enabled_for_live_execution".to_string())
     } else {
         None
     };
+    let fixed_guard = strategy_fixed_guard_payload(cfg);
+    if live_execute
+        && fixed_guard
+            .get("live_blocked")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        live_execute = false;
+        if live_execute_block_reason.is_none() {
+            live_execute_block_reason = Some("fixed_config_hash_mismatch".to_string());
+        }
+    }
     let exec_gate = fev1::ExecutionGate::from_env();
     if live_execute && !exec_gate.live_enabled {
         return Err(ApiError::bad_request(
@@ -1467,6 +1542,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         "samples": samples.len(),
         "config_source": config_source,
         "baseline_profile": strategy_current_default_profile_name(),
+        "fixed_guard": fixed_guard,
         "autotune": autotune_doc,
         "autotune_live_key": autotune_live_key,
         "config": strategy_cfg_json(cfg),
@@ -1882,6 +1958,7 @@ pub(super) async fn strategy_paper(
             cfg.entry_threshold_cap = cfg.entry_threshold_base;
         }
     }
+    let fixed_guard = strategy_fixed_guard_payload(&cfg);
     let full_history = params.full_history.unwrap_or(false);
     let lookback_minutes = params
         .lookback_minutes
@@ -1933,6 +2010,7 @@ pub(super) async fn strategy_paper(
             "autotune_active_key": active_key_used,
             "autotune_live_key": live_key_used,
             "autotune_live_found": live_opt.is_some(),
+            "fixed_guard": fixed_guard,
             "lookback_minutes": lookback_minutes,
             "samples": samples.len(),
             "current": Value::Null,
@@ -1975,6 +2053,7 @@ pub(super) async fn strategy_paper(
         "samples": samples.len(),
         "config_source": config_source,
         "baseline_profile": strategy_current_default_profile_name(),
+        "fixed_guard": fixed_guard,
         "autotune": autotune_info,
         "autotune_key_used": autotune_key_used,
         "config": {
@@ -2096,11 +2175,23 @@ pub(super) async fn strategy_live_balance(
     Query(params): Query<StrategyLiveBalanceQueryParams>,
 ) -> Result<Json<Value>, ApiError> {
     let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
-    let capital_cfg = LiveCapitalConfig::from_env();
+    let mut capital_cfg = LiveCapitalConfig::from_env();
     let refresh_ms = params
         .refresh_ms
         .unwrap_or(capital_cfg.balance_refresh_ms)
         .clamp(500, 120_000);
+    capital_cfg.balance_refresh_ms = refresh_ms;
+    let live_gateway_cfg = LiveGatewayConfig::from_env();
+    let runtime_cfg = LiveRuntimeConfig::from_env();
+    let base_quote_usdc = runtime_cfg.quote_usdc.max(live_gateway_cfg.min_quote_usdc);
+    let (dynamic_quote_usdc, capital_state, balance_sync_ok, balance_sync_error) = state
+        .compute_live_quote_usdc(
+            market_type,
+            base_quote_usdc,
+            live_gateway_cfg.min_quote_usdc,
+            &capital_cfg,
+        )
+        .await;
     let snapshot = state
         .get_live_balance_snapshot(refresh_ms)
         .await
@@ -2111,9 +2202,7 @@ pub(super) async fn strategy_live_balance(
     } else {
         market_type
     };
-    let capital_state = state
-        .get_live_capital_state(capital_scope, &capital_cfg)
-        .await;
+    let fixed_guard = strategy_fixed_guard_payload(&StrategyRuntimeConfig::default());
     Ok(Json(json!({
         "ok": true,
         "market_type": market_type,
@@ -2126,9 +2215,14 @@ pub(super) async fn strategy_live_balance(
         "spendable_usdc": snapshot.spendable_usdc,
         "capital_auto_enabled": capital_cfg.enabled,
         "capital_use_real_balance": capital_cfg.use_real_balance,
+        "base_quote_usdc": base_quote_usdc,
+        "dynamic_quote_usdc": dynamic_quote_usdc,
+        "balance_sync_ok": balance_sync_ok,
+        "balance_sync_error": balance_sync_error,
         "capital_state_equity_estimate_usdc": capital_state.equity_estimate_usdc,
         "capital_state_available_to_trade_usdc": capital_state.available_to_trade_usdc,
         "raw": snapshot.raw,
+        "fixed_guard": fixed_guard
     })))
 }
 
