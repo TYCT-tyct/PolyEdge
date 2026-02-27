@@ -1217,10 +1217,19 @@ impl ApiState {
         } else {
             cs.kelly_fraction = 0.0;
         }
-        let quote = base_quote_usdc
-            .max(quote_floor)
-            .min(quote_by_capital.max(quote_floor))
-            .clamp(quote_floor, 2_000.0);
+        if !quote_by_capital.is_finite() {
+            quote_by_capital = quote_floor;
+        }
+        // When real balance sync is healthy, quote sizing should follow live capital state.
+        // Base quote remains a fallback anchor only when balance is unavailable.
+        let base_anchor = base_quote_usdc.max(quote_floor);
+        let quote = if cfg.use_real_balance && balance_sync_ok {
+            quote_by_capital.max(quote_floor).clamp(quote_floor, 2_000.0)
+        } else {
+            base_anchor
+                .min(quote_by_capital.max(quote_floor))
+                .clamp(quote_floor, 2_000.0)
+        };
 
         cs.reserved_pending_usdc = reserved_pending;
         cs.available_to_trade_usdc = available;
