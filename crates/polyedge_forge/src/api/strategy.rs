@@ -2131,6 +2131,10 @@ pub(super) async fn strategy_live_reset(
         cache.take();
     }
     {
+        let mut capitals = state.live_capital_states.write().await;
+        capitals.clear();
+    }
+    {
         let mut exec = state.live_rust_executor.write().await;
         exec.take();
     }
@@ -2155,6 +2159,12 @@ pub(super) async fn strategy_live_reset(
     let seq_key = live_gateway_seq_key(&state.redis_prefix);
     if delete_key(&state, &seq_key).await.is_ok() {
         deleted_keys.push(seq_key);
+    }
+    for scope in ["5m", "15m", LIVE_CAPITAL_PORTFOLIO_SCOPE] {
+        let key = live_capital_state_key(&state.redis_prefix, scope);
+        if delete_key(&state, &key).await.is_ok() {
+            deleted_keys.push(key);
+        }
     }
 
     Ok(Json(json!({

@@ -239,6 +239,27 @@ fn risk_add_multiplier(risk_state: &str) -> f64 {
     }
 }
 
+fn derive_capital_risk_state(
+    max_equity_usdc: f64,
+    equity_estimate_usdc: f64,
+    consecutive_losses: u32,
+) -> &'static str {
+    let dd_pct = if max_equity_usdc > 1e-9 {
+        ((max_equity_usdc - equity_estimate_usdc).max(0.0) / max_equity_usdc).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if dd_pct >= 0.16 || consecutive_losses >= 6 {
+        "lockdown"
+    } else if dd_pct >= 0.09 || consecutive_losses >= 4 {
+        "defensive"
+    } else if dd_pct >= 0.04 || consecutive_losses >= 2 {
+        "caution"
+    } else {
+        "normal"
+    }
+}
+
 fn dynamic_entry_quote(
     decision: &Value,
     base_quote: f64,
@@ -612,6 +633,7 @@ struct LiveCapitalConfig {
     kelly_max_fraction: f64,
     kelly_payout_b: f64,
     kelly_min_samples: usize,
+    risk_idle_relief_ms: i64,
     reverse_two_phase: bool,
 }
 
@@ -685,6 +707,13 @@ impl LiveCapitalConfig {
                 24,
                 8,
                 200
+            ),
+            risk_idle_relief_ms: env_typed!(
+                i64,
+                "FORGE_FEV1_CAPITAL_RISK_IDLE_RELIEF_MS",
+                900_000,
+                60_000,
+                12 * 60 * 60 * 1000
             ),
 
             equity_base_usdc: env_f64!("FORGE_FEV1_CAPITAL_BASE_USDC", 50.0, 5.0, 5_000_000.0),
@@ -1076,21 +1105,12 @@ impl ApiState {
             cs.adaptive_leg_mult = 1.0;
             cs.adaptive_add_mult = 1.0;
         }
-        let dd_pct = if cs.max_equity_usdc > 1e-9 {
-            ((cs.max_equity_usdc - cs.equity_estimate_usdc).max(0.0) / cs.max_equity_usdc)
-                .clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        cs.risk_state = if dd_pct >= 0.16 || cs.consecutive_losses >= 6 {
-            "lockdown".to_string()
-        } else if dd_pct >= 0.09 || cs.consecutive_losses >= 4 {
-            "defensive".to_string()
-        } else if dd_pct >= 0.04 || cs.consecutive_losses >= 2 {
-            "caution".to_string()
-        } else {
-            "normal".to_string()
-        };
+        cs.risk_state = derive_capital_risk_state(
+            cs.max_equity_usdc,
+            cs.equity_estimate_usdc,
+            cs.consecutive_losses,
+        )
+        .to_string();
         cs.capital_stage = capital_stage_name(cs.equity_estimate_usdc).to_string();
         cs.updated_ts_ms = now_ms;
         self.put_live_capital_state(scope_market, cs.clone()).await;
@@ -1159,6 +1179,7 @@ impl ApiState {
                 }
             }
         }
+        let now_ms = Utc::now().timestamp_millis();
         let reserved_pending = self.pending_reserved_quote_usdc_all().await.max(0.0);
         if cfg.use_real_balance && cfg.hard_require_real_balance && !balance_sync_ok {
             cs.reserved_pending_usdc = reserved_pending;
@@ -1172,6 +1193,33 @@ impl ApiState {
             self.put_live_capital_state(scope_market, cs.clone()).await;
             return (cs.last_quote_usdc, cs, false, balance_sync_error);
         }
+        let position_open = self
+            .get_live_position_state(market_type)
+            .await
+            .side
+            .is_some();
+        if !position_open && reserved_pending <= 1e-9 {
+            let idle_ms = now_ms.saturating_sub(cs.updated_ts_ms);
+            if idle_ms >= cfg.risk_idle_relief_ms {
+                let steps = (idle_ms / cfg.risk_idle_relief_ms).clamp(1, 8) as u32;
+                cs.consecutive_losses = cs.consecutive_losses.saturating_sub(steps);
+                let gap = (cs.max_equity_usdc - cs.equity_estimate_usdc).max(0.0);
+                if gap > 1e-9 {
+                    let decay = (0.15 * steps as f64).clamp(0.0, 0.75);
+                    cs.max_equity_usdc =
+                        (cs.max_equity_usdc - gap * decay).max(cs.equity_estimate_usdc);
+                }
+            }
+        }
+        if cs.max_equity_usdc < cs.equity_estimate_usdc {
+            cs.max_equity_usdc = cs.equity_estimate_usdc;
+        }
+        cs.risk_state = derive_capital_risk_state(
+            cs.max_equity_usdc,
+            cs.equity_estimate_usdc,
+            cs.consecutive_losses,
+        )
+        .to_string();
         let risk_mult = match cs.risk_state.as_str() {
             "lockdown" => 0.0,
             "defensive" => 0.40,
@@ -1237,7 +1285,7 @@ impl ApiState {
         cs.last_quote_usdc = quote;
         cs.balance_sync_ok = balance_sync_ok;
         cs.balance_sync_error = balance_sync_error.clone();
-        cs.updated_ts_ms = Utc::now().timestamp_millis();
+        cs.updated_ts_ms = now_ms;
         self.put_live_capital_state(scope_market, cs.clone()).await;
         (quote, cs, balance_sync_ok, balance_sync_error)
     }
