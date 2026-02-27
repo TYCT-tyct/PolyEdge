@@ -285,14 +285,21 @@ def _safe_float(v: Any) -> Optional[float]:
         return None
 
 
+def _row_field(row: Any, key: str) -> Any:
+    if isinstance(row, dict):
+        return row.get(key)
+    try:
+        return getattr(row, key)
+    except Exception:
+        return None
+
+
 def _best_price(rows: Any, side: str) -> Optional[float]:
     if not isinstance(rows, list) or not rows:
         return None
     prices: list[float] = []
     for row in rows:
-        if not isinstance(row, dict):
-            continue
-        p = _safe_float(row.get("price"))
+        p = _safe_float(_row_field(row, "price"))
         if p is None:
             continue
         prices.append(p)
@@ -306,16 +313,14 @@ def _extract_book_levels(rows: Any) -> list[tuple[float, float]]:
         return []
     levels: list[tuple[float, float]] = []
     for row in rows:
-        if not isinstance(row, dict):
-            continue
-        p = _safe_float(row.get("price"))
+        p = _safe_float(_row_field(row, "price"))
         if p is None:
             continue
         size = (
-            _safe_float(row.get("size"))
-            or _safe_float(row.get("quantity"))
-            or _safe_float(row.get("amount"))
-            or _safe_float(row.get("shares"))
+            _safe_float(_row_field(row, "size"))
+            or _safe_float(_row_field(row, "quantity"))
+            or _safe_float(_row_field(row, "amount"))
+            or _safe_float(_row_field(row, "shares"))
         )
         if size is None or size <= 0.0:
             continue
@@ -343,6 +348,12 @@ def _quantize_price(price: float, tick_size: float, side: str) -> float:
     else:
         q = math.floor(steps + 1e-9) * tick
     return _normalize_price(q)
+
+
+def _ceil_cent(v: float) -> float:
+    # BUY orders on CLOB are validated by quote-notional precision (2 decimals).
+    # Always round up to cents to avoid under-notional rejections from float drift.
+    return math.ceil((max(0.0, v) * 100.0) - 1e-9) / 100.0
 
 
 def _get_market_meta(token_id: str) -> MarketMeta:
@@ -492,6 +503,10 @@ def _build_order(payload: dict) -> Tuple[dict, Optional[str]]:
         elif side == SELL and market_meta.best_bid is not None:
             price = min(price, float(market_meta.best_bid))
     price = _quantize_price(price, market_meta.tick_size, side)
+    if side == BUY:
+        # Enforce BUY quote precision to cents before signing.
+        # This prevents exchange-side "invalid amounts" for maker/taker accuracy.
+        price = _normalize_price(round(price, 2))
     # For marketable BUY paths, apply a small notional buffer when request is around/below $1.
     if side == BUY and ENFORCE_MARKETABLE_BUY_MIN:
         target_notional = MIN_MARKETABLE_BUY_USDC
@@ -499,6 +514,13 @@ def _build_order(payload: dict) -> Tuple[dict, Optional[str]]:
             target_notional = max(target_notional, MARKETABLE_BUY_BUFFER_USDC)
         if size * price < target_notional:
             size = round((target_notional / max(price, MIN_PRICE)) + 1e-6, 4)
+    if side == BUY:
+        # CLOB validates BUY maker amount with 2-decimal precision.
+        # Project notional to cents first, then derive share size with <=5 decimals.
+        target_notional = _ceil_cent(size * price)
+        size = round(max(market_meta.min_order_size, target_notional / max(price, MIN_PRICE)), 5)
+    else:
+        size = round(size, 4)
     fee_bps = int(payload.get("fee_rate_bps") or market_meta.fee_rate_bps or DEFAULT_FEE_RATE_BPS)
     fee_bps = max(0, min(10_000, fee_bps))
     # For proxy-wallet flow, arbitrary large nonces are frequently rejected.

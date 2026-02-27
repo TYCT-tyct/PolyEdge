@@ -104,6 +104,32 @@ function formatTime(ts: number | null | undefined, timeMode: TimeMode): string {
   return new Intl.DateTimeFormat("zh-CN", opts).format(new Date(ts));
 }
 
+function formatClockTime(ts: number | null | undefined, timeMode: TimeMode): string {
+  if (ts == null || !Number.isFinite(ts) || ts <= 0) {
+    return "--";
+  }
+  const opts: Intl.DateTimeFormatOptions = {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  };
+  if (timeMode === "et") {
+    return new Intl.DateTimeFormat("en-US", {
+      ...opts,
+      timeZone: ET_TIMEZONE
+    }).format(new Date(ts));
+  }
+  return new Intl.DateTimeFormat("zh-CN", opts).format(new Date(ts));
+}
+
+function shortRoundId(roundId: string | null | undefined): string {
+  if (!roundId) {
+    return "--";
+  }
+  return roundId.length > 22 ? `${roundId.slice(0, 22)}...` : roundId;
+}
+
 function strategyPaperSignature(payload: StrategyPaperResponse): string {
   const summary = payload.summary;
   const current = payload.current;
@@ -252,7 +278,7 @@ export function PaperLabPage({
         const data = await getStrategyPaper(strategyMarketType, {
           ...STRATEGY_PAPER_PROFILE,
           useAutotune: strategyUseAutotune,
-          source: strategySource,
+          source: strategySource === "live" ? "auto" : "replay",
           ...(strategySource === "live" ? STRATEGY_LIVE_PROFILE : {})
         });
         if (alive) {
@@ -409,6 +435,11 @@ export function PaperLabPage({
   const currentSpreadUp = finite(current?.spread_up_cents);
   const currentSpreadDown = finite(current?.spread_down_cents);
   const summaryNet = summary ? (finite(summary.net_pnl_cents) ?? finite(summary.total_pnl_cents) ?? 0) : null;
+  const liveWarmupFallback =
+    strategySource === "live" &&
+    strategyPaper?.source === "replay" &&
+    typeof strategyPaper?.source_fallback_error === "string" &&
+    strategyPaper.source_fallback_error.length > 0;
 
   return (
     <section className="panel">
@@ -571,7 +602,10 @@ export function PaperLabPage({
               <th>轮次</th>
               <th>入场</th>
               <th>出场</th>
+              <th>价格(¢)</th>
               <th>净盈亏</th>
+              <th>成本</th>
+              <th>时长</th>
               <th>原因</th>
             </tr>
           </thead>
@@ -581,18 +615,29 @@ export function PaperLabPage({
                 <td>
                   <span className={`chip ${t.side === "UP" ? "up" : "down"}`}>{t.side}</span>
                 </td>
-                <td>{t.entry_round_id}</td>
-                <td>{formatTime(t.entry_ts_ms, timeMode)}</td>
-                <td>{formatTime(t.exit_ts_ms, timeMode)}</td>
+                <td>{shortRoundId(t.entry_round_id)}</td>
+                <td>{formatClockTime(t.entry_ts_ms, timeMode)}</td>
+                <td>{formatClockTime(t.exit_ts_ms, timeMode)}</td>
+                <td>
+                  <div>{`${t.entry_price_raw_cents.toFixed(2)} → ${t.exit_price_raw_cents.toFixed(2)}`}</div>
+                  <small className="muted">{`exec ${t.entry_price_cents.toFixed(2)} → ${t.exit_price_cents.toFixed(2)}`}</small>
+                </td>
                 <td className={(t.pnl_net_cents ?? t.pnl_cents) >= 0 ? "up" : "down"}>
                   {(t.pnl_net_cents ?? t.pnl_cents).toFixed(2)}¢
                 </td>
-                <td>{t.entry_reason} / {t.exit_reason}</td>
+                <td>
+                  <div>{`${t.total_cost_cents.toFixed(2)}¢`}</div>
+                  <small className="muted">
+                    {`fee ${(t.entry_fee_cents + t.exit_fee_cents).toFixed(2)} · slip ${(t.entry_slippage_cents + t.exit_slippage_cents + (t.exit_emergency_penalty_cents ?? 0)).toFixed(2)}`}
+                  </small>
+                </td>
+                <td>{`${t.duration_s.toFixed(1)}s`}</td>
+                <td>{`${t.entry_reason} / ${t.exit_reason}`}</td>
               </tr>
             ))}
             {(strategyPaper?.trades.length ?? 0) === 0 ? (
               <tr>
-                <td colSpan={6}>暂无交易样本</td>
+                <td colSpan={9}>暂无交易样本</td>
               </tr>
             ) : null}
           </tbody>
@@ -605,6 +650,9 @@ export function PaperLabPage({
         <span>activeKey: {strategyPaper?.autotune_active_key ?? "--"}</span>
         <span>liveKey: {strategyPaper?.autotune_live_key ?? "--"}</span>
         <span>autotune: forced_off</span>
+        {liveWarmupFallback ? (
+          <span className="muted">live 预热中：已自动回退到 replay 展示</span>
+        ) : null}
         {errorText ? <span className="down">{errorText}</span> : null}
       </footer>
     </section>
