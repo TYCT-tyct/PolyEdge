@@ -308,10 +308,13 @@ export interface StrategyPaperResponse {
       level?: "ok" | "warn" | "critical" | string;
       paper?: {
         decision_count?: number;
+        decisions?: number;
         entry_count?: number;
+        entries?: number;
         add_count?: number;
         reduce_count?: number;
         exit_count?: number;
+        exits?: number;
       };
       live?: {
         submitted_count?: number;
@@ -327,6 +330,11 @@ export interface StrategyPaperResponse {
         accepted_count?: number;
         rejected_count?: number;
         skipped_count?: number;
+        entries?: { submitted?: number; accepted?: number; rejected?: number; skipped?: number };
+        exits?: { submitted?: number; accepted?: number; rejected?: number; skipped?: number };
+        accepted?: number;
+        rejected?: number;
+        skipped?: number;
         no_live_market_target?: boolean;
       };
     };
@@ -386,5 +394,7 @@ export interface StrategyPaperResponse {
     state_machine?: StrategyLivePositionState;
     events?: Record<string, unknown>[];
   };
+  live_execute?: boolean;
+  strategy_alias?: string;
   trades: StrategyPaperTrade[];
 }

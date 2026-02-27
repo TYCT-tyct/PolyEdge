@@ -1,4 +1,4 @@
-assets = ["BTCUSDT"]
+assets = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
 market_types = ["updown"]
 timeframes = ["5m", "15m"]
 tier_whitelist = []

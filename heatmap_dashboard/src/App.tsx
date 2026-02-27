@@ -1,41 +1,41 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
-  connectLiveWs,
-  getAccuracySeries,
-  getStrategyAutotuneHistory,
-  getStrategyAutotuneLatest,
-  getAvailableRounds,
-  getChart,
-  getCollectorStatus,
-  getHeatmap,
-  getLatestAllRaw,
-  getRoundChart,
-  getRoundHistory,
-  getStrategyPaper,
-  getStats
+    connectLiveWs,
+    getAccuracySeries,
+    getAvailableRounds,
+    getChart,
+    getCollectorStatus,
+    getHeatmap,
+    getLatestAllRaw,
+    getRoundChart,
+    getRoundHistory,
+    getStats,
+    getStrategyAutotuneHistory,
+    getStrategyAutotuneLatest,
+    getStrategyPaper
 } from "./api";
 import { AccuracyChart } from "./components/AccuracyChart";
 import { HeatmapGrid } from "./components/HeatmapGrid";
 import { MarketChart } from "./components/MarketChart";
 import type {
-  AccuracySeriesResponse,
-  AccuracyPoint,
-  AvailableRoundsResponse,
-  ChartPoint,
-  ChartResponse,
-  CollectorStatusResponse,
-  HeatmapCell,
-  HeatmapResponse,
-  LiveSnapshot,
-  MarketSymbol,
-  MarketType,
-  RoundHistoryRow,
-  RoundChartResponse,
-  RoundsResponse,
-  StrategyPaperResponse,
-  StatsResponse,
-  WindowType
+    AccuracyPoint,
+    AccuracySeriesResponse,
+    AvailableRoundsResponse,
+    ChartPoint,
+    ChartResponse,
+    CollectorStatusResponse,
+    HeatmapCell,
+    HeatmapResponse,
+    LiveSnapshot,
+    MarketSymbol,
+    MarketType,
+    RoundChartResponse,
+    RoundHistoryRow,
+    RoundsResponse,
+    StatsResponse,
+    StrategyPaperResponse,
+    WindowType
 } from "./types";
 
 const WINDOW_OPTIONS: Array<{ value: WindowType; label: string }> = [
@@ -126,24 +126,8 @@ function writeStrategyUiPrefs(prefs: StrategyUiPrefs): void {
   }
 }
 
-function windowToMinutes(view: WindowType): number {
-  switch (view) {
-    case "5m":
-      return 5;
-    case "15m":
-      return 15;
-    case "30m":
-      return 30;
-    case "1h":
-      return 60;
-    case "2h":
-      return 120;
-    case "4h":
-      return 240;
-    default:
-      return 0;
-  }
-}
+import { windowToMinutes } from "./utils";
+
 
 function maxLocalPointsForView(view: WindowType): number {
   switch (view) {
@@ -465,7 +449,7 @@ function normalizeLiveSnapshot(
     };
   }
 
-  if (prevStable && prevStable.round_id === nextRaw.round_id && prevStable.timestamp_ms > 0) {
+  if (prevStable && prevStable.round_id === nextRaw.round_id && (prevStable.timestamp_ms ?? 0) > 0 && nextRaw.timestamp_ms != null && prevStable.timestamp_ms != null) {
     const dtSec = Math.max(0.05, (nextRaw.timestamp_ms - prevStable.timestamp_ms) / 1000);
     const remaining = Math.max(0, nextRaw.time_remaining_s ?? 0);
     const maxStepPerSec = remaining <= 30 ? 1.2 : remaining <= 60 ? 0.8 : 0.45;
@@ -1052,12 +1036,8 @@ const StrategyPanel = memo(function StrategyPanel({
   const parityLiveSkipped =
     parity?.live?.skipped_count ?? parity?.live?.skipped ?? 0;
   const liveSubmittedTotal = isLiveDryRun
-    ? parity?.live?.simulated_submitted_count ??
-      (parityLiveSubmitEntry + parityLiveSubmitExit) ??
-      0
-    : parity?.live?.submitted_count ??
-    (parityLiveSubmitEntry + parityLiveSubmitExit) ??
-    0;
+    ? parity?.live?.simulated_submitted_count ?? (parityLiveSubmitEntry + parityLiveSubmitExit)
+    : parity?.live?.submitted_count ?? (parityLiveSubmitEntry + parityLiveSubmitExit);
   const liveSummary =
     liveExec?.summary && typeof liveExec.summary === "object"
       ? (liveExec.summary as Record<string, unknown>)
@@ -1807,7 +1787,8 @@ export default function App() {
         return prev;
       }
       const lastTs = current.points[current.points.length - 1]?.timestamp_ms ?? 0;
-      if (stablePoint.timestamp_ms <= lastTs) {
+      const stableTs = stablePoint.timestamp_ms ?? 0;
+      if (stableTs <= lastTs) {
         return prev;
       }
 

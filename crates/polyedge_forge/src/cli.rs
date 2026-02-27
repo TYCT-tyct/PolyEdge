@@ -15,7 +15,11 @@ pub enum Command {
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct TokyoRelayArgs {
-    #[arg(long, env = "FORGE_SYMBOLS", default_value = "BTCUSDT")]
+    #[arg(
+        long,
+        env = "FORGE_SYMBOLS",
+        default_value = "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT"
+    )]
     pub symbols: String,
     #[arg(long, env = "FORGE_TOKYO_BIND", default_value = "0.0.0.0:0")]
     pub bind: String,
@@ -39,7 +43,11 @@ pub struct IrelandRecorderArgs {
         default_value = "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT"
     )]
     pub supported_symbols: String,
-    #[arg(long, env = "FORGE_ACTIVE_SYMBOLS", default_value = "BTCUSDT")]
+    #[arg(
+        long,
+        env = "FORGE_ACTIVE_SYMBOLS",
+        default_value = "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT"
+    )]
     pub active_symbols: String,
     #[arg(long, env = "FORGE_ACTIVE_TFS", default_value = "5m,15m")]
     pub active_timeframes: String,

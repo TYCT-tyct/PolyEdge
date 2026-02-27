@@ -26,6 +26,21 @@ use crate::models::{
 };
 use crate::persist::{log_ingest, persist_event};
 
+// --- 后台 Target Fetch 请求/响应定义 ---
+struct TargetFetchReq {
+    cache_key: String,
+    round_id: String,
+    symbol: String,
+    timeframe: String,
+    start_ts_ms: i64,
+}
+
+struct TargetFetchRes {
+    cache_key: String,
+    target_price: Option<f64>,
+}
+
+
 const MARKET_FUTURE_GUARD_MS: i64 = 500;
 const MARKET_STALE_GUARD_MS: i64 = 5_000;
 const MOTION_PRICE_TAU_SEC: f64 = 1.2;
@@ -449,6 +464,46 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
     let (book_tx, mut book_rx) = mpsc::unbounded_channel::<BookTop>();
     let (market_tx, mut market_rx) = mpsc::unbounded_channel::<Vec<MarketMeta>>();
 
+    // target price 异步获取通道
+    let (target_req_tx, mut target_req_rx) = mpsc::unbounded_channel::<TargetFetchReq>();
+    let (target_res_tx, mut target_res_rx) = mpsc::unbounded_channel::<TargetFetchRes>();
+
+    // 提取的后台任务，接收请求并串行执行 fallback
+    let bg_persist_tx = persist_tx.clone();
+    tokio::spawn(async move {
+        let vatic_http = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+
+        while let Some(req) = target_req_rx.recv().await {
+            let round_start_sec = aligned_round_timestamp_sec(req.start_ts_ms, &req.timeframe);
+            let mut resolved_price = None;
+
+            if let Some(v) = fetch_target_from_vatic_market(&vatic_http, &req.symbol, &req.timeframe, round_start_sec).await {
+                resolved_price = Some(v);
+                log_ingest(&bg_persist_tx, "info", "target_price", &format!("source=vatic_market symbol={} tf={} start_ms={} target={}", req.symbol, req.timeframe, req.start_ts_ms, v));
+            } else if let Some(v) = fetch_target_from_vatic(&vatic_http, &req.symbol, &req.timeframe, round_start_sec).await {
+                resolved_price = Some(v);
+                log_ingest(&bg_persist_tx, "warn", "target_price", &format!("source=vatic_timestamp_fallback symbol={} tf={} start_ms={} target={}", req.symbol, req.timeframe, req.start_ts_ms, v));
+            } else if let Some(v) = fetch_target_from_vatic_active(&vatic_http, &req.symbol, &req.timeframe, round_start_sec).await {
+                resolved_price = Some(v);
+                log_ingest(&bg_persist_tx, "warn", "target_price", &format!("source=vatic_active_fallback symbol={} tf={} start_ms={} target={}", req.symbol, req.timeframe, req.start_ts_ms, v));
+            } else if let Some(v) = fetch_target_from_vatic_chainlink(&vatic_http, &req.symbol, &req.timeframe, round_start_sec).await {
+                resolved_price = Some(v);
+                log_ingest(&bg_persist_tx, "warn", "target_price", &format!("source=vatic_chainlink_fallback symbol={} tf={} start_ms={} target={}", req.symbol, req.timeframe, req.start_ts_ms, v));
+            } else if let Some(v) = fetch_target_from_official_binance(&req.symbol, req.start_ts_ms).await {
+                resolved_price = Some(v);
+                log_ingest(&bg_persist_tx, "warn", "target_price", &format!("source=binance_official_fallback symbol={} tf={} start_ms={} target={}", req.symbol, req.timeframe, req.start_ts_ms, v));
+            }
+
+            let _ = target_res_tx.send(TargetFetchRes {
+                cache_key: req.cache_key,
+                target_price: resolved_price,
+            });
+        }
+    });
+
     spawn_tokyo_udp_receiver(args.udp_bind.clone(), tokyo_tx, persist_tx.clone());
     spawn_chainlink_reader(active_symbols.clone(), chainlink_tx, persist_tx.clone());
     spawn_book_reader(
@@ -509,6 +564,18 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     markets_by_id.insert(m.market_id.clone(), m);
                 }
             }
+            Some(res) = target_res_rx.recv() => {
+                if let Some(v) = res.target_price {
+                    let now_ms = Utc::now().timestamp_millis();
+                    target_cache.insert(res.cache_key.clone(), (now_ms, v));
+                    target_retry_after_ms.remove(&res.cache_key);
+                } else {
+                    target_retry_after_ms.insert(
+                        res.cache_key,
+                        Utc::now().timestamp_millis().saturating_add(TARGET_RETRY_BACKOFF_MS),
+                    );
+                }
+            }
             _ = ticker.tick() => {
                 let now_ms = Utc::now().timestamp_millis();
                 prob_smooth_by_round.retain(|_, v| {
@@ -566,91 +633,8 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         }
                         let retry_after = target_retry_after_ms.get(&cache_key).copied().unwrap_or(0);
                         if target_price.is_none() && now_ms >= retry_after {
-                            let round_start_sec = aligned_round_timestamp_sec(
-                                market.start_ts_ms,
-                                &market.timeframe,
-                            );
-                            if let Some(v) = fetch_target_from_vatic_market(
-                                &vatic_http,
-                                &market.symbol,
-                                &market.timeframe,
-                                round_start_sec,
-                            )
-                            .await
-                            {
-                                target_cache.insert(cache_key.clone(), (now_ms, v));
-                                target_retry_after_ms.remove(&cache_key);
-                                target_price = Some(v);
-                                log_ingest(
-                                    &persist_tx,
-                                    "info",
-                                    "target_price",
-                                    &format!(
-                                        "source=vatic_market symbol={} tf={} start_ms={} target={}",
-                                        market.symbol, market.timeframe, market.start_ts_ms, v
-                                    ),
-                                );
-                            } else if let Some(v) = fetch_target_from_vatic(
-                                &vatic_http,
-                                &market.symbol,
-                                &market.timeframe,
-                                round_start_sec,
-                            )
-                            .await
-                            {
-                                target_cache.insert(cache_key.clone(), (now_ms, v));
-                                target_retry_after_ms.remove(&cache_key);
-                                target_price = Some(v);
-                                log_ingest(
-                                    &persist_tx,
-                                    "warn",
-                                    "target_price",
-                                    &format!(
-                                        "source=vatic_timestamp_fallback symbol={} tf={} start_ms={} target={}",
-                                        market.symbol, market.timeframe, market.start_ts_ms, v
-                                    ),
-                                );
-                            } else if let Some(v) = fetch_target_from_vatic_active(
-                                &vatic_http,
-                                &market.symbol,
-                                &market.timeframe,
-                                round_start_sec,
-                            )
-                            .await
-                            {
-                                target_cache.insert(cache_key.clone(), (now_ms, v));
-                                target_retry_after_ms.remove(&cache_key);
-                                target_price = Some(v);
-                                log_ingest(
-                                    &persist_tx,
-                                    "warn",
-                                    "target_price",
-                                    &format!(
-                                        "source=vatic_active_fallback symbol={} tf={} start_ms={} target={}",
-                                        market.symbol, market.timeframe, market.start_ts_ms, v
-                                    ),
-                                );
-                            } else if let Some(v) = fetch_target_from_vatic_chainlink(
-                                &vatic_http,
-                                &market.symbol,
-                                &market.timeframe,
-                                round_start_sec,
-                            )
-                            .await
-                            {
-                                target_cache.insert(cache_key.clone(), (now_ms, v));
-                                target_retry_after_ms.remove(&cache_key);
-                                target_price = Some(v);
-                                log_ingest(
-                                    &persist_tx,
-                                    "warn",
-                                    "target_price",
-                                    &format!(
-                                        "source=vatic_chainlink_fallback symbol={} tf={} start_ms={} target={}",
-                                        market.symbol, market.timeframe, market.start_ts_ms, v
-                                    ),
-                                );
-                            } else if let Some(v) = pick_official_chainlink_target(
+                            // 先尝试最后一道防线：Chainlink 官方离线取值 (同步、快)
+                            if let Some(v) = pick_official_chainlink_target(
                                 chainlink,
                                 market.start_ts_ms,
                                 &market.timeframe,
@@ -667,23 +651,16 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                         market.symbol, market.timeframe, market.start_ts_ms, v
                                     ),
                                 );
-                            } else if let Some(v) =
-                                fetch_target_from_official_binance(&market.symbol, market.start_ts_ms)
-                                    .await
-                            {
-                                target_cache.insert(cache_key.clone(), (now_ms, v));
-                                target_retry_after_ms.remove(&cache_key);
-                                target_price = Some(v);
-                                log_ingest(
-                                    &persist_tx,
-                                    "warn",
-                                    "target_price",
-                                    &format!(
-                                        "source=binance_official_fallback symbol={} tf={} start_ms={} target={}",
-                                        market.symbol, market.timeframe, market.start_ts_ms, v
-                                    ),
-                                );
                             } else {
+                                // 发送到后台异步获取，防止阻塞 ticker
+                                let _ = target_req_tx.send(TargetFetchReq {
+                                    cache_key: cache_key.clone(),
+                                    round_id: round_id.clone(),
+                                    symbol: market.symbol.clone(),
+                                    timeframe: market.timeframe.clone(),
+                                    start_ts_ms: market.start_ts_ms,
+                                });
+                                // 限制请求频率
                                 target_retry_after_ms.insert(
                                     cache_key,
                                     now_ms.saturating_add(TARGET_RETRY_BACKOFF_MS),

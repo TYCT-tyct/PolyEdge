@@ -678,7 +678,9 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
     }
 }
 
-pub fn simulate_dual<G: LiveOrderGateway>(
+/// 在回放模拟结果上叠加 gateway 提交记录，生成 paper/live 双视图。
+/// 注意：这不是两套独立策略的对照执行，signal 来自同一次 simulate()。
+pub fn simulate_with_gateway<G: LiveOrderGateway>(
     samples: &[Sample],
     cfg: &RuntimeConfig,
     max_trades: usize,
@@ -686,7 +688,19 @@ pub fn simulate_dual<G: LiveOrderGateway>(
     gateway: &G,
 ) -> DualExecutionResult {
     let run = simulate(samples, cfg, max_trades);
-    simulate_dual_from_run(&run, quote_size_usdc, gateway)
+    build_gateway_execution(&run, quote_size_usdc, gateway)
+}
+
+/// 向后兼容别名，新代码应使用 `simulate_with_gateway`。
+#[inline]
+pub fn simulate_dual<G: LiveOrderGateway>(
+    samples: &[Sample],
+    cfg: &RuntimeConfig,
+    max_trades: usize,
+    quote_size_usdc: f64,
+    gateway: &G,
+) -> DualExecutionResult {
+    simulate_with_gateway(samples, cfg, max_trades, quote_size_usdc, gateway)
 }
 
 fn build_decisions_from_trades(trades: &[Value], quote: f64) -> Vec<Value> {
@@ -807,7 +821,8 @@ fn build_decisions_from_trades(trades: &[Value], quote: f64) -> Vec<Value> {
     decisions
 }
 
-pub fn simulate_dual_from_run<G: LiveOrderGateway>(
+/// 对已有 SimulationResult 附加 gateway 执行记录，生成完整的双视图输出。
+pub fn build_gateway_execution<G: LiveOrderGateway>(
     run: &SimulationResult,
     quote_size_usdc: f64,
     gateway: &G,

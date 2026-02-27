@@ -1,18 +1,18 @@
 import type {
-  AccuracySeriesResponse,
-  AvailableRoundsResponse,
-  ChartPoint,
-  ChartResponse,
-  CollectorStatusResponse,
-  HeatmapResponse,
-  MarketSymbol,
-  MarketType,
-  RoundChartResponse,
-  RoundsResponse,
-  StrategyPaperResponse,
-  StatsResponse,
-  WindowType,
-  WsLivePayload
+    AccuracySeriesResponse,
+    AvailableRoundsResponse,
+    ChartPoint,
+    ChartResponse,
+    CollectorStatusResponse,
+    HeatmapResponse,
+    MarketSymbol,
+    MarketType,
+    RoundChartResponse,
+    RoundsResponse,
+    StatsResponse,
+    StrategyPaperResponse,
+    WindowType,
+    WsLivePayload
 } from "./types";
 
 const API_BASE = (import.meta.env.VITE_FORGE_API_BASE as string | undefined)?.trim() ?? "";
@@ -175,24 +175,7 @@ async function requestJson<T>(path: string): Promise<T> {
   }
 }
 
-function windowToMinutes(view: WindowType): number {
-  switch (view) {
-    case "5m":
-      return 5;
-    case "15m":
-      return 15;
-    case "30m":
-      return 30;
-    case "1h":
-      return 60;
-    case "2h":
-      return 120;
-    case "4h":
-      return 240;
-    default:
-      return 0;
-  }
-}
+import { windowToMinutes } from "./utils";
 
 const CHART_LOOKBACK_MAX_MINUTES = 360;
 
@@ -938,7 +921,7 @@ export async function getStrategyPaper(
   if (typeof payload.summary !== "object" || payload.summary == null) {
     throw new Error("strategy paper response missing summary");
   }
-  return payload as StrategyPaperResponse;
+  return payload as unknown as StrategyPaperResponse;
 }
 
 export interface StrategyAutotuneLatestResponse {

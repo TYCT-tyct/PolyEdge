@@ -31,11 +31,80 @@ pub enum DbEvent {
 
 pub fn normalize_opt_url(raw: &str) -> Option<String> {
     let v = raw.trim();
-    if v.is_empty() {
-        None
-    } else {
-        Some(v.to_string())
+    if v.is_empty() { None } else { Some(v.to_string()) }
+}
+
+// ------------------------------------------------------------------ //
+// 统一 Redis payload 结构 — 消灭 RedisSnapshotPayload / RedisSnapshotPayloadOwned 的冗余二元
+// ------------------------------------------------------------------ //
+#[derive(Debug, Clone, Serialize)]
+struct RedisSnapshot {
+    schema_version: String,
+    ts_ireland_sample_ms: i64,
+    symbol: String,
+    timeframe: String,
+    market_id: String,
+    round_id: String,
+    title: String,
+    target_price: Option<f64>,
+    binance_price: Option<f64>,
+    pm_live_btc_price: Option<f64>,
+    chainlink_price: Option<f64>,
+    mid_yes: f64,
+    mid_no: f64,
+    mid_yes_smooth: f64,
+    mid_no_smooth: f64,
+    bid_yes: f64,
+    ask_yes: f64,
+    bid_no: f64,
+    ask_no: f64,
+    delta_price: Option<f64>,
+    delta_pct: Option<f64>,
+    delta_pct_smooth: Option<f64>,
+    remaining_ms: i64,
+    velocity_bps_per_sec: Option<f64>,
+    acceleration: Option<f64>,
+}
+
+impl RedisSnapshot {
+    fn from_row(row: &SnapshotRow) -> Self {
+        Self {
+            schema_version: row.schema_version.to_string(),
+            ts_ireland_sample_ms: row.ts_ireland_sample_ms,
+            symbol: row.symbol.clone(),
+            timeframe: row.timeframe.clone(),
+            market_id: row.market_id.clone(),
+            round_id: row.round_id.clone(),
+            title: row.title.clone(),
+            target_price: row.target_price,
+            binance_price: row.binance_price,
+            pm_live_btc_price: row.pm_live_btc_price,
+            chainlink_price: row.chainlink_price,
+            mid_yes: row.mid_yes,
+            mid_no: row.mid_no,
+            mid_yes_smooth: row.mid_yes_smooth,
+            mid_no_smooth: row.mid_no_smooth,
+            bid_yes: row.bid_yes,
+            ask_yes: row.ask_yes,
+            bid_no: row.bid_no,
+            ask_no: row.ask_no,
+            delta_price: row.delta_price,
+            delta_pct: row.delta_pct,
+            delta_pct_smooth: row.delta_pct_smooth,
+            remaining_ms: row.remaining_ms,
+            velocity_bps_per_sec: row.velocity_bps_per_sec,
+            acceleration: row.acceleration,
+        }
     }
+}
+
+// ------------------------------------------------------------------ //
+// Redis 最新快照聚合状态 — by_symbol_tf 和 by_market 共用同一结构
+// ------------------------------------------------------------------ //
+#[derive(Debug, Default)]
+struct RedisLatestState {
+    by_symbol_tf: HashMap<(String, String), RedisSnapshot>,
+    by_market: HashMap<(String, String, String), RedisSnapshot>,
 }
 
 pub async fn run_db_sink(cfg: DbSinkConfig, mut rx: mpsc::Receiver<DbEvent>) {
@@ -45,10 +114,36 @@ pub async fn run_db_sink(cfg: DbSinkConfig, mut rx: mpsc::Receiver<DbEvent>) {
         }
     }
 
+    // Redis 连接在此提升为持久连接，整个 sink 生命周期内复用
+    let redis_conn = if let Some(redis_url) = cfg.redis_url.as_deref() {
+        match redis::Client::open(redis_url)
+            .and_then(|c| Ok(c))
+            .map_err(|e| anyhow!("{e}"))
+        {
+            Ok(client) => match client.get_multiplexed_tokio_connection().await {
+                Ok(conn) => {
+                    tracing::info!("redis persistent connection established");
+                    Some(conn)
+                }
+                Err(err) => {
+                    tracing::warn!(?err, "redis connect failed; redis flush disabled");
+                    None
+                }
+            },
+            Err(err) => {
+                tracing::warn!(?err, "redis client open failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut flush_tick = tokio::time::interval(Duration::from_millis(cfg.flush_ms.max(100)));
     let mut snapshot_batch = Vec::<SnapshotRow>::with_capacity(cfg.batch_size.saturating_mul(2));
     let mut round_batch = Vec::<RoundRow>::with_capacity(cfg.batch_size.saturating_mul(2));
     let mut redis_state = RedisLatestState::default();
+    let mut conn = redis_conn;
 
     loop {
         tokio::select! {
@@ -65,13 +160,7 @@ pub async fn run_db_sink(cfg: DbSinkConfig, mut rx: mpsc::Receiver<DbEvent>) {
                         }
                     }
                     None => {
-                        flush_batches(
-                            &cfg,
-                            &mut snapshot_batch,
-                            &mut round_batch,
-                            &mut redis_state,
-                        )
-                        .await;
+                        flush_batches(&cfg, &mut snapshot_batch, &mut round_batch, &mut redis_state, &mut conn).await;
                         break;
                     }
                 }
@@ -79,24 +168,12 @@ pub async fn run_db_sink(cfg: DbSinkConfig, mut rx: mpsc::Receiver<DbEvent>) {
                 if snapshot_batch.len() >= cfg.batch_size.max(10)
                     || round_batch.len() >= cfg.batch_size.max(10)
                 {
-                    flush_batches(
-                        &cfg,
-                        &mut snapshot_batch,
-                        &mut round_batch,
-                        &mut redis_state,
-                    )
-                    .await;
+                    flush_batches(&cfg, &mut snapshot_batch, &mut round_batch, &mut redis_state, &mut conn).await;
                 }
             }
             _ = flush_tick.tick() => {
                 if !snapshot_batch.is_empty() || !round_batch.is_empty() {
-                    flush_batches(
-                        &cfg,
-                        &mut snapshot_batch,
-                        &mut round_batch,
-                        &mut redis_state,
-                    )
-                    .await;
+                    flush_batches(&cfg, &mut snapshot_batch, &mut round_batch, &mut redis_state, &mut conn).await;
                 }
             }
         }
@@ -108,6 +185,7 @@ async fn flush_batches(
     snapshot_batch: &mut Vec<SnapshotRow>,
     round_batch: &mut Vec<RoundRow>,
     redis_state: &mut RedisLatestState,
+    redis_conn: &mut Option<redis::aio::MultiplexedConnection>,
 ) {
     if snapshot_batch.is_empty() && round_batch.is_empty() {
         return;
@@ -122,11 +200,7 @@ async fn flush_batches(
     if let Some(ch_url) = cfg.clickhouse_url.as_deref() {
         if !snapshots.is_empty() {
             if let Err(err) = flush_clickhouse_snapshots(ch_url, cfg, &snapshots).await {
-                tracing::warn!(
-                    ?err,
-                    rows = snapshots.len(),
-                    "clickhouse snapshot flush failed"
-                );
+                tracing::warn!(?err, rows = snapshots.len(), "clickhouse snapshot flush failed");
             }
         }
         if !rounds.is_empty() {
@@ -136,9 +210,9 @@ async fn flush_batches(
         }
     }
 
-    if let Some(redis_url) = cfg.redis_url.as_deref() {
+    if let Some(conn) = redis_conn {
         if !snapshots.is_empty() {
-            if let Err(err) = flush_redis_latest(redis_url, cfg, &snapshots, redis_state).await {
+            if let Err(err) = flush_redis_latest(cfg, &snapshots, redis_state, conn).await {
                 tracing::warn!(?err, rows = snapshots.len(), "redis flush failed");
             }
         }
@@ -193,11 +267,7 @@ async fn execute_clickhouse_query(ch_url: &str, sql: &str) -> Result<()> {
     }
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
-    Err(anyhow!(
-        "clickhouse query failed status={} body={}",
-        status,
-        body
-    ))
+    Err(anyhow!("clickhouse query failed status={} body={}", status, body))
 }
 
 async fn init_clickhouse(ch_url: &str, cfg: &DbSinkConfig) -> Result<()> {
@@ -427,18 +497,10 @@ async fn flush_clickhouse_snapshots(
         }
         let st2 = resp2.status();
         let b2 = resp2.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "clickhouse insert retry failed status={} body={}",
-            st2,
-            b2
-        ));
+        return Err(anyhow!("clickhouse insert retry failed status={} body={}", st2, b2));
     }
 
-    Err(anyhow!(
-        "clickhouse insert failed status={} body={}",
-        status,
-        body_err
-    ))
+    Err(anyhow!("clickhouse insert failed status={} body={}", status, body_err))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -515,222 +577,53 @@ async fn flush_clickhouse_rounds(
         }
         let st2 = resp2.status();
         let b2 = resp2.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "clickhouse insert retry failed status={} body={}",
-            st2,
-            b2
-        ));
+        return Err(anyhow!("clickhouse insert retry failed status={} body={}", st2, b2));
     }
 
-    Err(anyhow!(
-        "clickhouse insert failed status={} body={}",
-        status,
-        body_err
-    ))
-}
-
-
-#[derive(Debug, Clone, Serialize)]
-struct RedisSnapshotPayload<'a> {
-    schema_version: &'a str,
-    ts_ireland_sample_ms: i64,
-    symbol: &'a str,
-    timeframe: &'a str,
-    market_id: &'a str,
-    round_id: &'a str,
-    title: &'a str,
-    target_price: Option<f64>,
-    binance_price: Option<f64>,
-    pm_live_btc_price: Option<f64>,
-    chainlink_price: Option<f64>,
-    mid_yes: f64,
-    mid_no: f64,
-    mid_yes_smooth: f64,
-    mid_no_smooth: f64,
-    bid_yes: f64,
-    ask_yes: f64,
-    bid_no: f64,
-    ask_no: f64,
-    delta_price: Option<f64>,
-    delta_pct: Option<f64>,
-    delta_pct_smooth: Option<f64>,
-    remaining_ms: i64,
-    velocity_bps_per_sec: Option<f64>,
-    acceleration: Option<f64>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct RedisSnapshotPayloadOwned {
-    schema_version: String,
-    ts_ireland_sample_ms: i64,
-    symbol: String,
-    timeframe: String,
-    market_id: String,
-    round_id: String,
-    title: String,
-    target_price: Option<f64>,
-    binance_price: Option<f64>,
-    pm_live_btc_price: Option<f64>,
-    chainlink_price: Option<f64>,
-    mid_yes: f64,
-    mid_no: f64,
-    mid_yes_smooth: f64,
-    mid_no_smooth: f64,
-    bid_yes: f64,
-    ask_yes: f64,
-    bid_no: f64,
-    ask_no: f64,
-    delta_price: Option<f64>,
-    delta_pct: Option<f64>,
-    delta_pct_smooth: Option<f64>,
-    remaining_ms: i64,
-    velocity_bps_per_sec: Option<f64>,
-    acceleration: Option<f64>,
-}
-
-#[derive(Debug, Default)]
-struct RedisLatestState {
-    by_symbol_tf: HashMap<(String, String), RedisSnapshotPayloadOwned>,
-    by_market: HashMap<(String, String, String), RedisSnapshotPayloadOwned>,
-}
-
-fn to_payload_owned(row: &SnapshotRow) -> RedisSnapshotPayloadOwned {
-    RedisSnapshotPayloadOwned {
-        schema_version: row.schema_version.to_string(),
-        ts_ireland_sample_ms: row.ts_ireland_sample_ms,
-        symbol: row.symbol.clone(),
-        timeframe: row.timeframe.clone(),
-        market_id: row.market_id.clone(),
-        round_id: row.round_id.clone(),
-        title: row.title.clone(),
-        target_price: row.target_price,
-        binance_price: row.binance_price,
-        pm_live_btc_price: row.pm_live_btc_price,
-        chainlink_price: row.chainlink_price,
-        mid_yes: row.mid_yes,
-        mid_no: row.mid_no,
-        mid_yes_smooth: row.mid_yes_smooth,
-        mid_no_smooth: row.mid_no_smooth,
-        bid_yes: row.bid_yes,
-        ask_yes: row.ask_yes,
-        bid_no: row.bid_no,
-        ask_no: row.ask_no,
-        delta_price: row.delta_price,
-        delta_pct: row.delta_pct,
-        delta_pct_smooth: row.delta_pct_smooth,
-        remaining_ms: row.remaining_ms,
-        velocity_bps_per_sec: row.velocity_bps_per_sec,
-        acceleration: row.acceleration,
-    }
+    Err(anyhow!("clickhouse insert failed status={} body={}", status, body_err))
 }
 
 async fn flush_redis_latest(
-    redis_url: &str,
     cfg: &DbSinkConfig,
     rows: &[SnapshotRow],
     state: &mut RedisLatestState,
+    conn: &mut redis::aio::MultiplexedConnection,
 ) -> Result<()> {
-    let client = redis::Client::open(redis_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
-
+    // 更新聚合索引
     for row in rows {
-        let payload = to_payload_owned(row);
+        let snap = RedisSnapshot::from_row(row);
         state.by_symbol_tf.insert(
-            (payload.symbol.clone(), payload.timeframe.clone()),
-            payload.clone(),
+            (snap.symbol.clone(), snap.timeframe.clone()),
+            snap.clone(),
         );
         state.by_market.insert(
-            (
-                payload.symbol.clone(),
-                payload.timeframe.clone(),
-                payload.market_id.clone(),
-            ),
-            payload,
+            (snap.symbol.clone(), snap.timeframe.clone(), snap.market_id.clone()),
+            snap,
         );
     }
 
+    // 过期清理
     let ttl_ms = (cfg.redis_ttl_sec.min(i64::MAX as u64) as i64).saturating_mul(1000);
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let cutoff_ms = now_ms.saturating_sub(ttl_ms);
-    state
-        .by_symbol_tf
-        .retain(|_, row| row.ts_ireland_sample_ms >= cutoff_ms);
-    state
-        .by_market
-        .retain(|_, row| row.ts_ireland_sample_ms >= cutoff_ms);
+    let cutoff_ms = chrono::Utc::now().timestamp_millis().saturating_sub(ttl_ms);
+    state.by_symbol_tf.retain(|_, s| s.ts_ireland_sample_ms >= cutoff_ms);
+    state.by_market.retain(|_, s| s.ts_ireland_sample_ms >= cutoff_ms);
 
-    for ((symbol, timeframe), row) in &state.by_symbol_tf {
-        let key = format!(
-            "{}:snapshot:latest:{}:{}",
-            cfg.redis_prefix, symbol, timeframe
-        );
-        let payload = serde_json::to_string(&RedisSnapshotPayload {
-            schema_version: &row.schema_version,
-            ts_ireland_sample_ms: row.ts_ireland_sample_ms,
-            symbol: &row.symbol,
-            timeframe: &row.timeframe,
-            market_id: &row.market_id,
-            round_id: &row.round_id,
-            title: &row.title,
-            target_price: row.target_price,
-            binance_price: row.binance_price,
-            pm_live_btc_price: row.pm_live_btc_price,
-            chainlink_price: row.chainlink_price,
-            mid_yes: row.mid_yes,
-            mid_no: row.mid_no,
-            mid_yes_smooth: row.mid_yes_smooth,
-            mid_no_smooth: row.mid_no_smooth,
-            bid_yes: row.bid_yes,
-            ask_yes: row.ask_yes,
-            bid_no: row.bid_no,
-            ask_no: row.ask_no,
-            delta_price: row.delta_price,
-            delta_pct: row.delta_pct,
-            delta_pct_smooth: row.delta_pct_smooth,
-            remaining_ms: row.remaining_ms,
-            velocity_bps_per_sec: row.velocity_bps_per_sec,
-            acceleration: row.acceleration,
-        })?;
+    // symbol+tf 级别最新快照
+    for ((symbol, timeframe), snap) in &state.by_symbol_tf {
+        let key = format!("{}:snapshot:latest:{}:{}", cfg.redis_prefix, symbol, timeframe);
+        let payload = serde_json::to_string(snap)?;
         let _: () = conn.set_ex(key, payload, cfg.redis_ttl_sec).await?;
     }
 
-    for ((symbol, timeframe, market_id), row) in &state.by_market {
-        let key = format!(
-            "{}:snapshot:latest:{}:{}:{}",
-            cfg.redis_prefix, symbol, timeframe, market_id
-        );
-        let payload = serde_json::to_string(&RedisSnapshotPayload {
-            schema_version: &row.schema_version,
-            ts_ireland_sample_ms: row.ts_ireland_sample_ms,
-            symbol: &row.symbol,
-            timeframe: &row.timeframe,
-            market_id: &row.market_id,
-            round_id: &row.round_id,
-            title: &row.title,
-            target_price: row.target_price,
-            binance_price: row.binance_price,
-            pm_live_btc_price: row.pm_live_btc_price,
-            chainlink_price: row.chainlink_price,
-            mid_yes: row.mid_yes,
-            mid_no: row.mid_no,
-            mid_yes_smooth: row.mid_yes_smooth,
-            mid_no_smooth: row.mid_no_smooth,
-            bid_yes: row.bid_yes,
-            ask_yes: row.ask_yes,
-            bid_no: row.bid_no,
-            ask_no: row.ask_no,
-            delta_price: row.delta_price,
-            delta_pct: row.delta_pct,
-            delta_pct_smooth: row.delta_pct_smooth,
-            remaining_ms: row.remaining_ms,
-            velocity_bps_per_sec: row.velocity_bps_per_sec,
-            acceleration: row.acceleration,
-        })?;
+    // market 级别最新快照
+    for ((symbol, timeframe, market_id), snap) in &state.by_market {
+        let key = format!("{}:snapshot:latest:{}:{}:{}", cfg.redis_prefix, symbol, timeframe, market_id);
+        let payload = serde_json::to_string(snap)?;
         let _: () = conn.set_ex(key, payload, cfg.redis_ttl_sec).await?;
     }
 
-    let mut latest_all: Vec<RedisSnapshotPayloadOwned> =
-        state.by_market.values().cloned().collect();
+    // 全量 latest:all — 按时间倒序
+    let mut latest_all: Vec<&RedisSnapshot> = state.by_market.values().collect();
     latest_all.sort_by(|a, b| {
         b.ts_ireland_sample_ms
             .cmp(&a.ts_ireland_sample_ms)
@@ -743,12 +636,10 @@ async fn flush_redis_latest(
     let all_payload = serde_json::to_string(&latest_all)?;
     let _: () = conn.set_ex(all_key, all_payload, cfg.redis_ttl_sec).await?;
 
-    let mut by_tf: HashMap<String, Vec<RedisSnapshotPayloadOwned>> = HashMap::new();
-    for row in &latest_all {
-        by_tf
-            .entry(row.timeframe.clone())
-            .or_default()
-            .push(row.clone());
+    // 按 timeframe 分组
+    let mut by_tf: HashMap<&str, Vec<&RedisSnapshot>> = HashMap::new();
+    for snap in &latest_all {
+        by_tf.entry(snap.timeframe.as_str()).or_default().push(snap);
     }
     for (tf, payload_rows) in by_tf {
         let key = format!("{}:snapshot:latest:tf:{}", cfg.redis_prefix, tf);
@@ -758,11 +649,7 @@ async fn flush_redis_latest(
 
     let updated_key = format!("{}:snapshot:latest:updated_ms", cfg.redis_prefix);
     let _: () = conn
-        .set_ex(
-            updated_key,
-            chrono::Utc::now().timestamp_millis().to_string(),
-            cfg.redis_ttl_sec,
-        )
+        .set_ex(updated_key, chrono::Utc::now().timestamp_millis().to_string(), cfg.redis_ttl_sec)
         .await?;
 
     Ok(())

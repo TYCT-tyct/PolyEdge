@@ -7,6 +7,7 @@ use core_types::RefPriceWsFeed;
 use feed_reference::MultiSourceRefFeed;
 use futures::StreamExt;
 use tokio::net::UdpSocket;
+use tokio::time::sleep;
 
 use crate::cli::TokyoRelayArgs;
 use crate::common::parse_upper_csv;
@@ -33,46 +34,68 @@ pub async fn run_tokyo_relay(args: TokyoRelayArgs) -> Result<()> {
         "tokyo relay started"
     );
 
-    let feed = MultiSourceRefFeed::new(Duration::from_millis(25));
-    let mut stream = feed.stream_ticks_ws(symbols.clone()).await?;
-
+    // 指数退避重连参数
+    const BACKOFF_BASE_MS: u64 = 500;
+    const BACKOFF_MAX_MS: u64 = 30_000;
+    let mut backoff_ms = BACKOFF_BASE_MS;
     let mut sent: u64 = 0;
+
     loop {
-        let Some(next) = stream.next().await else {
-            anyhow::bail!("binance stream ended");
-        };
-        let tick = match next {
-            Ok(v) => v,
+        let feed = MultiSourceRefFeed::new(Duration::from_millis(25));
+        let mut stream = match feed.stream_ticks_ws(symbols.clone()).await {
+            Ok(s) => {
+                backoff_ms = BACKOFF_BASE_MS;
+                s
+            }
             Err(err) => {
-                tracing::warn!(?err, "tokyo relay stream error");
+                tracing::warn!(?err, backoff_ms, "tokyo relay ws connect failed, retrying");
+                sleep(Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(BACKOFF_MAX_MS);
                 continue;
             }
         };
-        if tick.source.as_str() != "binance_ws" {
-            continue;
-        }
-        let symbol = tick.symbol.to_ascii_uppercase();
-        if !symbols.iter().any(|s| s == &symbol) {
-            continue;
-        }
 
-        let now_ms = Utc::now().timestamp_millis();
-        let msg = TokyoBinanceWire {
-            ts_tokyo_recv_ms: tick.recv_ts_ms,
-            ts_tokyo_send_ms: now_ms,
-            ts_exchange_ms: tick.event_ts_exchange_ms.max(tick.event_ts_ms),
-            symbol,
-            binance_price: tick.price,
-        };
-        let payload = serde_json::to_vec(&msg)?;
-        for _ in 0..args.redundancy.max(1) {
-            if let Err(err) = socket.send_to(&payload, target).await {
-                tracing::warn!(?err, "tokyo relay udp send failed");
+        loop {
+            let Some(next) = stream.next().await else {
+                tracing::warn!(backoff_ms, "binance stream ended, reconnecting");
+                break; // 退出内层 loop，进入外层重连
+            };
+            let tick = match next {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::warn!(?err, "tokyo relay stream error");
+                    continue;
+                }
+            };
+            if tick.source.as_str() != "binance_ws" {
+                continue;
+            }
+            let symbol = tick.symbol.to_ascii_uppercase();
+            if !symbols.iter().any(|s| s == &symbol) {
+                continue;
+            }
+
+            let now_ms = Utc::now().timestamp_millis();
+            let msg = TokyoBinanceWire {
+                ts_tokyo_recv_ms: tick.recv_ts_ms,
+                ts_tokyo_send_ms: now_ms,
+                ts_exchange_ms: tick.event_ts_exchange_ms.max(tick.event_ts_ms),
+                symbol,
+                binance_price: tick.price,
+            };
+            let payload = serde_json::to_vec(&msg)?;
+            for _ in 0..args.redundancy.max(1) {
+                if let Err(err) = socket.send_to(&payload, target).await {
+                    tracing::warn!(?err, "tokyo relay udp send failed");
+                }
+            }
+            sent = sent.saturating_add(1);
+            if sent.is_multiple_of(500) {
+                tracing::info!(sent, "tokyo relay sent packets");
             }
         }
-        sent = sent.saturating_add(1);
-        if sent.is_multiple_of(500) {
-            tracing::info!(sent, "tokyo relay sent packets");
-        }
+
+        sleep(Duration::from_millis(backoff_ms)).await;
+        backoff_ms = (backoff_ms * 2).min(BACKOFF_MAX_MS);
     }
 }

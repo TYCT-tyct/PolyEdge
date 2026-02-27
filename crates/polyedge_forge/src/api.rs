@@ -570,195 +570,67 @@ struct LiveCapitalConfig {
 
 impl LiveCapitalConfig {
     fn from_env() -> Self {
-        let enabled = std::env::var("FORGE_FEV1_CAPITAL_AUTO")
-            .ok()
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(true);
-        let use_real_balance = std::env::var("FORGE_FEV1_CAPITAL_USE_REAL_BALANCE")
-            .ok()
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(true);
-        let balance_refresh_ms = std::env::var("FORGE_FEV1_CAPITAL_BALANCE_REFRESH_MS")
-            .ok()
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(5_000)
-            .clamp(500, 120_000);
-        let equity_base_usdc = std::env::var("FORGE_FEV1_CAPITAL_BASE_USDC")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(500.0)
-            .clamp(5.0, 5_000_000.0);
-        let reserve_usdc = std::env::var("FORGE_FEV1_CAPITAL_RESERVE_USDC")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.0)
-            .clamp(0.0, 1_000_000.0);
-        let reserve_ratio = std::env::var("FORGE_FEV1_CAPITAL_RESERVE_RATIO")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.20)
-            .clamp(0.0, 0.90);
-        let reserve_min_usdc = std::env::var("FORGE_FEV1_CAPITAL_RESERVE_MIN_USDC")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(1.0)
-            .clamp(0.0, 1_000_000.0);
-        let target_utilization = std::env::var("FORGE_FEV1_CAPITAL_TARGET_UTILIZATION")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.72)
-            .clamp(LIVE_CAPITAL_MIN_UTILIZATION, LIVE_CAPITAL_MAX_UTILIZATION);
-        let small_threshold_usdc = std::env::var("FORGE_FEV1_CAPITAL_SMALL_THRESHOLD_USDC")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(4_000.0)
-            .clamp(200.0, 100_000.0);
-        let leg_ratio_small = std::env::var("FORGE_FEV1_CAPITAL_LEG_RATIO_SMALL")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.12)
-            .clamp(0.01, 0.4);
-        let leg_ratio_large = std::env::var("FORGE_FEV1_CAPITAL_LEG_RATIO_LARGE")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.02)
-            .clamp(0.002, 0.2);
-        let add_scale_small = std::env::var("FORGE_FEV1_CAPITAL_ADD_SCALE_SMALL")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(1.25)
-            .clamp(0.5, 2.5);
-        let add_scale_large = std::env::var("FORGE_FEV1_CAPITAL_ADD_SCALE_LARGE")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.75)
-            .clamp(0.2, 1.5);
-        let max_add_layers = std::env::var("FORGE_FEV1_CAPITAL_MAX_ADD_LAYERS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(3)
-            .clamp(1, 8);
-        let disable_add_on_loss = std::env::var("FORGE_FEV1_CAPITAL_DISABLE_ADD_ON_LOSS")
-            .ok()
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(true);
-        let add_edge_alpha = std::env::var("FORGE_FEV1_CAPITAL_ADD_EDGE_ALPHA")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.45)
-            .clamp(0.0, 2.0);
-        let add_time_beta = std::env::var("FORGE_FEV1_CAPITAL_ADD_TIME_BETA")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.30)
-            .clamp(0.0, 1.5);
-        let entry_edge_alpha = std::env::var("FORGE_FEV1_CAPITAL_ENTRY_EDGE_ALPHA")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.28)
-            .clamp(0.0, 1.5);
-        let entry_time_beta = std::env::var("FORGE_FEV1_CAPITAL_ENTRY_TIME_BETA")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.18)
-            .clamp(0.0, 1.0);
-        let edge_score_pivot = std::env::var("FORGE_FEV1_CAPITAL_EDGE_SCORE_PIVOT")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.55)
-            .clamp(0.01, 0.95);
-        let edge_score_cap = std::env::var("FORGE_FEV1_CAPITAL_EDGE_SCORE_CAP")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.90)
-            .clamp(0.05, 0.99);
-        let edge_time_tau_ms = std::env::var("FORGE_FEV1_CAPITAL_EDGE_TIME_TAU_MS")
-            .ok()
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(90_000)
-            .clamp(5_000, 600_000);
-        let kelly_enabled = std::env::var("FORGE_FEV1_CAPITAL_KELLY_ENABLED")
-            .ok()
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(true);
-        let kelly_lambda = std::env::var("FORGE_FEV1_CAPITAL_KELLY_LAMBDA")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.25)
-            .clamp(0.0, 1.0);
-        let kelly_max_fraction = std::env::var("FORGE_FEV1_CAPITAL_KELLY_MAX_FRACTION")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.35)
-            .clamp(0.01, 0.90);
-        let kelly_payout_b = std::env::var("FORGE_FEV1_CAPITAL_KELLY_PAYOUT_B")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(1.0)
-            .clamp(0.2, 5.0);
-        let kelly_min_samples = std::env::var("FORGE_FEV1_CAPITAL_KELLY_MIN_SAMPLES")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(24)
-            .clamp(8, 200);
-        let reverse_two_phase = std::env::var("FORGE_FEV1_REVERSE_TWO_PHASE")
-            .ok()
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(true);
+        // --------------------------------------------------------- //
+        // 局部宏：消灭 30+ 个相同结构的 env 解析展开
+        // --------------------------------------------------------- //
+        macro_rules! env_bool {
+            ($key:literal, $default:expr) => {
+                std::env::var($key)
+                    .ok()
+                    .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                    .unwrap_or($default)
+            };
+        }
+        macro_rules! env_f64 {
+            ($key:literal, $default:expr, $lo:expr, $hi:expr) => {
+                std::env::var($key)
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or($default)
+                    .clamp($lo, $hi)
+            };
+        }
+        macro_rules! env_typed {
+            ($ty:ty, $key:literal, $default:expr, $lo:expr, $hi:expr) => {
+                std::env::var($key)
+                    .ok()
+                    .and_then(|v| v.parse::<$ty>().ok())
+                    .unwrap_or($default)
+                    .clamp($lo, $hi)
+            };
+        }
+
         Self {
-            enabled,
-            use_real_balance,
-            balance_refresh_ms,
-            equity_base_usdc,
-            reserve_usdc,
-            reserve_ratio,
-            reserve_min_usdc,
-            target_utilization,
-            small_threshold_usdc,
-            leg_ratio_small,
-            leg_ratio_large,
-            add_scale_small,
-            add_scale_large,
-            max_add_layers,
-            disable_add_on_loss,
-            add_edge_alpha,
-            add_time_beta,
-            entry_edge_alpha,
-            entry_time_beta,
-            edge_score_pivot,
-            edge_score_cap,
-            edge_time_tau_ms,
-            kelly_enabled,
-            kelly_lambda,
-            kelly_max_fraction,
-            kelly_payout_b,
-            kelly_min_samples,
-            reverse_two_phase,
+            enabled:              env_bool!("FORGE_FEV1_CAPITAL_AUTO",                true),
+            use_real_balance:     env_bool!("FORGE_FEV1_CAPITAL_USE_REAL_BALANCE",   true),
+            disable_add_on_loss:  env_bool!("FORGE_FEV1_CAPITAL_DISABLE_ADD_ON_LOSS", true),
+            kelly_enabled:        env_bool!("FORGE_FEV1_CAPITAL_KELLY_ENABLED",       true),
+            reverse_two_phase:    env_bool!("FORGE_FEV1_REVERSE_TWO_PHASE",           true),
+
+            balance_refresh_ms:   env_typed!(i64,   "FORGE_FEV1_CAPITAL_BALANCE_REFRESH_MS", 5_000,    500,      120_000),
+            edge_time_tau_ms:     env_typed!(i64,   "FORGE_FEV1_CAPITAL_EDGE_TIME_TAU_MS",   90_000,   5_000,    600_000),
+            max_add_layers:       env_typed!(u32,   "FORGE_FEV1_CAPITAL_MAX_ADD_LAYERS",      3,        1,        8),
+            kelly_min_samples:    env_typed!(usize, "FORGE_FEV1_CAPITAL_KELLY_MIN_SAMPLES",   24,       8,        200),
+
+            equity_base_usdc:     env_f64!("FORGE_FEV1_CAPITAL_BASE_USDC",              500.0,  5.0,    5_000_000.0),
+            reserve_usdc:         env_f64!("FORGE_FEV1_CAPITAL_RESERVE_USDC",             0.0,  0.0,    1_000_000.0),
+            reserve_ratio:        env_f64!("FORGE_FEV1_CAPITAL_RESERVE_RATIO",            0.20,  0.0,    0.90),
+            reserve_min_usdc:     env_f64!("FORGE_FEV1_CAPITAL_RESERVE_MIN_USDC",          1.0,  0.0,    1_000_000.0),
+            target_utilization:   env_f64!("FORGE_FEV1_CAPITAL_TARGET_UTILIZATION",       0.72,  LIVE_CAPITAL_MIN_UTILIZATION, LIVE_CAPITAL_MAX_UTILIZATION),
+            small_threshold_usdc: env_f64!("FORGE_FEV1_CAPITAL_SMALL_THRESHOLD_USDC",  4_000.0,  200.0,  100_000.0),
+            leg_ratio_small:      env_f64!("FORGE_FEV1_CAPITAL_LEG_RATIO_SMALL",          0.12,  0.01,   0.4),
+            leg_ratio_large:      env_f64!("FORGE_FEV1_CAPITAL_LEG_RATIO_LARGE",          0.02,  0.002,  0.2),
+            add_scale_small:      env_f64!("FORGE_FEV1_CAPITAL_ADD_SCALE_SMALL",          1.25,  0.5,    2.5),
+            add_scale_large:      env_f64!("FORGE_FEV1_CAPITAL_ADD_SCALE_LARGE",          0.75,  0.2,    1.5),
+            add_edge_alpha:       env_f64!("FORGE_FEV1_CAPITAL_ADD_EDGE_ALPHA",           0.45,  0.0,    2.0),
+            add_time_beta:        env_f64!("FORGE_FEV1_CAPITAL_ADD_TIME_BETA",            0.30,  0.0,    1.5),
+            entry_edge_alpha:     env_f64!("FORGE_FEV1_CAPITAL_ENTRY_EDGE_ALPHA",         0.28,  0.0,    1.5),
+            entry_time_beta:      env_f64!("FORGE_FEV1_CAPITAL_ENTRY_TIME_BETA",          0.18,  0.0,    1.0),
+            edge_score_pivot:     env_f64!("FORGE_FEV1_CAPITAL_EDGE_SCORE_PIVOT",         0.55,  0.01,   0.95),
+            edge_score_cap:       env_f64!("FORGE_FEV1_CAPITAL_EDGE_SCORE_CAP",           0.90,  0.05,   0.99),
+            kelly_lambda:         env_f64!("FORGE_FEV1_CAPITAL_KELLY_LAMBDA",             0.25,  0.0,    1.0),
+            kelly_max_fraction:   env_f64!("FORGE_FEV1_CAPITAL_KELLY_MAX_FRACTION",       0.35,  0.01,   0.90),
+            kelly_payout_b:       env_f64!("FORGE_FEV1_CAPITAL_KELLY_PAYOUT_B",           1.0,   0.2,    5.0),
         }
     }
 }
@@ -1571,6 +1443,9 @@ struct StrategyOptimizeQueryParams {
     recent_weight: Option<f64>,
     persist_best: Option<bool>,
     persist_ttl_sec: Option<u32>,
+    promote_min_trades: Option<f64>,
+    promote_min_win_rate: Option<f64>,
+    promote_min_pnl: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3079,16 +2954,19 @@ fn should_promote_candidate(
     candidate: &Value,
     incumbent: &Value,
     has_incumbent: bool,
+    min_trades: f64,
+    min_win_rate: f64,
+    min_pnl: f64,
 ) -> (bool, String) {
     let c = payload_metrics(candidate);
     if !has_incumbent {
-        if c.trade_count < 40.0 {
+        if c.trade_count < min_trades {
             return (false, "candidate_trade_count_too_low".to_string());
         }
-        if c.avg_pnl_cents <= 0.0 {
+        if c.avg_pnl_cents <= min_pnl {
             return (false, "candidate_avg_pnl_non_positive".to_string());
         }
-        if c.win_rate_pct < 70.0 {
+        if c.win_rate_pct < min_win_rate {
             return (
                 false,
                 "candidate_win_rate_below_bootstrap_floor".to_string(),
@@ -3097,10 +2975,11 @@ fn should_promote_candidate(
         return (true, "bootstrap_promote".to_string());
     }
     let i = payload_metrics(incumbent);
-    if c.trade_count < 35.0 {
+    // Incumbent comparison is slightly more relaxed on raw minimums but MUST strictly beat incumbent
+    if c.trade_count < (min_trades * 0.85).max(10.0) {
         return (false, "candidate_trade_count_too_low".to_string());
     }
-    if c.avg_pnl_cents <= 0.0 {
+    if c.avg_pnl_cents <= min_pnl {
         return (false, "candidate_avg_pnl_non_positive".to_string());
     }
     if c.trade_count + 1.0 < i.trade_count {
@@ -4264,7 +4143,7 @@ async fn strategy_paper_live(
     let mapped_cfg = map_cfg_to_fev1(cfg);
     let run = fev1::simulate(&mapped_samples, &mapped_cfg, max_trades);
     let gateway = fev1::ArmedSimulatedGateway;
-    let dual = fev1::simulate_dual_from_run(&run, dynamic_quote_usdc.max(0.01), &gateway);
+    let dual = fev1::build_gateway_execution(&run, dynamic_quote_usdc.max(0.01), &gateway);
     let live_executor_mode = LiveExecutorMode::from_env();
     reconcile_live_reports(state, &live_gateway_cfg, live_executor_mode).await;
     handle_live_pending_timeouts(state, &live_gateway_cfg, live_executor_mode).await;
@@ -8636,10 +8515,17 @@ async fn strategy_optimize(
         let (payload, _, _) = evaluate_candidate("incumbent_default".to_string(), &base_cfg);
         payload
     };
+    let promote_min_trades = params.promote_min_trades.unwrap_or(40.0);
+    let promote_min_win_rate = params.promote_min_win_rate.unwrap_or(70.0);
+    let promote_min_pnl = params.promote_min_pnl.unwrap_or(0.0);
+
     let (should_promote, promotion_reason) = should_promote_candidate(
         &best_payload,
         &incumbent_payload,
         active_before_opt.is_some(),
+        promote_min_trades,
+        promote_min_win_rate,
+        promote_min_pnl,
     );
     let mut promoted = false;
     let mut promotion_error: Option<String> = None;
