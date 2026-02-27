@@ -44,7 +44,7 @@ pub(super) struct StrategyRuntimeConfig {
     emergency_wide_spread_penalty_ratio: f64,
 }
 
-const STRATEGY_BASELINE_PROFILE: &str = "fev1_manual_profit_plus_2026_02_27";
+const STRATEGY_BASELINE_PROFILE: &str = "fev1_manual_profit_max_2026_02_27";
 
 #[allow(dead_code)]
 pub(super) fn strategy_backup_baseline_config() -> StrategyRuntimeConfig {
@@ -75,31 +75,31 @@ pub(super) fn strategy_backup_baseline_config() -> StrategyRuntimeConfig {
 }
 
 pub(super) fn strategy_current_default_config() -> StrategyRuntimeConfig {
-    // Manual profit-plus profile tuned on 2026-02-27 replay window (5m, 720/1440/2880 lookback, max_trades=900, autotune off).
-    // Goal: strictly better net pnl / win-rate / participation / drawdown vs previous manual profit baseline.
+    // Manual profit-max profile tuned on 2026-02-27 replay window (5m, 720/1440/2880 lookback, max_trades=900, autotune off).
+    // Goal: maximize order count + net pnl while keeping win-rate/drawdown inside guarded range.
     StrategyRuntimeConfig {
-        entry_threshold_base: 0.7681276377574093,
-        entry_threshold_cap: 0.9269633865328087,
-        spread_limit_prob: 0.02675442227522917,
-        entry_edge_prob: 0.07693517885672351,
-        entry_min_potential_cents: 17.4835931102258,
-        entry_max_price_cents: 68.17688477883828,
-        min_hold_ms: 10_638,
-        stop_loss_cents: 14.915073819425104,
-        reverse_signal_threshold: -0.18348107050149476,
+        entry_threshold_base: 0.7369682327402423,
+        entry_threshold_cap: 0.9497259999257743,
+        spread_limit_prob: 0.023675384305404043,
+        entry_edge_prob: 0.07006913988697057,
+        entry_min_potential_cents: 18.135042971301328,
+        entry_max_price_cents: 70.62354055896994,
+        min_hold_ms: 2_277,
+        stop_loss_cents: 11.992982528968525,
+        reverse_signal_threshold: -0.15512720801233063,
         reverse_signal_ticks: 2,
-        trail_activate_profit_cents: 24.670247046619748,
-        trail_drawdown_cents: 17.505644264595224,
-        take_profit_near_max_cents: 95.80036373375853,
-        endgame_take_profit_cents: 95.26774641680016,
-        endgame_remaining_ms: 21_736,
-        liquidity_widen_prob: 0.07541743773418815,
-        cooldown_ms: 450,
+        trail_activate_profit_cents: 26.093956734426936,
+        trail_drawdown_cents: 16.820471088753425,
+        take_profit_near_max_cents: 97.02669954722674,
+        endgame_take_profit_cents: 95.62661300231477,
+        endgame_remaining_ms: 23_453,
+        liquidity_widen_prob: 0.06300478937274487,
+        cooldown_ms: 2_268,
         max_entries_per_round: 3,
-        max_exec_spread_cents: 1.4379246342151217,
-        slippage_cents_per_side: 0.12104354415982855,
-        fee_cents_per_side: 0.04488957909163142,
-        emergency_wide_spread_penalty_ratio: 0.2551987452385947,
+        max_exec_spread_cents: 1.2249300342458038,
+        slippage_cents_per_side: 0.13017362950853426,
+        fee_cents_per_side: 0.04024842164853446,
+        emergency_wide_spread_penalty_ratio: 0.29593221663217434,
     }
 }
 
