@@ -1503,7 +1503,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
     let live_events = state.list_live_events(market_type, 60).await;
     let live_position_state = state.get_live_position_state(market_type).await;
     let capital_state = state
-        .get_live_capital_state(market_type, &capital_cfg)
+        .get_live_capital_state(capital_scope, &capital_cfg)
         .await;
     let live_balance_snapshot = if capital_cfg.use_real_balance {
         state
@@ -2221,6 +2221,11 @@ pub(super) async fn strategy_live_balance(
         "balance_sync_error": balance_sync_error,
         "capital_state_equity_estimate_usdc": capital_state.equity_estimate_usdc,
         "capital_state_available_to_trade_usdc": capital_state.available_to_trade_usdc,
+        "capital_state_reserved_pending_usdc": capital_state.reserved_pending_usdc,
+        "capital_state_utilization_ratio": capital_state.utilization_ratio,
+        "capital_state_risk_state": capital_state.risk_state,
+        "capital_state_stage": capital_state.capital_stage,
+        "capital_state_tune_factor": capital_state.tune_factor,
         "raw": snapshot.raw,
         "fixed_guard": fixed_guard
     })))
