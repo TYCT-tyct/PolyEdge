@@ -398,67 +398,68 @@ export function PaperLabPage({
 
   const summary = strategyPaper?.summary;
   const current = strategyPaper?.current;
+  const finite = (v: number | null | undefined): number | null =>
+    typeof v === "number" && Number.isFinite(v) ? v : null;
+  const currentScore = finite(current?.score);
+  const currentThreshold = finite(current?.entry_threshold);
+  const currentConfidencePct = finite(current?.confidence) != null ? (current!.confidence * 100) : null;
+  const currentPUpPct = finite(current?.p_up_pct) != null ? (current!.p_up_pct * 100) : null;
+  const currentDeltaPct = finite(current?.delta_pct) != null ? (current!.delta_pct * 100) : null;
+  const currentRemainingS = finite(current?.remaining_s);
+  const currentSpreadUp = finite(current?.spread_up_cents);
+  const currentSpreadDown = finite(current?.spread_down_cents);
+  const summaryNet = summary ? (finite(summary.net_pnl_cents) ?? finite(summary.total_pnl_cents) ?? 0) : null;
 
   return (
     <section className="panel">
       <header className="panel-head">
         <div>
-          <h2>策略 Paper（独立模块）</h2>
-          <p className="muted">Paper 页面已独立挂载，避免与市场页并发轮询造成卡顿。</p>
+          <h2>策略 Paper（{strategyMarketType}全时段）</h2>
+          <p className="muted">单模型双向策略：自动判断 UP/DOWN，只验证入场与出场，不做加仓和反向。</p>
         </div>
         <div className="panel-actions">
-          <div className="btn-group">
-            <button className={strategyMarketType === "5m" ? "active" : ""} onClick={() => setStrategyMarketType("5m")}>
-              5m
-            </button>
-            <button className={strategyMarketType === "15m" ? "active" : ""} onClick={() => setStrategyMarketType("15m")}>
-              15m
-            </button>
-          </div>
-          <div className="btn-group">
-            <button className={strategySource === "replay" ? "active" : ""} onClick={() => setStrategySource("replay")}>
-              Paper模拟
-            </button>
-            <button className={strategySource === "live" ? "active" : ""} onClick={() => setStrategySource("live")}>
-              真实交易
-            </button>
-          </div>
-          <div className="btn-group">
-            <button className={strategyUseAutotune ? "active" : ""} disabled>
-              AutoTune 开
-            </button>
-            <button className={!strategyUseAutotune ? "active" : ""} disabled>
-              AutoTune 关
-            </button>
-          </div>
-          <span className="loading-chip">{strategyLoading ? "计算中..." : "已更新"}</span>
+          <span className="loading-chip">{strategyLoading ? "计算中..." : strategySource === "live" ? "实时策略" : "模拟策略"}</span>
         </div>
       </header>
 
       <div className="info-cards compact strategy-matrix">
         <article className="info-card">
-          <span>动作</span>
-          <strong>{current?.suggested_action ?? "--"}</strong>
-          <small>{current ? formatTime(current.timestamp_ms, timeMode) : "等待样本"}</small>
+          <span>当前动作</span>
+          <strong className={current?.suggested_action?.includes("UP") ? "up" : current?.suggested_action?.includes("DOWN") ? "down" : ""}>
+            {current?.suggested_action ?? "--"}
+          </strong>
+          <small>
+            {current
+              ? `${formatTime(current.timestamp_ms, timeMode)} · ${current.round_id ?? "--"}`
+              : "等待数据"}
+          </small>
         </article>
         <article className="info-card">
-          <span>信号 / 阈值</span>
+          <span>信号强度 / 阈值</span>
           <strong>
-            {current ? `${current.score.toFixed(3)} / ${current.entry_threshold.toFixed(3)}` : "--"}
+            {currentScore != null && currentThreshold != null
+              ? `${currentScore.toFixed(3)} / ${currentThreshold.toFixed(3)}`
+              : "--"}
           </strong>
-          <small>置信度 {current ? `${(current.confidence * 100).toFixed(1)}%` : "--"}</small>
+          <small>置信度：{currentConfidencePct != null ? `${currentConfidencePct.toFixed(1)}%` : "--"}</small>
         </article>
         <article className="info-card">
-          <span>净收益</span>
-          <strong className={(summary?.net_pnl_cents ?? 0) >= 0 ? "up" : "down"}>
-            {summary ? `${summary.net_pnl_cents.toFixed(2)}¢` : "--"}
+          <span>累计净收益</span>
+          <strong className={(summaryNet ?? 0) >= 0 ? "up" : "down"}>
+            {summaryNet != null ? `${summaryNet.toFixed(2)}¢` : "--"}
           </strong>
-          <small>胜率 {summary ? `${summary.win_rate_pct.toFixed(1)}%` : "--"}</small>
+          <small>
+            交易 {summary?.trade_count ?? 0} · 胜率 {summary ? `${summary.win_rate_pct.toFixed(1)}%` : "--"} · 窗口 {strategyPaper?.lookback_minutes ?? "--"}m
+          </small>
         </article>
         <article className="info-card">
-          <span>交易数</span>
-          <strong>{summary?.trade_count ?? 0}</strong>
-          <small>样本 {strategyPaper?.samples ?? 0}</small>
+          <span>均值 / 回撤</span>
+          <strong>
+            {summary
+              ? `${summary.avg_pnl_cents.toFixed(2)}¢ / ${summary.max_drawdown_cents.toFixed(2)}¢`
+              : "--"}
+          </strong>
+          <small>平均每笔 / 最大回撤</small>
         </article>
         <article className="info-card">
           <span>毛收益 / 总成本</span>
@@ -470,15 +471,49 @@ export function PaperLabPage({
           <small>净利润率 {summary ? `${summary.net_margin_pct.toFixed(2)}%` : "--"}</small>
         </article>
         <article className="info-card">
-          <span>均值 / 最大回撤</span>
+          <span>市场状态</span>
           <strong>
-            {summary
-              ? `${summary.avg_pnl_cents.toFixed(2)}¢ / ${summary.max_drawdown_cents.toFixed(2)}¢`
-              : "--"}
+            {currentPUpPct != null ? `UP ${currentPUpPct.toFixed(1)}%` : "--"}
           </strong>
           <small>
-            市场 {current ? `${current.suggested_side} ${(current.p_up_pct * 100).toFixed(1)}%` : "--"}
+            Δ {currentDeltaPct != null ? `${currentDeltaPct.toFixed(4)}%` : "--"} · 剩余 {currentRemainingS != null ? `${currentRemainingS.toFixed(1)}s` : "--"} · 样本 {strategyPaper?.samples ?? 0}
           </small>
+        </article>
+      </div>
+
+      <div className="paper-toolbar">
+        <div className="btn-group">
+          <button className={strategyMarketType === "5m" ? "active" : ""} onClick={() => setStrategyMarketType("5m")}>
+            5m
+          </button>
+          <button className={strategyMarketType === "15m" ? "active" : ""} onClick={() => setStrategyMarketType("15m")}>
+            15m
+          </button>
+        </div>
+        <div className="btn-group">
+          <button className={strategySource === "replay" ? "active" : ""} onClick={() => setStrategySource("replay")}>
+            Paper模拟
+          </button>
+          <button className={strategySource === "live" ? "active" : ""} onClick={() => setStrategySource("live")}>
+            真实交易
+          </button>
+        </div>
+        <div className="btn-group">
+          <button className={strategyUseAutotune ? "active" : ""} disabled>
+            AutoTune 开
+          </button>
+          <button className={!strategyUseAutotune ? "active" : ""} disabled>
+            AutoTune 关
+          </button>
+        </div>
+        <article className="info-card paper-quote-card">
+          <span>盘口状态</span>
+          <strong>
+            {currentSpreadUp != null && currentSpreadDown != null
+              ? `${currentSpreadUp.toFixed(2)}¢ / ${currentSpreadDown.toFixed(2)}¢`
+              : "--"}
+          </strong>
+          <small>UP / DOWN 点差</small>
         </article>
       </div>
 
