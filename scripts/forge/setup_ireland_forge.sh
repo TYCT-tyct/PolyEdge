@@ -71,10 +71,19 @@ Type=simple
 User=$USER_NAME
 WorkingDirectory=$REPO_DIR
 Environment=RUST_LOG=info,polyedge_forge=debug
+Environment=FORGE_FEV1_RUNTIME_MARKETS=5m
+Environment=FORGE_STRATEGY_MARKETS=5m
+Environment=FORGE_STRATEGY_BASE_PROFILE=auto
+Environment=FORGE_STRATEGY_MAX_POINTS_FULL=320000
+Environment=FORGE_STRATEGY_MAX_POINTS_SHORT=180000
+Environment=FORGE_STRATEGY_MAX_POINTS_HARD_CAP=600000
+Environment=MALLOC_TRIM_THRESHOLD_=131072
 ExecStart=$REPO_DIR/target/release/polyedge_forge ireland-api --bind 0.0.0.0:9810 --clickhouse-url http://127.0.0.1:8123 --redis-url redis://127.0.0.1:6379/0 --redis-prefix forge --dashboard-dist /home/ubuntu/PolyEdge/heatmap_dashboard/dist
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
+MemoryHigh=6G
+MemoryMax=7G
 
 [Install]
 WantedBy=multi-user.target
@@ -89,6 +98,7 @@ RECORDER_SERVICE="polyedge-forge-ireland-recorder.service"
 API_SERVICE="polyedge-forge-ireland-api.service"
 API_URL="http://127.0.0.1:9810/health/live"
 MAX_STALE_MS=30000
+MAX_API_RSS_MB=4500
 
 if ! systemctl is-active --quiet "$RECORDER_SERVICE"; then
   systemctl restart "$RECORDER_SERVICE" || true
@@ -101,6 +111,18 @@ fi
 if ! curl -fsS --max-time 2 "$API_URL" >/dev/null; then
   systemctl restart "$API_SERVICE" || true
   exit 0
+fi
+
+api_pid="$(systemctl show -p MainPID --value "$API_SERVICE" 2>/dev/null || echo 0)"
+if [[ "${api_pid}" =~ ^[0-9]+$ ]] && [[ "${api_pid}" -gt 1 ]] && [[ -r "/proc/${api_pid}/status" ]]; then
+  api_rss_kb="$(awk '/VmRSS:/ {print $2}' "/proc/${api_pid}/status" 2>/dev/null || echo 0)"
+  if [[ "${api_rss_kb}" =~ ^[0-9]+$ ]] && [[ "${api_rss_kb}" -gt 0 ]]; then
+    api_rss_mb=$((api_rss_kb / 1024))
+    if [[ "${api_rss_mb}" -gt "${MAX_API_RSS_MB}" ]]; then
+      systemctl restart "$API_SERVICE" || true
+      exit 0
+    fi
+  fi
 fi
 
 latest_ms="$(clickhouse-client -q "SELECT max(ts_ireland_sample_ms) FROM polyedge_forge.snapshot_100ms WHERE symbol='BTCUSDT' AND timeframe IN ('5m','15m')" 2>/dev/null || echo 0)"

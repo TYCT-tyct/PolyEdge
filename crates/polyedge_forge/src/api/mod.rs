@@ -828,7 +828,7 @@ impl LiveRuntimeConfig {
                     .collect::<Vec<_>>()
             })
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| vec!["5m".to_string(), "15m".to_string()]);
+            .unwrap_or_else(|| vec!["5m".to_string()]);
         Self {
             enabled,
             live_execute,

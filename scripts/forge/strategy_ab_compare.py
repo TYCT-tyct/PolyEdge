@@ -11,6 +11,7 @@ def fetch_payload(
     market_type: str,
     lookback_minutes: int,
     max_trades: int,
+    max_samples: int,
     use_autotune: bool,
     cfg: dict | None,
 ) -> dict:
@@ -19,6 +20,7 @@ def fetch_payload(
         "full_history": "true",
         "lookback_minutes": str(lookback_minutes),
         "max_trades": str(max_trades),
+        "max_samples": str(max_samples),
         "use_autotune": "true" if use_autotune else "false",
     }
     if cfg:
@@ -97,6 +99,12 @@ def main() -> None:
     ap.add_argument("--market-type", default="5m")
     ap.add_argument("--lookback-minutes", type=int, default=2880)
     ap.add_argument("--max-trades", type=int, default=1500)
+    ap.add_argument(
+        "--max-samples",
+        type=int,
+        default=260000,
+        help="Upper bound for /api/strategy/paper max_samples; lower value reduces API memory pressure.",
+    )
     ap.add_argument("--use-autotune-a", action="store_true")
     ap.add_argument("--use-autotune-b", action="store_true")
     ap.add_argument("--config-a", help="JSON file for query A override params")
@@ -112,6 +120,7 @@ def main() -> None:
         args.market_type,
         args.lookback_minutes,
         args.max_trades,
+        args.max_samples,
         args.use_autotune_a,
         cfg_a,
     )
@@ -120,6 +129,7 @@ def main() -> None:
         args.market_type,
         args.lookback_minutes,
         args.max_trades,
+        args.max_samples,
         args.use_autotune_b,
         cfg_b,
     )
@@ -135,6 +145,7 @@ def main() -> None:
             "market_type": args.market_type,
             "lookback_minutes": args.lookback_minutes,
             "max_trades": args.max_trades,
+            "max_samples": args.max_samples,
         },
     }
     if args.out:

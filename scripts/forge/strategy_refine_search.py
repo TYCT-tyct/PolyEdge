@@ -25,12 +25,13 @@ def get_json(base_url: str, path: str, query: dict, timeout: int, retries: int) 
     raise RuntimeError(f"failed to fetch {url}")
 
 
-def eval_cfg(base_url: str, market_type: str, cfg: dict, retries: int) -> dict:
+def eval_cfg(base_url: str, market_type: str, max_samples: int, cfg: dict, retries: int) -> dict:
     q = {
         "market_type": market_type,
         "full_history": "true",
         "lookback_minutes": "1440",
         "max_trades": "900",
+        "max_samples": str(max_samples),
         "use_autotune": "false",
     }
     for k, v in cfg.items():
@@ -137,7 +138,9 @@ def mutate(cfg: dict, scale: float) -> dict:
         "emergency_wide_spread_penalty_ratio": 0.12,
     }
 
-    for k in c.keys():
+    for k in list(c.keys()):
+        if k not in bounds:
+            continue
         if k in {"max_entries_per_round", "reverse_signal_ticks"}:
             if random.random() < 0.20:
                 c[k] = clamp_param(k, float(c[k]) + random.choice([-1, 1]))
@@ -158,6 +161,12 @@ def main() -> None:
     ap.add_argument("--market-type", default="5m")
     ap.add_argument("--input", required=True, help="Path to JSON containing candidate config object.")
     ap.add_argument("--iters", type=int, default=280)
+    ap.add_argument(
+        "--max-samples",
+        type=int,
+        default=260000,
+        help="Upper bound for /api/strategy/paper max_samples; lower value reduces API memory pressure.",
+    )
     ap.add_argument("--out", default="/tmp/refine_result.json")
     ap.add_argument("--retries", type=int, default=3)
     args = ap.parse_args()
@@ -166,13 +175,13 @@ def main() -> None:
         base_cfg = json.load(f)
 
     best_cfg = dict(base_cfg)
-    best = eval_cfg(args.base_url, args.market_type, best_cfg, args.retries)
+    best = eval_cfg(args.base_url, args.market_type, args.max_samples, best_cfg, args.retries)
     print("BASE", json.dumps(best, ensure_ascii=False))
 
     for i in range(1, args.iters + 1):
         scale = 1.0 if i < int(args.iters * 0.45) else (0.6 if i < int(args.iters * 0.8) else 0.35)
         cand = mutate(best_cfg if random.random() < 0.70 else base_cfg, scale)
-        res = eval_cfg(args.base_url, args.market_type, cand, args.retries)
+        res = eval_cfg(args.base_url, args.market_type, args.max_samples, cand, args.retries)
         if (res["score"], res["w50"], res["a50"], res["w80"]) > (
             best["score"],
             best["w50"],

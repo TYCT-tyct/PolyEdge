@@ -105,12 +105,22 @@ def only_params(cfg: dict) -> dict:
     return out
 
 
-def fetch_payload(base_url: str, market_type: str, lookback_minutes: int, max_trades: int, cfg: dict, timeout: int, retries: int) -> dict:
+def fetch_payload(
+    base_url: str,
+    market_type: str,
+    lookback_minutes: int,
+    max_trades: int,
+    max_samples: int,
+    cfg: dict,
+    timeout: int,
+    retries: int,
+) -> dict:
     q: dict[str, str] = {
         "market_type": market_type,
         "full_history": "true",
         "lookback_minutes": str(lookback_minutes),
         "max_trades": str(max_trades),
+        "max_samples": str(max_samples),
         "use_autotune": "false",
     }
     for k, v in cfg.items():
@@ -177,11 +187,32 @@ def score_window(metrics: dict, min_trades: int, trade_target: int, win_floor: f
     )
 
 
-def evaluate_cfg(base_url: str, market_type: str, lookbacks: list[int], max_trades: int, cfg: dict, min_trades: int, trade_target: int, win_floor: float, timeout: int, retries: int) -> dict:
+def evaluate_cfg(
+    base_url: str,
+    market_type: str,
+    lookbacks: list[int],
+    max_trades: int,
+    max_samples: int,
+    cfg: dict,
+    min_trades: int,
+    trade_target: int,
+    win_floor: float,
+    timeout: int,
+    retries: int,
+) -> dict:
     windows = []
     total_score = 0.0
     for lb in lookbacks:
-        payload = fetch_payload(base_url, market_type, lb, max_trades, cfg, timeout, retries)
+        payload = fetch_payload(
+            base_url,
+            market_type,
+            lb,
+            max_trades,
+            max_samples,
+            cfg,
+            timeout,
+            retries,
+        )
         metrics = summarize_payload(payload)
         metrics["lookback_minutes"] = lb
         w_score = score_window(metrics, min_trades=min_trades, trade_target=trade_target, win_floor=win_floor)
@@ -252,6 +283,12 @@ def main() -> None:
     ap.add_argument("--seed-config", required=True)
     ap.add_argument("--lookbacks", default="1440,2880")
     ap.add_argument("--max-trades", type=int, default=900)
+    ap.add_argument(
+        "--max-samples",
+        type=int,
+        default=260000,
+        help="Upper bound for /api/strategy/paper max_samples; lower value reduces API memory pressure.",
+    )
     ap.add_argument("--generations", type=int, default=36)
     ap.add_argument("--population", type=int, default=16)
     ap.add_argument("--workers", type=int, default=4)
@@ -280,6 +317,7 @@ def main() -> None:
         args.market_type,
         lookbacks,
         args.max_trades,
+        args.max_samples,
         seed_cfg,
         args.min_trades,
         args.trade_target,
@@ -311,6 +349,7 @@ def main() -> None:
                     args.market_type,
                     lookbacks,
                     args.max_trades,
+                    args.max_samples,
                     cfg,
                     args.min_trades,
                     args.trade_target,
@@ -377,6 +416,7 @@ def main() -> None:
             "market_type": args.market_type,
             "lookbacks": lookbacks,
             "max_trades": args.max_trades,
+            "max_samples": args.max_samples,
             "generations": args.generations,
             "population": args.population,
             "workers": args.workers,

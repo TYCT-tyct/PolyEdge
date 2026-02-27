@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone)]
 pub(super) struct StrategySample {
@@ -44,7 +45,99 @@ pub(super) struct StrategyRuntimeConfig {
     emergency_wide_spread_penalty_ratio: f64,
 }
 
-const STRATEGY_BASELINE_PROFILE: &str = "fev1_manual_profit_max_2026_02_27";
+const STRATEGY_PROFILE_PROFIT_MAX: &str = "fev1_manual_profit_max_2026_02_27";
+const STRATEGY_PROFILE_HI_FREQ: &str = "fev1_manual_hi_freq_2026_02_27";
+const STRATEGY_PROFILE_HI_WIN: &str = "fev1_manual_hi_win_2026_02_27";
+
+fn strategy_enabled_markets() -> &'static Vec<String> {
+    static ENABLED: OnceLock<Vec<String>> = OnceLock::new();
+    ENABLED.get_or_init(|| {
+        std::env::var("FORGE_STRATEGY_MARKETS")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(|v| v.trim().to_ascii_lowercase())
+                    .filter(|v| v == "5m" || v == "15m")
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec!["5m".to_string()])
+    })
+}
+
+fn resolve_strategy_market_type(raw: Option<&str>) -> Result<&'static str, ApiError> {
+    let market_type = if let Some(mt) = raw {
+        normalize_market_type(mt).ok_or_else(|| ApiError::bad_request("invalid market_type"))?
+    } else {
+        "5m"
+    };
+    if strategy_enabled_markets()
+        .iter()
+        .any(|v| v.as_str() == market_type)
+    {
+        return Ok(market_type);
+    }
+    Err(ApiError::bad_request(format!(
+        "market_type '{}' disabled by FORGE_STRATEGY_MARKETS={}",
+        market_type,
+        strategy_enabled_markets().join(",")
+    )))
+}
+
+fn strategy_env_u32(name: &str, default: u32, min_v: u32, max_v: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(default)
+        .clamp(min_v, max_v)
+}
+
+fn strategy_default_max_points(full_history: bool) -> u32 {
+    if full_history {
+        strategy_env_u32("FORGE_STRATEGY_MAX_POINTS_FULL", 320_000, 20_000, 2_000_000)
+    } else {
+        strategy_env_u32("FORGE_STRATEGY_MAX_POINTS_SHORT", 180_000, 20_000, 600_000)
+    }
+}
+
+fn strategy_max_points_hard_cap() -> u32 {
+    strategy_env_u32(
+        "FORGE_STRATEGY_MAX_POINTS_HARD_CAP",
+        600_000,
+        20_000,
+        5_000_000,
+    )
+}
+
+fn strategy_select_profile_name() -> &'static str {
+    if let Ok(raw) = std::env::var("FORGE_STRATEGY_BASE_PROFILE") {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "profit_max" | "manual_profit_max" | "max" | "fev1_manual_profit_max_2026_02_27" => {
+                return STRATEGY_PROFILE_PROFIT_MAX;
+            }
+            "hi_win" | "manual_hi_win" | "safe" | "fev1_manual_hi_win_2026_02_27" => {
+                return STRATEGY_PROFILE_HI_WIN;
+            }
+            "hi_freq" | "manual_hi_freq" | "freq" | "fev1_manual_hi_freq_2026_02_27" => {
+                return STRATEGY_PROFILE_HI_FREQ;
+            }
+            _ => {}
+        }
+    }
+    let equity_base = std::env::var("FORGE_FEV1_CAPITAL_BASE_USDC")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(500.0);
+    if equity_base <= 60.0 {
+        STRATEGY_PROFILE_HI_WIN
+    } else {
+        STRATEGY_PROFILE_HI_FREQ
+    }
+}
+
+fn strategy_current_default_profile_name() -> &'static str {
+    strategy_select_profile_name()
+}
 
 #[allow(dead_code)]
 pub(super) fn strategy_backup_baseline_config() -> StrategyRuntimeConfig {
@@ -74,9 +167,7 @@ pub(super) fn strategy_backup_baseline_config() -> StrategyRuntimeConfig {
     }
 }
 
-pub(super) fn strategy_current_default_config() -> StrategyRuntimeConfig {
-    // Manual profit-max profile tuned on 2026-02-27 replay window (5m, 720/1440/2880 lookback, max_trades=900, autotune off).
-    // Goal: maximize order count + net pnl while keeping win-rate/drawdown inside guarded range.
+fn strategy_profit_max_config() -> StrategyRuntimeConfig {
     StrategyRuntimeConfig {
         entry_threshold_base: 0.7369682327402423,
         entry_threshold_cap: 0.9497259999257743,
@@ -100,6 +191,68 @@ pub(super) fn strategy_current_default_config() -> StrategyRuntimeConfig {
         slippage_cents_per_side: 0.13017362950853426,
         fee_cents_per_side: 0.04024842164853446,
         emergency_wide_spread_penalty_ratio: 0.29593221663217434,
+    }
+}
+
+fn strategy_hi_freq_config() -> StrategyRuntimeConfig {
+    StrategyRuntimeConfig {
+        entry_threshold_base: 0.7686523821483723,
+        entry_threshold_cap: 0.99,
+        spread_limit_prob: 0.031050931460392672,
+        entry_edge_prob: 0.04397227060534279,
+        entry_min_potential_cents: 11.713295063203187,
+        entry_max_price_cents: 74.19641304603604,
+        min_hold_ms: 4_271,
+        stop_loss_cents: 13.44825602224101,
+        reverse_signal_threshold: -0.24517460190661405,
+        reverse_signal_ticks: 2,
+        trail_activate_profit_cents: 23.872099447769717,
+        trail_drawdown_cents: 15.457789629059327,
+        take_profit_near_max_cents: 97.32996482850581,
+        endgame_take_profit_cents: 97.27772783424335,
+        endgame_remaining_ms: 23_313,
+        liquidity_widen_prob: 0.0671475985081152,
+        cooldown_ms: 7_196,
+        max_entries_per_round: 3,
+        max_exec_spread_cents: 1.2418651648940238,
+        slippage_cents_per_side: 0.12346479836309485,
+        fee_cents_per_side: 0.03,
+        emergency_wide_spread_penalty_ratio: 0.197306675940024,
+    }
+}
+
+fn strategy_hi_win_config() -> StrategyRuntimeConfig {
+    StrategyRuntimeConfig {
+        entry_threshold_base: 0.7928044963810135,
+        entry_threshold_cap: 0.9849918027705858,
+        spread_limit_prob: 0.028629416086831005,
+        entry_edge_prob: 0.06259309494575992,
+        entry_min_potential_cents: 17.245351179461537,
+        entry_max_price_cents: 65.17784700310176,
+        min_hold_ms: 3_235,
+        stop_loss_cents: 13.14946542892194,
+        reverse_signal_threshold: -0.10037499713079152,
+        reverse_signal_ticks: 4,
+        trail_activate_profit_cents: 24.393265002393424,
+        trail_drawdown_cents: 17.632807444464234,
+        take_profit_near_max_cents: 97.73898243530077,
+        endgame_take_profit_cents: 93.1420351179262,
+        endgame_remaining_ms: 24_778,
+        liquidity_widen_prob: 0.0620961928172456,
+        cooldown_ms: 2_671,
+        max_entries_per_round: 3,
+        max_exec_spread_cents: 1.1661721107208205,
+        slippage_cents_per_side: 0.14515338668372577,
+        fee_cents_per_side: 0.05331355583758494,
+        emergency_wide_spread_penalty_ratio: 0.20954404654691547,
+    }
+}
+
+pub(super) fn strategy_current_default_config() -> StrategyRuntimeConfig {
+    match strategy_select_profile_name() {
+        STRATEGY_PROFILE_HI_WIN => strategy_hi_win_config(),
+        STRATEGY_PROFILE_HI_FREQ => strategy_hi_freq_config(),
+        _ => strategy_profit_max_config(),
     }
 }
 
@@ -1281,7 +1434,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         "full_history": full_history,
         "samples": samples.len(),
         "config_source": config_source,
-        "baseline_profile": STRATEGY_BASELINE_PROFILE,
+        "baseline_profile": strategy_current_default_profile_name(),
         "autotune": autotune_doc,
         "autotune_live_key": autotune_live_key,
         "config": strategy_cfg_json(cfg),
@@ -1599,11 +1752,7 @@ pub(super) async fn strategy_paper(
     Query(params): Query<StrategyPaperQueryParams>,
 ) -> Result<Json<Value>, ApiError> {
     let source_mode = parse_strategy_paper_source(params.source.as_deref());
-    let market_type = if let Some(mt) = params.market_type.as_deref() {
-        normalize_market_type(mt).ok_or_else(|| ApiError::bad_request("invalid market_type"))?
-    } else {
-        "5m"
-    };
+    let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
     let autotune_context =
         normalize_autotune_context(params.autotune_context.as_deref(), market_type);
     let use_autotune = params.use_autotune.unwrap_or(false);
@@ -1708,8 +1857,8 @@ pub(super) async fn strategy_paper(
         .clamp(30, 365 * 24 * 60);
     let max_points = params
         .max_points
-        .unwrap_or(if full_history { 2_400_000 } else { 220_000 })
-        .clamp(20_000, 5_000_000);
+        .unwrap_or(strategy_default_max_points(full_history))
+        .clamp(20_000, strategy_max_points_hard_cap());
     let max_trades = params.max_trades.unwrap_or(200).clamp(20, 1000) as usize;
     let _live_execute = params.live_execute.unwrap_or(false);
     let _live_quote_usdc = params.live_quote_usdc.unwrap_or(1.0).clamp(0.5, 1000.0);
@@ -1793,7 +1942,7 @@ pub(super) async fn strategy_paper(
         "full_history": full_history,
         "samples": samples.len(),
         "config_source": config_source,
-        "baseline_profile": STRATEGY_BASELINE_PROFILE,
+        "baseline_profile": strategy_current_default_profile_name(),
         "autotune": autotune_info,
         "autotune_key_used": autotune_key_used,
         "config": {
@@ -1914,11 +2063,7 @@ pub(super) async fn strategy_live_balance(
     State(state): State<ApiState>,
     Query(params): Query<StrategyLiveBalanceQueryParams>,
 ) -> Result<Json<Value>, ApiError> {
-    let market_type = if let Some(mt) = params.market_type.as_deref() {
-        normalize_market_type(mt).ok_or_else(|| ApiError::bad_request("invalid market_type"))?
-    } else {
-        "5m"
-    };
+    let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
     let capital_cfg = LiveCapitalConfig::from_env();
     let refresh_ms = params
         .refresh_ms
@@ -1959,11 +2104,7 @@ pub(super) async fn strategy_autotune_latest(
     State(state): State<ApiState>,
     Query(params): Query<StrategyAutotuneLatestQueryParams>,
 ) -> Result<Json<Value>, ApiError> {
-    let market_type = if let Some(mt) = params.market_type.as_deref() {
-        normalize_market_type(mt).ok_or_else(|| ApiError::bad_request("invalid market_type"))?
-    } else {
-        "5m"
-    };
+    let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
     let context = normalize_autotune_context(params.context.as_deref(), market_type);
     let (payload, key, from_legacy) = resolve_autotune_doc(&state, &context, market_type).await?;
     let (active_payload, active_key) = resolve_autotune_active_doc(&state, market_type).await?;
@@ -1988,11 +2129,7 @@ pub(super) async fn strategy_autotune_history(
     State(state): State<ApiState>,
     Query(params): Query<StrategyAutotuneHistoryQueryParams>,
 ) -> Result<Json<Value>, ApiError> {
-    let market_type = if let Some(mt) = params.market_type.as_deref() {
-        normalize_market_type(mt).ok_or_else(|| ApiError::bad_request("invalid market_type"))?
-    } else {
-        "5m"
-    };
+    let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
     let context = normalize_autotune_context(params.context.as_deref(), market_type);
     let limit = params.limit.unwrap_or(20).clamp(1, 200) as usize;
     let active_key = strategy_autotune_active_history_key(&state.redis_prefix, market_type);
@@ -2029,11 +2166,7 @@ pub(super) async fn strategy_autotune_set(
     State(state): State<ApiState>,
     Json(body): Json<StrategyAutotuneSetBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let market_type = if let Some(mt) = body.market_type.as_deref() {
-        normalize_market_type(mt).ok_or_else(|| ApiError::bad_request("invalid market_type"))?
-    } else {
-        "5m"
-    };
+    let market_type = resolve_strategy_market_type(body.market_type.as_deref())?;
     let context = normalize_autotune_context(body.context.as_deref(), market_type);
     let key = strategy_autotune_key(&state.redis_prefix, &context);
     let history_key = strategy_autotune_history_key(&state.redis_prefix, &context);
@@ -2198,11 +2331,7 @@ pub(super) async fn strategy_full(
     State(state): State<ApiState>,
     Query(params): Query<StrategyFullQueryParams>,
 ) -> Result<Json<Value>, ApiError> {
-    let market_type = if let Some(mt) = params.market_type.as_deref() {
-        normalize_market_type(mt).ok_or_else(|| ApiError::bad_request("invalid market_type"))?
-    } else {
-        "5m"
-    };
+    let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
     let full_history = params.full_history.unwrap_or(true);
     let lookback_minutes = params
         .lookback_minutes
@@ -2210,8 +2339,8 @@ pub(super) async fn strategy_full(
         .clamp(30, 365 * 24 * 60);
     let max_points = params
         .max_points
-        .unwrap_or(if full_history { 2_400_000 } else { 220_000 })
-        .clamp(20_000, 5_000_000);
+        .unwrap_or(strategy_default_max_points(full_history))
+        .clamp(20_000, strategy_max_points_hard_cap());
     let max_trades = params.max_trades.unwrap_or(300).clamp(20, 1000) as usize;
     let max_arms = params.max_arms.unwrap_or(8).clamp(2, 24) as usize;
     let window_trades = params.window_trades.unwrap_or(50).clamp(10, 200) as usize;
@@ -2550,11 +2679,7 @@ pub(super) async fn strategy_optimize(
     State(state): State<ApiState>,
     Query(params): Query<StrategyOptimizeQueryParams>,
 ) -> Result<Json<Value>, ApiError> {
-    let market_type = if let Some(mt) = params.market_type.as_deref() {
-        normalize_market_type(mt).ok_or_else(|| ApiError::bad_request("invalid market_type"))?
-    } else {
-        "5m"
-    };
+    let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
     let autotune_context =
         normalize_autotune_context(params.autotune_context.as_deref(), market_type);
     let full_history = params.full_history.unwrap_or(true);
@@ -2564,8 +2689,8 @@ pub(super) async fn strategy_optimize(
         .clamp(30, 365 * 24 * 60);
     let max_points = params
         .max_points
-        .unwrap_or(if full_history { 2_400_000 } else { 220_000 })
-        .clamp(20_000, 5_000_000);
+        .unwrap_or(strategy_default_max_points(full_history))
+        .clamp(20_000, strategy_max_points_hard_cap());
     let max_trades = params.max_trades.unwrap_or(400).clamp(20, 2000) as usize;
     let max_arms = params.max_arms.unwrap_or(8).clamp(2, 24) as usize;
     let window_trades = params.window_trades.unwrap_or(50).clamp(10, 200) as usize;
