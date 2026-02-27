@@ -40,6 +40,17 @@ sudo chown -R "$USER_NAME:$USER_NAME" "$DATA_ROOT"
 cd "$REPO_DIR"
 ~/.cargo/bin/cargo build -p polyedge_forge --release
 
+# Always rebuild dashboard static assets before restarting API service.
+# This prevents stale /dashboard bundles after backend-only deploys.
+if command -v npm >/dev/null 2>&1; then
+  pushd "$REPO_DIR/heatmap_dashboard" >/dev/null
+  npm install --no-audit --no-fund
+  npm run build
+  popd >/dev/null
+else
+  echo "[forge-ireland] warning: npm not found; dashboard dist may be stale"
+fi
+
 sudo tee /etc/systemd/system/polyedge-forge-ireland-recorder.service >/dev/null <<UNIT
 [Unit]
 Description=PolyEdge Forge Ireland Recorder
