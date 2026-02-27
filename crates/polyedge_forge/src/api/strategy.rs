@@ -608,6 +608,11 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
 
     let live_gateway_cfg = LiveGatewayConfig::from_env();
     let capital_cfg = LiveCapitalConfig::from_env();
+    let capital_scope = if capital_cfg.portfolio_shared {
+        LIVE_CAPITAL_PORTFOLIO_SCOPE
+    } else {
+        market_type
+    };
     let (dynamic_quote_usdc, capital_before, balance_sync_ok, balance_sync_error) = state
         .compute_live_quote_usdc(
             market_type,
@@ -1307,6 +1312,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
             },
             "capital": {
                 "auto_enabled": capital_cfg.enabled,
+                "scope": capital_scope,
                 "portfolio_shared": capital_cfg.portfolio_shared,
                 "use_real_balance": capital_cfg.use_real_balance,
                 "hard_require_real_balance": capital_cfg.hard_require_real_balance,

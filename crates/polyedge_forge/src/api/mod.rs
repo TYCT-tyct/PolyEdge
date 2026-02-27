@@ -976,17 +976,6 @@ impl ApiState {
         states.insert(market_type.to_string(), next);
     }
 
-    async fn pending_reserved_quote_usdc(&self, market_type: &str) -> f64 {
-        let pending = self.list_pending_orders_for_market(market_type).await;
-        pending
-            .iter()
-            .filter(|p| {
-                p.action.eq_ignore_ascii_case("enter") || p.action.eq_ignore_ascii_case("add")
-            })
-            .map(|p| p.quote_size_usdc.max(0.0))
-            .sum::<f64>()
-    }
-
     async fn pending_reserved_quote_usdc_all(&self) -> f64 {
         let pending = self.list_pending_orders().await;
         pending
