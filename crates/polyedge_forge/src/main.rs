@@ -25,5 +25,6 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::TokyoRelay(args) => tokyo::run_tokyo_relay(args).await,
         Command::IrelandRecorder(args) => ireland::run_ireland_recorder(*args).await,
+        Command::IrelandApi(args) => ireland::run_ireland_api(*args).await,
     }
 }

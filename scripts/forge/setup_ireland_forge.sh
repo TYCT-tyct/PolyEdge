@@ -8,12 +8,18 @@ USER_NAME="${USER_NAME:-ubuntu}"
 echo "[forge-ireland] repo=$REPO_DIR data_root=$DATA_ROOT user=$USER_NAME"
 
 sudo systemctl stop \
+  polyedge-forge-ireland.service \
+  polyedge-forge-ireland-recorder.service \
+  polyedge-forge-ireland-api.service \
   polyedge-data-backend-ireland.service \
   polyedge-data-backend-api.service \
   polyedge-recorder.service \
   polyedge.service 2>/dev/null || true
 
 sudo systemctl disable \
+  polyedge-forge-ireland.service \
+  polyedge-forge-ireland-recorder.service \
+  polyedge-forge-ireland-api.service \
   polyedge-data-backend-ireland.service \
   polyedge-data-backend-api.service \
   polyedge-recorder.service \
@@ -30,7 +36,7 @@ sudo chown -R "$USER_NAME:$USER_NAME" "$DATA_ROOT"
 cd "$REPO_DIR"
 ~/.cargo/bin/cargo build -p polyedge_forge --release
 
-sudo tee /etc/systemd/system/polyedge-forge-ireland.service >/dev/null <<UNIT
+sudo tee /etc/systemd/system/polyedge-forge-ireland-recorder.service >/dev/null <<UNIT
 [Unit]
 Description=PolyEdge Forge Ireland Recorder
 After=network-online.target
@@ -43,7 +49,29 @@ Type=simple
 User=$USER_NAME
 WorkingDirectory=$REPO_DIR
 Environment=RUST_LOG=info,polyedge_forge=debug
-ExecStart=$REPO_DIR/target/release/polyedge_forge ireland-recorder --data-root $DATA_ROOT --udp-bind 0.0.0.0:9801 --sample-ms 100 --supported-symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT --active-symbols BTCUSDT --active-timeframes 5m,15m --discovery-refresh-sec 5 --clickhouse-url http://127.0.0.1:8123 --clickhouse-database polyedge_forge --clickhouse-snapshot-table snapshot_100ms --clickhouse-round-table rounds --redis-url redis://127.0.0.1:6379/0 --redis-prefix forge --redis-ttl-sec 7200 --sink-batch-size 200 --sink-flush-ms 1000 --sink-queue-cap 20000 --api-bind 0.0.0.0:9810 --dashboard-dist /home/ubuntu/PolyEdge/heatmap_dashboard/dist
+ExecStart=$REPO_DIR/target/release/polyedge_forge ireland-recorder --data-root $DATA_ROOT --udp-bind 0.0.0.0:9801 --sample-ms 100 --supported-symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT --active-symbols BTCUSDT --active-timeframes 5m,15m --discovery-refresh-sec 5 --clickhouse-url http://127.0.0.1:8123 --clickhouse-database polyedge_forge --clickhouse-snapshot-table snapshot_100ms --clickhouse-round-table rounds --redis-url redis://127.0.0.1:6379/0 --redis-prefix forge --redis-ttl-sec 7200 --sink-batch-size 200 --sink-flush-ms 1000 --sink-queue-cap 20000 --disable-api --dashboard-dist /home/ubuntu/PolyEdge/heatmap_dashboard/dist
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+sudo tee /etc/systemd/system/polyedge-forge-ireland-api.service >/dev/null <<UNIT
+[Unit]
+Description=PolyEdge Forge Ireland API + Dashboard
+After=network-online.target
+Wants=network-online.target
+After=clickhouse-server.service redis-server.service polyedge-forge-ireland-recorder.service
+Wants=clickhouse-server.service redis-server.service
+
+[Service]
+Type=simple
+User=$USER_NAME
+WorkingDirectory=$REPO_DIR
+Environment=RUST_LOG=info,polyedge_forge=debug
+ExecStart=$REPO_DIR/target/release/polyedge_forge ireland-api --bind 0.0.0.0:9810 --clickhouse-url http://127.0.0.1:8123 --redis-url redis://127.0.0.1:6379/0 --redis-prefix forge --dashboard-dist /home/ubuntu/PolyEdge/heatmap_dashboard/dist
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -57,17 +85,21 @@ sudo tee /usr/local/bin/polyedge_forge_healthcheck.sh >/dev/null <<'HC'
 #!/usr/bin/env bash
 set -euo pipefail
 
-SERVICE="polyedge-forge-ireland.service"
+RECORDER_SERVICE="polyedge-forge-ireland-recorder.service"
+API_SERVICE="polyedge-forge-ireland-api.service"
 API_URL="http://127.0.0.1:9810/health/live"
 MAX_STALE_MS=30000
 
-if ! systemctl is-active --quiet "$SERVICE"; then
-  systemctl restart "$SERVICE" || true
+if ! systemctl is-active --quiet "$RECORDER_SERVICE"; then
+  systemctl restart "$RECORDER_SERVICE" || true
+fi
+if ! systemctl is-active --quiet "$API_SERVICE"; then
+  systemctl restart "$API_SERVICE" || true
   exit 0
 fi
 
 if ! curl -fsS --max-time 2 "$API_URL" >/dev/null; then
-  systemctl restart "$SERVICE" || true
+  systemctl restart "$API_SERVICE" || true
   exit 0
 fi
 
@@ -79,7 +111,7 @@ fi
 
 now_ms="$(date +%s%3N)"
 if [[ $((now_ms - latest_ms)) -gt ${MAX_STALE_MS} ]]; then
-  systemctl restart "$SERVICE" || true
+  systemctl restart "$RECORDER_SERVICE" || true
 fi
 HC
 sudo chmod +x /usr/local/bin/polyedge_forge_healthcheck.sh
@@ -110,10 +142,13 @@ WantedBy=timers.target
 UNIT
 
 sudo systemctl daemon-reload
-sudo systemctl enable polyedge-forge-ireland.service
-sudo systemctl restart polyedge-forge-ireland.service
+sudo systemctl enable polyedge-forge-ireland-recorder.service
+sudo systemctl enable polyedge-forge-ireland-api.service
+sudo systemctl restart polyedge-forge-ireland-recorder.service
+sudo systemctl restart polyedge-forge-ireland-api.service
 sudo systemctl enable --now polyedge-forge-healthcheck.timer
-sudo systemctl --no-pager --full status polyedge-forge-ireland.service | sed -n '1,25p'
+sudo systemctl --no-pager --full status polyedge-forge-ireland-recorder.service | sed -n '1,25p'
+sudo systemctl --no-pager --full status polyedge-forge-ireland-api.service | sed -n '1,25p'
 sudo systemctl --no-pager --full status polyedge-forge-healthcheck.timer | sed -n '1,20p'
 
 echo "[forge-ireland] done"

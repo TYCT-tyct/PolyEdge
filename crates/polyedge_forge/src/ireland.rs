@@ -15,7 +15,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use crate::api::{run_api_server, ApiConfig};
-use crate::cli::IrelandRecorderArgs;
+use crate::cli::{IrelandApiArgs, IrelandRecorderArgs};
 use crate::common::{parse_lower_csv, parse_timestamp_ms, parse_upper_csv, timeframe_to_ms};
 use crate::db_sink::{normalize_opt_url, run_db_sink, DbEvent, DbSinkConfig};
 use crate::models::{
@@ -432,7 +432,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         None
     };
 
-    if !args.api_bind.trim().is_empty() {
+    if !args.disable_api && !args.api_bind.trim().is_empty() {
         let api_cfg = ApiConfig {
             bind: args.api_bind.clone(),
             clickhouse_url: normalize_opt_url(&args.clickhouse_url),
@@ -1115,6 +1115,17 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
             }
         }
     }
+}
+
+pub async fn run_ireland_api(args: IrelandApiArgs) -> Result<()> {
+    let api_cfg = ApiConfig {
+        bind: args.bind,
+        clickhouse_url: normalize_opt_url(&args.clickhouse_url),
+        redis_url: normalize_opt_url(&args.redis_url),
+        redis_prefix: args.redis_prefix,
+        dashboard_dist_dir: Some(args.dashboard_dist),
+    };
+    run_api_server(api_cfg).await
 }
 
 fn spawn_tokyo_udp_receiver(

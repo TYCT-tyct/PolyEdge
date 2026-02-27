@@ -11,6 +11,7 @@ pub struct Cli {
 pub enum Command {
     TokyoRelay(TokyoRelayArgs),
     IrelandRecorder(Box<IrelandRecorderArgs>),
+    IrelandApi(Box<IrelandApiArgs>),
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -99,6 +100,30 @@ pub struct IrelandRecorderArgs {
     pub round_end_tolerance_ms: i64,
     #[arg(long, env = "FORGE_API_BIND", default_value = "0.0.0.0:9810")]
     pub api_bind: String,
+    #[arg(long, env = "FORGE_DISABLE_API", default_value_t = false)]
+    pub disable_api: bool,
+    #[arg(
+        long,
+        env = "FORGE_DASHBOARD_DIST",
+        default_value = "/home/ubuntu/PolyEdge/heatmap_dashboard/dist"
+    )]
+    pub dashboard_dist: String,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct IrelandApiArgs {
+    #[arg(long, env = "FORGE_API_BIND", default_value = "0.0.0.0:9810")]
+    pub bind: String,
+    #[arg(long, env = "FORGE_CH_URL", default_value = "http://127.0.0.1:8123")]
+    pub clickhouse_url: String,
+    #[arg(
+        long,
+        env = "FORGE_REDIS_URL",
+        default_value = "redis://127.0.0.1:6379/0"
+    )]
+    pub redis_url: String,
+    #[arg(long, env = "FORGE_REDIS_PREFIX", default_value = "forge")]
+    pub redis_prefix: String,
     #[arg(
         long,
         env = "FORGE_DASHBOARD_DIST",
