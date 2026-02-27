@@ -9,6 +9,7 @@ from pathlib import Path
 def fetch_payload(
     base_url: str,
     market_type: str,
+    full_history: bool,
     lookback_minutes: int,
     max_trades: int,
     max_samples: int,
@@ -17,7 +18,7 @@ def fetch_payload(
 ) -> dict:
     q: dict[str, str] = {
         "market_type": market_type,
-        "full_history": "true",
+        "full_history": "true" if full_history else "false",
         "lookback_minutes": str(lookback_minutes),
         "max_trades": str(max_trades),
         "max_samples": str(max_samples),
@@ -97,6 +98,11 @@ def main() -> None:
     ap.add_argument("--url-a", default="http://127.0.0.1:9810")
     ap.add_argument("--url-b", default="http://127.0.0.1:9810")
     ap.add_argument("--market-type", default="5m")
+    ap.add_argument(
+        "--full-history",
+        action="store_true",
+        help="Request full history from API (default false to honor lookback window).",
+    )
     ap.add_argument("--lookback-minutes", type=int, default=2880)
     ap.add_argument("--max-trades", type=int, default=1500)
     ap.add_argument(
@@ -118,6 +124,7 @@ def main() -> None:
     payload_a = fetch_payload(
         args.url_a,
         args.market_type,
+        args.full_history,
         args.lookback_minutes,
         args.max_trades,
         args.max_samples,
@@ -127,6 +134,7 @@ def main() -> None:
     payload_b = fetch_payload(
         args.url_b,
         args.market_type,
+        args.full_history,
         args.lookback_minutes,
         args.max_trades,
         args.max_samples,
@@ -143,6 +151,7 @@ def main() -> None:
         "delta_b_minus_a": delta,
         "query": {
             "market_type": args.market_type,
+            "full_history": args.full_history,
             "lookback_minutes": args.lookback_minutes,
             "max_trades": args.max_trades,
             "max_samples": args.max_samples,

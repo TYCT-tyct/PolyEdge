@@ -38,10 +38,18 @@ def load_cfg(path: str | None) -> dict:
     return {k: v for k, v in raw.items() if k in PARAM_KEYS}
 
 
-def fetch_payload(base_url: str, market_type: str, lookback_minutes: int, max_trades: int, cfg: dict, timeout: int) -> dict:
+def fetch_payload(
+    base_url: str,
+    market_type: str,
+    full_history: bool,
+    lookback_minutes: int,
+    max_trades: int,
+    cfg: dict,
+    timeout: int,
+) -> dict:
     q = {
         "market_type": market_type,
-        "full_history": "true",
+        "full_history": "true" if full_history else "false",
         "lookback_minutes": str(lookback_minutes),
         "max_trades": str(max_trades),
         "use_autotune": "false",
@@ -172,6 +180,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Analyze why pnl/drawdown happen under unified baseline.")
     ap.add_argument("--base-url", default="http://127.0.0.1:9810")
     ap.add_argument("--market-type", default="5m")
+    ap.add_argument(
+        "--full-history",
+        action="store_true",
+        help="Request full history from API (default false to honor lookback window).",
+    )
     ap.add_argument("--lookback-minutes", type=int, default=1440)
     ap.add_argument("--max-trades", type=int, default=900)
     ap.add_argument("--config-a", help="baseline config json")
@@ -183,14 +196,31 @@ def main() -> None:
     cfg_a = load_cfg(args.config_a)
     cfg_b = load_cfg(args.config_b) if args.config_b else cfg_a
 
-    pa = fetch_payload(args.base_url, args.market_type, args.lookback_minutes, args.max_trades, cfg_a, args.timeout)
-    pb = fetch_payload(args.base_url, args.market_type, args.lookback_minutes, args.max_trades, cfg_b, args.timeout)
+    pa = fetch_payload(
+        args.base_url,
+        args.market_type,
+        args.full_history,
+        args.lookback_minutes,
+        args.max_trades,
+        cfg_a,
+        args.timeout,
+    )
+    pb = fetch_payload(
+        args.base_url,
+        args.market_type,
+        args.full_history,
+        args.lookback_minutes,
+        args.max_trades,
+        cfg_b,
+        args.timeout,
+    )
     aa = analyze(pa)
     bb = analyze(pb)
 
     report = {
         "query": {
             "market_type": args.market_type,
+            "full_history": args.full_history,
             "lookback_minutes": args.lookback_minutes,
             "max_trades": args.max_trades,
             "use_autotune": False,
