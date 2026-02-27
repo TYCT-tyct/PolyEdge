@@ -153,6 +153,15 @@ fn strategy_heavy_points_threshold() -> u32 {
     )
 }
 
+fn strategy_optimize_guard_max_points() -> u32 {
+    strategy_env_u32(
+        "FORGE_STRATEGY_OPTIMIZE_GUARD_MAX_POINTS",
+        60_000,
+        10_000,
+        600_000,
+    )
+}
+
 fn strategy_resolve_max_points(
     full_history: bool,
     requested_max_points: Option<u32>,
@@ -1788,7 +1797,9 @@ pub(super) fn map_sample_to_fev1(s: &StrategySample) -> fev1::Sample {
 }
 
 pub(super) fn map_samples_to_fev1(samples: &[StrategySample]) -> Vec<fev1::Sample> {
-    samples.iter().map(map_sample_to_fev1).collect()
+    let mut mapped = Vec::with_capacity(samples.len());
+    mapped.extend(samples.iter().map(map_sample_to_fev1));
+    mapped
 }
 
 pub(super) fn map_cfg_to_fev1(cfg: &StrategyRuntimeConfig) -> fev1::RuntimeConfig {
@@ -1849,8 +1860,16 @@ pub(super) fn run_strategy_simulation(
     max_trades: usize,
 ) -> StrategySimulationResult {
     let mapped_samples = map_samples_to_fev1(samples);
+    run_strategy_simulation_on_mapped(&mapped_samples, cfg, max_trades)
+}
+
+pub(super) fn run_strategy_simulation_on_mapped(
+    mapped_samples: &[fev1::Sample],
+    cfg: &StrategyRuntimeConfig,
+    max_trades: usize,
+) -> StrategySimulationResult {
     let mapped_cfg = map_cfg_to_fev1(cfg);
-    map_simulation_result(fev1::simulate(&mapped_samples, &mapped_cfg, max_trades))
+    map_simulation_result(fev1::simulate(mapped_samples, &mapped_cfg, max_trades))
 }
 
 pub(super) async fn load_strategy_samples(
@@ -2556,11 +2575,12 @@ pub(super) async fn strategy_full(
         })));
     }
 
+    let mapped_samples = map_samples_to_fev1(&samples);
     let base_cfg = StrategyRuntimeConfig::default();
     let arms = build_strategy_arms(base_cfg, max_arms);
     let mut evaluations: Vec<Value> = Vec::new();
     for (name, cfg) in &arms {
-        let run = run_strategy_simulation(&samples, cfg, max_trades);
+        let run = run_strategy_simulation_on_mapped(&mapped_samples, cfg, max_trades);
         let rs = compute_rolling_stats(&run.all_trade_pnls, window_trades);
         let objective = if rs.windows > 0 {
             rs.latest_win_rate_pct * 2.8
@@ -2884,7 +2904,8 @@ pub(super) async fn strategy_optimize(
         full_history,
         params.max_points,
         params.max_samples,
-    );
+    )
+    .min(strategy_optimize_guard_max_points());
     let _heavy_permit = strategy_acquire_heavy_permit(&state, full_history, max_points).await;
     let max_trades = params.max_trades.unwrap_or(400).clamp(20, 2000) as usize;
     let max_arms = params.max_arms.unwrap_or(8).clamp(2, 24) as usize;
@@ -2940,6 +2961,9 @@ pub(super) async fn strategy_optimize(
         recent_samples_buf = valid_samples.to_vec();
     }
     let recent_samples: &[StrategySample] = recent_samples_buf.as_slice();
+    let mapped_train_samples = map_samples_to_fev1(train_samples);
+    let mapped_valid_samples = map_samples_to_fev1(valid_samples);
+    let mapped_recent_samples = map_samples_to_fev1(recent_samples);
     let recent_target_win_rate = (target_win_rate - 2.0).clamp(40.0, 99.9);
     let recent_max_trades = std::cmp::max(valid_max_trades, window_trades * 4);
     let valid_weight = (1.0 - recent_weight).max(0.1);
@@ -2954,9 +2978,11 @@ pub(super) async fn strategy_optimize(
     let mut reached_target = false;
 
     let evaluate_candidate = |name: String, cfg: &StrategyRuntimeConfig| -> (Value, f64, bool) {
-        let train_run = run_strategy_simulation(train_samples, cfg, max_trades);
-        let valid_run = run_strategy_simulation(valid_samples, cfg, valid_max_trades);
-        let recent_run = run_strategy_simulation(recent_samples, cfg, recent_max_trades);
+        let train_run = run_strategy_simulation_on_mapped(&mapped_train_samples, cfg, max_trades);
+        let valid_run =
+            run_strategy_simulation_on_mapped(&mapped_valid_samples, cfg, valid_max_trades);
+        let recent_run =
+            run_strategy_simulation_on_mapped(&mapped_recent_samples, cfg, recent_max_trades);
 
         let (train_rs, train_obj, _train_hit) =
             score_with_rolling(&train_run, window_trades, target_win_rate);
