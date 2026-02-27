@@ -65,6 +65,8 @@ def eval_cfg(
     lookback_minutes: int,
     max_trades: int,
     max_samples: int,
+    min_trades: int,
+    win_floor: float,
     cfg: dict,
     retries: int,
 ) -> dict:
@@ -93,15 +95,20 @@ def eval_cfg(
 
     w50, a50, t50 = stat(t[-50:])
     w80, a80, t80 = stat(t[-80:])
+    n = len(t)
     max_drawdown = float(s.get("max_drawdown_cents") or 0.0)
+    sample_penalty = max(0, min_trades - n) * 8.0
+    win_penalty = max(0.0, win_floor - w50) * 20.0 + max(0.0, (win_floor - 2.0) - w80) * 12.0
     score = (
-        w50 * 10.0
-        + w80 * 4.0
-        + a50 * 4.0
-        + a80 * 2.0
-        + max(0.0, t50) * 0.02
-        - max(0.0, 90.0 - w50) * 50.0
-        - max_drawdown * 0.015
+        w50 * 6.5
+        + w80 * 4.5
+        + a50 * 2.8
+        + a80 * 1.8
+        + max(0.0, t50) * 0.03
+        + max(0.0, float(s.get("total_pnl_cents") or 0.0)) * 0.004
+        - max_drawdown * 0.9
+        - sample_penalty
+        - win_penalty
     )
     return {
         "w50": w50,
@@ -111,7 +118,7 @@ def eval_cfg(
         "a80": a80,
         "t80": t80,
         "score": score,
-        "n": len(t),
+        "n": n,
         "full": float(s.get("win_rate_pct") or 0.0),
         "total": float(s.get("total_pnl_cents") or 0.0),
         "max_drawdown": max_drawdown,
@@ -178,6 +185,8 @@ def main() -> None:
     )
     ap.add_argument("--lookback-minutes", type=int, default=1440)
     ap.add_argument("--max-trades", type=int, default=900)
+    ap.add_argument("--min-trades", type=int, default=120)
+    ap.add_argument("--win-floor", type=float, default=84.0)
     ap.add_argument("--input", required=True, help="Path to JSON containing candidate config object.")
     ap.add_argument("--iters", type=int, default=280)
     ap.add_argument(
@@ -201,6 +210,8 @@ def main() -> None:
         args.lookback_minutes,
         args.max_trades,
         args.max_samples,
+        args.min_trades,
+        args.win_floor,
         best_cfg,
         args.retries,
     )
@@ -216,6 +227,8 @@ def main() -> None:
             args.lookback_minutes,
             args.max_trades,
             args.max_samples,
+            args.min_trades,
+            args.win_floor,
             cand,
             args.retries,
         )
