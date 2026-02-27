@@ -1,6 +1,7 @@
 use super::*;
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
+use tokio::sync::OwnedSemaphorePermit;
 
 #[derive(Debug, Clone)]
 pub(super) struct StrategySample {
@@ -162,6 +163,10 @@ fn strategy_optimize_guard_max_points() -> u32 {
     )
 }
 
+fn strategy_heavy_trim_enabled() -> bool {
+    strategy_env_bool("FORGE_STRATEGY_HEAVY_TRIM", true)
+}
+
 fn strategy_resolve_max_points(
     full_history: bool,
     requested_max_points: Option<u32>,
@@ -181,12 +186,47 @@ async fn strategy_acquire_heavy_permit(
     state: &ApiState,
     full_history: bool,
     max_points: u32,
-) -> Option<tokio::sync::OwnedSemaphorePermit> {
+) -> StrategyHeavyScope {
     let heavy = full_history || max_points >= strategy_heavy_points_threshold();
     if !heavy {
-        return None;
+        return StrategyHeavyScope {
+            _permit: None,
+            trim_on_drop: false,
+        };
     }
-    state.strategy_heavy_slots.clone().acquire_owned().await.ok()
+    let permit = state.strategy_heavy_slots.clone().acquire_owned().await.ok();
+    StrategyHeavyScope {
+        _permit: permit,
+        trim_on_drop: strategy_heavy_trim_enabled(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn malloc_trim(pad: usize) -> i32;
+}
+
+fn strategy_try_trim_allocator() {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `malloc_trim` is thread-safe in glibc and can be called to return free heap pages.
+        unsafe {
+            let _ = malloc_trim(0);
+        }
+    }
+}
+
+struct StrategyHeavyScope {
+    _permit: Option<OwnedSemaphorePermit>,
+    trim_on_drop: bool,
+}
+
+impl Drop for StrategyHeavyScope {
+    fn drop(&mut self) {
+        if self.trim_on_drop {
+            strategy_try_trim_allocator();
+        }
+    }
 }
 
 fn strategy_select_profile_name() -> &'static str {
