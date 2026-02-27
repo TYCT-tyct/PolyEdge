@@ -1027,6 +1027,9 @@ impl ApiState {
         let now_ms = Utc::now().timestamp_millis();
         let scope_market = capital_scope_market(market_type, cfg);
         let mut cs = self.get_live_capital_state(scope_market, cfg).await;
+        if cs.market_type != scope_market {
+            cs.market_type = scope_market.to_string();
+        }
         if pnl_usdc.is_finite() && pnl_usdc.abs() > 1e-9 {
             cs.realized_pnl_usdc += pnl_usdc;
             cs.equity_estimate_usdc = (cs.equity_base_usdc + cs.realized_pnl_usdc).max(0.0);
@@ -1104,6 +1107,9 @@ impl ApiState {
         let scope_market = capital_scope_market(market_type, cfg);
         if !cfg.enabled {
             let mut cs = self.get_live_capital_state(scope_market, cfg).await;
+            if cs.market_type != scope_market {
+                cs.market_type = scope_market.to_string();
+            }
             cs.last_quote_usdc = base_quote_usdc.max(min_quote_usdc);
             cs.balance_sync_ok = true;
             cs.balance_sync_error = None;
@@ -1112,6 +1118,9 @@ impl ApiState {
             return (cs.last_quote_usdc, cs, true, None);
         }
         let mut cs = self.get_live_capital_state(scope_market, cfg).await;
+        if cs.market_type != scope_market {
+            cs.market_type = scope_market.to_string();
+        }
         let mut balance_sync_ok = !cfg.use_real_balance;
         let mut balance_sync_error: Option<String> = None;
         if cfg.use_real_balance {
