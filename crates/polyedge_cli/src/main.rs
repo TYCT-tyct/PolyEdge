@@ -291,16 +291,28 @@ fn cmd_data(cfg: &PolyedgeConfig, action: ServiceAction) -> Result<()> {
 fn cmd_docker(cfg: &PolyedgeConfig) -> Result<()> {
     print_header("docker", ServiceAction::Start);
     let mut failures = 0_u32;
+    let local_ireland_mode = should_use_local_exec(HostTarget::Ireland, &cfg.ireland_key);
+    let tokyo_key_exists = Path::new(&cfg.tokyo_key).exists();
 
     check_local_cmd("ssh", &["-V"], &mut failures);
     check_local_cmd("git", &["--version"], &mut failures);
     check_local_cmd("cargo", &["-V"], &mut failures);
 
-    check_path("爱尔兰密钥", &cfg.ireland_key, &mut failures);
-    check_path("东京密钥", &cfg.tokyo_key, &mut failures);
+    if local_ireland_mode {
+        warn("检测到服务器本机模式：跳过爱尔兰 SSH 密钥检查。");
+    } else {
+        check_path("爱尔兰密钥", &cfg.ireland_key, &mut failures);
+    }
+    if tokyo_key_exists {
+        check_path("东京密钥", &cfg.tokyo_key, &mut failures);
+    } else {
+        warn("未检测到东京密钥：将跳过东京 SSH/服务检查。");
+    }
 
     check_remote_echo(cfg, HostTarget::Ireland, &mut failures);
-    check_remote_echo(cfg, HostTarget::Tokyo, &mut failures);
+    if tokyo_key_exists {
+        check_remote_echo(cfg, HostTarget::Tokyo, &mut failures);
+    }
 
     check_remote_service(
         cfg,
@@ -314,12 +326,14 @@ fn cmd_docker(cfg: &PolyedgeConfig) -> Result<()> {
         &cfg.forge_proxy_service_ireland,
         &mut failures,
     );
-    check_remote_service(
-        cfg,
-        HostTarget::Tokyo,
-        &cfg.data_service_tokyo,
-        &mut failures,
-    );
+    if tokyo_key_exists {
+        check_remote_service(
+            cfg,
+            HostTarget::Tokyo,
+            &cfg.data_service_tokyo,
+            &mut failures,
+        );
+    }
 
     let health_cmd = format!(
         "curl -s -S -m 8 http://127.0.0.1:{}/health/live >/dev/null",
