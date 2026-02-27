@@ -1,4 +1,21 @@
 use super::*;
+use std::sync::OnceLock;
+
+const CLICKHOUSE_CONNECT_TIMEOUT_MS: u64 = 1_500;
+const CLICKHOUSE_REQUEST_TIMEOUT_MS: u64 = 8_000;
+
+fn clickhouse_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(CLICKHOUSE_CONNECT_TIMEOUT_MS))
+            .timeout(Duration::from_millis(CLICKHOUSE_REQUEST_TIMEOUT_MS))
+            .pool_max_idle_per_host(8)
+            .tcp_keepalive(Duration::from_secs(30))
+            .build()
+            .expect("build clickhouse reqwest client")
+    })
+}
 
 pub(super) async fn read_key_value(state: &ApiState, key: &str) -> Result<Option<Value>, ApiError> {
     let Some(client) = state.redis_client.as_ref() else {
@@ -80,7 +97,7 @@ pub(super) async fn read_key_json(state: &ApiState, key: &str) -> Result<Json<Va
 }
 
 pub(super) async fn query_clickhouse_json(ch_url: &str, query: &str) -> Result<Value, ApiError> {
-    let resp = reqwest::Client::new()
+    let resp = clickhouse_http_client()
         .post(ch_url)
         .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(query.to_string())
@@ -138,7 +155,7 @@ pub(super) async fn check_clickhouse(ch_url: Option<&str>) -> ServiceHealth {
     };
 
     let st = Instant::now();
-    let resp = reqwest::Client::new()
+    let resp = clickhouse_http_client()
         .post(url)
         .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .body("SELECT 1")

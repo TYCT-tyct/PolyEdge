@@ -34,7 +34,7 @@ pub(super) async fn ws_live(
 }
 
 pub(super) async fn ws_live_loop(mut socket: WebSocket, state: ApiState) {
-    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    let mut interval = tokio::time::interval(Duration::from_millis(350));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_payload = String::new();
 
@@ -277,6 +277,9 @@ pub(super) fn compact_live_snapshot(snapshot: &Value, market_type: &str) -> Valu
 }
 
 pub(super) async fn latest_all(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    if let Some(cached) = state.chart_cache_get("latest_all").await {
+        return Ok(Json(cached));
+    }
     let now_ms = Utc::now().timestamp_millis();
     if let Some(v) = read_key_value(
         &state,
@@ -296,7 +299,11 @@ pub(super) async fn latest_all(State(state): State<ApiState>) -> Result<Json<Val
                     }
                 })
                 .collect::<Vec<_>>();
-            return Ok(Json(Value::Array(filtered)));
+            let payload = Value::Array(filtered);
+            state
+                .chart_cache_put("latest_all".to_string(), payload.clone())
+                .await;
+            return Ok(Json(payload));
         }
     }
 
@@ -310,7 +317,11 @@ pub(super) async fn latest_all(State(state): State<ApiState>) -> Result<Json<Val
             }
         }
     }
-    Ok(Json(Value::Array(rows)))
+    let payload = Value::Array(rows);
+    state
+        .chart_cache_put("latest_all".to_string(), payload.clone())
+        .await;
+    Ok(Json(payload))
 }
 
 pub(super) async fn latest_timeframe(

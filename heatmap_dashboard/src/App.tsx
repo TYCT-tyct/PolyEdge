@@ -45,11 +45,11 @@ const WINDOW_OPTIONS: Array<{ value: WindowType; label: string }> = [
   { value: "all", label: "All" }
 ];
 
-const LIVE_POLL_MS = 1_200;
+const LIVE_POLL_MS = 2_200;
 const WS_STALE_FALLBACK_MS = 3000;
 const LIVE_UI_MIN_INTERVAL_MS = 900;
 const ET_TIMEZONE = "America/New_York";
-const COLLECTOR_POLL_MS = 5_000;
+const COLLECTOR_POLL_MS = 10_000;
 const SYMBOL_OPTIONS: Array<{ value: MarketSymbol; label: string }> = [
   { value: "BTCUSDT", label: "Bitcoin" },
   { value: "ETHUSDT", label: "Ethereum" },
@@ -971,6 +971,9 @@ export default function App() {
       if (!alive || inFlight) {
         return;
       }
+      if (document.visibilityState !== "visible") {
+        return;
+      }
       if (
         wsStatusRef.current === "open" &&
         Date.now() - (lastWsTickMsRef.current || 0) < WS_STALE_FALLBACK_MS &&
@@ -1068,6 +1071,9 @@ export default function App() {
     }
     const disconnect = connectLiveWs(
       (payload) => {
+        if (document.visibilityState !== "visible") {
+          return;
+        }
         if (selectedSymbolRef.current !== "BTCUSDT") {
           return;
         }
@@ -1103,6 +1109,9 @@ export default function App() {
     }
     let alive = true;
     const run = async () => {
+      if (document.visibilityState !== "visible") {
+        return;
+      }
       try {
         const value = await getStats(selectedSymbol);
         if (alive) {
@@ -1116,7 +1125,7 @@ export default function App() {
       }
     };
     void run();
-    const id = window.setInterval(run, 10_000);
+    const id = window.setInterval(run, 30_000);
     return () => {
       alive = false;
       window.clearInterval(id);
@@ -1155,9 +1164,10 @@ export default function App() {
                 : 7_500;
       timer = window.setTimeout(loop, delay);
     };
-    void loop();
+    const first = window.setTimeout(loop, 1_500);
     return () => {
       alive = false;
+      window.clearTimeout(first);
       if (timer != null) {
         window.clearTimeout(timer);
       }
@@ -1196,9 +1206,10 @@ export default function App() {
                 : 9_500;
       timer = window.setTimeout(loop, delay);
     };
-    void loop();
+    const first = window.setTimeout(loop, 1_800);
     return () => {
       alive = false;
+      window.clearTimeout(first);
       if (timer != null) {
         window.clearTimeout(timer);
       }
@@ -1237,7 +1248,7 @@ export default function App() {
       }
     };
     const first = window.setTimeout(load, 1_200);
-    const id = window.setInterval(load, 20_000);
+    const id = window.setInterval(load, 45_000);
     return () => {
       alive = false;
       window.clearTimeout(first);
