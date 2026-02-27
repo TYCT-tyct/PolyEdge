@@ -236,11 +236,14 @@ pub(super) async fn gate_live_decisions(
             continue;
         }
         if matches!(action.as_str(), "exit" | "reduce") && has_enter_pending {
-            skipped.push(json!({
-                "reason": "entry_pending_not_filled",
-                "decision": normalized
-            }));
-            continue;
+            // Exit signals must not be blocked by entry pending.
+            // Execution layer will actively cancel entry/add pendings first.
+            if let Some(obj) = normalized.as_object_mut() {
+                obj.insert(
+                    "pre_exit_cancel_entry_pending".to_string(),
+                    Value::Bool(true),
+                );
+            }
         }
         let decision_key = live_decision_key(market_type, &normalized);
         let should_submit = if action == "enter" {
@@ -959,7 +962,8 @@ struct PendingFillMeta {
 }
 
 fn value_as_f64(v: &Value) -> Option<f64> {
-    v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
 }
 
 fn collect_f64_by_key(node: &Value, target_key: &str, out: &mut Vec<f64>) {
@@ -1004,13 +1008,21 @@ fn normalize_usdc_amount(v: f64) -> f64 {
     }
 }
 
-fn extract_pending_fill_meta(fill_event: Option<&Value>, pending: &LivePendingOrder) -> PendingFillMeta {
+fn extract_pending_fill_meta(
+    fill_event: Option<&Value>,
+    pending: &LivePendingOrder,
+) -> PendingFillMeta {
     let Some(fill) = fill_event else {
         return PendingFillMeta::default();
     };
     let price_cents_direct = collect_candidates(
         fill,
-        &["price_cents", "fill_price_cents", "filled_price_cents", "avg_price_cents"],
+        &[
+            "price_cents",
+            "fill_price_cents",
+            "filled_price_cents",
+            "avg_price_cents",
+        ],
     )
     .into_iter()
     .find(|v| *v > 0.0);
@@ -1028,9 +1040,8 @@ fn extract_pending_fill_meta(fill_event: Option<&Value>, pending: &LivePendingOr
     )
     .into_iter()
     .find(|v| *v > 0.0);
-    let fill_price_cents = price_cents_direct.or_else(|| {
-        price_prob.map(|v| if v <= 1.5 { v * 100.0 } else { v })
-    });
+    let fill_price_cents =
+        price_cents_direct.or_else(|| price_prob.map(|v| if v <= 1.5 { v * 100.0 } else { v }));
 
     let quote_direct = collect_candidates(
         fill,
@@ -1048,7 +1059,13 @@ fn extract_pending_fill_meta(fill_event: Option<&Value>, pending: &LivePendingOr
 
     let size_candidates = collect_candidates(
         fill,
-        &["filled_size", "executed_size", "matched_size", "accepted_size", "size"],
+        &[
+            "filled_size",
+            "executed_size",
+            "matched_size",
+            "accepted_size",
+            "size",
+        ],
     );
     let quote_from_size = if let (Some(px_c), Some(sz)) = (
         fill_price_cents,
@@ -1060,29 +1077,33 @@ fn extract_pending_fill_meta(fill_event: Option<&Value>, pending: &LivePendingOr
     };
     let fill_quote_usdc = quote_direct.or(quote_from_size);
 
-    let fee_usdc = collect_candidates(fill, &["fee_usdc", "total_fee_usdc", "fee", "fees", "total_fee"])
-        .into_iter()
-        .map(normalize_usdc_amount)
-        .fold(0.0, |acc, v| acc + v);
+    let fee_usdc = collect_candidates(
+        fill,
+        &["fee_usdc", "total_fee_usdc", "fee", "fees", "total_fee"],
+    )
+    .into_iter()
+    .map(normalize_usdc_amount)
+    .fold(0.0, |acc, v| acc + v);
 
     let explicit_slippage_usdc = collect_candidates(fill, &["slippage_usdc"])
         .into_iter()
         .map(normalize_usdc_amount)
         .fold(0.0, |acc, v| acc + v);
 
-    let inferred_slippage_usdc = if let (Some(px_c), Some(quote)) = (fill_price_cents, fill_quote_usdc) {
-        let expected_c = pending.price_cents.max(0.01);
-        let shares = quote / (px_c / 100.0).max(0.0001);
-        let action = pending.action.to_ascii_lowercase();
-        let adverse_cents = if action == "enter" || action == "add" {
-            (px_c - expected_c).max(0.0)
+    let inferred_slippage_usdc =
+        if let (Some(px_c), Some(quote)) = (fill_price_cents, fill_quote_usdc) {
+            let expected_c = pending.price_cents.max(0.01);
+            let shares = quote / (px_c / 100.0).max(0.0001);
+            let action = pending.action.to_ascii_lowercase();
+            let adverse_cents = if action == "enter" || action == "add" {
+                (px_c - expected_c).max(0.0)
+            } else {
+                (expected_c - px_c).max(0.0)
+            };
+            ((adverse_cents / 100.0) * shares).max(0.0)
         } else {
-            (expected_c - px_c).max(0.0)
+            0.0
         };
-        ((adverse_cents / 100.0) * shares).max(0.0)
-    } else {
-        0.0
-    };
 
     PendingFillMeta {
         fill_price_cents,
@@ -1103,7 +1124,10 @@ pub(super) async fn apply_pending_confirmation(
     let capital_cfg = LiveCapitalConfig::from_env();
     let action = pending.action.to_ascii_lowercase();
     let fill_meta = extract_pending_fill_meta(fill_event, pending);
-    let fill_price_cents = fill_meta.fill_price_cents.unwrap_or(pending.price_cents).max(0.01);
+    let fill_price_cents = fill_meta
+        .fill_price_cents
+        .unwrap_or(pending.price_cents)
+        .max(0.01);
     let fill_quote_usdc = fill_meta
         .fill_quote_usdc
         .unwrap_or(pending.quote_size_usdc.max(0.0))
@@ -2398,14 +2422,149 @@ pub(super) async fn handle_live_pending_timeouts(
     }
 }
 
+pub(super) async fn flush_entry_pending_before_exit(
+    state: &ApiState,
+    gateway_cfg: &LiveGatewayConfig,
+    mode: LiveExecutorMode,
+    market_type: &str,
+) -> usize {
+    let pending_rows = state
+        .list_pending_orders_for_market(market_type)
+        .await
+        .into_iter()
+        .filter(|row| {
+            let action = row.action.to_ascii_lowercase();
+            action == "enter" || action == "add"
+        })
+        .collect::<Vec<_>>();
+    if pending_rows.is_empty() {
+        return 0;
+    }
+
+    let mut cancelled = 0usize;
+    let client = state.gateway_http_client.as_ref();
+    let rust_ctx = if matches!(mode, LiveExecutorMode::RustSdk) {
+        get_or_init_rust_executor(state).await.ok()
+    } else {
+        None
+    };
+
+    for row in pending_rows {
+        let mut cancel_ok = false;
+        let mut cancel_detail = Value::Null;
+        let mut cancel_path = "gateway".to_string();
+
+        if let Some(ctx) = rust_ctx.as_ref() {
+            cancel_path = "rust_sdk".to_string();
+            match ctx.client.cancel_order(&row.order_id).await {
+                Ok(resp) => {
+                    cancel_ok = true;
+                    cancel_detail = json!({
+                        "cancelled": resp.canceled,
+                        "not_cancelled": resp.not_canceled
+                    });
+                }
+                Err(err) => {
+                    cancel_detail = json!({ "rust_error": err.to_string() });
+                }
+            }
+        }
+
+        if !cancel_ok {
+            let mut endpoint = gateway_cfg.primary_url.clone();
+            let mut cancel_res =
+                delete_gateway_order(client, gateway_cfg.timeout_ms, &endpoint, &row.order_id)
+                    .await;
+            if cancel_res.is_err() {
+                if let Some(backup) = gateway_cfg.backup_url.as_deref() {
+                    endpoint = backup.to_string();
+                    cancel_res = delete_gateway_order(
+                        client,
+                        gateway_cfg.timeout_ms,
+                        &endpoint,
+                        &row.order_id,
+                    )
+                    .await;
+                }
+            }
+            match cancel_res {
+                Ok(v) => {
+                    cancel_ok = true;
+                    cancel_path = format!("gateway:{endpoint}");
+                    cancel_detail = v;
+                }
+                Err(err) => {
+                    if cancel_detail.is_null() {
+                        cancel_detail = json!({ "gateway_error": err });
+                    }
+                }
+            }
+        }
+
+        if cancel_ok {
+            let _ = state.remove_pending_order(&row.order_id).await;
+            apply_pending_revert(state, &row, "pre_exit_cancelled").await;
+            cancelled = cancelled.saturating_add(1);
+            state
+                .append_live_event(
+                    &row.market_type,
+                    json!({
+                        "accepted": true,
+                        "action": row.action,
+                        "side": row.side,
+                        "round_id": row.round_id,
+                        "reason": "pre_exit_cancelled",
+                        "order_id": row.order_id,
+                        "cancel_path": cancel_path,
+                        "cancel_response": cancel_detail
+                    }),
+                )
+                .await;
+        } else {
+            state
+                .append_live_event(
+                    &row.market_type,
+                    json!({
+                        "accepted": false,
+                        "action": row.action,
+                        "side": row.side,
+                        "round_id": row.round_id,
+                        "reason": "pre_exit_cancel_failed",
+                        "order_id": row.order_id,
+                        "cancel_path": cancel_path,
+                        "cancel_response": cancel_detail
+                    }),
+                )
+                .await;
+        }
+    }
+
+    cancelled
+}
+
 pub(super) async fn execute_live_orders(
     state: &ApiState,
     gateway_cfg: &LiveGatewayConfig,
     mode: LiveExecutorMode,
+    market_type: &str,
     target: &LiveMarketTarget,
     position_state: &LivePositionState,
     decisions: &[LiveGatedDecision],
 ) -> Vec<Value> {
+    let has_exit_like = decisions.iter().any(|d| {
+        d.decision
+            .get("action")
+            .and_then(Value::as_str)
+            .map(|a| {
+                let a = a.to_ascii_lowercase();
+                a == "exit" || a == "reduce"
+            })
+            .unwrap_or(false)
+    });
+    if has_exit_like {
+        let _ = flush_entry_pending_before_exit(state, gateway_cfg, mode, market_type).await;
+    }
+
     match mode {
         LiveExecutorMode::Gateway => {
             execute_live_orders_via_gateway(state, gateway_cfg, target, position_state, decisions)

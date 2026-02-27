@@ -186,7 +186,7 @@ fn max_add_layers_by_equity(base_layers: u32, equity: f64) -> u32 {
     } else {
         base_layers
     };
-    base_layers.min(cap).max(1)
+    base_layers.min(cap)
 }
 
 fn capital_scope_market<'a>(market_type: &'a str, cfg: &LiveCapitalConfig) -> &'a str {
@@ -702,7 +702,7 @@ impl LiveCapitalConfig {
                 5_000,
                 600_000
             ),
-            max_add_layers: env_typed!(u32, "FORGE_FEV1_CAPITAL_MAX_ADD_LAYERS", 3, 1, 8),
+            max_add_layers: env_typed!(u32, "FORGE_FEV1_CAPITAL_MAX_ADD_LAYERS", 3, 0, 8),
             kelly_min_samples: env_typed!(
                 usize,
                 "FORGE_FEV1_CAPITAL_KELLY_MIN_SAMPLES",
@@ -814,7 +814,7 @@ impl LiveRuntimeConfig {
         let loop_interval_ms = std::env::var("FORGE_FEV1_RUNTIME_LOOP_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(700)
+            .unwrap_or(450)
             .clamp(200, 10_000);
         let lookback_minutes = std::env::var("FORGE_FEV1_RUNTIME_LOOKBACK_MINUTES")
             .ok()
@@ -824,12 +824,12 @@ impl LiveRuntimeConfig {
         let max_points = std::env::var("FORGE_FEV1_RUNTIME_MAX_POINTS")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(220_000)
+            .unwrap_or(140_000)
             .clamp(20_000, 1_000_000);
         let max_trades = std::env::var("FORGE_FEV1_RUNTIME_MAX_TRADES")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(160)
+            .unwrap_or(120)
             .clamp(20, 500);
         let max_orders = std::env::var("FORGE_FEV1_RUNTIME_MAX_ORDERS")
             .ok()
@@ -1324,7 +1324,9 @@ impl ApiState {
         // Base quote remains a fallback anchor only when balance is unavailable.
         let base_anchor = base_quote_usdc.max(quote_floor);
         let quote = if cfg.use_real_balance && balance_sync_ok {
-            quote_by_capital.max(quote_floor).clamp(quote_floor, 2_000.0)
+            quote_by_capital
+                .max(quote_floor)
+                .clamp(quote_floor, 2_000.0)
         } else {
             base_anchor
                 .min(quote_by_capital.max(quote_floor))

@@ -140,9 +140,19 @@ fn strategy_min_points() -> u32 {
 
 fn strategy_guard_max_points(full_history: bool) -> u32 {
     if full_history {
-        strategy_env_u32("FORGE_STRATEGY_GUARD_MAX_POINTS_FULL", 120_000, 10_000, 2_000_000)
+        strategy_env_u32(
+            "FORGE_STRATEGY_GUARD_MAX_POINTS_FULL",
+            120_000,
+            10_000,
+            2_000_000,
+        )
     } else {
-        strategy_env_u32("FORGE_STRATEGY_GUARD_MAX_POINTS_SHORT", 80_000, 10_000, 1_000_000)
+        strategy_env_u32(
+            "FORGE_STRATEGY_GUARD_MAX_POINTS_SHORT",
+            80_000,
+            10_000,
+            1_000_000,
+        )
     }
 }
 
@@ -195,7 +205,12 @@ async fn strategy_acquire_heavy_permit(
             trim_on_drop: false,
         };
     }
-    let permit = state.strategy_heavy_slots.clone().acquire_owned().await.ok();
+    let permit = state
+        .strategy_heavy_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .ok();
     StrategyHeavyScope {
         _permit: permit,
         trim_on_drop: strategy_heavy_trim_enabled(),
@@ -1280,6 +1295,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                     state,
                     &live_gateway_cfg,
                     live_executor_mode,
+                    market_type,
                     target,
                     &live_position_state,
                     &gated_decisions,
@@ -1396,9 +1412,9 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                                     .to_string(),
                                 submitted_ts_ms: ts_ms,
                                 cancel_after_ms: if action == "exit" || action == "reduce" {
-                                    2200
+                                    900
                                 } else {
-                                    3600
+                                    1500
                                 },
                                 retry_count: 0,
                             };
@@ -2417,7 +2433,10 @@ pub(super) async fn strategy_live_control(
     }
 
     let position = state.get_live_position_state(market_type).await;
-    let pending_count = state.list_pending_orders_for_market(market_type).await.len();
+    let pending_count = state
+        .list_pending_orders_for_market(market_type)
+        .await
+        .len();
     let flatten_done = position.side.is_none() && pending_count == 0;
     if matches!(control.mode, LiveRuntimeControlMode::GracefulStop)
         && flatten_done
@@ -2756,11 +2775,8 @@ pub(super) async fn strategy_full(
         .lookback_minutes
         .unwrap_or(if full_history { 30 * 24 * 60 } else { 12 * 60 })
         .clamp(30, 365 * 24 * 60);
-    let max_points = strategy_resolve_max_points(
-        full_history,
-        params.max_points,
-        params.max_samples,
-    );
+    let max_points =
+        strategy_resolve_max_points(full_history, params.max_points, params.max_samples);
     let _heavy_permit = strategy_acquire_heavy_permit(&state, full_history, max_points).await;
     let max_trades = params.max_trades.unwrap_or(300).clamp(20, 1000) as usize;
     let max_arms = params.max_arms.unwrap_or(8).clamp(2, 24) as usize;
@@ -3109,12 +3125,9 @@ pub(super) async fn strategy_optimize(
         .lookback_minutes
         .unwrap_or(if full_history { 30 * 24 * 60 } else { 12 * 60 })
         .clamp(30, 365 * 24 * 60);
-    let max_points = strategy_resolve_max_points(
-        full_history,
-        params.max_points,
-        params.max_samples,
-    )
-    .min(strategy_optimize_guard_max_points());
+    let max_points =
+        strategy_resolve_max_points(full_history, params.max_points, params.max_samples)
+            .min(strategy_optimize_guard_max_points());
     let _heavy_permit = strategy_acquire_heavy_permit(&state, full_history, max_points).await;
     let max_trades = params.max_trades.unwrap_or(400).clamp(20, 2000) as usize;
     let max_arms = params.max_arms.unwrap_or(8).clamp(2, 24) as usize;
