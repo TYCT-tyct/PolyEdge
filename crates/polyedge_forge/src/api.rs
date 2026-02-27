@@ -1877,7 +1877,18 @@ async fn live_runtime_loop(state: ApiState, bootstrap: LiveRuntimeConfig) {
 
         for market in &cfg.markets {
             let market_type = market.as_str();
-            let strategy_cfg = StrategyRuntimeConfig::default();
+            let mut strategy_cfg = StrategyRuntimeConfig::default();
+            let mut runtime_cfg_source = "live_default";
+            let mut runtime_autotune_doc = Value::Null;
+            let mut runtime_autotune_live_key = Value::Null;
+            if let Ok((live_doc_opt, live_key)) = resolve_autotune_live_doc(&state, market_type).await {
+                runtime_autotune_live_key = Value::String(live_key);
+                if let Some(live_doc) = live_doc_opt {
+                    strategy_cfg = strategy_cfg_from_payload(strategy_cfg, &live_doc);
+                    runtime_cfg_source = "live_pinned_autotune";
+                    runtime_autotune_doc = live_doc;
+                }
+            }
             match strategy_paper_live(
                 &state,
                 market_type,
@@ -1886,6 +1897,9 @@ async fn live_runtime_loop(state: ApiState, bootstrap: LiveRuntimeConfig) {
                 cfg.max_points,
                 cfg.max_trades,
                 &strategy_cfg,
+                runtime_cfg_source,
+                runtime_autotune_doc,
+                runtime_autotune_live_key,
                 cfg.live_execute,
                 cfg.quote_usdc,
                 cfg.max_orders,
@@ -2321,12 +2335,6 @@ async fn latest_all(State(state): State<ApiState>) -> Result<Json<Value>, ApiErr
         if let Some(arr) = v.as_array() {
             let filtered = arr
                 .iter()
-                .filter(|row| {
-                    row.get("symbol")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .eq_ignore_ascii_case("BTCUSDT")
-                })
                 .filter_map(|row| {
                     let tf = row.get("timeframe").and_then(Value::as_str)?;
                     if is_live_snapshot_fresh(row, tf, now_ms) {
@@ -2341,11 +2349,14 @@ async fn latest_all(State(state): State<ApiState>) -> Result<Json<Value>, ApiErr
     }
 
     let mut rows = Vec::<Value>::new();
-    if let Some(v) = fetch_latest_snapshot(&state, "BTCUSDT", "5m").await? {
-        rows.push(v);
-    }
-    if let Some(v) = fetch_latest_snapshot(&state, "BTCUSDT", "15m").await? {
-        rows.push(v);
+    const SYMBOLS: [&str; 4] = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"];
+    const TFS: [&str; 2] = ["5m", "15m"];
+    for symbol in SYMBOLS {
+        for tf in TFS {
+            if let Some(v) = fetch_latest_snapshot(&state, symbol, tf).await? {
+                rows.push(v);
+            }
+        }
     }
     Ok(Json(Value::Array(rows)))
 }
@@ -2987,6 +2998,10 @@ fn strategy_autotune_active_key(redis_prefix: &str, market_type: &str) -> String
     format!("{redis_prefix}:strategy:autotune:active:{market_type}")
 }
 
+fn strategy_autotune_live_key(redis_prefix: &str, market_type: &str) -> String {
+    format!("{redis_prefix}:strategy:autotune:live:{market_type}")
+}
+
 fn strategy_autotune_active_history_key(redis_prefix: &str, market_type: &str) -> String {
     format!("{redis_prefix}:strategy:autotune:active:{market_type}:history")
 }
@@ -3008,6 +3023,15 @@ async fn resolve_autotune_active_doc(
     market_type: &str,
 ) -> Result<(Option<Value>, String), ApiError> {
     let key = strategy_autotune_active_key(&state.redis_prefix, market_type);
+    let payload = read_key_value(state, &key).await?;
+    Ok((payload, key))
+}
+
+async fn resolve_autotune_live_doc(
+    state: &ApiState,
+    market_type: &str,
+) -> Result<(Option<Value>, String), ApiError> {
+    let key = strategy_autotune_live_key(&state.redis_prefix, market_type);
     let payload = read_key_value(state, &key).await?;
     Ok((payload, key))
 }
@@ -4196,6 +4220,9 @@ async fn strategy_paper_live(
     max_points: u32,
     max_trades: usize,
     cfg: &StrategyRuntimeConfig,
+    config_source: &str,
+    autotune_doc: Value,
+    autotune_live_key: Value,
     live_execute: bool,
     live_quote_usdc: f64,
     live_max_orders: usize,
@@ -4865,9 +4892,10 @@ async fn strategy_paper_live(
         "lookback_minutes": lookback_minutes,
         "full_history": full_history,
         "samples": samples.len(),
-        "config_source": "live_gate",
+        "config_source": config_source,
         "baseline_profile": STRATEGY_BASELINE_PROFILE,
-        "autotune": Value::Null,
+        "autotune": autotune_doc,
+        "autotune_live_key": autotune_live_key,
         "config": strategy_cfg_json(cfg),
         "current": run.current,
         "summary": run_summary_json(&map_simulation_result(run.clone())),
@@ -7415,6 +7443,7 @@ async fn strategy_paper(
     let mut autotune_info = Value::Null;
     let mut autotune_key_used = Value::Null;
     let (active_opt, active_key_used) = resolve_autotune_active_doc(&state, market_type).await?;
+    let (live_opt, live_key_used) = resolve_autotune_live_doc(&state, market_type).await?;
     if use_autotune {
         if let Some(active) = active_opt {
             cfg = strategy_cfg_from_payload(cfg, &active);
@@ -7552,6 +7581,8 @@ async fn strategy_paper(
             "market_type": market_type,
             "autotune_context": autotune_context,
             "autotune_active_key": active_key_used,
+            "autotune_live_key": live_key_used,
+            "autotune_live_found": live_opt.is_some(),
             "lookback_minutes": lookback_minutes,
             "samples": samples.len(),
             "current": Value::Null,
@@ -7587,6 +7618,8 @@ async fn strategy_paper(
         "market_type": market_type,
         "autotune_context": autotune_context,
         "autotune_active_key": active_key_used,
+        "autotune_live_key": live_key_used,
+        "autotune_live_found": live_opt.is_some(),
         "lookback_minutes": lookback_minutes,
         "full_history": full_history,
         "samples": samples.len(),
@@ -7757,6 +7790,7 @@ async fn strategy_autotune_latest(
     let context = normalize_autotune_context(params.context.as_deref(), market_type);
     let (payload, key, from_legacy) = resolve_autotune_doc(&state, &context, market_type).await?;
     let (active_payload, active_key) = resolve_autotune_active_doc(&state, market_type).await?;
+    let (live_payload, live_key) = resolve_autotune_live_doc(&state, market_type).await?;
     Ok(Json(json!({
         "market_type": market_type,
         "context": context,
@@ -7767,6 +7801,9 @@ async fn strategy_autotune_latest(
         "active_key": active_key,
         "active_found": active_payload.is_some(),
         "active_data": active_payload,
+        "live_key": live_key,
+        "live_found": live_payload.is_some(),
+        "live_data": live_payload,
     })))
 }
 
@@ -8582,6 +8619,7 @@ async fn strategy_optimize(
     let persist_ttl_sec = params.persist_ttl_sec.filter(|v| *v > 0);
     let persist_key = strategy_autotune_key(&state.redis_prefix, &autotune_context);
     let active_key = strategy_autotune_active_key(&state.redis_prefix, market_type);
+    let live_key = strategy_autotune_live_key(&state.redis_prefix, market_type);
     let active_history_key = strategy_autotune_active_history_key(&state.redis_prefix, market_type);
     let mut persist_error: Option<String> = None;
     let mut persisted = false;
@@ -8646,23 +8684,40 @@ async fn strategy_optimize(
                     {
                         promotion_error = Some(e.message);
                     } else {
-                        promoted = true;
-                        active_saved_doc = promote_doc.clone();
-                        let mut history: Vec<Value> = read_key_value(&state, &active_history_key)
-                            .await?
-                            .and_then(|v| v.as_array().cloned())
-                            .unwrap_or_default();
-                        history.insert(0, promote_doc);
-                        if history.len() > 40 {
-                            history.truncate(40);
+                        if let Err(e) =
+                            write_key_value(&state, &live_key, &promote_doc, persist_ttl_sec).await
+                        {
+                            if let Some(active_before) = active_before_opt.as_ref() {
+                                let _ = write_key_value(
+                                    &state,
+                                    &active_key,
+                                    active_before,
+                                    persist_ttl_sec,
+                                )
+                                .await;
+                            } else {
+                                let _ = delete_key(&state, &active_key).await;
+                            }
+                            promotion_error = Some(format!("live_pinned_write_failed: {}", e.message));
+                        } else {
+                            promoted = true;
+                            active_saved_doc = promote_doc.clone();
+                            let mut history: Vec<Value> = read_key_value(&state, &active_history_key)
+                                .await?
+                                .and_then(|v| v.as_array().cloned())
+                                .unwrap_or_default();
+                            history.insert(0, promote_doc);
+                            if history.len() > 40 {
+                                history.truncate(40);
+                            }
+                            let _ = write_key_value(
+                                &state,
+                                &active_history_key,
+                                &Value::Array(history),
+                                None,
+                            )
+                            .await;
                         }
-                        let _ = write_key_value(
-                            &state,
-                            &active_history_key,
-                            &Value::Array(history),
-                            None,
-                        )
-                        .await;
                     }
                 }
             }
@@ -8701,6 +8756,7 @@ async fn strategy_optimize(
             "reason": promotion_reason,
             "error": promotion_error,
             "active_key": active_key,
+            "live_key": live_key,
             "active_history_key": active_history_key,
             "active_before_found": active_before_opt.is_some(),
             "active_saved": active_saved_doc,

@@ -1,4 +1,5 @@
 export type MarketType = "5m" | "15m";
+export type MarketSymbol = "BTCUSDT" | "ETHUSDT" | "SOLUSDT" | "XRPUSDT";
 export type WindowType = "5m" | "15m" | "30m" | "1h" | "2h" | "4h" | "all";
 
 export interface LiveSnapshot {
@@ -252,6 +253,8 @@ export interface StrategyPaperResponse {
   market_type: string;
   autotune_context?: string;
   autotune_active_key?: string;
+  autotune_live_key?: string;
+  autotune_live_found?: boolean;
   lookback_minutes: number;
   samples: number;
   config_source?: string;

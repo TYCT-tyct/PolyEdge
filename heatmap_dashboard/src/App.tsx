@@ -28,6 +28,7 @@ import type {
   HeatmapCell,
   HeatmapResponse,
   LiveSnapshot,
+  MarketSymbol,
   MarketType,
   RoundHistoryRow,
   RoundChartResponse,
@@ -57,6 +58,12 @@ const STRATEGY_POLL_MAX_MS = 20_000;
 const AUTOTUNE_POLL_MIN_MS = 6_000;
 const AUTOTUNE_POLL_MAX_MS = 60_000;
 type StrategyPaperSource = "replay" | "live";
+const SYMBOL_OPTIONS: Array<{ value: MarketSymbol; label: string }> = [
+  { value: "BTCUSDT", label: "Bitcoin" },
+  { value: "ETHUSDT", label: "Ethereum" },
+  { value: "SOLUSDT", label: "Solana" },
+  { value: "XRPUSDT", label: "XRP" }
+];
 const STRATEGY_PAPER_PROFILE = Object.freeze({
   lookbackMinutes: 24 * 60,
   maxTrades: 180,
@@ -652,7 +659,7 @@ function MarketSection({
         <div>
           <h2>{title}</h2>
           <p className="muted">
-            BTC {formatUsd(live?.btc_price)} | 目标价 {formatUsd(live?.target_price)} | Δ{" "}
+            标的价 {formatUsd(live?.btc_price)} | 目标价 {formatUsd(live?.target_price)} | Δ{" "}
             <span className={(live?.delta_pct ?? 0) >= 0 ? "up" : "down"}>{formatPct(live?.delta_pct)}</span>
           </p>
         </div>
@@ -834,7 +841,7 @@ const RoundHistoryPanel = memo(function RoundHistoryPanel({
             <tr>
               <th>结束时间</th>
               <th>目标价</th>
-              <th>结算BTC</th>
+              <th>结算价</th>
               <th>偏离</th>
               <th>结果</th>
               <th>市场价</th>
@@ -958,6 +965,55 @@ const StrategyPanel = memo(function StrategyPanel({
         : "";
     return { savedAt, sourceTag, note };
   }, [autotuneLatest]);
+  const effectiveConfigRows = useMemo(() => {
+    const rawCfg = data?.config && typeof data.config === "object"
+      ? (data.config as Record<string, unknown>)
+      : null;
+    if (!rawCfg) {
+      return [];
+    }
+    const preferredOrder = [
+      "entry_threshold_base",
+      "entry_threshold_cap",
+      "entry_edge_prob",
+      "entry_min_potential_cents",
+      "entry_max_price_cents",
+      "spread_limit_prob",
+      "min_hold_ms",
+      "stop_loss_cents",
+      "trail_activate_profit_cents",
+      "trail_drawdown_cents",
+      "reverse_signal_threshold",
+      "reverse_signal_ticks",
+      "max_exec_spread_cents",
+      "slippage_cents_per_side",
+      "fee_cents_per_side",
+      "cooldown_ms",
+      "max_entries_per_round",
+      "liquidity_widen_prob",
+      "take_profit_near_max_cents",
+      "endgame_take_profit_cents",
+      "endgame_remaining_ms",
+      "emergency_wide_spread_penalty_ratio",
+    ];
+    const allKeys = Object.keys(rawCfg);
+    const orderedKeys = [
+      ...preferredOrder.filter((k) => allKeys.includes(k)),
+      ...allKeys.filter((k) => !preferredOrder.includes(k)).sort(),
+    ];
+    return orderedKeys.map((key) => {
+      const value = rawCfg[key];
+      let rendered = "--";
+      if (typeof value === "number" && Number.isFinite(value)) {
+        rendered = Number.isInteger(value) ? value.toString() : value.toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
+      } else if (typeof value === "boolean") {
+        rendered = value ? "true" : "false";
+      } else if (typeof value === "string" && value.length > 0) {
+        rendered = value;
+      }
+      return { key, rendered };
+    });
+  }, [data?.config]);
   const liveExec = data?.live_execution;
   const liveState = liveExec?.state_machine;
   const liveCapital = liveExec?.capital;
@@ -1170,6 +1226,7 @@ const StrategyPanel = memo(function StrategyPanel({
             <span>source={data?.source ?? "--"}</span>
             <span>config={data?.config_source ?? "--"}</span>
             <span>activeKey={typeof data?.autotune_active_key === "string" ? data.autotune_active_key : "--"}</span>
+            <span>liveKey={typeof data?.autotune_live_key === "string" ? data.autotune_live_key : "--"}</span>
           </div>
         </div>
         <div className="autotune-kpis">
@@ -1188,6 +1245,30 @@ const StrategyPanel = memo(function StrategyPanel({
             <strong>{autotuneLatestDoc?.note || "--"}</strong>
             <small>用于快速判断参数变更原因</small>
           </article>
+        </div>
+        <div className="table-wrap">
+          <h3 className="table-title">当前生效参数（本次计算）</h3>
+          <table className="history-table autotune-history-table">
+            <thead>
+              <tr>
+                <th>参数</th>
+                <th>值</th>
+              </tr>
+            </thead>
+            <tbody>
+              {effectiveConfigRows.map((row) => (
+                <tr key={`cfg-${row.key}`}>
+                  <td>{row.key}</td>
+                  <td>{row.rendered}</td>
+                </tr>
+              ))}
+              {effectiveConfigRows.length === 0 ? (
+                <tr>
+                  <td colSpan={2}>暂无参数快照。</td>
+                </tr>
+              ) : null}
+            </tbody>
+          </table>
         </div>
         <div className="table-wrap">
           <h3 className="table-title">参数调整历史（最近8条）</h3>
@@ -1530,6 +1611,7 @@ const StrategyPanel = memo(function StrategyPanel({
 
 export default function App() {
   const strategyPrefs = useMemo(() => readStrategyUiPrefs(), []);
+  const [selectedSymbol, setSelectedSymbol] = useState<MarketSymbol>("BTCUSDT");
   const [wsStatus, setWsStatus] = useState<"connecting" | "open" | "closed" | "error">("connecting");
   const [live, setLive] = useState<Record<MarketType, LiveSnapshot | null>>({
     "5m": null,
@@ -1582,6 +1664,7 @@ export default function App() {
   const [strategyAutotuneLoading, setStrategyAutotuneLoading] = useState<boolean>(false);
   const [errorText, setErrorText] = useState<string>("");
   const [timeMode, setTimeMode] = useState<TimeMode>("local");
+  const strategyEnabled = selectedSymbol === "BTCUSDT";
   const lastLiveTsRef = useRef<Record<MarketType, number>>({ "5m": 0, "15m": 0 });
   const liveUiCommitRef = useRef<Record<MarketType, { uiTs: number; roundId: string; remSec: number }>>({
     "5m": { uiTs: 0, roundId: "", remSec: -1 },
@@ -1601,6 +1684,7 @@ export default function App() {
   const strategyAutotuneUnchangedRef = useRef<number>(0);
   const strategyHasLoadedRef = useRef<boolean>(false);
   const strategyAutotuneHasLoadedRef = useRef<boolean>(false);
+  const selectedSymbolRef = useRef<MarketSymbol>("BTCUSDT");
   const stableLiveRef = useRef<Record<MarketType, LiveSnapshot | null>>({ "5m": null, "15m": null });
   const boundaryRefreshRef = useRef<Record<MarketType, number>>({ "5m": 0, "15m": 0 });
   const accuracyTabRef = useRef<MarketType>("5m");
@@ -1622,6 +1706,10 @@ export default function App() {
   }, [wsStatus]);
 
   useEffect(() => {
+    selectedSymbolRef.current = selectedSymbol;
+  }, [selectedSymbol]);
+
+  useEffect(() => {
     accuracyTabRef.current = accuracyTab;
   }, [accuracyTab]);
 
@@ -1635,7 +1723,7 @@ export default function App() {
       chartReqSeqRef.current[marketType] = reqId;
       setChartLoading((prev) => ({ ...prev, [marketType]: true }));
       try {
-        const data = await getChart(marketType, windowType);
+        const data = await getChart(marketType, windowType, selectedSymbolRef.current);
         if (chartReqSeqRef.current[marketType] !== reqId) {
           return;
         }
@@ -1658,6 +1746,20 @@ export default function App() {
     },
     []
   );
+
+  useEffect(() => {
+    stableLiveRef.current = { "5m": null, "15m": null };
+    lastLiveTsRef.current = { "5m": 0, "15m": 0 };
+    setLive({ "5m": null, "15m": null });
+    setCharts({ "5m": null, "15m": null });
+    setRoundHistory({ "5m": null, "15m": null });
+    setAvailableRounds({ "5m": null, "15m": null });
+    setRoundChart(null);
+    setHeatmap(null);
+    setAccuracy(null);
+    void loadChartFor("5m", chartWindowRef.current["5m"], true);
+    void loadChartFor("15m", chartWindowRef.current["15m"], true);
+  }, [selectedSymbol, loadChartFor]);
 
   pushLivePointRef.current = (marketType: MarketType, livePoint: LiveSnapshot | null) => {
     if (!livePoint || !livePoint.timestamp_ms) {
@@ -1750,7 +1852,7 @@ export default function App() {
     if (prevStable?.round_id && prevStable.round_id !== stablePoint.round_id) {
       void loadChartFor(marketType, chartWindowRef.current[marketType]);
       if (accuracyTabRef.current === marketType) {
-        void getAccuracySeries(marketType, 24)
+        void getAccuracySeries(marketType, 24, selectedSymbolRef.current)
           .then((v) => {
             setAccuracy(v);
           })
@@ -1799,8 +1901,9 @@ export default function App() {
 
         let latest5: (typeof rows)[number] | undefined;
         let latest15: (typeof rows)[number] | undefined;
+        const symbol = selectedSymbolRef.current;
         for (const row of rows) {
-          if (row.symbol !== "BTCUSDT") {
+          if (!row.symbol || row.symbol.toUpperCase() !== symbol) {
             continue;
           }
           if (row.timeframe === "5m") {
@@ -1867,6 +1970,9 @@ export default function App() {
   useEffect(() => {
     const disconnect = connectLiveWs(
       (payload) => {
+        if (selectedSymbolRef.current !== "BTCUSDT") {
+          return;
+        }
         lastWsTickMsRef.current = Date.now();
         pushLivePointRef.current("5m", payload["5m"]);
         pushLivePointRef.current("15m", payload["15m"]);
@@ -1894,7 +2000,7 @@ export default function App() {
     let alive = true;
     const run = async () => {
       try {
-        const value = await getStats();
+        const value = await getStats(selectedSymbol);
         if (alive) {
           setStats(value);
           setErrorText("");
@@ -2004,7 +2110,10 @@ export default function App() {
         return;
       }
       try {
-        const [r5, r15] = await Promise.all([getRoundHistory("5m", 250), getRoundHistory("15m", 250)]);
+        const [r5, r15] = await Promise.all([
+          getRoundHistory("5m", 250, selectedSymbol),
+          getRoundHistory("15m", 250, selectedSymbol)
+        ]);
         if (alive) {
           setRoundHistory({ "5m": r5, "15m": r15 });
         }
@@ -2021,7 +2130,7 @@ export default function App() {
       window.clearTimeout(first);
       window.clearInterval(id);
     };
-  }, []);
+  }, [selectedSymbol]);
 
   useEffect(() => {
     let alive = true;
@@ -2030,7 +2139,7 @@ export default function App() {
         return;
       }
       try {
-        const data = await getAvailableRounds(explorerTab);
+        const data = await getAvailableRounds(explorerTab, selectedSymbol);
         if (!alive) {
           return;
         }
@@ -2052,7 +2161,7 @@ export default function App() {
       window.clearTimeout(first);
       window.clearInterval(id);
     };
-  }, [explorerTab]);
+  }, [explorerTab, selectedSymbol]);
 
   const explorerDateRounds = useMemo(() => {
     const source = availableRounds[explorerTab];
@@ -2082,7 +2191,7 @@ export default function App() {
     }
     const load = async () => {
       try {
-        const row = await getRoundChart(selectedRoundId, explorerTab);
+        const row = await getRoundChart(selectedRoundId, explorerTab, selectedSymbol);
         if (alive) {
           setRoundChart(row);
         }
@@ -2096,7 +2205,7 @@ export default function App() {
     return () => {
       alive = false;
     };
-  }, [selectedRoundId, explorerTab]);
+  }, [selectedRoundId, explorerTab, selectedSymbol]);
 
   useEffect(() => {
     let alive = true;
@@ -2105,7 +2214,7 @@ export default function App() {
         return;
       }
       try {
-        const v = await getHeatmap(heatmapTab, 72);
+        const v = await getHeatmap(heatmapTab, 72, selectedSymbol);
         if (alive) {
           setHeatmap(v);
         }
@@ -2122,7 +2231,7 @@ export default function App() {
       window.clearTimeout(first);
       window.clearInterval(id);
     };
-  }, [heatmapTab]);
+  }, [heatmapTab, selectedSymbol]);
 
   useEffect(() => {
     let alive = true;
@@ -2131,7 +2240,7 @@ export default function App() {
         return;
       }
       try {
-        const v = await getAccuracySeries(accuracyTab, 24);
+        const v = await getAccuracySeries(accuracyTab, 24, selectedSymbol);
         if (alive) {
           setAccuracy(v);
         }
@@ -2148,11 +2257,19 @@ export default function App() {
       window.clearTimeout(first);
       window.clearInterval(id);
     };
-  }, [accuracyTab]);
+  }, [accuracyTab, selectedSymbol]);
 
   useEffect(() => {
     let alive = true;
     let timer: number | null = null;
+    if (!strategyEnabled) {
+      setStrategyPaper(null);
+      setStrategyLoading(false);
+      strategyHasLoadedRef.current = false;
+      return () => {
+        alive = false;
+      };
+    }
 
     const nextDelayMs = (changed: boolean): number => {
       if (document.visibilityState !== "visible") {
@@ -2232,10 +2349,19 @@ export default function App() {
         window.clearTimeout(timer);
       }
     };
-  }, [strategyMarketType, strategySource, strategyUseAutotune]);
+  }, [strategyMarketType, strategySource, strategyUseAutotune, strategyEnabled]);
 
   useEffect(() => {
     let alive = true;
+    if (!strategyEnabled) {
+      setStrategyAutotuneLatest(null);
+      setStrategyAutotuneHistory([]);
+      setStrategyAutotuneLoading(false);
+      strategyAutotuneHasLoadedRef.current = false;
+      return () => {
+        alive = false;
+      };
+    }
     if (!strategyUseAutotune) {
       setStrategyAutotuneLatest(null);
       setStrategyAutotuneHistory([]);
@@ -2326,7 +2452,7 @@ export default function App() {
         window.clearTimeout(timer);
       }
     };
-  }, [strategyMarketType, strategyUseAutotune]);
+  }, [strategyMarketType, strategyUseAutotune, strategyEnabled]);
 
   useEffect(() => {
     let alive = true;
@@ -2335,7 +2461,7 @@ export default function App() {
         return;
       }
       try {
-        const value = await getCollectorStatus();
+        const value = await getCollectorStatus(selectedSymbol);
         if (alive) {
           setCollectorStatus(value);
         }
@@ -2350,7 +2476,7 @@ export default function App() {
       window.clearTimeout(first);
       window.clearInterval(id);
     };
-  }, []);
+  }, [selectedSymbol]);
 
   const currentHistory = roundHistory[roundHistoryTab];
   const historyRows = useMemo(() => currentHistory?.rounds ?? [], [currentHistory]);
@@ -2386,16 +2512,27 @@ export default function App() {
         <div className="hero-left">
           <p className="hero-kicker">POLYEDGE PREDATOR</p>
           <h1>
-            实时研究仪表盘 <span>Polymarket BTC 短周期</span>
+            实时研究仪表盘 <span>Polymarket {selectedSymbol.replace("USDT", "")} 短周期</span>
           </h1>
           <p className="hero-sub">
-            统一展示 5m / 15m 市场的概率、价差、轮次与准确率，用于策略研究与训练数据校验。
+            统一展示 5m / 15m 市场的概率、价差、轮次与准确率，支持 BTC/ETH/SOL/XRP 数据切换。
           </p>
         </div>
         <div className="hero-right">
           <div className="live-indicator">
             <span className={`dot ${wsStatus === "open" ? "ok" : ""}`} />
             {wsStatus === "open" ? "实时连接" : "重连中"}
+          </div>
+          <div className="btn-group">
+            {SYMBOL_OPTIONS.map((opt) => (
+              <button
+                key={opt.value}
+                className={selectedSymbol === opt.value ? "active" : ""}
+                onClick={() => setSelectedSymbol(opt.value)}
+              >
+                {opt.label}
+              </button>
+            ))}
           </div>
           <div className="btn-group">
             <button className={timeMode === "local" ? "active" : ""} onClick={() => setTimeMode("local")}>
@@ -2407,6 +2544,7 @@ export default function App() {
           </div>
           <div className="hero-meta">
             <span>时区: {formatTimeZoneLabel(timeMode)}</span>
+            <span>交易对: {selectedSymbol}</span>
             <span>5m: {formatTime(live["5m"]?.timestamp_ms, timeMode)}</span>
             <span>15m: {formatTime(live["15m"]?.timestamp_ms, timeMode)}</span>
             <span className={collectorStatus ? (collectorStatus.ok ? "up" : "down") : ""}>
@@ -2423,12 +2561,12 @@ export default function App() {
       </header>
 
       <section className="round-grid">
-        {roundCard("5分钟轮次", live["5m"])}
-        {roundCard("15分钟轮次", live["15m"])}
+        {roundCard(`${selectedSymbol.replace("USDT", "")} 5分钟轮次`, live["5m"])}
+        {roundCard(`${selectedSymbol.replace("USDT", "")} 15分钟轮次`, live["15m"])}
       </section>
 
       <MemoMarketSection
-        title="5分钟市场"
+        title={`${selectedSymbol.replace("USDT", "")} 5分钟市场`}
         marketType="5m"
         live={live["5m"]}
         timeMode={timeMode}
@@ -2439,7 +2577,7 @@ export default function App() {
       />
 
       <MemoMarketSection
-        title="15分钟市场"
+        title={`${selectedSymbol.replace("USDT", "")} 15分钟市场`}
         marketType="15m"
         live={live["15m"]}
         timeMode={timeMode}
@@ -2449,20 +2587,33 @@ export default function App() {
         loading={chartLoading["15m"]}
       />
 
-      <StrategyPanel
-        data={strategyPaper}
-        loading={strategyLoading}
-        timeMode={timeMode}
-        marketType={strategyMarketType}
-        source={strategySource}
-        autotuneEnabled={strategyUseAutotune}
-        autotuneLatest={strategyAutotuneLatest}
-        autotuneHistory={strategyAutotuneHistory}
-        autotuneLoading={strategyAutotuneLoading}
-        onMarketTypeChange={setStrategyMarketType}
-        onSourceChange={setStrategySource}
-        onAutotuneToggle={setStrategyUseAutotune}
-      />
+      {strategyEnabled ? (
+        <StrategyPanel
+          data={strategyPaper}
+          loading={strategyLoading}
+          timeMode={timeMode}
+          marketType={strategyMarketType}
+          source={strategySource}
+          autotuneEnabled={strategyUseAutotune}
+          autotuneLatest={strategyAutotuneLatest}
+          autotuneHistory={strategyAutotuneHistory}
+          autotuneLoading={strategyAutotuneLoading}
+          onMarketTypeChange={setStrategyMarketType}
+          onSourceChange={setStrategySource}
+          onAutotuneToggle={setStrategyUseAutotune}
+        />
+      ) : (
+        <section className="panel">
+          <header className="panel-head">
+            <div>
+              <h2>策略执行</h2>
+              <p className="muted">
+                {selectedSymbol.replace("USDT", "")} 当前为采集模式，仅展示与收集数据；Paper/Live 交易已关闭。
+              </p>
+            </div>
+          </header>
+        </section>
+      )}
 
       <section className="panel">
         <header className="panel-head">

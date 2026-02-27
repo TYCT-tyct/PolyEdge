@@ -5,6 +5,7 @@ import type {
   ChartResponse,
   CollectorStatusResponse,
   HeatmapResponse,
+  MarketSymbol,
   MarketType,
   RoundChartResponse,
   RoundsResponse,
@@ -89,6 +90,14 @@ interface HistoryRaw {
     settle_price: number;
     label_up: number | boolean;
   }>;
+}
+
+function normalizeSymbol(symbol: string): MarketSymbol {
+  const s = symbol.trim().toUpperCase();
+  if (s === "ETHUSDT" || s === "SOLUSDT" || s === "XRPUSDT") {
+    return s;
+  }
+  return "BTCUSDT";
 }
 
 class HttpError extends Error {
@@ -359,16 +368,21 @@ function normalizeRoundChartResponse(data: RoundChartResponse): RoundChartRespon
   };
 }
 
-async function getHistoryRaw(marketType: MarketType, lookbackMinutes: number, limit: number): Promise<HistoryRaw> {
+async function getHistoryRaw(
+  symbol: MarketSymbol,
+  marketType: MarketType,
+  lookbackMinutes: number,
+  limit: number
+): Promise<HistoryRaw> {
   const qs = new URLSearchParams({
     lookback_minutes: String(lookbackMinutes),
     limit: String(limit)
   });
-  return requestJson<HistoryRaw>(`/api/history/BTCUSDT/${marketType}?${qs.toString()}`);
+  return requestJson<HistoryRaw>(`/api/history/${symbol}/${marketType}?${qs.toString()}`);
 }
 
-export async function getStats(): Promise<StatsResponse> {
-  if (apiSupport.stats !== false) {
+export async function getStats(symbol: MarketSymbol = "BTCUSDT"): Promise<StatsResponse> {
+  if (symbol === "BTCUSDT" && apiSupport.stats !== false) {
     try {
       const data = await requestJson<StatsResponse>("/api/stats");
       apiSupport.stats = true;
@@ -381,8 +395,8 @@ export async function getStats(): Promise<StatsResponse> {
     }
   }
   const [h5, h15] = await Promise.all([
-    getHistoryRaw("5m", 6 * 60, 30_000),
-    getHistoryRaw("15m", 12 * 60, 30_000)
+    getHistoryRaw(symbol, "5m", 6 * 60, 30_000),
+    getHistoryRaw(symbol, "15m", 12 * 60, 30_000)
   ]);
   const totalSamples = h5.sample_count + h15.sample_count;
   const rounds = [...h5.rounds, ...h15.rounds];
@@ -407,8 +421,8 @@ export async function getStats(): Promise<StatsResponse> {
   };
 }
 
-export async function getCollectorStatus(): Promise<CollectorStatusResponse> {
-  if (apiSupport.collectorStatus !== false) {
+export async function getCollectorStatus(symbol: MarketSymbol = "BTCUSDT"): Promise<CollectorStatusResponse> {
+  if (symbol === "BTCUSDT" && apiSupport.collectorStatus !== false) {
     try {
       const data = await requestJson<CollectorStatusResponse>("/api/collector/status");
       apiSupport.collectorStatus = true;
@@ -424,7 +438,7 @@ export async function getCollectorStatus(): Promise<CollectorStatusResponse> {
   const rows = await getLatestAllRaw();
   const makeRow = (tf: MarketType) => {
     const latest = rows
-      .filter((r) => r.timeframe === tf)
+      .filter((r) => r.timeframe === tf && normalizeSymbol(r.symbol) === symbol)
       .sort((a, b) => b.ts_ireland_sample_ms - a.ts_ireland_sample_ms)[0];
     if (!latest) {
       return {
@@ -486,7 +500,11 @@ export async function getLatestAllRaw(): Promise<LatestRawRow[]> {
   return requestJson<LatestRawRow[]>("/api/latest/all");
 }
 
-export async function getChart(marketType: MarketType, view: WindowType): Promise<ChartResponse> {
+export async function getChart(
+  marketType: MarketType,
+  view: WindowType,
+  symbol: MarketSymbol = "BTCUSDT"
+): Promise<ChartResponse> {
   const minutes = computeChartLookbackMinutes(view);
   const maxPoints = maxPointsForView(view);
   const qs = new URLSearchParams({
@@ -494,7 +512,7 @@ export async function getChart(marketType: MarketType, view: WindowType): Promis
     minutes: String(minutes),
     max_points: String(maxPoints)
   });
-  if (apiSupport.chart !== false) {
+  if (symbol === "BTCUSDT" && apiSupport.chart !== false) {
     try {
       const data = await requestJson<ChartResponse>(`/api/chart?${qs.toString()}`);
       apiSupport.chart = true;
@@ -509,7 +527,7 @@ export async function getChart(marketType: MarketType, view: WindowType): Promis
   try {
     const lookback = minutes;
     const estimatedLimit = Math.min(50_000, Math.max(6_000, lookback * 600));
-    const history = await getHistoryRaw(marketType, lookback, estimatedLimit);
+    const history = await getHistoryRaw(symbol, marketType, lookback, estimatedLimit);
     const points = history.samples
       .map((s) =>
         normalizeChartPoint({
@@ -551,12 +569,16 @@ export async function getChart(marketType: MarketType, view: WindowType): Promis
   }
 }
 
-export async function getRoundHistory(marketType: MarketType, limit = 200): Promise<RoundsResponse> {
+export async function getRoundHistory(
+  marketType: MarketType,
+  limit = 200,
+  symbol: MarketSymbol = "BTCUSDT"
+): Promise<RoundsResponse> {
   const qs = new URLSearchParams({
     market_type: marketType,
     limit: String(limit)
   });
-  if (apiSupport.rounds !== false) {
+  if (symbol === "BTCUSDT" && apiSupport.rounds !== false) {
     try {
       const data = await requestJson<RoundsResponse>(`/api/rounds?${qs.toString()}`);
       apiSupport.rounds = true;
@@ -569,7 +591,7 @@ export async function getRoundHistory(marketType: MarketType, limit = 200): Prom
     }
   }
   try {
-    const history = await getHistoryRaw(marketType, 12 * 60, 50_000);
+    const history = await getHistoryRaw(symbol, marketType, 12 * 60, 50_000);
     const rows = history.rounds
       .map((r) => {
         const target = r.target_price;
@@ -600,11 +622,14 @@ export async function getRoundHistory(marketType: MarketType, limit = 200): Prom
   }
 }
 
-export async function getAvailableRounds(marketType: MarketType): Promise<AvailableRoundsResponse> {
+export async function getAvailableRounds(
+  marketType: MarketType,
+  symbol: MarketSymbol = "BTCUSDT"
+): Promise<AvailableRoundsResponse> {
   const qs = new URLSearchParams({
     market_type: marketType
   });
-  if (apiSupport.roundsAvailable !== false) {
+  if (symbol === "BTCUSDT" && apiSupport.roundsAvailable !== false) {
     try {
       const data = await requestJson<AvailableRoundsResponse>(`/api/rounds/available?${qs.toString()}`);
       apiSupport.roundsAvailable = true;
@@ -617,7 +642,7 @@ export async function getAvailableRounds(marketType: MarketType): Promise<Availa
     }
   }
   try {
-    const history = await getRoundHistory(marketType, 600);
+    const history = await getRoundHistory(marketType, 600, symbol);
     const rounds = history.rounds.map((r) => {
       const date = new Date(r.start_time_ms).toISOString().slice(0, 10);
       return {
@@ -647,14 +672,15 @@ export async function getAvailableRounds(marketType: MarketType): Promise<Availa
 
 export async function getRoundChart(
   roundId: string,
-  marketType: MarketType
+  marketType: MarketType,
+  symbol: MarketSymbol = "BTCUSDT"
 ): Promise<RoundChartResponse> {
   const qs = new URLSearchParams({
     round_id: roundId,
     market_type: marketType,
     max_points: "6000"
   });
-  if (apiSupport.roundChart !== false) {
+  if (symbol === "BTCUSDT" && apiSupport.roundChart !== false) {
     try {
       const data = await requestJson<RoundChartResponse>(`/api/chart/round?${qs.toString()}`);
       apiSupport.roundChart = true;
@@ -667,7 +693,7 @@ export async function getRoundChart(
     }
   }
   try {
-    const history = await getHistoryRaw(marketType, 12 * 60, 80_000);
+    const history = await getHistoryRaw(symbol, marketType, 12 * 60, 80_000);
     const points = history.samples
       .filter((s) => s.round_id === roundId)
       .map((s) =>
@@ -713,28 +739,132 @@ export async function getRoundChart(
 
 export async function getHeatmap(
   marketType: MarketType,
-  lookbackHours = 72
+  lookbackHours = 72,
+  symbol: MarketSymbol = "BTCUSDT"
 ): Promise<HeatmapResponse> {
   const qs = new URLSearchParams({
     market_type: marketType,
     lookback_hours: String(lookbackHours)
   });
-  const data = await requestJson<HeatmapResponse>(`/api/heatmap?${qs.toString()}`);
-  apiSupport.heatmap = true;
-  return data;
+  if (symbol === "BTCUSDT") {
+    const data = await requestJson<HeatmapResponse>(`/api/heatmap?${qs.toString()}`);
+    apiSupport.heatmap = true;
+    return data;
+  }
+  const durationMs = marketType === "5m" ? 5 * 60_000 : 15 * 60_000;
+  const history = await getHistoryRaw(
+    symbol,
+    marketType,
+    Math.max(60, Math.floor(lookbackHours * 60)),
+    120_000
+  );
+  const bin = new Map<string, { count: number; sum: number }>();
+  for (const s of history.samples) {
+    const delta = computeDeltaPct(s.delta_pct_smooth ?? s.delta_pct, s.binance_price, s.target_price);
+    const midYes = midpointProb(s.bid_yes, s.ask_yes);
+    if (delta == null || midYes == null) {
+      continue;
+    }
+    const remainingMs = Math.max(0, Math.min(durationMs, s.remaining_ms));
+    const deltaBin = Math.round((delta / 0.05)) * 0.05;
+    const timeBin = Math.floor(remainingMs / 30_000) * 30;
+    const k = `${deltaBin.toFixed(2)}|${timeBin}`;
+    const prev = bin.get(k) ?? { count: 0, sum: 0 };
+    prev.count += 1;
+    prev.sum += midYes * 100;
+    bin.set(k, prev);
+  }
+  const maxSampleCount = Math.max(0, ...Array.from(bin.values()).map((v) => v.count));
+  const cells = Array.from(bin.entries())
+    .map(([k, v]) => {
+      const [deltaBin, timeBin] = k.split("|");
+      return {
+        delta_bin_pct: Number(deltaBin),
+        time_left_s_bin: Number(timeBin),
+        avg_up_price_cents: v.sum / Math.max(1, v.count),
+        sample_count: v.count,
+        opacity: maxSampleCount > 0 ? v.count / maxSampleCount : 0
+      };
+    })
+    .sort((a, b) => b.time_left_s_bin - a.time_left_s_bin || a.delta_bin_pct - b.delta_bin_pct);
+  return {
+    market_type: marketType,
+    lookback_hours: lookbackHours,
+    max_sample_count: maxSampleCount,
+    cells
+  };
 }
 
 export async function getAccuracySeries(
   marketType: MarketType,
   lookbackHours = 24,
+  symbol: MarketSymbol = "BTCUSDT"
 ): Promise<AccuracySeriesResponse> {
   const qs = new URLSearchParams({
     market_type: marketType,
     lookback_hours: String(lookbackHours),
   });
-  const data = await requestJson<AccuracySeriesResponse>(`/api/accuracy_series?${qs.toString()}`);
-  apiSupport.accuracy = true;
-  return data;
+  if (symbol === "BTCUSDT") {
+    const data = await requestJson<AccuracySeriesResponse>(`/api/accuracy_series?${qs.toString()}`);
+    apiSupport.accuracy = true;
+    return data;
+  }
+  const history = await getHistoryRaw(
+    symbol,
+    marketType,
+    Math.max(60, Math.floor(lookbackHours * 60)),
+    120_000
+  );
+  const rounds = [...history.rounds].sort((a, b) => a.end_ts_ms - b.end_ts_ms);
+  const rollingWindow = marketType === "5m" ? 40 : 20;
+  const rolling: number[] = [];
+  const points: Array<{ timestamp_ms: number; round_id: string; accuracy_pct: number; sample_count: number }> = [];
+  let sum = 0;
+  for (const r of rounds) {
+    const outcome = roundOutcome(r.settle_price, r.target_price, r.label_up);
+    const targetEval = r.end_ts_ms - (marketType === "5m" ? 60_000 : 180_000);
+    let bestDiff = Number.POSITIVE_INFINITY;
+    let evalMid: number | null = null;
+    for (const s of history.samples) {
+      if (s.round_id !== r.round_id) {
+        continue;
+      }
+      const mid = midpointProb(s.bid_yes, s.ask_yes);
+      if (mid == null) {
+        continue;
+      }
+      const diff = Math.abs(s.ts_ireland_sample_ms - targetEval);
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        evalMid = mid;
+      }
+    }
+    if (evalMid == null) {
+      continue;
+    }
+    const correct = (evalMid >= 0.5) === (outcome === 1) ? 1 : 0;
+    rolling.push(correct);
+    sum += correct;
+    if (rolling.length > rollingWindow) {
+      sum -= rolling.shift() ?? 0;
+    }
+    points.push({
+      timestamp_ms: r.end_ts_ms,
+      round_id: r.round_id,
+      accuracy_pct: (sum / Math.max(1, rolling.length)) * 100,
+      sample_count: rolling.length
+    });
+  }
+  const latest = points[points.length - 1]?.accuracy_pct ?? null;
+  return {
+    market_type: marketType,
+    window: rollingWindow,
+    lookback_hours: lookbackHours,
+    bucket_minutes: 30,
+    processed_rounds: points.length,
+    series: points,
+    latest_accuracy_pct: latest
+  };
 }
 
 export interface StrategyPaperQueryOptions {
