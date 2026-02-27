@@ -608,7 +608,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
 
     let live_gateway_cfg = LiveGatewayConfig::from_env();
     let capital_cfg = LiveCapitalConfig::from_env();
-    let (dynamic_quote_usdc, capital_before) = state
+    let (dynamic_quote_usdc, capital_before, balance_sync_ok, balance_sync_error) = state
         .compute_live_quote_usdc(
             market_type,
             live_quote_usdc.max(live_gateway_cfg.min_quote_usdc),
@@ -687,6 +687,21 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_ascii_uppercase();
+        let entry_like_action = action == "enter" || action == "add";
+        if live_execute
+            && entry_like_action
+            && capital_cfg.use_real_balance
+            && capital_cfg.hard_require_real_balance
+            && !balance_sync_ok
+        {
+            capital_skipped.push(json!({
+                "reason": "balance_sync_required",
+                "balance_sync_ok": balance_sync_ok,
+                "balance_sync_error": balance_sync_error,
+                "decision": d
+            }));
+            continue;
+        }
         if action == "enter" {
             if let Some(state_side) = position_before_gate.side.as_deref() {
                 if state_side.eq_ignore_ascii_case(&side) {
@@ -1116,6 +1131,12 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         .and_then(Value::as_str)
         .map(|v| v == "no_live_market_target")
         .unwrap_or(false);
+    let balance_blocked_entries = skipped_decisions_all.iter().any(|row| {
+        row.get("reason")
+            .and_then(Value::as_str)
+            .map(|v| v == "balance_sync_required")
+            .unwrap_or(false)
+    });
     let paper_has_signal = paper_entry_count > 0
         || paper_add_count > 0
         || paper_reduce_count > 0
@@ -1128,6 +1149,11 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         "dry_run"
     } else if no_live_market_target {
         "blocked_no_market_target"
+    } else if balance_blocked_entries
+        && (paper_entry_count + paper_add_count > 0)
+        && (submitted_entry_count + submitted_add_count == 0)
+    {
+        "blocked_balance_sync"
     } else if paper_has_signal && !submitted_has_signal {
         "blocked_by_gate_or_state"
     } else if submitted_has_signal && gateway_accept_count == 0 {
@@ -1137,7 +1163,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
     };
     let level = match status {
         "ok" | "dry_run" => "ok",
-        "blocked_by_gate_or_state" | "blocked_no_market_target" => "warn",
+        "blocked_by_gate_or_state" | "blocked_no_market_target" | "blocked_balance_sync" => "warn",
         _ => "critical",
     };
     if live_execute && !matches!(status, "ok") {
@@ -1281,7 +1307,9 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
             },
             "capital": {
                 "auto_enabled": capital_cfg.enabled,
+                "portfolio_shared": capital_cfg.portfolio_shared,
                 "use_real_balance": capital_cfg.use_real_balance,
+                "hard_require_real_balance": capital_cfg.hard_require_real_balance,
                 "dynamic_quote_usdc": dynamic_quote_usdc,
                 "base_quote_usdc": live_quote_usdc,
                 "target_utilization": capital_cfg.target_utilization,
@@ -1292,6 +1320,8 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                 "max_add_layers": capital_cfg.max_add_layers,
                 "disable_add_on_loss": capital_cfg.disable_add_on_loss,
                 "balance_refresh_ms": capital_cfg.balance_refresh_ms,
+                "balance_sync_ok": balance_sync_ok,
+                "balance_sync_error": balance_sync_error,
                 "real_balance": live_balance_snapshot,
                 "state": capital_state,
                 "available_after_capital_guard_usdc": capital_remaining.max(0.0),
@@ -1893,12 +1923,18 @@ pub(super) async fn strategy_live_balance(
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::internal("live balance unavailable"))?;
+    let capital_scope = if capital_cfg.portfolio_shared {
+        LIVE_CAPITAL_PORTFOLIO_SCOPE
+    } else {
+        market_type
+    };
     let capital_state = state
-        .get_live_capital_state(market_type, &capital_cfg)
+        .get_live_capital_state(capital_scope, &capital_cfg)
         .await;
     Ok(Json(json!({
         "ok": true,
         "market_type": market_type,
+        "capital_scope": capital_scope,
         "fetched_at_ms": snapshot.fetched_at_ms,
         "fetched_at_iso": DateTime::<Utc>::from_timestamp_millis(snapshot.fetched_at_ms).map(|v| v.to_rfc3339()).unwrap_or_default(),
         "source": snapshot.source,

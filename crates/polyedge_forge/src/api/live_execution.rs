@@ -950,26 +950,177 @@ pub(super) fn extract_order_id_from_gateway_record(row: &Value) -> Option<String
         })
 }
 
+#[derive(Debug, Clone, Default)]
+struct PendingFillMeta {
+    fill_price_cents: Option<f64>,
+    fill_quote_usdc: Option<f64>,
+    fee_usdc: f64,
+    slippage_usdc: f64,
+}
+
+fn value_as_f64(v: &Value) -> Option<f64> {
+    v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+}
+
+fn collect_f64_by_key(node: &Value, target_key: &str, out: &mut Vec<f64>) {
+    match node {
+        Value::Object(map) => {
+            for (k, v) in map {
+                if k.eq_ignore_ascii_case(target_key) {
+                    if let Some(x) = value_as_f64(v) {
+                        if x.is_finite() {
+                            out.push(x);
+                        }
+                    }
+                }
+                collect_f64_by_key(v, target_key, out);
+            }
+        }
+        Value::Array(rows) => {
+            for row in rows {
+                collect_f64_by_key(row, target_key, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_candidates(node: &Value, keys: &[&str]) -> Vec<f64> {
+    let mut out = Vec::<f64>::new();
+    for key in keys {
+        collect_f64_by_key(node, key, &mut out);
+    }
+    out
+}
+
+fn normalize_usdc_amount(v: f64) -> f64 {
+    if v <= 0.0 || !v.is_finite() {
+        0.0
+    } else if v > 100_000.0 {
+        // Some gateways return 6-decimal scaled collateral integers.
+        (v / 1_000_000.0).max(0.0)
+    } else {
+        v
+    }
+}
+
+fn extract_pending_fill_meta(fill_event: Option<&Value>, pending: &LivePendingOrder) -> PendingFillMeta {
+    let Some(fill) = fill_event else {
+        return PendingFillMeta::default();
+    };
+    let price_cents_direct = collect_candidates(
+        fill,
+        &["price_cents", "fill_price_cents", "filled_price_cents", "avg_price_cents"],
+    )
+    .into_iter()
+    .find(|v| *v > 0.0);
+    let price_prob = collect_candidates(
+        fill,
+        &[
+            "price",
+            "avg_price",
+            "fill_price",
+            "filled_price",
+            "execution_price",
+            "executed_price",
+            "matched_price",
+        ],
+    )
+    .into_iter()
+    .find(|v| *v > 0.0);
+    let fill_price_cents = price_cents_direct.or_else(|| {
+        price_prob.map(|v| if v <= 1.5 { v * 100.0 } else { v })
+    });
+
+    let quote_direct = collect_candidates(
+        fill,
+        &[
+            "effective_notional",
+            "filled_notional",
+            "executed_notional",
+            "notional",
+            "quote_size_usdc",
+        ],
+    )
+    .into_iter()
+    .map(normalize_usdc_amount)
+    .find(|v| *v > 0.0);
+
+    let size_candidates = collect_candidates(
+        fill,
+        &["filled_size", "executed_size", "matched_size", "accepted_size", "size"],
+    );
+    let quote_from_size = if let (Some(px_c), Some(sz)) = (
+        fill_price_cents,
+        size_candidates.into_iter().find(|v| *v > 0.0),
+    ) {
+        Some((px_c / 100.0) * sz)
+    } else {
+        None
+    };
+    let fill_quote_usdc = quote_direct.or(quote_from_size);
+
+    let fee_usdc = collect_candidates(fill, &["fee_usdc", "total_fee_usdc", "fee", "fees", "total_fee"])
+        .into_iter()
+        .map(normalize_usdc_amount)
+        .fold(0.0, |acc, v| acc + v);
+
+    let explicit_slippage_usdc = collect_candidates(fill, &["slippage_usdc"])
+        .into_iter()
+        .map(normalize_usdc_amount)
+        .fold(0.0, |acc, v| acc + v);
+
+    let inferred_slippage_usdc = if let (Some(px_c), Some(quote)) = (fill_price_cents, fill_quote_usdc) {
+        let expected_c = pending.price_cents.max(0.01);
+        let shares = quote / (px_c / 100.0).max(0.0001);
+        let action = pending.action.to_ascii_lowercase();
+        let adverse_cents = if action == "enter" || action == "add" {
+            (px_c - expected_c).max(0.0)
+        } else {
+            (expected_c - px_c).max(0.0)
+        };
+        ((adverse_cents / 100.0) * shares).max(0.0)
+    } else {
+        0.0
+    };
+
+    PendingFillMeta {
+        fill_price_cents,
+        fill_quote_usdc,
+        fee_usdc,
+        slippage_usdc: explicit_slippage_usdc.max(inferred_slippage_usdc),
+    }
+}
+
 pub(super) async fn apply_pending_confirmation(
     state: &ApiState,
     pending: &LivePendingOrder,
     reason: &str,
+    fill_event: Option<&Value>,
 ) {
     let now_ms = Utc::now().timestamp_millis();
     let mut ps = state.get_live_position_state(&pending.market_type).await;
     let capital_cfg = LiveCapitalConfig::from_env();
     let action = pending.action.to_ascii_lowercase();
+    let fill_meta = extract_pending_fill_meta(fill_event, pending);
+    let fill_price_cents = fill_meta.fill_price_cents.unwrap_or(pending.price_cents).max(0.01);
+    let fill_quote_usdc = fill_meta
+        .fill_quote_usdc
+        .unwrap_or(pending.quote_size_usdc.max(0.0))
+        .max(0.0);
+    let fill_cost_usdc = (fill_meta.fee_usdc + fill_meta.slippage_usdc).max(0.0);
     let mut realized_pnl_usdc = 0.0_f64;
     if action == "enter" {
         ps.state = "in_position".to_string();
         ps.side = Some(pending.side.clone());
         ps.entry_round_id = Some(pending.round_id.clone());
         ps.entry_ts_ms = Some(pending.submitted_ts_ms);
-        ps.entry_price_cents = Some(pending.price_cents);
-        ps.entry_quote_usdc = Some(pending.quote_size_usdc);
-        ps.net_quote_usdc = pending.quote_size_usdc.max(0.0);
-        ps.vwap_entry_cents = Some(pending.price_cents.max(0.01));
+        ps.entry_price_cents = Some(fill_price_cents);
+        ps.entry_quote_usdc = Some(fill_quote_usdc);
+        ps.net_quote_usdc = fill_quote_usdc;
+        ps.vwap_entry_cents = Some(fill_price_cents);
         ps.open_add_layers = 0;
+        ps.position_cost_usdc = fill_cost_usdc;
         ps.total_entries = ps.total_entries.saturating_add(1);
         ps.last_fill_pnl_usdc = 0.0;
     } else if action == "add" {
@@ -977,16 +1128,16 @@ pub(super) async fn apply_pending_confirmation(
             .net_quote_usdc
             .max(ps.entry_quote_usdc.unwrap_or(0.0))
             .max(0.0);
-        let add_quote = pending.quote_size_usdc.max(0.0);
+        let add_quote = fill_quote_usdc;
         let prev_price = ps
             .vwap_entry_cents
             .or(ps.entry_price_cents)
-            .unwrap_or(pending.price_cents);
+            .unwrap_or(fill_price_cents);
         let next_quote = prev_quote + add_quote;
         let next_price = if next_quote > 1e-9 {
-            (prev_price * prev_quote + pending.price_cents * add_quote) / next_quote
+            (prev_price * prev_quote + fill_price_cents * add_quote) / next_quote
         } else {
-            pending.price_cents
+            fill_price_cents
         };
         ps.state = "in_position".to_string();
         ps.side = Some(pending.side.clone());
@@ -998,6 +1149,7 @@ pub(super) async fn apply_pending_confirmation(
         ps.net_quote_usdc = next_quote;
         ps.total_adds = ps.total_adds.saturating_add(1);
         ps.open_add_layers = ps.open_add_layers.saturating_add(1);
+        ps.position_cost_usdc += fill_cost_usdc;
         ps.last_fill_pnl_usdc = 0.0;
     } else if action == "reduce" || action == "exit" {
         let entry_price_cents = ps
@@ -1012,11 +1164,18 @@ pub(super) async fn apply_pending_confirmation(
         let close_quote = if action == "exit" {
             prev_quote
         } else {
-            pending.quote_size_usdc.max(0.0).min(prev_quote)
+            fill_quote_usdc.max(0.0).min(prev_quote)
         };
         if close_quote > 1e-9 {
             let shares = close_quote / (entry_price_cents / 100.0).max(0.0001);
-            realized_pnl_usdc = shares * ((pending.price_cents - entry_price_cents) / 100.0);
+            let gross_pnl_usdc = shares * ((fill_price_cents - entry_price_cents) / 100.0);
+            let entry_cost_alloc = if prev_quote > 1e-9 {
+                ps.position_cost_usdc * (close_quote / prev_quote).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            realized_pnl_usdc = gross_pnl_usdc - entry_cost_alloc - fill_cost_usdc;
+            ps.position_cost_usdc = (ps.position_cost_usdc - entry_cost_alloc).max(0.0);
             ps.realized_pnl_usdc += realized_pnl_usdc;
             ps.last_fill_pnl_usdc = realized_pnl_usdc;
         } else {
@@ -1033,6 +1192,7 @@ pub(super) async fn apply_pending_confirmation(
             ps.net_quote_usdc = 0.0;
             ps.vwap_entry_cents = None;
             ps.open_add_layers = 0;
+            ps.position_cost_usdc = 0.0;
             ps.total_exits = ps.total_exits.saturating_add(1);
         } else {
             ps.state = "in_position".to_string();
@@ -1150,7 +1310,7 @@ pub(super) async fn reconcile_gateway_reports(state: &ApiState, gateway_cfg: &Li
             "cancelled" | "canceled" | "rejected" | "expired"
         );
         if event_name == "order_terminal" && filled_terminal {
-            apply_pending_confirmation(state, &pending, "order_terminal_filled").await;
+            apply_pending_confirmation(state, &pending, "order_terminal_filled", Some(&ev)).await;
         } else if event_name == "order_terminal" && canceled_terminal {
             apply_pending_revert(state, &pending, "order_terminal_canceled").await;
         } else if event_name == "order_timeout_cancelled" {
@@ -2023,7 +2183,7 @@ pub(super) async fn reconcile_rust_reports(state: &ApiState, gateway_cfg: &LiveG
         };
         if pm_is_terminal_fill(&order.status) {
             let _ = state.remove_pending_order(&row.order_id).await;
-            apply_pending_confirmation(state, &row, "rust_order_terminal_filled").await;
+            apply_pending_confirmation(state, &row, "rust_order_terminal_filled", None).await;
             state
                 .append_live_event(
                     &row.market_type,

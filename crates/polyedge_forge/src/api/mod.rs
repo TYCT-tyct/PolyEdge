@@ -104,6 +104,7 @@ const LIVE_RUST_BOOK_CACHE_TTL_MS: u64 = 260;
 const LIVE_RUST_BOOK_CACHE_MAX: usize = 512;
 const LIVE_CAPITAL_MAX_UTILIZATION: f64 = 0.92;
 const LIVE_CAPITAL_MIN_UTILIZATION: f64 = 0.12;
+const LIVE_CAPITAL_PORTFOLIO_SCOPE: &str = "__portfolio__";
 const LIVE_ALERT_THROTTLE_DEFAULT_MS: i64 = 5 * 60_000;
 const LIVE_CAPITAL_RECENT_PNL_LIMIT: usize = 200;
 
@@ -184,6 +185,14 @@ fn max_add_layers_by_equity(base_layers: u32, equity: f64) -> u32 {
         base_layers
     };
     base_layers.min(cap).max(1)
+}
+
+fn capital_scope_market<'a>(market_type: &'a str, cfg: &LiveCapitalConfig) -> &'a str {
+    if cfg.portfolio_shared {
+        LIVE_CAPITAL_PORTFOLIO_SCOPE
+    } else {
+        market_type
+    }
 }
 
 fn decision_edge_score(decision: &Value) -> f64 {
@@ -458,6 +467,8 @@ struct LivePositionState {
     realized_pnl_usdc: f64,
     #[serde(default)]
     last_fill_pnl_usdc: f64,
+    #[serde(default)]
+    position_cost_usdc: f64,
     updated_ts_ms: i64,
 }
 
@@ -482,6 +493,7 @@ impl LivePositionState {
             total_reduces: 0,
             realized_pnl_usdc: 0.0,
             last_fill_pnl_usdc: 0.0,
+            position_cost_usdc: 0.0,
             updated_ts_ms: now_ms,
         }
     }
@@ -521,7 +533,17 @@ struct LiveCapitalState {
     kelly_fraction: f64,
     #[serde(default)]
     capital_stage: String,
+    #[serde(default = "default_true")]
+    balance_sync_ok: bool,
+    #[serde(default)]
+    balance_sync_error: Option<String>,
+    #[serde(default)]
+    last_balance_sync_ms: i64,
     updated_ts_ms: i64,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl LiveCapitalState {
@@ -551,6 +573,9 @@ impl LiveCapitalState {
             adaptive_add_mult: 1.0,
             kelly_fraction: 0.0,
             capital_stage: "micro_10".to_string(),
+            balance_sync_ok: true,
+            balance_sync_error: None,
+            last_balance_sync_ms: 0,
             updated_ts_ms: now_ms,
         }
     }
@@ -559,7 +584,9 @@ impl LiveCapitalState {
 #[derive(Debug, Clone, Copy)]
 struct LiveCapitalConfig {
     enabled: bool,
+    portfolio_shared: bool,
     use_real_balance: bool,
+    hard_require_real_balance: bool,
     balance_refresh_ms: i64,
     equity_base_usdc: f64,
     reserve_usdc: f64,
@@ -627,7 +654,12 @@ impl LiveCapitalConfig {
 
         Self {
             enabled: env_bool!("FORGE_FEV1_CAPITAL_AUTO", true),
+            portfolio_shared: env_bool!("FORGE_FEV1_CAPITAL_PORTFOLIO_SHARED", true),
             use_real_balance: env_bool!("FORGE_FEV1_CAPITAL_USE_REAL_BALANCE", true),
+            hard_require_real_balance: env_bool!(
+                "FORGE_FEV1_CAPITAL_HARD_REQUIRE_REAL_BALANCE",
+                true
+            ),
             disable_add_on_loss: env_bool!("FORGE_FEV1_CAPITAL_DISABLE_ADD_ON_LOSS", true),
             kelly_enabled: env_bool!("FORGE_FEV1_CAPITAL_KELLY_ENABLED", true),
             reverse_two_phase: env_bool!("FORGE_FEV1_REVERSE_TWO_PHASE", true),
@@ -955,6 +987,17 @@ impl ApiState {
             .sum::<f64>()
     }
 
+    async fn pending_reserved_quote_usdc_all(&self) -> f64 {
+        let pending = self.list_pending_orders().await;
+        pending
+            .iter()
+            .filter(|p| {
+                p.action.eq_ignore_ascii_case("enter") || p.action.eq_ignore_ascii_case("add")
+            })
+            .map(|p| p.quote_size_usdc.max(0.0))
+            .sum::<f64>()
+    }
+
     async fn get_live_balance_snapshot(
         &self,
         refresh_ms: i64,
@@ -993,7 +1036,8 @@ impl ApiState {
         pnl_usdc: f64,
     ) -> LiveCapitalState {
         let now_ms = Utc::now().timestamp_millis();
-        let mut cs = self.get_live_capital_state(market_type, cfg).await;
+        let scope_market = capital_scope_market(market_type, cfg);
+        let mut cs = self.get_live_capital_state(scope_market, cfg).await;
         if pnl_usdc.is_finite() && pnl_usdc.abs() > 1e-9 {
             cs.realized_pnl_usdc += pnl_usdc;
             cs.equity_estimate_usdc = (cs.equity_base_usdc + cs.realized_pnl_usdc).max(0.0);
@@ -1057,7 +1101,7 @@ impl ApiState {
         };
         cs.capital_stage = capital_stage_name(cs.equity_estimate_usdc).to_string();
         cs.updated_ts_ms = now_ms;
-        self.put_live_capital_state(market_type, cs.clone()).await;
+        self.put_live_capital_state(scope_market, cs.clone()).await;
         cs
     }
 
@@ -1067,15 +1111,20 @@ impl ApiState {
         base_quote_usdc: f64,
         min_quote_usdc: f64,
         cfg: &LiveCapitalConfig,
-    ) -> (f64, LiveCapitalState) {
+    ) -> (f64, LiveCapitalState, bool, Option<String>) {
+        let scope_market = capital_scope_market(market_type, cfg);
         if !cfg.enabled {
-            let mut cs = self.get_live_capital_state(market_type, cfg).await;
+            let mut cs = self.get_live_capital_state(scope_market, cfg).await;
             cs.last_quote_usdc = base_quote_usdc.max(min_quote_usdc);
+            cs.balance_sync_ok = true;
+            cs.balance_sync_error = None;
             cs.updated_ts_ms = Utc::now().timestamp_millis();
-            self.put_live_capital_state(market_type, cs.clone()).await;
-            return (cs.last_quote_usdc, cs);
+            self.put_live_capital_state(scope_market, cs.clone()).await;
+            return (cs.last_quote_usdc, cs, true, None);
         }
-        let mut cs = self.get_live_capital_state(market_type, cfg).await;
+        let mut cs = self.get_live_capital_state(scope_market, cfg).await;
+        let mut balance_sync_ok = !cfg.use_real_balance;
+        let mut balance_sync_error: Option<String> = None;
         if cfg.use_real_balance {
             match self.get_live_balance_snapshot(cfg.balance_refresh_ms).await {
                 Ok(Some(snapshot)) => {
@@ -1089,14 +1138,42 @@ impl ApiState {
                             cs.max_equity_usdc = cs.equity_estimate_usdc;
                         }
                     }
+                    cs.last_balance_sync_ms = snapshot.fetched_at_ms;
+                    balance_sync_ok = true;
+                    cs.balance_sync_ok = true;
+                    cs.balance_sync_error = None;
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    balance_sync_ok = false;
+                    balance_sync_error = Some("live balance unavailable".to_string());
+                }
                 Err(err) => {
-                    tracing::warn!(error = %err, "live balance sync failed; fallback to internal capital state");
+                    balance_sync_ok = false;
+                    balance_sync_error = Some(err);
+                }
+            }
+            if !balance_sync_ok && !cfg.hard_require_real_balance {
+                if let Some(err) = balance_sync_error.as_deref() {
+                    tracing::warn!(
+                        error = %err,
+                        "live balance sync failed; fallback to internal capital state"
+                    );
                 }
             }
         }
-        let reserved_pending = self.pending_reserved_quote_usdc(market_type).await.max(0.0);
+        let reserved_pending = self.pending_reserved_quote_usdc_all().await.max(0.0);
+        if cfg.use_real_balance && cfg.hard_require_real_balance && !balance_sync_ok {
+            cs.reserved_pending_usdc = reserved_pending;
+            cs.available_to_trade_usdc = 0.0;
+            cs.utilization_ratio = 0.0;
+            cs.risk_state = "lockdown".to_string();
+            cs.last_quote_usdc = min_quote_usdc.max(0.5);
+            cs.balance_sync_ok = false;
+            cs.balance_sync_error = balance_sync_error.clone();
+            cs.updated_ts_ms = Utc::now().timestamp_millis();
+            self.put_live_capital_state(scope_market, cs.clone()).await;
+            return (cs.last_quote_usdc, cs, false, balance_sync_error);
+        }
         let risk_mult = match cs.risk_state.as_str() {
             "lockdown" => 0.0,
             "defensive" => 0.40,
@@ -1151,9 +1228,11 @@ impl ApiState {
         cs.available_to_trade_usdc = available;
         cs.utilization_ratio = util;
         cs.last_quote_usdc = quote;
+        cs.balance_sync_ok = balance_sync_ok;
+        cs.balance_sync_error = balance_sync_error.clone();
         cs.updated_ts_ms = Utc::now().timestamp_millis();
-        self.put_live_capital_state(market_type, cs.clone()).await;
-        (quote, cs)
+        self.put_live_capital_state(scope_market, cs.clone()).await;
+        (quote, cs, balance_sync_ok, balance_sync_error)
     }
 
     async fn check_and_mark_live_decision(
@@ -1732,14 +1811,28 @@ async fn restore_live_runtime_state(
                 state.put_live_position_state(market, parsed).await;
             }
         }
-        let capital_key = live_capital_state_key(&state.redis_prefix, market);
+        if !capital_cfg.portfolio_shared {
+            let capital_key = live_capital_state_key(&state.redis_prefix, market);
+            if let Some(v) = read_key_value(state, &capital_key).await? {
+                if let Ok(parsed) = serde_json::from_value::<LiveCapitalState>(v) {
+                    state.put_live_capital_state(market, parsed).await;
+                }
+            } else {
+                let bootstrap = state.get_live_capital_state(market, &capital_cfg).await;
+                state.put_live_capital_state(market, bootstrap).await;
+            }
+        }
+    }
+    if capital_cfg.portfolio_shared {
+        let scope = LIVE_CAPITAL_PORTFOLIO_SCOPE;
+        let capital_key = live_capital_state_key(&state.redis_prefix, scope);
         if let Some(v) = read_key_value(state, &capital_key).await? {
             if let Ok(parsed) = serde_json::from_value::<LiveCapitalState>(v) {
-                state.put_live_capital_state(market, parsed).await;
+                state.put_live_capital_state(scope, parsed).await;
             }
         } else {
-            let bootstrap = state.get_live_capital_state(market, &capital_cfg).await;
-            state.put_live_capital_state(market, bootstrap).await;
+            let bootstrap = state.get_live_capital_state(scope, &capital_cfg).await;
+            state.put_live_capital_state(scope, bootstrap).await;
         }
     }
     let pending_key = live_pending_orders_key(&state.redis_prefix);
@@ -1765,10 +1858,11 @@ async fn persist_live_runtime_state(state: &ApiState, market_type: &str) {
     let pos_key = live_position_state_key(&state.redis_prefix, market_type);
     let _ = write_key_value(state, &pos_key, &json!(position), Some(2 * 24 * 3600)).await;
     let capital_cfg = LiveCapitalConfig::from_env();
+    let capital_scope = capital_scope_market(market_type, &capital_cfg);
     let capital_state = state
-        .get_live_capital_state(market_type, &capital_cfg)
+        .get_live_capital_state(capital_scope, &capital_cfg)
         .await;
-    let capital_key = live_capital_state_key(&state.redis_prefix, market_type);
+    let capital_key = live_capital_state_key(&state.redis_prefix, capital_scope);
     let _ = write_key_value(
         state,
         &capital_key,
