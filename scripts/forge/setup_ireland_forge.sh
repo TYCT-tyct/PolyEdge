@@ -74,6 +74,7 @@ Wants=clickhouse-server.service redis-server.service
 Type=simple
 User=$USER_NAME
 WorkingDirectory=$REPO_DIR
+EnvironmentFile=-$REPO_DIR/.env
 Environment=RUST_LOG=info,polyedge_forge=debug
 Environment=FORGE_FEV1_RUNTIME_MARKETS=$RUNTIME_MARKETS
 Environment=FORGE_STRATEGY_MARKETS=$STRATEGY_MARKETS
