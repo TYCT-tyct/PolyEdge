@@ -34,7 +34,7 @@ use polymarket_client_sdk::POLYGON;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
@@ -87,6 +87,7 @@ struct ApiState {
     live_balance_cache: Arc<RwLock<Option<LiveBalanceSnapshot>>>,
     runtime_alert_throttle: Arc<RwLock<HashMap<String, i64>>>,
     runtime_daily_report_sent: Arc<RwLock<HashSet<String>>>,
+    strategy_heavy_slots: Arc<Semaphore>,
     gateway_http_client: Arc<reqwest::Client>,
 }
 
@@ -1555,6 +1556,7 @@ struct StrategyPaperQueryParams {
     autotune_context: Option<String>,
     lookback_minutes: Option<u32>,
     max_points: Option<u32>,
+    max_samples: Option<u32>,
     max_trades: Option<u32>,
     full_history: Option<bool>,
     use_autotune: Option<bool>,
@@ -1610,6 +1612,7 @@ struct StrategyFullQueryParams {
     market_type: Option<String>,
     lookback_minutes: Option<u32>,
     max_points: Option<u32>,
+    max_samples: Option<u32>,
     max_trades: Option<u32>,
     full_history: Option<bool>,
     max_arms: Option<u32>,
@@ -1623,6 +1626,7 @@ struct StrategyOptimizeQueryParams {
     autotune_context: Option<String>,
     lookback_minutes: Option<u32>,
     max_points: Option<u32>,
+    max_samples: Option<u32>,
     max_trades: Option<u32>,
     full_history: Option<bool>,
     max_arms: Option<u32>,
@@ -1738,6 +1742,11 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         .tcp_nodelay(true)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
+    let strategy_heavy_slots = std::env::var("FORGE_STRATEGY_HEAVY_MAX_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, 8);
     let state = ApiState {
         ch_url: cfg.clickhouse_url,
         redis_prefix: cfg.redis_prefix,
@@ -1755,6 +1764,7 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         live_balance_cache: Arc::new(RwLock::new(None)),
         runtime_alert_throttle: Arc::new(RwLock::new(HashMap::new())),
         runtime_daily_report_sent: Arc::new(RwLock::new(HashSet::new())),
+        strategy_heavy_slots: Arc::new(Semaphore::new(strategy_heavy_slots)),
         gateway_http_client: Arc::new(gateway_http_client),
     };
 

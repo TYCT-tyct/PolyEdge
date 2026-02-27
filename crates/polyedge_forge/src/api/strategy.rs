@@ -117,9 +117,9 @@ fn strategy_env_u32(name: &str, default: u32, min_v: u32, max_v: u32) -> u32 {
 
 fn strategy_default_max_points(full_history: bool) -> u32 {
     if full_history {
-        strategy_env_u32("FORGE_STRATEGY_MAX_POINTS_FULL", 320_000, 20_000, 2_000_000)
+        strategy_env_u32("FORGE_STRATEGY_MAX_POINTS_FULL", 160_000, 5_000, 2_000_000)
     } else {
-        strategy_env_u32("FORGE_STRATEGY_MAX_POINTS_SHORT", 180_000, 20_000, 600_000)
+        strategy_env_u32("FORGE_STRATEGY_MAX_POINTS_SHORT", 90_000, 5_000, 600_000)
     }
 }
 
@@ -127,9 +127,57 @@ fn strategy_max_points_hard_cap() -> u32 {
     strategy_env_u32(
         "FORGE_STRATEGY_MAX_POINTS_HARD_CAP",
         600_000,
-        20_000,
+        5_000,
         5_000_000,
     )
+}
+
+fn strategy_min_points() -> u32 {
+    strategy_env_u32("FORGE_STRATEGY_MIN_POINTS", 5_000, 1_000, 50_000)
+}
+
+fn strategy_guard_max_points(full_history: bool) -> u32 {
+    if full_history {
+        strategy_env_u32("FORGE_STRATEGY_GUARD_MAX_POINTS_FULL", 120_000, 10_000, 2_000_000)
+    } else {
+        strategy_env_u32("FORGE_STRATEGY_GUARD_MAX_POINTS_SHORT", 80_000, 10_000, 1_000_000)
+    }
+}
+
+fn strategy_heavy_points_threshold() -> u32 {
+    strategy_env_u32(
+        "FORGE_STRATEGY_HEAVY_POINTS_THRESHOLD",
+        70_000,
+        5_000,
+        2_000_000,
+    )
+}
+
+fn strategy_resolve_max_points(
+    full_history: bool,
+    requested_max_points: Option<u32>,
+    requested_max_samples: Option<u32>,
+) -> u32 {
+    let min_points = strategy_min_points();
+    let hard_cap = strategy_max_points_hard_cap().max(min_points);
+    let guard_cap = strategy_guard_max_points(full_history).clamp(min_points, hard_cap);
+    let mut max_points = requested_max_points.unwrap_or(strategy_default_max_points(full_history));
+    if let Some(max_samples) = requested_max_samples {
+        max_points = max_points.min(max_samples);
+    }
+    max_points.clamp(min_points, hard_cap).min(guard_cap)
+}
+
+async fn strategy_acquire_heavy_permit(
+    state: &ApiState,
+    full_history: bool,
+    max_points: u32,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let heavy = full_history || max_points >= strategy_heavy_points_threshold();
+    if !heavy {
+        return None;
+    }
+    state.strategy_heavy_slots.clone().acquire_owned().await.ok()
 }
 
 fn strategy_select_profile_name() -> &'static str {
@@ -1964,10 +2012,12 @@ pub(super) async fn strategy_paper(
         .lookback_minutes
         .unwrap_or(if full_history { 30 * 24 * 60 } else { 24 * 60 })
         .clamp(30, 365 * 24 * 60);
-    let max_points = params
-        .max_points
-        .unwrap_or(strategy_default_max_points(full_history))
-        .clamp(20_000, strategy_max_points_hard_cap());
+    let max_points = strategy_resolve_max_points(
+        full_history,
+        params.max_points,
+        params.max_samples,
+    );
+    let _heavy_permit = strategy_acquire_heavy_permit(&state, full_history, max_points).await;
     let max_trades = params.max_trades.unwrap_or(200).clamp(20, 1000) as usize;
     let _live_execute = params.live_execute.unwrap_or(false);
     let _live_quote_usdc = params.live_quote_usdc.unwrap_or(1.0).clamp(0.5, 1000.0);
@@ -2478,10 +2528,12 @@ pub(super) async fn strategy_full(
         .lookback_minutes
         .unwrap_or(if full_history { 30 * 24 * 60 } else { 12 * 60 })
         .clamp(30, 365 * 24 * 60);
-    let max_points = params
-        .max_points
-        .unwrap_or(strategy_default_max_points(full_history))
-        .clamp(20_000, strategy_max_points_hard_cap());
+    let max_points = strategy_resolve_max_points(
+        full_history,
+        params.max_points,
+        params.max_samples,
+    );
+    let _heavy_permit = strategy_acquire_heavy_permit(&state, full_history, max_points).await;
     let max_trades = params.max_trades.unwrap_or(300).clamp(20, 1000) as usize;
     let max_arms = params.max_arms.unwrap_or(8).clamp(2, 24) as usize;
     let window_trades = params.window_trades.unwrap_or(50).clamp(10, 200) as usize;
@@ -2828,10 +2880,12 @@ pub(super) async fn strategy_optimize(
         .lookback_minutes
         .unwrap_or(if full_history { 30 * 24 * 60 } else { 12 * 60 })
         .clamp(30, 365 * 24 * 60);
-    let max_points = params
-        .max_points
-        .unwrap_or(strategy_default_max_points(full_history))
-        .clamp(20_000, strategy_max_points_hard_cap());
+    let max_points = strategy_resolve_max_points(
+        full_history,
+        params.max_points,
+        params.max_samples,
+    );
+    let _heavy_permit = strategy_acquire_heavy_permit(&state, full_history, max_points).await;
     let max_trades = params.max_trades.unwrap_or(400).clamp(20, 2000) as usize;
     let max_arms = params.max_arms.unwrap_or(8).clamp(2, 24) as usize;
     let window_trades = params.window_trades.unwrap_or(50).clamp(10, 200) as usize;
