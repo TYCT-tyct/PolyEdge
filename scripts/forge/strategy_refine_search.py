@@ -6,6 +6,39 @@ import time
 import urllib.parse
 import urllib.request
 
+BOUNDS = {
+    "entry_threshold_base": (0.40, 0.95),
+    "entry_threshold_cap": (0.45, 0.99),
+    "spread_limit_prob": (0.005, 0.05),
+    "entry_edge_prob": (0.002, 0.25),
+    "entry_min_potential_cents": (1.0, 70.0),
+    "entry_max_price_cents": (45.0, 98.5),
+    "min_hold_ms": (0, 25000),
+    "stop_loss_cents": (2.0, 60.0),
+    "reverse_signal_threshold": (-0.95, -0.02),
+    "reverse_signal_ticks": (1, 12),
+    "trail_activate_profit_cents": (2.0, 80.0),
+    "trail_drawdown_cents": (1.0, 50.0),
+    "take_profit_near_max_cents": (70.0, 99.5),
+    "endgame_take_profit_cents": (50.0, 99.0),
+    "endgame_remaining_ms": (1000, 45000),
+    "liquidity_widen_prob": (0.02, 0.20),
+    "cooldown_ms": (0, 20000),
+    "max_entries_per_round": (1, 2),
+    "max_exec_spread_cents": (0.8, 3.4),
+    "slippage_cents_per_side": (0.03, 0.35),
+    "fee_cents_per_side": (0.03, 0.45),
+    "emergency_wide_spread_penalty_ratio": (0.0, 0.8),
+}
+
+INT_KEYS = {
+    "min_hold_ms",
+    "reverse_signal_ticks",
+    "endgame_remaining_ms",
+    "cooldown_ms",
+    "max_entries_per_round",
+}
+
 
 def get_json(base_url: str, path: str, query: dict, timeout: int, retries: int) -> dict:
     url = f"{base_url}{path}?{urllib.parse.urlencode(query)}"
@@ -25,12 +58,21 @@ def get_json(base_url: str, path: str, query: dict, timeout: int, retries: int) 
     raise RuntimeError(f"failed to fetch {url}")
 
 
-def eval_cfg(base_url: str, market_type: str, max_samples: int, cfg: dict, retries: int) -> dict:
+def eval_cfg(
+    base_url: str,
+    market_type: str,
+    full_history: bool,
+    lookback_minutes: int,
+    max_trades: int,
+    max_samples: int,
+    cfg: dict,
+    retries: int,
+) -> dict:
     q = {
         "market_type": market_type,
-        "full_history": "true",
-        "lookback_minutes": "1440",
-        "max_trades": "900",
+        "full_history": "true" if full_history else "false",
+        "lookback_minutes": str(lookback_minutes),
+        "max_trades": str(max_trades),
         "max_samples": str(max_samples),
         "use_autotune": "false",
     }
@@ -77,38 +119,8 @@ def eval_cfg(base_url: str, market_type: str, max_samples: int, cfg: dict, retri
 
 
 def clamp_param(k: str, v: float | int) -> float | int:
-    bounds = {
-        "entry_threshold_base": (0.40, 0.95),
-        "entry_threshold_cap": (0.45, 0.99),
-        "spread_limit_prob": (0.005, 0.05),
-        "entry_edge_prob": (0.002, 0.25),
-        "entry_min_potential_cents": (1.0, 70.0),
-        "entry_max_price_cents": (45.0, 98.5),
-        "min_hold_ms": (0, 25000),
-        "stop_loss_cents": (2.0, 60.0),
-        "reverse_signal_threshold": (-0.95, -0.02),
-        "reverse_signal_ticks": (1, 12),
-        "trail_activate_profit_cents": (2.0, 80.0),
-        "trail_drawdown_cents": (1.0, 50.0),
-        "take_profit_near_max_cents": (70.0, 99.5),
-        "endgame_take_profit_cents": (50.0, 99.0),
-        "endgame_remaining_ms": (1000, 45000),
-        "liquidity_widen_prob": (0.02, 0.20),
-        "cooldown_ms": (0, 20000),
-        "max_entries_per_round": (1, 2),
-        "max_exec_spread_cents": (0.8, 3.4),
-        "slippage_cents_per_side": (0.03, 0.35),
-        "fee_cents_per_side": (0.03, 0.45),
-        "emergency_wide_spread_penalty_ratio": (0.0, 0.8),
-    }
-    lo, hi = bounds[k]
-    if k in {
-        "min_hold_ms",
-        "reverse_signal_ticks",
-        "endgame_remaining_ms",
-        "cooldown_ms",
-        "max_entries_per_round",
-    }:
+    lo, hi = BOUNDS[k]
+    if k in INT_KEYS:
         return int(max(lo, min(hi, round(float(v)))))
     return max(lo, min(hi, float(v)))
 
@@ -139,7 +151,7 @@ def mutate(cfg: dict, scale: float) -> dict:
     }
 
     for k in list(c.keys()):
-        if k not in bounds:
+        if k not in BOUNDS:
             continue
         if k in {"max_entries_per_round", "reverse_signal_ticks"}:
             if random.random() < 0.20:
@@ -159,6 +171,13 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Refine local neighborhood around a seed config.")
     ap.add_argument("--base-url", default="http://127.0.0.1:9810")
     ap.add_argument("--market-type", default="5m")
+    ap.add_argument(
+        "--full-history",
+        action="store_true",
+        help="Request full history from API (default false to honor lookback window).",
+    )
+    ap.add_argument("--lookback-minutes", type=int, default=1440)
+    ap.add_argument("--max-trades", type=int, default=900)
     ap.add_argument("--input", required=True, help="Path to JSON containing candidate config object.")
     ap.add_argument("--iters", type=int, default=280)
     ap.add_argument(
@@ -175,13 +194,31 @@ def main() -> None:
         base_cfg = json.load(f)
 
     best_cfg = dict(base_cfg)
-    best = eval_cfg(args.base_url, args.market_type, args.max_samples, best_cfg, args.retries)
+    best = eval_cfg(
+        args.base_url,
+        args.market_type,
+        args.full_history,
+        args.lookback_minutes,
+        args.max_trades,
+        args.max_samples,
+        best_cfg,
+        args.retries,
+    )
     print("BASE", json.dumps(best, ensure_ascii=False))
 
     for i in range(1, args.iters + 1):
         scale = 1.0 if i < int(args.iters * 0.45) else (0.6 if i < int(args.iters * 0.8) else 0.35)
         cand = mutate(best_cfg if random.random() < 0.70 else base_cfg, scale)
-        res = eval_cfg(args.base_url, args.market_type, args.max_samples, cand, args.retries)
+        res = eval_cfg(
+            args.base_url,
+            args.market_type,
+            args.full_history,
+            args.lookback_minutes,
+            args.max_trades,
+            args.max_samples,
+            cand,
+            args.retries,
+        )
         if (res["score"], res["w50"], res["a50"], res["w80"]) > (
             best["score"],
             best["w50"],

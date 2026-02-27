@@ -108,6 +108,7 @@ def only_params(cfg: dict) -> dict:
 def fetch_payload(
     base_url: str,
     market_type: str,
+    full_history: bool,
     lookback_minutes: int,
     max_trades: int,
     max_samples: int,
@@ -117,7 +118,7 @@ def fetch_payload(
 ) -> dict:
     q: dict[str, str] = {
         "market_type": market_type,
-        "full_history": "true",
+        "full_history": "true" if full_history else "false",
         "lookback_minutes": str(lookback_minutes),
         "max_trades": str(max_trades),
         "max_samples": str(max_samples),
@@ -190,6 +191,7 @@ def score_window(metrics: dict, min_trades: int, trade_target: int, win_floor: f
 def evaluate_cfg(
     base_url: str,
     market_type: str,
+    full_history: bool,
     lookbacks: list[int],
     max_trades: int,
     max_samples: int,
@@ -206,6 +208,7 @@ def evaluate_cfg(
         payload = fetch_payload(
             base_url,
             market_type,
+            full_history,
             lb,
             max_trades,
             max_samples,
@@ -281,6 +284,11 @@ def main() -> None:
     ap.add_argument("--base-url", default="http://127.0.0.1:9810")
     ap.add_argument("--market-type", default="5m")
     ap.add_argument("--seed-config", required=True)
+    ap.add_argument(
+        "--full-history",
+        action="store_true",
+        help="Request full history from API (default false to honor lookback windows).",
+    )
     ap.add_argument("--lookbacks", default="1440,2880")
     ap.add_argument("--max-trades", type=int, default=900)
     ap.add_argument(
@@ -315,6 +323,7 @@ def main() -> None:
     seed_metrics = evaluate_cfg(
         args.base_url,
         args.market_type,
+        args.full_history,
         lookbacks,
         args.max_trades,
         args.max_samples,
@@ -347,6 +356,7 @@ def main() -> None:
                     evaluate_cfg,
                     args.base_url,
                     args.market_type,
+                    args.full_history,
                     lookbacks,
                     args.max_trades,
                     args.max_samples,
@@ -414,6 +424,7 @@ def main() -> None:
     result = {
         "search": {
             "market_type": args.market_type,
+            "full_history": args.full_history,
             "lookbacks": lookbacks,
             "max_trades": args.max_trades,
             "max_samples": args.max_samples,
