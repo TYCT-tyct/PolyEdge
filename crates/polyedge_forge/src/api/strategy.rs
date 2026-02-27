@@ -65,6 +65,28 @@ fn strategy_enabled_markets() -> &'static Vec<String> {
     })
 }
 
+fn live_execution_enabled_markets() -> &'static Vec<String> {
+    static ENABLED: OnceLock<Vec<String>> = OnceLock::new();
+    ENABLED.get_or_init(|| {
+        std::env::var("FORGE_FEV1_RUNTIME_MARKETS")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(|v| v.trim().to_ascii_lowercase())
+                    .filter(|v| v == "5m" || v == "15m")
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec!["5m".to_string()])
+    })
+}
+
+fn live_execution_market_allowed(market_type: &str) -> bool {
+    live_execution_enabled_markets()
+        .iter()
+        .any(|v| v.as_str() == market_type)
+}
+
 fn resolve_strategy_market_type(raw: Option<&str>) -> Result<&'static str, ApiError> {
     let market_type = if let Some(mt) = raw {
         normalize_market_type(mt).ok_or_else(|| ApiError::bad_request("invalid market_type"))?
@@ -738,6 +760,13 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         live_max_orders,
         live_drain_only,
     } = req;
+    let live_execute_requested = live_execute;
+    let live_execute = live_execute_requested && live_execution_market_allowed(market_type);
+    let live_execute_block_reason = if live_execute_requested && !live_execute {
+        Some("market_not_enabled_for_live_execution")
+    } else {
+        None
+    };
     let exec_gate = fev1::ExecutionGate::from_env();
     if live_execute && !exec_gate.live_enabled {
         return Err(ApiError::bad_request(
@@ -1427,7 +1456,10 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         "engine_version": "v1",
         "executor_mode": "same_signal_dual_executor",
         "live_executor": if live_execute { live_executor_mode.as_str() } else { "dry_run" },
+        "live_execute_requested": live_execute_requested,
         "live_execute": live_execute,
+        "live_execute_block_reason": live_execute_block_reason,
+        "live_execute_markets": live_execution_enabled_markets(),
         "runtime_mode": if live_drain_only { "drain" } else { "normal" },
         "market_type": market_type,
         "lookback_minutes": lookback_minutes,
