@@ -361,8 +361,23 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
     let mut last_side = "WAIT";
     let mut last_p_fair_up = 0.5;
     let mut last_edge_prob = 0.0;
+    let mut last_ts_ms = 0_i64;
+    let mut last_round_id = String::new();
+    let mut last_remaining_s = 0.0_f64;
+    let mut last_p_up = 0.5_f64;
+    let mut last_delta_pct = 0.0_f64;
+    let mut last_spread_up_cents = 0.0_f64;
+    let mut last_spread_down_cents = 0.0_f64;
 
     for sample in samples {
+        last_ts_ms = sample.ts_ms;
+        last_round_id = sample.round_id.clone();
+        last_remaining_s = (sample.remaining_ms.max(0) as f64) / 1000.0;
+        last_p_up = sample.p_up.clamp(0.0, 1.0);
+        last_delta_pct = sample.delta_pct;
+        last_spread_up_cents = sample.spread_up * 100.0;
+        last_spread_down_cents = sample.spread_down * 100.0;
+
         let signal = compute_signal(sample, &p_hist, &score_hist, cfg);
         let score = signal.score;
         let side = if score >= 0.0 { Side::Up } else { Side::Down };
@@ -643,6 +658,12 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
         0.0
     };
     let net_pnl_cents = total_pnl_cents;
+    let confidence = if last_entry_threshold > 1e-9 {
+        (last_score.abs() / last_entry_threshold).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let suggested_side = if last_confirmed { last_side } else { "WAIT" };
 
     let current = json!({
         "suggested_action": if last_confirmed && last_score.abs() >= last_entry_threshold {
@@ -652,12 +673,22 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
         } else {
             "WAIT"
         },
+        "suggested_side": suggested_side,
         "score": last_score,
         "entry_threshold": last_entry_threshold,
         "side": last_side,
         "confirmed": last_confirmed,
+        "confidence": confidence,
         "p_fair_up": last_p_fair_up,
         "edge_prob": last_edge_prob,
+        // Compatibility fields for dashboard cards (legacy shape).
+        "timestamp_ms": last_ts_ms,
+        "round_id": last_round_id,
+        "remaining_s": last_remaining_s,
+        "p_up_pct": last_p_up,
+        "delta_pct": last_delta_pct,
+        "spread_up_cents": last_spread_up_cents,
+        "spread_down_cents": last_spread_down_cents,
     });
 
     let trades_view = if trades.len() > max_trades {
