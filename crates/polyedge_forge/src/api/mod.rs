@@ -687,7 +687,7 @@ impl LiveCapitalConfig {
                 200
             ),
 
-            equity_base_usdc: env_f64!("FORGE_FEV1_CAPITAL_BASE_USDC", 500.0, 5.0, 5_000_000.0),
+            equity_base_usdc: env_f64!("FORGE_FEV1_CAPITAL_BASE_USDC", 50.0, 5.0, 5_000_000.0),
             reserve_usdc: env_f64!("FORGE_FEV1_CAPITAL_RESERVE_USDC", 0.0, 0.0, 1_000_000.0),
             reserve_ratio: env_f64!("FORGE_FEV1_CAPITAL_RESERVE_RATIO", 0.20, 0.0, 0.90),
             reserve_min_usdc: env_f64!(

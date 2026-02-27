@@ -127,7 +127,7 @@ fn strategy_select_profile_name() -> &'static str {
     let equity_base = std::env::var("FORGE_FEV1_CAPITAL_BASE_USDC")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(500.0);
+        .unwrap_or(50.0);
     if equity_base <= 60.0 {
         STRATEGY_PROFILE_HI_WIN
     } else {
