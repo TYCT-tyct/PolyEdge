@@ -1150,7 +1150,7 @@ impl ApiState {
                     if spendable.is_finite() {
                         cs.equity_estimate_usdc = spendable;
                         if cs.max_equity_usdc <= 0.0
-                            || cs.max_equity_usdc > (cs.equity_estimate_usdc * 3.0).max(50.0)
+                            || cs.max_equity_usdc >= (cs.equity_estimate_usdc * 3.0).max(50.0)
                             || cs.equity_estimate_usdc > cs.max_equity_usdc
                         {
                             cs.max_equity_usdc = cs.equity_estimate_usdc;
