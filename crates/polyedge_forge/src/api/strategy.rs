@@ -50,6 +50,7 @@ pub(super) struct StrategyRuntimeConfig {
 const STRATEGY_PROFILE_PROFIT_MAX: &str = "fev1_manual_profit_max_2026_02_27";
 const STRATEGY_PROFILE_HI_FREQ: &str = "fev1_manual_hi_freq_2026_02_27";
 const STRATEGY_PROFILE_HI_WIN: &str = "fev1_manual_hi_win_2026_02_27";
+const STRATEGY_PROFILE_BALANCED: &str = "fev1_manual_balanced_2026_02_28";
 
 fn strategy_enabled_markets() -> &'static Vec<String> {
     static ENABLED: OnceLock<Vec<String>> = OnceLock::new();
@@ -241,6 +242,9 @@ fn strategy_select_profile_name() -> &'static str {
             "hi_freq" | "manual_hi_freq" | "freq" | "fev1_manual_hi_freq_2026_02_27" => {
                 return STRATEGY_PROFILE_HI_FREQ;
             }
+            "balanced" | "manual_balanced" | "fev1_manual_balanced_2026_02_28" => {
+                return STRATEGY_PROFILE_BALANCED;
+            }
             _ => {}
         }
     }
@@ -430,10 +434,38 @@ fn strategy_hi_win_config() -> StrategyRuntimeConfig {
     }
 }
 
+fn strategy_balanced_config() -> StrategyRuntimeConfig {
+    StrategyRuntimeConfig {
+        entry_threshold_base: 0.7575819023940004,
+        entry_threshold_cap: 0.9615721516952305,
+        spread_limit_prob: 0.02439836783513124,
+        entry_edge_prob: 0.03165667526330243,
+        entry_min_potential_cents: 12.370095762634644,
+        entry_max_price_cents: 75.52831419817902,
+        min_hold_ms: 0,
+        stop_loss_cents: 16.127324932603138,
+        reverse_signal_threshold: -0.1770513110145612,
+        reverse_signal_ticks: 2,
+        trail_activate_profit_cents: 24.99799978463737,
+        trail_drawdown_cents: 17.473635150051532,
+        take_profit_near_max_cents: 99.5,
+        endgame_take_profit_cents: 93.55513599829052,
+        endgame_remaining_ms: 20_518,
+        liquidity_widen_prob: 0.06143177168730615,
+        cooldown_ms: 4_654,
+        max_entries_per_round: 3,
+        max_exec_spread_cents: 1.6807376190292096,
+        slippage_cents_per_side: 0.10036573476058915,
+        fee_cents_per_side: 0.03,
+        emergency_wide_spread_penalty_ratio: 0.13810130927202827,
+    }
+}
+
 pub(super) fn strategy_current_default_config() -> StrategyRuntimeConfig {
     match strategy_select_profile_name() {
         STRATEGY_PROFILE_HI_WIN => strategy_hi_win_config(),
         STRATEGY_PROFILE_HI_FREQ => strategy_hi_freq_config(),
+        STRATEGY_PROFILE_BALANCED => strategy_balanced_config(),
         _ => strategy_profit_max_config(),
     }
 }
