@@ -819,6 +819,8 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
             }
             Some(markets) = market_rx.recv() => {
                 let received = markets.len();
+                let now_ms = Utc::now().timestamp_millis();
+                let prev_markets = markets_by_id.clone();
                 markets_by_id.clear();
                 let mut kept = 0usize;
                 for m in markets {
@@ -826,6 +828,31 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         markets_by_id.insert(m.market_id.clone(), m);
                         kept = kept.saturating_add(1);
                     }
+                }
+                let mut pair_seen: HashSet<String> = markets_by_id
+                    .values()
+                    .map(|m| format!("{}:{}", m.symbol, m.timeframe))
+                    .collect();
+                let mut sticky_reused = 0usize;
+                for prev in prev_markets.values() {
+                    if !market_filter.allows(&prev.symbol, &prev.timeframe) {
+                        continue;
+                    }
+                    let pair_key = format!("{}:{}", prev.symbol, prev.timeframe);
+                    if pair_seen.contains(&pair_key) {
+                        continue;
+                    }
+                    // Discovery can temporarily miss active markets; keep the most recent
+                    // still-valid market meta to avoid short data gaps on critical pairs.
+                    if now_ms > prev.end_ts_ms.saturating_add(MARKET_STALE_GUARD_MS) {
+                        continue;
+                    }
+                    if now_ms.saturating_add(market_future_guard_ms) < prev.start_ts_ms {
+                        continue;
+                    }
+                    markets_by_id.insert(prev.market_id.clone(), prev.clone());
+                    pair_seen.insert(pair_key);
+                    sticky_reused = sticky_reused.saturating_add(1);
                 }
                 let mut kept_pairs = markets_by_id
                     .values()
@@ -835,7 +862,8 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                 kept_pairs.dedup();
                 tracing::info!(
                     received_markets = received,
-                    kept_markets = kept,
+                    kept_markets = markets_by_id.len(),
+                    sticky_reused = sticky_reused,
                     kept_pairs = kept_pairs.join(","),
                     "market meta update applied"
                 );
