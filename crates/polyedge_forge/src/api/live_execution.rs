@@ -352,6 +352,11 @@ pub(super) fn select_live_decisions(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_ascii_lowercase();
+            let freshness_ms = if action == "enter" || action == "add" {
+                20_000
+            } else {
+                90_000
+            };
             let round_ok = d
                 .get("round_id")
                 .and_then(Value::as_str)
@@ -360,7 +365,7 @@ pub(super) fn select_live_decisions(
             let ts_ok = d
                 .get("ts_ms")
                 .and_then(Value::as_i64)
-                .map(|ts| ts >= latest_ts_ms.saturating_sub(90_000))
+                .map(|ts| ts >= latest_ts_ms.saturating_sub(freshness_ms))
                 .unwrap_or(false);
             let scope_ok = if drain_only { round_ok || ts_ok } else { ts_ok };
             let action_ok = if drain_only {
@@ -380,12 +385,17 @@ pub(super) fn select_live_decisions(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_ascii_lowercase();
+            let freshness_ms = if action == "enter" || action == "add" {
+                20_000
+            } else {
+                90_000
+            };
             let action_ok = if drain_only {
                 action == "exit" || action == "reduce"
             } else {
                 d.get("ts_ms")
                     .and_then(Value::as_i64)
-                    .map(|ts| ts >= latest_ts_ms.saturating_sub(90_000))
+                    .map(|ts| ts >= latest_ts_ms.saturating_sub(freshness_ms))
                     .unwrap_or(false)
             };
             action_ok && !is_replay_only_reason(d)
@@ -594,6 +604,30 @@ pub(super) fn decision_to_live_payload(
         .clamp(0.0, 500.0);
     if let Some(force) = gateway_cfg.force_slippage_bps {
         slippage_bps = force.clamp(0.0, 500.0);
+    }
+    if let Some(book) = book {
+        let taker_like = style == "taker" || matches!(tif.as_str(), "FAK" | "FOK");
+        if taker_like {
+            if is_buy {
+                if let Some(best_ask) = book.best_ask.filter(|v| v.is_finite() && *v > 0.0) {
+                    let anchored = best_ask.clamp(0.01, 0.99);
+                    if anchored > price {
+                        price = anchored;
+                        notes.push("anchor_taker_to_best_ask".to_string());
+                    }
+                }
+            } else if let Some(best_bid) = book.best_bid.filter(|v| v.is_finite() && *v > 0.0) {
+                let anchored = best_bid.clamp(0.01, 0.99);
+                if anchored < price {
+                    price = anchored;
+                    notes.push("anchor_taker_to_best_bid".to_string());
+                }
+            }
+            let tick_size = book.tick_size.max(0.0001);
+            price = round_to_tick(price, tick_size, is_buy);
+            size = (quote_size / price).max(min_order_size).max(0.01);
+            size = (size * 10_000.0).round() / 10_000.0;
+        }
     }
     let cache_key = format!(
         "fev1:{}:{}:{}:{:.4}:{:.4}",

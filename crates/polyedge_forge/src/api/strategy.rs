@@ -1778,16 +1778,20 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                         .get("round_id")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    let ts_ms = decision
-                        .get("ts_ms")
-                        .and_then(Value::as_i64)
-                        .unwrap_or_else(|| Utc::now().timestamp_millis());
-                    let accepted = record
+                    let accepted_raw = record
                         .get("accepted")
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
+                    let order_id = if accepted_raw {
+                        extract_order_id_from_gateway_record(record)
+                    } else {
+                        None
+                    };
+                    let accepted = accepted_raw && order_id.is_some();
                     let event_reason = if accepted {
                         "submit_accepted_pending_confirm".to_string()
+                    } else if accepted_raw && order_id.is_none() {
+                        "submit_accepted_missing_order_id".to_string()
                     } else {
                         record
                             .get("error")
@@ -1801,94 +1805,92 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                         } else if action == "exit" || action == "reduce" {
                             live_position_state.state = "exit_pending".to_string();
                         }
-                        let order_id = extract_order_id_from_gateway_record(record);
-                        if let Some(order_id) = order_id {
-                            let filled_size = record
-                                .get("response")
-                                .and_then(|v| v.get("accepted_size"))
-                                .and_then(Value::as_f64)
-                                .unwrap_or(0.0)
-                                .max(0.0);
-                            let exec_price = record
-                                .get("final_request")
-                                .and_then(|v| v.get("price"))
-                                .and_then(Value::as_f64)
-                                .or_else(|| {
-                                    record
-                                        .get("request")
-                                        .and_then(|v| v.get("price"))
-                                        .and_then(Value::as_f64)
-                                })
-                                .unwrap_or_else(|| {
-                                    decision
-                                        .get("price_cents")
-                                        .and_then(Value::as_f64)
-                                        .unwrap_or(0.0)
-                                        / 100.0
-                                })
-                                .max(0.0001);
-                            let effective_notional = record
-                                .get("response")
-                                .and_then(|v| v.get("effective_notional"))
-                                .and_then(Value::as_f64)
-                                .unwrap_or(filled_size * exec_price)
-                                .max(0.0);
-                            let submit_reason = decision
-                                .get("reason")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string();
-                            let is_exit_like = is_live_exit_action(&action);
-                            let emergency_exit =
-                                is_exit_like && is_emergency_exit_reason(&submit_reason);
-                            let pending = LivePendingOrder {
-                                market_type: market_type.to_string(),
-                                order_id,
-                                action: action.clone(),
-                                side: side.clone(),
-                                round_id: round_id.to_string(),
-                                decision_key: record
-                                    .get("decision_key")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                price_cents: decision
+                        let order_id = order_id.unwrap_or_default();
+                        let filled_size = record
+                            .get("response")
+                            .and_then(|v| v.get("accepted_size"))
+                            .and_then(Value::as_f64)
+                            .unwrap_or(0.0)
+                            .max(0.0);
+                        let exec_price = record
+                            .get("final_request")
+                            .and_then(|v| v.get("price"))
+                            .and_then(Value::as_f64)
+                            .or_else(|| {
+                                record
+                                    .get("request")
+                                    .and_then(|v| v.get("price"))
+                                    .and_then(Value::as_f64)
+                            })
+                            .unwrap_or_else(|| {
+                                decision
                                     .get("price_cents")
                                     .and_then(Value::as_f64)
-                                    .unwrap_or(0.0),
-                                quote_size_usdc: if effective_notional > 0.0 {
-                                    effective_notional
+                                    .unwrap_or(0.0)
+                                    / 100.0
+                            })
+                            .max(0.0001);
+                        let effective_notional = record
+                            .get("response")
+                            .and_then(|v| v.get("effective_notional"))
+                            .and_then(Value::as_f64)
+                            .unwrap_or(filled_size * exec_price)
+                            .max(0.0);
+                        let submit_reason = decision
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let is_exit_like = is_live_exit_action(&action);
+                        let emergency_exit = is_exit_like && is_emergency_exit_reason(&submit_reason);
+                        let pending = LivePendingOrder {
+                            market_type: market_type.to_string(),
+                            order_id,
+                            action: action.clone(),
+                            side: side.clone(),
+                            round_id: round_id.to_string(),
+                            decision_key: record
+                                .get("decision_key")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            price_cents: decision
+                                .get("price_cents")
+                                .and_then(Value::as_f64)
+                                .unwrap_or(0.0),
+                            quote_size_usdc: if effective_notional > 0.0 {
+                                effective_notional
+                            } else {
+                                decision
+                                    .get("quote_size_usdc")
+                                    .and_then(Value::as_f64)
+                                    .unwrap_or(0.0)
+                            },
+                            tif: decision
+                                .get("tif")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            style: decision
+                                .get("style")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            submit_reason,
+                            // Use real submit time, not signal timestamp, to avoid premature timeout cancellation.
+                            submitted_ts_ms: Utc::now().timestamp_millis(),
+                            cancel_after_ms: if is_exit_like {
+                                if emergency_exit {
+                                    650
                                 } else {
-                                    decision
-                                        .get("quote_size_usdc")
-                                        .and_then(Value::as_f64)
-                                        .unwrap_or(0.0)
-                                },
-                                tif: decision
-                                    .get("tif")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                style: decision
-                                    .get("style")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                submit_reason,
-                                submitted_ts_ms: ts_ms,
-                                cancel_after_ms: if is_exit_like {
-                                    if emergency_exit {
-                                        650
-                                    } else {
-                                        900
-                                    }
-                                } else {
-                                    1500
-                                },
-                                retry_count: 0,
-                            };
-                            state.upsert_pending_order(pending).await;
-                        }
+                                    900
+                                }
+                            } else {
+                                1500
+                            },
+                            retry_count: 0,
+                        };
+                        state.upsert_pending_order(pending).await;
                     }
                     live_position_state.last_action = Some(format!("{}_{}", action, side));
                     live_position_state.last_reason = Some(event_reason.clone());
@@ -1915,7 +1917,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                 state
                     .put_live_position_state(market_type, live_position_state.clone())
                     .await;
-                reconcile_gateway_reports(state, &live_gateway_cfg).await;
+                reconcile_live_reports(state, &live_gateway_cfg, live_executor_mode).await;
                 json!({
                     "mode": "real_gateway",
                     "target": {
@@ -1986,7 +1988,10 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         .map(|orders| {
             let accepted = orders
                 .iter()
-                .filter(|o| o.get("accepted").and_then(Value::as_bool).unwrap_or(false))
+                .filter(|o| {
+                    o.get("accepted").and_then(Value::as_bool).unwrap_or(false)
+                        && extract_order_id_from_gateway_record(o).is_some()
+                })
                 .count();
             let rejected = orders.len().saturating_sub(accepted);
             (accepted, rejected)
