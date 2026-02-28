@@ -59,6 +59,8 @@ const TARGET_CACHE_RETENTION_MS: i64 = 2 * 60 * 60 * 1000;
 const TARGET_RETRY_RETENTION_MS: i64 = 20 * 60 * 1000;
 const ROUND_META_RETENTION_MS: i64 = 6 * 60 * 60 * 1000;
 const EMITTED_ROUND_RETENTION_MS: i64 = 6 * 60 * 60 * 1000;
+const TOKYO_INPUT_STALE_GUARD_DEFAULT_MS: i64 = 2_500;
+const INPUT_STALE_WARN_THROTTLE_MS: i64 = 15_000;
 
 fn env_flag(key: &str, default: bool) -> bool {
     std::env::var(key)
@@ -76,9 +78,106 @@ fn chainlink_runtime_enabled() -> bool {
     env_flag("FORGE_CHAINLINK_ENABLED", false)
 }
 
+#[derive(Debug, Clone)]
+struct ActiveMarketFilter {
+    by_symbol: HashMap<String, HashSet<String>>,
+    symbols: Vec<String>,
+    timeframes: Vec<String>,
+}
+
+impl ActiveMarketFilter {
+    fn from_inputs(active_symbols: &[String], active_tfs: &[String], raw: &str) -> Self {
+        let allowed_symbols: HashSet<String> = active_symbols
+            .iter()
+            .map(|v| v.to_ascii_uppercase())
+            .collect();
+        let allowed_tfs: HashSet<String> =
+            active_tfs.iter().map(|v| v.to_ascii_lowercase()).collect();
+
+        let mut default_by_symbol: HashMap<String, HashSet<String>> = HashMap::new();
+        for symbol in &allowed_symbols {
+            let tfs = allowed_tfs.iter().cloned().collect::<HashSet<_>>();
+            if !tfs.is_empty() {
+                default_by_symbol.insert(symbol.clone(), tfs);
+            }
+        }
+
+        let mut custom_by_symbol: HashMap<String, HashSet<String>> = HashMap::new();
+        for entry in raw.split([',', ';']) {
+            let item = entry.trim();
+            if item.is_empty() {
+                continue;
+            }
+            let Some((symbol_raw, tfs_raw)) = item.split_once(':') else {
+                continue;
+            };
+            let symbol = symbol_raw.trim().to_ascii_uppercase();
+            if !allowed_symbols.contains(&symbol) {
+                continue;
+            }
+            for tf in tfs_raw
+                .split(['|', '/'])
+                .map(|v| v.trim().to_ascii_lowercase())
+                .filter(|v| !v.is_empty() && allowed_tfs.contains(v))
+            {
+                custom_by_symbol
+                    .entry(symbol.clone())
+                    .or_default()
+                    .insert(tf);
+            }
+        }
+
+        let mut by_symbol = if custom_by_symbol.is_empty() {
+            default_by_symbol
+        } else {
+            custom_by_symbol
+        };
+        by_symbol.retain(|_, tfs| !tfs.is_empty());
+
+        let mut symbols = by_symbol.keys().cloned().collect::<Vec<_>>();
+        symbols.sort();
+        let mut timeframes = by_symbol
+            .values()
+            .flat_map(|set| set.iter().cloned())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        timeframes.sort();
+
+        Self {
+            by_symbol,
+            symbols,
+            timeframes,
+        }
+    }
+
+    fn allows(&self, symbol: &str, timeframe: &str) -> bool {
+        let symbol = symbol.to_ascii_uppercase();
+        let timeframe = timeframe.to_ascii_lowercase();
+        self.by_symbol
+            .get(&symbol)
+            .map(|tfs| tfs.contains(&timeframe))
+            .unwrap_or(false)
+    }
+
+    fn summary(&self) -> String {
+        let mut entries = self
+            .by_symbol
+            .iter()
+            .map(|(symbol, tfs)| {
+                let mut tf_list = tfs.iter().cloned().collect::<Vec<_>>();
+                tf_list.sort();
+                format!("{symbol}:{}", tf_list.join("|"))
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries.join(",")
+    }
+}
+
 fn round_end_ts_ms_from_round_id(round_id: &str) -> Option<i64> {
     let mut parts = round_id.rsplitn(3, '_');
-    let start_ms = parse_timestamp_ms(Some(parts.next()?))?;
+    let start_ms = parts.next()?.trim().parse::<i64>().ok()?;
     let timeframe = parts.next()?;
     let tf_ms = timeframe_to_ms(timeframe)?;
     Some(start_ms.saturating_add(tf_ms))
@@ -113,6 +212,7 @@ struct RoundQualityPolicy {
     max_gap_ms: i64,
     start_tolerance_ms: i64,
     end_tolerance_ms: i64,
+    settle_stale_tolerance_ms: i64,
 }
 
 impl RoundQualityPolicy {
@@ -125,6 +225,7 @@ impl RoundQualityPolicy {
             max_gap_ms: args.round_max_gap_ms.max(base_gap).max(1_000),
             start_tolerance_ms: args.round_start_tolerance_ms.max(base_tol).max(500),
             end_tolerance_ms: args.round_end_tolerance_ms.max(base_tol).max(500),
+            settle_stale_tolerance_ms: sample_period_ms.saturating_mul(25).max(1_500),
         }
     }
 }
@@ -140,6 +241,7 @@ struct RoundQualityReport {
     max_gap_ms: i64,
     start_delay_ms: i64,
     end_missing_ms: i64,
+    settle_stale_ms: i64,
 }
 
 #[derive(Debug)]
@@ -158,6 +260,7 @@ struct RoundBuffer {
     max_gap_ms: i64,
     target_price_latest: Option<f64>,
     settle_price_latest: Option<f64>,
+    settle_price_latest_ts_ms: Option<i64>,
 }
 
 impl RoundBuffer {
@@ -180,6 +283,7 @@ impl RoundBuffer {
             max_gap_ms: 0,
             target_price_latest: market.target_price,
             settle_price_latest: None,
+            settle_price_latest_ts_ms: None,
         }
     }
 
@@ -200,6 +304,7 @@ impl RoundBuffer {
         }
         if let Some(v) = row.binance_price {
             self.settle_price_latest = Some(v);
+            self.settle_price_latest_ts_ms = Some(ts);
         }
         self.snapshots.push(row);
     }
@@ -218,6 +323,10 @@ impl RoundBuffer {
         let sample_ratio = sample_count as f64 / expected_samples.max(1) as f64;
         let start_delay_ms = first.saturating_sub(self.start_ts_ms).max(0);
         let end_missing_ms = self.end_ts_ms.saturating_sub(last).max(0);
+        let settle_stale_ms = self
+            .settle_price_latest_ts_ms
+            .map(|v| self.end_ts_ms.saturating_sub(v).max(0))
+            .unwrap_or(i64::MAX);
 
         let mut reasons = Vec::<String>::new();
         if sample_count < 2 {
@@ -243,6 +352,8 @@ impl RoundBuffer {
         }
         if self.settle_price_latest.is_none() {
             reasons.push("missing_settle_price".to_string());
+        } else if settle_stale_ms > policy.settle_stale_tolerance_ms {
+            reasons.push(format!("stale_settle={}ms", settle_stale_ms));
         }
 
         RoundQualityReport {
@@ -255,6 +366,7 @@ impl RoundBuffer {
             max_gap_ms: self.max_gap_ms,
             start_delay_ms,
             end_missing_ms,
+            settle_stale_ms,
         }
     }
 }
@@ -409,6 +521,25 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
     if active_symbols.is_empty() || active_tfs.is_empty() {
         anyhow::bail!("active symbols/timeframes must not be empty");
     }
+    let market_filter = ActiveMarketFilter::from_inputs(
+        &active_symbols,
+        &active_tfs,
+        &args.active_symbol_timeframes,
+    );
+    if market_filter.by_symbol.is_empty() {
+        anyhow::bail!("active symbol/timeframe map resolves to empty set");
+    }
+    let subscribe_symbols = market_filter.symbols.clone();
+    let subscribe_tfs = market_filter.timeframes.clone();
+    let active_symbols_set: HashSet<String> = subscribe_symbols
+        .iter()
+        .map(|v| v.to_ascii_uppercase())
+        .collect();
+    let tokyo_input_stale_guard_ms = std::env::var("FORGE_TOKYO_INPUT_STALE_GUARD_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(TOKYO_INPUT_STALE_GUARD_DEFAULT_MS)
+        .clamp(500, 30_000);
 
     let root = PathBuf::from(&args.data_root);
     fs::create_dir_all(root.join("snapshot_100ms")).ok();
@@ -427,6 +558,9 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         round_max_gap_ms = quality_policy.max_gap_ms,
         round_start_tolerance_ms = quality_policy.start_tolerance_ms,
         round_end_tolerance_ms = quality_policy.end_tolerance_ms,
+        settle_stale_tolerance_ms = quality_policy.settle_stale_tolerance_ms,
+        tokyo_input_stale_guard_ms = tokyo_input_stale_guard_ms,
+        market_filter = %market_filter.summary(),
         ?supported_symbols,
         ?active_symbols,
         ?active_tfs,
@@ -614,7 +748,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
 
     spawn_tokyo_udp_receiver(args.udp_bind.clone(), tokyo_tx, persist_tx.clone());
     if chainlink_enabled {
-        spawn_chainlink_reader(active_symbols.clone(), chainlink_tx, persist_tx.clone());
+        spawn_chainlink_reader(subscribe_symbols.clone(), chainlink_tx, persist_tx.clone());
     } else {
         log_ingest(
             &persist_tx,
@@ -624,14 +758,14 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         );
     }
     spawn_book_reader(
-        active_symbols.clone(),
-        active_tfs.clone(),
+        subscribe_symbols.clone(),
+        subscribe_tfs.clone(),
         book_tx,
         persist_tx.clone(),
     );
     spawn_market_discovery_reader(
-        active_symbols.clone(),
-        active_tfs.clone(),
+        subscribe_symbols.clone(),
+        subscribe_tfs.clone(),
         args.discovery_refresh_sec.max(1),
         market_tx,
         persist_tx.clone(),
@@ -649,10 +783,8 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
     let mut target_cache: HashMap<String, (i64, f64)> = HashMap::new();
     let mut target_retry_after_ms: HashMap<String, i64> = HashMap::new();
     let mut target_anchor_by_round: HashMap<String, f64> = HashMap::new();
-    let active_symbols_set: HashSet<String> = active_symbols
-        .iter()
-        .map(|v| v.to_ascii_uppercase())
-        .collect();
+    let mut stale_tokyo_warn_by_symbol: HashMap<String, i64> = HashMap::new();
+    let mut committed_rounds: HashMap<String, i64> = HashMap::new();
 
     let mut ingest_seq: u64 = 0;
 
@@ -682,7 +814,9 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
             Some(markets) = market_rx.recv() => {
                 markets_by_id.clear();
                 for m in markets {
-                    markets_by_id.insert(m.market_id.clone(), m);
+                    if market_filter.allows(&m.symbol, &m.timeframe) {
+                        markets_by_id.insert(m.market_id.clone(), m);
+                    }
                 }
             }
             Some(res) = target_res_rx.recv() => {
@@ -740,7 +874,36 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
 
                     let tokyo = tokyo_by_symbol.get(&market.symbol);
                     let chainlink = chainlink_by_symbol.get(&market.symbol);
-                    let binance_price = tokyo.map(|v| v.binance_price);
+                    let tokyo_fresh = tokyo.filter(|row| {
+                        now_ms.saturating_sub(row.ts_ireland_recv_ms)
+                            <= tokyo_input_stale_guard_ms
+                    });
+                    if tokyo_fresh.is_none() {
+                        let warn_at = stale_tokyo_warn_by_symbol
+                            .entry(market.symbol.clone())
+                            .or_insert(0);
+                        if now_ms.saturating_sub(*warn_at) >= INPUT_STALE_WARN_THROTTLE_MS {
+                            let age_ms = tokyo
+                                .map(|row| now_ms.saturating_sub(row.ts_ireland_recv_ms))
+                                .unwrap_or(i64::MAX);
+                            log_ingest(
+                                &persist_tx,
+                                "warn",
+                                "tokyo_price",
+                                &format!(
+                                    "tokyo_price_unavailable symbol={} tf={} age_ms={} guard_ms={}",
+                                    market.symbol,
+                                    market.timeframe,
+                                    age_ms,
+                                    tokyo_input_stale_guard_ms
+                                ),
+                            );
+                            *warn_at = now_ms;
+                        }
+                    }
+                    let binance_price = tokyo_fresh
+                        .map(|v| v.binance_price)
+                        .filter(|v| v.is_finite() && *v > 0.0);
                     let round_start = market.start_ts_ms;
                     let round_id = format!("{}_{}_{}", market.symbol, market.timeframe, round_start);
                     let mut target_price = market.target_price;
@@ -955,10 +1118,10 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         schema_version: "forge_snapshot_v1",
                         ingest_seq,
                         ts_ireland_sample_ms: now_ms,
-                        ts_tokyo_recv_ms: tokyo.map(|v| v.ts_tokyo_recv_ms),
-                        ts_exchange_ms: tokyo.map(|v| v.ts_exchange_ms),
-                        ts_ireland_recv_ms: tokyo.map(|v| v.ts_ireland_recv_ms),
-                        path_lag_ms: tokyo
+                        ts_tokyo_recv_ms: tokyo_fresh.map(|v| v.ts_tokyo_recv_ms),
+                        ts_exchange_ms: tokyo_fresh.map(|v| v.ts_exchange_ms),
+                        ts_ireland_recv_ms: tokyo_fresh.map(|v| v.ts_ireland_recv_ms),
+                        path_lag_ms: tokyo_fresh
                             .map(|v| (v.ts_ireland_recv_ms - v.ts_tokyo_recv_ms).max(0) as f64),
                         symbol: market.symbol.clone(),
                         ts_pm_recv_ms: if book.recv_ts_local_ns > 0 {
@@ -1012,6 +1175,10 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             let report = buffer.evaluate(&quality_policy, sample_period_ms);
                             let target = buffer.target_price_latest.unwrap_or(0.0);
                             let settle = buffer.settle_price_latest.unwrap_or(0.0);
+                            let settle_stale = report
+                                .reasons
+                                .iter()
+                                .any(|r| r.starts_with("stale_settle="));
                             if !(target.is_finite() && target > 0.0 && settle.is_finite() && settle > 0.0)
                             {
                                 log_ingest(
@@ -1020,6 +1187,18 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                     "round_quality",
                                     &format!(
                                         "skip_invalid_round {} target={} settle={} reason=invalid_target_or_settle",
+                                        round_id, target, settle
+                                    ),
+                                );
+                                continue;
+                            }
+                            if settle_stale {
+                                log_ingest(
+                                    &persist_tx,
+                                    "warn",
+                                    "round_quality",
+                                    &format!(
+                                        "skip_invalid_round {} target={} settle={} reason=stale_settle",
                                         round_id, target, settle
                                     ),
                                 );
@@ -1038,6 +1217,18 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                 label_up: settle > target,
                                 ts_recorded_ms: now_ms,
                             };
+                            if committed_rounds.contains_key(&round.round_id) {
+                                log_ingest(
+                                    &persist_tx,
+                                    "warn",
+                                    "round_quality",
+                                    &format!(
+                                        "skip_duplicate_round {} reason=already_committed_in_process",
+                                        round.round_id
+                                    ),
+                                );
+                                continue;
+                            }
                             let snapshot_count = buffer.snapshots.len();
                             if let Err(err) = commit_tx
                                 .send(RoundCommit {
@@ -1048,6 +1239,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             {
                                 tracing::error!(?err, "commit queue closed; dropping round");
                             } else {
+                                committed_rounds.insert(round_id.clone(), now_ms);
                                 if report.accept {
                                     log_ingest(
                                         &persist_tx,
@@ -1070,7 +1262,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                         "warn",
                                         "round_quality",
                                         &format!(
-                                            "quality_warn {} samples={} expected={} coverage={:.3} sample_ratio={:.3} max_gap_ms={} start_delay_ms={} end_missing_ms={} reason={}",
+                                            "quality_warn {} samples={} expected={} coverage={:.3} sample_ratio={:.3} max_gap_ms={} start_delay_ms={} end_missing_ms={} settle_stale_ms={} reason={}",
                                             round_id,
                                             report.sample_count,
                                             report.expected_samples,
@@ -1079,6 +1271,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                             report.max_gap_ms,
                                             report.start_delay_ms,
                                             report.end_missing_ms,
+                                            report.settle_stale_ms,
                                             reason
                                         ),
                                     );
@@ -1118,6 +1311,10 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         let report = buffer.evaluate(&quality_policy, sample_period_ms);
                         let target = buffer.target_price_latest.unwrap_or(0.0);
                         let settle = buffer.settle_price_latest.unwrap_or(0.0);
+                        let settle_stale = report
+                            .reasons
+                            .iter()
+                            .any(|r| r.starts_with("stale_settle="));
                         if !(target.is_finite() && target > 0.0 && settle.is_finite() && settle > 0.0)
                         {
                             log_ingest(
@@ -1126,6 +1323,18 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                 "round_quality",
                                 &format!(
                                     "skip_invalid_stale_round {} target={} settle={} reason=invalid_target_or_settle",
+                                    rid, target, settle
+                                ),
+                            );
+                            continue;
+                        }
+                        if settle_stale {
+                            log_ingest(
+                                &persist_tx,
+                                "warn",
+                                "round_quality",
+                                &format!(
+                                    "skip_invalid_stale_round {} target={} settle={} reason=stale_settle",
                                     rid, target, settle
                                 ),
                             );
@@ -1144,6 +1353,18 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             label_up: settle > target,
                             ts_recorded_ms: now_ms,
                         };
+                        if committed_rounds.contains_key(&round.round_id) {
+                            log_ingest(
+                                &persist_tx,
+                                "warn",
+                                "round_quality",
+                                &format!(
+                                    "skip_duplicate_stale_round {} reason=already_committed_in_process",
+                                    round.round_id
+                                ),
+                            );
+                            continue;
+                        }
                         let reason = if report.reasons.is_empty() {
                             "stale_round_without_close".to_string()
                         } else {
@@ -1159,18 +1380,20 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             tracing::error!(?err, "commit queue closed; dropping stale round");
                             continue;
                         }
+                        committed_rounds.insert(rid.clone(), now_ms);
                         log_ingest(
                             &persist_tx,
                             "warn",
                             "round_quality",
                             &format!(
-                                "stale_committed {} samples={} expected={} coverage={:.3} sample_ratio={:.3} max_gap_ms={} reason={}",
+                                "stale_committed {} samples={} expected={} coverage={:.3} sample_ratio={:.3} max_gap_ms={} settle_stale_ms={} reason={}",
                                 rid,
                                 report.sample_count,
                                 report.expected_samples,
                                 report.coverage_ratio,
                                 report.sample_ratio,
                                 report.max_gap_ms,
+                                report.settle_stale_ms,
                                 reason
                             ),
                         );
@@ -1206,6 +1429,8 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             && now_ms.saturating_sub(row.ts_ireland_recv_ms)
                                 <= RECORDER_STALE_STATE_RETENTION_MS
                     });
+                    stale_tokyo_warn_by_symbol
+                        .retain(|symbol, _| active_symbols_set.contains(symbol.as_str()));
                     motion_by_key.retain(|key, state| {
                         let symbol = key.split('|').next().unwrap_or_default();
                         active_symbols_set.contains(symbol)
@@ -1223,6 +1448,10 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     });
                     emitted_rounds.retain(|round_id, closed_at_ms| {
                         now_ms.saturating_sub(*closed_at_ms) <= EMITTED_ROUND_RETENTION_MS
+                            && round_meta_is_fresh(round_id, now_ms, ROUND_META_RETENTION_MS)
+                    });
+                    committed_rounds.retain(|round_id, committed_at_ms| {
+                        now_ms.saturating_sub(*committed_at_ms) <= EMITTED_ROUND_RETENTION_MS
                             && round_meta_is_fresh(round_id, now_ms, ROUND_META_RETENTION_MS)
                     });
                 }
@@ -1789,5 +2018,53 @@ mod tests {
         let ts_ms = 1771918380123_i64;
         assert_eq!(aligned_round_timestamp_sec(ts_ms, "5m"), 1771918200_i64);
         assert_eq!(aligned_round_timestamp_sec(ts_ms, "15m"), 1771918200_i64);
+    }
+
+    #[test]
+    fn active_market_filter_honors_symbol_tf_map() {
+        let symbols = vec![
+            "BTCUSDT".to_string(),
+            "ETHUSDT".to_string(),
+            "SOLUSDT".to_string(),
+            "XRPUSDT".to_string(),
+        ];
+        let tfs = vec!["5m".to_string(), "15m".to_string()];
+        let f = ActiveMarketFilter::from_inputs(
+            &symbols,
+            &tfs,
+            "BTCUSDT:5m|15m,ETHUSDT:5m,SOLUSDT:5m,XRPUSDT:5m",
+        );
+        assert!(f.allows("BTCUSDT", "5m"));
+        assert!(f.allows("BTCUSDT", "15m"));
+        assert!(f.allows("ETHUSDT", "5m"));
+        assert!(!f.allows("ETHUSDT", "15m"));
+        assert!(!f.allows("DOGEUSDT", "5m"));
+    }
+
+    #[test]
+    fn active_market_filter_falls_back_to_defaults_when_map_invalid() {
+        let symbols = vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()];
+        let tfs = vec!["5m".to_string(), "15m".to_string()];
+        let f = ActiveMarketFilter::from_inputs(&symbols, &tfs, "DOGEUSDT:1m");
+        assert!(f.allows("BTCUSDT", "5m"));
+        assert!(f.allows("BTCUSDT", "15m"));
+        assert!(f.allows("ETHUSDT", "5m"));
+        assert!(f.allows("ETHUSDT", "15m"));
+    }
+
+    #[test]
+    fn round_end_ts_parses_numeric_round_id_ms() {
+        assert_eq!(
+            round_end_ts_ms_from_round_id("BTCUSDT_5m_1772279700000"),
+            Some(1772280000000)
+        );
+    }
+
+    #[test]
+    fn round_meta_freshness_uses_round_end_plus_retention() {
+        let rid = "BTCUSDT_5m_1772279700000";
+        assert!(round_meta_is_fresh(rid, 1772280000000, 60_000));
+        assert!(round_meta_is_fresh(rid, 1772280060000, 60_000));
+        assert!(!round_meta_is_fresh(rid, 1772280060001, 60_000));
     }
 }

@@ -4,6 +4,7 @@ set -euo pipefail
 REPO_DIR="${REPO_DIR:-/home/ubuntu/PolyEdge}"
 USER_NAME="${USER_NAME:-ubuntu}"
 IRELAND_PRIVATE_UDP="${IRELAND_PRIVATE_UDP:-10.0.3.123:9801}"
+TOKYO_SYMBOLS="${TOKYO_SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT}"
 
 echo "[forge-tokyo] repo=$REPO_DIR user=$USER_NAME ireland_udp=$IRELAND_PRIVATE_UDP"
 
@@ -28,7 +29,7 @@ Type=simple
 User=$USER_NAME
 WorkingDirectory=$REPO_DIR
 Environment=RUST_LOG=info,polyedge_forge=debug
-ExecStart=$REPO_DIR/target/release/polyedge_forge tokyo-relay --symbols BTCUSDT --bind 0.0.0.0:0 --ireland-udp $IRELAND_PRIVATE_UDP --redundancy 2
+ExecStart=$REPO_DIR/target/release/polyedge_forge tokyo-relay --symbols $TOKYO_SYMBOLS --bind 0.0.0.0:0 --ireland-udp $IRELAND_PRIVATE_UDP --redundancy 2
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -540,12 +540,57 @@ async fn flush_clickhouse_rounds(
     cfg: &DbSinkConfig,
     rows: &[RoundRow],
 ) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
     let db = &cfg.clickhouse_database;
     let tbl = &cfg.clickhouse_round_table;
+
+    let mut unique_rows = Vec::<&RoundRow>::with_capacity(rows.len());
+    let mut seen = HashSet::<&str>::with_capacity(rows.len());
+    for row in rows {
+        if seen.insert(row.round_id.as_str()) {
+            unique_rows.push(row);
+        }
+    }
+    if unique_rows.is_empty() {
+        return Ok(());
+    }
+
+    let mut existing_round_ids = HashSet::<String>::new();
+    let id_sql = unique_rows
+        .iter()
+        .map(|r| format!("'{}'", r.round_id.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(",");
+    let existing_query = format!(
+        "SELECT round_id FROM {}.{} WHERE round_id IN ({}) FORMAT JSON",
+        db, tbl, id_sql
+    );
+    let existing_resp = reqwest::Client::new()
+        .post(ch_url)
+        .query(&[("query", existing_query.as_str())])
+        .send()
+        .await?;
+    if existing_resp.status().is_success() {
+        let payload: serde_json::Value = existing_resp.json().await?;
+        if let Some(arr) = payload.get("data").and_then(|v| v.as_array()) {
+            for row in arr {
+                if let Some(id) = row.get("round_id").and_then(|v| v.as_str()) {
+                    existing_round_ids.insert(id.to_string());
+                }
+            }
+        }
+    }
+    unique_rows.retain(|r| !existing_round_ids.contains(&r.round_id));
+    if unique_rows.is_empty() {
+        return Ok(());
+    }
+
     let query = format!("INSERT INTO {}.{} FORMAT JSONEachRow", db, tbl);
 
-    let mut body = String::with_capacity(rows.len().saturating_mul(400));
-    for row in rows {
+    let mut body = String::with_capacity(unique_rows.len().saturating_mul(400));
+    for row in unique_rows {
         let line = serde_json::to_string(&RoundInsertRow {
             round_id: &row.round_id,
             market_id: &row.market_id,
