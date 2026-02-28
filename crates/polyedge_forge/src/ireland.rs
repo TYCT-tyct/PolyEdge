@@ -812,12 +812,20 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                 book_by_market.insert(book.market_id.clone(), book);
             }
             Some(markets) = market_rx.recv() => {
+                let received = markets.len();
                 markets_by_id.clear();
+                let mut kept = 0usize;
                 for m in markets {
                     if market_filter.allows(&m.symbol, &m.timeframe) {
                         markets_by_id.insert(m.market_id.clone(), m);
+                        kept = kept.saturating_add(1);
                     }
                 }
+                tracing::info!(
+                    received_markets = received,
+                    kept_markets = kept,
+                    "market meta update applied"
+                );
             }
             Some(res) = target_res_rx.recv() => {
                 if let Some(v) = res.target_price {
@@ -1667,6 +1675,7 @@ fn spawn_market_discovery_reader(
         loop {
             match discover_markets(&symbols, &timeframes).await {
                 Ok(markets) => {
+                    tracing::info!(market_count = markets.len(), "discovery succeeded");
                     log_ingest(
                         &persist,
                         "info",
@@ -1683,6 +1692,11 @@ fn spawn_market_discovery_reader(
                     if let Ok(fallback) =
                         discover_markets_from_target_cache(&symbols, &timeframes).await
                     {
+                        tracing::warn!(
+                            fallback_market_count = fallback.len(),
+                            error = %err,
+                            "discovery failed; using cache fallback"
+                        );
                         log_ingest(
                             &persist,
                             "warn",
@@ -1701,6 +1715,11 @@ fn spawn_market_discovery_reader(
                         continue;
                     }
                     if !last_markets.is_empty() {
+                        tracing::warn!(
+                            fallback_market_count = last_markets.len(),
+                            error = %err,
+                            "discovery failed; reusing last known markets"
+                        );
                         log_ingest(
                             &persist,
                             "warn",
@@ -1723,6 +1742,7 @@ fn spawn_market_discovery_reader(
                         "discovery",
                         &format!("discover failed: {err}"),
                     );
+                    tracing::warn!(error = %err, "discovery failed with no fallback");
                     current_wait = (current_wait.saturating_mul(2)).min(max_wait);
                 }
             }
