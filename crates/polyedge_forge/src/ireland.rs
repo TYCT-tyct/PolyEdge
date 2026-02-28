@@ -37,7 +37,7 @@ struct TargetFetchRes {
     target_price: Option<f64>,
 }
 
-const MARKET_FUTURE_GUARD_MS: i64 = 500;
+const MARKET_FUTURE_GUARD_DEFAULT_MS: i64 = 3 * 60 * 60 * 1000;
 const MARKET_STALE_GUARD_MS: i64 = 5_000;
 const MOTION_PRICE_TAU_SEC: f64 = 1.2;
 const MOTION_VELOCITY_TAU_SEC: f64 = 1.8;
@@ -540,6 +540,11 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         .and_then(|v| v.trim().parse::<i64>().ok())
         .unwrap_or(TOKYO_INPUT_STALE_GUARD_DEFAULT_MS)
         .clamp(500, 30_000);
+    let market_future_guard_ms = std::env::var("FORGE_MARKET_FUTURE_GUARD_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(MARKET_FUTURE_GUARD_DEFAULT_MS)
+        .clamp(0, 24 * 60 * 60 * 1000);
 
     let root = PathBuf::from(&args.data_root);
     fs::create_dir_all(root.join("snapshot_100ms")).ok();
@@ -560,6 +565,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         round_end_tolerance_ms = quality_policy.end_tolerance_ms,
         settle_stale_tolerance_ms = quality_policy.settle_stale_tolerance_ms,
         tokyo_input_stale_guard_ms = tokyo_input_stale_guard_ms,
+        market_future_guard_ms = market_future_guard_ms,
         market_filter = %market_filter.summary(),
         ?supported_symbols,
         ?active_symbols,
@@ -852,7 +858,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     now_ms.saturating_sub(v.ts_ms) <= PROB_STATE_RETENTION_MS
                 });
                 for market in markets_by_id.values() {
-                    if now_ms + MARKET_FUTURE_GUARD_MS < market.start_ts_ms {
+                    if now_ms + market_future_guard_ms < market.start_ts_ms {
                         continue;
                     }
                     if now_ms > market.end_ts_ms.saturating_add(MARKET_STALE_GUARD_MS) {
