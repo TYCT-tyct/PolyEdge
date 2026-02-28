@@ -70,6 +70,21 @@ pub struct RuntimeConfig {
     pub slippage_cents_per_side: f64,
     pub fee_cents_per_side: f64,
     pub emergency_wide_spread_penalty_ratio: f64,
+    pub stop_loss_grace_ticks: usize,
+    pub stop_loss_hard_mult: f64,
+    pub stop_loss_reverse_extra_ticks: usize,
+    pub loss_cluster_limit: usize,
+    pub loss_cluster_cooldown_ms: i64,
+    pub noise_gate_enabled: bool,
+    pub noise_gate_threshold_add: f64,
+    pub noise_gate_edge_add: f64,
+    pub noise_gate_spread_scale: f64,
+    pub vic_enabled: bool,
+    pub vic_target_entries_per_hour: f64,
+    pub vic_deadband_ratio: f64,
+    pub vic_threshold_relax_max: f64,
+    pub vic_edge_relax_max: f64,
+    pub vic_spread_relax_max: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +224,7 @@ struct Position {
     peak_pnl_cents: f64,
     reverse_streak: usize,
     blocked_exit_streak: usize,
+    soft_stop_pending_ticks: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -220,11 +236,25 @@ struct Signal {
     edge_prob: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct EntryAdjustments {
+    threshold_add: f64,
+    edge_add: f64,
+    spread_scale: f64,
+}
+
 fn tanh_norm(v: f64, scale: f64) -> f64 {
     if !v.is_finite() || !scale.is_finite() || scale <= 0.0 {
         return 0.0;
     }
     (v / scale).tanh()
+}
+
+fn milli_cents(v: f64) -> i64 {
+    if !v.is_finite() {
+        return 0;
+    }
+    (v * 1_000.0).round() as i64
 }
 
 fn dynamic_taker_fee_cents(price_cents: f64) -> f64 {
@@ -303,6 +333,50 @@ fn confirm_direction(score_hist: &VecDeque<f64>, current_score: f64) -> bool {
         .rev()
         .take(2)
         .all(|v| (*v > 0.0 && sgn > 0) || (*v < 0.0 && sgn < 0))
+}
+
+fn hour_cn_from_ts_ms(ts_ms: i64) -> u8 {
+    ((ts_ms.div_euclid(3_600_000) + 8).rem_euclid(24)) as u8
+}
+
+fn is_noise_hour_cn(hour: u8) -> bool {
+    matches!(hour, 5 | 10 | 13 | 18 | 20)
+}
+
+fn entry_adjustments(
+    ts_ms: i64,
+    cfg: &RuntimeConfig,
+    session_start_ts_ms: i64,
+    total_entries: usize,
+) -> EntryAdjustments {
+    let mut out = EntryAdjustments {
+        threshold_add: 0.0,
+        edge_add: 0.0,
+        spread_scale: 1.0,
+    };
+    if cfg.noise_gate_enabled && is_noise_hour_cn(hour_cn_from_ts_ms(ts_ms)) {
+        out.threshold_add += cfg.noise_gate_threshold_add.max(0.0);
+        out.edge_add += cfg.noise_gate_edge_add.max(0.0);
+        out.spread_scale *= cfg.noise_gate_spread_scale.clamp(0.5, 1.2);
+    }
+    if cfg.vic_enabled
+        && cfg.vic_target_entries_per_hour > 0.0
+        && cfg.vic_deadband_ratio < 1.0
+        && ts_ms > session_start_ts_ms
+    {
+        let elapsed_hours = (ts_ms - session_start_ts_ms) as f64 / 3_600_000.0;
+        let target_entries = (cfg.vic_target_entries_per_hour * elapsed_hours).max(1.0);
+        let actual_entries = total_entries as f64;
+        let deficit_ratio = ((target_entries - actual_entries) / target_entries).clamp(0.0, 1.0);
+        let deadband = cfg.vic_deadband_ratio.clamp(0.0, 0.8);
+        if deficit_ratio > deadband {
+            let norm = ((deficit_ratio - deadband) / (1.0 - deadband)).clamp(0.0, 1.0);
+            out.threshold_add -= cfg.vic_threshold_relax_max.max(0.0) * norm;
+            out.edge_add -= cfg.vic_edge_relax_max.max(0.0) * norm;
+            out.spread_scale *= 1.0 + cfg.vic_spread_relax_max.max(0.0) * norm;
+        }
+    }
+    out
 }
 
 fn compute_signal(
@@ -395,6 +469,10 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
     let mut last_delta_pct = 0.0_f64;
     let mut last_spread_up_cents = 0.0_f64;
     let mut last_spread_down_cents = 0.0_f64;
+    let mut total_entries = 0usize;
+    let mut loss_cluster_streak = 0usize;
+    let mut loss_cluster_cooldown_until_ts_ms = 0_i64;
+    let session_start_ts_ms = samples.first().map(|v| v.ts_ms).unwrap_or(0);
 
     for sample in samples {
         last_ts_ms = sample.ts_ms;
@@ -445,17 +523,40 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
                 && bid_raw >= cfg.endgame_take_profit_cents
             {
                 exit_reason = Some("endgame_take_profit");
-            } else if can_exit_now && pnl <= -cfg.stop_loss_cents {
-                exit_reason = Some("stop_loss");
+            } else if can_exit_now && milli_cents(pnl) <= -milli_cents(cfg.stop_loss_cents) {
+                let can_fill_now = spread_side_cents <= cfg.max_exec_spread_cents;
+                if can_fill_now || cfg.stop_loss_grace_ticks == 0 {
+                    pos.soft_stop_pending_ticks = 0;
+                    exit_reason = Some("stop_loss");
+                } else {
+                    pos.soft_stop_pending_ticks = pos.soft_stop_pending_ticks.saturating_add(1);
+                    let hard_stop = -cfg.stop_loss_cents * cfg.stop_loss_hard_mult.max(1.0);
+                    let reverse_trigger = pos.reverse_streak
+                        >= cfg
+                            .reverse_signal_ticks
+                            .saturating_add(cfg.stop_loss_reverse_extra_ticks);
+                    let should_force = milli_cents(pnl) <= milli_cents(hard_stop)
+                        || reverse_trigger
+                        || sample.remaining_ms <= cfg.endgame_remaining_ms
+                        || pos.soft_stop_pending_ticks >= cfg.stop_loss_grace_ticks;
+                    if should_force {
+                        exit_reason = Some("stop_loss_wide_grace");
+                    }
+                }
             } else if can_exit_now && pos.reverse_streak >= cfg.reverse_signal_ticks {
+                pos.soft_stop_pending_ticks = 0;
                 exit_reason = Some("signal_reverse");
             } else if can_exit_now
                 && pos.peak_pnl_cents >= cfg.trail_activate_profit_cents
                 && drawdown >= cfg.trail_drawdown_cents
             {
+                pos.soft_stop_pending_ticks = 0;
                 exit_reason = Some("trail_drawdown");
             } else if can_exit_now && side_spread(sample, pos.side) >= cfg.liquidity_widen_prob {
+                pos.soft_stop_pending_ticks = 0;
                 exit_reason = Some("liquidity_widen");
+            } else {
+                pos.soft_stop_pending_ticks = 0;
             }
             if exit_reason.is_none() {
                 pos.blocked_exit_streak = 0;
@@ -464,7 +565,11 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
             if let Some(reason) = exit_reason {
                 let emergency = matches!(
                     reason,
-                    "round_rollover" | "stop_loss" | "endgame_take_profit" | "signal_reverse"
+                    "round_rollover"
+                        | "stop_loss"
+                        | "stop_loss_wide_grace"
+                        | "endgame_take_profit"
+                        | "signal_reverse"
                 );
                 let can_fill = spread_side_cents <= cfg.max_exec_spread_cents;
                 let mut escalated_for_blocked_exit = false;
@@ -497,6 +602,16 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
                 let gross_pnl = bid_raw - pos.entry_price_raw_cents;
                 let total_cost = (gross_pnl - net_pnl).max(0.0);
                 let duration_s = ((sample.ts_ms - pos.entry_ts_ms).max(0) as f64) / 1000.0;
+                if net_pnl < 0.0 {
+                    loss_cluster_streak = loss_cluster_streak.saturating_add(1);
+                    if cfg.loss_cluster_limit > 0 && loss_cluster_streak >= cfg.loss_cluster_limit {
+                        loss_cluster_cooldown_until_ts_ms = sample
+                            .ts_ms
+                            .saturating_add(cfg.loss_cluster_cooldown_ms.max(0));
+                    }
+                } else {
+                    loss_cluster_streak = 0;
+                }
                 trades.push(json!({
                     "id": trade_id,
                     "side": pos.side.as_str(),
@@ -527,7 +642,8 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
                     "entry_reason": "fev1_signal_entry",
                     "exit_reason": if escalated_for_blocked_exit { "blocked_exit_escalation" } else { reason },
                     "exec_fill_ok": can_fill,
-                    "exit_spread_cents": spread_side_cents
+                    "exit_spread_cents": spread_side_cents,
+                    "loss_cluster_streak_after_exit": loss_cluster_streak,
                 }));
                 trade_id += 1;
                 position = None;
@@ -536,20 +652,33 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
         } else {
             let ask_raw = side_ask(sample, side) * 100.0;
             let spread_side_cents = side_spread(sample, side) * 100.0;
+            let dynamic = entry_adjustments(sample.ts_ms, cfg, session_start_ts_ms, total_entries);
+            let dynamic_entry_threshold = (signal.entry_threshold + dynamic.threshold_add).clamp(
+                cfg.entry_threshold_base * 0.65,
+                cfg.entry_threshold_cap + 0.20,
+            );
+            last_entry_threshold = dynamic_entry_threshold;
+            let dynamic_edge_req =
+                (cfg.entry_edge_prob + dynamic.edge_add).clamp(0.001, cfg.entry_edge_prob + 0.2);
+            let dynamic_spread_limit_prob =
+                (cfg.spread_limit_prob * dynamic.spread_scale).clamp(0.003, 0.25);
+            let dynamic_max_exec_spread =
+                (cfg.max_exec_spread_cents * dynamic.spread_scale).clamp(0.5, 12.0);
             let cooldown_ok = last_exit_ts_ms <= 0
                 || sample.ts_ms.saturating_sub(last_exit_ts_ms) >= cfg.cooldown_ms;
+            let cluster_cooldown_ok = sample.ts_ms >= loss_cluster_cooldown_until_ts_ms;
             let round_entries = entries_by_round.get(&sample.round_id).copied().unwrap_or(0);
             let within_limit = round_entries < cfg.max_entries_per_round;
-            let edge_ok = signal.edge_prob.abs() >= cfg.entry_edge_prob;
-            let score_ok = score.abs() >= signal.entry_threshold;
+            let edge_ok = signal.edge_prob.abs() >= dynamic_edge_req;
+            let score_ok = score.abs() >= dynamic_entry_threshold;
             let fair_conf = if side == Side::Up {
                 signal.p_fair_up
             } else {
                 1.0 - signal.p_fair_up
             };
             let confidence_ok = fair_conf >= 0.56;
-            let spread_ok = sample.spread_mid <= cfg.spread_limit_prob
-                && spread_side_cents <= cfg.max_exec_spread_cents;
+            let spread_ok = sample.spread_mid <= dynamic_spread_limit_prob
+                && spread_side_cents <= dynamic_max_exec_spread;
             let fee = cfg.fee_cents_per_side + dynamic_taker_fee_cents(ask_raw);
             let entry_impact_cents =
                 execution_impact_cents(sample, side, cfg, sample.remaining_ms, false);
@@ -565,6 +694,7 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
                 && price_ok
                 && potential_ok
                 && cooldown_ok
+                && cluster_cooldown_ok
                 && within_limit
             {
                 position = Some(Position {
@@ -581,8 +711,10 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
                     peak_pnl_cents: 0.0,
                     reverse_streak: 0,
                     blocked_exit_streak: 0,
+                    soft_stop_pending_ticks: 0,
                 });
                 *entries_by_round.entry(sample.round_id.clone()).or_insert(0) += 1;
+                total_entries = total_entries.saturating_add(1);
             }
         }
 
@@ -749,6 +881,8 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
         "delta_pct": last_delta_pct,
         "spread_up_cents": last_spread_up_cents,
         "spread_down_cents": last_spread_down_cents,
+        "loss_cluster_streak": loss_cluster_streak,
+        "loss_cluster_cooldown_until_ts_ms": loss_cluster_cooldown_until_ts_ms,
     });
 
     let trades_view = if trades.len() > max_trades {
@@ -1072,6 +1206,21 @@ mod tests {
             slippage_cents_per_side: 0.0,
             fee_cents_per_side: 0.0,
             emergency_wide_spread_penalty_ratio: 0.5,
+            stop_loss_grace_ticks: 0,
+            stop_loss_hard_mult: 1.4,
+            stop_loss_reverse_extra_ticks: 1,
+            loss_cluster_limit: 0,
+            loss_cluster_cooldown_ms: 0,
+            noise_gate_enabled: false,
+            noise_gate_threshold_add: 0.0,
+            noise_gate_edge_add: 0.0,
+            noise_gate_spread_scale: 1.0,
+            vic_enabled: false,
+            vic_target_entries_per_hour: 0.0,
+            vic_deadband_ratio: 0.08,
+            vic_threshold_relax_max: 0.0,
+            vic_edge_relax_max: 0.0,
+            vic_spread_relax_max: 0.0,
         };
         let mut samples = vec![
             // Build confirmation history and open one UP position.
@@ -1155,5 +1304,263 @@ mod tests {
                 .unwrap_or(false)
         });
         assert!(has_escalation, "expected blocked_exit_escalation trade");
+    }
+
+    #[test]
+    fn wide_spread_stop_loss_uses_grace_then_forces_exit() {
+        let cfg = RuntimeConfig {
+            entry_threshold_base: 0.40,
+            entry_threshold_cap: 0.55,
+            spread_limit_prob: 0.05,
+            entry_edge_prob: 0.01,
+            entry_min_potential_cents: 1.0,
+            entry_max_price_cents: 95.0,
+            min_hold_ms: 0,
+            stop_loss_cents: 2.0,
+            reverse_signal_threshold: -0.95,
+            reverse_signal_ticks: 12,
+            trail_activate_profit_cents: 99.0,
+            trail_drawdown_cents: 99.0,
+            take_profit_near_max_cents: 99.9,
+            endgame_take_profit_cents: 99.9,
+            endgame_remaining_ms: 1_000,
+            liquidity_widen_prob: 0.2,
+            cooldown_ms: 0,
+            max_entries_per_round: 2,
+            max_exec_spread_cents: 1.0,
+            slippage_cents_per_side: 0.0,
+            fee_cents_per_side: 0.0,
+            emergency_wide_spread_penalty_ratio: 0.1,
+            stop_loss_grace_ticks: 2,
+            stop_loss_hard_mult: 1.8,
+            stop_loss_reverse_extra_ticks: 1,
+            loss_cluster_limit: 0,
+            loss_cluster_cooldown_ms: 0,
+            noise_gate_enabled: false,
+            noise_gate_threshold_add: 0.0,
+            noise_gate_edge_add: 0.0,
+            noise_gate_spread_scale: 1.0,
+            vic_enabled: false,
+            vic_target_entries_per_hour: 0.0,
+            vic_deadband_ratio: 0.08,
+            vic_threshold_relax_max: 0.0,
+            vic_edge_relax_max: 0.0,
+            vic_spread_relax_max: 0.0,
+        };
+
+        let mut samples = vec![
+            Sample {
+                ts_ms: 1_000,
+                round_id: "r-1".to_string(),
+                remaining_ms: 200_000,
+                p_up: 0.18,
+                delta_pct: 0.8,
+                velocity: 6.0,
+                acceleration: 2.0,
+                bid_yes: 0.49,
+                ask_yes: 0.50,
+                bid_no: 0.50,
+                ask_no: 0.51,
+                spread_up: 0.005,
+                spread_down: 0.005,
+                spread_mid: 0.005,
+            },
+            Sample {
+                ts_ms: 2_000,
+                round_id: "r-1".to_string(),
+                remaining_ms: 199_000,
+                p_up: 0.18,
+                delta_pct: 0.8,
+                velocity: 6.0,
+                acceleration: 2.0,
+                bid_yes: 0.49,
+                ask_yes: 0.50,
+                bid_no: 0.50,
+                ask_no: 0.51,
+                spread_up: 0.005,
+                spread_down: 0.005,
+                spread_mid: 0.005,
+            },
+            Sample {
+                ts_ms: 3_000,
+                round_id: "r-1".to_string(),
+                remaining_ms: 198_000,
+                p_up: 0.18,
+                delta_pct: 0.8,
+                velocity: 6.0,
+                acceleration: 2.0,
+                bid_yes: 0.50,
+                ask_yes: 0.51,
+                bid_no: 0.49,
+                ask_no: 0.50,
+                spread_up: 0.005,
+                spread_down: 0.005,
+                spread_mid: 0.005,
+            },
+        ];
+        for ts in [4_000_i64, 5_000_i64] {
+            samples.push(Sample {
+                ts_ms: ts,
+                round_id: "r-1".to_string(),
+                remaining_ms: 197_000 - (ts - 4_000),
+                p_up: 0.40,
+                delta_pct: -0.3,
+                velocity: -2.0,
+                acceleration: -0.5,
+                bid_yes: 0.47,
+                ask_yes: 0.50,
+                bid_no: 0.50,
+                ask_no: 0.53,
+                spread_up: 0.03,
+                spread_down: 0.03,
+                spread_mid: 0.03,
+            });
+        }
+
+        let run = simulate(&samples, &cfg, 100);
+        assert_eq!(run.trade_count, 1);
+        let last_reason = run
+            .trades
+            .last()
+            .and_then(|v| v.get("exit_reason"))
+            .and_then(|v| v.as_str());
+        assert_eq!(last_reason, Some("stop_loss_wide_grace"));
+    }
+
+    #[test]
+    fn loss_cluster_cooldown_blocks_reentry_after_loss() {
+        let cfg = RuntimeConfig {
+            entry_threshold_base: 0.40,
+            entry_threshold_cap: 0.55,
+            spread_limit_prob: 0.05,
+            entry_edge_prob: 0.01,
+            entry_min_potential_cents: 1.0,
+            entry_max_price_cents: 95.0,
+            min_hold_ms: 0,
+            stop_loss_cents: 2.0,
+            reverse_signal_threshold: -0.95,
+            reverse_signal_ticks: 12,
+            trail_activate_profit_cents: 99.0,
+            trail_drawdown_cents: 99.0,
+            take_profit_near_max_cents: 99.9,
+            endgame_take_profit_cents: 99.9,
+            endgame_remaining_ms: 1_000,
+            liquidity_widen_prob: 0.2,
+            cooldown_ms: 0,
+            max_entries_per_round: 10,
+            max_exec_spread_cents: 2.0,
+            slippage_cents_per_side: 0.0,
+            fee_cents_per_side: 0.0,
+            emergency_wide_spread_penalty_ratio: 0.1,
+            stop_loss_grace_ticks: 0,
+            stop_loss_hard_mult: 1.4,
+            stop_loss_reverse_extra_ticks: 1,
+            loss_cluster_limit: 1,
+            loss_cluster_cooldown_ms: 30_000,
+            noise_gate_enabled: false,
+            noise_gate_threshold_add: 0.0,
+            noise_gate_edge_add: 0.0,
+            noise_gate_spread_scale: 1.0,
+            vic_enabled: false,
+            vic_target_entries_per_hour: 0.0,
+            vic_deadband_ratio: 0.08,
+            vic_threshold_relax_max: 0.0,
+            vic_edge_relax_max: 0.0,
+            vic_spread_relax_max: 0.0,
+        };
+
+        let mut samples = vec![
+            Sample {
+                ts_ms: 1_000,
+                round_id: "r-1".to_string(),
+                remaining_ms: 200_000,
+                p_up: 0.18,
+                delta_pct: 0.8,
+                velocity: 6.0,
+                acceleration: 2.0,
+                bid_yes: 0.49,
+                ask_yes: 0.50,
+                bid_no: 0.50,
+                ask_no: 0.51,
+                spread_up: 0.005,
+                spread_down: 0.005,
+                spread_mid: 0.005,
+            },
+            Sample {
+                ts_ms: 2_000,
+                round_id: "r-1".to_string(),
+                remaining_ms: 199_000,
+                p_up: 0.18,
+                delta_pct: 0.8,
+                velocity: 6.0,
+                acceleration: 2.0,
+                bid_yes: 0.49,
+                ask_yes: 0.50,
+                bid_no: 0.50,
+                ask_no: 0.51,
+                spread_up: 0.005,
+                spread_down: 0.005,
+                spread_mid: 0.005,
+            },
+            Sample {
+                ts_ms: 3_000,
+                round_id: "r-1".to_string(),
+                remaining_ms: 198_000,
+                p_up: 0.18,
+                delta_pct: 0.8,
+                velocity: 6.0,
+                acceleration: 2.0,
+                bid_yes: 0.50,
+                ask_yes: 0.51,
+                bid_no: 0.49,
+                ask_no: 0.50,
+                spread_up: 0.005,
+                spread_down: 0.005,
+                spread_mid: 0.005,
+            },
+            Sample {
+                ts_ms: 4_000,
+                round_id: "r-1".to_string(),
+                remaining_ms: 197_000,
+                p_up: 0.35,
+                delta_pct: -0.6,
+                velocity: -4.0,
+                acceleration: -1.0,
+                bid_yes: 0.47,
+                ask_yes: 0.48,
+                bid_no: 0.52,
+                ask_no: 0.53,
+                spread_up: 0.01,
+                spread_down: 0.01,
+                spread_mid: 0.01,
+            },
+        ];
+        for ts in [5_000_i64, 6_000_i64, 7_000_i64] {
+            samples.push(Sample {
+                ts_ms: ts,
+                round_id: "r-1".to_string(),
+                remaining_ms: 196_000 - (ts - 5_000),
+                p_up: 0.18,
+                delta_pct: 0.8,
+                velocity: 6.0,
+                acceleration: 2.0,
+                bid_yes: 0.49,
+                ask_yes: 0.50,
+                bid_no: 0.50,
+                ask_no: 0.51,
+                spread_up: 0.005,
+                spread_down: 0.005,
+                spread_mid: 0.005,
+            });
+        }
+
+        let run = simulate(&samples, &cfg, 100);
+        assert_eq!(run.trade_count, 1);
+        let last_reason = run
+            .trades
+            .last()
+            .and_then(|v| v.get("exit_reason"))
+            .and_then(|v| v.as_str());
+        assert_eq!(last_reason, Some("stop_loss"));
     }
 }

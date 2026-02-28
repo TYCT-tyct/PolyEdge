@@ -48,6 +48,21 @@ pub(super) struct StrategyRuntimeConfig {
     slippage_cents_per_side: f64,
     fee_cents_per_side: f64,
     emergency_wide_spread_penalty_ratio: f64,
+    stop_loss_grace_ticks: usize,
+    stop_loss_hard_mult: f64,
+    stop_loss_reverse_extra_ticks: usize,
+    loss_cluster_limit: usize,
+    loss_cluster_cooldown_ms: i64,
+    noise_gate_enabled: bool,
+    noise_gate_threshold_add: f64,
+    noise_gate_edge_add: f64,
+    noise_gate_spread_scale: f64,
+    vic_enabled: bool,
+    vic_target_entries_per_hour: f64,
+    vic_deadband_ratio: f64,
+    vic_threshold_relax_max: f64,
+    vic_edge_relax_max: f64,
+    vic_spread_relax_max: f64,
 }
 
 const STRATEGY_PROFILE_PROFIT_MAX: &str = "fev1_manual_profit_max_2026_02_27";
@@ -501,6 +516,21 @@ pub(super) fn strategy_backup_baseline_config() -> StrategyRuntimeConfig {
         slippage_cents_per_side: 0.06918614011422781,
         fee_cents_per_side: 0.03270800007174326,
         emergency_wide_spread_penalty_ratio: 0.27217322622042583,
+        stop_loss_grace_ticks: 2,
+        stop_loss_hard_mult: 1.45,
+        stop_loss_reverse_extra_ticks: 1,
+        loss_cluster_limit: 3,
+        loss_cluster_cooldown_ms: 25_000,
+        noise_gate_enabled: true,
+        noise_gate_threshold_add: 0.03,
+        noise_gate_edge_add: 0.008,
+        noise_gate_spread_scale: 0.9,
+        vic_enabled: true,
+        vic_target_entries_per_hour: 14.0,
+        vic_deadband_ratio: 0.08,
+        vic_threshold_relax_max: 0.02,
+        vic_edge_relax_max: 0.008,
+        vic_spread_relax_max: 0.12,
     }
 }
 
@@ -528,6 +558,21 @@ fn strategy_profit_max_config() -> StrategyRuntimeConfig {
         slippage_cents_per_side: 0.13017362950853426,
         fee_cents_per_side: 0.04024842164853446,
         emergency_wide_spread_penalty_ratio: 0.29593221663217434,
+        stop_loss_grace_ticks: 2,
+        stop_loss_hard_mult: 1.45,
+        stop_loss_reverse_extra_ticks: 1,
+        loss_cluster_limit: 3,
+        loss_cluster_cooldown_ms: 25_000,
+        noise_gate_enabled: true,
+        noise_gate_threshold_add: 0.03,
+        noise_gate_edge_add: 0.008,
+        noise_gate_spread_scale: 0.9,
+        vic_enabled: true,
+        vic_target_entries_per_hour: 14.0,
+        vic_deadband_ratio: 0.08,
+        vic_threshold_relax_max: 0.02,
+        vic_edge_relax_max: 0.008,
+        vic_spread_relax_max: 0.12,
     }
 }
 
@@ -555,6 +600,21 @@ fn strategy_hi_freq_config() -> StrategyRuntimeConfig {
         slippage_cents_per_side: 0.12346479836309485,
         fee_cents_per_side: 0.03,
         emergency_wide_spread_penalty_ratio: 0.197306675940024,
+        stop_loss_grace_ticks: 2,
+        stop_loss_hard_mult: 1.45,
+        stop_loss_reverse_extra_ticks: 1,
+        loss_cluster_limit: 3,
+        loss_cluster_cooldown_ms: 25_000,
+        noise_gate_enabled: true,
+        noise_gate_threshold_add: 0.03,
+        noise_gate_edge_add: 0.008,
+        noise_gate_spread_scale: 0.9,
+        vic_enabled: true,
+        vic_target_entries_per_hour: 14.0,
+        vic_deadband_ratio: 0.08,
+        vic_threshold_relax_max: 0.02,
+        vic_edge_relax_max: 0.008,
+        vic_spread_relax_max: 0.12,
     }
 }
 
@@ -582,6 +642,21 @@ fn strategy_hi_win_config() -> StrategyRuntimeConfig {
         slippage_cents_per_side: 0.14515338668372577,
         fee_cents_per_side: 0.05331355583758494,
         emergency_wide_spread_penalty_ratio: 0.20954404654691547,
+        stop_loss_grace_ticks: 2,
+        stop_loss_hard_mult: 1.45,
+        stop_loss_reverse_extra_ticks: 1,
+        loss_cluster_limit: 3,
+        loss_cluster_cooldown_ms: 25_000,
+        noise_gate_enabled: true,
+        noise_gate_threshold_add: 0.03,
+        noise_gate_edge_add: 0.008,
+        noise_gate_spread_scale: 0.9,
+        vic_enabled: true,
+        vic_target_entries_per_hour: 14.0,
+        vic_deadband_ratio: 0.08,
+        vic_threshold_relax_max: 0.02,
+        vic_edge_relax_max: 0.008,
+        vic_spread_relax_max: 0.12,
     }
 }
 
@@ -609,6 +684,21 @@ fn strategy_balanced_config() -> StrategyRuntimeConfig {
         slippage_cents_per_side: 0.10036573476058915,
         fee_cents_per_side: 0.03,
         emergency_wide_spread_penalty_ratio: 0.13810130927202827,
+        stop_loss_grace_ticks: 2,
+        stop_loss_hard_mult: 1.45,
+        stop_loss_reverse_extra_ticks: 1,
+        loss_cluster_limit: 3,
+        loss_cluster_cooldown_ms: 25_000,
+        noise_gate_enabled: true,
+        noise_gate_threshold_add: 0.03,
+        noise_gate_edge_add: 0.008,
+        noise_gate_spread_scale: 0.9,
+        vic_enabled: true,
+        vic_target_entries_per_hour: 14.0,
+        vic_deadband_ratio: 0.08,
+        vic_threshold_relax_max: 0.02,
+        vic_edge_relax_max: 0.008,
+        vic_spread_relax_max: 0.12,
     }
 }
 
@@ -636,6 +726,21 @@ fn strategy_cand_growth_mix_config() -> StrategyRuntimeConfig {
         slippage_cents_per_side: 0.1353580016533842,
         fee_cents_per_side: 0.03776880159417778,
         emergency_wide_spread_penalty_ratio: 0.2152594179877152,
+        stop_loss_grace_ticks: 2,
+        stop_loss_hard_mult: 1.45,
+        stop_loss_reverse_extra_ticks: 1,
+        loss_cluster_limit: 3,
+        loss_cluster_cooldown_ms: 25_000,
+        noise_gate_enabled: true,
+        noise_gate_threshold_add: 0.03,
+        noise_gate_edge_add: 0.008,
+        noise_gate_spread_scale: 0.9,
+        vic_enabled: true,
+        vic_target_entries_per_hour: 14.0,
+        vic_deadband_ratio: 0.08,
+        vic_threshold_relax_max: 0.02,
+        vic_edge_relax_max: 0.008,
+        vic_spread_relax_max: 0.12,
     }
 }
 
@@ -934,6 +1039,21 @@ pub(super) fn strategy_cfg_json(cfg: &StrategyRuntimeConfig) -> Value {
         "slippage_cents_per_side": cfg.slippage_cents_per_side,
         "fee_cents_per_side": cfg.fee_cents_per_side,
         "emergency_wide_spread_penalty_ratio": cfg.emergency_wide_spread_penalty_ratio,
+        "stop_loss_grace_ticks": cfg.stop_loss_grace_ticks,
+        "stop_loss_hard_mult": cfg.stop_loss_hard_mult,
+        "stop_loss_reverse_extra_ticks": cfg.stop_loss_reverse_extra_ticks,
+        "loss_cluster_limit": cfg.loss_cluster_limit,
+        "loss_cluster_cooldown_ms": cfg.loss_cluster_cooldown_ms,
+        "noise_gate_enabled": cfg.noise_gate_enabled,
+        "noise_gate_threshold_add": cfg.noise_gate_threshold_add,
+        "noise_gate_edge_add": cfg.noise_gate_edge_add,
+        "noise_gate_spread_scale": cfg.noise_gate_spread_scale,
+        "vic_enabled": cfg.vic_enabled,
+        "vic_target_entries_per_hour": cfg.vic_target_entries_per_hour,
+        "vic_deadband_ratio": cfg.vic_deadband_ratio,
+        "vic_threshold_relax_max": cfg.vic_threshold_relax_max,
+        "vic_edge_relax_max": cfg.vic_edge_relax_max,
+        "vic_spread_relax_max": cfg.vic_spread_relax_max,
     })
 }
 
@@ -1095,6 +1215,111 @@ pub(super) fn strategy_cfg_from_payload(
         .and_then(Value::as_f64)
     {
         c.emergency_wide_spread_penalty_ratio = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("stop_loss_grace_ticks"))
+        .and_then(Value::as_u64)
+    {
+        c.stop_loss_grace_ticks = v as usize;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("stop_loss_hard_mult"))
+        .and_then(Value::as_f64)
+    {
+        c.stop_loss_hard_mult = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("stop_loss_reverse_extra_ticks"))
+        .and_then(Value::as_u64)
+    {
+        c.stop_loss_reverse_extra_ticks = v as usize;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("loss_cluster_limit"))
+        .and_then(Value::as_u64)
+    {
+        c.loss_cluster_limit = v as usize;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("loss_cluster_cooldown_ms"))
+        .and_then(Value::as_i64)
+    {
+        c.loss_cluster_cooldown_ms = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("noise_gate_enabled"))
+        .and_then(Value::as_bool)
+    {
+        c.noise_gate_enabled = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("noise_gate_threshold_add"))
+        .and_then(Value::as_f64)
+    {
+        c.noise_gate_threshold_add = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("noise_gate_edge_add"))
+        .and_then(Value::as_f64)
+    {
+        c.noise_gate_edge_add = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("noise_gate_spread_scale"))
+        .and_then(Value::as_f64)
+    {
+        c.noise_gate_spread_scale = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("vic_enabled"))
+        .and_then(Value::as_bool)
+    {
+        c.vic_enabled = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("vic_target_entries_per_hour"))
+        .and_then(Value::as_f64)
+    {
+        c.vic_target_entries_per_hour = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("vic_deadband_ratio"))
+        .and_then(Value::as_f64)
+    {
+        c.vic_deadband_ratio = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("vic_threshold_relax_max"))
+        .and_then(Value::as_f64)
+    {
+        c.vic_threshold_relax_max = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("vic_edge_relax_max"))
+        .and_then(Value::as_f64)
+    {
+        c.vic_edge_relax_max = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("vic_spread_relax_max"))
+        .and_then(Value::as_f64)
+    {
+        c.vic_spread_relax_max = v;
     }
     c
 }
@@ -2127,6 +2352,21 @@ pub(super) fn map_cfg_to_fev1(cfg: &StrategyRuntimeConfig) -> fev1::RuntimeConfi
         slippage_cents_per_side: cfg.slippage_cents_per_side,
         fee_cents_per_side: cfg.fee_cents_per_side,
         emergency_wide_spread_penalty_ratio: cfg.emergency_wide_spread_penalty_ratio,
+        stop_loss_grace_ticks: cfg.stop_loss_grace_ticks,
+        stop_loss_hard_mult: cfg.stop_loss_hard_mult,
+        stop_loss_reverse_extra_ticks: cfg.stop_loss_reverse_extra_ticks,
+        loss_cluster_limit: cfg.loss_cluster_limit,
+        loss_cluster_cooldown_ms: cfg.loss_cluster_cooldown_ms,
+        noise_gate_enabled: cfg.noise_gate_enabled,
+        noise_gate_threshold_add: cfg.noise_gate_threshold_add,
+        noise_gate_edge_add: cfg.noise_gate_edge_add,
+        noise_gate_spread_scale: cfg.noise_gate_spread_scale,
+        vic_enabled: cfg.vic_enabled,
+        vic_target_entries_per_hour: cfg.vic_target_entries_per_hour,
+        vic_deadband_ratio: cfg.vic_deadband_ratio,
+        vic_threshold_relax_max: cfg.vic_threshold_relax_max,
+        vic_edge_relax_max: cfg.vic_edge_relax_max,
+        vic_spread_relax_max: cfg.vic_spread_relax_max,
     }
 }
 
@@ -2507,6 +2747,51 @@ pub(super) async fn strategy_paper(
         if let Some(v) = params.emergency_wide_spread_penalty_ratio {
             cfg.emergency_wide_spread_penalty_ratio = v.clamp(0.2, 3.0);
         }
+        if let Some(v) = params.stop_loss_grace_ticks {
+            cfg.stop_loss_grace_ticks = v.clamp(0, 8) as usize;
+        }
+        if let Some(v) = params.stop_loss_hard_mult {
+            cfg.stop_loss_hard_mult = v.clamp(1.0, 3.0);
+        }
+        if let Some(v) = params.stop_loss_reverse_extra_ticks {
+            cfg.stop_loss_reverse_extra_ticks = v.clamp(0, 6) as usize;
+        }
+        if let Some(v) = params.loss_cluster_limit {
+            cfg.loss_cluster_limit = v.clamp(0, 8) as usize;
+        }
+        if let Some(v) = params.loss_cluster_cooldown_ms {
+            cfg.loss_cluster_cooldown_ms = v.clamp(0, 120_000);
+        }
+        if let Some(v) = params.noise_gate_enabled {
+            cfg.noise_gate_enabled = v;
+        }
+        if let Some(v) = params.noise_gate_threshold_add {
+            cfg.noise_gate_threshold_add = v.clamp(0.0, 0.20);
+        }
+        if let Some(v) = params.noise_gate_edge_add {
+            cfg.noise_gate_edge_add = v.clamp(0.0, 0.12);
+        }
+        if let Some(v) = params.noise_gate_spread_scale {
+            cfg.noise_gate_spread_scale = v.clamp(0.5, 1.2);
+        }
+        if let Some(v) = params.vic_enabled {
+            cfg.vic_enabled = v;
+        }
+        if let Some(v) = params.vic_target_entries_per_hour {
+            cfg.vic_target_entries_per_hour = v.clamp(0.0, 120.0);
+        }
+        if let Some(v) = params.vic_deadband_ratio {
+            cfg.vic_deadband_ratio = v.clamp(0.0, 0.8);
+        }
+        if let Some(v) = params.vic_threshold_relax_max {
+            cfg.vic_threshold_relax_max = v.clamp(0.0, 0.2);
+        }
+        if let Some(v) = params.vic_edge_relax_max {
+            cfg.vic_edge_relax_max = v.clamp(0.0, 0.1);
+        }
+        if let Some(v) = params.vic_spread_relax_max {
+            cfg.vic_spread_relax_max = v.clamp(0.0, 0.8);
+        }
         if cfg.entry_threshold_cap < cfg.entry_threshold_base {
             cfg.entry_threshold_cap = cfg.entry_threshold_base;
         }
@@ -2637,28 +2922,7 @@ pub(super) async fn strategy_paper(
         "fixed_guard": fixed_guard,
         "autotune": autotune_info,
         "autotune_key_used": autotune_key_used,
-        "config": {
-            "entry_threshold_base": cfg.entry_threshold_base,
-            "entry_threshold_cap": cfg.entry_threshold_cap,
-            "spread_limit_prob": cfg.spread_limit_prob,
-            "entry_edge_prob": cfg.entry_edge_prob,
-            "entry_min_potential_cents": cfg.entry_min_potential_cents,
-            "entry_max_price_cents": cfg.entry_max_price_cents,
-            "min_hold_ms": cfg.min_hold_ms,
-            "stop_loss_cents": cfg.stop_loss_cents,
-            "trail_activate_profit_cents": cfg.trail_activate_profit_cents,
-            "trail_drawdown_cents": cfg.trail_drawdown_cents,
-            "take_profit_near_max_cents": cfg.take_profit_near_max_cents,
-            "endgame_take_profit_cents": cfg.endgame_take_profit_cents,
-            "endgame_remaining_ms": cfg.endgame_remaining_ms,
-            "liquidity_widen_prob": cfg.liquidity_widen_prob,
-            "reverse_signal_threshold": cfg.reverse_signal_threshold,
-            "reverse_signal_ticks": cfg.reverse_signal_ticks,
-            "max_exec_spread_cents": cfg.max_exec_spread_cents,
-            "slippage_cents_per_side": cfg.slippage_cents_per_side,
-            "fee_cents_per_side": cfg.fee_cents_per_side,
-            "emergency_wide_spread_penalty_ratio": cfg.emergency_wide_spread_penalty_ratio
-        },
+        "config": strategy_cfg_json(&cfg),
         "current": run.current,
         "summary": {
             "trade_count": run.trade_count,
@@ -3245,30 +3509,7 @@ pub(super) async fn strategy_full(
                 "execution_penalty_cents_total": run.execution_penalty_cents_total,
             },
             "rolling_window": rolling_stats_json(rs),
-            "config": {
-                "entry_threshold_base": cfg.entry_threshold_base,
-                "entry_threshold_cap": cfg.entry_threshold_cap,
-                "spread_limit_prob": cfg.spread_limit_prob,
-                "entry_edge_prob": cfg.entry_edge_prob,
-                "entry_min_potential_cents": cfg.entry_min_potential_cents,
-                "entry_max_price_cents": cfg.entry_max_price_cents,
-                "min_hold_ms": cfg.min_hold_ms,
-                "stop_loss_cents": cfg.stop_loss_cents,
-                "reverse_signal_threshold": cfg.reverse_signal_threshold,
-                "reverse_signal_ticks": cfg.reverse_signal_ticks,
-                "trail_activate_profit_cents": cfg.trail_activate_profit_cents,
-                "trail_drawdown_cents": cfg.trail_drawdown_cents,
-                "take_profit_near_max_cents": cfg.take_profit_near_max_cents,
-                "endgame_take_profit_cents": cfg.endgame_take_profit_cents,
-                "endgame_remaining_ms": cfg.endgame_remaining_ms,
-                "liquidity_widen_prob": cfg.liquidity_widen_prob,
-                "cooldown_ms": cfg.cooldown_ms,
-                "max_entries_per_round": cfg.max_entries_per_round,
-                "max_exec_spread_cents": cfg.max_exec_spread_cents,
-                "slippage_cents_per_side": cfg.slippage_cents_per_side,
-                "fee_cents_per_side": cfg.fee_cents_per_side,
-                "emergency_wide_spread_penalty_ratio": cfg.emergency_wide_spread_penalty_ratio,
-            },
+            "config": strategy_cfg_json(cfg),
             "trades": run.trades,
             "current": run.current,
         }));
@@ -3397,6 +3638,19 @@ pub(super) fn clamp_runtime_cfg(cfg: &mut StrategyRuntimeConfig) {
     cfg.fee_cents_per_side = cfg.fee_cents_per_side.clamp(0.03, 4.0);
     cfg.emergency_wide_spread_penalty_ratio =
         cfg.emergency_wide_spread_penalty_ratio.clamp(0.0, 2.0);
+    cfg.stop_loss_grace_ticks = cfg.stop_loss_grace_ticks.clamp(0, 8);
+    cfg.stop_loss_hard_mult = cfg.stop_loss_hard_mult.clamp(1.0, 3.0);
+    cfg.stop_loss_reverse_extra_ticks = cfg.stop_loss_reverse_extra_ticks.clamp(0, 6);
+    cfg.loss_cluster_limit = cfg.loss_cluster_limit.clamp(0, 8);
+    cfg.loss_cluster_cooldown_ms = cfg.loss_cluster_cooldown_ms.clamp(0, 120_000);
+    cfg.noise_gate_threshold_add = cfg.noise_gate_threshold_add.clamp(0.0, 0.20);
+    cfg.noise_gate_edge_add = cfg.noise_gate_edge_add.clamp(0.0, 0.12);
+    cfg.noise_gate_spread_scale = cfg.noise_gate_spread_scale.clamp(0.5, 1.2);
+    cfg.vic_target_entries_per_hour = cfg.vic_target_entries_per_hour.clamp(0.0, 120.0);
+    cfg.vic_deadband_ratio = cfg.vic_deadband_ratio.clamp(0.0, 0.8);
+    cfg.vic_threshold_relax_max = cfg.vic_threshold_relax_max.clamp(0.0, 0.2);
+    cfg.vic_edge_relax_max = cfg.vic_edge_relax_max.clamp(0.0, 0.1);
+    cfg.vic_spread_relax_max = cfg.vic_spread_relax_max.clamp(0.0, 0.8);
 }
 
 pub(super) fn lcg_next(seed: &mut u64) -> f64 {
@@ -3444,6 +3698,21 @@ pub(super) fn mutate_cfg(
     c.slippage_cents_per_side += r(seed) * 0.4 * scale;
     c.fee_cents_per_side += r(seed) * 0.2 * scale;
     c.emergency_wide_spread_penalty_ratio += r(seed) * 0.25 * scale;
+    c.stop_loss_grace_ticks =
+        ((c.stop_loss_grace_ticks as f64) + r(seed) * 2.0 * scale).round() as usize;
+    c.stop_loss_hard_mult += r(seed) * 0.35 * scale;
+    c.stop_loss_reverse_extra_ticks =
+        ((c.stop_loss_reverse_extra_ticks as f64) + r(seed) * 2.0 * scale).round() as usize;
+    c.loss_cluster_limit = ((c.loss_cluster_limit as f64) + r(seed) * 2.0 * scale).round() as usize;
+    c.loss_cluster_cooldown_ms += (r(seed) * 25_000.0 * scale) as i64;
+    c.noise_gate_threshold_add += r(seed) * 0.03 * scale;
+    c.noise_gate_edge_add += r(seed) * 0.02 * scale;
+    c.noise_gate_spread_scale += r(seed) * 0.20 * scale;
+    c.vic_target_entries_per_hour += r(seed) * 8.0 * scale;
+    c.vic_deadband_ratio += r(seed) * 0.08 * scale;
+    c.vic_threshold_relax_max += r(seed) * 0.03 * scale;
+    c.vic_edge_relax_max += r(seed) * 0.02 * scale;
+    c.vic_spread_relax_max += r(seed) * 0.12 * scale;
     clamp_runtime_cfg(&mut c);
     c
 }
