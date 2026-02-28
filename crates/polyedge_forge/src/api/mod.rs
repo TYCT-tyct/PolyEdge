@@ -950,11 +950,14 @@ impl LiveRuntimeConfig {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(140_000)
             .clamp(20_000, 1_000_000);
+        // Runtime trade cap semantics:
+        // - 0 => unbounded by trade count (bounded by lookback/max_points instead)
+        // - N > 0 => keep only latest N trades in simulation summary payload
         let max_trades = std::env::var("FORGE_FEV1_RUNTIME_MAX_TRADES")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(120)
-            .clamp(20, 500);
+            .map(|v| if v == 0 { usize::MAX } else { v.clamp(1, 20_000) })
+            .unwrap_or(120);
         let max_orders = std::env::var("FORGE_FEV1_RUNTIME_MAX_ORDERS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
