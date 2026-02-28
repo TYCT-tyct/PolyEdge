@@ -57,6 +57,10 @@ else
   echo "[forge-ireland] warning: npm not found; dashboard dist may be stale"
 fi
 
+# Remove stale systemd drop-in overrides so deploy script remains source of truth.
+sudo rm -rf /etc/systemd/system/polyedge-forge-ireland-recorder.service.d
+sudo rm -rf /etc/systemd/system/polyedge-forge-ireland-api.service.d
+
 sudo tee /etc/systemd/system/polyedge-forge-ireland-recorder.service >/dev/null <<UNIT
 [Unit]
 Description=PolyEdge Forge Ireland Recorder
@@ -74,10 +78,12 @@ Environment=POLYEDGE_MARKET_REFRESH_SEC=$MARKET_WS_REFRESH_SEC
 Environment=POLYEDGE_TARGET_MARKET_CACHE_FILE=/data/polyedge-forge/cache/target_market_cache.json
 Environment=POLYEDGE_DISCOVERY_ENDDATE_MAX_PAGES=6
 Environment=POLYEDGE_DISCOVERY_VOLUME_MAX_PAGES=0
+Environment=POLYEDGE_DISCOVERY_VOLUME_FALLBACK_PAGES=2
 Environment=POLYEDGE_DISCOVERY_MAX_PAST_MS=300000
 Environment=FORGE_TOKYO_INPUT_STALE_GUARD_MS=$TOKYO_INPUT_STALE_GUARD_MS
 Environment=FORGE_CHAINLINK_ENABLED=false
 Environment=POLYEDGE_ENABLE_CHAINLINK_ANCHOR=false
+Environment=POLYEDGE_MARKET_STALE_RECONNECT_RATIO=1.0
 ExecStart=$REPO_DIR/target/release/polyedge_forge ireland-recorder --data-root $DATA_ROOT --udp-bind 0.0.0.0:9801 --sample-ms 100 --supported-symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT --active-symbols $ACTIVE_SYMBOLS --active-timeframes $ACTIVE_TIMEFRAMES --active-symbol-timeframes $ACTIVE_SYMBOL_TIMEFRAMES --discovery-refresh-sec $DISCOVERY_REFRESH_SEC --clickhouse-url http://127.0.0.1:8123 --clickhouse-database polyedge_forge --clickhouse-snapshot-table snapshot_100ms --clickhouse-round-table rounds --redis-url redis://127.0.0.1:6379/0 --redis-prefix forge --redis-ttl-sec 7200 --sink-batch-size 200 --sink-flush-ms 1000 --sink-queue-cap 20000 --disable-api --dashboard-dist /home/ubuntu/PolyEdge/heatmap_dashboard/dist
 Restart=always
 RestartSec=2

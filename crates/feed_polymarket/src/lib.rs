@@ -312,6 +312,11 @@ impl PolymarketFeed {
             .and_then(|v| v.parse::<u64>().ok())
             .map(Duration::from_secs)
             .unwrap_or(Duration::from_secs(180));
+        let stale_reconnect_ratio = std::env::var("POLYEDGE_MARKET_STALE_RECONNECT_RATIO")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(1.0)
+            .clamp(0.25, 1.0);
         let refresh_deadline = tokio::time::sleep(refresh_every);
         tokio::pin!(refresh_deadline);
         let mut parse_failures = 0_u64;
@@ -322,7 +327,8 @@ impl PolymarketFeed {
             tokio::select! {
                 _ = idle_tick.tick() => {
                     let now = Instant::now();
-                    let mut stale_market: Option<(String, u64, u64, Option<String>)> = None;
+                    let mut stale_market_count = 0_usize;
+                    let mut most_stale_market: Option<(String, u64, u64, Option<String>)> = None;
                     for (market_id, updated_at) in &market_last_update_at {
                         let timeout = market_idle_break
                             .get(market_id)
@@ -330,25 +336,42 @@ impl PolymarketFeed {
                             .unwrap_or(default_idle_break);
                         let elapsed = now.saturating_duration_since(*updated_at);
                         if elapsed >= timeout {
-                            let timeframe = markets.get(market_id).and_then(|m| m.timeframe.clone());
-                            stale_market = Some((
-                                market_id.clone(),
-                                elapsed.as_secs(),
-                                timeout.as_secs(),
-                                timeframe,
-                            ));
-                            break;
+                            stale_market_count = stale_market_count.saturating_add(1);
+                            let elapsed_sec = elapsed.as_secs();
+                            if most_stale_market
+                                .as_ref()
+                                .map(|(_, current_elapsed_sec, _, _)| elapsed_sec > *current_elapsed_sec)
+                                .unwrap_or(true)
+                            {
+                                let timeframe = markets.get(market_id).and_then(|m| m.timeframe.clone());
+                                most_stale_market = Some((
+                                    market_id.clone(),
+                                    elapsed_sec,
+                                    timeout.as_secs(),
+                                    timeframe,
+                                ));
+                            }
                         }
                     }
-                    if let Some((market_id, idle_sec, idle_break_sec_market, timeframe)) = stale_market {
-                        tracing::warn!(
-                            %market_id,
-                            timeframe = timeframe.as_deref().unwrap_or("unknown"),
-                            idle_sec,
-                            idle_break_sec_market,
-                            "polymarket market ws stale market detected, reconnecting"
-                        );
-                        break;
+                    let market_count = market_last_update_at.len().max(1);
+                    let stale_ratio = stale_market_count as f64 / market_count as f64;
+                    if stale_market_count > 0 && stale_ratio >= stale_reconnect_ratio {
+                        if let Some((market_id, idle_sec, idle_break_sec_market, timeframe)) =
+                            most_stale_market
+                        {
+                            tracing::warn!(
+                                %market_id,
+                                timeframe = timeframe.as_deref().unwrap_or("unknown"),
+                                stale_market_count,
+                                market_count,
+                                stale_ratio,
+                                stale_reconnect_ratio,
+                                idle_sec,
+                                idle_break_sec_market,
+                                "polymarket market ws stale market detected, reconnecting"
+                            );
+                            break;
+                        }
                     }
                     if last_update_at.elapsed().as_secs() >= idle_break_sec {
                         tracing::warn!(
@@ -743,12 +766,18 @@ fn market_stale_timeout(state: &MarketState, fallback: Duration) -> Duration {
         .as_deref()
         .map(|v| v.trim().to_ascii_lowercase());
     match timeframe.as_deref() {
-        Some("5m") => Duration::from_secs(env_secs("POLYEDGE_MARKET_IDLE_BREAK_SEC_5M", 20, 5, 300)),
+        Some("5m") => {
+            Duration::from_secs(env_secs("POLYEDGE_MARKET_IDLE_BREAK_SEC_5M", 20, 5, 300))
+        }
         Some("15m") => {
             Duration::from_secs(env_secs("POLYEDGE_MARKET_IDLE_BREAK_SEC_15M", 35, 5, 300))
         }
-        Some("1h") => Duration::from_secs(env_secs("POLYEDGE_MARKET_IDLE_BREAK_SEC_1H", 45, 5, 600)),
-        Some("1d") => Duration::from_secs(env_secs("POLYEDGE_MARKET_IDLE_BREAK_SEC_1D", 60, 5, 900)),
+        Some("1h") => {
+            Duration::from_secs(env_secs("POLYEDGE_MARKET_IDLE_BREAK_SEC_1H", 45, 5, 600))
+        }
+        Some("1d") => {
+            Duration::from_secs(env_secs("POLYEDGE_MARKET_IDLE_BREAK_SEC_1D", 60, 5, 900))
+        }
         _ => fallback,
     }
 }
@@ -1178,6 +1207,7 @@ struct WsEvent {
     #[serde(default)]
     changes: Vec<WsChange>,
     #[serde(default)]
+    #[serde(alias = "priceChanges")]
     price_changes: Vec<WsEvent>,
 }
 

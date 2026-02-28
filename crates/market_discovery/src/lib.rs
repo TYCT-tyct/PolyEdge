@@ -191,7 +191,13 @@ impl MarketDiscovery {
         let enddate_limit = env_i64("POLYEDGE_DISCOVERY_ENDDATE_LIMIT", 200, 50, 1000);
         let enddate_pages = env_usize("POLYEDGE_DISCOVERY_ENDDATE_MAX_PAGES", 20, 1, 64);
         let volume_limit = env_i64("POLYEDGE_DISCOVERY_VOLUME_LIMIT", 600, 50, 1000);
-        let volume_pages = env_usize("POLYEDGE_DISCOVERY_VOLUME_MAX_PAGES", 0, 0, 32);
+        let volume_pages_cfg = env_usize("POLYEDGE_DISCOVERY_VOLUME_MAX_PAGES", 0, 0, 32);
+        let volume_pages_fallback = env_usize("POLYEDGE_DISCOVERY_VOLUME_FALLBACK_PAGES", 2, 0, 8);
+        let volume_pages = if volume_pages_cfg > 0 {
+            volume_pages_cfg
+        } else {
+            volume_pages_fallback
+        };
 
         let mut plans = Vec::with_capacity(2);
         plans.push(ScanPlan {
@@ -209,6 +215,7 @@ impl MarketDiscovery {
             });
         }
 
+        let mut last_err: Option<anyhow::Error> = None;
         'scan_plans: for plan in plans {
             for page_idx in 0..plan.max_pages {
                 let offset = (page_idx as i64) * plan.limit;
@@ -231,27 +238,21 @@ impl MarketDiscovery {
                 let response = match response {
                     Ok(v) => v,
                     Err(err) => {
-                        if out.is_empty() {
-                            return Err(err).context("discovery request");
-                        }
+                        last_err = Some(anyhow!("discovery request failed: {err}"));
                         break;
                     }
                 };
                 let response = match response.error_for_status() {
                     Ok(v) => v,
                     Err(err) => {
-                        if out.is_empty() {
-                            return Err(err).context("discovery status");
-                        }
+                        last_err = Some(anyhow!("discovery status failed: {err}"));
                         break;
                     }
                 };
                 let markets: Vec<GammaMarket> = match response.json().await {
                     Ok(v) => v,
                     Err(err) => {
-                        if out.is_empty() {
-                            return Err(err).context("discovery json");
-                        }
+                        last_err = Some(anyhow!("discovery json parse failed: {err}"));
                         break;
                     }
                 };
@@ -363,6 +364,9 @@ impl MarketDiscovery {
         }
 
         if out.is_empty() {
+            if let Some(err) = last_err {
+                return Err(err).context("no markets discovered from gamma");
+            }
             return Err(anyhow!("no markets discovered from gamma"));
         }
 

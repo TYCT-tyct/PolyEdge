@@ -142,6 +142,37 @@ pub(super) struct LiveGatedDecision {
     pub(super) decision_key: String,
 }
 
+const LIVE_MARKET_TARGET_CACHE_TTL_MS_DEFAULT: i64 = 8_000;
+const LIVE_MARKET_TARGET_CACHE_TTL_MS_MIN: i64 = 2_000;
+const LIVE_MARKET_TARGET_CACHE_TTL_MS_MAX: i64 = 120_000;
+const LIVE_CANCEL_FAILURE_FORCE_PAUSE_EXIT_THRESHOLD: u8 = 2;
+const LIVE_CANCEL_FAILURE_FORCE_PAUSE_OTHER_THRESHOLD: u8 = 3;
+
+#[derive(Debug, Clone)]
+struct CachedLiveMarketTarget {
+    fetched_at_ms: i64,
+    target: LiveMarketTarget,
+}
+
+fn live_market_target_cache(
+) -> &'static tokio::sync::RwLock<HashMap<String, CachedLiveMarketTarget>> {
+    static CACHE: std::sync::OnceLock<
+        tokio::sync::RwLock<HashMap<String, CachedLiveMarketTarget>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
+}
+
+fn live_market_target_cache_ttl_ms() -> i64 {
+    std::env::var("FORGE_FEV1_LIVE_TARGET_CACHE_TTL_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(LIVE_MARKET_TARGET_CACHE_TTL_MS_DEFAULT)
+        .clamp(
+            LIVE_MARKET_TARGET_CACHE_TTL_MS_MIN,
+            LIVE_MARKET_TARGET_CACHE_TTL_MS_MAX,
+        )
+}
+
 pub(super) fn live_decision_key(market_type: &str, decision: &Value) -> String {
     let action = decision
         .get("action")
@@ -429,13 +460,26 @@ pub(super) fn select_live_decisions(
 pub(super) async fn resolve_live_market_target(
     market_type: &str,
 ) -> Result<LiveMarketTarget, ApiError> {
+    let now_ms = Utc::now().timestamp_millis();
+    let cache_ttl_ms = live_market_target_cache_ttl_ms();
+    {
+        let cache = live_market_target_cache().read().await;
+        if let Some(cached) = cache.get(market_type) {
+            let age_ms = now_ms.saturating_sub(cached.fetched_at_ms);
+            let end_ms =
+                parse_end_date_ms(cached.target.end_date.as_deref()).unwrap_or(i64::MAX / 4);
+            if age_ms <= cache_ttl_ms && end_ms >= now_ms.saturating_sub(10_000) {
+                return Ok(cached.target.clone());
+            }
+        }
+    }
+
     let discovery = MarketDiscovery::new(DiscoveryConfig {
         symbols: vec!["BTCUSDT".to_string()],
         market_types: vec!["updown".to_string()],
         timeframes: vec![market_type.to_string()],
         ..DiscoveryConfig::default()
     });
-    let now_ms = Utc::now().timestamp_millis();
     let mut markets: Vec<MarketDescriptor> = discovery
         .discover()
         .await
@@ -463,14 +507,25 @@ pub(super) async fn resolve_live_market_target(
         (ended_penalty, distance)
     });
     let best = markets.remove(0);
-    Ok(LiveMarketTarget {
+    let target = LiveMarketTarget {
         market_id: best.market_id,
         symbol: best.symbol,
         timeframe: best.timeframe.unwrap_or_else(|| market_type.to_string()),
         token_id_yes: best.token_id_yes.unwrap_or_default(),
         token_id_no: best.token_id_no.unwrap_or_default(),
         end_date: best.end_date,
-    })
+    };
+    {
+        let mut cache = live_market_target_cache().write().await;
+        cache.insert(
+            market_type.to_string(),
+            CachedLiveMarketTarget {
+                fetched_at_ms: now_ms,
+                target: target.clone(),
+            },
+        );
+    }
+    Ok(target)
 }
 
 pub(super) fn decision_to_live_payload(
@@ -1456,23 +1511,16 @@ pub(super) async fn reconcile_gateway_reports(state: &ApiState, gateway_cfg: &Li
         } else if event_name == "order_timeout_cancelled" {
             apply_pending_revert(state, &pending, "timeout_cancelled").await;
         } else if event_name == "order_timeout_cancel_failed" {
-            let mut retry = pending.clone();
-            retry.retry_count = retry.retry_count.saturating_add(1);
-            state.upsert_pending_order(retry.clone()).await;
-            state
-                .append_live_event(
-                    &retry.market_type,
-                    json!({
-                        "accepted": false,
-                        "action": retry.action,
-                        "side": retry.side,
-                        "round_id": retry.round_id,
-                        "reason": "timeout_cancel_failed_requeued",
-                        "order_id": retry.order_id,
-                        "gateway_endpoint": endpoint
-                    }),
-                )
-                .await;
+            handle_cancel_failure_with_escalation(
+                state,
+                &pending,
+                "timeout_cancel_failed",
+                json!({
+                    "gateway_endpoint": endpoint,
+                    "event": ev
+                }),
+            )
+            .await;
             continue;
         } else {
             let retry = pending.clone();
@@ -1665,21 +1713,16 @@ pub(super) async fn handle_pending_timeouts(state: &ApiState, gateway_cfg: &Live
                     .await;
             }
             Err(err) => {
-                state
-                    .append_live_event(
-                        &row.market_type,
-                        json!({
-                            "accepted": false,
-                            "action": row.action,
-                            "side": row.side,
-                            "round_id": row.round_id,
-                            "reason": "local_timeout_cancel_failed",
-                            "order_id": row.order_id,
-                            "gateway_endpoint": endpoint,
-                            "error": err
-                        }),
-                    )
-                    .await;
+                handle_cancel_failure_with_escalation(
+                    state,
+                    &row,
+                    "local_timeout_cancel_failed",
+                    json!({
+                        "gateway_endpoint": endpoint,
+                        "error": err
+                    }),
+                )
+                .await;
             }
         }
     }
@@ -1930,6 +1973,98 @@ pub(super) fn pm_is_terminal_reject(status: &PmOrderStatusType) -> bool {
         status,
         PmOrderStatusType::Canceled | PmOrderStatusType::Unmatched
     )
+}
+
+pub(super) fn fill_event_from_open_order(
+    order: &polymarket_client_sdk::clob::types::response::OpenOrderResponse,
+) -> Value {
+    let fill_price = pm_dec_to_f64(&order.price).max(0.0001);
+    let fill_size = pm_dec_to_f64(&order.size_matched).max(0.0);
+    let fill_quote = (fill_price * fill_size).max(0.0);
+    json!({
+        "event": "order_terminal",
+        "state": "filled",
+        "order_id": order.id,
+        "fill_price_cents": fill_price * 100.0,
+        "fill_quote_usdc": fill_quote,
+        "size_matched": fill_size,
+        "associate_trades": order.associate_trades,
+    })
+}
+
+fn is_exit_like_action(action: &str) -> bool {
+    let a = action.trim().to_ascii_lowercase();
+    a == "exit" || a == "reduce"
+}
+
+fn cancel_failure_pause_threshold(action: &str) -> u8 {
+    if is_exit_like_action(action) {
+        LIVE_CANCEL_FAILURE_FORCE_PAUSE_EXIT_THRESHOLD
+    } else {
+        LIVE_CANCEL_FAILURE_FORCE_PAUSE_OTHER_THRESHOLD
+    }
+}
+
+pub(super) async fn handle_cancel_failure_with_escalation(
+    state: &ApiState,
+    pending: &LivePendingOrder,
+    reason: &str,
+    detail: Value,
+) {
+    let mut retry = pending.clone();
+    retry.retry_count = retry.retry_count.saturating_add(1);
+    state.upsert_pending_order(retry.clone()).await;
+    state
+        .append_live_event(
+            &retry.market_type,
+            json!({
+                "accepted": false,
+                "action": retry.action,
+                "side": retry.side,
+                "round_id": retry.round_id,
+                "reason": format!("{reason}_requeued"),
+                "order_id": retry.order_id,
+                "retry_count": retry.retry_count,
+                "detail": detail
+            }),
+        )
+        .await;
+
+    if retry.retry_count < cancel_failure_pause_threshold(&retry.action) {
+        return;
+    }
+
+    let now_ms = Utc::now().timestamp_millis();
+    let mut control = state.get_live_runtime_control(&retry.market_type).await;
+    if control.mode != LiveRuntimeControlMode::ForcePause {
+        control.mode = LiveRuntimeControlMode::ForcePause;
+        control.requested_at_ms = now_ms;
+        control.updated_at_ms = now_ms;
+        control.completed_at_ms = None;
+        control.note = Some(format!(
+            "auto_force_pause:{}:order_id={}:retry={}",
+            reason, retry.order_id, retry.retry_count
+        ));
+        state
+            .put_live_runtime_control(&retry.market_type, control.clone())
+            .await;
+    }
+    state
+        .append_live_event(
+            &retry.market_type,
+            json!({
+                "accepted": false,
+                "action": retry.action,
+                "side": retry.side,
+                "round_id": retry.round_id,
+                "reason": "auto_force_pause_cancel_failure",
+                "order_id": retry.order_id,
+                "retry_count": retry.retry_count,
+                "runtime_mode": control.mode,
+                "runtime_note": control.note,
+            }),
+        )
+        .await;
 }
 
 pub(super) async fn get_or_init_rust_executor(
@@ -2338,7 +2473,14 @@ pub(super) async fn reconcile_rust_reports(state: &ApiState, gateway_cfg: &LiveG
         };
         if pm_is_terminal_fill(&order.status) {
             let _ = state.remove_pending_order(&row.order_id).await;
-            apply_pending_confirmation(state, &row, "rust_order_terminal_filled", None).await;
+            let fill_event = fill_event_from_open_order(&order);
+            apply_pending_confirmation(
+                state,
+                &row,
+                "rust_order_terminal_filled",
+                Some(&fill_event),
+            )
+            .await;
             state
                 .append_live_event(
                     &row.market_type,
@@ -2526,20 +2668,15 @@ pub(super) async fn handle_pending_timeouts_rust(
                     .await;
             }
             Err(err) => {
-                state
-                    .append_live_event(
-                        &row.market_type,
-                        json!({
-                            "accepted": false,
-                            "action": row.action,
-                            "side": row.side,
-                            "round_id": row.round_id,
-                            "reason": "rust_timeout_cancel_failed",
-                            "order_id": row.order_id,
-                            "error": err.to_string()
-                        }),
-                    )
-                    .await;
+                handle_cancel_failure_with_escalation(
+                    state,
+                    &row,
+                    "rust_timeout_cancel_failed",
+                    json!({
+                        "error": err.to_string()
+                    }),
+                )
+                .await;
             }
         }
     }
