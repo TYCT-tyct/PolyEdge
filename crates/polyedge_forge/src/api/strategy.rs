@@ -51,6 +51,7 @@ const STRATEGY_PROFILE_PROFIT_MAX: &str = "fev1_manual_profit_max_2026_02_27";
 const STRATEGY_PROFILE_HI_FREQ: &str = "fev1_manual_hi_freq_2026_02_27";
 const STRATEGY_PROFILE_HI_WIN: &str = "fev1_manual_hi_win_2026_02_27";
 const STRATEGY_PROFILE_BALANCED: &str = "fev1_manual_balanced_2026_02_28";
+const STRATEGY_PROFILE_CAND_GROWTH_MIX: &str = "fev1_cand_growth_mix_2026_02_28";
 
 fn strategy_enabled_markets() -> &'static Vec<String> {
     static ENABLED: OnceLock<Vec<String>> = OnceLock::new();
@@ -259,6 +260,9 @@ fn strategy_select_profile_name() -> &'static str {
             }
             "balanced" | "manual_balanced" | "fev1_manual_balanced_2026_02_28" => {
                 return STRATEGY_PROFILE_BALANCED;
+            }
+            "cand_growth_mix" | "growth_mix" | "fev1_cand_growth_mix_2026_02_28" => {
+                return STRATEGY_PROFILE_CAND_GROWTH_MIX;
             }
             _ => {}
         }
@@ -476,11 +480,39 @@ fn strategy_balanced_config() -> StrategyRuntimeConfig {
     }
 }
 
+fn strategy_cand_growth_mix_config() -> StrategyRuntimeConfig {
+    StrategyRuntimeConfig {
+        entry_threshold_base: 0.7996697997497385,
+        entry_threshold_cap: 0.99,
+        spread_limit_prob: 0.04383330249581228,
+        entry_edge_prob: 0.006583305481398134,
+        entry_min_potential_cents: 23.554519107808108,
+        entry_max_price_cents: 75.48156075488825,
+        min_hold_ms: 406,
+        stop_loss_cents: 21.10061478699938,
+        reverse_signal_threshold: -0.2504710423293769,
+        reverse_signal_ticks: 4,
+        trail_activate_profit_cents: 22.52846740256911,
+        trail_drawdown_cents: 14.579074544933382,
+        take_profit_near_max_cents: 99.5,
+        endgame_take_profit_cents: 93.77424625997885,
+        endgame_remaining_ms: 18_077,
+        liquidity_widen_prob: 0.06181790968658127,
+        cooldown_ms: 7_580,
+        max_entries_per_round: 2,
+        max_exec_spread_cents: 2.163925319960545,
+        slippage_cents_per_side: 0.1353580016533842,
+        fee_cents_per_side: 0.03776880159417778,
+        emergency_wide_spread_penalty_ratio: 0.2152594179877152,
+    }
+}
+
 pub(super) fn strategy_current_default_config() -> StrategyRuntimeConfig {
     match strategy_select_profile_name() {
         STRATEGY_PROFILE_HI_WIN => strategy_hi_win_config(),
         STRATEGY_PROFILE_HI_FREQ => strategy_hi_freq_config(),
         STRATEGY_PROFILE_BALANCED => strategy_balanced_config(),
+        STRATEGY_PROFILE_CAND_GROWTH_MIX => strategy_cand_growth_mix_config(),
         _ => strategy_profit_max_config(),
     }
 }
