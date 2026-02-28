@@ -46,6 +46,16 @@ sudo chown -R "$USER_NAME:$USER_NAME" "$DATA_ROOT"
 cd "$REPO_DIR"
 ~/.cargo/bin/cargo build -p polyedge_forge --release
 
+# Keep service-level defaults in sync even when .env overrides are present.
+ENV_FILE="$REPO_DIR/.env"
+if [ -f "$ENV_FILE" ]; then
+  if grep -q '^FORGE_FEV1_RUNTIME_MAX_TRADES=' "$ENV_FILE"; then
+    sed -i 's/^FORGE_FEV1_RUNTIME_MAX_TRADES=.*/FORGE_FEV1_RUNTIME_MAX_TRADES=500/' "$ENV_FILE"
+  else
+    echo 'FORGE_FEV1_RUNTIME_MAX_TRADES=500' >> "$ENV_FILE"
+  fi
+fi
+
 # Always rebuild dashboard static assets before restarting API service.
 # This prevents stale /dashboard bundles after backend-only deploys.
 if command -v npm >/dev/null 2>&1; then
