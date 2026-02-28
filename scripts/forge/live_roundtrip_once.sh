@@ -8,6 +8,7 @@ LIVE_URL="${LIVE_URL:-http://127.0.0.1:9810/api/strategy/paper?market_type=5m&so
 ENTRY_TIMEOUT_SEC="${ENTRY_TIMEOUT_SEC:-420}"
 EXIT_TIMEOUT_SEC="${EXIT_TIMEOUT_SEC:-420}"
 POLL_SEC="${POLL_SEC:-2}"
+PROFILE_OVERRIDE="${PROFILE_OVERRIDE:-}"
 
 upsert_env() {
   local key="$1"
@@ -36,8 +37,13 @@ fetch_position_field() {
   python3 -c "import json,sys; d=json.loads(sys.stdin.read()); v=d.get('$field'); print('' if v is None else v)" <<<"$raw"
 }
 
-echo "[roundtrip] ensure live mode enabled with cand_growth_mix profile"
-upsert_env "FORGE_STRATEGY_BASE_PROFILE" "fev1_cand_growth_mix_2026_02_28" "$ENV_FILE"
+echo "[roundtrip] ensure live mode enabled (profile is not overridden by default)"
+if [[ -n "$PROFILE_OVERRIDE" ]]; then
+  echo "[roundtrip] override profile -> $PROFILE_OVERRIDE"
+  upsert_env "FORGE_STRATEGY_BASE_PROFILE" "$PROFILE_OVERRIDE" "$ENV_FILE"
+else
+  echo "[roundtrip] keep existing FORGE_STRATEGY_BASE_PROFILE from $ENV_FILE"
+fi
 upsert_env "FORGE_FEV1_RUNTIME_LOOKBACK_MINUTES" "1440" "$ENV_FILE"
 upsert_env "FORGE_FEV1_LIVE_ENABLED" "true" "$ENV_FILE"
 upsert_env "FORGE_FEV1_LIVE_EXECUTE" "true" "$ENV_FILE"
