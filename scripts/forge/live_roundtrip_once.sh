@@ -36,8 +36,8 @@ fetch_position_field() {
   python3 -c "import json,sys; d=json.loads(sys.stdin.read()); v=d.get('$field'); print('' if v is None else v)" <<<"$raw"
 }
 
-echo "[roundtrip] ensure live mode enabled with balanced profile"
-upsert_env "FORGE_STRATEGY_BASE_PROFILE" "fev1_manual_balanced_2026_02_28" "$ENV_FILE"
+echo "[roundtrip] ensure live mode enabled with cand_growth_mix profile"
+upsert_env "FORGE_STRATEGY_BASE_PROFILE" "fev1_cand_growth_mix_2026_02_28" "$ENV_FILE"
 upsert_env "FORGE_FEV1_RUNTIME_LOOKBACK_MINUTES" "1440" "$ENV_FILE"
 upsert_env "FORGE_FEV1_LIVE_ENABLED" "true" "$ENV_FILE"
 upsert_env "FORGE_FEV1_LIVE_EXECUTE" "true" "$ENV_FILE"
