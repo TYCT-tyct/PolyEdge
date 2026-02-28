@@ -852,6 +852,7 @@ export async function getAccuracySeries(
 
 export interface StrategyPaperQueryOptions {
   source?: "replay" | "live" | "auto";
+  profile?: string;
   lookbackMinutes?: number;
   maxTrades?: number;
   fullHistory?: boolean;
@@ -875,10 +876,14 @@ export async function getStrategyPaper(
 ): Promise<StrategyPaperResponse> {
   const qs = new URLSearchParams({
     source: options.source ?? "replay",
+    profile: options.profile ?? "",
     market_type: marketType,
     full_history: options.fullHistory ? "true" : "false",
     use_autotune: options.useAutotune ? "true" : "false",
   });
+  if (!options.profile) {
+    qs.delete("profile");
+  }
   if (options.lookbackMinutes != null) {
     qs.set("lookback_minutes", String(options.lookbackMinutes));
   }

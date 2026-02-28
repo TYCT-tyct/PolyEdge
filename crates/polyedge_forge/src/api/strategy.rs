@@ -408,25 +408,45 @@ fn strategy_select_profile_name() -> &'static str {
             "balanced" | "manual_balanced" | "fev1_manual_balanced_2026_02_28" => {
                 return STRATEGY_PROFILE_BALANCED;
             }
-            "cand_growth_mix" | "growth_mix" | "fev1_cand_growth_mix_2026_02_28" => {
+            "cand_growth_mix"
+            | "growth_mix"
+            | "growth"
+            | "fev1_cand_growth_mix_2026_02_28" => {
                 return STRATEGY_PROFILE_CAND_GROWTH_MIX;
             }
             _ => {}
         }
     }
-    let equity_base = std::env::var("FORGE_FEV1_CAPITAL_BASE_USDC")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(50.0);
-    if equity_base <= 60.0 {
-        STRATEGY_PROFILE_HI_WIN
-    } else {
-        STRATEGY_PROFILE_HI_FREQ
-    }
+    STRATEGY_PROFILE_CAND_GROWTH_MIX
 }
 
 fn strategy_current_default_profile_name() -> &'static str {
     strategy_select_profile_name()
+}
+
+fn strategy_profile_from_alias(raw: &str) -> Option<(&'static str, StrategyRuntimeConfig)> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "profit_max" | "manual_profit_max" | "max" | "fev1_manual_profit_max_2026_02_27" => {
+            Some((STRATEGY_PROFILE_PROFIT_MAX, strategy_profit_max_config()))
+        }
+        "hi_win" | "manual_hi_win" | "safe" | "safety" | "fev1_manual_hi_win_2026_02_27" => {
+            Some((STRATEGY_PROFILE_HI_WIN, strategy_hi_win_config()))
+        }
+        "hi_freq" | "manual_hi_freq" | "freq" | "fev1_manual_hi_freq_2026_02_27" => {
+            Some((STRATEGY_PROFILE_HI_FREQ, strategy_hi_freq_config()))
+        }
+        "balanced" | "manual_balanced" | "fev1_manual_balanced_2026_02_28" => {
+            Some((STRATEGY_PROFILE_BALANCED, strategy_balanced_config()))
+        }
+        "cand_growth_mix"
+        | "growth_mix"
+        | "growth"
+        | "fev1_cand_growth_mix_2026_02_28" => Some((
+            STRATEGY_PROFILE_CAND_GROWTH_MIX,
+            strategy_cand_growth_mix_config(),
+        )),
+        _ => None,
+    }
 }
 
 fn strategy_env_bool(name: &str, default: bool) -> bool {
@@ -721,7 +741,7 @@ fn strategy_cand_growth_mix_config() -> StrategyRuntimeConfig {
         endgame_remaining_ms: 18_077,
         liquidity_widen_prob: 0.06181790968658127,
         cooldown_ms: 7_580,
-        max_entries_per_round: 2,
+        max_entries_per_round: 1,
         max_exec_spread_cents: 2.163925319960545,
         slippage_cents_per_side: 0.1353580016533842,
         fee_cents_per_side: 0.03776880159417778,
@@ -1523,6 +1543,13 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         if action == "enter" {
             if let Some(state_side) = position_before_gate.side.as_deref() {
                 if state_side.eq_ignore_ascii_case(&side) {
+                    if capital_cfg.bankroll_policy_enabled {
+                        capital_skipped.push(json!({
+                            "reason": "bankroll_policy_no_add",
+                            "decision": d
+                        }));
+                        continue;
+                    }
                     if capital_cfg.disable_add_on_loss && in_loss_phase {
                         capital_skipped.push(json!({
                             "reason": "add_disabled_on_loss_or_risk",
@@ -1641,6 +1668,13 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                 }
             }
         } else if action == "add" {
+            if capital_cfg.bankroll_policy_enabled {
+                capital_skipped.push(json!({
+                    "reason": "bankroll_policy_no_add",
+                    "decision": d
+                }));
+                continue;
+            }
             let Some(state_side) = position_before_gate.side.as_deref() else {
                 capital_skipped.push(json!({
                     "reason": "add_without_open_position",
@@ -2663,6 +2697,12 @@ pub(super) async fn strategy_paper(
     let mut autotune_key_used = Value::Null;
     let (active_opt, active_key_used) = resolve_autotune_active_doc(&state, market_type).await?;
     let (live_opt, live_key_used) = resolve_autotune_live_doc(&state, market_type).await?;
+    if let Some(profile_raw) = params.profile.as_deref() {
+        if let Some((profile_name, profile_cfg)) = strategy_profile_from_alias(profile_raw) {
+            cfg = profile_cfg;
+            config_source = profile_name;
+        }
+    }
     if use_autotune {
         if let Some(active) = active_opt {
             cfg = strategy_cfg_from_payload(cfg, &active);

@@ -21,8 +21,10 @@ const STRATEGY_PREFS_STORAGE_KEY = "polyedge.strategy.prefs.v4";
 const PAPER_LOOKBACK_MINUTES = 1440;
 
 const STRATEGY_PAPER_PROFILE = Object.freeze({
+  profile: "growth",
   fullHistory: false,
-  useAutotune: false
+  useAutotune: false,
+  maxEntriesPerRound: 1
 });
 
 const STRATEGY_LIVE_PROFILE = Object.freeze({
@@ -53,8 +55,8 @@ function readStrategyUiPrefs(): Partial<StrategyUiPrefs> {
         ? (parsed.marketType as MarketType)
         : undefined;
     const source =
-      parsed.source === "replay"
-        ? ("replay" as StrategyPaperSource)
+      parsed.source === "replay" || parsed.source === "live"
+        ? (parsed.source as StrategyPaperSource)
         : undefined;
     const useAutotune =
       typeof parsed.useAutotune === "boolean" ? parsed.useAutotune : undefined;
@@ -186,6 +188,53 @@ function numCell(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
+function compactStrategyPayload(payload: StrategyPaperResponse): StrategyPaperResponse {
+  const trimmedTrades = payload.trades.length > 60 ? payload.trades.slice(-60) : payload.trades;
+  const live = payload.live_execution;
+  if (!live) {
+    return { ...payload, trades: trimmedTrades };
+  }
+  const compactLive = {
+    ...live,
+    decisions:
+      live.decisions && live.decisions.length > 80
+        ? live.decisions.slice(live.decisions.length - 80)
+        : live.decisions,
+    paper_records:
+      live.paper_records && live.paper_records.length > 60
+        ? live.paper_records.slice(live.paper_records.length - 60)
+        : live.paper_records,
+    live_records:
+      live.live_records && live.live_records.length > 60
+        ? live.live_records.slice(live.live_records.length - 60)
+        : live.live_records,
+    events:
+      live.events && live.events.length > 50
+        ? live.events.slice(live.events.length - 50)
+        : live.events,
+    gated: live.gated
+      ? {
+          ...live.gated,
+          submitted_decisions:
+            live.gated.submitted_decisions &&
+            live.gated.submitted_decisions.length > 60
+              ? live.gated.submitted_decisions.slice(
+                  live.gated.submitted_decisions.length - 60
+                )
+              : live.gated.submitted_decisions,
+          skipped_decisions:
+            live.gated.skipped_decisions &&
+            live.gated.skipped_decisions.length > 60
+              ? live.gated.skipped_decisions.slice(
+                  live.gated.skipped_decisions.length - 60
+                )
+              : live.gated.skipped_decisions
+        }
+      : live.gated
+  };
+  return { ...payload, trades: trimmedTrades, live_execution: compactLive };
+}
+
 export function PaperLabPage({
   selectedSymbol,
   timeMode
@@ -199,7 +248,9 @@ export function PaperLabPage({
   const [strategyMarketType, setStrategyMarketType] = useState<MarketType>(
     prefs.marketType ?? "5m"
   );
-  const [strategySource] = useState<StrategyPaperSource>("replay");
+  const [strategySource, setStrategySource] = useState<StrategyPaperSource>(
+    prefs.source ?? "replay"
+  );
   const [strategyUseAutotune] = useState<boolean>(false);
   const [strategyAutotuneLatest, setStrategyAutotuneLatest] = useState<Record<string, unknown> | null>(null);
   const [strategyAutotuneHistory, setStrategyAutotuneHistory] = useState<Array<Record<string, unknown>>>([]);
@@ -286,12 +337,13 @@ export function PaperLabPage({
           source: strategySource === "live" ? "auto" : "replay",
           ...(strategySource === "live" ? STRATEGY_LIVE_PROFILE : {})
         });
+        const compactData = compactStrategyPayload(data);
         if (alive) {
-          const nextSig = strategyPaperSignature(data);
+          const nextSig = strategyPaperSignature(compactData);
           changed = nextSig !== strategySigRef.current;
           if (changed) {
             strategySigRef.current = nextSig;
-            setStrategyPaper(data);
+            setStrategyPaper(compactData);
           }
           strategyHasLoadedRef.current = true;
           setErrorText("");
@@ -454,6 +506,12 @@ export function PaperLabPage({
   const nowTs = finite(current?.timestamp_ms) ?? Date.now();
   const idleMinutes =
     lastTradeTs != null ? Math.max(0, (nowTs - lastTradeTs) / 60_000) : null;
+  const liveExecution = strategyPaper?.live_execution;
+  const liveParity = liveExecution?.parity_check;
+  const liveCapital = liveExecution?.capital;
+  const liveState = liveExecution?.state_machine;
+  const liveEvents = (liveExecution?.events ?? []).slice(-20).reverse();
+  const liveOrders = (liveExecution?.execution?.orders ?? []).slice(-20).reverse();
 
   return (
     <section className="panel">
@@ -536,10 +594,16 @@ export function PaperLabPage({
           </button>
         </div>
         <div className="btn-group">
-          <button className="active" disabled>
+          <button
+            className={strategySource === "replay" ? "active" : ""}
+            onClick={() => setStrategySource("replay")}
+          >
             Paper模拟
           </button>
-          <button disabled>
+          <button
+            className={strategySource === "live" ? "active" : ""}
+            onClick={() => setStrategySource("live")}
+          >
             真实交易
           </button>
         </div>
@@ -561,6 +625,186 @@ export function PaperLabPage({
           <small>UP / DOWN 点差</small>
         </article>
       </div>
+
+      {strategySource === "live" ? (
+        <section className="live-execution-wrap">
+          <div className="info-cards compact live-kpi-grid">
+            <article className="info-card">
+              <span>执行状态</span>
+              <strong
+                className={
+                  liveParity?.status === "ok"
+                    ? "up"
+                    : liveParity?.status === "dry_run"
+                    ? ""
+                    : "down"
+                }
+              >
+                {textCell(liveParity?.status)}
+              </strong>
+              <small>level: {textCell(liveParity?.level)}</small>
+            </article>
+            <article className="info-card">
+              <span>下单统计</span>
+              <strong>
+                {`${numCell(liveParity?.live?.submitted_count) ?? 0} / ${
+                  numCell(liveParity?.live?.accepted_count) ?? 0
+                }`}
+              </strong>
+              <small>
+                提交 / 接受（拒绝 {numCell(liveParity?.live?.rejected_count) ?? 0}）
+              </small>
+            </article>
+            <article className="info-card">
+              <span>风控仓位</span>
+              <strong>{`${numCell(liveCapital?.state?.last_quote_usdc)?.toFixed(2) ?? "--"} USDC`}</strong>
+              <small>
+                模式 {textCell(liveCapital?.state?.bankroll_mode)} ·
+                日回撤{" "}
+                {numCell(liveCapital?.state?.daily_drawdown_ratio) != null
+                  ? `${(numCell(liveCapital?.state?.daily_drawdown_ratio)! * 100).toFixed(2)}%`
+                  : "--"}
+              </small>
+            </article>
+          </div>
+          <div className="live-block-grid">
+            <article className="live-block">
+              <header>
+                <h3>状态机</h3>
+                <small>实时持仓与资金状态</small>
+              </header>
+              <ul className="diag-list">
+                <li>
+                  <span>仓位方向</span>
+                  <strong>{textCell(liveState?.side)}</strong>
+                </li>
+                <li>
+                  <span>最近动作</span>
+                  <strong>{textCell(liveState?.last_action)}</strong>
+                </li>
+                <li>
+                  <span>未结挂单</span>
+                  <strong>{numCell(liveCapital?.open_pending_orders) ?? 0}</strong>
+                </li>
+                <li>
+                  <span>可用资金</span>
+                  <strong>{`${numCell(liveCapital?.state?.available_to_trade_usdc)?.toFixed(2) ?? "--"} USDC`}</strong>
+                </li>
+                <li>
+                  <span>连赢 / 连亏</span>
+                  <strong>{`${numCell(liveCapital?.state?.consecutive_wins) ?? 0} / ${
+                    numCell(liveCapital?.state?.consecutive_losses) ?? 0
+                  }`}</strong>
+                </li>
+              </ul>
+            </article>
+            <article className="live-block">
+              <header>
+                <h3>链路告警</h3>
+                <small>无法成交与回退原因</small>
+              </header>
+              <ul className="diag-list">
+                <li>
+                  <span>no_live_market_target</span>
+                  <strong>{liveParity?.live?.no_live_market_target ? "yes" : "no"}</strong>
+                </li>
+                <li>
+                  <span>gated skipped</span>
+                  <strong>{numCell(liveExecution?.gated?.skipped_count) ?? 0}</strong>
+                </li>
+                <li>
+                  <span>capital skipped</span>
+                  <strong>{numCell(liveCapital?.capital_skipped_count) ?? 0}</strong>
+                </li>
+                <li>
+                  <span>gateway mode</span>
+                  <strong>{textCell(liveExecution?.execution?.mode)}</strong>
+                </li>
+                <li>
+                  <span>execution error</span>
+                  <strong>{textCell(liveExecution?.execution?.error)}</strong>
+                </li>
+              </ul>
+            </article>
+          </div>
+          <div className="live-tables-grid">
+            <div className="table-wrap">
+              <h3 className="table-title">真实下单记录（最近 20）</h3>
+              <table className="history-table live-exec-table">
+                <thead>
+                  <tr>
+                    <th>结果</th>
+                    <th>动作</th>
+                    <th>方向</th>
+                    <th>轮次</th>
+                    <th>order_id</th>
+                    <th>原因</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {liveOrders.map((row, idx) => {
+                    const response =
+                      row.response && typeof row.response === "object"
+                        ? (row.response as Record<string, unknown>)
+                        : null;
+                    const orderId =
+                      textCell(response?.order_id) !== "--"
+                        ? textCell(response?.order_id)
+                        : textCell(response?.id);
+                    return (
+                      <tr key={`live-order-${idx}`}>
+                        <td className={row.ok && row.accepted !== false ? "up" : "down"}>
+                          {row.ok && row.accepted !== false ? "ok" : "fail"}
+                        </td>
+                        <td>{textCell(row.decision?.action)}</td>
+                        <td>{textCell(row.decision?.side)}</td>
+                        <td>{shortRoundId(textCell(row.decision?.round_id))}</td>
+                        <td>{orderId}</td>
+                        <td>{textCell(row.error ?? row.reason)}</td>
+                      </tr>
+                    );
+                  })}
+                  {liveOrders.length === 0 ? (
+                    <tr>
+                      <td colSpan={6}>暂无真实下单记录</td>
+                    </tr>
+                  ) : null}
+                </tbody>
+              </table>
+            </div>
+            <div className="table-wrap">
+              <h3 className="table-title">链路事件（最近 20）</h3>
+              <table className="history-table live-event-table">
+                <thead>
+                  <tr>
+                    <th>时间</th>
+                    <th>动作</th>
+                    <th>方向</th>
+                    <th>order_id</th>
+                    <th>原因</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {liveEvents.map((row, idx) => (
+                    <tr key={`live-event-${idx}`}>
+                      <td>{formatClockTime(numCell(row.ts_ms), timeMode)}</td>
+                      <td>{textCell(row.action)}</td>
+                      <td>{textCell(row.side)}</td>
+                      <td>{textCell(row.order_id)}</td>
+                      <td>{textCell(row.reason)}</td>
+                    </tr>
+                  ))}
+                  {liveEvents.length === 0 ? (
+                    <tr>
+                      <td colSpan={5}>暂无链路事件</td>
+                    </tr>
+                  ) : null}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+      ) : null}
 
       {!PAPER_AUTOTUNE_DISABLED ? (
         <div className="table-wrap">
@@ -660,6 +904,7 @@ export function PaperLabPage({
 
       <footer className="status-row">
         <span>source: {strategyPaper?.source ?? "--"}</span>
+        <span>profile: {strategyPaper?.config_source ?? "--"}</span>
         <span>market: {strategyMarketType}</span>
         <span>
           最近成交: {formatTime(lastTradeTs, timeMode)}

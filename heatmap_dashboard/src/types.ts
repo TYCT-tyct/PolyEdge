@@ -396,6 +396,11 @@ export interface StrategyPaperResponse {
         risk_state?: string;
         consecutive_wins?: number;
         consecutive_losses?: number;
+        bankroll_mode?: string;
+        bankroll_defense_armed?: boolean;
+        day_cn_bucket?: number;
+        day_start_equity_usdc?: number;
+        daily_drawdown_ratio?: number;
         last_realized_pnl_usdc?: number;
         last_quote_usdc?: number;
         updated_ts_ms?: number;
