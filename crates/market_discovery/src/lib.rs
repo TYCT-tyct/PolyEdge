@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MarketDescriptor {
@@ -141,10 +142,21 @@ struct ScanPlan {
 
 impl MarketDiscovery {
     pub fn new(cfg: DiscoveryConfig) -> Self {
-        Self {
-            http: Client::new(),
-            cfg,
-        }
+        let user_agent = std::env::var("POLYEDGE_DISCOVERY_USER_AGENT")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| {
+                "Mozilla/5.0 (compatible; PolyEdgeBot/1.0; +https://github.com/TYCT-tyct/PolyEdge)"
+                    .to_string()
+            });
+        let http = Client::builder()
+            .user_agent(user_agent)
+            .connect_timeout(Duration::from_secs(6))
+            .timeout(Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+        Self { http, cfg }
     }
 
     pub async fn discover(&self) -> Result<Vec<MarketDescriptor>> {
@@ -190,9 +202,9 @@ impl MarketDiscovery {
         // while still allowing opt-in wider scans via env variables.
         let enddate_limit = env_i64("POLYEDGE_DISCOVERY_ENDDATE_LIMIT", 200, 50, 1000);
         let enddate_pages = env_usize("POLYEDGE_DISCOVERY_ENDDATE_MAX_PAGES", 20, 1, 64);
-        let volume_limit = env_i64("POLYEDGE_DISCOVERY_VOLUME_LIMIT", 600, 50, 1000);
+        let volume_limit = env_i64("POLYEDGE_DISCOVERY_VOLUME_LIMIT", 200, 50, 1000);
         let volume_pages_cfg = env_usize("POLYEDGE_DISCOVERY_VOLUME_MAX_PAGES", 0, 0, 32);
-        let volume_pages_fallback = env_usize("POLYEDGE_DISCOVERY_VOLUME_FALLBACK_PAGES", 2, 0, 8);
+        let volume_pages_fallback = env_usize("POLYEDGE_DISCOVERY_VOLUME_FALLBACK_PAGES", 1, 0, 8);
         let volume_pages = if volume_pages_cfg > 0 {
             volume_pages_cfg
         } else {

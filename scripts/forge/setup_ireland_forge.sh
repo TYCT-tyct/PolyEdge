@@ -76,14 +76,17 @@ WorkingDirectory=$REPO_DIR
 Environment=RUST_LOG=info,polyedge_forge=debug
 Environment=POLYEDGE_MARKET_REFRESH_SEC=$MARKET_WS_REFRESH_SEC
 Environment=POLYEDGE_TARGET_MARKET_CACHE_FILE=/data/polyedge-forge/cache/target_market_cache.json
-Environment=POLYEDGE_DISCOVERY_ENDDATE_MAX_PAGES=6
+Environment=POLYEDGE_DISCOVERY_ENDDATE_LIMIT=100
+Environment=POLYEDGE_DISCOVERY_ENDDATE_MAX_PAGES=20
 Environment=POLYEDGE_DISCOVERY_VOLUME_MAX_PAGES=0
-Environment=POLYEDGE_DISCOVERY_VOLUME_FALLBACK_PAGES=2
+Environment=POLYEDGE_DISCOVERY_VOLUME_LIMIT=200
+Environment=POLYEDGE_DISCOVERY_VOLUME_FALLBACK_PAGES=0
 Environment=POLYEDGE_DISCOVERY_MAX_PAST_MS=300000
+Environment="POLYEDGE_DISCOVERY_USER_AGENT=Mozilla/5.0 (compatible; PolyEdgeBot/1.0; +https://github.com/TYCT-tyct/PolyEdge)"
 Environment=FORGE_TOKYO_INPUT_STALE_GUARD_MS=$TOKYO_INPUT_STALE_GUARD_MS
 Environment=FORGE_CHAINLINK_ENABLED=false
 Environment=POLYEDGE_ENABLE_CHAINLINK_ANCHOR=false
-Environment=POLYEDGE_MARKET_STALE_RECONNECT_RATIO=1.0
+Environment=POLYEDGE_MARKET_STALE_RECONNECT_RATIO=0.75
 ExecStart=$REPO_DIR/target/release/polyedge_forge ireland-recorder --data-root $DATA_ROOT --udp-bind 0.0.0.0:9801 --sample-ms 100 --supported-symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT --active-symbols $ACTIVE_SYMBOLS --active-timeframes $ACTIVE_TIMEFRAMES --active-symbol-timeframes $ACTIVE_SYMBOL_TIMEFRAMES --discovery-refresh-sec $DISCOVERY_REFRESH_SEC --clickhouse-url http://127.0.0.1:8123 --clickhouse-database polyedge_forge --clickhouse-snapshot-table snapshot_100ms --clickhouse-round-table rounds --redis-url redis://127.0.0.1:6379/0 --redis-prefix forge --redis-ttl-sec 7200 --sink-batch-size 200 --sink-flush-ms 1000 --sink-queue-cap 20000 --disable-api --dashboard-dist /home/ubuntu/PolyEdge/heatmap_dashboard/dist
 Restart=always
 RestartSec=2
@@ -111,7 +114,7 @@ Environment=FORGE_FEV1_RUNTIME_MARKETS=$RUNTIME_MARKETS
 Environment=FORGE_FEV1_RUNTIME_LOOKBACK_MINUTES=$RUNTIME_LOOKBACK_MINUTES
 Environment=FORGE_FEV1_RUNTIME_LOOP_MS=450
 Environment=FORGE_FEV1_RUNTIME_MAX_POINTS=140000
-Environment=FORGE_FEV1_RUNTIME_MAX_TRADES=120
+Environment=FORGE_FEV1_RUNTIME_MAX_TRADES=500
 Environment=FORGE_STRATEGY_MARKETS=$STRATEGY_MARKETS
 Environment=FORGE_STRATEGY_BASE_PROFILE=$STRATEGY_BASE_PROFILE
 Environment=FORGE_FEV1_EXECUTOR=rust_sdk
