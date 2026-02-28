@@ -183,6 +183,39 @@ fn round_end_ts_ms_from_round_id(round_id: &str) -> Option<i64> {
     Some(start_ms.saturating_add(tf_ms))
 }
 
+fn market_pair_key(m: &MarketMeta) -> String {
+    format!("{}:{}", m.symbol, m.timeframe)
+}
+
+fn market_selection_rank(m: &MarketMeta, now_ms: i64) -> (u8, i64, i64) {
+    if now_ms >= m.start_ts_ms && now_ms <= m.end_ts_ms.saturating_add(MARKET_STALE_GUARD_MS) {
+        // Prefer currently active round first, then the one closest to settlement.
+        return (
+            0,
+            m.end_ts_ms.saturating_sub(now_ms).abs(),
+            m.start_ts_ms.abs(),
+        );
+    }
+    if now_ms < m.start_ts_ms {
+        // Then prefer the nearest upcoming round.
+        return (
+            1,
+            m.start_ts_ms.saturating_sub(now_ms),
+            m.start_ts_ms.abs(),
+        );
+    }
+    // Finally keep the most recently ended round as last resort.
+    (
+        2,
+        now_ms.saturating_sub(m.end_ts_ms),
+        m.start_ts_ms.saturating_abs(),
+    )
+}
+
+fn market_is_preferred(candidate: &MarketMeta, current: &MarketMeta, now_ms: i64) -> bool {
+    market_selection_rank(candidate, now_ms) < market_selection_rank(current, now_ms)
+}
+
 fn round_meta_is_fresh(round_id: &str, now_ms: i64, retention_ms: i64) -> bool {
     round_end_ts_ms_from_round_id(round_id)
         .map(|round_end_ms| now_ms <= round_end_ms.saturating_add(retention_ms))
@@ -853,6 +886,23 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     markets_by_id.insert(prev.market_id.clone(), prev.clone());
                     pair_seen.insert(pair_key);
                     sticky_reused = sticky_reused.saturating_add(1);
+                }
+                let mut selected_by_pair: HashMap<String, MarketMeta> = HashMap::new();
+                for market in markets_by_id.values() {
+                    let pair_key = market_pair_key(market);
+                    match selected_by_pair.get(&pair_key) {
+                        Some(existing) if !market_is_preferred(market, existing, now_ms) => {}
+                        _ => {
+                            selected_by_pair.insert(pair_key, market.clone());
+                        }
+                    }
+                }
+                if selected_by_pair.len() != markets_by_id.len() {
+                    let mut reduced: HashMap<String, MarketMeta> = HashMap::new();
+                    for market in selected_by_pair.values() {
+                        reduced.insert(market.market_id.clone(), market.clone());
+                    }
+                    markets_by_id = reduced;
                 }
                 let mut kept_pairs = markets_by_id
                     .values()
