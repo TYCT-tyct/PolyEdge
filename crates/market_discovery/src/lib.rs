@@ -166,6 +166,25 @@ impl MarketDiscovery {
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::<String>::new();
         let now_ms = Utc::now().timestamp_millis();
+        let can_early_stop = !self.cfg.symbols.is_empty()
+            && !self.cfg.market_types.is_empty()
+            && !self.cfg.timeframes.is_empty();
+        let mut target_template_keys = std::collections::HashSet::<String>::new();
+        let mut matched_template_keys = std::collections::HashSet::<String>::new();
+        if can_early_stop {
+            for symbol in &self.cfg.symbols {
+                for market_type in &self.cfg.market_types {
+                    for timeframe in &self.cfg.timeframes {
+                        target_template_keys.insert(format!(
+                            "{}|{}|{}",
+                            symbol,
+                            market_type.to_ascii_lowercase(),
+                            timeframe.to_ascii_lowercase()
+                        ));
+                    }
+                }
+            }
+        }
 
         // Keep discovery query volume bounded by default to avoid Gamma rate-limits (429),
         // while still allowing opt-in wider scans via env variables.
@@ -190,7 +209,7 @@ impl MarketDiscovery {
             });
         }
 
-        for plan in plans {
+        'scan_plans: for plan in plans {
             for page_idx in 0..plan.max_pages {
                 let offset = (page_idx as i64) * plan.limit;
                 let limit_s = plan.limit.to_string();
@@ -303,23 +322,42 @@ impl MarketDiscovery {
                         .and_then(|ev| ev.event_metadata.as_ref())
                         .and_then(|m| m.price_to_beat);
                     out.push(MarketDescriptor {
-                        market_id: market.id,
-                        question: market.question,
-                        symbol,
-                        market_slug: market.slug,
+                        market_id: market.id.clone(),
+                        question: market.question.clone(),
+                        symbol: symbol.clone(),
+                        market_slug: market.slug.clone(),
                         token_id_yes: parse_token_pair(market.clob_token_ids.as_deref())
                             .map(|x| x.0),
                         token_id_no: parse_token_pair(market.clob_token_ids.as_deref())
                             .map(|x| x.1),
-                        event_slug: market.event_slug,
-                        end_date: market.end_date,
-                        event_start_time: market.event_start_time,
+                        event_slug: market.event_slug.clone(),
+                        end_date: market.end_date.clone(),
+                        event_start_time: market.event_start_time.clone(),
                         timeframe: timeframe.map(|v| v.to_string()),
                         market_type: Some(market_type.to_string()),
                         best_bid: market.best_bid,
                         best_ask: market.best_ask,
                         price_to_beat,
                     });
+
+                    if can_early_stop {
+                        if let Some(tf) = timeframe {
+                            let discovered_key = format!(
+                                "{}|{}|{}",
+                                symbol,
+                                market_type.to_ascii_lowercase(),
+                                tf.to_ascii_lowercase()
+                            );
+                            if target_template_keys.contains(&discovered_key) {
+                                matched_template_keys.insert(discovered_key);
+                            }
+                        }
+                        if !target_template_keys.is_empty()
+                            && matched_template_keys.len() >= target_template_keys.len()
+                        {
+                            break 'scan_plans;
+                        }
+                    }
                 }
             }
         }
