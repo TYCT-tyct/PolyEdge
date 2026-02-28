@@ -53,6 +53,42 @@ const PROB_RAW_MAX_STEP_MID_CLOSE_PER_SEC: f64 = 0.80;
 const PROB_RAW_MAX_STEP_NEAR_CLOSE_PER_SEC: f64 = 1.20;
 const PROB_STATE_RETENTION_MS: i64 = 2 * 60 * 60 * 1000;
 const TARGET_RETRY_BACKOFF_MS: i64 = 1_200;
+const RECORDER_HOUSEKEEPING_INTERVAL_MS: i64 = 10_000;
+const RECORDER_STALE_STATE_RETENTION_MS: i64 = 20 * 60 * 1000;
+const TARGET_CACHE_RETENTION_MS: i64 = 2 * 60 * 60 * 1000;
+const TARGET_RETRY_RETENTION_MS: i64 = 20 * 60 * 1000;
+const ROUND_META_RETENTION_MS: i64 = 6 * 60 * 60 * 1000;
+const EMITTED_ROUND_RETENTION_MS: i64 = 6 * 60 * 60 * 1000;
+
+fn env_flag(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(default)
+}
+
+fn chainlink_runtime_enabled() -> bool {
+    env_flag("FORGE_CHAINLINK_ENABLED", false)
+}
+
+fn round_end_ts_ms_from_round_id(round_id: &str) -> Option<i64> {
+    let mut parts = round_id.rsplitn(3, '_');
+    let start_ms = parse_timestamp_ms(Some(parts.next()?))?;
+    let timeframe = parts.next()?;
+    let tf_ms = timeframe_to_ms(timeframe)?;
+    Some(start_ms.saturating_add(tf_ms))
+}
+
+fn round_meta_is_fresh(round_id: &str, now_ms: i64, retention_ms: i64) -> bool {
+    round_end_ts_ms_from_round_id(round_id)
+        .map(|round_end_ms| now_ms <= round_end_ms.saturating_add(retention_ms))
+        .unwrap_or(false)
+}
 
 fn ema_alpha_from_tau(dt_s: f64, tau_s: f64) -> f64 {
     if !dt_s.is_finite() || !tau_s.is_finite() || dt_s <= 0.0 || tau_s <= 0.0 {
@@ -466,6 +502,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
     // target price 异步获取通道
     let (target_req_tx, mut target_req_rx) = mpsc::unbounded_channel::<TargetFetchReq>();
     let (target_res_tx, mut target_res_rx) = mpsc::unbounded_channel::<TargetFetchRes>();
+    let chainlink_enabled = chainlink_runtime_enabled();
 
     // 提取的后台任务，接收请求并串行执行 fallback
     let bg_persist_tx = persist_tx.clone();
@@ -529,37 +566,43 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         req.symbol, req.timeframe, req.start_ts_ms, v
                     ),
                 );
-            } else if let Some(v) = fetch_target_from_vatic_chainlink(
-                &vatic_http,
-                &req.symbol,
-                &req.timeframe,
-                round_start_sec,
-            )
-            .await
-            {
-                resolved_price = Some(v);
-                log_ingest(
-                    &bg_persist_tx,
-                    "warn",
-                    "target_price",
-                    &format!(
-                        "source=vatic_chainlink_fallback symbol={} tf={} start_ms={} target={}",
-                        req.symbol, req.timeframe, req.start_ts_ms, v
-                    ),
-                );
-            } else if let Some(v) =
-                fetch_target_from_official_binance(&req.symbol, req.start_ts_ms).await
-            {
-                resolved_price = Some(v);
-                log_ingest(
-                    &bg_persist_tx,
-                    "warn",
-                    "target_price",
-                    &format!(
-                        "source=binance_official_fallback symbol={} tf={} start_ms={} target={}",
-                        req.symbol, req.timeframe, req.start_ts_ms, v
-                    ),
-                );
+            } else if chainlink_enabled {
+                if let Some(v) = fetch_target_from_vatic_chainlink(
+                    &vatic_http,
+                    &req.symbol,
+                    &req.timeframe,
+                    round_start_sec,
+                )
+                .await
+                {
+                    resolved_price = Some(v);
+                    log_ingest(
+                        &bg_persist_tx,
+                        "warn",
+                        "target_price",
+                        &format!(
+                            "source=vatic_chainlink_fallback symbol={} tf={} start_ms={} target={}",
+                            req.symbol, req.timeframe, req.start_ts_ms, v
+                        ),
+                    );
+                }
+            }
+
+            if resolved_price.is_none() {
+                if let Some(v) =
+                    fetch_target_from_official_binance(&req.symbol, req.start_ts_ms).await
+                {
+                    resolved_price = Some(v);
+                    log_ingest(
+                        &bg_persist_tx,
+                        "warn",
+                        "target_price",
+                        &format!(
+                            "source=binance_official_fallback symbol={} tf={} start_ms={} target={}",
+                            req.symbol, req.timeframe, req.start_ts_ms, v
+                        ),
+                    );
+                }
             }
 
             let _ = target_res_tx.send(TargetFetchRes {
@@ -570,7 +613,16 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
     });
 
     spawn_tokyo_udp_receiver(args.udp_bind.clone(), tokyo_tx, persist_tx.clone());
-    spawn_chainlink_reader(active_symbols.clone(), chainlink_tx, persist_tx.clone());
+    if chainlink_enabled {
+        spawn_chainlink_reader(active_symbols.clone(), chainlink_tx, persist_tx.clone());
+    } else {
+        log_ingest(
+            &persist_tx,
+            "info",
+            "chainlink",
+            "chainlink runtime disabled by FORGE_CHAINLINK_ENABLED=false",
+        );
+    }
     spawn_book_reader(
         active_symbols.clone(),
         active_tfs.clone(),
@@ -592,16 +644,23 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
     let mut markets_by_id: HashMap<String, MarketMeta> = HashMap::new();
     let mut motion_by_key: HashMap<String, MotionState> = HashMap::new();
     let mut prob_smooth_by_round: HashMap<String, ProbSmoothState> = HashMap::new();
-    let mut emitted_rounds: HashSet<String> = HashSet::new();
+    let mut emitted_rounds: HashMap<String, i64> = HashMap::new();
     let mut round_buffers: HashMap<String, RoundBuffer> = HashMap::new();
     let mut target_cache: HashMap<String, (i64, f64)> = HashMap::new();
     let mut target_retry_after_ms: HashMap<String, i64> = HashMap::new();
     let mut target_anchor_by_round: HashMap<String, f64> = HashMap::new();
+    let active_symbols_set: HashSet<String> = active_symbols
+        .iter()
+        .map(|v| v.to_ascii_uppercase())
+        .collect();
 
     let mut ingest_seq: u64 = 0;
 
     let mut ticker = tokio::time::interval(Duration::from_millis(sample_period_ms as u64));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut next_housekeeping_ms = Utc::now()
+        .timestamp_millis()
+        .saturating_add(RECORDER_HOUSEKEEPING_INTERVAL_MS);
 
     loop {
         tokio::select! {
@@ -695,33 +754,48 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         }
                         let retry_after = target_retry_after_ms.get(&cache_key).copied().unwrap_or(0);
                         if target_price.is_none() && now_ms >= retry_after {
-                            // 先尝试最后一道防线：Chainlink 官方离线取值 (同步、快)
-                            if let Some(v) = pick_official_chainlink_target(
-                                chainlink,
-                                market.start_ts_ms,
-                                &market.timeframe,
-                            ) {
-                                target_cache.insert(cache_key.clone(), (now_ms, v));
-                                target_retry_after_ms.remove(&cache_key);
-                                target_price = Some(v);
-                                log_ingest(
-                                    &persist_tx,
-                                    "warn",
-                                    "target_price",
-                                    &format!(
-                                        "source=chainlink_official_fallback symbol={} tf={} start_ms={} target={}",
-                                        market.symbol, market.timeframe, market.start_ts_ms, v
-                                    ),
-                                );
+                            // Chainlink fallback is optional and currently disabled by default.
+                            if chainlink_enabled {
+                                if let Some(v) = pick_official_chainlink_target(
+                                    chainlink,
+                                    market.start_ts_ms,
+                                    &market.timeframe,
+                                ) {
+                                    target_cache.insert(cache_key.clone(), (now_ms, v));
+                                    target_retry_after_ms.remove(&cache_key);
+                                    target_price = Some(v);
+                                    log_ingest(
+                                        &persist_tx,
+                                        "warn",
+                                        "target_price",
+                                        &format!(
+                                            "source=chainlink_official_fallback symbol={} tf={} start_ms={} target={}",
+                                            market.symbol, market.timeframe, market.start_ts_ms, v
+                                        ),
+                                    );
+                                } else {
+                                    // Offload target fetch to background worker to keep ticker non-blocking.
+                                    let _ = target_req_tx.send(TargetFetchReq {
+                                        cache_key: cache_key.clone(),
+                                        symbol: market.symbol.clone(),
+                                        timeframe: market.timeframe.clone(),
+                                        start_ts_ms: market.start_ts_ms,
+                                    });
+                                    // Rate-limit follow-up fetches for the same key.
+                                    target_retry_after_ms.insert(
+                                        cache_key,
+                                        now_ms.saturating_add(TARGET_RETRY_BACKOFF_MS),
+                                    );
+                                }
                             } else {
-                                // 发送到后台异步获取，防止阻塞 ticker
+                                // Offload target fetch to background worker to keep ticker non-blocking.
                                 let _ = target_req_tx.send(TargetFetchReq {
                                     cache_key: cache_key.clone(),
                                     symbol: market.symbol.clone(),
                                     timeframe: market.timeframe.clone(),
                                     start_ts_ms: market.start_ts_ms,
                                 });
-                                // 限制请求频率
+                                // Rate-limit follow-up fetches for the same key.
                                 target_retry_after_ms.insert(
                                     cache_key,
                                     now_ms.saturating_add(TARGET_RETRY_BACKOFF_MS),
@@ -872,7 +946,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         _ => (None, None),
                     };
 
-                    if emitted_rounds.contains(&round_id) {
+                    if emitted_rounds.contains_key(&round_id) {
                         continue;
                     }
 
@@ -930,8 +1004,8 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     round_buf.push_snapshot(row);
 
                     let remaining_ms = market.end_ts_ms.saturating_sub(now_ms);
-                    if remaining_ms <= 0 && !emitted_rounds.contains(&round_id) {
-                        emitted_rounds.insert(round_id.clone());
+                    if remaining_ms <= 0 && !emitted_rounds.contains_key(&round_id) {
+                        emitted_rounds.insert(round_id.clone(), now_ms);
                         if let Some(buffer) = round_buffers.remove(&round_id) {
                             target_anchor_by_round.remove(&round_id);
                             prob_smooth_by_round.remove(&round_id);
@@ -1028,7 +1102,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     .iter()
                     .filter_map(|(rid, buf)| {
                         if now_ms > buf.end_ts_ms.saturating_add(MARKET_STALE_GUARD_MS)
-                            && !emitted_rounds.contains(rid)
+                            && !emitted_rounds.contains_key(rid)
                         {
                             Some(rid.clone())
                         } else {
@@ -1037,7 +1111,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     })
                     .collect();
                 for rid in stale_round_ids {
-                    emitted_rounds.insert(rid.clone());
+                    emitted_rounds.insert(rid.clone(), now_ms);
                     if let Some(buffer) = round_buffers.remove(&rid) {
                         target_anchor_by_round.remove(&rid);
                         prob_smooth_by_round.remove(&rid);
@@ -1111,6 +1185,46 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             "stale round committed with quality warning"
                         );
                     }
+                }
+
+                if now_ms >= next_housekeeping_ms {
+                    next_housekeeping_ms = now_ms.saturating_add(RECORDER_HOUSEKEEPING_INTERVAL_MS);
+
+                    let active_market_ids: HashSet<&str> =
+                        markets_by_id.keys().map(String::as_str).collect();
+                    book_by_market.retain(|market_id, _| active_market_ids.contains(market_id.as_str()));
+                    quote_cache_by_market
+                        .retain(|market_id, _| active_market_ids.contains(market_id.as_str()));
+
+                    tokyo_by_symbol.retain(|symbol, row| {
+                        active_symbols_set.contains(symbol.as_str())
+                            && now_ms.saturating_sub(row.ts_ireland_recv_ms)
+                                <= RECORDER_STALE_STATE_RETENTION_MS
+                    });
+                    chainlink_by_symbol.retain(|symbol, row| {
+                        active_symbols_set.contains(symbol.as_str())
+                            && now_ms.saturating_sub(row.ts_ireland_recv_ms)
+                                <= RECORDER_STALE_STATE_RETENTION_MS
+                    });
+                    motion_by_key.retain(|key, state| {
+                        let symbol = key.split('|').next().unwrap_or_default();
+                        active_symbols_set.contains(symbol)
+                            && now_ms.saturating_sub(state.ts_ms) <= RECORDER_STALE_STATE_RETENTION_MS
+                    });
+
+                    target_cache.retain(|_, (cached_at, _)| {
+                        now_ms.saturating_sub(*cached_at) <= TARGET_CACHE_RETENTION_MS
+                    });
+                    target_retry_after_ms.retain(|_, retry_after_ms| {
+                        now_ms <= retry_after_ms.saturating_add(TARGET_RETRY_RETENTION_MS)
+                    });
+                    target_anchor_by_round.retain(|round_id, _| {
+                        round_meta_is_fresh(round_id, now_ms, ROUND_META_RETENTION_MS)
+                    });
+                    emitted_rounds.retain(|round_id, closed_at_ms| {
+                        now_ms.saturating_sub(*closed_at_ms) <= EMITTED_ROUND_RETENTION_MS
+                            && round_meta_is_fresh(round_id, now_ms, ROUND_META_RETENTION_MS)
+                    });
                 }
             }
         }
@@ -1246,6 +1360,8 @@ fn spawn_book_reader(
     persist: mpsc::UnboundedSender<PersistEvent>,
 ) {
     tokio::spawn(async move {
+        let mut retry_wait = Duration::from_secs(1);
+        let max_retry_wait = Duration::from_secs(20);
         loop {
             let feed = PolymarketFeed::new_with_universe(
                 Duration::from_millis(50),
@@ -1263,10 +1379,12 @@ fn spawn_book_reader(
                         "polymarket_book",
                         &format!("stream start failed: {err}"),
                     );
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    tokio::time::sleep(retry_wait).await;
+                    retry_wait = std::cmp::min(max_retry_wait, retry_wait.saturating_mul(2));
                     continue;
                 }
             };
+            let mut saw_book = false;
             while let Some(next) = stream.next().await {
                 let book = match next {
                     Ok(v) => v,
@@ -1280,11 +1398,27 @@ fn spawn_book_reader(
                         break;
                     }
                 };
+                if !saw_book {
+                    saw_book = true;
+                    retry_wait = Duration::from_secs(1);
+                }
                 if tx.send(book).is_err() {
                     return;
                 }
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            if !saw_book {
+                log_ingest(
+                    &persist,
+                    "warn",
+                    "polymarket_book",
+                    &format!(
+                        "stream ended without data; backing off {}ms",
+                        retry_wait.as_millis()
+                    ),
+                );
+            }
+            tokio::time::sleep(retry_wait).await;
+            retry_wait = std::cmp::min(max_retry_wait, retry_wait.saturating_mul(2));
         }
     });
 }
@@ -1297,6 +1431,9 @@ fn spawn_market_discovery_reader(
     persist: mpsc::UnboundedSender<PersistEvent>,
 ) {
     tokio::spawn(async move {
+        let base_refresh = refresh_sec.max(10);
+        let mut current_wait = base_refresh;
+        let max_wait = base_refresh.saturating_mul(8).min(600);
         loop {
             match discover_markets(&symbols, &timeframes).await {
                 Ok(markets) => {
@@ -1309,6 +1446,7 @@ fn spawn_market_discovery_reader(
                     if tx.send(markets).is_err() {
                         return;
                     }
+                    current_wait = base_refresh;
                 }
                 Err(err) => {
                     log_ingest(
@@ -1317,9 +1455,10 @@ fn spawn_market_discovery_reader(
                         "discovery",
                         &format!("discover failed: {err}"),
                     );
+                    current_wait = (current_wait.saturating_mul(2)).min(max_wait);
                 }
             }
-            tokio::time::sleep(Duration::from_secs(refresh_sec.max(1))).await;
+            tokio::time::sleep(Duration::from_secs(current_wait.max(1))).await;
         }
     });
 }

@@ -148,26 +148,47 @@ impl MarketDiscovery {
     }
 
     pub async fn discover(&self) -> Result<Vec<MarketDescriptor>> {
+        fn env_usize(key: &str, default: usize, min: usize, max: usize) -> usize {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(default)
+                .clamp(min, max)
+        }
+        fn env_i64(key: &str, default: i64, min: i64, max: i64) -> i64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .unwrap_or(default)
+                .clamp(min, max)
+        }
+
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::<String>::new();
         let now_ms = Utc::now().timestamp_millis();
 
-        // Prefer time-window ordering first to avoid missing low-volume but currently tradable
-        // crypto windows (e.g. SOL 15m), then do a volume sweep as fallback enrichment.
-        let plans = [
-            ScanPlan {
-                order: "endDate",
-                ascending: "true",
-                limit: 200,
-                max_pages: 16,
-            },
-            ScanPlan {
+        // Keep discovery query volume bounded by default to avoid Gamma rate-limits (429),
+        // while still allowing opt-in wider scans via env variables.
+        let enddate_limit = env_i64("POLYEDGE_DISCOVERY_ENDDATE_LIMIT", 200, 50, 1000);
+        let enddate_pages = env_usize("POLYEDGE_DISCOVERY_ENDDATE_MAX_PAGES", 20, 1, 64);
+        let volume_limit = env_i64("POLYEDGE_DISCOVERY_VOLUME_LIMIT", 600, 50, 1000);
+        let volume_pages = env_usize("POLYEDGE_DISCOVERY_VOLUME_MAX_PAGES", 0, 0, 32);
+
+        let mut plans = Vec::with_capacity(2);
+        plans.push(ScanPlan {
+            order: "endDate",
+            ascending: "true",
+            limit: enddate_limit,
+            max_pages: enddate_pages,
+        });
+        if volume_pages > 0 {
+            plans.push(ScanPlan {
                 order: "volume",
                 ascending: "false",
-                limit: 1000,
-                max_pages: 4,
-            },
-        ];
+                limit: volume_limit,
+                max_pages: volume_pages,
+            });
+        }
 
         for plan in plans {
             for page_idx in 0..plan.max_pages {
@@ -243,7 +264,11 @@ impl MarketDiscovery {
                     {
                         continue;
                     }
-                    let timeframe = classify_timeframe(&text);
+                    let timeframe = classify_timeframe_with_bounds(
+                        &text,
+                        market.event_start_time.as_deref(),
+                        market.end_date.as_deref(),
+                    );
                     if !self.cfg.timeframes.is_empty() {
                         let Some(tf) = timeframe else {
                             continue;
@@ -320,7 +345,9 @@ fn collapse_to_one_market_per_template(
         let key = format!(
             "{}|{}|{}",
             m.symbol,
-            m.market_type.clone().unwrap_or_else(|| "unknown".to_string()),
+            m.market_type
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
             m.timeframe.clone().unwrap_or_else(|| "unknown".to_string())
         );
         let end_ms = parse_end_date_ms(m.end_date.as_deref()).unwrap_or(i64::MAX / 4);
@@ -438,6 +465,40 @@ fn classify_timeframe(text: &str) -> Option<&'static str> {
     None
 }
 
+fn classify_timeframe_with_bounds(
+    text: &str,
+    event_start_time: Option<&str>,
+    end_date: Option<&str>,
+) -> Option<&'static str> {
+    if let Some(tf) = classify_timeframe(text) {
+        return Some(tf);
+    }
+    infer_timeframe_from_bounds(event_start_time, end_date)
+}
+
+fn infer_timeframe_from_bounds(
+    event_start_time: Option<&str>,
+    end_date: Option<&str>,
+) -> Option<&'static str> {
+    let start_ms = parse_end_date_ms(event_start_time)?;
+    let end_ms = parse_end_date_ms(end_date)?;
+    let span_ms = end_ms.saturating_sub(start_ms).abs();
+
+    if (3 * 60 * 1_000..=7 * 60 * 1_000).contains(&span_ms) {
+        return Some("5m");
+    }
+    if (10 * 60 * 1_000..=20 * 60 * 1_000).contains(&span_ms) {
+        return Some("15m");
+    }
+    if (45 * 60 * 1_000..=90 * 60 * 1_000).contains(&span_ms) {
+        return Some("1h");
+    }
+    if (18 * 60 * 60 * 1_000..=36 * 60 * 60 * 1_000).contains(&span_ms) {
+        return Some("1d");
+    }
+    None
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GammaMarket {
@@ -541,6 +602,22 @@ mod tests {
         );
         assert_eq!(classify_timeframe("SOLANA UP OR DOWN - 1 HOUR"), Some("1h"));
         assert_eq!(classify_timeframe("XRP UP OR DOWN - 1 DAY"), Some("1d"));
+        assert_eq!(
+            classify_timeframe_with_bounds(
+                "BITCOIN UP OR DOWN",
+                Some("2026-02-28T09:35:00Z"),
+                Some("2026-02-28T09:40:00Z")
+            ),
+            Some("5m")
+        );
+        assert_eq!(
+            classify_timeframe_with_bounds(
+                "BITCOIN UP OR DOWN",
+                Some("2026-02-28T09:30:00Z"),
+                Some("2026-02-28T09:45:00Z")
+            ),
+            Some("15m")
+        );
     }
 
     #[test]

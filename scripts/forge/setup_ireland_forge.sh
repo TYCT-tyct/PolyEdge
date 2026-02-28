@@ -9,6 +9,8 @@ RUNTIME_MARKETS="${RUNTIME_MARKETS:-5m}"
 STRATEGY_MARKETS="${STRATEGY_MARKETS:-5m,15m}"
 STRATEGY_BASE_PROFILE="${STRATEGY_BASE_PROFILE:-fev1_cand_growth_mix_2026_02_28}"
 RUNTIME_LOOKBACK_MINUTES="${RUNTIME_LOOKBACK_MINUTES:-1440}"
+DISCOVERY_REFRESH_SEC="${DISCOVERY_REFRESH_SEC:-120}"
+MARKET_WS_REFRESH_SEC="${MARKET_WS_REFRESH_SEC:-180}"
 
 echo "[forge-ireland] repo=$REPO_DIR data_root=$DATA_ROOT user=$USER_NAME"
 
@@ -65,7 +67,14 @@ Type=simple
 User=$USER_NAME
 WorkingDirectory=$REPO_DIR
 Environment=RUST_LOG=info,polyedge_forge=debug
-ExecStart=$REPO_DIR/target/release/polyedge_forge ireland-recorder --data-root $DATA_ROOT --udp-bind 0.0.0.0:9801 --sample-ms 100 --supported-symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT --active-symbols BTCUSDT --active-timeframes $ACTIVE_TIMEFRAMES --discovery-refresh-sec 5 --clickhouse-url http://127.0.0.1:8123 --clickhouse-database polyedge_forge --clickhouse-snapshot-table snapshot_100ms --clickhouse-round-table rounds --redis-url redis://127.0.0.1:6379/0 --redis-prefix forge --redis-ttl-sec 7200 --sink-batch-size 200 --sink-flush-ms 1000 --sink-queue-cap 20000 --disable-api --dashboard-dist /home/ubuntu/PolyEdge/heatmap_dashboard/dist
+Environment=POLYEDGE_MARKET_REFRESH_SEC=$MARKET_WS_REFRESH_SEC
+Environment=POLYEDGE_TARGET_MARKET_CACHE_FILE=/data/polyedge-forge/cache/target_market_cache.json
+Environment=POLYEDGE_DISCOVERY_ENDDATE_MAX_PAGES=6
+Environment=POLYEDGE_DISCOVERY_VOLUME_MAX_PAGES=0
+Environment=POLYEDGE_DISCOVERY_MAX_PAST_MS=300000
+Environment=FORGE_CHAINLINK_ENABLED=false
+Environment=POLYEDGE_ENABLE_CHAINLINK_ANCHOR=false
+ExecStart=$REPO_DIR/target/release/polyedge_forge ireland-recorder --data-root $DATA_ROOT --udp-bind 0.0.0.0:9801 --sample-ms 100 --supported-symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT --active-symbols BTCUSDT --active-timeframes $ACTIVE_TIMEFRAMES --discovery-refresh-sec $DISCOVERY_REFRESH_SEC --clickhouse-url http://127.0.0.1:8123 --clickhouse-database polyedge_forge --clickhouse-snapshot-table snapshot_100ms --clickhouse-round-table rounds --redis-url redis://127.0.0.1:6379/0 --redis-prefix forge --redis-ttl-sec 7200 --sink-batch-size 200 --sink-flush-ms 1000 --sink-queue-cap 20000 --disable-api --dashboard-dist /home/ubuntu/PolyEdge/heatmap_dashboard/dist
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -125,8 +134,14 @@ set -euo pipefail
 RECORDER_SERVICE="polyedge-forge-ireland-recorder.service"
 API_SERVICE="polyedge-forge-ireland-api.service"
 API_URL="http://127.0.0.1:9810/health/live"
-MAX_STALE_MS=30000
 MAX_API_RSS_MB=4500
+API_MAX_TIME_SEC="${HEALTHCHECK_API_MAX_TIME_SEC:-6}"
+API_FAIL_THRESHOLD="${HEALTHCHECK_API_FAIL_THRESHOLD:-3}"
+API_FAIL_COUNT_FILE="/run/polyedge_forge_api_health_fail.count"
+STALE_MAX_AGE_MS="${HEALTHCHECK_STALE_MAX_AGE_MS:-900000}"
+STALE_FAIL_THRESHOLD="${HEALTHCHECK_STALE_FAIL_THRESHOLD:-10}"
+STALE_FAIL_COUNT_FILE="/run/polyedge_forge_stale_fail.count"
+STALE_RESTART_ENABLED="${HEALTHCHECK_STALE_RESTART_ENABLED:-false}"
 
 if ! systemctl is-active --quiet "$RECORDER_SERVICE"; then
   systemctl restart "$RECORDER_SERVICE" || true
@@ -136,10 +151,23 @@ if ! systemctl is-active --quiet "$API_SERVICE"; then
   exit 0
 fi
 
-if ! curl -fsS --max-time 2 "$API_URL" >/dev/null; then
-  systemctl restart "$API_SERVICE" || true
+if ! curl -fsS --max-time "$API_MAX_TIME_SEC" "$API_URL" >/dev/null; then
+  fail_count=0
+  if [[ -r "$API_FAIL_COUNT_FILE" ]]; then
+    fail_count="$(cat "$API_FAIL_COUNT_FILE" 2>/dev/null || echo 0)"
+  fi
+  if ! [[ "$fail_count" =~ ^[0-9]+$ ]]; then
+    fail_count=0
+  fi
+  fail_count=$((fail_count + 1))
+  echo "$fail_count" > "$API_FAIL_COUNT_FILE"
+  if [[ "$fail_count" -ge "$API_FAIL_THRESHOLD" ]]; then
+    systemctl restart "$API_SERVICE" || true
+    echo 0 > "$API_FAIL_COUNT_FILE"
+  fi
   exit 0
 fi
+echo 0 > "$API_FAIL_COUNT_FILE"
 
 api_pid="$(systemctl show -p MainPID --value "$API_SERVICE" 2>/dev/null || echo 0)"
 if [[ "${api_pid}" =~ ^[0-9]+$ ]] && [[ "${api_pid}" -gt 1 ]] && [[ -r "/proc/${api_pid}/status" ]]; then
@@ -160,9 +188,25 @@ if [[ -z "${latest_ms}" || "${latest_ms}" == "0" ]]; then
 fi
 
 now_ms="$(date +%s%3N)"
-if [[ $((now_ms - latest_ms)) -gt ${MAX_STALE_MS} ]]; then
-  systemctl restart "$RECORDER_SERVICE" || true
+if [[ $((now_ms - latest_ms)) -gt ${STALE_MAX_AGE_MS} ]]; then
+  stale_count=0
+  if [[ -r "$STALE_FAIL_COUNT_FILE" ]]; then
+    stale_count="$(cat "$STALE_FAIL_COUNT_FILE" 2>/dev/null || echo 0)"
+  fi
+  if ! [[ "$stale_count" =~ ^[0-9]+$ ]]; then
+    stale_count=0
+  fi
+  stale_count=$((stale_count + 1))
+  echo "$stale_count" > "$STALE_FAIL_COUNT_FILE"
+  if [[ "$stale_count" -ge "$STALE_FAIL_THRESHOLD" ]]; then
+    if [[ "${STALE_RESTART_ENABLED,,}" == "1" || "${STALE_RESTART_ENABLED,,}" == "true" || "${STALE_RESTART_ENABLED,,}" == "yes" || "${STALE_RESTART_ENABLED,,}" == "on" ]]; then
+      systemctl restart "$RECORDER_SERVICE" || true
+    fi
+    echo 0 > "$STALE_FAIL_COUNT_FILE"
+  fi
+  exit 0
 fi
+echo 0 > "$STALE_FAIL_COUNT_FILE"
 HC
 sudo chmod +x /usr/local/bin/polyedge_forge_healthcheck.sh
 
