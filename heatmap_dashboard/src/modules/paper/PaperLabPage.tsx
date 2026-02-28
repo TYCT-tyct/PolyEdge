@@ -12,6 +12,7 @@ type StrategyPaperSource = "replay" | "live";
 const PAPER_AUTOTUNE_DISABLED = true;
 
 const ET_TIMEZONE = "America/New_York";
+const CN_TIMEZONE = "Asia/Shanghai";
 const STRATEGY_POLL_MIN_MS = 3_500;
 const STRATEGY_POLL_MAX_MS = 20_000;
 const AUTOTUNE_POLL_MIN_MS = 6_000;
@@ -52,8 +53,8 @@ function readStrategyUiPrefs(): Partial<StrategyUiPrefs> {
         ? (parsed.marketType as MarketType)
         : undefined;
     const source =
-      parsed.source === "replay" || parsed.source === "live"
-        ? (parsed.source as StrategyPaperSource)
+      parsed.source === "replay"
+        ? ("replay" as StrategyPaperSource)
         : undefined;
     const useAutotune =
       typeof parsed.useAutotune === "boolean" ? parsed.useAutotune : undefined;
@@ -100,7 +101,10 @@ function formatTime(ts: number | null | undefined, timeMode: TimeMode): string {
       timeZone: ET_TIMEZONE
     }).format(new Date(ts));
   }
-  return new Intl.DateTimeFormat("zh-CN", opts).format(new Date(ts));
+  return new Intl.DateTimeFormat("zh-CN", {
+    ...opts,
+    timeZone: CN_TIMEZONE
+  }).format(new Date(ts));
 }
 
 function formatClockTime(ts: number | null | undefined, timeMode: TimeMode): string {
@@ -119,7 +123,10 @@ function formatClockTime(ts: number | null | undefined, timeMode: TimeMode): str
       timeZone: ET_TIMEZONE
     }).format(new Date(ts));
   }
-  return new Intl.DateTimeFormat("zh-CN", opts).format(new Date(ts));
+  return new Intl.DateTimeFormat("zh-CN", {
+    ...opts,
+    timeZone: CN_TIMEZONE
+  }).format(new Date(ts));
 }
 
 function shortRoundId(roundId: string | null | undefined): string {
@@ -192,9 +199,7 @@ export function PaperLabPage({
   const [strategyMarketType, setStrategyMarketType] = useState<MarketType>(
     prefs.marketType ?? "5m"
   );
-  const [strategySource, setStrategySource] = useState<StrategyPaperSource>(
-    prefs.source ?? "replay"
-  );
+  const [strategySource] = useState<StrategyPaperSource>("replay");
   const [strategyUseAutotune] = useState<boolean>(false);
   const [strategyAutotuneLatest, setStrategyAutotuneLatest] = useState<Record<string, unknown> | null>(null);
   const [strategyAutotuneHistory, setStrategyAutotuneHistory] = useState<Array<Record<string, unknown>>>([]);
@@ -440,6 +445,15 @@ export function PaperLabPage({
     strategyPaper?.source === "replay" &&
     typeof strategyPaper?.source_fallback_error === "string" &&
     strategyPaper.source_fallback_error.length > 0;
+  const lastTrade = strategyPaper?.trades?.length
+    ? strategyPaper.trades[strategyPaper.trades.length - 1]
+    : null;
+  const lastTradeTs =
+    finite(lastTrade?.exit_ts_ms) ??
+    finite(lastTrade?.entry_ts_ms);
+  const nowTs = finite(current?.timestamp_ms) ?? Date.now();
+  const idleMinutes =
+    lastTradeTs != null ? Math.max(0, (nowTs - lastTradeTs) / 60_000) : null;
 
   return (
     <section className="panel">
@@ -522,10 +536,10 @@ export function PaperLabPage({
           </button>
         </div>
         <div className="btn-group">
-          <button className={strategySource === "replay" ? "active" : ""} onClick={() => setStrategySource("replay")}>
+          <button className="active" disabled>
             Paper模拟
           </button>
-          <button className={strategySource === "live" ? "active" : ""} onClick={() => setStrategySource("live")}>
+          <button disabled>
             真实交易
           </button>
         </div>
@@ -647,6 +661,10 @@ export function PaperLabPage({
       <footer className="status-row">
         <span>source: {strategyPaper?.source ?? "--"}</span>
         <span>market: {strategyMarketType}</span>
+        <span>
+          最近成交: {formatTime(lastTradeTs, timeMode)}
+          {idleMinutes != null ? ` (${idleMinutes.toFixed(1)}m 前)` : ""}
+        </span>
         <span>
           runtime:
           {` ${

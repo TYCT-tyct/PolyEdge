@@ -1,6 +1,9 @@
 use super::*;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use tokio::sync::OwnedSemaphorePermit;
 
 #[derive(Debug, Clone)]
@@ -52,6 +55,71 @@ const STRATEGY_PROFILE_HI_FREQ: &str = "fev1_manual_hi_freq_2026_02_27";
 const STRATEGY_PROFILE_HI_WIN: &str = "fev1_manual_hi_win_2026_02_27";
 const STRATEGY_PROFILE_BALANCED: &str = "fev1_manual_balanced_2026_02_28";
 const STRATEGY_PROFILE_CAND_GROWTH_MIX: &str = "fev1_cand_growth_mix_2026_02_28";
+
+#[derive(Clone)]
+struct StrategySampleCacheEntry {
+    created_at: Instant,
+    samples: Arc<Vec<StrategySample>>,
+}
+
+#[derive(Clone)]
+struct StrategyRuntimeStreamState {
+    updated_at: Instant,
+    last_ts_ms: i64,
+    samples: Arc<Vec<StrategySample>>,
+}
+
+fn strategy_sample_cache_enabled() -> bool {
+    strategy_env_bool("FORGE_STRATEGY_SAMPLE_CACHE_ENABLED", true)
+}
+
+fn strategy_sample_cache_ttl_ms() -> u64 {
+    strategy_env_u32("FORGE_STRATEGY_SAMPLE_CACHE_TTL_MS", 300, 0, 5_000) as u64
+}
+
+fn strategy_sample_cache_max_entries() -> usize {
+    strategy_env_u32("FORGE_STRATEGY_SAMPLE_CACHE_MAX_ENTRIES", 24, 4, 256) as usize
+}
+
+fn strategy_sample_cache() -> &'static tokio::sync::RwLock<HashMap<String, StrategySampleCacheEntry>>
+{
+    static CACHE: OnceLock<tokio::sync::RwLock<HashMap<String, StrategySampleCacheEntry>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
+}
+
+fn strategy_sample_cache_key(
+    market_type: &str,
+    full_history: bool,
+    lookback_minutes: u32,
+    max_points: u32,
+) -> String {
+    format!("{market_type}|{full_history}|{lookback_minutes}|{max_points}")
+}
+
+fn strategy_runtime_stream_enabled() -> bool {
+    strategy_env_bool("FORGE_STRATEGY_RUNTIME_STREAM_ENABLED", true)
+}
+
+fn strategy_runtime_stream_reload_sec() -> u64 {
+    strategy_env_u32("FORGE_STRATEGY_RUNTIME_STREAM_RELOAD_SEC", 180, 10, 3_600) as u64
+}
+
+fn strategy_runtime_stream_delta_limit() -> u32 {
+    strategy_env_u32(
+        "FORGE_STRATEGY_RUNTIME_STREAM_DELTA_LIMIT",
+        6_000,
+        200,
+        50_000,
+    )
+}
+
+fn strategy_runtime_stream_cache(
+) -> &'static tokio::sync::RwLock<HashMap<String, StrategyRuntimeStreamState>> {
+    static CACHE: OnceLock<tokio::sync::RwLock<HashMap<String, StrategyRuntimeStreamState>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
+}
 
 fn strategy_enabled_markets() -> &'static Vec<String> {
     static ENABLED: OnceLock<Vec<String>> = OnceLock::new();
@@ -1037,14 +1105,27 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         ));
     }
 
-    let samples = load_strategy_samples(
-        state,
-        market_type,
-        full_history,
-        lookback_minutes,
-        max_points,
-    )
-    .await?;
+    let (samples, sample_source_mode, sample_resolution_ms) = if !full_history {
+        (
+            load_strategy_samples_runtime_stream(state, market_type, lookback_minutes, max_points)
+                .await?,
+            "runtime_stream_100ms",
+            100,
+        )
+    } else {
+        (
+            load_strategy_samples(
+                state,
+                market_type,
+                full_history,
+                lookback_minutes,
+                max_points,
+            )
+            .await?,
+            "replay_bucket_1s",
+            1000,
+        )
+    };
     if samples.len() < 20 {
         return Err(ApiError::bad_request(
             "not enough samples for live execution",
@@ -1476,7 +1557,11 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                                 submit_reason,
                                 submitted_ts_ms: ts_ms,
                                 cancel_after_ms: if is_exit_like {
-                                    if emergency_exit { 650 } else { 900 }
+                                    if emergency_exit {
+                                        650
+                                    } else {
+                                        900
+                                    }
                                 } else {
                                     1500
                                 },
@@ -1747,6 +1832,8 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         "runtime_mode": if live_drain_only { "drain" } else { "normal" },
         "market_type": market_type,
         "lookback_minutes": lookback_minutes,
+        "sample_source_mode": sample_source_mode,
+        "sample_resolution_ms": sample_resolution_ms,
         "full_history": full_history,
         "samples": samples.len(),
         "config_source": config_source,
@@ -2030,7 +2117,20 @@ pub(super) async fn load_strategy_samples(
     full_history: bool,
     lookback_minutes: u32,
     max_points: u32,
-) -> Result<Vec<StrategySample>, ApiError> {
+) -> Result<Arc<Vec<StrategySample>>, ApiError> {
+    let cache_enabled = strategy_sample_cache_enabled() && !full_history;
+    let cache_ttl = Duration::from_millis(strategy_sample_cache_ttl_ms());
+    let cache_key =
+        strategy_sample_cache_key(market_type, full_history, lookback_minutes, max_points);
+    if cache_enabled && !cache_ttl.is_zero() {
+        let cache = strategy_sample_cache().read().await;
+        if let Some(entry) = cache.get(&cache_key) {
+            if entry.created_at.elapsed() <= cache_ttl {
+                return Ok(entry.samples.clone());
+            }
+        }
+    }
+
     let Some(ch_url) = state.ch_url.as_deref() else {
         return Err(ApiError::internal("clickhouse not configured"));
     };
@@ -2043,35 +2143,206 @@ pub(super) async fn load_strategy_samples(
         format!("AND ts_ireland_sample_ms >= {from_ms}")
     };
     let q = format!(
-        "SELECT
-            intDiv(ts_ireland_sample_ms, 1000) * 1000 AS ts_ms,
-            argMax(round_id, ts_ireland_sample_ms) AS round_id,
-            argMax(remaining_ms, ts_ireland_sample_ms) AS remaining_ms,
-            argMax(mid_yes, ts_ireland_sample_ms) AS mid_yes,
-            argMax(mid_yes_smooth, ts_ireland_sample_ms) AS mid_yes_smooth,
-            argMax(mid_no, ts_ireland_sample_ms) AS mid_no,
-            argMax(mid_no_smooth, ts_ireland_sample_ms) AS mid_no_smooth,
-            argMax(bid_yes, ts_ireland_sample_ms) AS bid_yes,
-            argMax(ask_yes, ts_ireland_sample_ms) AS ask_yes,
-            argMax(bid_no, ts_ireland_sample_ms) AS bid_no,
-            argMax(ask_no, ts_ireland_sample_ms) AS ask_no,
-            argMax(delta_pct, ts_ireland_sample_ms) AS delta_pct,
-            argMax(delta_pct_smooth, ts_ireland_sample_ms) AS delta_pct_smooth,
-            argMax(velocity_bps_per_sec, ts_ireland_sample_ms) AS velocity_bps_per_sec,
-            argMax(acceleration, ts_ireland_sample_ms) AS acceleration,
-            argMax(binance_price, ts_ireland_sample_ms) AS binance_price,
-            argMax(target_price, ts_ireland_sample_ms) AS target_price
-        FROM polyedge_forge.snapshot_100ms
-        WHERE symbol='BTCUSDT'
-          AND timeframe='{market_type}'
-          {ts_filter}
-        GROUP BY ts_ms
-        ORDER BY ts_ms ASC
-        LIMIT {max_points}
-        FORMAT JSON"
+        "SELECT *
+         FROM (
+            SELECT
+                intDiv(ts_ireland_sample_ms, 1000) * 1000 AS ts_ms,
+                argMax(round_id, ts_ireland_sample_ms) AS round_id,
+                argMax(remaining_ms, ts_ireland_sample_ms) AS remaining_ms,
+                argMax(mid_yes, ts_ireland_sample_ms) AS mid_yes,
+                argMax(mid_yes_smooth, ts_ireland_sample_ms) AS mid_yes_smooth,
+                argMax(mid_no, ts_ireland_sample_ms) AS mid_no,
+                argMax(mid_no_smooth, ts_ireland_sample_ms) AS mid_no_smooth,
+                argMax(bid_yes, ts_ireland_sample_ms) AS bid_yes,
+                argMax(ask_yes, ts_ireland_sample_ms) AS ask_yes,
+                argMax(bid_no, ts_ireland_sample_ms) AS bid_no,
+                argMax(ask_no, ts_ireland_sample_ms) AS ask_no,
+                argMax(delta_pct, ts_ireland_sample_ms) AS delta_pct,
+                argMax(delta_pct_smooth, ts_ireland_sample_ms) AS delta_pct_smooth,
+                argMax(velocity_bps_per_sec, ts_ireland_sample_ms) AS velocity_bps_per_sec,
+                argMax(acceleration, ts_ireland_sample_ms) AS acceleration,
+                argMax(binance_price, ts_ireland_sample_ms) AS binance_price,
+                argMax(target_price, ts_ireland_sample_ms) AS target_price
+            FROM polyedge_forge.snapshot_100ms
+            WHERE symbol='BTCUSDT'
+              AND timeframe='{market_type}'
+              {ts_filter}
+            GROUP BY ts_ms
+            ORDER BY ts_ms DESC
+            LIMIT {max_points}
+         )
+         ORDER BY ts_ms ASC
+         FORMAT JSON"
     );
     let rows = rows_from_json(query_clickhouse_json(ch_url, &q).await?);
-    Ok(parse_strategy_rows(rows))
+    let samples = Arc::new(parse_strategy_rows(rows));
+
+    if cache_enabled {
+        let mut cache = strategy_sample_cache().write().await;
+        let now = Instant::now();
+        cache.retain(|_, v| now.duration_since(v.created_at) <= cache_ttl.saturating_mul(3));
+        let max_entries = strategy_sample_cache_max_entries();
+        if cache.len() >= max_entries {
+            let mut oldest: Vec<(String, Instant)> = cache
+                .iter()
+                .map(|(k, v)| (k.clone(), v.created_at))
+                .collect();
+            oldest.sort_by_key(|(_, ts)| *ts);
+            let remove_n = cache.len().saturating_sub(max_entries.saturating_sub(1));
+            for (k, _) in oldest.into_iter().take(remove_n) {
+                cache.remove(&k);
+            }
+        }
+        cache.insert(
+            cache_key,
+            StrategySampleCacheEntry {
+                created_at: now,
+                samples: samples.clone(),
+            },
+        );
+    }
+
+    Ok(samples)
+}
+
+pub(super) async fn load_strategy_samples_runtime_stream(
+    state: &ApiState,
+    market_type: &str,
+    lookback_minutes: u32,
+    max_points: u32,
+) -> Result<Arc<Vec<StrategySample>>, ApiError> {
+    if !strategy_runtime_stream_enabled() {
+        return load_strategy_samples(state, market_type, false, lookback_minutes, max_points)
+            .await;
+    }
+    let Some(ch_url) = state.ch_url.as_deref() else {
+        return Err(ApiError::internal("clickhouse not configured"));
+    };
+
+    let now_ms = Utc::now().timestamp_millis();
+    let from_ms = now_ms.saturating_sub(i64::from(lookback_minutes) * 60_000);
+    let key = format!("{market_type}|{lookback_minutes}|{max_points}");
+    let reload_after = Duration::from_secs(strategy_runtime_stream_reload_sec());
+    let delta_limit = strategy_runtime_stream_delta_limit();
+
+    let cached = {
+        let cache = strategy_runtime_stream_cache().read().await;
+        cache.get(&key).cloned()
+    };
+
+    let bootstrap = cached
+        .as_ref()
+        .map(|v| v.updated_at.elapsed() > reload_after)
+        .unwrap_or(true);
+
+    if bootstrap {
+        let q = format!(
+            "SELECT *
+             FROM (
+                SELECT
+                    ts_ireland_sample_ms AS ts_ms,
+                    round_id,
+                    remaining_ms,
+                    mid_yes,
+                    mid_yes_smooth,
+                    mid_no,
+                    mid_no_smooth,
+                    bid_yes,
+                    ask_yes,
+                    bid_no,
+                    ask_no,
+                    delta_pct,
+                    delta_pct_smooth,
+                    velocity_bps_per_sec,
+                    acceleration,
+                    binance_price,
+                    target_price
+                FROM polyedge_forge.snapshot_100ms
+                WHERE symbol='BTCUSDT'
+                  AND timeframe='{market_type}'
+                  AND ts_ireland_sample_ms >= {from_ms}
+                ORDER BY ts_ireland_sample_ms DESC
+                LIMIT {max_points}
+             )
+             ORDER BY ts_ms ASC
+             FORMAT JSON"
+        );
+        let rows = rows_from_json(query_clickhouse_json(ch_url, &q).await?);
+        let samples = Arc::new(parse_strategy_rows(rows));
+        let last_ts_ms = samples.last().map(|v| v.ts_ms).unwrap_or(from_ms);
+        let mut cache = strategy_runtime_stream_cache().write().await;
+        cache.insert(
+            key,
+            StrategyRuntimeStreamState {
+                updated_at: Instant::now(),
+                last_ts_ms,
+                samples: samples.clone(),
+            },
+        );
+        return Ok(samples);
+    }
+
+    let state_before = cached.expect("cached checked above");
+    let q = format!(
+        "SELECT
+            ts_ireland_sample_ms AS ts_ms,
+            round_id,
+            remaining_ms,
+            mid_yes,
+            mid_yes_smooth,
+            mid_no,
+            mid_no_smooth,
+            bid_yes,
+            ask_yes,
+            bid_no,
+            ask_no,
+            delta_pct,
+            delta_pct_smooth,
+            velocity_bps_per_sec,
+            acceleration,
+            binance_price,
+            target_price
+         FROM polyedge_forge.snapshot_100ms
+         WHERE symbol='BTCUSDT'
+           AND timeframe='{market_type}'
+           AND ts_ireland_sample_ms > {}
+           AND ts_ireland_sample_ms >= {from_ms}
+         ORDER BY ts_ireland_sample_ms ASC
+         LIMIT {delta_limit}
+         FORMAT JSON",
+        state_before.last_ts_ms
+    );
+    let rows = rows_from_json(query_clickhouse_json(ch_url, &q).await?);
+    let delta = parse_strategy_rows(rows);
+
+    let mut merged = (*state_before.samples).clone();
+    let mut last_ts_ms = state_before.last_ts_ms;
+    for s in delta {
+        if s.ts_ms > last_ts_ms {
+            last_ts_ms = s.ts_ms;
+            merged.push(s);
+        }
+    }
+    merged.retain(|v| v.ts_ms >= from_ms);
+    let max_points_usize = max_points as usize;
+    if merged.len() > max_points_usize {
+        let remove_n = merged.len().saturating_sub(max_points_usize);
+        merged.drain(0..remove_n);
+    }
+    if let Some(v) = merged.last() {
+        last_ts_ms = v.ts_ms;
+    }
+    let samples = Arc::new(merged);
+    let mut cache = strategy_runtime_stream_cache().write().await;
+    cache.insert(
+        key,
+        StrategyRuntimeStreamState {
+            updated_at: Instant::now(),
+            last_ts_ms,
+            samples: samples.clone(),
+        },
+    );
+    Ok(samples)
 }
 
 pub(super) async fn strategy_paper(

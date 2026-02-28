@@ -35,6 +35,15 @@ pub(super) fn is_live_snapshot_fresh(snapshot: &Value, market_type: &str, now_ms
     true
 }
 
+pub(super) fn is_live_snapshot_recent(snapshot: &Value, now_ms: i64) -> bool {
+    let ts_ms = snapshot
+        .get("ts_ireland_sample_ms")
+        .or_else(|| snapshot.get("timestamp_ms"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    ts_ms > 0 && now_ms.saturating_sub(ts_ms) <= LIVE_SNAPSHOT_FALLBACK_MAX_AGE_MS
+}
+
 pub(super) fn snapshot_remaining_ms(snapshot: &Value) -> i64 {
     snapshot
         .get("remaining_ms")

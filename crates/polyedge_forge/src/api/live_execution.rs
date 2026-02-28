@@ -1569,7 +1569,8 @@ pub(super) async fn handle_pending_timeouts(state: &ApiState, gateway_cfg: &Live
                                         pending.tif = "FAK".to_string();
                                         pending.style = "taker".to_string();
                                         pending.submitted_ts_ms = now_ms;
-                                        pending.cancel_after_ms = if emergency_exit { 700 } else { 1500 };
+                                        pending.cancel_after_ms =
+                                            if emergency_exit { 700 } else { 1500 };
                                         state.upsert_pending_order(pending).await;
                                         state
                                             .append_live_event(
@@ -2429,7 +2430,8 @@ pub(super) async fn handle_pending_timeouts_rust(
                                         pending.tif = "FAK".to_string();
                                         pending.style = "taker".to_string();
                                         pending.submitted_ts_ms = now_ms;
-                                        pending.cancel_after_ms = if emergency_exit { 700 } else { 1500 };
+                                        pending.cancel_after_ms =
+                                            if emergency_exit { 700 } else { 1500 };
                                         state.upsert_pending_order(pending).await;
                                         state
                                             .append_live_event(
@@ -2714,12 +2716,24 @@ pub(super) async fn execute_live_orders(
     }
     let mut out = match mode {
         LiveExecutorMode::Gateway => {
-            execute_live_orders_via_gateway(state, gateway_cfg, target, position_state, &prioritized)
-                .await
+            execute_live_orders_via_gateway(
+                state,
+                gateway_cfg,
+                target,
+                position_state,
+                &prioritized,
+            )
+            .await
         }
         LiveExecutorMode::RustSdk => {
-            execute_live_orders_via_rust_sdk(state, gateway_cfg, target, position_state, &prioritized)
-                .await
+            execute_live_orders_via_rust_sdk(
+                state,
+                gateway_cfg,
+                target,
+                position_state,
+                &prioritized,
+            )
+            .await
         }
     };
     if !deferred.is_empty() {

@@ -86,7 +86,9 @@ pub(super) async fn fetch_latest_snapshot(
     let now_ms = Utc::now().timestamp_millis();
     if state.redis_client.is_none() {
         let row = fetch_latest_snapshot_from_clickhouse(state, symbol, timeframe).await?;
-        return Ok(row.filter(|v| is_live_snapshot_fresh(v, timeframe, now_ms)));
+        return Ok(row.filter(|v| {
+            is_live_snapshot_fresh(v, timeframe, now_ms) || is_live_snapshot_recent(v, now_ms)
+        }));
     }
 
     let mut fallback_direct: Option<Value> = None;
@@ -101,6 +103,8 @@ pub(super) async fn fetch_latest_snapshot(
             if snapshot_remaining_ms(&v) > 0 {
                 return Ok(Some(v));
             }
+            fallback_direct = Some(v);
+        } else if is_live_snapshot_recent(&v, now_ms) {
             fallback_direct = Some(v);
         }
     }
@@ -119,8 +123,10 @@ pub(super) async fn fetch_latest_snapshot(
         return Ok(None);
     };
 
-    let mut best: Option<Value> = None;
-    let mut best_priority: Option<(i64, i64, i64)> = None;
+    let mut best_fresh: Option<Value> = None;
+    let mut best_fresh_priority: Option<(i64, i64, i64)> = None;
+    let mut best_recent: Option<Value> = None;
+    let mut best_recent_priority: Option<(i64, i64, i64)> = None;
     for row in arr {
         let row_symbol = row
             .get("symbol")
@@ -135,26 +141,36 @@ pub(super) async fn fetch_latest_snapshot(
         if row_symbol != symbol.to_ascii_uppercase() || row_tf != timeframe {
             continue;
         }
-        if !is_live_snapshot_fresh(row, timeframe, now_ms) {
-            continue;
-        }
         let pri = snapshot_priority(row, timeframe, now_ms);
-        if best_priority.map(|v| pri > v).unwrap_or(true) {
-            best_priority = Some(pri);
-            best = Some(row.clone());
+        if is_live_snapshot_fresh(row, timeframe, now_ms) {
+            if best_fresh_priority.map(|v| pri > v).unwrap_or(true) {
+                best_fresh_priority = Some(pri);
+                best_fresh = Some(row.clone());
+            }
+        } else if is_live_snapshot_recent(row, now_ms) {
+            if best_recent_priority.map(|v| pri > v).unwrap_or(true) {
+                best_recent_priority = Some(pri);
+                best_recent = Some(row.clone());
+            }
         }
     }
 
-    if best.is_some() {
-        return Ok(best);
+    if best_fresh.is_some() {
+        return Ok(best_fresh);
     }
 
     if fallback_direct.is_some() {
         return Ok(fallback_direct);
     }
 
+    if best_recent.is_some() {
+        return Ok(best_recent);
+    }
+
     let row = fetch_latest_snapshot_from_clickhouse(state, symbol, timeframe).await?;
-    Ok(row.filter(|v| is_live_snapshot_fresh(v, timeframe, now_ms)))
+    Ok(row.filter(|v| {
+        is_live_snapshot_fresh(v, timeframe, now_ms) || is_live_snapshot_recent(v, now_ms)
+    }))
 }
 
 pub(super) async fn fetch_latest_snapshot_from_clickhouse(
@@ -299,11 +315,13 @@ pub(super) async fn latest_all(State(state): State<ApiState>) -> Result<Json<Val
                     }
                 })
                 .collect::<Vec<_>>();
-            let payload = Value::Array(filtered);
-            state
-                .chart_cache_put("latest_all".to_string(), payload.clone())
-                .await;
-            return Ok(Json(payload));
+            if !filtered.is_empty() {
+                let payload = Value::Array(filtered);
+                state
+                    .chart_cache_put("latest_all".to_string(), payload.clone())
+                    .await;
+                return Ok(Json(payload));
+            }
         }
     }
 

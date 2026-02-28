@@ -878,6 +878,34 @@ impl LiveRuntimeConfig {
     }
 }
 
+fn runtime_fast_loop_enabled() -> bool {
+    std::env::var("FORGE_FEV1_RUNTIME_FAST_ENABLED")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(true)
+}
+
+fn runtime_fast_loop_ms(base_loop_ms: u64) -> u64 {
+    std::env::var("FORGE_FEV1_RUNTIME_FAST_LOOP_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(120)
+        .clamp(80, base_loop_ms.max(80))
+}
+
+fn runtime_fast_margin_threshold() -> f64 {
+    std::env::var("FORGE_FEV1_RUNTIME_FAST_MARGIN")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.10)
+        .clamp(0.01, 0.50)
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 enum LiveRuntimeControlMode {
@@ -1565,6 +1593,7 @@ impl ApiState {
 }
 
 const LIVE_SNAPSHOT_MAX_AGE_MS: i64 = 4_000;
+const LIVE_SNAPSHOT_FALLBACK_MAX_AGE_MS: i64 = 20 * 60_000;
 const LIVE_ROUND_END_GRACE_MS: i64 = 1_500;
 const RESOLVED_UP_PRICE_CENTS: f64 = 99.0;
 const RESOLVED_DOWN_PRICE_CENTS: f64 = 0.0;
@@ -2046,6 +2075,10 @@ async fn live_runtime_loop(state: ApiState, bootstrap: LiveRuntimeConfig) {
     loop {
         let cfg = LiveRuntimeConfig::from_env();
         let push_cfg = ServerChanConfig::from_env();
+        let fast_enabled = runtime_fast_loop_enabled();
+        let fast_loop_ms = runtime_fast_loop_ms(cfg.loop_interval_ms);
+        let fast_margin = runtime_fast_margin_threshold();
+        let mut cycle_sleep_ms = cfg.loop_interval_ms;
         if !cfg.enabled {
             tokio::time::sleep(Duration::from_millis(cfg.loop_interval_ms)).await;
             continue;
@@ -2123,9 +2156,50 @@ async fn live_runtime_loop(state: ApiState, bootstrap: LiveRuntimeConfig) {
                                 "effective_drain_only": effective_drain_only,
                                 "position_side_before_cycle": position_before_cycle.side,
                                 "pending_orders_before_cycle": pending_before_count,
+                                "fast_loop_enabled": fast_enabled,
+                                "fast_loop_ms": fast_loop_ms,
+                                "base_loop_ms": cfg.loop_interval_ms,
                             }),
                         );
                     }
+
+                    if fast_enabled {
+                        let mut fast_path = effective_drain_only
+                            || position_before_cycle.side.is_some()
+                            || pending_before_count > 0;
+                        if !fast_path {
+                            let suggested_enter = payload
+                                .get("current")
+                                .and_then(|v| v.get("suggested_action"))
+                                .and_then(Value::as_str)
+                                .map(|s| s.starts_with("ENTER_"))
+                                .unwrap_or(false);
+                            if suggested_enter {
+                                fast_path = true;
+                            } else {
+                                let score = payload
+                                    .get("current")
+                                    .and_then(|v| v.get("score"))
+                                    .and_then(Value::as_f64)
+                                    .map(f64::abs);
+                                let threshold = payload
+                                    .get("current")
+                                    .and_then(|v| v.get("entry_threshold"))
+                                    .and_then(Value::as_f64)
+                                    .map(f64::abs);
+                                if let (Some(s), Some(t)) = (score, threshold) {
+                                    let margin = s - t;
+                                    if margin >= -fast_margin {
+                                        fast_path = true;
+                                    }
+                                }
+                            }
+                        }
+                        if fast_path {
+                            cycle_sleep_ms = cycle_sleep_ms.min(fast_loop_ms);
+                        }
+                    }
+
                     let status = payload
                         .get("status")
                         .and_then(Value::as_str)
@@ -2267,7 +2341,7 @@ async fn live_runtime_loop(state: ApiState, bootstrap: LiveRuntimeConfig) {
                 }
             }
         }
-        tokio::time::sleep(Duration::from_millis(cfg.loop_interval_ms)).await;
+        tokio::time::sleep(Duration::from_millis(cycle_sleep_ms)).await;
     }
 }
 
