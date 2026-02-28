@@ -724,31 +724,31 @@ fn strategy_balanced_config() -> StrategyRuntimeConfig {
 
 fn strategy_cand_growth_mix_config() -> StrategyRuntimeConfig {
     StrategyRuntimeConfig {
-        entry_threshold_base: 0.7996697997497385,
-        entry_threshold_cap: 0.99,
-        spread_limit_prob: 0.04383330249581228,
-        entry_edge_prob: 0.006583305481398134,
-        entry_min_potential_cents: 23.554519107808108,
-        entry_max_price_cents: 75.48156075488825,
-        min_hold_ms: 406,
-        stop_loss_cents: 21.10061478699938,
-        reverse_signal_threshold: -0.2504710423293769,
-        reverse_signal_ticks: 4,
-        trail_activate_profit_cents: 22.52846740256911,
-        trail_drawdown_cents: 14.579074544933382,
-        take_profit_near_max_cents: 99.5,
-        endgame_take_profit_cents: 93.77424625997885,
-        endgame_remaining_ms: 18_077,
-        liquidity_widen_prob: 0.06181790968658127,
-        cooldown_ms: 7_580,
-        max_entries_per_round: 1,
-        max_exec_spread_cents: 2.163925319960545,
-        slippage_cents_per_side: 0.1353580016533842,
-        fee_cents_per_side: 0.03776880159417778,
-        emergency_wide_spread_penalty_ratio: 0.2152594179877152,
-        stop_loss_grace_ticks: 2,
-        stop_loss_hard_mult: 1.45,
-        stop_loss_reverse_extra_ticks: 1,
+        entry_threshold_base: 0.46609049156288435,
+        entry_threshold_cap: 0.9881009239180837,
+        spread_limit_prob: 0.03507852373259387,
+        entry_edge_prob: 0.05493483341582213,
+        entry_min_potential_cents: 1.2554961335457504,
+        entry_max_price_cents: 69.3428100950126,
+        min_hold_ms: 2_640,
+        stop_loss_cents: 5.982446876417477,
+        reverse_signal_threshold: -0.6692399725831516,
+        reverse_signal_ticks: 3,
+        trail_activate_profit_cents: 2.0,
+        trail_drawdown_cents: 1.059069848563025,
+        take_profit_near_max_cents: 94.16496449394661,
+        endgame_take_profit_cents: 93.87031351778629,
+        endgame_remaining_ms: 25_647,
+        liquidity_widen_prob: 0.11634976307085412,
+        cooldown_ms: 12_362,
+        max_entries_per_round: 3,
+        max_exec_spread_cents: 2.5917043735187626,
+        slippage_cents_per_side: 0.052941519427761694,
+        fee_cents_per_side: 0.03725807613665984,
+        emergency_wide_spread_penalty_ratio: 0.026745245474743332,
+        stop_loss_grace_ticks: 7,
+        stop_loss_hard_mult: 1.670270804386013,
+        stop_loss_reverse_extra_ticks: 0,
         loss_cluster_limit: 3,
         loss_cluster_cooldown_ms: 25_000,
         noise_gate_enabled: true,
@@ -2860,8 +2860,8 @@ pub(super) async fn strategy_paper(
     let _heavy_permit = strategy_acquire_heavy_permit(&state, full_history, max_points).await;
     let max_trades = params
         .max_trades
-        .unwrap_or(runtime_defaults.max_trades as u32)
-        .clamp(20, 1000) as usize;
+        .map(|v| v.max(1) as usize)
+        .unwrap_or(usize::MAX);
     let _live_execute = params.live_execute.unwrap_or(false);
     let _live_quote_usdc = params.live_quote_usdc.unwrap_or(1.0).clamp(0.5, 1000.0);
     let _live_max_orders = params.live_max_orders.unwrap_or(1).clamp(1, 8) as usize;
