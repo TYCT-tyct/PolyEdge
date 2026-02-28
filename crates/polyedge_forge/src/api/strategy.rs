@@ -259,19 +259,71 @@ fn strategy_heavy_trim_enabled() -> bool {
     strategy_env_bool("FORGE_STRATEGY_HEAVY_TRIM", true)
 }
 
+fn strategy_ensure_lookback_coverage_enabled() -> bool {
+    strategy_env_bool("FORGE_STRATEGY_ENSURE_LOOKBACK_COVERAGE", true)
+}
+
+fn strategy_required_points_1s(lookback_minutes: u32) -> u32 {
+    lookback_minutes.saturating_mul(60)
+}
+
+fn strategy_samples_coverage_minutes(samples: &[StrategySample]) -> f64 {
+    if samples.len() < 2 {
+        return 0.0;
+    }
+    let start_ms = samples.first().map(|v| v.ts_ms).unwrap_or(0);
+    let end_ms = samples.last().map(|v| v.ts_ms).unwrap_or(start_ms);
+    (end_ms.saturating_sub(start_ms).max(0) as f64) / 60_000.0
+}
+
+fn strategy_lookback_meta_json(
+    samples: &[StrategySample],
+    full_history: bool,
+    lookback_minutes: u32,
+    max_points: u32,
+) -> Value {
+    let required_points_1s = strategy_required_points_1s(lookback_minutes);
+    let coverage_minutes_by_points = if required_points_1s == 0 {
+        0.0
+    } else {
+        ((lookback_minutes as f64) * (max_points as f64 / required_points_1s as f64).min(1.0))
+            .max(0.0)
+    };
+    json!({
+        "requested_lookback_minutes": lookback_minutes,
+        "full_history": full_history,
+        "required_points_1s": required_points_1s,
+        "max_points_effective": max_points,
+        "truncated_by_points": !full_history && max_points < required_points_1s,
+        "coverage_minutes_by_points": coverage_minutes_by_points,
+        "coverage_minutes_by_samples": strategy_samples_coverage_minutes(samples)
+    })
+}
+
 fn strategy_resolve_max_points(
     full_history: bool,
+    lookback_minutes: u32,
     requested_max_points: Option<u32>,
     requested_max_samples: Option<u32>,
 ) -> u32 {
     let min_points = strategy_min_points();
     let hard_cap = strategy_max_points_hard_cap().max(min_points);
     let guard_cap = strategy_guard_max_points(full_history).clamp(min_points, hard_cap);
+    let ensure_lookback_coverage = strategy_ensure_lookback_coverage_enabled() && !full_history;
     let mut max_points = requested_max_points.unwrap_or(strategy_default_max_points(full_history));
     if let Some(max_samples) = requested_max_samples {
         max_points = max_points.min(max_samples);
     }
-    max_points.clamp(min_points, hard_cap).min(guard_cap)
+    if ensure_lookback_coverage {
+        let required = strategy_required_points_1s(lookback_minutes).clamp(min_points, hard_cap);
+        max_points = max_points.max(required);
+    }
+    let resolved = max_points.clamp(min_points, hard_cap);
+    if ensure_lookback_coverage {
+        resolved
+    } else {
+        resolved.min(guard_cap)
+    }
 }
 
 async fn strategy_acquire_heavy_permit(
@@ -744,6 +796,7 @@ pub(super) struct StrategySimulationResult {
     total_entry_fee_cents: f64,
     total_exit_fee_cents: f64,
     total_slippage_cents: f64,
+    total_impact_cents: f64,
     total_cost_cents: f64,
     net_margin_pct: f64,
 }
@@ -847,6 +900,7 @@ pub(super) fn run_summary_json(run: &StrategySimulationResult) -> Value {
         "total_entry_fee_cents": run.total_entry_fee_cents,
         "total_exit_fee_cents": run.total_exit_fee_cents,
         "total_slippage_cents": run.total_slippage_cents,
+        "total_impact_cents": run.total_impact_cents,
         "net_margin_pct": run.net_margin_pct,
         "max_drawdown_cents": run.max_drawdown_cents,
         "max_profit_trade_cents": run.max_profit_trade_cents,
@@ -1079,6 +1133,13 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         live_max_orders,
         live_drain_only,
     } = req;
+    let max_points = if !full_history && strategy_ensure_lookback_coverage_enabled() {
+        max_points
+            .max(strategy_required_points_1s(lookback_minutes))
+            .min(strategy_max_points_hard_cap())
+    } else {
+        max_points
+    };
     let live_execute_requested = live_execute;
     let mut live_execute = live_execute_requested && live_execution_market_allowed(market_type);
     let mut live_execute_block_reason = if live_execute_requested && !live_execute {
@@ -1834,6 +1895,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         "lookback_minutes": lookback_minutes,
         "sample_source_mode": sample_source_mode,
         "sample_resolution_ms": sample_resolution_ms,
+        "lookback": strategy_lookback_meta_json(&samples, full_history, lookback_minutes, max_points),
         "full_history": full_history,
         "samples": samples.len(),
         "config_source": config_source,
@@ -2088,6 +2150,7 @@ pub(super) fn map_simulation_result(run: fev1::SimulationResult) -> StrategySimu
         total_entry_fee_cents: run.total_entry_fee_cents,
         total_exit_fee_cents: run.total_exit_fee_cents,
         total_slippage_cents: run.total_slippage_cents,
+        total_impact_cents: run.total_impact_cents,
         total_cost_cents: run.total_cost_cents,
         net_margin_pct: run.net_margin_pct,
     }
@@ -2461,6 +2524,7 @@ pub(super) async fn strategy_paper(
         .clamp(30, 365 * 24 * 60);
     let max_points = strategy_resolve_max_points(
         full_history,
+        lookback_minutes,
         params.max_points.or(if full_history {
             None
         } else {
@@ -2521,6 +2585,7 @@ pub(super) async fn strategy_paper(
                 "max_trades": runtime_defaults.max_trades,
             },
             "lookback_minutes": lookback_minutes,
+            "lookback": strategy_lookback_meta_json(&samples, full_history, lookback_minutes, max_points),
             "samples": samples.len(),
             "current": Value::Null,
             "summary": {
@@ -2535,6 +2600,7 @@ pub(super) async fn strategy_paper(
                 "total_entry_fee_cents": 0.0,
                 "total_exit_fee_cents": 0.0,
                 "total_slippage_cents": 0.0,
+                "total_impact_cents": 0.0,
                 "net_margin_pct": 0.0,
                 "max_drawdown_cents": 0.0,
             },
@@ -2558,6 +2624,7 @@ pub(super) async fn strategy_paper(
         "autotune_live_key": live_key_used,
         "autotune_live_found": live_opt.is_some(),
         "lookback_minutes": lookback_minutes,
+        "lookback": strategy_lookback_meta_json(&samples, full_history, lookback_minutes, max_points),
         "runtime_defaults": {
             "lookback_minutes": runtime_defaults.lookback_minutes,
             "max_points": runtime_defaults.max_points,
@@ -2605,6 +2672,7 @@ pub(super) async fn strategy_paper(
             "total_entry_fee_cents": run.total_entry_fee_cents,
             "total_exit_fee_cents": run.total_exit_fee_cents,
             "total_slippage_cents": run.total_slippage_cents,
+            "total_impact_cents": run.total_impact_cents,
             "net_margin_pct": run.net_margin_pct,
             "max_drawdown_cents": run.max_drawdown_cents,
             "max_profit_trade_cents": run.max_profit_trade_cents,
@@ -3110,8 +3178,12 @@ pub(super) async fn strategy_full(
         .lookback_minutes
         .unwrap_or(if full_history { 30 * 24 * 60 } else { 12 * 60 })
         .clamp(30, 365 * 24 * 60);
-    let max_points =
-        strategy_resolve_max_points(full_history, params.max_points, params.max_samples);
+    let max_points = strategy_resolve_max_points(
+        full_history,
+        lookback_minutes,
+        params.max_points,
+        params.max_samples,
+    );
     let _heavy_permit = strategy_acquire_heavy_permit(&state, full_history, max_points).await;
     let max_trades = params.max_trades.unwrap_or(300).clamp(20, 1000) as usize;
     let max_arms = params.max_arms.unwrap_or(8).clamp(2, 24) as usize;
@@ -3281,6 +3353,7 @@ pub(super) async fn strategy_full(
         "market_type": market_type,
         "full_history": full_history,
         "lookback_minutes": lookback_minutes,
+        "lookback": strategy_lookback_meta_json(&samples, full_history, lookback_minutes, max_points),
         "target_win_rate_pct": target_win_rate,
         "window_trades": window_trades,
         "samples": samples.len(),
@@ -3460,9 +3533,20 @@ pub(super) async fn strategy_optimize(
         .lookback_minutes
         .unwrap_or(if full_history { 30 * 24 * 60 } else { 12 * 60 })
         .clamp(30, 365 * 24 * 60);
-    let max_points =
-        strategy_resolve_max_points(full_history, params.max_points, params.max_samples)
-            .min(strategy_optimize_guard_max_points());
+    let max_points = {
+        let resolved = strategy_resolve_max_points(
+            full_history,
+            lookback_minutes,
+            params.max_points,
+            params.max_samples,
+        );
+        let optimize_cap = if !full_history && strategy_ensure_lookback_coverage_enabled() {
+            strategy_optimize_guard_max_points().max(strategy_required_points_1s(lookback_minutes))
+        } else {
+            strategy_optimize_guard_max_points()
+        };
+        resolved.min(optimize_cap)
+    };
     let _heavy_permit = strategy_acquire_heavy_permit(&state, full_history, max_points).await;
     let max_trades = params.max_trades.unwrap_or(400).clamp(20, 2000) as usize;
     let max_arms = params.max_arms.unwrap_or(8).clamp(2, 24) as usize;
@@ -3814,6 +3898,7 @@ pub(super) async fn strategy_optimize(
         "autotune_context": autotune_context,
         "full_history": full_history,
         "lookback_minutes": lookback_minutes,
+        "lookback": strategy_lookback_meta_json(&samples, full_history, lookback_minutes, max_points),
         "samples": samples.len(),
         "samples_train": train_samples.len(),
         "samples_validation": valid_samples.len(),

@@ -92,6 +92,7 @@ pub struct SimulationResult {
     pub total_entry_fee_cents: f64,
     pub total_exit_fee_cents: f64,
     pub total_slippage_cents: f64,
+    pub total_impact_cents: f64,
     pub total_cost_cents: f64,
     pub net_margin_pct: f64,
 }
@@ -202,6 +203,7 @@ struct Position {
     entry_price_cents: f64,
     entry_fee_cents: f64,
     entry_slippage_cents: f64,
+    entry_impact_cents: f64,
     entry_score: f64,
     entry_remaining_ms: i64,
     peak_pnl_cents: f64,
@@ -248,6 +250,31 @@ fn side_ask(sample: &Sample, side: Side) -> f64 {
         Side::Up => sample.ask_yes,
         Side::Down => sample.ask_no,
     }
+}
+
+fn execution_impact_cents(
+    sample: &Sample,
+    side: Side,
+    cfg: &RuntimeConfig,
+    remaining_ms: i64,
+    emergency: bool,
+) -> f64 {
+    let spread_cents = side_spread(sample, side) * 100.0;
+    let spread_pressure = (spread_cents / cfg.max_exec_spread_cents.max(0.5)).clamp(0.0, 4.0);
+    let velocity_pressure = tanh_norm(sample.velocity.abs(), 4.0).abs();
+    let accel_pressure = tanh_norm(sample.acceleration.abs(), 16.0).abs();
+    let endgame_ms = cfg.endgame_remaining_ms.max(1) as f64;
+    let remaining_ms = remaining_ms.max(0) as f64;
+    let time_pressure = ((2.0 * endgame_ms - remaining_ms) / (2.0 * endgame_ms)).clamp(0.0, 1.0);
+    let mut impact = cfg.slippage_cents_per_side * 0.35
+        + spread_cents * (0.16 + 0.14 * spread_pressure)
+        + velocity_pressure * 0.55
+        + accel_pressure * 0.40
+        + time_pressure * 0.50;
+    if emergency {
+        impact *= 1.35;
+    }
+    impact.clamp(0.0, 18.0)
 }
 
 fn side_spread(sample: &Sample, side: Side) -> f64 {
@@ -392,7 +419,10 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
             let bid_raw = side_bid(sample, pos.side) * 100.0;
             let spread_side_cents = side_spread(sample, pos.side) * 100.0;
             let exit_fee = cfg.fee_cents_per_side + dynamic_taker_fee_cents(bid_raw);
-            let mut exit_exec = bid_raw - cfg.slippage_cents_per_side - exit_fee;
+            let mut exit_impact_cents =
+                execution_impact_cents(sample, pos.side, cfg, sample.remaining_ms, false);
+            let mut exit_exec =
+                bid_raw - cfg.slippage_cents_per_side - exit_fee - exit_impact_cents;
             let pnl = exit_exec - pos.entry_price_cents;
             if pnl > pos.peak_pnl_cents {
                 pos.peak_pnl_cents = pnl;
@@ -454,6 +484,12 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
                 } else {
                     0.0
                 };
+                if emergency || escalated_for_blocked_exit {
+                    exit_impact_cents =
+                        execution_impact_cents(sample, pos.side, cfg, sample.remaining_ms, true);
+                    exit_exec =
+                        bid_raw - cfg.slippage_cents_per_side - exit_fee - exit_impact_cents;
+                }
                 exit_exec -= emergency_penalty_cents;
                 execution_penalty_cents_total += emergency_penalty_cents;
 
@@ -473,9 +509,11 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
                     "entry_price_raw_cents": pos.entry_price_raw_cents,
                     "entry_fee_cents": pos.entry_fee_cents,
                     "entry_slippage_cents": pos.entry_slippage_cents,
+                    "entry_impact_cents": pos.entry_impact_cents,
                     "exit_price_cents": exit_exec,
                     "exit_price_raw_cents": bid_raw,
                     "exit_slippage_cents": cfg.slippage_cents_per_side,
+                    "exit_impact_cents": exit_impact_cents,
                     "exit_emergency_penalty_cents": emergency_penalty_cents,
                     "exit_fee_cents": exit_fee,
                     "pnl_gross_cents": gross_pnl,
@@ -513,7 +551,9 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
             let spread_ok = sample.spread_mid <= cfg.spread_limit_prob
                 && spread_side_cents <= cfg.max_exec_spread_cents;
             let fee = cfg.fee_cents_per_side + dynamic_taker_fee_cents(ask_raw);
-            let entry_exec = ask_raw + cfg.slippage_cents_per_side + fee;
+            let entry_impact_cents =
+                execution_impact_cents(sample, side, cfg, sample.remaining_ms, false);
+            let entry_exec = ask_raw + cfg.slippage_cents_per_side + fee + entry_impact_cents;
             let expected_potential = (99.0 - entry_exec).max(0.0);
             let potential_ok = expected_potential >= cfg.entry_min_potential_cents;
             let price_ok = entry_exec <= cfg.entry_max_price_cents;
@@ -535,6 +575,7 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
                     entry_price_cents: entry_exec,
                     entry_fee_cents: fee,
                     entry_slippage_cents: cfg.slippage_cents_per_side,
+                    entry_impact_cents,
                     entry_score: score,
                     entry_remaining_ms: sample.remaining_ms,
                     peak_pnl_cents: 0.0,
@@ -558,7 +599,9 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
     if let (Some(pos), Some(last)) = (position.take(), samples.last()) {
         let bid_raw = side_bid(last, pos.side) * 100.0;
         let exit_fee = cfg.fee_cents_per_side + dynamic_taker_fee_cents(bid_raw);
-        let exit_exec = bid_raw - cfg.slippage_cents_per_side - exit_fee;
+        let exit_impact_cents =
+            execution_impact_cents(last, pos.side, cfg, last.remaining_ms, false);
+        let exit_exec = bid_raw - cfg.slippage_cents_per_side - exit_fee - exit_impact_cents;
         let net_pnl = exit_exec - pos.entry_price_cents;
         let gross_pnl = bid_raw - pos.entry_price_raw_cents;
         let total_cost = (gross_pnl - net_pnl).max(0.0);
@@ -574,9 +617,11 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
             "entry_price_raw_cents": pos.entry_price_raw_cents,
             "entry_fee_cents": pos.entry_fee_cents,
             "entry_slippage_cents": pos.entry_slippage_cents,
+            "entry_impact_cents": pos.entry_impact_cents,
             "exit_price_cents": exit_exec,
             "exit_price_raw_cents": bid_raw,
             "exit_slippage_cents": cfg.slippage_cents_per_side,
+            "exit_impact_cents": exit_impact_cents,
             "exit_emergency_penalty_cents": 0.0,
             "exit_fee_cents": exit_fee,
             "pnl_gross_cents": gross_pnl,
@@ -632,9 +677,24 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
             a + b
         })
         .sum();
+    let total_impact_cents: f64 = trades
+        .iter()
+        .map(|t| {
+            let a = t
+                .get("entry_impact_cents")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            let b = t
+                .get("exit_impact_cents")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            a + b
+        })
+        .sum();
     let total_cost_cents = total_entry_fee_cents
         + total_exit_fee_cents
         + total_slippage_cents
+        + total_impact_cents
         + execution_penalty_cents_total;
     let avg_pnl_cents = if trade_count > 0 {
         total_pnl_cents / trade_count as f64
@@ -716,6 +776,7 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
         total_entry_fee_cents,
         total_exit_fee_cents,
         total_slippage_cents,
+        total_impact_cents,
         total_cost_cents,
         net_margin_pct,
     }
