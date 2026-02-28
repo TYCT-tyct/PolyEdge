@@ -1663,6 +1663,7 @@ fn spawn_market_discovery_reader(
         let base_refresh = refresh_sec.max(10);
         let mut current_wait = base_refresh;
         let max_wait = base_refresh.saturating_mul(8).min(600);
+        let mut last_markets: Vec<MarketMeta> = Vec::new();
         loop {
             match discover_markets(&symbols, &timeframes).await {
                 Ok(markets) => {
@@ -1672,12 +1673,50 @@ fn spawn_market_discovery_reader(
                         "discovery",
                         &format!("discovered {} active markets", markets.len()),
                     );
-                    if tx.send(markets).is_err() {
+                    if tx.send(markets.clone()).is_err() {
                         return;
                     }
+                    last_markets = markets;
                     current_wait = base_refresh;
                 }
                 Err(err) => {
+                    if let Ok(fallback) =
+                        discover_markets_from_target_cache(&symbols, &timeframes).await
+                    {
+                        log_ingest(
+                            &persist,
+                            "warn",
+                            "discovery",
+                            &format!(
+                                "discover failed, recovered {} markets from cache fallback: {err}",
+                                fallback.len()
+                            ),
+                        );
+                        if tx.send(fallback.clone()).is_err() {
+                            return;
+                        }
+                        last_markets = fallback;
+                        current_wait = base_refresh;
+                        tokio::time::sleep(Duration::from_secs(current_wait.max(1))).await;
+                        continue;
+                    }
+                    if !last_markets.is_empty() {
+                        log_ingest(
+                            &persist,
+                            "warn",
+                            "discovery",
+                            &format!(
+                                "discover failed, reusing last known {} markets: {err}",
+                                last_markets.len()
+                            ),
+                        );
+                        if tx.send(last_markets.clone()).is_err() {
+                            return;
+                        }
+                        current_wait = base_refresh;
+                        tokio::time::sleep(Duration::from_secs(current_wait.max(1))).await;
+                        continue;
+                    }
                     log_ingest(
                         &persist,
                         "warn",
@@ -1690,6 +1729,164 @@ fn spawn_market_discovery_reader(
             tokio::time::sleep(Duration::from_secs(current_wait.max(1))).await;
         }
     });
+}
+
+fn target_market_cache_file_path() -> PathBuf {
+    if let Ok(raw) = std::env::var("POLYEDGE_TARGET_MARKET_CACHE_FILE") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    std::env::temp_dir().join("polyedge_target_market_cache.json")
+}
+
+fn target_market_cache_key(symbols: &[String], timeframes: &[String]) -> String {
+    let mut symbols_norm = symbols
+        .iter()
+        .map(|s| s.trim().to_ascii_uppercase())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+    symbols_norm.sort();
+    symbols_norm.dedup();
+    let mut timeframes_norm = timeframes
+        .iter()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+    timeframes_norm.sort();
+    timeframes_norm.dedup();
+    format!(
+        "symbols={}|types=updown|tfs={}",
+        symbols_norm.join(","),
+        timeframes_norm.join(",")
+    )
+}
+
+fn detect_symbol_from_question(question: &str, allowed_symbols: &[String]) -> Option<String> {
+    let text = question.to_ascii_uppercase();
+    let aliases: [(&str, [&str; 3]); 15] = [
+        ("BTCUSDT", ["BITCOIN", "BTC", "XBT"]),
+        ("ETHUSDT", ["ETHEREUM", "ETH", "ETHER"]),
+        ("SOLUSDT", ["SOLANA", "SOL", "SOLAN"]),
+        ("XRPUSDT", ["RIPPLE", "XRP", "XRP"]),
+        ("BNBUSDT", ["BINANCE", "BNB", "BNB"]),
+        ("DOGEUSDT", ["DOGECOIN", "DOGE", "DOGE"]),
+        ("ADAUSDT", ["CARDANO", "ADA", "ADA"]),
+        ("AVAXUSDT", ["AVALANCHE", "AVAX", "AVAX"]),
+        ("LINKUSDT", ["CHAINLINK", "LINK", "LINK"]),
+        ("MATICUSDT", ["POLYGON", "MATIC", "POL"]),
+        ("LTCUSDT", ["LITECOIN", "LTC", "LTC"]),
+        ("DOTUSDT", ["POLKADOT", "DOT", "DOT"]),
+        ("TRXUSDT", ["TRON", "TRX", "TRX"]),
+        ("TONUSDT", ["TONCOIN", "TON", "TON"]),
+        ("NEARUSDT", ["NEAR", "NEAR", "NEAR"]),
+    ];
+    for (symbol, keys) in aliases {
+        if !allowed_symbols
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(symbol))
+        {
+            continue;
+        }
+        if keys.iter().any(|k| text.contains(k)) {
+            return Some(symbol.to_string());
+        }
+    }
+    None
+}
+
+async fn discover_markets_from_target_cache(
+    symbols: &[String],
+    timeframes: &[String],
+) -> Result<Vec<MarketMeta>> {
+    let cache_path = target_market_cache_file_path();
+    let raw = tokio::fs::read_to_string(&cache_path)
+        .await
+        .map_err(|err| anyhow::anyhow!("read cache failed ({}): {err}", cache_path.display()))?;
+    let root: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
+        anyhow::anyhow!("parse cache json failed ({}): {err}", cache_path.display())
+    })?;
+    let cache_key = target_market_cache_key(symbols, timeframes);
+    let Some(markets_obj) = root.get(&cache_key).and_then(serde_json::Value::as_object) else {
+        anyhow::bail!("cache key not found: {cache_key}");
+    };
+
+    let user_agent = std::env::var("POLYEDGE_DISCOVERY_USER_AGENT")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            "Mozilla/5.0 (compatible; PolyEdgeBot/1.0; +https://github.com/TYCT-tyct/PolyEdge)"
+                .to_string()
+        });
+    let http = Client::builder()
+        .user_agent(user_agent)
+        .connect_timeout(Duration::from_secs(6))
+        .timeout(Duration::from_secs(12))
+        .build()
+        .unwrap_or_else(|_| Client::new());
+
+    let mut out = Vec::<MarketMeta>::new();
+    for (market_id, market_v) in markets_obj {
+        let Some(timeframe) = market_v
+            .get("timeframe")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if !timeframes
+            .iter()
+            .any(|tf| tf.eq_ignore_ascii_case(timeframe))
+        {
+            continue;
+        }
+        let detail_url = format!("https://gamma-api.polymarket.com/markets/{market_id}");
+        let detail = match http.get(&detail_url).send().await {
+            Ok(resp) => match resp.error_for_status() {
+                Ok(ok) => ok,
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+        let detail_json: serde_json::Value = match detail.json().await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let Some(question) = detail_json
+            .get("question")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(symbol) = detect_symbol_from_question(&question, symbols) else {
+            continue;
+        };
+        let Some(end_ts_ms) = parse_timestamp_ms(
+            detail_json
+                .get("endDate")
+                .and_then(serde_json::Value::as_str),
+        ) else {
+            continue;
+        };
+        let tf_ms = timeframe_to_ms(timeframe).unwrap_or(300_000);
+        let start_ts_ms = end_ts_ms.saturating_sub(tf_ms);
+        out.push(MarketMeta {
+            market_id: market_id.clone(),
+            symbol,
+            timeframe: timeframe.to_string(),
+            title: question,
+            target_price: None,
+            end_ts_ms,
+            start_ts_ms,
+        });
+    }
+
+    if out.is_empty() {
+        anyhow::bail!("cache fallback produced no market meta");
+    }
+    Ok(out)
 }
 
 async fn discover_markets(symbols: &[String], timeframes: &[String]) -> Result<Vec<MarketMeta>> {
