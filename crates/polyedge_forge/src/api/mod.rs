@@ -556,6 +556,8 @@ struct LiveCapitalState {
     kelly_fraction: f64,
     #[serde(default)]
     capital_stage: String,
+    #[serde(default)]
+    last_risk_relief_ts_ms: i64,
     #[serde(default = "default_true")]
     balance_sync_ok: bool,
     #[serde(default)]
@@ -596,6 +598,7 @@ impl LiveCapitalState {
             adaptive_add_mult: 1.0,
             kelly_fraction: 0.0,
             capital_stage: "micro_10".to_string(),
+            last_risk_relief_ts_ms: now_ms,
             balance_sync_ok: true,
             balance_sync_error: None,
             last_balance_sync_ms: 0,
@@ -1135,6 +1138,7 @@ impl ApiState {
                 cs.tune_factor = (cs.tune_factor - 0.08).max(0.4);
             }
             cs.last_realized_pnl_usdc = pnl_usdc;
+            cs.last_risk_relief_ts_ms = now_ms;
         }
         let (n, wr, avg, std) = rolling_pnl_stats(&cs.recent_realized_pnls);
         cs.rolling_trade_count = n as u32;
@@ -1251,7 +1255,11 @@ impl ApiState {
             .side
             .is_some();
         if !position_open && reserved_pending <= 1e-9 {
-            let idle_ms = now_ms.saturating_sub(cs.updated_ts_ms);
+            let idle_ms = if cs.last_risk_relief_ts_ms <= 0 {
+                cfg.risk_idle_relief_ms
+            } else {
+                now_ms.saturating_sub(cs.last_risk_relief_ts_ms)
+            };
             if idle_ms >= cfg.risk_idle_relief_ms {
                 let steps = (idle_ms / cfg.risk_idle_relief_ms).clamp(1, 8) as u32;
                 cs.consecutive_losses = cs.consecutive_losses.saturating_sub(steps);
@@ -1261,7 +1269,10 @@ impl ApiState {
                     cs.max_equity_usdc =
                         (cs.max_equity_usdc - gap * decay).max(cs.equity_estimate_usdc);
                 }
+                cs.last_risk_relief_ts_ms = now_ms;
             }
+        } else {
+            cs.last_risk_relief_ts_ms = now_ms;
         }
         if cs.max_equity_usdc < cs.equity_estimate_usdc {
             cs.max_equity_usdc = cs.equity_estimate_usdc;
