@@ -1467,8 +1467,8 @@ export default function App() {
         </div>
         <div className="hero-right">
           <div className="live-indicator">
-            <span className={`dot ${wsStatus === "open" ? "ok" : ""}`} />
-            {wsStatus === "open" ? "实时连接" : "重连中"}
+            <span className={`dot ${isMarketView && wsStatus === "open" ? "ok" : ""}`} />
+            {isMarketView ? (wsStatus === "open" ? "实时连接" : "重连中") : "Paper视图"}
           </div>
           <div className="btn-group">
             {SYMBOL_OPTIONS.map((opt) => (
@@ -1498,19 +1498,30 @@ export default function App() {
             </button>
           </div>
           <div className="hero-meta">
-            <span>时区: {formatTimeZoneLabel(timeMode)}</span>
-            <span>交易对: {selectedSymbol}</span>
-            <span>5m: {formatTime(live["5m"]?.timestamp_ms, timeMode)}</span>
-            <span>15m: {formatTime(live["15m"]?.timestamp_ms, timeMode)}</span>
-            <span className={collectorStatus ? (collectorStatus.ok ? "up" : "down") : ""}>
-              {collectorOverallText}
-            </span>
-            <span>
-              5m采集: {collector5m?.status ?? "--"} · {formatAgeMs(collector5m?.age_ms ?? null)}
-            </span>
-            <span>
-              15m采集: {collector15m?.status ?? "--"} · {formatAgeMs(collector15m?.age_ms ?? null)}
-            </span>
+            {isMarketView ? (
+              <>
+                <span>时区: {formatTimeZoneLabel(timeMode)}</span>
+                <span>交易对: {selectedSymbol}</span>
+                <span>5m: {formatTime(live["5m"]?.timestamp_ms, timeMode)}</span>
+                <span>15m: {formatTime(live["15m"]?.timestamp_ms, timeMode)}</span>
+                <span className={collectorStatus ? (collectorStatus.ok ? "up" : "down") : ""}>
+                  {collectorOverallText}
+                </span>
+                <span>
+                  5m采集: {collector5m?.status ?? "--"} · {formatAgeMs(collector5m?.age_ms ?? null)}
+                </span>
+                <span>
+                  15m采集: {collector15m?.status ?? "--"} · {formatAgeMs(collector15m?.age_ms ?? null)}
+                </span>
+              </>
+            ) : (
+              <>
+                <span>时区: {formatTimeZoneLabel(timeMode)}</span>
+                <span>交易对: {selectedSymbol}</span>
+                <span>模式: Paper</span>
+                <span>Paper 页面不展示 WS / 采集状态</span>
+              </>
+            )}
           </div>
         </div>
       </header>
@@ -1679,24 +1690,26 @@ export default function App() {
         <PaperLabPage selectedSymbol={selectedSymbol} timeMode={timeMode} />
       )}
 
-      <footer className="status-row">
-        <span>WS状态: {wsStatus}</span>
-        <span>时区: {formatTimeZoneLabel(timeMode)}</span>
-        <span>5m最新Tick: {formatTime(live["5m"]?.timestamp_ms, timeMode)}</span>
-        <span>15m最新Tick: {formatTime(live["15m"]?.timestamp_ms, timeMode)}</span>
-        <span className={collectorStatus ? (collectorStatus.ok ? "up" : "down") : ""}>
-          {collectorOverallText}
-        </span>
-        <span>
-          5m采集延迟: {formatAgeMs(collector5m?.age_ms ?? null)} · 轮次{" "}
-          {collector5m?.round_id || "--"}
-        </span>
-        <span>
-          15m采集延迟: {formatAgeMs(collector15m?.age_ms ?? null)} · 轮次{" "}
-          {collector15m?.round_id || "--"}
-        </span>
-        {errorText ? <span className="down">{errorText}</span> : null}
-      </footer>
+      {isMarketView ? (
+        <footer className="status-row">
+          <span>WS状态: {wsStatus}</span>
+          <span>时区: {formatTimeZoneLabel(timeMode)}</span>
+          <span>5m最新Tick: {formatTime(live["5m"]?.timestamp_ms, timeMode)}</span>
+          <span>15m最新Tick: {formatTime(live["15m"]?.timestamp_ms, timeMode)}</span>
+          <span className={collectorStatus ? (collectorStatus.ok ? "up" : "down") : ""}>
+            {collectorOverallText}
+          </span>
+          <span>
+            5m采集延迟: {formatAgeMs(collector5m?.age_ms ?? null)} · 轮次{" "}
+            {collector5m?.round_id || "--"}
+          </span>
+          <span>
+            15m采集延迟: {formatAgeMs(collector15m?.age_ms ?? null)} · 轮次{" "}
+            {collector15m?.round_id || "--"}
+          </span>
+          {errorText ? <span className="down">{errorText}</span> : null}
+        </footer>
+      ) : null}
     </main>
   );
 }
