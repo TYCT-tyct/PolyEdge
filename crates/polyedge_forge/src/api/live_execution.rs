@@ -31,7 +31,7 @@ impl LiveGatewayConfig {
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(1.0)
-            .clamp(0.5, 1000.0);
+            .clamp(0.01, 1000.0);
         let entry_slippage_bps = std::env::var("FORGE_FEV1_ENTRY_SLIPPAGE_BPS")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
@@ -802,6 +802,67 @@ pub(super) fn can_retry_on_liquidity(reason: &str) -> bool {
         || r.contains("would not fill")
 }
 
+pub(super) fn is_live_exit_action(action: &str) -> bool {
+    let a = action.to_ascii_lowercase();
+    a == "exit" || a == "reduce"
+}
+
+pub(super) fn is_emergency_exit_reason(reason: &str) -> bool {
+    let r = reason.to_ascii_lowercase();
+    r.contains("stop_loss")
+        || r.contains("signal_reverse")
+        || r.contains("trail_drawdown")
+        || r.contains("liquidity_widen")
+        || r.contains("round_rollover")
+        || r.contains("blocked_exit_escalation")
+        || r.contains("panic_exit")
+        || r.contains("emergency")
+}
+
+pub(super) fn decision_is_emergency_exit(decision: &Value) -> bool {
+    let action = decision
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !is_live_exit_action(action) {
+        return false;
+    }
+    decision
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(is_emergency_exit_reason)
+        .unwrap_or(false)
+}
+
+pub(super) fn apply_emergency_exit_overrides(
+    decision: &mut Value,
+    gateway_cfg: &LiveGatewayConfig,
+) {
+    if !decision_is_emergency_exit(decision) {
+        return;
+    }
+    if let Some(obj) = decision.as_object_mut() {
+        obj.insert("tif".to_string(), json!("FAK"));
+        obj.insert("style".to_string(), json!("taker"));
+        let ttl_ms = obj
+            .get("ttl_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or(900)
+            .min(700)
+            .max(350);
+        obj.insert("ttl_ms".to_string(), json!(ttl_ms));
+        let slippage = obj
+            .get("max_slippage_bps")
+            .and_then(Value::as_f64)
+            .unwrap_or(gateway_cfg.exit_slippage_bps)
+            .max(gateway_cfg.exit_slippage_bps + 14.0)
+            .max(34.0)
+            .min(140.0);
+        obj.insert("max_slippage_bps".to_string(), json!(slippage));
+        obj.insert("emergency_exit".to_string(), Value::Bool(true));
+    }
+}
+
 pub(super) fn build_retry_payload(current: &Value, reason: &str, attempt: usize) -> Option<Value> {
     if attempt >= 2 || !can_retry_on_liquidity(reason) {
         return None;
@@ -811,7 +872,12 @@ pub(super) fn build_retry_payload(current: &Value, reason: &str, attempt: usize)
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let is_exit_like = action == "exit" || action == "reduce";
+    let is_exit_like = is_live_exit_action(&action);
+    let emergency_exit = current
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(is_emergency_exit_reason)
+        .unwrap_or(false);
     let mut next = current.clone();
     let current_slippage = current
         .get("max_slippage_bps")
@@ -832,14 +898,30 @@ pub(super) fn build_retry_payload(current: &Value, reason: &str, attempt: usize)
 
     if attempt == 0 {
         let boosted_slippage = if is_exit_like {
-            (current_slippage + 16.0).min(120.0)
+            if emergency_exit {
+                (current_slippage + 24.0).min(160.0)
+            } else {
+                (current_slippage + 16.0).min(120.0)
+            }
         } else {
             (current_slippage + 12.0).min(90.0)
         };
+        let next_ttl = if emergency_exit {
+            current_ttl.min(900).max(350)
+        } else {
+            (current_ttl + 400).min(5_000)
+        };
         if let Some(obj) = next.as_object_mut() {
             obj.insert("max_slippage_bps".to_string(), json!(boosted_slippage));
-            obj.insert("ttl_ms".to_string(), json!((current_ttl + 400).min(5_000)));
-            obj.insert("retry_tag".to_string(), json!("slippage_retry"));
+            obj.insert("ttl_ms".to_string(), json!(next_ttl));
+            obj.insert(
+                "retry_tag".to_string(),
+                json!(if emergency_exit {
+                    "emergency_slippage_retry"
+                } else {
+                    "slippage_retry"
+                }),
+            );
         }
         return Some(next);
     }
@@ -1426,7 +1508,14 @@ pub(super) async fn handle_pending_timeouts(state: &ApiState, gateway_cfg: &Live
                     row.tif.to_ascii_uppercase().as_str(),
                     "GTD" | "GTC" | "POST_ONLY"
                 );
-                if maker_tif && row.retry_count < 1 {
+                let exit_like = is_live_exit_action(&row.action);
+                let emergency_exit = exit_like && is_emergency_exit_reason(&row.submit_reason);
+                let can_retry = if emergency_exit {
+                    row.retry_count < 2
+                } else {
+                    row.retry_count < 1
+                };
+                if (maker_tif || emergency_exit) && can_retry {
                     let maybe_target = resolve_live_market_target(&row.market_type).await.ok();
                     if let Some(target) = maybe_target {
                         let decision = json!({
@@ -1438,8 +1527,12 @@ pub(super) async fn handle_pending_timeouts(state: &ApiState, gateway_cfg: &Live
                             "reason": format!("{}_timeout_fallback_fak", row.submit_reason),
                             "tif": "FAK",
                             "style": "taker",
-                            "ttl_ms": 900,
-                            "max_slippage_bps": gateway_cfg.exit_slippage_bps.max(gateway_cfg.entry_slippage_bps) + 10.0
+                            "ttl_ms": if emergency_exit { 700 } else { 900 },
+                            "max_slippage_bps": if emergency_exit {
+                                (gateway_cfg.exit_slippage_bps + 18.0).max(38.0)
+                            } else {
+                                gateway_cfg.exit_slippage_bps.max(gateway_cfg.entry_slippage_bps) + 10.0
+                            }
                         });
                         let token_id =
                             token_id_for_decision(&decision, &target).map(str::to_string);
@@ -1476,7 +1569,7 @@ pub(super) async fn handle_pending_timeouts(state: &ApiState, gateway_cfg: &Live
                                         pending.tif = "FAK".to_string();
                                         pending.style = "taker".to_string();
                                         pending.submitted_ts_ms = now_ms;
-                                        pending.cancel_after_ms = 1500;
+                                        pending.cancel_after_ms = if emergency_exit { 700 } else { 1500 };
                                         state.upsert_pending_order(pending).await;
                                         state
                                             .append_live_event(
@@ -1491,7 +1584,8 @@ pub(super) async fn handle_pending_timeouts(state: &ApiState, gateway_cfg: &Live
                                                     "gateway_endpoint": submit_endpoint,
                                                     "cancel_response": v.clone(),
                                                     "submit_response": resp,
-                                                    "book_snapshot": book_snapshot
+                                                    "book_snapshot": book_snapshot,
+                                                    "emergency_exit": emergency_exit
                                                 }),
                                             )
                                             .await;
@@ -1610,6 +1704,7 @@ pub(super) async fn execute_live_orders_via_gateway(
                 }
             }
         }
+        apply_emergency_exit_overrides(&mut decision, gateway_cfg);
         let token_id = token_id_for_decision(&decision, target).map(str::to_string);
         let book_snapshot = if let Some(token_id) = token_id.clone() {
             if let Some(cached) = book_cache.get(&token_id) {
@@ -2023,6 +2118,7 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                 }
             }
         }
+        apply_emergency_exit_overrides(&mut decision, gateway_cfg);
         let token_id = token_id_for_decision(&decision, target).map(str::to_string);
         let book_snapshot = if let Some(token_id) = token_id.clone() {
             if let Some(cached) = book_cache.get(&token_id) {
@@ -2267,7 +2363,14 @@ pub(super) async fn handle_pending_timeouts_rust(
                     row.tif.to_ascii_uppercase().as_str(),
                     "GTD" | "GTC" | "POST_ONLY"
                 );
-                if maker_tif && row.retry_count < 1 {
+                let exit_like = is_live_exit_action(&row.action);
+                let emergency_exit = exit_like && is_emergency_exit_reason(&row.submit_reason);
+                let can_retry = if emergency_exit {
+                    row.retry_count < 2
+                } else {
+                    row.retry_count < 1
+                };
+                if (maker_tif || emergency_exit) && can_retry {
                     let maybe_target = resolve_live_market_target(&row.market_type).await.ok();
                     if let Some(target) = maybe_target {
                         let decision = json!({
@@ -2279,7 +2382,12 @@ pub(super) async fn handle_pending_timeouts_rust(
                             "reason": format!("{}_timeout_fallback_fak", row.submit_reason),
                             "tif": "FAK",
                             "style": "taker",
-                            "ttl_ms": 900
+                            "ttl_ms": if emergency_exit { 700 } else { 900 },
+                            "max_slippage_bps": if emergency_exit {
+                                (gateway_cfg.exit_slippage_bps + 18.0).max(38.0)
+                            } else {
+                                gateway_cfg.exit_slippage_bps.max(gateway_cfg.entry_slippage_bps) + 10.0
+                            }
                         });
                         let token_id =
                             token_id_for_decision(&decision, &target).map(str::to_string);
@@ -2321,7 +2429,7 @@ pub(super) async fn handle_pending_timeouts_rust(
                                         pending.tif = "FAK".to_string();
                                         pending.style = "taker".to_string();
                                         pending.submitted_ts_ms = now_ms;
-                                        pending.cancel_after_ms = 1500;
+                                        pending.cancel_after_ms = if emergency_exit { 700 } else { 1500 };
                                         state.upsert_pending_order(pending).await;
                                         state
                                             .append_live_event(
@@ -2336,7 +2444,8 @@ pub(super) async fn handle_pending_timeouts_rust(
                                                     "cancelled": resp.canceled,
                                                     "not_cancelled": resp.not_canceled,
                                                     "submit_response": submit_resp,
-                                                    "book_snapshot": book_snapshot
+                                                    "book_snapshot": book_snapshot,
+                                                    "emergency_exit": emergency_exit
                                                 }),
                                             )
                                             .await;
@@ -2551,28 +2660,70 @@ pub(super) async fn execute_live_orders(
     position_state: &LivePositionState,
     decisions: &[LiveGatedDecision],
 ) -> Vec<Value> {
-    let has_exit_like = decisions.iter().any(|d| {
+    let mut prioritized = decisions.to_vec();
+    prioritized.sort_by_key(|d| {
+        let action = d
+            .decision
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if is_live_exit_action(&action) {
+            0_u8
+        } else if action == "enter" || action == "add" {
+            2_u8
+        } else {
+            1_u8
+        }
+    });
+    let has_exit_like = prioritized.iter().any(|d| {
         d.decision
             .get("action")
             .and_then(Value::as_str)
             .map(|a| {
                 let a = a.to_ascii_lowercase();
-                a == "exit" || a == "reduce"
+                is_live_exit_action(&a)
             })
             .unwrap_or(false)
     });
+    let mut deferred = Vec::<Value>::new();
+    if has_exit_like {
+        prioritized.retain(|d| {
+            let action = d
+                .decision
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if action == "enter" || action == "add" {
+                deferred.push(json!({
+                    "ok": false,
+                    "accepted": false,
+                    "decision_key": d.decision_key,
+                    "decision": d.decision,
+                    "reason": "deferred_due_exit_priority"
+                }));
+                false
+            } else {
+                true
+            }
+        });
+    }
     if has_exit_like {
         let _ = flush_entry_pending_before_exit(state, gateway_cfg, mode, market_type).await;
     }
-
-    match mode {
+    let mut out = match mode {
         LiveExecutorMode::Gateway => {
-            execute_live_orders_via_gateway(state, gateway_cfg, target, position_state, decisions)
+            execute_live_orders_via_gateway(state, gateway_cfg, target, position_state, &prioritized)
                 .await
         }
         LiveExecutorMode::RustSdk => {
-            execute_live_orders_via_rust_sdk(state, gateway_cfg, target, position_state, decisions)
+            execute_live_orders_via_rust_sdk(state, gateway_cfg, target, position_state, &prioritized)
                 .await
         }
+    };
+    if !deferred.is_empty() {
+        out.extend(deferred);
     }
+    out
 }

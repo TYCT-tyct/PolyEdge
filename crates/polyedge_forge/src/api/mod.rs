@@ -852,7 +852,7 @@ impl LiveRuntimeConfig {
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(1.0)
-            .clamp(0.5, 500.0);
+            .clamp(0.01, 500.0);
         let markets = std::env::var("FORGE_FEV1_RUNTIME_MARKETS")
             .ok()
             .map(|raw| {
@@ -1242,7 +1242,7 @@ impl ApiState {
             cs.available_to_trade_usdc = 0.0;
             cs.utilization_ratio = 0.0;
             cs.risk_state = "lockdown".to_string();
-            cs.last_quote_usdc = min_quote_usdc.max(0.5);
+            cs.last_quote_usdc = min_quote_usdc.max(0.01);
             cs.balance_sync_ok = false;
             cs.balance_sync_error = balance_sync_error.clone();
             cs.updated_ts_ms = Utc::now().timestamp_millis();
@@ -1313,7 +1313,7 @@ impl ApiState {
             leg_ratio *= 0.1;
         }
         let mut quote_by_capital = (available * leg_ratio).max(0.0);
-        let quote_floor = min_quote_usdc.max(0.5);
+        let quote_floor = min_quote_usdc.max(0.01);
         let (rolling_n, rolling_wr, _, _) = rolling_pnl_stats(&cs.recent_realized_pnls);
         if cfg.kelly_enabled && rolling_n >= cfg.kelly_min_samples {
             let p = rolling_wr.clamp(0.01, 0.99);

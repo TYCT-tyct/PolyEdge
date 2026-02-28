@@ -91,6 +91,18 @@ fn live_execution_market_allowed(market_type: &str) -> bool {
         .any(|v| v.as_str() == market_type)
 }
 
+fn live_quote_from_price_enabled() -> bool {
+    std::env::var("FORGE_FEV1_LIVE_QUOTE_FROM_PRICE")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn resolve_strategy_market_type(raw: Option<&str>) -> Result<&'static str, ApiError> {
     let market_type = if let Some(mt) = raw {
         normalize_market_type(mt).ok_or_else(|| ApiError::bad_request("invalid market_type"))?
@@ -1041,6 +1053,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
 
     let live_gateway_cfg = LiveGatewayConfig::from_env();
     let capital_cfg = LiveCapitalConfig::from_env();
+    let quote_from_price = live_quote_from_price_enabled();
     let capital_scope = if capital_cfg.portfolio_shared {
         LIVE_CAPITAL_PORTFOLIO_SCOPE
     } else {
@@ -1234,15 +1247,30 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                     .and_then(Value::as_f64)
                     .unwrap_or(dynamic_quote_usdc)
                     .max(live_gateway_cfg.min_quote_usdc);
-                let tuned_q = dynamic_entry_quote(
-                    &d,
-                    q,
-                    live_gateway_cfg.min_quote_usdc,
-                    &capital_before,
-                    &capital_cfg,
-                );
+                let tuned_q = if quote_from_price {
+                    let px = d
+                        .get("price_cents")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(50.0)
+                        .clamp(1.0, 99.0);
+                    (px / 100.0).max(live_gateway_cfg.min_quote_usdc)
+                } else {
+                    dynamic_entry_quote(
+                        &d,
+                        q,
+                        live_gateway_cfg.min_quote_usdc,
+                        &capital_before,
+                        &capital_cfg,
+                    )
+                };
                 if let Some(obj) = d.as_object_mut() {
                     obj.insert("quote_size_usdc".to_string(), json!(tuned_q));
+                    if quote_from_price {
+                        obj.insert(
+                            "quote_source".to_string(),
+                            Value::String("price_prob_usdc".to_string()),
+                        );
+                    }
                 }
             }
         } else if action == "add" {
@@ -1404,6 +1432,14 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                                 .and_then(Value::as_f64)
                                 .unwrap_or(filled_size * exec_price)
                                 .max(0.0);
+                            let submit_reason = decision
+                                .get("reason")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            let is_exit_like = is_live_exit_action(&action);
+                            let emergency_exit =
+                                is_exit_like && is_emergency_exit_reason(&submit_reason);
                             let pending = LivePendingOrder {
                                 market_type: market_type.to_string(),
                                 order_id,
@@ -1437,14 +1473,10 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                                     .and_then(Value::as_str)
                                     .unwrap_or_default()
                                     .to_string(),
-                                submit_reason: decision
-                                    .get("reason")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_string(),
+                                submit_reason,
                                 submitted_ts_ms: ts_ms,
-                                cancel_after_ms: if action == "exit" || action == "reduce" {
-                                    900
+                                cancel_after_ms: if is_exit_like {
+                                    if emergency_exit { 650 } else { 900 }
                                 } else {
                                     1500
                                 },
