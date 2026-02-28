@@ -1912,6 +1912,10 @@ async fn discover_markets(symbols: &[String], timeframes: &[String]) -> Result<V
         out.push(to_market_meta(m, tf, start_ts_ms, end_ts_ms));
     }
 
+    if out.is_empty() {
+        anyhow::bail!("discovery returned no usable markets");
+    }
+
     Ok(out)
 }
 
