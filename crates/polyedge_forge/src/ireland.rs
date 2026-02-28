@@ -821,9 +821,16 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         kept = kept.saturating_add(1);
                     }
                 }
+                let mut kept_pairs = markets_by_id
+                    .values()
+                    .map(|m| format!("{}:{}", m.symbol, m.timeframe))
+                    .collect::<Vec<_>>();
+                kept_pairs.sort();
+                kept_pairs.dedup();
                 tracing::info!(
                     received_markets = received,
                     kept_markets = kept,
+                    kept_pairs = kept_pairs.join(","),
                     "market meta update applied"
                 );
             }
