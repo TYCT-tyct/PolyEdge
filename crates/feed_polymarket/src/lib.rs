@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::time::Duration;
+use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use core_types::{
@@ -11,7 +13,7 @@ use futures::{SinkExt, StreamExt};
 use market_discovery::{DiscoveryConfig, MarketDiscovery};
 use rand::Rng;
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
@@ -98,6 +100,52 @@ impl PolymarketFeed {
         }
     }
 
+    fn cache_key(&self) -> String {
+        let mut symbols = self.symbols.clone();
+        symbols.sort();
+        symbols.dedup();
+        let mut market_types = self.market_types.clone();
+        market_types.sort();
+        market_types.dedup();
+        let mut timeframes = self.timeframes.clone();
+        timeframes.sort();
+        timeframes.dedup();
+        format!(
+            "symbols={}|types={}|tfs={}",
+            symbols.join(","),
+            market_types.join(","),
+            timeframes.join(",")
+        )
+    }
+
+    async fn read_cached_markets(&self) -> Option<HashMap<String, MarketState>> {
+        let key = self.cache_key();
+        {
+            let cache = target_market_cache().read().await;
+            if let Some(markets) = cache.get(&key).cloned() {
+                return Some(markets);
+            }
+        }
+
+        let disk_cache = read_target_market_cache_file().await?;
+        let markets = disk_cache.get(&key).cloned()?;
+        let mut cache = target_market_cache().write().await;
+        cache.insert(key, markets.clone());
+        Some(markets)
+    }
+
+    async fn write_cached_markets(&self, markets: &HashMap<String, MarketState>) {
+        let key = self.cache_key();
+        let snapshot = {
+            let mut cache = target_market_cache().write().await;
+            cache.insert(key, markets.clone());
+            cache.clone()
+        };
+        if let Err(err) = write_target_market_cache_file(&snapshot).await {
+            tracing::warn!(?err, "persist target market cache failed");
+        }
+    }
+
     pub async fn fetch_active_books(&self) -> Result<Vec<BookTop>> {
         let markets = self.discover_target_markets().await?;
         let mut out = Vec::new();
@@ -136,6 +184,7 @@ impl PolymarketFeed {
                 market.market_id.clone(),
                 MarketState {
                     market_id: market.market_id,
+                    timeframe: market.timeframe,
                     yes_token: yes,
                     no_token: no,
                     yes: AssetTop {
@@ -162,6 +211,7 @@ impl PolymarketFeed {
             return Err(anyhow!("no active target markets discovered"));
         }
 
+        self.write_cached_markets(&out).await;
         Ok(out)
     }
 
@@ -183,12 +233,43 @@ impl PolymarketFeed {
     }
 
     async fn run_market_loop(&self, tx: &mpsc::Sender<BookTop>) -> Result<()> {
-        let mut markets = self.discover_target_markets().await?;
+        let mut markets = match self.discover_target_markets().await {
+            Ok(v) => v,
+            Err(err) => {
+                if let Some(cached) = self.read_cached_markets().await {
+                    tracing::warn!(
+                        ?err,
+                        cached_markets = cached.len(),
+                        "discover target markets failed, using cached markets"
+                    );
+                    cached
+                } else {
+                    return Err(err);
+                }
+            }
+        };
 
         for state in markets.values() {
             if tx.send(state.to_book_top()).await.is_err() {
                 return Ok(());
             }
+        }
+
+        let idle_break_sec = std::env::var("POLYEDGE_MARKET_WS_IDLE_BREAK_SEC")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(25)
+            .max(10);
+        let default_idle_break = Duration::from_secs(idle_break_sec);
+        let mut market_idle_break = HashMap::<String, Duration>::new();
+        let now = Instant::now();
+        let mut market_last_update_at = HashMap::<String, Instant>::new();
+        for (market_id, state) in &markets {
+            market_idle_break.insert(
+                market_id.clone(),
+                market_stale_timeout(state, default_idle_break),
+            );
+            market_last_update_at.insert(market_id.clone(), now);
         }
 
         let asset_map = build_asset_to_market_map(&markets);
@@ -220,6 +301,9 @@ impl PolymarketFeed {
 
         let mut ping = tokio::time::interval(Duration::from_secs(15));
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut idle_tick = tokio::time::interval(Duration::from_secs(5));
+        idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_update_at = Instant::now();
         // Many Polymarket markets (especially 5m/15m contracts) expire quickly. If the WS
         // connection stays up, we would otherwise keep subscribing to stale/closed assets and
         // stop seeing updates. Force a periodic re-discovery + resubscribe.
@@ -227,7 +311,7 @@ impl PolymarketFeed {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(30));
+            .unwrap_or(Duration::from_secs(180));
         let refresh_deadline = tokio::time::sleep(refresh_every);
         tokio::pin!(refresh_deadline);
         let mut parse_failures = 0_u64;
@@ -236,6 +320,45 @@ impl PolymarketFeed {
 
         loop {
             tokio::select! {
+                _ = idle_tick.tick() => {
+                    let now = Instant::now();
+                    let mut stale_market: Option<(String, u64, u64, Option<String>)> = None;
+                    for (market_id, updated_at) in &market_last_update_at {
+                        let timeout = market_idle_break
+                            .get(market_id)
+                            .copied()
+                            .unwrap_or(default_idle_break);
+                        let elapsed = now.saturating_duration_since(*updated_at);
+                        if elapsed >= timeout {
+                            let timeframe = markets.get(market_id).and_then(|m| m.timeframe.clone());
+                            stale_market = Some((
+                                market_id.clone(),
+                                elapsed.as_secs(),
+                                timeout.as_secs(),
+                                timeframe,
+                            ));
+                            break;
+                        }
+                    }
+                    if let Some((market_id, idle_sec, idle_break_sec_market, timeframe)) = stale_market {
+                        tracing::warn!(
+                            %market_id,
+                            timeframe = timeframe.as_deref().unwrap_or("unknown"),
+                            idle_sec,
+                            idle_break_sec_market,
+                            "polymarket market ws stale market detected, reconnecting"
+                        );
+                        break;
+                    }
+                    if last_update_at.elapsed().as_secs() >= idle_break_sec {
+                        tracing::warn!(
+                            idle_sec = last_update_at.elapsed().as_secs(),
+                            idle_break_sec,
+                            "polymarket market ws idle too long, reconnecting"
+                        );
+                        break;
+                    }
+                }
                 _ = &mut refresh_deadline => {
                     tracing::info!(
                         refresh_sec = refresh_every.as_secs(),
@@ -362,6 +485,9 @@ impl PolymarketFeed {
                             if tx.send(state.to_book_top()).await.is_err() {
                                 return Ok(());
                             }
+                            let now = Instant::now();
+                            last_update_at = now;
+                            market_last_update_at.insert(market_id, now);
                         }
                     }
                 }
@@ -370,6 +496,53 @@ impl PolymarketFeed {
 
         Ok(())
     }
+}
+
+fn target_market_cache(
+) -> &'static tokio::sync::RwLock<HashMap<String, HashMap<String, MarketState>>> {
+    static CACHE: OnceLock<tokio::sync::RwLock<HashMap<String, HashMap<String, MarketState>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
+}
+
+fn target_market_cache_file_path() -> PathBuf {
+    if let Ok(raw) = std::env::var("POLYEDGE_TARGET_MARKET_CACHE_FILE") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    std::env::temp_dir().join("polyedge_target_market_cache.json")
+}
+
+async fn read_target_market_cache_file() -> Option<HashMap<String, HashMap<String, MarketState>>> {
+    let path = target_market_cache_file_path();
+    let raw = tokio::fs::read_to_string(&path).await.ok()?;
+    match serde_json::from_str::<HashMap<String, HashMap<String, MarketState>>>(&raw) {
+        Ok(v) if !v.is_empty() => Some(v),
+        Ok(_) => None,
+        Err(err) => {
+            tracing::warn!(?err, path = %path.display(), "parse target market cache file failed");
+            None
+        }
+    }
+}
+
+async fn write_target_market_cache_file(
+    cache: &HashMap<String, HashMap<String, MarketState>>,
+) -> Result<()> {
+    let path = target_market_cache_file_path();
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("create cache dir: {}", parent.display()))?;
+    }
+    let payload =
+        serde_json::to_vec(cache).context("serialize target market cache for persistence")?;
+    tokio::fs::write(&path, payload)
+        .await
+        .with_context(|| format!("write target market cache: {}", path.display()))?;
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -555,6 +728,29 @@ fn build_asset_to_market_map(
         out.insert(state.no_token.clone(), (market_id.clone(), false));
     }
     out
+}
+
+fn market_stale_timeout(state: &MarketState, fallback: Duration) -> Duration {
+    fn env_secs(key: &str, default: u64, min: u64, max: u64) -> u64 {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(default)
+            .clamp(min, max)
+    }
+    let timeframe = state
+        .timeframe
+        .as_deref()
+        .map(|v| v.trim().to_ascii_lowercase());
+    match timeframe.as_deref() {
+        Some("5m") => Duration::from_secs(env_secs("POLYEDGE_MARKET_IDLE_BREAK_SEC_5M", 20, 5, 300)),
+        Some("15m") => {
+            Duration::from_secs(env_secs("POLYEDGE_MARKET_IDLE_BREAK_SEC_15M", 35, 5, 300))
+        }
+        Some("1h") => Duration::from_secs(env_secs("POLYEDGE_MARKET_IDLE_BREAK_SEC_1H", 45, 5, 600)),
+        Some("1d") => Duration::from_secs(env_secs("POLYEDGE_MARKET_IDLE_BREAK_SEC_1D", 60, 5, 900)),
+        _ => fallback,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1041,7 +1237,7 @@ where
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct AssetTop {
     bid: f64,
     ask: f64,
@@ -1051,9 +1247,11 @@ struct AssetTop {
     recv_ts_local_ns: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct MarketState {
     market_id: String,
+    #[serde(default)]
+    timeframe: Option<String>,
     yes_token: String,
     no_token: String,
     yes: AssetTop,
