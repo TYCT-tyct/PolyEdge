@@ -827,14 +827,22 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
     if let Ok(seed_markets) =
         discover_markets_from_target_cache(&subscribe_symbols, &subscribe_tfs).await
     {
+        let seed_now_ms = Utc::now().timestamp_millis();
         for market in seed_markets {
-            if market_filter.allows(&market.symbol, &market.timeframe) {
-                candidate_markets_by_pair
-                    .entry(market_pair_key(&market))
-                    .or_default()
-                    .push(market.clone());
-                markets_by_id.insert(market.market_id.clone(), market);
+            if !market_filter.allows(&market.symbol, &market.timeframe) {
+                continue;
             }
+            if seed_now_ms.saturating_add(market_prestart_allow_ms) < market.start_ts_ms {
+                continue;
+            }
+            if seed_now_ms > market.end_ts_ms.saturating_add(MARKET_STALE_GUARD_MS) {
+                continue;
+            }
+            candidate_markets_by_pair
+                .entry(market_pair_key(&market))
+                .or_default()
+                .push(market.clone());
+            markets_by_id.insert(market.market_id.clone(), market);
         }
         for markets in candidate_markets_by_pair.values_mut() {
             markets.sort_by_key(|m| market_selection_rank(m, Utc::now().timestamp_millis()));
@@ -919,7 +927,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     if now_ms > prev.end_ts_ms.saturating_add(MARKET_STALE_GUARD_MS) {
                         continue;
                     }
-                    if now_ms.saturating_add(market_future_guard_ms) < prev.start_ts_ms {
+                    if now_ms.saturating_add(market_prestart_allow_ms) < prev.start_ts_ms {
                         continue;
                     }
                     markets_by_id.insert(prev.market_id.clone(), prev.clone());
