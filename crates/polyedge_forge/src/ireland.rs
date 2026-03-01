@@ -213,10 +213,6 @@ fn market_selection_rank(m: &MarketMeta, now_ms: i64) -> (u8, i64, i64) {
     )
 }
 
-fn market_is_preferred(candidate: &MarketMeta, current: &MarketMeta, now_ms: i64) -> bool {
-    market_selection_rank(candidate, now_ms) < market_selection_rank(current, now_ms)
-}
-
 fn round_meta_is_fresh(round_id: &str, now_ms: i64, retention_ms: i64) -> bool {
     round_end_ts_ms_from_round_id(round_id)
         .map(|round_end_ms| now_ms <= round_end_ms.saturating_add(retention_ms))
@@ -827,13 +823,22 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
     let mut book_by_market: HashMap<String, BookTop> = HashMap::new();
     let mut quote_cache_by_market: HashMap<String, (f64, f64, f64, f64)> = HashMap::new();
     let mut markets_by_id: HashMap<String, MarketMeta> = HashMap::new();
+    let mut candidate_markets_by_pair: HashMap<String, Vec<MarketMeta>> = HashMap::new();
     if let Ok(seed_markets) =
         discover_markets_from_target_cache(&subscribe_symbols, &subscribe_tfs).await
     {
         for market in seed_markets {
             if market_filter.allows(&market.symbol, &market.timeframe) {
+                candidate_markets_by_pair
+                    .entry(market_pair_key(&market))
+                    .or_default()
+                    .push(market.clone());
                 markets_by_id.insert(market.market_id.clone(), market);
             }
+        }
+        for markets in candidate_markets_by_pair.values_mut() {
+            markets.sort_by_key(|m| market_selection_rank(m, Utc::now().timestamp_millis()));
+            markets.dedup_by(|a, b| a.market_id == b.market_id);
         }
         if !markets_by_id.is_empty() {
             let mut seeded_pairs = markets_by_id
@@ -922,13 +927,21 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     sticky_reused = sticky_reused.saturating_add(1);
                 }
                 let mut selected_by_pair: HashMap<String, MarketMeta> = HashMap::new();
+                let mut candidates_by_pair: HashMap<String, Vec<MarketMeta>> = HashMap::new();
                 for market in markets_by_id.values() {
                     let pair_key = market_pair_key(market);
-                    match selected_by_pair.get(&pair_key) {
-                        Some(existing) if !market_is_preferred(market, existing, now_ms) => {}
-                        _ => {
-                            selected_by_pair.insert(pair_key, market.clone());
-                        }
+                    candidates_by_pair
+                        .entry(pair_key)
+                        .or_default()
+                        .push(market.clone());
+                }
+                for markets in candidates_by_pair.values_mut() {
+                    markets.sort_by_key(|m| market_selection_rank(m, now_ms));
+                    markets.dedup_by(|a, b| a.market_id == b.market_id);
+                }
+                for (pair_key, markets) in &candidates_by_pair {
+                    if let Some(best) = markets.first() {
+                        selected_by_pair.insert(pair_key.clone(), best.clone());
                     }
                 }
                 let mut missing_required_pairs: HashSet<String> = required_pair_keys
@@ -949,13 +962,15 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             if !missing_required_pairs.contains(&pair_key) {
                                 continue;
                             }
-                            match selected_by_pair.get(&pair_key) {
-                                Some(existing)
-                                    if !market_is_preferred(&market, existing, now_ms) => {}
-                                _ => {
-                                    selected_by_pair.insert(pair_key.clone(), market);
-                                    cache_repaired = cache_repaired.saturating_add(1);
-                                }
+                            let entry = candidates_by_pair.entry(pair_key.clone()).or_default();
+                            if !entry.iter().any(|m| m.market_id == market.market_id) {
+                                entry.push(market);
+                                entry.sort_by_key(|m| market_selection_rank(m, now_ms));
+                                entry.dedup_by(|a, b| a.market_id == b.market_id);
+                                cache_repaired = cache_repaired.saturating_add(1);
+                            }
+                            if let Some(best) = entry.first() {
+                                selected_by_pair.insert(pair_key.clone(), best.clone());
                             }
                             if selected_by_pair.contains_key(&pair_key) {
                                 missing_required_pairs.remove(&pair_key);
@@ -973,6 +988,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     }
                     markets_by_id = reduced;
                 }
+                candidate_markets_by_pair = candidates_by_pair;
                 let mut kept_pairs = markets_by_id
                     .values()
                     .map(|m| format!("{}:{}", m.symbol, m.timeframe))
@@ -1005,7 +1021,21 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                 prob_smooth_by_round.retain(|_, v| {
                     now_ms.saturating_sub(v.ts_ms) <= PROB_STATE_RETENTION_MS
                 });
-                for market in markets_by_id.values() {
+                for primary_market in markets_by_id.values() {
+                    let pair_key = market_pair_key(primary_market);
+                    let mut market = primary_market.clone();
+                    let mut book = book_by_market.get(&market.market_id);
+                    if book.is_none() {
+                        if let Some(candidates) = candidate_markets_by_pair.get(&pair_key) {
+                            if let Some(alt_market) = candidates
+                                .iter()
+                                .find(|m| book_by_market.contains_key(&m.market_id))
+                            {
+                                market = alt_market.clone();
+                                book = book_by_market.get(&market.market_id);
+                            }
+                        }
+                    }
                     if now_ms + market_future_guard_ms < market.start_ts_ms {
                         continue;
                     }
@@ -1016,7 +1046,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         continue;
                     }
 
-                    let Some(book) = book_by_market.get(&market.market_id) else {
+                    let Some(book) = book else {
                         continue;
                     };
                     let stable_quote = match stabilize_book_quotes(
@@ -1330,7 +1360,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     };
                     let round_buf = round_buffers
                         .entry(round_id.clone())
-                        .or_insert_with(|| RoundBuffer::new(round_id.clone(), market));
+                        .or_insert_with(|| RoundBuffer::new(round_id.clone(), &market));
                     if let Some(tx) = sink_tx.as_ref() {
                         if let Err(err) = tx.send(DbEvent::Snapshot(Box::new(row.clone()))).await {
                             tracing::warn!(?err, "db sink closed while sending live snapshot");
@@ -1585,8 +1615,13 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                 if now_ms >= next_housekeeping_ms {
                     next_housekeeping_ms = now_ms.saturating_add(RECORDER_HOUSEKEEPING_INTERVAL_MS);
 
-                    let active_market_ids: HashSet<&str> =
+                    let mut active_market_ids: HashSet<&str> =
                         markets_by_id.keys().map(String::as_str).collect();
+                    for candidates in candidate_markets_by_pair.values() {
+                        for market in candidates {
+                            active_market_ids.insert(market.market_id.as_str());
+                        }
+                    }
                     book_by_market.retain(|market_id, _| active_market_ids.contains(market_id.as_str()));
                     quote_cache_by_market
                         .retain(|market_id, _| active_market_ids.contains(market_id.as_str()));

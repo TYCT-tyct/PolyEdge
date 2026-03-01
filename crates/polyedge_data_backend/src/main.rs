@@ -17,14 +17,18 @@ use core_types::{BookTop, MarketFeed, RefPriceWsFeed};
 use feed_polymarket::PolymarketFeed;
 use feed_reference::MultiSourceRefFeed;
 use futures::StreamExt;
-use market_discovery::{DiscoveryConfig, MarketDiscovery, MarketDescriptor};
+use market_discovery::{DiscoveryConfig, MarketDescriptor, MarketDiscovery};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, RwLock};
 
 #[derive(Parser, Debug)]
-#[command(name = "polyedge-data-backend", version, about = "Independent high-resolution data backend")]
+#[command(
+    name = "polyedge-data-backend",
+    version,
+    about = "Independent high-resolution data backend"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -42,7 +46,11 @@ enum Command {
 
 #[derive(clap::Args, Debug, Clone)]
 struct TokyoCollectorArgs {
-    #[arg(long, env = "POLYEDGE_DATA_ROOT", default_value = "datasets/research_backend")]
+    #[arg(
+        long,
+        env = "POLYEDGE_DATA_ROOT",
+        default_value = "datasets/research_backend"
+    )]
     dataset_root: String,
     #[arg(long, env = "POLYEDGE_SYMBOLS", default_value = "BTCUSDT")]
     symbols: String,
@@ -54,13 +62,21 @@ struct TokyoCollectorArgs {
 
 #[derive(clap::Args, Debug, Clone)]
 struct IrelandIngestArgs {
-    #[arg(long, env = "POLYEDGE_DATA_ROOT", default_value = "/data/polyedge-data")]
+    #[arg(
+        long,
+        env = "POLYEDGE_DATA_ROOT",
+        default_value = "/data/polyedge-data"
+    )]
     dataset_root: String,
     #[arg(long, env = "POLYEDGE_SYMBOLS", default_value = "BTCUSDT")]
     symbols: String,
     #[arg(long, env = "POLYEDGE_TIMEFRAMES", default_value = "5m,15m")]
     timeframes: String,
-    #[arg(long, env = "POLYEDGE_IRELAND_UDP_BIND", default_value = "0.0.0.0:9801")]
+    #[arg(
+        long,
+        env = "POLYEDGE_IRELAND_UDP_BIND",
+        default_value = "0.0.0.0:9801"
+    )]
     udp_bind: String,
     #[arg(long, env = "POLYEDGE_SNAPSHOT_MS", default_value_t = 100)]
     snapshot_ms: u64,
@@ -70,7 +86,11 @@ struct IrelandIngestArgs {
     clickhouse_url: String,
     #[arg(long, env = "POLYEDGE_CH_DATABASE", default_value = "polyedge")]
     clickhouse_database: String,
-    #[arg(long, env = "POLYEDGE_CH_SNAPSHOT_TABLE", default_value = "snapshot_100ms")]
+    #[arg(
+        long,
+        env = "POLYEDGE_CH_SNAPSHOT_TABLE",
+        default_value = "snapshot_100ms"
+    )]
     clickhouse_snapshot_table: String,
     #[arg(long, env = "POLYEDGE_CH_TTL_DAYS", default_value_t = 30)]
     clickhouse_ttl_days: u32,
@@ -90,7 +110,11 @@ struct IrelandIngestArgs {
 
 #[derive(clap::Args, Debug, Clone)]
 struct ApiArgs {
-    #[arg(long, env = "POLYEDGE_DATA_ROOT", default_value = "/data/polyedge-data")]
+    #[arg(
+        long,
+        env = "POLYEDGE_DATA_ROOT",
+        default_value = "/data/polyedge-data"
+    )]
     dataset_root: String,
     #[arg(long, env = "POLYEDGE_API_BIND", default_value = "0.0.0.0:8095")]
     bind: String,
@@ -371,7 +395,8 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
     let discover_symbols = symbols.clone();
     let discover_tfs = timeframes.clone();
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(args.discovery_refresh_sec.max(1)));
+        let mut tick =
+            tokio::time::interval(Duration::from_secs(args.discovery_refresh_sec.max(1)));
         let mut ptb_cache = HashMap::<String, f64>::new();
         let mut ptb_retry_after = HashMap::<String, i64>::new();
         loop {
@@ -403,23 +428,20 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
                                 meta.target_price = Some(v);
                                 meta.target_source = Some("pm_event_price_to_beat".to_string());
                             }
-                            Ok(_) => {
-                                match fetch_page_price_to_beat(slug).await {
-                                    Ok(Some(v)) if v.is_finite() && v > 100.0 => {
-                                        ptb_cache.insert(slug.to_string(), v);
-                                        meta.target_price = Some(v);
-                                        meta.target_source =
-                                            Some("pm_page_price_to_beat".to_string());
-                                    }
-                                    Ok(_) => {
-                                        ptb_retry_after.insert(slug.to_string(), now + 5_000);
-                                    }
-                                    Err(err) => {
-                                        tracing::debug!(?err, event_slug = %slug, "page priceToBeat fetch failed");
-                                        ptb_retry_after.insert(slug.to_string(), now + 5_000);
-                                    }
+                            Ok(_) => match fetch_page_price_to_beat(slug).await {
+                                Ok(Some(v)) if v.is_finite() && v > 100.0 => {
+                                    ptb_cache.insert(slug.to_string(), v);
+                                    meta.target_price = Some(v);
+                                    meta.target_source = Some("pm_page_price_to_beat".to_string());
                                 }
-                            }
+                                Ok(_) => {
+                                    ptb_retry_after.insert(slug.to_string(), now + 5_000);
+                                }
+                                Err(err) => {
+                                    tracing::debug!(?err, event_slug = %slug, "page priceToBeat fetch failed");
+                                    ptb_retry_after.insert(slug.to_string(), now + 5_000);
+                                }
+                            },
                             Err(err) => {
                                 tracing::debug!(?err, event_slug = %slug, "gamma priceToBeat fetch failed");
                                 ptb_retry_after.insert(slug.to_string(), now + 5_000);
@@ -471,7 +493,10 @@ async fn run_ireland_ingest(args: IrelandIngestArgs) -> Result<()> {
                         "market_count": markets.len(),
                         "markets": markets
                     });
-                    let _ = write_json_pretty(discover_root.join("reports").join("latest_markets.json"), &report);
+                    let _ = write_json_pretty(
+                        discover_root.join("reports").join("latest_markets.json"),
+                        &report,
+                    );
                     let day = Utc::now().format("%Y-%m-%d").to_string();
                     let _ = write_json_pretty(
                         discover_root
@@ -709,7 +734,11 @@ async fn build_snapshots(state: Arc<RwLock<IngestState>>) -> Vec<SnapshotRow> {
             w.vel_prev.insert(symbol.clone(), (now, v));
             prev_v.and_then(|(t0, v0)| {
                 let dt = (now - t0) as f64 / 1000.0;
-                if dt > 0.0 { Some((v - v0) / dt) } else { None }
+                if dt > 0.0 {
+                    Some((v - v0) / dt)
+                } else {
+                    None
+                }
             })
         } else {
             None
@@ -726,8 +755,11 @@ async fn build_snapshots(state: Arc<RwLock<IngestState>>) -> Vec<SnapshotRow> {
             .map(|t| book.ts_exchange_ms as f64 - t.ts_exchange_ms as f64);
 
         let net_ev_bps = estimate_net_ev_bps(delta_pct, book.spread_yes, velocity);
-        let predicted_win_rate = estimate_predicted_win_rate(book.mid_yes, delta_pct, velocity, acceleration);
-        if let (Some(rem), Some(target), Some(ch)) = (remaining_ms, target_price, chainlink.as_ref()) {
+        let predicted_win_rate =
+            estimate_predicted_win_rate(book.mid_yes, delta_pct, velocity, acceleration);
+        if let (Some(rem), Some(target), Some(ch)) =
+            (remaining_ms, target_price, chainlink.as_ref())
+        {
             if rem <= 0 && !w.settled_markets.contains(&market_id) {
                 let final_up = ch.chainlink_price >= target;
                 let k = (meta.symbol.clone(), meta.timeframe.clone());
@@ -801,7 +833,11 @@ fn calc_velocity(prev: Option<&TokyoTick>, now: Option<&TokyoTick>) -> Option<f6
     Some((ret * 10_000.0) / dt_s)
 }
 
-fn estimate_net_ev_bps(delta_pct: Option<f64>, spread_yes: f64, velocity: Option<f64>) -> Option<f64> {
+fn estimate_net_ev_bps(
+    delta_pct: Option<f64>,
+    spread_yes: f64,
+    velocity: Option<f64>,
+) -> Option<f64> {
     let d = delta_pct?;
     let v = velocity.unwrap_or(0.0).abs();
     let signal_bps = d * 10_000.0 + v * 0.15;
@@ -952,7 +988,11 @@ async fn flush_sink_batch(cfg: &AnalyticsSinkConfig, batch: &mut Vec<SnapshotRow
     }
     if let Some(redis_url) = cfg.redis_url.as_deref() {
         if let Err(err) = flush_redis_latest(redis_url, cfg, &to_flush).await {
-            tracing::warn!(?err, rows = to_flush.len(), "redis latest cache flush failed");
+            tracing::warn!(
+                ?err,
+                rows = to_flush.len(),
+                "redis latest cache flush failed"
+            );
         }
     }
 }
@@ -1044,7 +1084,11 @@ async fn init_clickhouse(ch_url: &str, cfg: &AnalyticsSinkConfig) -> Result<()> 
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("clickhouse init failed status={} body={}", status, body));
+            return Err(anyhow!(
+                "clickhouse init failed status={} body={}",
+                status,
+                body
+            ));
         }
     }
     for q in &alter_cols {
@@ -1104,15 +1148,24 @@ async fn flush_clickhouse_snapshots(
         }
         let st2 = resp2.status();
         let b2 = resp2.text().await.unwrap_or_default();
-        return Err(anyhow!("clickhouse insert retry failed status={} body={}", st2, b2));
+        return Err(anyhow!(
+            "clickhouse insert retry failed status={} body={}",
+            st2,
+            b2
+        ));
     }
     Err(anyhow!(
         "clickhouse insert failed status={} body={}",
-        status, body_err
+        status,
+        body_err
     ))
 }
 
-async fn flush_redis_latest(redis_url: &str, cfg: &AnalyticsSinkConfig, rows: &[SnapshotRow]) -> Result<()> {
+async fn flush_redis_latest(
+    redis_url: &str,
+    cfg: &AnalyticsSinkConfig,
+    rows: &[SnapshotRow],
+) -> Result<()> {
     let client = redis::Client::open(redis_url)?;
     let mut conn = client.get_multiplexed_async_connection().await?;
     let mut latest_symbol_tf: HashMap<(String, String), &SnapshotRow> = HashMap::new();
@@ -1120,7 +1173,11 @@ async fn flush_redis_latest(redis_url: &str, cfg: &AnalyticsSinkConfig, rows: &[
     for row in rows {
         latest_symbol_tf.insert((row.symbol.clone(), row.timeframe.clone()), row);
         latest_market.insert(
-            (row.symbol.clone(), row.timeframe.clone(), row.market_id.clone()),
+            (
+                row.symbol.clone(),
+                row.timeframe.clone(),
+                row.market_id.clone(),
+            ),
             row,
         );
     }
@@ -1286,7 +1343,9 @@ fn find_price_to_beat_by_ticker(v: &serde_json::Value, slug: &str) -> Option<f64
 }
 
 fn map_market_meta(m: MarketDescriptor) -> MarketMeta {
-    let target = m.price_to_beat.or_else(|| extract_price_from_title(&m.question));
+    let target = m
+        .price_to_beat
+        .or_else(|| extract_price_from_title(&m.question));
     let target_source = if m.price_to_beat.is_some() {
         Some("pm_event_price_to_beat".to_string())
     } else {
@@ -1360,7 +1419,11 @@ fn push_tokyo_hist(hist: &mut HashMap<String, VecDeque<TokyoTick>>, row: &TokyoT
     let q = hist.entry(row.symbol.clone()).or_default();
     q.push_back(row.clone());
     let cutoff = row.ts_exchange_ms.saturating_sub(6 * 60 * 60 * 1000);
-    while q.front().map(|x| x.ts_exchange_ms < cutoff).unwrap_or(false) {
+    while q
+        .front()
+        .map(|x| x.ts_exchange_ms < cutoff)
+        .unwrap_or(false)
+    {
         q.pop_front();
     }
     if q.len() > 500_000 {
@@ -1372,7 +1435,11 @@ fn push_chainlink_hist(hist: &mut HashMap<String, VecDeque<ChainlinkTick>>, row:
     let q = hist.entry(row.symbol.clone()).or_default();
     q.push_back(row.clone());
     let cutoff = row.ts_exchange_ms.saturating_sub(6 * 60 * 60 * 1000);
-    while q.front().map(|x| x.ts_exchange_ms < cutoff).unwrap_or(false) {
+    while q
+        .front()
+        .map(|x| x.ts_exchange_ms < cutoff)
+        .unwrap_or(false)
+    {
         q.pop_front();
     }
     if q.len() > 500_000 {
@@ -1453,7 +1520,9 @@ fn resolve_target_anchor(
         // If the first anchor used Tokyo fallback, upgrade to Chainlink open anchor
         // once the exact open tick becomes available.
         if existing.source == "tokyo_first_seen_after_open" {
-            if let Some(observed) = resolve_open_anchor_from_ticks(state, &meta.symbol, start, now_ms) {
+            if let Some(observed) =
+                resolve_open_anchor_from_ticks(state, &meta.symbol, start, now_ms)
+            {
                 if observed.source == "chainlink_market_open" {
                     state
                         .target_anchor
@@ -1465,7 +1534,9 @@ fn resolve_target_anchor(
         // If existing target came from metadata parse, re-validate near market-open
         // against observable Chainlink/Tokyo ticks and self-correct if drift is large.
         if existing.source == "pm_price_to_beat" || existing.source == "metadata_target" {
-            if let Some(observed) = resolve_open_anchor_from_ticks(state, &meta.symbol, start, now_ms) {
+            if let Some(observed) =
+                resolve_open_anchor_from_ticks(state, &meta.symbol, start, now_ms)
+            {
                 if (existing.price - observed.price).abs() > 5.0 {
                     state
                         .target_anchor
@@ -1598,8 +1669,10 @@ async fn api_markets(
     } else {
         st.root.join("reports").join("latest_markets.json")
     };
-    let mut payload =
-        read_json_or(path, serde_json::json!({"markets": [], "market_count": 0, "ts_ms": now_ms()}));
+    let mut payload = read_json_or(
+        path,
+        serde_json::json!({"markets": [], "market_count": 0, "ts_ms": now_ms()}),
+    );
     if let Some(markets) = payload.get_mut("markets").and_then(|v| v.as_array_mut()) {
         if let Some(sym) = q.symbol.as_deref() {
             markets.retain(|m| m.get("symbol").and_then(|x| x.as_str()) == Some(sym));
@@ -1662,7 +1735,10 @@ async fn api_latest_cached(
             st.redis_prefix, symbol, timeframe, mid
         )
     } else {
-        format!("{}:snapshot:latest:{}:{}", st.redis_prefix, symbol, timeframe)
+        format!(
+            "{}:snapshot:latest:{}:{}",
+            st.redis_prefix, symbol, timeframe
+        )
     };
     let row = match read_cached_row(&redis_url, &key).await {
         Ok(v) => v,
@@ -1779,7 +1855,10 @@ async fn latest_row_from_cache_or_file(
                 st.redis_prefix, symbol, timeframe, mid
             )
         } else {
-            format!("{}:snapshot:latest:{}:{}", st.redis_prefix, symbol, timeframe)
+            format!(
+                "{}:snapshot:latest:{}:{}",
+                st.redis_prefix, symbol, timeframe
+            )
         };
         if let Ok(row) = read_cached_row(redis_url, &key).await {
             if !row.is_null() {
@@ -1787,10 +1866,16 @@ async fn latest_row_from_cache_or_file(
             }
         }
     }
-    latest_row_from_file(&st.root, symbol, timeframe, market_id).unwrap_or_else(|| serde_json::json!({}))
+    latest_row_from_file(&st.root, symbol, timeframe, market_id)
+        .unwrap_or_else(|| serde_json::json!({}))
 }
 
-fn latest_row_from_file(root: &Path, symbol: &str, timeframe: &str, market_id: Option<&str>) -> Option<serde_json::Value> {
+fn latest_row_from_file(
+    root: &Path,
+    symbol: &str,
+    timeframe: &str,
+    market_id: Option<&str>,
+) -> Option<serde_json::Value> {
     if let Some(mid) = market_id {
         for date in list_date_dirs(&root.join("normalized")) {
             let p = history_snapshot_path(root, &date, symbol, timeframe, Some(mid));
@@ -1848,9 +1933,16 @@ async fn api_heatmap(
 
     let mut bins: HashMap<(i32, i32), (u64, f64)> = HashMap::new();
     for r in rows {
-        let Some(delta) = r.get("delta_pct").and_then(|v| v.as_f64()) else { continue; };
-        let Some(rem) = r.get("remaining_ms").and_then(|v| v.as_i64()) else { continue; };
-        let key = (((delta * 1000.0) as i32).clamp(-500, 500), ((rem / 10000) as i32).clamp(0, 60));
+        let Some(delta) = r.get("delta_pct").and_then(|v| v.as_f64()) else {
+            continue;
+        };
+        let Some(rem) = r.get("remaining_ms").and_then(|v| v.as_i64()) else {
+            continue;
+        };
+        let key = (
+            ((delta * 1000.0) as i32).clamp(-500, 500),
+            ((rem / 10000) as i32).clamp(0, 60),
+        );
         let score = r.get("mid_yes").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let e = bins.entry(key).or_insert((0, 0.0));
         e.0 = e.0.saturating_add(1);
@@ -1894,10 +1986,11 @@ async fn api_history_markets(
     Query(q): Query<MarketsQuery>,
 ) -> Json<serde_json::Value> {
     let req_tz = q.date_tz.clone().unwrap_or_else(|| "et".to_string());
-    let date = q
-        .date
-        .clone()
-        .or_else(|| list_date_dirs(&st.root.join("reports").join("catalog")).into_iter().next());
+    let date = q.date.clone().or_else(|| {
+        list_date_dirs(&st.root.join("reports").join("catalog"))
+            .into_iter()
+            .next()
+    });
     let Some(date) = date else {
         return Json(serde_json::json!({"ts_ms": now_ms(), "market_count": 0, "markets": []}));
     };
@@ -1948,17 +2041,16 @@ async fn api_history_snapshot(
     Query(q): Query<HistorySnapshotQuery>,
 ) -> Json<serde_json::Value> {
     let req_tz = q.date_tz.clone().unwrap_or_else(|| "et".to_string());
-    let date = q
-        .date
-        .clone();
-    let date = date
-        .or_else(|| {
-            if req_tz.eq_ignore_ascii_case("utc") {
-                list_date_dirs(&st.root.join("normalized")).into_iter().next()
-            } else {
-                Some(ts_to_et(now_ms()).chars().take(10).collect::<String>())
-            }
-        });
+    let date = q.date.clone();
+    let date = date.or_else(|| {
+        if req_tz.eq_ignore_ascii_case("utc") {
+            list_date_dirs(&st.root.join("normalized"))
+                .into_iter()
+                .next()
+        } else {
+            Some(ts_to_et(now_ms()).chars().take(10).collect::<String>())
+        }
+    });
     let Some(date) = date else {
         return Json(serde_json::json!({"ts_ms": now_ms(), "count": 0, "rows": []}));
     };
@@ -2041,9 +2133,7 @@ fn ts_to_et(ms: i64) -> String {
 
 fn et_date_from_ms(ms: i64) -> String {
     if let Some(dt) = DateTime::<Utc>::from_timestamp_millis(ms) {
-        dt.with_timezone(&New_York)
-            .format("%Y-%m-%d")
-            .to_string()
+        dt.with_timezone(&New_York).format("%Y-%m-%d").to_string()
     } else {
         Utc::now()
             .with_timezone(&New_York)
@@ -2173,8 +2263,7 @@ fn snapshot_market_100ms_path(root: &Path, row: &SnapshotRow) -> PathBuf {
 
 fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create dir {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("create dir {}", parent.display()))?;
     }
     let mut f = OpenOptions::new()
         .create(true)

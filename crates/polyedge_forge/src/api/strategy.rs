@@ -408,10 +408,7 @@ fn strategy_select_profile_name() -> &'static str {
             "balanced" | "manual_balanced" | "fev1_manual_balanced_2026_02_28" => {
                 return STRATEGY_PROFILE_BALANCED;
             }
-            "cand_growth_mix"
-            | "growth_mix"
-            | "growth"
-            | "fev1_cand_growth_mix_2026_02_28" => {
+            "cand_growth_mix" | "growth_mix" | "growth" | "fev1_cand_growth_mix_2026_02_28" => {
                 return STRATEGY_PROFILE_CAND_GROWTH_MIX;
             }
             _ => {}
@@ -438,10 +435,7 @@ fn strategy_profile_from_alias(raw: &str) -> Option<(&'static str, StrategyRunti
         "balanced" | "manual_balanced" | "fev1_manual_balanced_2026_02_28" => {
             Some((STRATEGY_PROFILE_BALANCED, strategy_balanced_config()))
         }
-        "cand_growth_mix"
-        | "growth_mix"
-        | "growth"
-        | "fev1_cand_growth_mix_2026_02_28" => Some((
+        "cand_growth_mix" | "growth_mix" | "growth" | "fev1_cand_growth_mix_2026_02_28" => Some((
             STRATEGY_PROFILE_CAND_GROWTH_MIX,
             strategy_cand_growth_mix_config(),
         )),
@@ -1842,7 +1836,8 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                             .unwrap_or_default()
                             .to_string();
                         let is_exit_like = is_live_exit_action(&action);
-                        let emergency_exit = is_exit_like && is_emergency_exit_reason(&submit_reason);
+                        let emergency_exit =
+                            is_exit_like && is_emergency_exit_reason(&submit_reason);
                         let pending = LivePendingOrder {
                             market_type: market_type.to_string(),
                             order_id,

@@ -265,7 +265,9 @@ impl DirectionDetector {
 
         let ret_short = (latest_binance - anchor_short_binance) / anchor_short_binance;
         let ret_long = (latest_binance - anchor_long_binance) / anchor_long_binance;
-        let long_target_ms = (self.cfg.lookback_long_sec as i64).saturating_mul(1_000).max(1);
+        let long_target_ms = (self.cfg.lookback_long_sec as i64)
+            .saturating_mul(1_000)
+            .max(1);
         let hist_span_ms = match (w.binance_ticks.front(), w.binance_ticks.back()) {
             (Some((first_ts, _)), Some((last_ts, _))) => last_ts.saturating_sub(*first_ts),
             _ => 0,

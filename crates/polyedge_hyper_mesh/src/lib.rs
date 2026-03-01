@@ -26,8 +26,7 @@ mod tests {
     fn health_goes_lockdown_when_gap_rate_high() {
         let cfg = HealthConfig::default();
         let state = evaluate_health(
-            &cfg,
-            0.08, // 8% gap rate
+            &cfg, 0.08, // 8% gap rate
             2.0,  // low latency
             10,
         );

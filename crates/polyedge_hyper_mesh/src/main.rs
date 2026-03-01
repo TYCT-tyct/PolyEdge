@@ -14,7 +14,11 @@ use polyedge_hyper_mesh::protocol::HyperMeshFrame;
 use polyedge_hyper_mesh::tracker::StreamTracker;
 
 #[derive(Debug, Parser)]
-#[command(name = "polyedge-hyper-mesh", version, about = "Standalone Hyper-Mesh transport runtime")]
+#[command(
+    name = "polyedge-hyper-mesh",
+    version,
+    about = "Standalone Hyper-Mesh transport runtime"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Command,
