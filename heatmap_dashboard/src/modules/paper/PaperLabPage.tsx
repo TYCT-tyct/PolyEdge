@@ -519,6 +519,13 @@ export function PaperLabPage({
       ? `${lookbackCoverageMinutes.toFixed(0)}/${lookbackRequestedMinutes.toFixed(0)}m`
       : "--";
   const lookbackTruncated = lookbackMeta?.truncated_by_points === true;
+  const profileSource = strategyPaper?.config_source ?? "--";
+  const effectiveProfile =
+    !strategyPaper
+      ? "--"
+      : profileSource === "default"
+      ? strategyPaper.baseline_profile ?? "default"
+      : profileSource;
 
   return (
     <section className="panel">
@@ -913,7 +920,8 @@ export function PaperLabPage({
 
       <footer className="status-row">
         <span>source: {strategyPaper?.source ?? "--"}</span>
-        <span>profile: {strategyPaper?.config_source ?? "--"}</span>
+        <span>profile: {effectiveProfile}</span>
+        <span>profileSource: {profileSource}</span>
         <span>market: {strategyMarketType}</span>
         <span>
           最近成交: {formatTime(lastTradeTs, timeMode)}
