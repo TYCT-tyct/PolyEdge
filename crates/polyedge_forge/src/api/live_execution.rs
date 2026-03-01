@@ -1,4 +1,5 @@
 use super::*;
+use futures::future::join_all;
 
 #[derive(Debug, Clone)]
 pub(super) struct LiveGatewayConfig {
@@ -714,6 +715,64 @@ pub(super) async fn resolve_live_market_target(
             .map(|e| format!(", last_error={e}"))
             .unwrap_or_default()
     )))
+}
+
+fn collect_decision_token_ids(
+    target: &LiveMarketTarget,
+    decisions: &[LiveGatedDecision],
+) -> Vec<String> {
+    let mut uniq = HashSet::<String>::new();
+    for gated in decisions {
+        if let Some(token) = token_id_for_decision(&gated.decision, target) {
+            uniq.insert(token.to_string());
+        }
+    }
+    uniq.into_iter().collect()
+}
+
+async fn prefetch_gateway_books_for_tokens(
+    client: &reqwest::Client,
+    gateway_cfg: &LiveGatewayConfig,
+    token_ids: &[String],
+) -> HashMap<String, Option<GatewayBookSnapshot>> {
+    let futures = token_ids.iter().cloned().map(|token_id| async move {
+        let snap = fetch_gateway_book_snapshot(client, gateway_cfg, &token_id).await;
+        (token_id, snap)
+    });
+    let rows = join_all(futures).await;
+    rows.into_iter().collect()
+}
+
+async fn prefetch_rust_books_for_tokens(
+    state: &ApiState,
+    ctx: &Arc<RustExecutorContext>,
+    fallback_client: &reqwest::Client,
+    gateway_cfg: &LiveGatewayConfig,
+    token_ids: &[String],
+) -> HashMap<String, Option<GatewayBookSnapshot>> {
+    let futures = token_ids.iter().cloned().map(|token_id| {
+        let state = state.clone();
+        let ctx = Arc::clone(ctx);
+        let gateway_cfg = gateway_cfg.clone();
+        async move {
+            let snapshot = if let Some(cached) = state.get_rust_book_cache(&token_id).await {
+                Some(cached)
+            } else if let Some(v) = fetch_rust_book_snapshot(&ctx, &token_id).await {
+                state.put_rust_book_cache(&token_id, v.clone()).await;
+                Some(v)
+            } else {
+                let fetched =
+                    fetch_gateway_book_snapshot(fallback_client, &gateway_cfg, &token_id).await;
+                if let Some(v) = fetched.as_ref() {
+                    state.put_rust_book_cache(&token_id, v.clone()).await;
+                }
+                fetched
+            };
+            (token_id, snapshot)
+        }
+    });
+    let rows = join_all(futures).await;
+    rows.into_iter().collect()
 }
 
 pub(super) fn decision_to_live_payload(
@@ -2149,8 +2208,8 @@ pub(super) async fn execute_live_orders_via_gateway(
 ) -> Vec<Value> {
     let client = state.gateway_http_client.as_ref();
     let mut out = Vec::<Value>::with_capacity(decisions.len());
-    let mut book_cache: HashMap<String, Option<GatewayBookSnapshot>> =
-        HashMap::with_capacity(decisions.len());
+    let token_ids = collect_decision_token_ids(target, decisions);
+    let mut book_cache = prefetch_gateway_books_for_tokens(client, gateway_cfg, &token_ids).await;
     let exit_quote_override =
         position_state
             .entry_quote_usdc
@@ -2180,12 +2239,13 @@ pub(super) async fn execute_live_orders_via_gateway(
         apply_emergency_exit_overrides(&mut decision, gateway_cfg);
         let token_id = token_id_for_decision(&decision, target).map(str::to_string);
         let book_snapshot = if let Some(token_id) = token_id.clone() {
-            if let Some(cached) = book_cache.get(&token_id) {
-                cached.clone()
-            } else {
-                let fetched = fetch_gateway_book_snapshot(client, gateway_cfg, &token_id).await;
-                book_cache.insert(token_id.clone(), fetched.clone());
-                fetched
+            match book_cache.get(&token_id) {
+                Some(cached) => cached.clone(),
+                None => {
+                    let fetched = fetch_gateway_book_snapshot(client, gateway_cfg, &token_id).await;
+                    book_cache.insert(token_id.clone(), fetched.clone());
+                    fetched
+                }
             }
         } else {
             None
@@ -2916,9 +2976,10 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
     };
 
     let mut out = Vec::<Value>::with_capacity(decisions.len());
-    let mut book_cache: HashMap<String, Option<GatewayBookSnapshot>> =
-        HashMap::with_capacity(decisions.len());
     let fallback_client = state.gateway_http_client.as_ref();
+    let token_ids = collect_decision_token_ids(target, decisions);
+    let mut book_cache =
+        prefetch_rust_books_for_tokens(state, &ctx, fallback_client, gateway_cfg, &token_ids).await;
     let exit_quote_override =
         position_state
             .entry_quote_usdc
@@ -2949,25 +3010,26 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
         apply_emergency_exit_overrides(&mut decision, gateway_cfg);
         let token_id = token_id_for_decision(&decision, target).map(str::to_string);
         let book_snapshot = if let Some(token_id) = token_id.clone() {
-            if let Some(cached) = book_cache.get(&token_id) {
-                cached.clone()
-            } else {
-                let fetched = if let Some(cached) = state.get_rust_book_cache(&token_id).await {
-                    Some(cached)
-                } else if let Some(v) = fetch_rust_book_snapshot(&ctx, &token_id).await {
-                    state.put_rust_book_cache(&token_id, v.clone()).await;
-                    Some(v)
-                } else {
-                    tracing::warn!(token_id = %token_id, "rust_sdk /book failed, fallback gateway /book");
-                    let fetched =
-                        fetch_gateway_book_snapshot(fallback_client, gateway_cfg, &token_id).await;
-                    if let Some(v) = fetched.as_ref() {
+            match book_cache.get(&token_id) {
+                Some(cached) => cached.clone(),
+                None => {
+                    let fetched = if let Some(cached) = state.get_rust_book_cache(&token_id).await {
+                        Some(cached)
+                    } else if let Some(v) = fetch_rust_book_snapshot(&ctx, &token_id).await {
                         state.put_rust_book_cache(&token_id, v.clone()).await;
-                    }
+                        Some(v)
+                    } else {
+                        let fetched =
+                            fetch_gateway_book_snapshot(fallback_client, gateway_cfg, &token_id)
+                                .await;
+                        if let Some(v) = fetched.as_ref() {
+                            state.put_rust_book_cache(&token_id, v.clone()).await;
+                        }
+                        fetched
+                    };
+                    book_cache.insert(token_id.clone(), fetched.clone());
                     fetched
-                };
-                book_cache.insert(token_id.clone(), fetched.clone());
-                fetched
+                }
             }
         } else {
             None

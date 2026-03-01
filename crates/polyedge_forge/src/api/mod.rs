@@ -1077,6 +1077,10 @@ struct LiveExecutionAggState {
     reject_ema: f64,
     submit_delta_ema_cents: f64,
     accepted_delta_ema_cents: f64,
+    #[serde(default)]
+    latency_ema_ms: f64,
+    #[serde(default)]
+    attempts_ema: f64,
     sample_count: u64,
     last_error: Option<String>,
     updated_ts_ms: i64,
@@ -1091,6 +1095,8 @@ impl LiveExecutionAggState {
             reject_ema: 0.0,
             submit_delta_ema_cents: 0.0,
             accepted_delta_ema_cents: 0.0,
+            latency_ema_ms: 0.0,
+            attempts_ema: 0.0,
             sample_count: 0,
             last_error: None,
             updated_ts_ms: Utc::now().timestamp_millis(),
@@ -1782,6 +1788,19 @@ impl ApiState {
         let st = store
             .entry(market_type.to_string())
             .or_insert_with(|| LiveExecutionAggState::new(market_type));
+        if orders.is_empty() {
+            // No recent executions: slowly relax back to baseline to avoid stale high aggressiveness.
+            st.entry_slippage_mult =
+                (st.entry_slippage_mult * 0.992 + 1.0 * 0.008).clamp(0.85, 2.40);
+            st.exit_slippage_mult = (st.exit_slippage_mult * 0.990 + 1.0 * 0.010).clamp(0.85, 2.40);
+            st.reject_ema *= 0.92;
+            st.submit_delta_ema_cents *= 0.96;
+            st.accepted_delta_ema_cents *= 0.96;
+            st.latency_ema_ms *= 0.95;
+            st.attempts_ema = (st.attempts_ema * 0.95).max(1.0);
+            st.updated_ts_ms = Utc::now().timestamp_millis();
+            return st.clone();
+        }
         for row in orders {
             let action = row
                 .get("decision")
@@ -1810,6 +1829,17 @@ impl ApiState {
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0)
                 .abs();
+            let order_latency_ms = row
+                .get("order_latency_ms")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                .max(0.0);
+            let attempts = row
+                .get("attempts")
+                .and_then(Value::as_array)
+                .map(|v| v.len() as f64)
+                .unwrap_or(1.0)
+                .max(1.0);
 
             st.sample_count = st.sample_count.saturating_add(1);
             st.reject_ema = st.reject_ema * 0.86 + if accepted { 0.0 } else { 0.14 };
@@ -1826,10 +1856,25 @@ impl ApiState {
                         + 0.20 * (accepted_delta - st.accepted_delta_ema_cents)
                 };
             }
+            st.latency_ema_ms = if st.latency_ema_ms <= 1e-9 {
+                order_latency_ms
+            } else {
+                st.latency_ema_ms + 0.16 * (order_latency_ms - st.latency_ema_ms)
+            };
+            st.attempts_ema = if st.attempts_ema <= 1e-9 {
+                attempts
+            } else {
+                st.attempts_ema + 0.20 * (attempts - st.attempts_ema)
+            };
+
+            let latency_boost = ((st.latency_ema_ms - 220.0) / 340.0).clamp(0.0, 1.0) * 0.42;
+            let attempts_boost = ((st.attempts_ema - 1.0) / 1.8).clamp(0.0, 1.0) * 0.35;
 
             let mut target_mult = 1.0
                 + (st.submit_delta_ema_cents / 3.2).clamp(0.0, 0.85)
-                + (st.reject_ema * 0.65).clamp(0.0, 0.8);
+                + (st.reject_ema * 0.65).clamp(0.0, 0.8)
+                + latency_boost
+                + attempts_boost;
             if accepted {
                 target_mult -= 0.04;
             } else if is_liquidity_reject_reason(&err) {
@@ -1843,7 +1888,12 @@ impl ApiState {
                 &mut st.entry_slippage_mult
             };
             *mult = (*mult * 0.84 + target_mult * 0.16).clamp(0.85, 2.40);
-            if accepted && st.reject_ema <= 0.16 && st.accepted_delta_ema_cents <= 0.9 {
+            if accepted
+                && st.reject_ema <= 0.16
+                && st.accepted_delta_ema_cents <= 0.9
+                && st.latency_ema_ms <= 260.0
+                && st.attempts_ema <= 1.2
+            {
                 *mult = (*mult * 0.96 + 1.0 * 0.04).clamp(0.85, 2.40);
             }
             if !accepted && !err.is_empty() {
@@ -2571,15 +2621,35 @@ async fn live_runtime_loop(
         let target_prewarm_ms = runtime_target_prewarm_ms();
         let mut cycle_sleep_ms = cfg.loop_interval_ms;
         let wait_ms = next_wait_ms.clamp(20, cfg.loop_interval_ms.max(20));
-        let wake_event = tokio::select! {
+        let first_wake_event = tokio::select! {
             maybe = wake_rx.recv() => maybe,
             _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => None,
         };
-        let wake_event_market = wake_event.as_ref().map(|v| v.market_type.clone());
-        let wake_event_scope_enabled = wake_event_market
-            .as_ref()
-            .map(|market| cfg.markets.iter().any(|m| m == market))
-            .unwrap_or(false);
+        let mut wake_events = Vec::<LiveRuntimeWakeEvent>::new();
+        if let Some(first) = first_wake_event {
+            wake_events.push(first);
+            while let Ok(ev) = wake_rx.try_recv() {
+                wake_events.push(ev);
+                if wake_events.len() >= 48 {
+                    break;
+                }
+            }
+        }
+        let wake_markets: HashSet<String> = wake_events
+            .iter()
+            .filter_map(|ev| {
+                if cfg
+                    .markets
+                    .iter()
+                    .any(|m| m.eq_ignore_ascii_case(&ev.market_type))
+                {
+                    Some(ev.market_type.to_ascii_lowercase())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let wake_event_scope_enabled = !wake_markets.is_empty();
         if !cfg.enabled {
             next_wait_ms = cfg.loop_interval_ms;
             continue;
@@ -2587,14 +2657,14 @@ async fn live_runtime_loop(
 
         for market in &cfg.markets {
             let market_type = market.as_str();
-            if wake_event_scope_enabled
-                && wake_event_market
-                    .as_deref()
-                    .map(|m| m != market_type)
-                    .unwrap_or(false)
+            if wake_event_scope_enabled && !wake_markets.contains(&market_type.to_ascii_lowercase())
             {
                 continue;
             }
+            let trigger_for_market = wake_events
+                .iter()
+                .rev()
+                .find(|ev| ev.market_type.eq_ignore_ascii_case(market_type));
             let now_ms = Utc::now().timestamp_millis();
             let position_before_cycle = state.get_live_position_state(market_type).await;
             let pending_before_cycle = state.list_pending_orders_for_market(market_type).await;
@@ -2691,9 +2761,9 @@ async fn live_runtime_loop(
                                 "base_loop_ms": cfg.loop_interval_ms,
                                 "round_switched": round_switched,
                                 "target_prewarm_ms": target_prewarm_ms,
-                                "trigger_source": wake_event.as_ref().map(|v| v.source.clone()),
-                                "trigger_market": wake_event.as_ref().map(|v| v.market_type.clone()),
-                                "trigger_ts_ms": wake_event.as_ref().map(|v| v.ts_ms),
+                                "trigger_source": trigger_for_market.map(|v| v.source.clone()),
+                                "trigger_market": trigger_for_market.map(|v| v.market_type.clone()),
+                                "trigger_ts_ms": trigger_for_market.map(|v| v.ts_ms),
                             }),
                         );
                         obj.insert("execution_aggressiveness".to_string(), json!(exec_aggr));
@@ -2740,11 +2810,11 @@ async fn live_runtime_loop(
                         }
                     }
 
-                    if effective_live_execute
-                        && current_remaining_ms
-                            .map(|v| v >= 0 && v <= target_prewarm_ms)
-                            .unwrap_or(false)
+                    if current_remaining_ms
+                        .map(|v| v >= 0 && v <= target_prewarm_ms)
+                        .unwrap_or(false)
                     {
+                        // Round-switch prewarm is always on, even in paused mode, to eliminate no_live_market_target gaps.
                         let _ = tokio::time::timeout(
                             Duration::from_millis(420),
                             resolve_live_market_target(market_type),

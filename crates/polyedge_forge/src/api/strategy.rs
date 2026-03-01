@@ -1458,9 +1458,12 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
     let gateway = fev1::ArmedSimulatedGateway;
     let dual = fev1::build_gateway_execution(&run, dynamic_quote_usdc.max(0.01), &gateway);
     let live_executor_mode = LiveExecutorMode::from_env();
-    reconcile_live_reports(state, &live_gateway_cfg_effective, live_executor_mode).await;
-    handle_live_pending_timeouts(state, &live_gateway_cfg_effective, live_executor_mode).await;
-    let (live_market_res, position_before_gate) = tokio::join!(
+    let maintenance_fut = async {
+        reconcile_live_reports(state, &live_gateway_cfg_effective, live_executor_mode).await;
+        handle_live_pending_timeouts(state, &live_gateway_cfg_effective, live_executor_mode).await;
+    };
+    let (_, live_market_res, position_before_gate) = tokio::join!(
+        maintenance_fut,
         resolve_live_market_target(market_type),
         state.get_live_position_state(market_type)
     );
