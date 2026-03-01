@@ -21,7 +21,6 @@ const STRATEGY_PREFS_STORAGE_KEY = "polyedge.strategy.prefs.v4";
 const PAPER_LOOKBACK_MINUTES = 1440;
 
 const STRATEGY_PAPER_PROFILE = Object.freeze({
-  profile: "growth",
   fullHistory: false,
   useAutotune: false
 });

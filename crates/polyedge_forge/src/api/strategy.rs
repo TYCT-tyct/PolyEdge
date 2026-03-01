@@ -282,7 +282,10 @@ fn strategy_required_points_1s(lookback_minutes: u32) -> u32 {
     lookback_minutes.saturating_mul(60)
 }
 
-fn strategy_required_points_for_resolution(lookback_minutes: u32, sample_resolution_ms: u32) -> u32 {
+fn strategy_required_points_for_resolution(
+    lookback_minutes: u32,
+    sample_resolution_ms: u32,
+) -> u32 {
     let resolution_ms = sample_resolution_ms.max(1);
     let points_per_minute = 60_000u32 / resolution_ms;
     lookback_minutes.saturating_mul(points_per_minute.max(1))
@@ -312,7 +315,7 @@ fn strategy_lookback_meta_json(
     } else {
         ((lookback_minutes as f64)
             * (max_points as f64 / required_points_effective as f64).min(1.0))
-            .max(0.0)
+        .max(0.0)
     };
     json!({
         "requested_lookback_minutes": lookback_minutes,
@@ -426,7 +429,7 @@ fn strategy_select_profile_name() -> &'static str {
             _ => {}
         }
     }
-    STRATEGY_PROFILE_CAND_GROWTH_MIX
+    STRATEGY_PROFILE_HI_WIN
 }
 
 fn strategy_current_default_profile_name() -> &'static str {
@@ -646,25 +649,25 @@ fn strategy_hi_freq_config() -> StrategyRuntimeConfig {
 
 fn strategy_hi_win_config() -> StrategyRuntimeConfig {
     StrategyRuntimeConfig {
-        entry_threshold_base: 0.7928044963810135,
+        entry_threshold_base: 0.8314779297828662,
         entry_threshold_cap: 0.9849918027705858,
-        spread_limit_prob: 0.028629416086831005,
-        entry_edge_prob: 0.06259309494575992,
-        entry_min_potential_cents: 17.245351179461537,
+        spread_limit_prob: 0.0288942174328033,
+        entry_edge_prob: 0.0373510369141804,
+        entry_min_potential_cents: 20.154522797899034,
         entry_max_price_cents: 65.17784700310176,
         min_hold_ms: 3_235,
-        stop_loss_cents: 13.14946542892194,
+        stop_loss_cents: 15.18003510866328,
         reverse_signal_threshold: -0.10037499713079152,
-        reverse_signal_ticks: 4,
-        trail_activate_profit_cents: 24.393265002393424,
-        trail_drawdown_cents: 17.632807444464234,
+        reverse_signal_ticks: 5,
+        trail_activate_profit_cents: 27.22169453317154,
+        trail_drawdown_cents: 15.340040835594506,
         take_profit_near_max_cents: 97.73898243530077,
         endgame_take_profit_cents: 93.1420351179262,
         endgame_remaining_ms: 24_778,
         liquidity_widen_prob: 0.0620961928172456,
-        cooldown_ms: 2_671,
-        max_entries_per_round: 3,
-        max_exec_spread_cents: 1.1661721107208205,
+        cooldown_ms: 5_482,
+        max_entries_per_round: 2,
+        max_exec_spread_cents: 1.138843264683389,
         slippage_cents_per_side: 0.14515338668372577,
         fee_cents_per_side: 0.05331355583758494,
         emergency_wide_spread_penalty_ratio: 0.20954404654691547,
@@ -730,28 +733,28 @@ fn strategy_balanced_config() -> StrategyRuntimeConfig {
 
 fn strategy_cand_growth_mix_config() -> StrategyRuntimeConfig {
     StrategyRuntimeConfig {
-        entry_threshold_base: 0.46609049156288435,
-        entry_threshold_cap: 0.9881009239180837,
-        spread_limit_prob: 0.03507852373259387,
-        entry_edge_prob: 0.05493483341582213,
-        entry_min_potential_cents: 1.2554961335457504,
-        entry_max_price_cents: 69.3428100950126,
-        min_hold_ms: 2_640,
-        stop_loss_cents: 5.982446876417477,
-        reverse_signal_threshold: -0.6692399725831516,
+        entry_threshold_base: 0.4269851137406586,
+        entry_threshold_cap: 0.982715262239892,
+        spread_limit_prob: 0.031847184690691074,
+        entry_edge_prob: 0.04923706878164002,
+        entry_min_potential_cents: 2.5648265524713785,
+        entry_max_price_cents: 72.91716340298034,
+        min_hold_ms: 4_957,
+        stop_loss_cents: 7.897615544731114,
+        reverse_signal_threshold: -0.7707977919813044,
         reverse_signal_ticks: 3,
         trail_activate_profit_cents: 2.0,
-        trail_drawdown_cents: 1.059069848563025,
-        take_profit_near_max_cents: 94.16496449394661,
-        endgame_take_profit_cents: 93.87031351778629,
-        endgame_remaining_ms: 25_647,
-        liquidity_widen_prob: 0.11634976307085412,
-        cooldown_ms: 12_362,
-        max_entries_per_round: 3,
-        max_exec_spread_cents: 2.5917043735187626,
+        trail_drawdown_cents: 1.5742668933343105,
+        take_profit_near_max_cents: 92.93113282745682,
+        endgame_take_profit_cents: 91.79762168224036,
+        endgame_remaining_ms: 27_380,
+        liquidity_widen_prob: 0.12074517172470603,
+        cooldown_ms: 14_776,
+        max_entries_per_round: 2,
+        max_exec_spread_cents: 2.478838531930359,
         slippage_cents_per_side: 0.052941519427761694,
         fee_cents_per_side: 0.03725807613665984,
-        emergency_wide_spread_penalty_ratio: 0.026745245474743332,
+        emergency_wide_spread_penalty_ratio: 0.04172825825876407,
         stop_loss_grace_ticks: 7,
         stop_loss_hard_mult: 1.670270804386013,
         stop_loss_reverse_extra_ticks: 0,
@@ -2737,7 +2740,10 @@ pub(super) async fn strategy_paper(
 ) -> Result<Json<Value>, ApiError> {
     let source_mode = parse_strategy_paper_source(params.source.as_deref());
     let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
-    let _live_source_permit = if matches!(source_mode, StrategyPaperSource::Live | StrategyPaperSource::Auto) {
+    let _live_source_permit = if matches!(
+        source_mode,
+        StrategyPaperSource::Live | StrategyPaperSource::Auto
+    ) {
         match state.strategy_live_source_slots.clone().try_acquire_owned() {
             Ok(permit) => Some(permit),
             Err(_) => {
