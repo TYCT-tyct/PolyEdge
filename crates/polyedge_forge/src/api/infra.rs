@@ -3,6 +3,12 @@ use std::sync::OnceLock;
 
 const CLICKHOUSE_CONNECT_TIMEOUT_MS: u64 = 1_500;
 const CLICKHOUSE_REQUEST_TIMEOUT_MS: u64 = 8_000;
+const CLICKHOUSE_QUERY_RETRY_ATTEMPTS_DEFAULT: usize = 3;
+const CLICKHOUSE_QUERY_RETRY_ATTEMPTS_MIN: usize = 1;
+const CLICKHOUSE_QUERY_RETRY_ATTEMPTS_MAX: usize = 6;
+const CLICKHOUSE_QUERY_RETRY_BACKOFF_MS_DEFAULT: u64 = 180;
+const CLICKHOUSE_QUERY_RETRY_BACKOFF_MS_MIN: u64 = 50;
+const CLICKHOUSE_QUERY_RETRY_BACKOFF_MS_MAX: u64 = 2_000;
 
 fn clickhouse_http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -15,6 +21,28 @@ fn clickhouse_http_client() -> &'static reqwest::Client {
             .build()
             .expect("build clickhouse reqwest client")
     })
+}
+
+fn clickhouse_query_retry_attempts() -> usize {
+    std::env::var("FORGE_CLICKHOUSE_QUERY_RETRY_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(CLICKHOUSE_QUERY_RETRY_ATTEMPTS_DEFAULT)
+        .clamp(
+            CLICKHOUSE_QUERY_RETRY_ATTEMPTS_MIN,
+            CLICKHOUSE_QUERY_RETRY_ATTEMPTS_MAX,
+        )
+}
+
+fn clickhouse_query_retry_backoff_ms() -> u64 {
+    std::env::var("FORGE_CLICKHOUSE_QUERY_RETRY_BACKOFF_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(CLICKHOUSE_QUERY_RETRY_BACKOFF_MS_DEFAULT)
+        .clamp(
+            CLICKHOUSE_QUERY_RETRY_BACKOFF_MS_MIN,
+            CLICKHOUSE_QUERY_RETRY_BACKOFF_MS_MAX,
+        )
 }
 
 fn redis_manager_optional(state: &ApiState) -> Option<redis::aio::ConnectionManager> {
@@ -90,28 +118,57 @@ pub(super) async fn read_key_json(state: &ApiState, key: &str) -> Result<Json<Va
 }
 
 pub(super) async fn query_clickhouse_json(ch_url: &str, query: &str) -> Result<Value, ApiError> {
-    let resp = clickhouse_http_client()
-        .post(ch_url)
-        .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(query.to_string())
-        .send()
-        .await
-        .map_err(|e| ApiError::internal(format!("clickhouse request failed: {}", e)))?;
-
-    let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| ApiError::internal(format!("clickhouse body read failed: {}", e)))?;
-    if !status.is_success() {
-        return Err(ApiError::internal(format!(
-            "clickhouse query failed status={} body={}",
-            status, body
-        )));
+    let attempts = clickhouse_query_retry_attempts();
+    let base_backoff_ms = clickhouse_query_retry_backoff_ms();
+    for attempt in 1..=attempts {
+        let resp = clickhouse_http_client()
+            .post(ch_url)
+            .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(query.to_string())
+            .send()
+            .await;
+        match resp {
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.map_err(|e| {
+                    ApiError::internal(format!("clickhouse body read failed: {}", e))
+                })?;
+                if status.is_success() {
+                    return serde_json::from_str::<Value>(&body).map_err(|e| {
+                        ApiError::internal(format!("clickhouse json parse failed: {}", e))
+                    });
+                }
+                let retriable = status.is_server_error()
+                    || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status == reqwest::StatusCode::REQUEST_TIMEOUT;
+                if retriable && attempt < attempts {
+                    let backoff = base_backoff_ms
+                        .saturating_mul(2_u64.saturating_pow((attempt - 1) as u32))
+                        .min(2_500);
+                    tokio::time::sleep(Duration::from_millis(backoff)).await;
+                    continue;
+                }
+                return Err(ApiError::internal(format!(
+                    "clickhouse query failed status={} body={} (attempt {}/{})",
+                    status, body, attempt, attempts
+                )));
+            }
+            Err(e) => {
+                if attempt < attempts {
+                    let backoff = base_backoff_ms
+                        .saturating_mul(2_u64.saturating_pow((attempt - 1) as u32))
+                        .min(2_500);
+                    tokio::time::sleep(Duration::from_millis(backoff)).await;
+                    continue;
+                }
+                return Err(ApiError::internal(format!(
+                    "clickhouse request failed after {} attempts: {}",
+                    attempts, e
+                )));
+            }
+        }
     }
-
-    serde_json::from_str::<Value>(&body)
-        .map_err(|e| ApiError::internal(format!("clickhouse json parse failed: {}", e)))
+    Err(ApiError::internal("clickhouse request failed unexpectedly"))
 }
 
 pub(super) fn is_safe_identifier(v: &str) -> bool {

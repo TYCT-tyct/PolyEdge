@@ -180,10 +180,13 @@ pub(super) struct LiveGatedDecision {
 const LIVE_MARKET_TARGET_CACHE_TTL_MS_DEFAULT: i64 = 8_000;
 const LIVE_MARKET_TARGET_CACHE_TTL_MS_MIN: i64 = 2_000;
 const LIVE_MARKET_TARGET_CACHE_TTL_MS_MAX: i64 = 120_000;
-const LIVE_MARKET_TARGET_RESOLVE_ATTEMPTS_DEFAULT: i64 = 3;
+const LIVE_MARKET_TARGET_ACTIVE_CACHE_MAX_AGE_MS_DEFAULT: i64 = 90_000;
+const LIVE_MARKET_TARGET_ACTIVE_CACHE_MAX_AGE_MS_MIN: i64 = 5_000;
+const LIVE_MARKET_TARGET_ACTIVE_CACHE_MAX_AGE_MS_MAX: i64 = 600_000;
+const LIVE_MARKET_TARGET_RESOLVE_ATTEMPTS_DEFAULT: i64 = 5;
 const LIVE_MARKET_TARGET_RESOLVE_ATTEMPTS_MIN: i64 = 1;
 const LIVE_MARKET_TARGET_RESOLVE_ATTEMPTS_MAX: i64 = 8;
-const LIVE_MARKET_TARGET_RESOLVE_RETRY_MS_DEFAULT: i64 = 140;
+const LIVE_MARKET_TARGET_RESOLVE_RETRY_MS_DEFAULT: i64 = 220;
 const LIVE_MARKET_TARGET_RESOLVE_RETRY_MS_MIN: i64 = 0;
 const LIVE_MARKET_TARGET_RESOLVE_RETRY_MS_MAX: i64 = 2_000;
 const LIVE_MARKET_TARGET_SWITCH_GUARD_MS_DEFAULT: i64 = 2_500;
@@ -191,6 +194,9 @@ const LIVE_MARKET_TARGET_SWITCH_GUARD_MS_MIN: i64 = 0;
 const LIVE_MARKET_TARGET_SWITCH_GUARD_MS_MAX: i64 = 30_000;
 const LIVE_CANCEL_FAILURE_FORCE_PAUSE_EXIT_THRESHOLD: u8 = 2;
 const LIVE_CANCEL_FAILURE_FORCE_PAUSE_OTHER_THRESHOLD: u8 = 3;
+const LIVE_GTD_MIN_FUTURE_GUARD_SEC_DEFAULT: i64 = 60;
+const LIVE_GTD_MIN_FUTURE_GUARD_SEC_MIN: i64 = 30;
+const LIVE_GTD_MIN_FUTURE_GUARD_SEC_MAX: i64 = 240;
 
 #[derive(Debug, Clone)]
 struct CachedLiveMarketTarget {
@@ -214,6 +220,17 @@ fn live_market_target_cache_ttl_ms() -> i64 {
         .clamp(
             LIVE_MARKET_TARGET_CACHE_TTL_MS_MIN,
             LIVE_MARKET_TARGET_CACHE_TTL_MS_MAX,
+        )
+}
+
+fn live_market_target_active_cache_max_age_ms() -> i64 {
+    std::env::var("FORGE_FEV1_LIVE_TARGET_ACTIVE_CACHE_MAX_AGE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(LIVE_MARKET_TARGET_ACTIVE_CACHE_MAX_AGE_MS_DEFAULT)
+        .clamp(
+            LIVE_MARKET_TARGET_ACTIVE_CACHE_MAX_AGE_MS_MIN,
+            LIVE_MARKET_TARGET_ACTIVE_CACHE_MAX_AGE_MS_MAX,
         )
 }
 
@@ -247,6 +264,17 @@ fn live_market_target_switch_guard_ms() -> i64 {
         .clamp(
             LIVE_MARKET_TARGET_SWITCH_GUARD_MS_MIN,
             LIVE_MARKET_TARGET_SWITCH_GUARD_MS_MAX,
+        )
+}
+
+fn live_gtd_min_future_guard_sec() -> i64 {
+    std::env::var("FORGE_FEV1_GTD_MIN_FUTURE_GUARD_SEC")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(LIVE_GTD_MIN_FUTURE_GUARD_SEC_DEFAULT)
+        .clamp(
+            LIVE_GTD_MIN_FUTURE_GUARD_SEC_MIN,
+            LIVE_GTD_MIN_FUTURE_GUARD_SEC_MAX,
         )
 }
 
@@ -549,12 +577,15 @@ pub(super) async fn resolve_live_market_target(
 ) -> Result<LiveMarketTarget, ApiError> {
     let now_ms = Utc::now().timestamp_millis();
     let cache_ttl_ms = live_market_target_cache_ttl_ms();
+    let active_cache_max_age_ms = live_market_target_active_cache_max_age_ms();
     let resolve_attempts = live_market_target_resolve_attempts();
     let resolve_retry_ms = live_market_target_resolve_retry_ms();
     let switch_guard_ms = live_market_target_switch_guard_ms();
+    let mut cached_entry: Option<CachedLiveMarketTarget> = None;
     {
         let cache = live_market_target_cache().read().await;
         if let Some(cached) = cache.get(market_type) {
+            cached_entry = Some(cached.clone());
             let age_ms = now_ms.saturating_sub(cached.fetched_at_ms);
             let end_ms =
                 parse_end_date_ms(cached.target.end_date.as_deref()).unwrap_or(i64::MAX / 4);
@@ -641,6 +672,20 @@ pub(super) async fn resolve_live_market_target(
             );
         }
         return Ok(target);
+    }
+    if let Some(cached) = cached_entry {
+        let age_ms = now_ms.saturating_sub(cached.fetched_at_ms);
+        let end_ms = parse_end_date_ms(cached.target.end_date.as_deref()).unwrap_or(i64::MIN / 4);
+        if age_ms <= active_cache_max_age_ms && end_ms >= now_ms {
+            tracing::warn!(
+                market_type = market_type,
+                resolve_attempts = resolve_attempts,
+                cache_age_ms = age_ms,
+                active_cache_max_age_ms = active_cache_max_age_ms,
+                "market target resolve exhausted retries, fallback to still-active cached target"
+            );
+            return Ok(cached.target);
+        }
     }
     tracing::warn!(
         market_type = market_type,
@@ -2653,7 +2698,11 @@ pub(super) async fn submit_rust_order(
             style == "maker" && matches!(order_type, PmOrderType::GTC | PmOrderType::GTD);
         builder = builder.post_only(post_only);
         if matches!(order_type, PmOrderType::GTD) {
-            let expiration = Utc::now() + chrono::Duration::milliseconds(ttl_ms);
+            // Polymarket GTD requires expiration to be sufficiently in the future
+            // (server-side security threshold, typically >= 60s).
+            let ttl_sec = ((ttl_ms + 999) / 1000).max(1);
+            let expiration =
+                Utc::now() + chrono::Duration::seconds(live_gtd_min_future_guard_sec() + ttl_sec);
             builder = builder.expiration(expiration);
         }
         let signable = builder

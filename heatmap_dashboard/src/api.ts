@@ -145,10 +145,26 @@ async function requestJson<T>(path: string): Promise<T> {
   }
   const req = (async () => {
     const controller = new AbortController();
-    const timer = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-    const resp = await fetch(key, { cache: "no-store", signal: controller.signal }).finally(() =>
-      window.clearTimeout(timer)
-    );
+    let timeoutTriggered = false;
+    const timer = window.setTimeout(() => {
+      timeoutTriggered = true;
+      controller.abort();
+    }, REQUEST_TIMEOUT_MS);
+    let resp: Response;
+    try {
+      resp = await fetch(key, { cache: "no-store", signal: controller.signal });
+    } catch (err) {
+      const aborted =
+        err instanceof DOMException
+          ? err.name === "AbortError"
+          : typeof err === "object" && err != null && (err as { name?: string }).name === "AbortError";
+      if (aborted && timeoutTriggered) {
+        throw new HttpError(408, `Request timeout after ${REQUEST_TIMEOUT_MS}ms: ${path}`);
+      }
+      throw err;
+    } finally {
+      window.clearTimeout(timer);
+    }
     if (!resp.ok) {
       const text = await resp.text();
       throw new HttpError(resp.status, `HTTP ${resp.status}: ${text}`);
