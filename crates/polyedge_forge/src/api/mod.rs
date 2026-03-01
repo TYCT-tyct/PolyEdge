@@ -1052,6 +1052,14 @@ fn runtime_fast_margin_threshold() -> f64 {
         .clamp(0.01, 0.50)
 }
 
+fn runtime_target_prewarm_ms() -> i64 {
+    std::env::var("FORGE_FEV1_RUNTIME_TARGET_PREWARM_MS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(40_000)
+        .clamp(5_000, 120_000)
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 enum LiveRuntimeControlMode {
@@ -2321,12 +2329,14 @@ async fn live_runtime_loop(state: ApiState, bootstrap: LiveRuntimeConfig) {
         loop_ms = bootstrap.loop_interval_ms,
         "fev1 live runtime started"
     );
+    let mut last_round_seen: HashMap<String, String> = HashMap::new();
     loop {
         let cfg = LiveRuntimeConfig::from_env();
         let push_cfg = ServerChanConfig::from_env();
         let fast_enabled = runtime_fast_loop_enabled();
         let fast_loop_ms = runtime_fast_loop_ms(cfg.loop_interval_ms);
         let fast_margin = runtime_fast_margin_threshold();
+        let target_prewarm_ms = runtime_target_prewarm_ms();
         let mut cycle_sleep_ms = cfg.loop_interval_ms;
         if !cfg.enabled {
             tokio::time::sleep(Duration::from_millis(cfg.loop_interval_ms)).await;
@@ -2392,6 +2402,26 @@ async fn live_runtime_loop(state: ApiState, bootstrap: LiveRuntimeConfig) {
                 Ok(mut payload) => {
                     let now = Utc::now();
                     let now_ms = now.timestamp_millis();
+                    let current_round = payload
+                        .get("current")
+                        .and_then(|v| v.get("round_id"))
+                        .and_then(Value::as_str)
+                        .map(|v| v.to_string());
+                    let current_remaining_ms = payload
+                        .get("current")
+                        .and_then(|v| v.get("remaining_ms"))
+                        .and_then(Value::as_i64);
+                    let round_switched = if let Some(round_id) = current_round.clone() {
+                        if let Some(prev) =
+                            last_round_seen.insert(market_type.to_string(), round_id.clone())
+                        {
+                            prev != round_id
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
                     if let Some(obj) = payload.as_object_mut() {
                         obj.insert(
                             "runtime_control".to_string(),
@@ -2408,6 +2438,8 @@ async fn live_runtime_loop(state: ApiState, bootstrap: LiveRuntimeConfig) {
                                 "fast_loop_enabled": fast_enabled,
                                 "fast_loop_ms": fast_loop_ms,
                                 "base_loop_ms": cfg.loop_interval_ms,
+                                "round_switched": round_switched,
+                                "target_prewarm_ms": target_prewarm_ms,
                             }),
                         );
                     }
@@ -2447,6 +2479,23 @@ async fn live_runtime_loop(state: ApiState, bootstrap: LiveRuntimeConfig) {
                         if fast_path {
                             cycle_sleep_ms = cycle_sleep_ms.min(fast_loop_ms);
                         }
+                        if round_switched {
+                            // Event-driven assist: immediately tighten next cycle on round rollover.
+                            cycle_sleep_ms = cycle_sleep_ms.min(fast_loop_ms);
+                        }
+                    }
+
+                    if effective_live_execute
+                        && current_remaining_ms
+                            .map(|v| v >= 0 && v <= target_prewarm_ms)
+                            .unwrap_or(false)
+                    {
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(420),
+                            resolve_live_market_target(market_type),
+                        )
+                        .await;
+                        cycle_sleep_ms = cycle_sleep_ms.min(fast_loop_ms);
                     }
 
                     let status = payload
@@ -2687,26 +2736,31 @@ mod tests {
     }
 
     #[test]
-    fn retry_payload_escalates_to_maker_fallback_for_entry() {
+    fn retry_payload_escalates_fak_ladder_for_entry() {
         let payload = json!({
             "action": "enter",
+            "side": "buy_yes",
+            "price": 0.50,
             "tif": "FAK",
             "style": "taker",
             "ttl_ms": 1200,
-            "max_slippage_bps": 18.0
+            "max_slippage_bps": 18.0,
+            "book_meta": { "tick_size": 0.01 }
         });
         let reason = "no orders found to match with FAK order";
         let first = build_retry_payload(&payload, reason, 0).expect("first retry");
         assert_eq!(
             first.get("retry_tag").and_then(Value::as_str),
-            Some("slippage_retry")
+            Some("entry_fak_ladder_step_1")
         );
+        assert_eq!(first.get("tif").and_then(Value::as_str), Some("FAK"));
+        assert_eq!(first.get("style").and_then(Value::as_str), Some("taker"));
         let second = build_retry_payload(&first, reason, 1).expect("second retry");
-        assert_eq!(second.get("tif").and_then(Value::as_str), Some("GTD"));
-        assert_eq!(second.get("style").and_then(Value::as_str), Some("maker"));
+        assert_eq!(second.get("tif").and_then(Value::as_str), Some("FAK"));
+        assert_eq!(second.get("style").and_then(Value::as_str), Some("taker"));
         assert_eq!(
             second.get("retry_tag").and_then(Value::as_str),
-            Some("maker_fallback")
+            Some("entry_fak_ladder_step_2")
         );
     }
 

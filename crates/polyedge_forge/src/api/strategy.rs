@@ -1457,10 +1457,12 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
     let live_executor_mode = LiveExecutorMode::from_env();
     reconcile_live_reports(state, &live_gateway_cfg, live_executor_mode).await;
     handle_live_pending_timeouts(state, &live_gateway_cfg, live_executor_mode).await;
-    let live_market_res = resolve_live_market_target(market_type).await;
+    let (live_market_res, position_before_gate) = tokio::join!(
+        resolve_live_market_target(market_type),
+        state.get_live_position_state(market_type)
+    );
     let live_market_target_error = live_market_res.as_ref().err().map(|e| e.message.clone());
     let live_market = live_market_res.ok();
-    let position_before_gate = state.get_live_position_state(market_type).await;
     let prefer_action = if live_drain_only {
         if position_before_gate.side.is_some() {
             Some("exit")
@@ -1864,10 +1866,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                                 .and_then(Value::as_str)
                                 .unwrap_or_default()
                                 .to_string(),
-                            price_cents: decision
-                                .get("price_cents")
-                                .and_then(Value::as_f64)
-                                .unwrap_or(0.0),
+                            price_cents: (exec_price * 100.0).max(0.0),
                             quote_size_usdc: if effective_notional > 0.0 {
                                 effective_notional
                             } else {
@@ -1919,7 +1918,8 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                                 "reason": event_reason,
                                 "gateway_endpoint": record.get("endpoint"),
                                 "response": record.get("response"),
-                                "error": record.get("error")
+                                "error": record.get("error"),
+                                "price_trace": record.get("price_trace")
                             }),
                         )
                         .await;

@@ -184,6 +184,15 @@ const LIVE_MARKET_TARGET_STALE_GRACE_MS_MAX: i64 = 180_000;
 const LIVE_MARKET_TARGET_STALE_MAX_AGE_MS_DEFAULT: i64 = 90_000;
 const LIVE_MARKET_TARGET_STALE_MAX_AGE_MS_MIN: i64 = 5_000;
 const LIVE_MARKET_TARGET_STALE_MAX_AGE_MS_MAX: i64 = 600_000;
+const LIVE_MARKET_TARGET_RESOLVE_ATTEMPTS_DEFAULT: i64 = 3;
+const LIVE_MARKET_TARGET_RESOLVE_ATTEMPTS_MIN: i64 = 1;
+const LIVE_MARKET_TARGET_RESOLVE_ATTEMPTS_MAX: i64 = 8;
+const LIVE_MARKET_TARGET_RESOLVE_RETRY_MS_DEFAULT: i64 = 140;
+const LIVE_MARKET_TARGET_RESOLVE_RETRY_MS_MIN: i64 = 0;
+const LIVE_MARKET_TARGET_RESOLVE_RETRY_MS_MAX: i64 = 2_000;
+const LIVE_MARKET_TARGET_SWITCH_GUARD_MS_DEFAULT: i64 = 2_500;
+const LIVE_MARKET_TARGET_SWITCH_GUARD_MS_MIN: i64 = 0;
+const LIVE_MARKET_TARGET_SWITCH_GUARD_MS_MAX: i64 = 30_000;
 const LIVE_CANCEL_FAILURE_FORCE_PAUSE_EXIT_THRESHOLD: u8 = 2;
 const LIVE_CANCEL_FAILURE_FORCE_PAUSE_OTHER_THRESHOLD: u8 = 3;
 
@@ -231,6 +240,39 @@ fn live_market_target_stale_max_age_ms() -> i64 {
         .clamp(
             LIVE_MARKET_TARGET_STALE_MAX_AGE_MS_MIN,
             LIVE_MARKET_TARGET_STALE_MAX_AGE_MS_MAX,
+        )
+}
+
+fn live_market_target_resolve_attempts() -> usize {
+    std::env::var("FORGE_FEV1_LIVE_TARGET_RESOLVE_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(LIVE_MARKET_TARGET_RESOLVE_ATTEMPTS_DEFAULT)
+        .clamp(
+            LIVE_MARKET_TARGET_RESOLVE_ATTEMPTS_MIN,
+            LIVE_MARKET_TARGET_RESOLVE_ATTEMPTS_MAX,
+        ) as usize
+}
+
+fn live_market_target_resolve_retry_ms() -> u64 {
+    std::env::var("FORGE_FEV1_LIVE_TARGET_RESOLVE_RETRY_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(LIVE_MARKET_TARGET_RESOLVE_RETRY_MS_DEFAULT)
+        .clamp(
+            LIVE_MARKET_TARGET_RESOLVE_RETRY_MS_MIN,
+            LIVE_MARKET_TARGET_RESOLVE_RETRY_MS_MAX,
+        ) as u64
+}
+
+fn live_market_target_switch_guard_ms() -> i64 {
+    std::env::var("FORGE_FEV1_LIVE_TARGET_SWITCH_GUARD_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(LIVE_MARKET_TARGET_SWITCH_GUARD_MS_DEFAULT)
+        .clamp(
+            LIVE_MARKET_TARGET_SWITCH_GUARD_MS_MIN,
+            LIVE_MARKET_TARGET_SWITCH_GUARD_MS_MAX,
         )
 }
 
@@ -326,6 +368,16 @@ pub(super) async fn gate_live_decisions(
         if side != "UP" && side != "DOWN" {
             skipped.push(json!({
                 "reason": "invalid_side",
+                "decision": normalized
+            }));
+            continue;
+        }
+        if matches!(action.as_str(), "enter" | "add")
+            && position_state.state.eq_ignore_ascii_case("exit_pending")
+        {
+            skipped.push(json!({
+                "reason": "exit_state_lock",
+                "state": position_state.state,
                 "decision": normalized
             }));
             continue;
@@ -542,6 +594,9 @@ pub(super) async fn resolve_live_market_target(
     let cache_ttl_ms = live_market_target_cache_ttl_ms();
     let stale_grace_ms = live_market_target_stale_grace_ms();
     let stale_max_age_ms = live_market_target_stale_max_age_ms();
+    let resolve_attempts = live_market_target_resolve_attempts();
+    let resolve_retry_ms = live_market_target_resolve_retry_ms();
+    let switch_guard_ms = live_market_target_switch_guard_ms();
     let mut cached_entry_for_fallback: Option<CachedLiveMarketTarget> = None;
     {
         let cache = live_market_target_cache().read().await;
@@ -562,84 +617,102 @@ pub(super) async fn resolve_live_market_target(
         timeframes: vec![market_type.to_string()],
         ..DiscoveryConfig::default()
     });
-    let discovered = match discovery.discover().await {
-        Ok(v) => v,
-        Err(e) => {
-            if let Some(cached) = cached_entry_for_fallback.as_ref() {
-                if let Some(stale) =
-                    stale_target_from_cache(cached, now_ms, stale_grace_ms, stale_max_age_ms)
-                {
-                    tracing::warn!(
-                        market_type = market_type,
-                        error = %e,
-                        stale_grace_ms = stale_grace_ms,
-                        stale_max_age_ms = stale_max_age_ms,
-                        "market discovery failed, fallback to stale cached target"
-                    );
-                    return Ok(stale);
+    let mut last_discovery_error: Option<String> = None;
+    for attempt_idx in 0..resolve_attempts {
+        let discovered = match discovery.discover().await {
+            Ok(v) => v,
+            Err(e) => {
+                last_discovery_error = Some(e.to_string());
+                if attempt_idx + 1 < resolve_attempts && resolve_retry_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(resolve_retry_ms)).await;
                 }
+                continue;
             }
-            return Err(ApiError::internal(format!("market discovery failed: {e}")));
-        }
-    };
-    let mut markets: Vec<MarketDescriptor> = discovered
-        .into_iter()
-        .filter(|m| {
-            m.symbol.eq_ignore_ascii_case("BTCUSDT")
-                && m.timeframe
-                    .as_deref()
-                    .map(|tf| tf.eq_ignore_ascii_case(market_type))
-                    .unwrap_or(false)
-                && m.token_id_yes.is_some()
-                && m.token_id_no.is_some()
-        })
-        .collect();
-    if markets.is_empty() {
-        if let Some(cached) = cached_entry_for_fallback.as_ref() {
-            if let Some(stale) =
-                stale_target_from_cache(cached, now_ms, stale_grace_ms, stale_max_age_ms)
-            {
-                tracing::warn!(
-                    market_type = market_type,
-                    stale_grace_ms = stale_grace_ms,
-                    stale_max_age_ms = stale_max_age_ms,
-                    "market discovery returned empty, fallback to stale cached target"
-                );
-                return Ok(stale);
+        };
+        let mut markets: Vec<MarketDescriptor> = discovered
+            .into_iter()
+            .filter(|m| {
+                m.symbol.eq_ignore_ascii_case("BTCUSDT")
+                    && m.timeframe
+                        .as_deref()
+                        .map(|tf| tf.eq_ignore_ascii_case(market_type))
+                        .unwrap_or(false)
+                    && m.token_id_yes.is_some()
+                    && m.token_id_no.is_some()
+            })
+            .collect();
+        if markets.is_empty() {
+            if attempt_idx + 1 < resolve_attempts && resolve_retry_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(resolve_retry_ms)).await;
             }
+            continue;
+        }
+        markets.sort_by_key(|m| {
+            let end_ms = parse_end_date_ms(m.end_date.as_deref()).unwrap_or(i64::MAX / 4);
+            let bucket = if end_ms >= now_ms.saturating_add(switch_guard_ms) {
+                0_i64
+            } else if end_ms >= now_ms.saturating_sub(stale_grace_ms) {
+                1_i64
+            } else {
+                2_i64
+            };
+            let distance = if end_ms >= now_ms {
+                end_ms.saturating_sub(now_ms)
+            } else {
+                now_ms.saturating_sub(end_ms)
+            };
+            (
+                bucket,
+                distance,
+                std::cmp::Reverse(end_ms),
+                m.market_id.clone(),
+            )
+        });
+        let best = markets.remove(0);
+        let target = LiveMarketTarget {
+            market_id: best.market_id,
+            symbol: best.symbol,
+            timeframe: best.timeframe.unwrap_or_else(|| market_type.to_string()),
+            token_id_yes: best.token_id_yes.unwrap_or_default(),
+            token_id_no: best.token_id_no.unwrap_or_default(),
+            end_date: best.end_date,
+        };
+        {
+            let mut cache = live_market_target_cache().write().await;
+            cache.insert(
+                market_type.to_string(),
+                CachedLiveMarketTarget {
+                    fetched_at_ms: Utc::now().timestamp_millis(),
+                    target: target.clone(),
+                },
+            );
+        }
+        return Ok(target);
+    }
+
+    if let Some(cached) = cached_entry_for_fallback.as_ref() {
+        if let Some(stale) =
+            stale_target_from_cache(cached, now_ms, stale_grace_ms, stale_max_age_ms)
+        {
+            tracing::warn!(
+                market_type = market_type,
+                stale_grace_ms = stale_grace_ms,
+                stale_max_age_ms = stale_max_age_ms,
+                resolve_attempts = resolve_attempts,
+                last_discovery_error = last_discovery_error.as_deref().unwrap_or("none"),
+                "market target resolve exhausted retries, fallback to stale cached target"
+            );
+            return Ok(stale);
         }
     }
-    if markets.is_empty() {
-        return Err(ApiError::bad_request(format!(
-            "no active BTC {market_type} market with token ids"
-        )));
-    }
-    markets.sort_by_key(|m| {
-        let end_ms = parse_end_date_ms(m.end_date.as_deref()).unwrap_or(i64::MAX / 4);
-        let ended_penalty = if end_ms < now_ms { 1_i64 } else { 0_i64 };
-        let distance = end_ms.saturating_sub(now_ms).abs();
-        (ended_penalty, distance)
-    });
-    let best = markets.remove(0);
-    let target = LiveMarketTarget {
-        market_id: best.market_id,
-        symbol: best.symbol,
-        timeframe: best.timeframe.unwrap_or_else(|| market_type.to_string()),
-        token_id_yes: best.token_id_yes.unwrap_or_default(),
-        token_id_no: best.token_id_no.unwrap_or_default(),
-        end_date: best.end_date,
-    };
-    {
-        let mut cache = live_market_target_cache().write().await;
-        cache.insert(
-            market_type.to_string(),
-            CachedLiveMarketTarget {
-                fetched_at_ms: now_ms,
-                target: target.clone(),
-            },
-        );
-    }
-    Ok(target)
+    Err(ApiError::bad_request(format!(
+        "no active BTC {market_type} market with token ids after {} attempts{}",
+        resolve_attempts,
+        last_discovery_error
+            .as_ref()
+            .map(|e| format!(", last_error={e}"))
+            .unwrap_or_default()
+    )))
 }
 
 pub(super) fn decision_to_live_payload(
@@ -805,6 +878,60 @@ pub(super) fn decision_to_live_payload(
                 if anchored < price {
                     price = anchored;
                     notes.push("anchor_taker_to_best_bid".to_string());
+                }
+            }
+            let depth_top3 = if is_buy {
+                book.ask_depth_top3.unwrap_or(0.0)
+            } else {
+                book.bid_depth_top3.unwrap_or(0.0)
+            };
+            if depth_top3.is_finite() && depth_top3 > 0.0 {
+                let depth_util = (size / depth_top3).max(0.0);
+                let mut extra_bps = if depth_util <= 0.25 {
+                    2.0
+                } else if depth_util <= 0.5 {
+                    4.0
+                } else if depth_util <= 0.85 {
+                    8.0
+                } else if depth_util <= 1.0 {
+                    14.0
+                } else if depth_util <= 1.3 {
+                    22.0
+                } else {
+                    34.0
+                };
+                if let (Some(best_bid), Some(best_ask)) = (book.best_bid, book.best_ask) {
+                    if best_bid.is_finite()
+                        && best_ask.is_finite()
+                        && best_bid > 0.0
+                        && best_ask > 0.0
+                    {
+                        let mid = ((best_bid + best_ask) * 0.5).max(0.0001);
+                        let spread_bps = ((best_ask - best_bid) / mid * 10_000.0).max(0.0);
+                        if spread_bps >= 100.0 {
+                            extra_bps += 4.0;
+                        }
+                    }
+                }
+                if is_exit_like {
+                    extra_bps += 4.0;
+                }
+                if extra_bps > 0.0 {
+                    let adjusted = if is_buy {
+                        (price * (1.0 + extra_bps / 10_000.0)).clamp(0.01, 0.99)
+                    } else {
+                        (price * (1.0 - extra_bps / 10_000.0)).clamp(0.01, 0.99)
+                    };
+                    if (adjusted - price).abs() >= 0.00001 {
+                        price = adjusted;
+                        notes.push(format!("adaptive_taker_price_bps_{extra_bps:.1}"));
+                    }
+                    let min_slippage =
+                        (extra_bps + if is_exit_like { 18.0 } else { 12.0 }).min(500.0);
+                    if min_slippage > slippage_bps {
+                        slippage_bps = min_slippage;
+                        notes.push("adaptive_slippage_floor".to_string());
+                    }
                 }
             }
             let tick_size = book.tick_size.max(0.0001);
@@ -1050,6 +1177,11 @@ pub(super) fn can_retry_on_liquidity(reason: &str) -> bool {
         || r.contains("insufficient liquidity")
         || r.contains("cannot be matched")
         || r.contains("would not fill")
+        || r.contains("unmatched")
+        || r.contains("canceled")
+        || r.contains("cancelled")
+        || r.contains("rejected")
+        || r.contains("timeout")
 }
 
 pub(super) fn is_live_exit_action(action: &str) -> bool {
@@ -1145,33 +1277,103 @@ pub(super) fn build_retry_payload(current: &Value, reason: &str, attempt: usize)
         .unwrap_or("FAK")
         .to_ascii_uppercase();
     let maker_mode = matches!(current_tif.as_str(), "GTD" | "GTC" | "POST_ONLY");
+    let side = current
+        .get("side")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let is_buy = side.starts_with("buy_");
+    let is_taker_like = matches!(current_tif.as_str(), "FAK" | "FOK")
+        || current
+            .get("style")
+            .and_then(Value::as_str)
+            .map(|s| s.eq_ignore_ascii_case("taker"))
+            .unwrap_or(false);
+    let tick_size = current
+        .get("book_meta")
+        .and_then(|v| v.get("tick_size"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.01)
+        .max(0.0001);
+    let current_price = current
+        .get("price")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.5)
+        .clamp(0.01, 0.99);
 
-    if attempt == 0 {
-        let boosted_slippage = if is_exit_like {
-            if emergency_exit {
-                (current_slippage + 24.0).min(160.0)
+    if is_taker_like {
+        let (slip_boost, ttl_target, tick_steps) = if attempt == 0 {
+            if is_exit_like {
+                if emergency_exit {
+                    (24.0, 520_i64, 1_u32)
+                } else {
+                    (16.0, 620_i64, 1_u32)
+                }
             } else {
-                (current_slippage + 16.0).min(120.0)
+                (12.0, 900_i64, 1_u32)
             }
         } else {
-            (current_slippage + 12.0).min(90.0)
+            // Final taker step: favor certainty of exit/fill over price.
+            if is_exit_like {
+                if emergency_exit {
+                    (36.0, 420_i64, 3_u32)
+                } else {
+                    (28.0, 520_i64, 2_u32)
+                }
+            } else {
+                (18.0, 760_i64, 2_u32)
+            }
         };
-        let next_ttl = if emergency_exit {
-            current_ttl.min(900).max(350)
+        let boosted_slippage =
+            (current_slippage + slip_boost).min(if is_exit_like { 180.0 } else { 120.0 });
+        let shifted_price = {
+            let step = tick_size * (tick_steps as f64);
+            let raw = if is_buy {
+                current_price + step
+            } else {
+                current_price - step
+            };
+            round_to_tick(raw.clamp(0.01, 0.99), tick_size, is_buy)
+        };
+        let next_ttl = if is_exit_like {
+            current_ttl.min(ttl_target).max(320)
         } else {
-            (current_ttl + 400).min(5_000)
+            current_ttl.min(ttl_target).max(420)
         };
         if let Some(obj) = next.as_object_mut() {
+            obj.insert("tif".to_string(), json!("FAK"));
+            obj.insert("style".to_string(), json!("taker"));
+            obj.insert("price".to_string(), json!(shifted_price));
             obj.insert("max_slippage_bps".to_string(), json!(boosted_slippage));
             obj.insert("ttl_ms".to_string(), json!(next_ttl));
             obj.insert(
                 "retry_tag".to_string(),
-                json!(if emergency_exit {
-                    "emergency_slippage_retry"
+                json!(if is_exit_like {
+                    if attempt == 0 {
+                        "exit_fak_ladder_step_1"
+                    } else {
+                        "exit_fak_ladder_step_2"
+                    }
                 } else {
-                    "slippage_retry"
+                    if attempt == 0 {
+                        "entry_fak_ladder_step_1"
+                    } else {
+                        "entry_fak_ladder_step_2"
+                    }
                 }),
             );
+            if let Some(q) = obj
+                .get("quote_size_usdc")
+                .and_then(Value::as_f64)
+                .or_else(|| obj.get("requested_notional_usdc").and_then(Value::as_f64))
+                .filter(|v| v.is_finite() && *v > 0.0)
+            {
+                let resized = (q / shifted_price).max(0.01);
+                obj.insert(
+                    "size".to_string(),
+                    json!((resized * 10_000.0).round() / 10_000.0),
+                );
+            }
         }
         return Some(next);
     }
@@ -1193,24 +1395,45 @@ pub(super) fn build_retry_payload(current: &Value, reason: &str, attempt: usize)
         return Some(next);
     }
 
-    if action == "enter" || action == "add" {
-        if let Some(obj) = next.as_object_mut() {
-            obj.insert("tif".to_string(), json!("GTD"));
-            obj.insert("style".to_string(), json!("maker"));
-            obj.insert(
-                "ttl_ms".to_string(),
-                json!((current_ttl + 700).clamp(800, 6_000)),
-            );
-            obj.insert(
-                "max_slippage_bps".to_string(),
-                json!((current_slippage + 6.0).min(90.0)),
-            );
-            obj.insert("retry_tag".to_string(), json!("maker_fallback"));
-        }
-        return Some(next);
-    }
-
     None
+}
+
+fn build_execution_price_trace(
+    decision: &Value,
+    request: &Value,
+    final_request: &Value,
+    response: Option<&Value>,
+) -> Value {
+    let signal_price_cents = decision.get("price_cents").and_then(Value::as_f64);
+    let submit_price_cents = request
+        .get("price")
+        .and_then(Value::as_f64)
+        .map(|v| (v * 100.0).clamp(0.0, 100.0));
+    let final_submit_price_cents = final_request
+        .get("price")
+        .and_then(Value::as_f64)
+        .map(|v| (v * 100.0).clamp(0.0, 100.0));
+    let accepted_price_cents = response
+        .and_then(|v| v.get("price").and_then(Value::as_f64))
+        .map(|v| (v * 100.0).clamp(0.0, 100.0))
+        .or(final_submit_price_cents);
+    let signal_vs_submit_cents = match (signal_price_cents, submit_price_cents) {
+        (Some(signal), Some(submit)) => Some(submit - signal),
+        _ => None,
+    };
+    let signal_vs_accepted_cents = match (signal_price_cents, accepted_price_cents) {
+        (Some(signal), Some(accepted)) => Some(accepted - signal),
+        _ => None,
+    };
+    json!({
+        "signal_price_cents": signal_price_cents,
+        "submit_price_cents": submit_price_cents,
+        "final_submit_price_cents": final_submit_price_cents,
+        "accepted_price_cents": accepted_price_cents,
+        "fill_price_cents": Value::Null,
+        "signal_vs_submit_cents": signal_vs_submit_cents,
+        "signal_vs_accepted_cents": signal_vs_accepted_cents,
+    })
 }
 
 pub(super) async fn get_gateway_reports(
@@ -2053,7 +2276,13 @@ pub(super) async fn execute_live_orders_via_gateway(
             "error": final_error,
             "attempts": attempts,
             "order_latency_ms": order_started.elapsed().as_millis() as u64,
-            "book_snapshot": book_snapshot
+            "book_snapshot": book_snapshot,
+            "price_trace": build_execution_price_trace(
+                &decision,
+                &payload,
+                &attempt_payload,
+                final_response.as_ref()
+            )
         }));
     }
     out
@@ -2875,7 +3104,13 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
             "attempts": attempts,
             "executor": executed_via,
             "order_latency_ms": order_started.elapsed().as_millis() as u64,
-            "book_snapshot": book_snapshot
+            "book_snapshot": book_snapshot,
+            "price_trace": build_execution_price_trace(
+                &decision,
+                &payload,
+                &attempt_payload,
+                final_response.as_ref()
+            )
         }));
     }
     out
@@ -3417,6 +3652,10 @@ mod tests {
             .get("size")
             .and_then(Value::as_f64)
             .unwrap_or_default();
+        let price = payload
+            .get("price")
+            .and_then(Value::as_f64)
+            .unwrap_or_default();
         let amount = payload
             .get("buy_amount_usdc")
             .and_then(Value::as_f64)
@@ -3431,8 +3670,8 @@ mod tests {
             "taker buy must keep min_order_size floor, got {size}"
         );
         assert!(
-            (amount - 2.5).abs() < 1e-9,
-            "buy amount should be raised to floor notional, got {amount}"
+            amount + 1e-9 >= size * price,
+            "buy amount should cover min-order notional, got amount={amount}, size={size}, price={price}"
         );
         assert_eq!(mode, "buy_usdc");
     }
@@ -3466,6 +3705,70 @@ mod tests {
         assert!(
             payload.get("buy_amount_usdc").is_none(),
             "maker path should stay in share-size mode"
+        );
+    }
+
+    #[test]
+    fn retry_payload_exit_ladder_moves_price_and_slippage() {
+        let cur = json!({
+            "action": "exit",
+            "reason": "signal_reverse",
+            "side": "sell_yes",
+            "price": 0.60,
+            "size": 5.0,
+            "quote_size_usdc": 3.0,
+            "tif": "FAK",
+            "style": "taker",
+            "ttl_ms": 900,
+            "max_slippage_bps": 22.0,
+            "book_meta": {
+                "tick_size": 0.01
+            }
+        });
+        let nxt = build_retry_payload(&cur, "UNMATCHED", 0).expect("retry payload");
+        let px = nxt.get("price").and_then(Value::as_f64).unwrap_or_default();
+        let slip = nxt
+            .get("max_slippage_bps")
+            .and_then(Value::as_f64)
+            .unwrap_or_default();
+        let ttl = nxt
+            .get("ttl_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        assert!(
+            px <= 0.59 + 1e-9,
+            "exit retry should move sell price down by >=1 tick, got {px}"
+        );
+        assert!(slip > 22.0, "exit retry should raise slippage, got {slip}");
+        assert!(ttl <= 900, "exit retry should not increase ttl, got {ttl}");
+    }
+
+    #[test]
+    fn retry_payload_entry_ladder_keeps_taker_mode() {
+        let cur = json!({
+            "action": "enter",
+            "reason": "fev1_signal_entry",
+            "side": "buy_yes",
+            "price": 0.51,
+            "size": 5.0,
+            "quote_size_usdc": 3.0,
+            "tif": "FAK",
+            "style": "taker",
+            "ttl_ms": 1400,
+            "max_slippage_bps": 18.0,
+            "book_meta": {
+                "tick_size": 0.01
+            }
+        });
+        let nxt = build_retry_payload(&cur, "insufficient liquidity", 0).expect("retry payload");
+        let tif = nxt.get("tif").and_then(Value::as_str).unwrap_or_default();
+        let style = nxt.get("style").and_then(Value::as_str).unwrap_or_default();
+        let px = nxt.get("price").and_then(Value::as_f64).unwrap_or_default();
+        assert_eq!(tif, "FAK");
+        assert_eq!(style, "taker");
+        assert!(
+            px >= 0.52 - 1e-9,
+            "entry retry should move buy price up by >=1 tick, got {px}"
         );
     }
 }
