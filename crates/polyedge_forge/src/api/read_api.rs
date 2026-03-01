@@ -105,7 +105,10 @@ pub(super) async fn fetch_latest_snapshot(
             }
             fallback_direct = Some(v);
         } else if is_live_snapshot_recent(&v, now_ms) {
-            fallback_direct = Some(v);
+            let pri = snapshot_priority(&v, timeframe, now_ms);
+            if pri.0 > 0 {
+                fallback_direct = Some(v);
+            }
         }
     }
 
@@ -148,6 +151,9 @@ pub(super) async fn fetch_latest_snapshot(
                 best_fresh = Some(row.clone());
             }
         } else if is_live_snapshot_recent(row, now_ms) {
+            if pri.0 <= 0 {
+                continue;
+            }
             if best_recent_priority.map(|v| pri > v).unwrap_or(true) {
                 best_recent_priority = Some(pri);
                 best_recent = Some(row.clone());
@@ -242,8 +248,22 @@ pub(super) fn compact_live_snapshot(snapshot: &Value, market_type: &str) -> Valu
     let mid_yes_smooth = snapshot.get("mid_yes_smooth").and_then(Value::as_f64);
     let mid_no_smooth = snapshot.get("mid_no_smooth").and_then(Value::as_f64);
     // Live display should prefer smoothed mids to avoid transient quote noise.
-    let mid_yes = mid_yes_smooth.or(mid_yes_raw);
-    let mid_no = mid_no_smooth.or(mid_no_raw);
+    let remaining_ms = snapshot
+        .get("remaining_ms")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    // Near settlement, display should follow raw orderbook as closely as possible.
+    let near_settlement = remaining_ms > 0 && remaining_ms <= 45_000;
+    let mid_yes = if near_settlement {
+        mid_yes_raw.or(mid_yes_smooth)
+    } else {
+        mid_yes_smooth.or(mid_yes_raw)
+    };
+    let mid_no = if near_settlement {
+        mid_no_raw.or(mid_no_smooth)
+    } else {
+        mid_no_smooth.or(mid_no_raw)
+    };
     let raw_bid_yes = snapshot.get("bid_yes").and_then(Value::as_f64);
     let raw_ask_yes = snapshot.get("ask_yes").and_then(Value::as_f64);
     let raw_bid_no = snapshot.get("bid_no").and_then(Value::as_f64);

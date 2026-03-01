@@ -368,7 +368,10 @@ function formatCentFromCents(v: number | null | undefined): string {
 }
 
 function formatCountdown(seconds: number | null | undefined): string {
-  if (seconds == null || !Number.isFinite(seconds) || seconds <= 0) {
+  if (seconds == null || !Number.isFinite(seconds)) {
+    return "--:--";
+  }
+  if (seconds <= 0) {
     return "0:00";
   }
   const total = Math.floor(seconds);
