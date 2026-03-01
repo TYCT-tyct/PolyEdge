@@ -1938,6 +1938,11 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                                 "price_cents": decision.get("price_cents").and_then(Value::as_f64),
                                 "quote_size_usdc": decision.get("quote_size_usdc").and_then(Value::as_f64),
                                 "reason": event_reason,
+                                "order_latency_ms": record.get("order_latency_ms"),
+                                "attempt_count": record.get("attempt_count"),
+                                "attempts": record.get("attempts"),
+                                "request": record.get("request"),
+                                "final_request": record.get("final_request"),
                                 "gateway_endpoint": record.get("endpoint"),
                                 "response": record.get("response"),
                                 "error": record.get("error"),
@@ -3056,6 +3061,10 @@ pub(super) async fn strategy_live_reset(
         events.clear();
     }
     {
+        let mut seq = state.live_event_seq.write().await;
+        *seq = 0;
+    }
+    {
         let mut pending = state.live_pending_orders.write().await;
         pending.clear();
     }
@@ -3106,6 +3115,10 @@ pub(super) async fn strategy_live_reset(
         let key = live_position_state_key(&state.redis_prefix, market);
         if delete_key(&state, &key).await.is_ok() {
             deleted_keys.push(key);
+        }
+        let events_key = live_events_key(&state.redis_prefix, market);
+        if delete_key(&state, &events_key).await.is_ok() {
+            deleted_keys.push(events_key);
         }
         let control_key = live_runtime_control_key(&state.redis_prefix, market);
         if delete_key(&state, &control_key).await.is_ok() {
@@ -3305,6 +3318,172 @@ pub(super) async fn strategy_live_balance(
         "capital_state_tune_factor": capital_state.tune_factor,
         "raw": snapshot.raw,
         "fixed_guard": fixed_guard
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct StrategyLiveEventsQueryParams {
+    market_type: Option<String>,
+    limit: Option<u32>,
+    since_ts_ms: Option<i64>,
+    order_id: Option<String>,
+    action: Option<String>,
+    reason: Option<String>,
+    accepted: Option<bool>,
+}
+
+pub(super) async fn strategy_live_events(
+    State(state): State<ApiState>,
+    Query(params): Query<StrategyLiveEventsQueryParams>,
+) -> Result<Json<Value>, ApiError> {
+    let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
+    let limit = params.limit.unwrap_or(400).clamp(1, 5000) as usize;
+    let since_ts_ms = params.since_ts_ms.unwrap_or(0);
+    let order_id_filter = params
+        .order_id
+        .as_deref()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty());
+    let action_filter = params
+        .action
+        .as_deref()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty());
+    let reason_filter = params
+        .reason
+        .as_deref()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty());
+    let accepted_filter = params.accepted;
+
+    let scanned = state
+        .list_live_events(market_type, live_event_log_max())
+        .await;
+    let mut filtered = scanned
+        .into_iter()
+        .filter(|ev| {
+            let ts_ok = ev.get("ts_ms").and_then(Value::as_i64).unwrap_or(0) >= since_ts_ms;
+            if !ts_ok {
+                return false;
+            }
+            if let Some(want) = order_id_filter.as_deref() {
+                let got = ev
+                    .get("order_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase();
+                if got != want {
+                    return false;
+                }
+            }
+            if let Some(want) = action_filter.as_deref() {
+                let got = ev
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase();
+                if got != want {
+                    return false;
+                }
+            }
+            if let Some(want) = reason_filter.as_deref() {
+                let got = ev
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase();
+                if !got.contains(want) {
+                    return false;
+                }
+            }
+            if let Some(want) = accepted_filter {
+                let got = ev.get("accepted").and_then(Value::as_bool).unwrap_or(false);
+                if got != want {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect::<Vec<_>>();
+    if filtered.len() > limit {
+        filtered = filtered.split_off(filtered.len().saturating_sub(limit));
+    }
+
+    let mut by_reason = HashMap::<String, usize>::new();
+    let mut by_action = HashMap::<String, usize>::new();
+    let mut by_event_type = HashMap::<String, usize>::new();
+    let mut accept_count = 0usize;
+    let mut reject_like_count = 0usize;
+    let mut order_latency_sum = 0f64;
+    let mut order_latency_n = 0usize;
+    for ev in &filtered {
+        let reason = ev
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        *by_reason.entry(reason.clone()).or_insert(0) += 1;
+        let action = ev
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("none")
+            .to_string();
+        *by_action.entry(action).or_insert(0) += 1;
+        let event_type = ev
+            .get("event_type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        *by_event_type.entry(event_type).or_insert(0) += 1;
+        if ev.get("accepted").and_then(Value::as_bool).unwrap_or(false) {
+            accept_count += 1;
+        }
+        let reason_lc = reason.to_ascii_lowercase();
+        if reason_lc.contains("reject")
+            || reason_lc.contains("cancel")
+            || reason_lc.contains("timeout")
+            || reason_lc.contains("blocked")
+        {
+            reject_like_count += 1;
+        }
+        if let Some(lat_ms) = ev.get("order_latency_ms").and_then(Value::as_f64) {
+            order_latency_sum += lat_ms.max(0.0);
+            order_latency_n += 1;
+        }
+    }
+    let mut reason_top = by_reason.into_iter().collect::<Vec<_>>();
+    reason_top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    reason_top.truncate(20);
+    let avg_order_latency_ms = if order_latency_n > 0 {
+        order_latency_sum / order_latency_n as f64
+    } else {
+        0.0
+    };
+
+    Ok(Json(json!({
+        "ok": true,
+        "market_type": market_type,
+        "filters": {
+            "limit": limit,
+            "since_ts_ms": since_ts_ms,
+            "order_id": params.order_id,
+            "action": params.action,
+            "reason": params.reason,
+            "accepted": accepted_filter,
+        },
+        "summary": {
+            "event_count": filtered.len(),
+            "accept_count": accept_count,
+            "reject_like_count": reject_like_count,
+            "avg_order_latency_ms": avg_order_latency_ms,
+            "reason_top": reason_top,
+            "by_action": by_action,
+            "by_event_type": by_event_type
+        },
+        "events": filtered
     })))
 }
 

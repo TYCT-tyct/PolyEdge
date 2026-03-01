@@ -82,6 +82,7 @@ struct ApiState {
     live_position_states: Arc<RwLock<HashMap<String, LivePositionState>>>,
     live_decision_guard: Arc<RwLock<HashMap<String, i64>>>,
     live_events: Arc<RwLock<VecDeque<Value>>>,
+    live_event_seq: Arc<RwLock<u64>>,
     live_pending_orders: Arc<RwLock<HashMap<String, LivePendingOrder>>>,
     live_capital_states: Arc<RwLock<HashMap<String, LiveCapitalState>>>,
     live_gateway_report_seq: Arc<RwLock<i64>>,
@@ -108,7 +109,12 @@ struct ChartCacheEntry {
 const CHART_CACHE_TTL_MS: u64 = 900;
 const CHART_CACHE_MAX_ENTRIES: usize = 120;
 const LIVE_DECISION_GUARD_TTL_MS: i64 = 45_000;
-const LIVE_EVENT_LOG_MAX: usize = 240;
+const LIVE_EVENT_LOG_MAX_DEFAULT: usize = 4_000;
+const LIVE_EVENT_LOG_MAX_MIN: usize = 200;
+const LIVE_EVENT_LOG_MAX_MAX: usize = 20_000;
+const LIVE_EVENT_LOG_TTL_SEC_DEFAULT: u32 = 7 * 24 * 3600;
+const LIVE_EVENT_LOG_TTL_SEC_MIN: u32 = 3600;
+const LIVE_EVENT_LOG_TTL_SEC_MAX: u32 = 30 * 24 * 3600;
 const LIVE_RUST_BOOK_CACHE_TTL_MS: u64 = 260;
 const LIVE_RUST_BOOK_CACHE_MAX: usize = 512;
 const LIVE_CAPITAL_MAX_UTILIZATION: f64 = 0.92;
@@ -118,6 +124,81 @@ const LIVE_ALERT_THROTTLE_DEFAULT_MS: i64 = 5 * 60_000;
 const LIVE_CAPITAL_RECENT_PNL_LIMIT: usize = 200;
 const CN_DAY_MS: i64 = 86_400_000;
 const CN_TZ_OFFSET_MS: i64 = 8 * 60 * 60 * 1000;
+
+fn live_event_log_max() -> usize {
+    std::env::var("FORGE_FEV1_LIVE_EVENT_LOG_MAX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(LIVE_EVENT_LOG_MAX_DEFAULT)
+        .clamp(LIVE_EVENT_LOG_MAX_MIN, LIVE_EVENT_LOG_MAX_MAX)
+}
+
+fn live_event_log_ttl_sec() -> u32 {
+    std::env::var("FORGE_FEV1_LIVE_EVENT_LOG_TTL_SEC")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(LIVE_EVENT_LOG_TTL_SEC_DEFAULT)
+        .clamp(LIVE_EVENT_LOG_TTL_SEC_MIN, LIVE_EVENT_LOG_TTL_SEC_MAX)
+}
+
+fn extract_order_id_from_live_event(event: &Value) -> Option<String> {
+    event
+        .get("order_id")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            event.get("response").and_then(|resp| {
+                resp.get("order_id")
+                    .and_then(Value::as_str)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+        })
+        .or_else(|| {
+            event.get("event").and_then(|ev| {
+                ev.get("order_id")
+                    .and_then(Value::as_str)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+        })
+}
+
+fn classify_live_event_type(event: &Value) -> &'static str {
+    let reason = event
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let action = event
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if reason.contains("no_live_market_target") {
+        "target_miss"
+    } else if reason.contains("pending_confirm")
+        || reason.contains("submit")
+        || reason.contains("decision_to_payload_failed")
+    {
+        "submit"
+    } else if reason.contains("terminal")
+        || reason.contains("filled")
+        || reason.contains("canceled")
+        || reason.contains("cancelled")
+    {
+        "terminal"
+    } else if reason.contains("timeout") {
+        "timeout"
+    } else if reason.contains("resubmit") || reason.contains("retry") {
+        "retry"
+    } else if action == "none" {
+        "state"
+    } else {
+        "execution"
+    }
+}
 
 fn interpolate_piecewise(x: f64, points: &[(f64, f64)]) -> f64 {
     if points.is_empty() {
@@ -1733,11 +1814,38 @@ impl ApiState {
         if event.get("ts_ms").is_none() {
             event["ts_ms"] = Value::from(now_ms);
         }
+        let ts_ms = event.get("ts_ms").and_then(Value::as_i64).unwrap_or(now_ms);
+        if event.get("ts_iso").is_none() {
+            event["ts_iso"] = Value::String(
+                DateTime::<Utc>::from_timestamp_millis(ts_ms)
+                    .map(|v| v.to_rfc3339())
+                    .unwrap_or_default(),
+            );
+        }
+        if event.get("event_id").is_none() {
+            event["event_id"] = Value::String(Uuid::new_v4().to_string());
+        }
+        if event.get("order_id").is_none() {
+            if let Some(order_id) = extract_order_id_from_live_event(&event) {
+                event["order_id"] = Value::String(order_id);
+            }
+        }
+        if event.get("event_type").is_none() {
+            event["event_type"] = Value::String(classify_live_event_type(&event).to_string());
+        }
+        {
+            let mut seq = self.live_event_seq.write().await;
+            *seq = seq.saturating_add(1);
+            event["event_seq"] = Value::from(*seq);
+        }
+        let max_len = live_event_log_max();
         let mut events = self.live_events.write().await;
         events.push_back(event);
-        while events.len() > LIVE_EVENT_LOG_MAX {
+        while events.len() > max_len {
             events.pop_front();
         }
+        drop(events);
+        self.persist_live_runtime_state_async(market_type).await;
     }
 
     async fn list_live_events(&self, market_type: &str, limit: usize) -> Vec<Value> {
@@ -2378,6 +2486,7 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         live_position_states: Arc::new(RwLock::new(HashMap::new())),
         live_decision_guard: Arc::new(RwLock::new(HashMap::new())),
         live_events: Arc::new(RwLock::new(VecDeque::new())),
+        live_event_seq: Arc::new(RwLock::new(0)),
         live_pending_orders: Arc::new(RwLock::new(HashMap::new())),
         live_capital_states: Arc::new(RwLock::new(HashMap::new())),
         live_gateway_report_seq: Arc::new(RwLock::new(0)),
@@ -2435,6 +2544,7 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         .route("/api/strategy/live/reset", post(strategy_live_reset))
         .route("/api/strategy/live/control", post(strategy_live_control))
         .route("/api/strategy/live/balance", get(strategy_live_balance))
+        .route("/api/strategy/live/events", get(strategy_live_events))
         .with_state(state.clone());
 
     if let Some(dist) = cfg.dashboard_dist_dir {
@@ -2467,6 +2577,10 @@ fn live_position_state_key(redis_prefix: &str, market_type: &str) -> String {
 
 fn live_pending_orders_key(redis_prefix: &str) -> String {
     format!("{redis_prefix}:fev1:live:pending")
+}
+
+fn live_events_key(redis_prefix: &str, market_type: &str) -> String {
+    format!("{redis_prefix}:fev1:live:events:{market_type}")
 }
 
 fn live_runtime_control_key(redis_prefix: &str, market_type: &str) -> String {
@@ -2558,6 +2672,8 @@ async fn restore_live_runtime_state(
     cfg: &LiveRuntimeConfig,
 ) -> Result<(), ApiError> {
     let capital_cfg = LiveCapitalConfig::from_env();
+    let mut restored_events = Vec::<Value>::new();
+    let mut max_event_seq: u64 = 0;
     for market in &cfg.markets {
         let key = live_position_state_key(&state.redis_prefix, market);
         if let Some(v) = read_key_value(state, &key).await? {
@@ -2569,6 +2685,17 @@ async fn restore_live_runtime_state(
         if let Some(v) = read_key_value(state, &control_key).await? {
             if let Ok(parsed) = serde_json::from_value::<LiveRuntimeControl>(v) {
                 state.put_live_runtime_control(market, parsed).await;
+            }
+        }
+        let events_key = live_events_key(&state.redis_prefix, market);
+        if let Some(v) = read_key_value(state, &events_key).await? {
+            if let Ok(rows) = serde_json::from_value::<Vec<Value>>(v) {
+                for ev in rows {
+                    if let Some(seq) = ev.get("event_seq").and_then(Value::as_u64) {
+                        max_event_seq = max_event_seq.max(seq);
+                    }
+                    restored_events.push(ev);
+                }
             }
         }
         if !capital_cfg.portfolio_shared {
@@ -2609,6 +2736,22 @@ async fn restore_live_runtime_state(
     if let Some(v) = read_key_value(state, &seq_key).await? {
         let seq = v.get("seq").and_then(Value::as_i64).unwrap_or(0);
         state.set_gateway_report_seq(seq).await;
+    }
+    if !restored_events.is_empty() {
+        restored_events.sort_by_key(|ev| ev.get("ts_ms").and_then(Value::as_i64).unwrap_or(0));
+        let max_len = live_event_log_max();
+        let mut events = state.live_events.write().await;
+        events.clear();
+        for ev in restored_events {
+            events.push_back(ev);
+            while events.len() > max_len {
+                events.pop_front();
+            }
+        }
+    }
+    {
+        let mut seq = state.live_event_seq.write().await;
+        *seq = max_event_seq;
     }
     Ok(())
 }
@@ -2653,6 +2796,18 @@ async fn persist_live_runtime_state(state: &ApiState, market_type: &str) {
     let seq = state.get_gateway_report_seq().await;
     let seq_key = live_gateway_seq_key(&state.redis_prefix);
     let _ = write_key_value(state, &seq_key, &json!({ "seq": seq }), Some(2 * 24 * 3600)).await;
+
+    let events_key = live_events_key(&state.redis_prefix, market_type);
+    let events_rows = state
+        .list_live_events(market_type, live_event_log_max())
+        .await;
+    let _ = write_key_value(
+        state,
+        &events_key,
+        &json!(events_rows),
+        Some(live_event_log_ttl_sec()),
+    )
+    .await;
 }
 
 async fn live_runtime_loop(
