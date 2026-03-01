@@ -272,6 +272,17 @@ export interface StrategyPaperResponse {
     pending_orders_before_cycle?: number;
   };
   lookback_minutes: number;
+  lookback?: {
+    requested_lookback_minutes?: number;
+    max_points?: number;
+    sample_resolution_ms?: number;
+    required_points_1s?: number;
+    required_points_effective?: number;
+    full_history?: boolean;
+    truncated_by_points?: boolean;
+    coverage_minutes_by_points?: number;
+    coverage_minutes_by_samples?: number;
+  };
   samples: number;
   config_source?: string;
   baseline_profile?: string;
@@ -284,6 +295,7 @@ export interface StrategyPaperResponse {
     trail_drawdown_cents: number;
     reverse_signal_threshold: number;
     reverse_signal_ticks: number;
+    max_entries_per_round?: number;
   };
   current: {
     timestamp_ms: number;

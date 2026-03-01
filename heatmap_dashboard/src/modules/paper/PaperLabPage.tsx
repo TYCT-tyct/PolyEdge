@@ -23,8 +23,7 @@ const PAPER_LOOKBACK_MINUTES = 1440;
 const STRATEGY_PAPER_PROFILE = Object.freeze({
   profile: "growth",
   fullHistory: false,
-  useAutotune: false,
-  maxEntriesPerRound: 1
+  useAutotune: false
 });
 
 const STRATEGY_LIVE_PROFILE = Object.freeze({
@@ -512,13 +511,22 @@ export function PaperLabPage({
   const liveState = liveExecution?.state_machine;
   const liveEvents = (liveExecution?.events ?? []).slice(-20).reverse();
   const liveOrders = (liveExecution?.execution?.orders ?? []).slice(-20).reverse();
+  const lookbackMeta = strategyPaper?.lookback;
+  const lookbackCoverageMinutes = finite(lookbackMeta?.coverage_minutes_by_samples);
+  const lookbackRequestedMinutes =
+    finite(lookbackMeta?.requested_lookback_minutes) ?? finite(strategyPaper?.lookback_minutes);
+  const lookbackCoverageLabel =
+    lookbackCoverageMinutes != null && lookbackRequestedMinutes != null
+      ? `${lookbackCoverageMinutes.toFixed(0)}/${lookbackRequestedMinutes.toFixed(0)}m`
+      : "--";
+  const lookbackTruncated = lookbackMeta?.truncated_by_points === true;
 
   return (
     <section className="panel">
       <header className="panel-head">
         <div>
           <h2>策略 Paper（{strategyMarketType}全时段）</h2>
-          <p className="muted">单模型双向策略：自动判断 UP/DOWN，只验证入场与出场，不做加仓和反向。</p>
+          <p className="muted">单模型双向策略：自动判断 UP/DOWN，具体入场/加仓/退出行为以后端策略参数为准。</p>
         </div>
         <div className="panel-actions">
           <span className="loading-chip">{strategyLoading ? "计算中..." : strategySource === "live" ? "实时策略" : "模拟策略"}</span>
@@ -552,7 +560,9 @@ export function PaperLabPage({
             {summaryNet != null ? `${summaryNet.toFixed(2)}¢` : "--"}
           </strong>
           <small>
-            交易 {summary?.trade_count ?? 0} · 胜率 {summary ? `${summary.win_rate_pct.toFixed(1)}%` : "--"} · 窗口 {strategyPaper?.lookback_minutes ?? "--"}m
+            交易 {summary?.trade_count ?? 0} · 胜率 {summary ? `${summary.win_rate_pct.toFixed(1)}%` : "--"} · 窗口{" "}
+            {strategyPaper?.lookback_minutes ?? "--"}m · 覆盖 {lookbackCoverageLabel}
+            {lookbackTruncated ? " (截断)" : ""}
           </small>
         </article>
         <article className="info-card">
@@ -915,6 +925,13 @@ export function PaperLabPage({
           {` ${
             strategyPaper?.runtime_defaults?.lookback_minutes ?? "--"
           }m / ${strategyPaper?.runtime_defaults?.max_trades ?? "--"} trades`}
+        </span>
+        <span>
+          maxEntries/round: {strategyPaper?.config?.max_entries_per_round ?? "--"}
+        </span>
+        <span>
+          coverage: {lookbackCoverageLabel}
+          {lookbackTruncated ? " (truncated)" : ""}
         </span>
         <span>
           liveCtrl: {strategyPaper?.runtime_control?.mode ?? "normal"}
