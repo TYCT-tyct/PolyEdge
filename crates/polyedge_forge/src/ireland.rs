@@ -822,6 +822,28 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
     let mut book_by_market: HashMap<String, BookTop> = HashMap::new();
     let mut quote_cache_by_market: HashMap<String, (f64, f64, f64, f64)> = HashMap::new();
     let mut markets_by_id: HashMap<String, MarketMeta> = HashMap::new();
+    if let Ok(seed_markets) =
+        discover_markets_from_target_cache(&subscribe_symbols, &subscribe_tfs).await
+    {
+        for market in seed_markets {
+            if market_filter.allows(&market.symbol, &market.timeframe) {
+                markets_by_id.insert(market.market_id.clone(), market);
+            }
+        }
+        if !markets_by_id.is_empty() {
+            let mut seeded_pairs = markets_by_id
+                .values()
+                .map(market_pair_key)
+                .collect::<Vec<_>>();
+            seeded_pairs.sort();
+            seeded_pairs.dedup();
+            tracing::info!(
+                seeded_markets = markets_by_id.len(),
+                seeded_pairs = seeded_pairs.join(","),
+                "market meta cache prewarm applied"
+            );
+        }
+    }
     let mut motion_by_key: HashMap<String, MotionState> = HashMap::new();
     let mut prob_smooth_by_round: HashMap<String, ProbSmoothState> = HashMap::new();
     let mut emitted_rounds: HashMap<String, i64> = HashMap::new();
