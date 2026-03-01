@@ -970,10 +970,10 @@ fn build_decisions_from_trades(trades: &[Value], quote: f64) -> Vec<Value> {
             .unwrap_or(0)
             .max(0);
         let (entry_tif, entry_style, entry_ttl_ms, entry_slippage_bps) =
-            if entry_remaining_ms <= 95_000 || entry_score >= 0.82 {
+            if entry_remaining_ms <= 120_000 || entry_score >= 0.80 {
                 ("FAK", "taker", 900_i64, 24.0_f64)
             } else {
-                ("GTD", "maker", 1_300_i64, 12.0_f64)
+                ("GTD", "maker", 900_i64, 10.0_f64)
             };
         let exit_reason_lc = exit_reason.to_ascii_lowercase();
         let take_profit_exit = exit_reason_lc.contains("take_profit");

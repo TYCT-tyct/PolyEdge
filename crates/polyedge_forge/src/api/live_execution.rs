@@ -196,6 +196,18 @@ const LIVE_MARKET_TARGET_SNAPSHOT_MAX_AGE_MS_DEFAULT: i64 = 8_000;
 const LIVE_MARKET_TARGET_SNAPSHOT_MAX_AGE_MS_MIN: i64 = 1_000;
 const LIVE_MARKET_TARGET_SNAPSHOT_MAX_AGE_MS_MAX: i64 = 120_000;
 const LIVE_TARGET_CACHE_FILE_DEFAULT: &str = "/data/polyedge-forge/cache/target_market_cache.json";
+const LIVE_ENTRY_MAKER_MAX_WAIT_MS_DEFAULT: i64 = 850;
+const LIVE_ENTRY_MAKER_MAX_WAIT_MS_MIN: i64 = 500;
+const LIVE_ENTRY_MAKER_MAX_WAIT_MS_MAX: i64 = 3_000;
+const LIVE_ENTRY_FAK_TTL_MS_DEFAULT: i64 = 650;
+const LIVE_ENTRY_FAK_TTL_MS_MIN: i64 = 400;
+const LIVE_ENTRY_FAK_TTL_MS_MAX: i64 = 2_000;
+const LIVE_ENTRY_FAK_CANCEL_AFTER_MS_DEFAULT: i64 = 900;
+const LIVE_ENTRY_FAK_CANCEL_AFTER_MS_MIN: i64 = 500;
+const LIVE_ENTRY_FAK_CANCEL_AFTER_MS_MAX: i64 = 3_000;
+const LIVE_ENTRY_FAK_SLIPPAGE_BOOST_BPS_DEFAULT: f64 = 16.0;
+const LIVE_ENTRY_FAK_SLIPPAGE_BOOST_BPS_MIN: f64 = 0.0;
+const LIVE_ENTRY_FAK_SLIPPAGE_BOOST_BPS_MAX: f64 = 120.0;
 const LIVE_CANCEL_FAILURE_FORCE_PAUSE_EXIT_THRESHOLD: u8 = 2;
 const LIVE_CANCEL_FAILURE_FORCE_PAUSE_OTHER_THRESHOLD: u8 = 3;
 const LIVE_GTD_MIN_FUTURE_GUARD_SEC_DEFAULT: i64 = 60;
@@ -282,6 +294,47 @@ fn live_market_target_snapshot_max_age_ms() -> i64 {
         )
 }
 
+fn live_entry_maker_max_wait_ms() -> i64 {
+    std::env::var("FORGE_FEV1_ENTRY_MAKER_MAX_WAIT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(LIVE_ENTRY_MAKER_MAX_WAIT_MS_DEFAULT)
+        .clamp(
+            LIVE_ENTRY_MAKER_MAX_WAIT_MS_MIN,
+            LIVE_ENTRY_MAKER_MAX_WAIT_MS_MAX,
+        )
+}
+
+fn live_entry_fak_ttl_ms() -> i64 {
+    std::env::var("FORGE_FEV1_ENTRY_FAK_TTL_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(LIVE_ENTRY_FAK_TTL_MS_DEFAULT)
+        .clamp(LIVE_ENTRY_FAK_TTL_MS_MIN, LIVE_ENTRY_FAK_TTL_MS_MAX)
+}
+
+fn live_entry_fak_cancel_after_ms() -> i64 {
+    std::env::var("FORGE_FEV1_ENTRY_FAK_CANCEL_AFTER_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(LIVE_ENTRY_FAK_CANCEL_AFTER_MS_DEFAULT)
+        .clamp(
+            LIVE_ENTRY_FAK_CANCEL_AFTER_MS_MIN,
+            LIVE_ENTRY_FAK_CANCEL_AFTER_MS_MAX,
+        )
+}
+
+fn live_entry_fak_slippage_boost_bps() -> f64 {
+    std::env::var("FORGE_FEV1_ENTRY_FAK_SLIPPAGE_BOOST_BPS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(LIVE_ENTRY_FAK_SLIPPAGE_BOOST_BPS_DEFAULT)
+        .clamp(
+            LIVE_ENTRY_FAK_SLIPPAGE_BOOST_BPS_MIN,
+            LIVE_ENTRY_FAK_SLIPPAGE_BOOST_BPS_MAX,
+        )
+}
+
 fn live_target_cache_file_path() -> String {
     std::env::var("FORGE_FEV1_LIVE_TARGET_CACHE_FILE")
         .ok()
@@ -303,6 +356,24 @@ fn live_gtd_min_future_guard_sec() -> i64 {
 
 fn parse_round_end_ts_ms(round_id: &str) -> Option<i64> {
     round_id.rsplit('_').next()?.parse::<i64>().ok()
+}
+
+fn is_entry_action(action: &str) -> bool {
+    let a = action.to_ascii_lowercase();
+    a == "enter" || a == "add"
+}
+
+fn pending_cancel_due_ms(row: &LivePendingOrder) -> i64 {
+    let base = row.cancel_after_ms.max(500);
+    let maker_tif = matches!(
+        row.tif.to_ascii_uppercase().as_str(),
+        "GTD" | "GTC" | "POST_ONLY"
+    );
+    if maker_tif && is_entry_action(&row.action) {
+        base.min(live_entry_maker_max_wait_ms())
+    } else {
+        base
+    }
 }
 
 fn end_date_iso_from_ms(end_ms: i64) -> Option<String> {
@@ -1576,16 +1647,24 @@ pub(super) fn build_retry_payload(current: &Value, reason: &str, attempt: usize)
     }
 
     if maker_mode {
+        let entry_like = is_entry_action(&action);
+        let ttl_ms = if entry_like {
+            live_entry_fak_ttl_ms()
+        } else {
+            (current_ttl / 2).clamp(520, 1_400)
+        };
+        let slip_boost = if is_exit_like {
+            20.0
+        } else {
+            live_entry_fak_slippage_boost_bps()
+        };
         if let Some(obj) = next.as_object_mut() {
             obj.insert("tif".to_string(), json!("FAK"));
             obj.insert("style".to_string(), json!("taker"));
-            obj.insert(
-                "ttl_ms".to_string(),
-                json!((current_ttl / 2).clamp(600, 2_000)),
-            );
+            obj.insert("ttl_ms".to_string(), json!(ttl_ms));
             obj.insert(
                 "max_slippage_bps".to_string(),
-                json!((current_slippage + if is_exit_like { 20.0 } else { 14.0 }).min(140.0)),
+                json!((current_slippage + slip_boost).min(160.0)),
             );
             obj.insert("retry_tag".to_string(), json!("maker_timeout_to_fak"));
         }
@@ -2152,7 +2231,7 @@ pub(super) async fn handle_pending_timeouts(state: &ApiState, gateway_cfg: &Live
     let client = state.gateway_http_client.as_ref();
     for row in pending {
         let elapsed = now_ms.saturating_sub(row.submitted_ts_ms);
-        if elapsed < row.cancel_after_ms.max(500) {
+        if elapsed < pending_cancel_due_ms(&row) {
             continue;
         }
         let mut endpoint = gateway_cfg.primary_url.clone();
@@ -2181,6 +2260,27 @@ pub(super) async fn handle_pending_timeouts(state: &ApiState, gateway_cfg: &Live
                     row.retry_count < 1
                 };
                 if (maker_tif || emergency_exit) && can_retry {
+                    let entry_like = is_entry_action(&row.action);
+                    let fallback_ttl_ms = if emergency_exit {
+                        700
+                    } else if entry_like {
+                        live_entry_fak_ttl_ms()
+                    } else {
+                        900
+                    };
+                    let fallback_slippage_bps = if emergency_exit {
+                        (gateway_cfg.exit_slippage_bps + 18.0).max(38.0)
+                    } else if entry_like {
+                        gateway_cfg
+                            .exit_slippage_bps
+                            .max(gateway_cfg.entry_slippage_bps)
+                            + live_entry_fak_slippage_boost_bps()
+                    } else {
+                        gateway_cfg
+                            .exit_slippage_bps
+                            .max(gateway_cfg.entry_slippage_bps)
+                            + 10.0
+                    };
                     let maybe_target =
                         resolve_live_market_target_with_state(state, &row.market_type)
                             .await
@@ -2195,12 +2295,8 @@ pub(super) async fn handle_pending_timeouts(state: &ApiState, gateway_cfg: &Live
                             "reason": format!("{}_timeout_fallback_fak", row.submit_reason),
                             "tif": "FAK",
                             "style": "taker",
-                            "ttl_ms": if emergency_exit { 700 } else { 900 },
-                            "max_slippage_bps": if emergency_exit {
-                                (gateway_cfg.exit_slippage_bps + 18.0).max(38.0)
-                            } else {
-                                gateway_cfg.exit_slippage_bps.max(gateway_cfg.entry_slippage_bps) + 10.0
-                            }
+                            "ttl_ms": fallback_ttl_ms,
+                            "max_slippage_bps": fallback_slippage_bps
                         });
                         let token_id =
                             token_id_for_decision(&decision, &target).map(str::to_string);
@@ -2237,8 +2333,13 @@ pub(super) async fn handle_pending_timeouts(state: &ApiState, gateway_cfg: &Live
                                         pending.tif = "FAK".to_string();
                                         pending.style = "taker".to_string();
                                         pending.submitted_ts_ms = now_ms;
-                                        pending.cancel_after_ms =
-                                            if emergency_exit { 700 } else { 1500 };
+                                        pending.cancel_after_ms = if emergency_exit {
+                                            700
+                                        } else if entry_like {
+                                            live_entry_fak_cancel_after_ms()
+                                        } else {
+                                            1500
+                                        };
                                         state.upsert_pending_order(pending).await;
                                         state
                                             .append_live_event(
@@ -3412,7 +3513,7 @@ pub(super) async fn handle_pending_timeouts_rust(
     let now_ms = Utc::now().timestamp_millis();
     let pending = state.list_pending_orders().await;
     for row in pending {
-        if now_ms.saturating_sub(row.submitted_ts_ms) < row.cancel_after_ms.max(500) {
+        if now_ms.saturating_sub(row.submitted_ts_ms) < pending_cancel_due_ms(&row) {
             continue;
         }
         match ctx.client.cancel_order(&row.order_id).await {
@@ -3430,6 +3531,27 @@ pub(super) async fn handle_pending_timeouts_rust(
                     row.retry_count < 1
                 };
                 if (maker_tif || emergency_exit) && can_retry {
+                    let entry_like = is_entry_action(&row.action);
+                    let fallback_ttl_ms = if emergency_exit {
+                        700
+                    } else if entry_like {
+                        live_entry_fak_ttl_ms()
+                    } else {
+                        900
+                    };
+                    let fallback_slippage_bps = if emergency_exit {
+                        (gateway_cfg.exit_slippage_bps + 18.0).max(38.0)
+                    } else if entry_like {
+                        gateway_cfg
+                            .exit_slippage_bps
+                            .max(gateway_cfg.entry_slippage_bps)
+                            + live_entry_fak_slippage_boost_bps()
+                    } else {
+                        gateway_cfg
+                            .exit_slippage_bps
+                            .max(gateway_cfg.entry_slippage_bps)
+                            + 10.0
+                    };
                     let maybe_target =
                         resolve_live_market_target_with_state(state, &row.market_type)
                             .await
@@ -3444,12 +3566,8 @@ pub(super) async fn handle_pending_timeouts_rust(
                             "reason": format!("{}_timeout_fallback_fak", row.submit_reason),
                             "tif": "FAK",
                             "style": "taker",
-                            "ttl_ms": if emergency_exit { 700 } else { 900 },
-                            "max_slippage_bps": if emergency_exit {
-                                (gateway_cfg.exit_slippage_bps + 18.0).max(38.0)
-                            } else {
-                                gateway_cfg.exit_slippage_bps.max(gateway_cfg.entry_slippage_bps) + 10.0
-                            }
+                            "ttl_ms": fallback_ttl_ms,
+                            "max_slippage_bps": fallback_slippage_bps
                         });
                         let token_id =
                             token_id_for_decision(&decision, &target).map(str::to_string);
@@ -3491,8 +3609,13 @@ pub(super) async fn handle_pending_timeouts_rust(
                                         pending.tif = "FAK".to_string();
                                         pending.style = "taker".to_string();
                                         pending.submitted_ts_ms = now_ms;
-                                        pending.cancel_after_ms =
-                                            if emergency_exit { 700 } else { 1500 };
+                                        pending.cancel_after_ms = if emergency_exit {
+                                            700
+                                        } else if entry_like {
+                                            live_entry_fak_cancel_after_ms()
+                                        } else {
+                                            1500
+                                        };
                                         state.upsert_pending_order(pending).await;
                                         state
                                             .append_live_event(
