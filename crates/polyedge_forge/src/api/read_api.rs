@@ -633,12 +633,17 @@ pub(super) async fn collector_status(
                 overall_ok = false;
                 "stalled"
             };
+            let expose_snapshot = matches!(status, "ok" | "lagging");
             json!({
                 "status": status,
                 "timestamp_ms": if ts_ms > 0 { Some(ts_ms) } else { None::<i64> },
                 "age_ms": if ts_ms > 0 { Some(age_ms) } else { None::<i64> },
-                "remaining_ms": remaining_ms,
-                "round_id": row.get("round_id").and_then(Value::as_str).unwrap_or_default(),
+                "remaining_ms": if expose_snapshot { json!(remaining_ms) } else { Value::Null },
+                "round_id": if expose_snapshot {
+                    json!(row.get("round_id").and_then(Value::as_str).unwrap_or_default())
+                } else {
+                    json!("")
+                },
             })
         } else {
             overall_ok = false;
