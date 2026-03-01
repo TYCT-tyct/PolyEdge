@@ -274,7 +274,12 @@ impl MarketDiscovery {
                 }
 
                 for market in markets {
-                    if !market.active || market.closed || !market.accepting_orders {
+                    // Gamma can omit `acceptingOrders` for still-tradable markets.
+                    // Treat only explicit `false` as non-tradable.
+                    if !market.active
+                        || market.closed
+                        || matches!(market.accepting_orders, Some(false))
+                    {
                         continue;
                     }
                     if !seen.insert(market.id.clone()) {
@@ -577,7 +582,7 @@ struct GammaMarket {
     #[serde(default)]
     closed: bool,
     #[serde(default)]
-    accepting_orders: bool,
+    accepting_orders: Option<bool>,
     #[serde(default)]
     events: Option<Vec<GammaEvent>>,
 }

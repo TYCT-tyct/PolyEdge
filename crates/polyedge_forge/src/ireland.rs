@@ -565,6 +565,11 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
     }
     let subscribe_symbols = market_filter.symbols.clone();
     let subscribe_tfs = market_filter.timeframes.clone();
+    let required_pair_keys: HashSet<String> = market_filter
+        .by_symbol
+        .iter()
+        .flat_map(|(symbol, tfs)| tfs.iter().map(move |tf| format!("{symbol}:{tf}")))
+        .collect();
     let active_symbols_set: HashSet<String> = subscribe_symbols
         .iter()
         .map(|v| v.to_ascii_uppercase())
@@ -926,6 +931,41 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         }
                     }
                 }
+                let mut missing_required_pairs: HashSet<String> = required_pair_keys
+                    .iter()
+                    .filter(|pair| !selected_by_pair.contains_key(*pair))
+                    .cloned()
+                    .collect();
+                let mut cache_repaired = 0usize;
+                if !missing_required_pairs.is_empty() {
+                    if let Ok(cache_markets) =
+                        discover_markets_from_target_cache(&subscribe_symbols, &subscribe_tfs).await
+                    {
+                        for market in cache_markets {
+                            if !market_filter.allows(&market.symbol, &market.timeframe) {
+                                continue;
+                            }
+                            let pair_key = market_pair_key(&market);
+                            if !missing_required_pairs.contains(&pair_key) {
+                                continue;
+                            }
+                            match selected_by_pair.get(&pair_key) {
+                                Some(existing)
+                                    if !market_is_preferred(&market, existing, now_ms) => {}
+                                _ => {
+                                    selected_by_pair.insert(pair_key.clone(), market);
+                                    cache_repaired = cache_repaired.saturating_add(1);
+                                }
+                            }
+                            if selected_by_pair.contains_key(&pair_key) {
+                                missing_required_pairs.remove(&pair_key);
+                            }
+                            if missing_required_pairs.is_empty() {
+                                break;
+                            }
+                        }
+                    }
+                }
                 if selected_by_pair.len() != markets_by_id.len() {
                     let mut reduced: HashMap<String, MarketMeta> = HashMap::new();
                     for market in selected_by_pair.values() {
@@ -943,6 +983,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     received_markets = received,
                     kept_markets = markets_by_id.len(),
                     sticky_reused = sticky_reused,
+                    cache_repaired = cache_repaired,
                     kept_pairs = kept_pairs.join(","),
                     "market meta update applied"
                 );
