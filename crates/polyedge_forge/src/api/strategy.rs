@@ -1433,6 +1433,9 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
     }
 
     let live_gateway_cfg = LiveGatewayConfig::from_env();
+    let (live_gateway_cfg_effective, live_aggr_state_before) = state
+        .apply_aggressiveness_to_gateway_cfg(market_type, &live_gateway_cfg)
+        .await;
     let capital_cfg = LiveCapitalConfig::from_env();
     let quote_from_price = live_quote_from_price_enabled();
     let capital_scope = if capital_cfg.portfolio_shared {
@@ -1455,8 +1458,8 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
     let gateway = fev1::ArmedSimulatedGateway;
     let dual = fev1::build_gateway_execution(&run, dynamic_quote_usdc.max(0.01), &gateway);
     let live_executor_mode = LiveExecutorMode::from_env();
-    reconcile_live_reports(state, &live_gateway_cfg, live_executor_mode).await;
-    handle_live_pending_timeouts(state, &live_gateway_cfg, live_executor_mode).await;
+    reconcile_live_reports(state, &live_gateway_cfg_effective, live_executor_mode).await;
+    handle_live_pending_timeouts(state, &live_gateway_cfg_effective, live_executor_mode).await;
     let (live_market_res, position_before_gate) = tokio::join!(
         resolve_live_market_target(market_type),
         state.get_live_position_state(market_type)
@@ -1760,12 +1763,13 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
     let submitted_decisions: Vec<Value> =
         gated_decisions.iter().map(|v| v.decision.clone()).collect();
 
+    let mut live_aggr_state_after = live_aggr_state_before.clone();
     let live_exec_payload = if live_execute {
         match live_market.as_ref() {
             Some(target) => {
                 let execution_orders = execute_live_orders(
                     state,
-                    &live_gateway_cfg,
+                    &live_gateway_cfg_effective,
                     live_executor_mode,
                     market_type,
                     target,
@@ -1773,6 +1777,9 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                     &gated_decisions,
                 )
                 .await;
+                live_aggr_state_after = state
+                    .update_live_execution_aggr_from_orders(market_type, &execution_orders)
+                    .await;
                 for record in &execution_orders {
                     let decision = record.get("decision").cloned().unwrap_or(Value::Null);
                     let action = decision
@@ -1927,7 +1934,8 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                 state
                     .put_live_position_state(market_type, live_position_state.clone())
                     .await;
-                reconcile_live_reports(state, &live_gateway_cfg, live_executor_mode).await;
+                reconcile_live_reports(state, &live_gateway_cfg_effective, live_executor_mode)
+                    .await;
                 json!({
                     "mode": "real_gateway",
                     "target": {
@@ -2202,8 +2210,12 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                 "timeout_ms": live_gateway_cfg.timeout_ms,
                 "entry_slippage_bps": live_gateway_cfg.entry_slippage_bps,
                 "exit_slippage_bps": live_gateway_cfg.exit_slippage_bps,
+                "effective_entry_slippage_bps": live_gateway_cfg_effective.entry_slippage_bps,
+                "effective_exit_slippage_bps": live_gateway_cfg_effective.exit_slippage_bps,
                 "min_quote_usdc": live_gateway_cfg.min_quote_usdc,
-                "rust_submit_fallback_gateway": live_gateway_cfg.rust_submit_fallback_gateway
+                "rust_submit_fallback_gateway": live_gateway_cfg.rust_submit_fallback_gateway,
+                "adaptive_state_before": live_aggr_state_before,
+                "adaptive_state_after": live_aggr_state_after
             },
             "capital": {
                 "auto_enabled": capital_cfg.enabled,

@@ -1,5 +1,6 @@
 use super::*;
 
+#[derive(Debug, Clone)]
 pub(super) struct LiveGatewayConfig {
     pub(super) primary_url: String,
     pub(super) backup_url: Option<String>,

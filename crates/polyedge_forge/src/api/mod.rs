@@ -14,6 +14,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Datelike, Timelike, Utc};
+use futures::StreamExt;
 use market_discovery::{DiscoveryConfig, MarketDescriptor, MarketDiscovery};
 use polymarket_client_sdk::auth::state::Authenticated as PmAuthenticated;
 use polymarket_client_sdk::auth::Credentials as PmCredentials;
@@ -36,7 +37,7 @@ use polymarket_client_sdk::POLYGON;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{mpsc, RwLock, Semaphore};
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
@@ -85,6 +86,7 @@ struct ApiState {
     live_gateway_report_seq: Arc<RwLock<i64>>,
     live_runtime_snapshots: Arc<RwLock<HashMap<String, Value>>>,
     live_runtime_controls: Arc<RwLock<HashMap<String, LiveRuntimeControl>>>,
+    live_execution_aggr_states: Arc<RwLock<HashMap<String, LiveExecutionAggState>>>,
     live_rust_executor: Arc<RwLock<Option<Arc<RustExecutorContext>>>>,
     live_rust_book_cache: Arc<RwLock<HashMap<String, RustBookCacheEntry>>>,
     live_balance_cache: Arc<RwLock<Option<LiveBalanceSnapshot>>>,
@@ -1060,6 +1062,71 @@ fn runtime_target_prewarm_ms() -> i64 {
         .clamp(5_000, 120_000)
 }
 
+#[derive(Debug, Clone)]
+struct LiveRuntimeWakeEvent {
+    market_type: String,
+    source: String,
+    ts_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LiveExecutionAggState {
+    market_type: String,
+    entry_slippage_mult: f64,
+    exit_slippage_mult: f64,
+    reject_ema: f64,
+    submit_delta_ema_cents: f64,
+    accepted_delta_ema_cents: f64,
+    sample_count: u64,
+    last_error: Option<String>,
+    updated_ts_ms: i64,
+}
+
+impl LiveExecutionAggState {
+    fn new(market_type: &str) -> Self {
+        Self {
+            market_type: market_type.to_string(),
+            entry_slippage_mult: 1.0,
+            exit_slippage_mult: 1.0,
+            reject_ema: 0.0,
+            submit_delta_ema_cents: 0.0,
+            accepted_delta_ema_cents: 0.0,
+            sample_count: 0,
+            last_error: None,
+            updated_ts_ms: Utc::now().timestamp_millis(),
+        }
+    }
+}
+
+fn parse_snapshot_event_market_type(payload: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(payload).ok()?;
+    let tf = v
+        .get("timeframe")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_ascii_lowercase())?;
+    if tf == "5m" || tf == "15m" {
+        Some(tf)
+    } else {
+        None
+    }
+}
+
+fn live_snapshot_event_channel(prefix: &str) -> String {
+    format!("{prefix}:snapshot:events")
+}
+
+fn is_liquidity_reject_reason(reason: &str) -> bool {
+    let r = reason.trim().to_ascii_lowercase();
+    r.contains("unmatched")
+        || r.contains("insufficient liquidity")
+        || r.contains("no orders found")
+        || r.contains("rejected")
+        || r.contains("terminal_rejected")
+        || r.contains("timeout")
+        || r.contains("canceled")
+        || r.contains("cancelled")
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 enum LiveRuntimeControlMode {
@@ -1685,6 +1752,108 @@ impl ApiState {
         store.insert(market_type.to_string(), payload);
     }
 
+    async fn get_live_execution_aggr_state(&self, market_type: &str) -> LiveExecutionAggState {
+        let mut store = self.live_execution_aggr_states.write().await;
+        store
+            .entry(market_type.to_string())
+            .or_insert_with(|| LiveExecutionAggState::new(market_type))
+            .clone()
+    }
+
+    async fn apply_aggressiveness_to_gateway_cfg(
+        &self,
+        market_type: &str,
+        cfg: &LiveGatewayConfig,
+    ) -> (LiveGatewayConfig, LiveExecutionAggState) {
+        let s = self.get_live_execution_aggr_state(market_type).await;
+        let mut tuned = cfg.clone();
+        tuned.entry_slippage_bps =
+            (cfg.entry_slippage_bps * s.entry_slippage_mult).clamp(0.0, 500.0);
+        tuned.exit_slippage_bps = (cfg.exit_slippage_bps * s.exit_slippage_mult).clamp(0.0, 500.0);
+        (tuned, s)
+    }
+
+    async fn update_live_execution_aggr_from_orders(
+        &self,
+        market_type: &str,
+        orders: &[Value],
+    ) -> LiveExecutionAggState {
+        let mut store = self.live_execution_aggr_states.write().await;
+        let st = store
+            .entry(market_type.to_string())
+            .or_insert_with(|| LiveExecutionAggState::new(market_type));
+        for row in orders {
+            let action = row
+                .get("decision")
+                .and_then(|v| v.get("action"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let is_exit_like = is_live_exit_action(&action);
+            let accepted = row
+                .get("accepted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let err = row
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let trace = row.get("price_trace").cloned().unwrap_or(Value::Null);
+            let submit_delta = trace
+                .get("submit_delta_cents_abs")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                .abs();
+            let accepted_delta = trace
+                .get("accepted_delta_cents_abs")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                .abs();
+
+            st.sample_count = st.sample_count.saturating_add(1);
+            st.reject_ema = st.reject_ema * 0.86 + if accepted { 0.0 } else { 0.14 };
+            st.submit_delta_ema_cents = if st.submit_delta_ema_cents <= 1e-9 {
+                submit_delta
+            } else {
+                st.submit_delta_ema_cents + 0.20 * (submit_delta - st.submit_delta_ema_cents)
+            };
+            if accepted {
+                st.accepted_delta_ema_cents = if st.accepted_delta_ema_cents <= 1e-9 {
+                    accepted_delta
+                } else {
+                    st.accepted_delta_ema_cents
+                        + 0.20 * (accepted_delta - st.accepted_delta_ema_cents)
+                };
+            }
+
+            let mut target_mult = 1.0
+                + (st.submit_delta_ema_cents / 3.2).clamp(0.0, 0.85)
+                + (st.reject_ema * 0.65).clamp(0.0, 0.8);
+            if accepted {
+                target_mult -= 0.04;
+            } else if is_liquidity_reject_reason(&err) {
+                target_mult += if is_exit_like { 0.16 } else { 0.10 };
+            }
+            target_mult = target_mult.clamp(0.85, 2.40);
+
+            let mult = if is_exit_like {
+                &mut st.exit_slippage_mult
+            } else {
+                &mut st.entry_slippage_mult
+            };
+            *mult = (*mult * 0.84 + target_mult * 0.16).clamp(0.85, 2.40);
+            if accepted && st.reject_ema <= 0.16 && st.accepted_delta_ema_cents <= 0.9 {
+                *mult = (*mult * 0.96 + 1.0 * 0.04).clamp(0.85, 2.40);
+            }
+            if !accepted && !err.is_empty() {
+                st.last_error = Some(err);
+            }
+        }
+        st.updated_ts_ms = Utc::now().timestamp_millis();
+        st.clone()
+    }
+
     async fn upsert_pending_order(&self, row: LivePendingOrder) {
         let mut pending = self.live_pending_orders.write().await;
         pending.insert(row.order_id.clone(), row);
@@ -2110,6 +2279,7 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         live_gateway_report_seq: Arc::new(RwLock::new(0)),
         live_runtime_snapshots: Arc::new(RwLock::new(HashMap::new())),
         live_runtime_controls: Arc::new(RwLock::new(HashMap::new())),
+        live_execution_aggr_states: Arc::new(RwLock::new(HashMap::new())),
         live_rust_executor: Arc::new(RwLock::new(None)),
         live_rust_book_cache: Arc::new(RwLock::new(HashMap::new())),
         live_balance_cache: Arc::new(RwLock::new(None)),
@@ -2212,12 +2382,69 @@ fn start_live_runtime(state: ApiState) {
             "fev1 live runtime starts in paused mode (FORGE_FEV1_RUNTIME_ENABLED=false)"
         );
     }
+    let (wake_tx, wake_rx) = mpsc::unbounded_channel::<LiveRuntimeWakeEvent>();
+    if state.redis_client.is_some() {
+        let state_for_listener = state.clone();
+        let tx_for_listener = wake_tx.clone();
+        tokio::spawn(async move {
+            live_runtime_snapshot_event_listener(state_for_listener, tx_for_listener).await;
+        });
+    } else {
+        tracing::warn!(
+            "redis unavailable: runtime event-driven wakeup disabled, fallback to polling"
+        );
+    }
     tokio::spawn(async move {
         if let Err(err) = restore_live_runtime_state(&state, &cfg).await {
             tracing::warn!(?err, "restore live runtime state failed");
         }
-        live_runtime_loop(state, cfg).await;
+        live_runtime_loop(state, cfg, wake_rx).await;
     });
+}
+
+async fn live_runtime_snapshot_event_listener(
+    state: ApiState,
+    wake_tx: mpsc::UnboundedSender<LiveRuntimeWakeEvent>,
+) {
+    let Some(client) = state.redis_client.clone() else {
+        return;
+    };
+    let channel = live_snapshot_event_channel(&state.redis_prefix);
+    loop {
+        match client.get_async_pubsub().await {
+            Ok(mut pubsub) => {
+                if let Err(err) = pubsub.subscribe(&channel).await {
+                    tracing::warn!(?err, channel = %channel, "runtime pubsub subscribe failed");
+                    tokio::time::sleep(Duration::from_millis(900)).await;
+                    continue;
+                }
+                tracing::info!(channel = %channel, "runtime pubsub subscribed");
+                let mut stream = pubsub.on_message();
+                while let Some(msg) = stream.next().await {
+                    let payload: String = match msg.get_payload() {
+                        Ok(v) => v,
+                        Err(err) => {
+                            tracing::warn!(?err, "runtime pubsub payload decode failed");
+                            continue;
+                        }
+                    };
+                    let Some(market_type) = parse_snapshot_event_market_type(&payload) else {
+                        continue;
+                    };
+                    let _ = wake_tx.send(LiveRuntimeWakeEvent {
+                        market_type,
+                        source: "redis_snapshot_event".to_string(),
+                        ts_ms: Utc::now().timestamp_millis(),
+                    });
+                }
+                tracing::warn!(channel = %channel, "runtime pubsub stream closed, reconnecting");
+            }
+            Err(err) => {
+                tracing::warn!(?err, "runtime pubsub connect failed");
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(900)).await;
+    }
 }
 
 async fn restore_live_runtime_state(
@@ -2322,7 +2549,11 @@ async fn persist_live_runtime_state(state: &ApiState, market_type: &str) {
     let _ = write_key_value(state, &seq_key, &json!({ "seq": seq }), Some(2 * 24 * 3600)).await;
 }
 
-async fn live_runtime_loop(state: ApiState, bootstrap: LiveRuntimeConfig) {
+async fn live_runtime_loop(
+    state: ApiState,
+    bootstrap: LiveRuntimeConfig,
+    mut wake_rx: mpsc::UnboundedReceiver<LiveRuntimeWakeEvent>,
+) {
     tracing::info!(
         markets = ?bootstrap.markets,
         live_execute = bootstrap.live_execute,
@@ -2330,6 +2561,7 @@ async fn live_runtime_loop(state: ApiState, bootstrap: LiveRuntimeConfig) {
         "fev1 live runtime started"
     );
     let mut last_round_seen: HashMap<String, String> = HashMap::new();
+    let mut next_wait_ms = bootstrap.loop_interval_ms;
     loop {
         let cfg = LiveRuntimeConfig::from_env();
         let push_cfg = ServerChanConfig::from_env();
@@ -2338,18 +2570,37 @@ async fn live_runtime_loop(state: ApiState, bootstrap: LiveRuntimeConfig) {
         let fast_margin = runtime_fast_margin_threshold();
         let target_prewarm_ms = runtime_target_prewarm_ms();
         let mut cycle_sleep_ms = cfg.loop_interval_ms;
+        let wait_ms = next_wait_ms.clamp(20, cfg.loop_interval_ms.max(20));
+        let wake_event = tokio::select! {
+            maybe = wake_rx.recv() => maybe,
+            _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => None,
+        };
+        let wake_event_market = wake_event.as_ref().map(|v| v.market_type.clone());
+        let wake_event_scope_enabled = wake_event_market
+            .as_ref()
+            .map(|market| cfg.markets.iter().any(|m| m == market))
+            .unwrap_or(false);
         if !cfg.enabled {
-            tokio::time::sleep(Duration::from_millis(cfg.loop_interval_ms)).await;
+            next_wait_ms = cfg.loop_interval_ms;
             continue;
         }
 
         for market in &cfg.markets {
             let market_type = market.as_str();
+            if wake_event_scope_enabled
+                && wake_event_market
+                    .as_deref()
+                    .map(|m| m != market_type)
+                    .unwrap_or(false)
+            {
+                continue;
+            }
             let now_ms = Utc::now().timestamp_millis();
             let position_before_cycle = state.get_live_position_state(market_type).await;
             let pending_before_cycle = state.list_pending_orders_for_market(market_type).await;
             let pending_before_count = pending_before_cycle.len();
             let mut runtime_control = state.get_live_runtime_control(market_type).await;
+            let exec_aggr = state.get_live_execution_aggr_state(market_type).await;
             let mut effective_live_execute = cfg.live_execute;
             let mut effective_drain_only = cfg.drain_only;
             match runtime_control.mode {
@@ -2440,8 +2691,12 @@ async fn live_runtime_loop(state: ApiState, bootstrap: LiveRuntimeConfig) {
                                 "base_loop_ms": cfg.loop_interval_ms,
                                 "round_switched": round_switched,
                                 "target_prewarm_ms": target_prewarm_ms,
+                                "trigger_source": wake_event.as_ref().map(|v| v.source.clone()),
+                                "trigger_market": wake_event.as_ref().map(|v| v.market_type.clone()),
+                                "trigger_ts_ms": wake_event.as_ref().map(|v| v.ts_ms),
                             }),
                         );
+                        obj.insert("execution_aggressiveness".to_string(), json!(exec_aggr));
                     }
 
                     if fast_enabled {
@@ -2495,6 +2750,10 @@ async fn live_runtime_loop(state: ApiState, bootstrap: LiveRuntimeConfig) {
                             resolve_live_market_target(market_type),
                         )
                         .await;
+                        cycle_sleep_ms = cycle_sleep_ms.min(fast_loop_ms);
+                    }
+
+                    if wake_event_scope_enabled {
                         cycle_sleep_ms = cycle_sleep_ms.min(fast_loop_ms);
                     }
 
@@ -2639,7 +2898,7 @@ async fn live_runtime_loop(state: ApiState, bootstrap: LiveRuntimeConfig) {
                 }
             }
         }
-        tokio::time::sleep(Duration::from_millis(cycle_sleep_ms)).await;
+        next_wait_ms = cycle_sleep_ms.clamp(20, cfg.loop_interval_ms.max(20));
     }
 }
 

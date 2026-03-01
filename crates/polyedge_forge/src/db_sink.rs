@@ -4,6 +4,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use redis::AsyncCommands;
 use serde::Serialize;
+use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::models::{RoundRow, SnapshotRow};
@@ -109,6 +110,18 @@ impl RedisSnapshot {
 struct RedisLatestState {
     by_symbol_tf: HashMap<(String, String), RedisSnapshot>,
     by_market: HashMap<(String, String, String), RedisSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RedisSnapshotEvent {
+    event: &'static str,
+    symbol: String,
+    timeframe: String,
+    market_id: String,
+    round_id: String,
+    ts_ireland_sample_ms: i64,
+    remaining_ms: i64,
+    source: &'static str,
 }
 
 pub async fn run_db_sink(cfg: DbSinkConfig, mut rx: mpsc::Receiver<DbEvent>) {
@@ -660,8 +673,14 @@ async fn flush_redis_latest(
     conn: &mut redis::aio::MultiplexedConnection,
 ) -> Result<()> {
     // 更新聚合索引
+    let mut changed_markets = HashSet::<(String, String, String)>::new();
     for row in rows {
         let snap = RedisSnapshot::from_row(row);
+        changed_markets.insert((
+            snap.symbol.clone(),
+            snap.timeframe.clone(),
+            snap.market_id.clone(),
+        ));
         state
             .by_symbol_tf
             .insert((snap.symbol.clone(), snap.timeframe.clone()), snap.clone());
@@ -738,6 +757,52 @@ async fn flush_redis_latest(
             cfg.redis_ttl_sec,
         )
         .await?;
+
+    let event_channel = format!("{}:snapshot:events", cfg.redis_prefix);
+    for (symbol, timeframe, market_id) in changed_markets {
+        let Some(snap) =
+            state
+                .by_market
+                .get(&(symbol.clone(), timeframe.clone(), market_id.clone()))
+        else {
+            continue;
+        };
+        let payload = serde_json::to_string(&RedisSnapshotEvent {
+            event: "snapshot_updated",
+            symbol,
+            timeframe,
+            market_id,
+            round_id: snap.round_id.clone(),
+            ts_ireland_sample_ms: snap.ts_ireland_sample_ms,
+            remaining_ms: snap.remaining_ms,
+            source: "db_sink",
+        })?;
+        if let Err(err) = conn.publish::<_, _, i64>(&event_channel, payload).await {
+            tracing::warn!(
+                ?err,
+                channel = %event_channel,
+                "redis snapshot event publish failed"
+            );
+        }
+    }
+
+    let heartbeat_channel = format!("{}:snapshot:events:heartbeat", cfg.redis_prefix);
+    let heartbeat = json!({
+        "event": "snapshot_flush",
+        "source": "db_sink",
+        "updated_count": rows.len(),
+        "ts_ms": chrono::Utc::now().timestamp_millis()
+    });
+    if let Err(err) = conn
+        .publish::<_, _, i64>(&heartbeat_channel, heartbeat.to_string())
+        .await
+    {
+        tracing::debug!(
+            ?err,
+            channel = %heartbeat_channel,
+            "redis snapshot heartbeat publish failed"
+        );
+    }
 
     Ok(())
 }
