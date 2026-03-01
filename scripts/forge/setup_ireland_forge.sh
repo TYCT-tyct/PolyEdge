@@ -184,7 +184,8 @@ API_FAIL_COUNT_FILE="/run/polyedge_forge_api_health_fail.count"
 STALE_MAX_AGE_MS="${HEALTHCHECK_STALE_MAX_AGE_MS:-900000}"
 STALE_FAIL_THRESHOLD="${HEALTHCHECK_STALE_FAIL_THRESHOLD:-10}"
 STALE_FAIL_COUNT_FILE="/run/polyedge_forge_stale_fail.count"
-STALE_RESTART_ENABLED="${HEALTHCHECK_STALE_RESTART_ENABLED:-false}"
+STALE_RESTART_ENABLED="${HEALTHCHECK_STALE_RESTART_ENABLED:-true}"
+STALE_TIMEFRAMES="${HEALTHCHECK_STALE_TIMEFRAMES:-5m,15m}"
 
 if ! systemctl is-active --quiet "$RECORDER_SERVICE"; then
   systemctl restart "$RECORDER_SERVICE" || true
@@ -224,14 +225,29 @@ if [[ "${api_pid}" =~ ^[0-9]+$ ]] && [[ "${api_pid}" -gt 1 ]] && [[ -r "/proc/${
   fi
 fi
 
-latest_ms="$(clickhouse-client -q "SELECT max(ts_ireland_sample_ms) FROM polyedge_forge.snapshot_100ms WHERE symbol='BTCUSDT' AND timeframe='5m'" 2>/dev/null || echo 0)"
-if [[ -z "${latest_ms}" || "${latest_ms}" == "0" ]]; then
-  # Recorder may just be starting; skip hard restart.
-  exit 0
-fi
-
 now_ms="$(date +%s%3N)"
-if [[ $((now_ms - latest_ms)) -gt ${STALE_MAX_AGE_MS} ]]; then
+stale_hit=0
+stale_details=""
+
+IFS=',' read -r -a stale_timeframe_arr <<<"${STALE_TIMEFRAMES}"
+for tf in "${stale_timeframe_arr[@]}"; do
+  tf="$(echo "${tf}" | tr '[:upper:]' '[:lower:]' | xargs)"
+  if [[ -z "${tf}" ]]; then
+    continue
+  fi
+  latest_ms="$(clickhouse-client -q "SELECT max(ts_ireland_sample_ms) FROM polyedge_forge.snapshot_100ms WHERE symbol='BTCUSDT' AND timeframe='${tf}'" 2>/dev/null || echo 0)"
+  if [[ -z "${latest_ms}" || "${latest_ms}" == "0" ]]; then
+    # Recorder may just be starting or this timeframe has not emitted yet.
+    continue
+  fi
+  age_ms=$((now_ms - latest_ms))
+  if [[ "${age_ms}" -gt "${STALE_MAX_AGE_MS}" ]]; then
+    stale_hit=1
+    stale_details="${stale_details}${tf}:${age_ms}ms "
+  fi
+done
+
+if [[ "${stale_hit}" -eq 1 ]]; then
   stale_count=0
   if [[ -r "$STALE_FAIL_COUNT_FILE" ]]; then
     stale_count="$(cat "$STALE_FAIL_COUNT_FILE" 2>/dev/null || echo 0)"
@@ -242,6 +258,7 @@ if [[ $((now_ms - latest_ms)) -gt ${STALE_MAX_AGE_MS} ]]; then
   stale_count=$((stale_count + 1))
   echo "$stale_count" > "$STALE_FAIL_COUNT_FILE"
   if [[ "$stale_count" -ge "$STALE_FAIL_THRESHOLD" ]]; then
+    logger -t polyedge_forge_healthcheck "stale data detected (${stale_details}) count=${stale_count}, restarting=${STALE_RESTART_ENABLED}"
     if [[ "${STALE_RESTART_ENABLED,,}" == "1" || "${STALE_RESTART_ENABLED,,}" == "true" || "${STALE_RESTART_ENABLED,,}" == "yes" || "${STALE_RESTART_ENABLED,,}" == "on" ]]; then
       systemctl restart "$RECORDER_SERVICE" || true
     fi
