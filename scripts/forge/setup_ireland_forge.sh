@@ -4,9 +4,9 @@ set -euo pipefail
 REPO_DIR="${REPO_DIR:-/home/ubuntu/PolyEdge}"
 DATA_ROOT="${DATA_ROOT:-/data/polyedge-forge}"
 USER_NAME="${USER_NAME:-ubuntu}"
-ACTIVE_SYMBOLS="${ACTIVE_SYMBOLS:-BTCUSDT}"
+ACTIVE_SYMBOLS="${ACTIVE_SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT}"
 ACTIVE_TIMEFRAMES="${ACTIVE_TIMEFRAMES:-5m,15m}"
-ACTIVE_SYMBOL_TIMEFRAMES="${ACTIVE_SYMBOL_TIMEFRAMES:-BTCUSDT:5m|15m}"
+ACTIVE_SYMBOL_TIMEFRAMES="${ACTIVE_SYMBOL_TIMEFRAMES:-BTCUSDT:5m|15m,ETHUSDT:5m,SOLUSDT:5m,XRPUSDT:5m}"
 RUNTIME_MARKETS="${RUNTIME_MARKETS:-5m}"
 STRATEGY_MARKETS="${STRATEGY_MARKETS:-5m,15m}"
 STRATEGY_BASE_PROFILE="${STRATEGY_BASE_PROFILE:-fev1_cand_growth_mix_2026_02_28}"
@@ -191,7 +191,7 @@ STALE_MAX_AGE_MS="${HEALTHCHECK_STALE_MAX_AGE_MS:-30000}"
 STALE_FAIL_THRESHOLD="${HEALTHCHECK_STALE_FAIL_THRESHOLD:-3}"
 STALE_FAIL_COUNT_FILE="/run/polyedge_forge_stale_fail.count"
 STALE_RESTART_ENABLED="${HEALTHCHECK_STALE_RESTART_ENABLED:-true}"
-STALE_TIMEFRAMES="${HEALTHCHECK_STALE_TIMEFRAMES:-5m,15m}"
+STALE_PAIRS="${HEALTHCHECK_STALE_PAIRS:-BTCUSDT:5m,BTCUSDT:15m,ETHUSDT:5m,SOLUSDT:5m,XRPUSDT:5m}"
 
 if ! systemctl is-active --quiet "$RECORDER_SERVICE"; then
   systemctl restart "$RECORDER_SERVICE" || true
@@ -235,21 +235,28 @@ now_ms="$(date +%s%3N)"
 stale_hit=0
 stale_details=""
 
-IFS=',' read -r -a stale_timeframe_arr <<<"${STALE_TIMEFRAMES}"
-for tf in "${stale_timeframe_arr[@]}"; do
-  tf="$(echo "${tf}" | tr '[:upper:]' '[:lower:]' | xargs)"
-  if [[ -z "${tf}" ]]; then
+IFS=',' read -r -a stale_pair_arr <<<"${STALE_PAIRS}"
+for pair in "${stale_pair_arr[@]}"; do
+  pair="$(echo "${pair}" | xargs)"
+  if [[ -z "${pair}" || "${pair}" != *:* ]]; then
     continue
   fi
-  latest_ms="$(clickhouse-client -q "SELECT max(ts_ireland_sample_ms) FROM polyedge_forge.snapshot_100ms WHERE symbol='BTCUSDT' AND timeframe='${tf}'" 2>/dev/null || echo 0)"
+  symbol_raw="${pair%%:*}"
+  tf_raw="${pair#*:}"
+  symbol="$(echo "${symbol_raw}" | tr '[:lower:]' '[:upper:]' | xargs)"
+  tf="$(echo "${tf_raw}" | tr '[:upper:]' '[:lower:]' | xargs)"
+  if [[ -z "${symbol}" || -z "${tf}" ]]; then
+    continue
+  fi
+  latest_ms="$(clickhouse-client -q "SELECT max(ts_ireland_sample_ms) FROM polyedge_forge.snapshot_100ms WHERE symbol='${symbol}' AND timeframe='${tf}'" 2>/dev/null || echo 0)"
   if [[ -z "${latest_ms}" || "${latest_ms}" == "0" ]]; then
-    # Recorder may just be starting or this timeframe has not emitted yet.
+    # Recorder may just be starting or this pair has not emitted yet.
     continue
   fi
   age_ms=$((now_ms - latest_ms))
   if [[ "${age_ms}" -gt "${STALE_MAX_AGE_MS}" ]]; then
     stale_hit=1
-    stale_details="${stale_details}${tf}:${age_ms}ms "
+    stale_details="${stale_details}${symbol}:${tf}:${age_ms}ms "
   fi
 done
 
