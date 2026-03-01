@@ -638,16 +638,24 @@ pub(super) fn decision_to_live_payload(
     quote_size = quote_size.max(gateway_cfg.min_quote_usdc);
     let mut notes: Vec<String> = Vec::with_capacity(3);
     let is_buy = gateway_side.starts_with("buy_");
+    let forced_exit_size_shares = if is_exit_like {
+        decision
+            .get("position_size_shares")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite() && *v > 0.0)
+    } else {
+        None
+    };
     let mut min_order_size = 0.01_f64;
     let mut size_floor = min_order_size;
-    let mut size = (quote_size / price).max(size_floor);
+    let mut size = forced_exit_size_shares.unwrap_or_else(|| (quote_size / price).max(size_floor));
     if let Some(book) = book {
         min_order_size = book.min_order_size.max(0.0001);
         let taker_like = style == "taker" || matches!(tif.as_str(), "FAK" | "FOK");
         size_floor = min_order_size;
         let tick_size = book.tick_size.max(0.0001);
         price = round_to_tick(price, tick_size, is_buy);
-        size = (quote_size / price).max(size_floor);
+        size = forced_exit_size_shares.unwrap_or_else(|| (quote_size / price).max(size_floor));
 
         let depth_top1 = if is_buy {
             book.best_ask_size.unwrap_or(0.0)
@@ -659,7 +667,8 @@ pub(super) fn decision_to_live_payload(
         } else {
             book.bid_depth_top3.unwrap_or(0.0)
         };
-        if !(is_buy && taker_like)
+        if forced_exit_size_shares.is_none()
+            && !(is_buy && taker_like)
             && depth_top1.is_finite()
             && depth_top1 > 0.0
             && size > depth_top1 * 1.12
@@ -720,9 +729,15 @@ pub(super) fn decision_to_live_payload(
             let tick_size = book.tick_size.max(0.0001);
             price = round_to_tick(price, tick_size, is_buy);
             size_floor = min_order_size;
-            size = (quote_size / price).max(size_floor).max(0.01);
+            size = forced_exit_size_shares
+                .unwrap_or_else(|| (quote_size / price).max(size_floor))
+                .max(0.01);
             size = (size * 10_000.0).round() / 10_000.0;
         }
+    }
+    if let Some(forced) = forced_exit_size_shares {
+        size = forced.max(size_floor).max(0.01);
+        notes.push("force_exit_full_size".to_string());
     }
     let taker_like = style == "taker" || matches!(tif.as_str(), "FAK" | "FOK");
     let floor_notional_usdc = (size * price).max(0.0);
@@ -1368,6 +1383,7 @@ pub(super) async fn apply_pending_confirmation(
         .fill_quote_usdc
         .unwrap_or(pending.quote_size_usdc.max(0.0))
         .max(0.0);
+    let fill_shares = fill_quote_usdc / (fill_price_cents / 100.0).max(0.0001);
     let fill_cost_usdc = (fill_meta.fee_usdc + fill_meta.slippage_usdc).max(0.0);
     let mut realized_pnl_usdc = 0.0_f64;
     if action == "enter" {
@@ -1381,6 +1397,7 @@ pub(super) async fn apply_pending_confirmation(
         ps.vwap_entry_cents = Some(fill_price_cents);
         ps.open_add_layers = 0;
         ps.position_cost_usdc = fill_cost_usdc;
+        ps.position_size_shares = fill_shares.max(0.0);
         ps.total_entries = ps.total_entries.saturating_add(1);
         ps.last_fill_pnl_usdc = 0.0;
     } else if action == "add" {
@@ -1410,6 +1427,7 @@ pub(super) async fn apply_pending_confirmation(
         ps.total_adds = ps.total_adds.saturating_add(1);
         ps.open_add_layers = ps.open_add_layers.saturating_add(1);
         ps.position_cost_usdc += fill_cost_usdc;
+        ps.position_size_shares = (ps.position_size_shares + fill_shares).max(0.0);
         ps.last_fill_pnl_usdc = 0.0;
     } else if action == "reduce" || action == "exit" {
         let entry_price_cents = ps
@@ -1417,20 +1435,16 @@ pub(super) async fn apply_pending_confirmation(
             .or(ps.entry_price_cents)
             .unwrap_or(0.0)
             .max(0.01);
-        let prev_quote = ps
-            .net_quote_usdc
-            .max(ps.entry_quote_usdc.unwrap_or(0.0))
-            .max(0.0);
-        let close_quote = if action == "exit" {
-            prev_quote
+        let prev_shares = ps.position_size_shares.max(0.0);
+        let close_shares = if action == "exit" {
+            prev_shares
         } else {
-            fill_quote_usdc.max(0.0).min(prev_quote)
+            fill_shares.max(0.0).min(prev_shares)
         };
-        if close_quote > 1e-9 {
-            let shares = close_quote / (entry_price_cents / 100.0).max(0.0001);
-            let gross_pnl_usdc = shares * ((fill_price_cents - entry_price_cents) / 100.0);
-            let entry_cost_alloc = if prev_quote > 1e-9 {
-                ps.position_cost_usdc * (close_quote / prev_quote).clamp(0.0, 1.0)
+        if close_shares > 1e-9 {
+            let gross_pnl_usdc = close_shares * ((fill_price_cents - entry_price_cents) / 100.0);
+            let entry_cost_alloc = if prev_shares > 1e-9 {
+                ps.position_cost_usdc * (close_shares / prev_shares).clamp(0.0, 1.0)
             } else {
                 0.0
             };
@@ -1441,8 +1455,9 @@ pub(super) async fn apply_pending_confirmation(
         } else {
             ps.last_fill_pnl_usdc = 0.0;
         }
-        let remaining_quote = (prev_quote - close_quote).max(0.0);
-        if action == "exit" || remaining_quote <= 1e-6 {
+        let remaining_shares = (prev_shares - close_shares).max(0.0);
+        let remaining_quote = (remaining_shares * (entry_price_cents / 100.0)).max(0.0);
+        if action == "exit" || remaining_shares <= 1e-6 {
             ps.state = "flat".to_string();
             ps.side = None;
             ps.entry_round_id = None;
@@ -1453,11 +1468,13 @@ pub(super) async fn apply_pending_confirmation(
             ps.vwap_entry_cents = None;
             ps.open_add_layers = 0;
             ps.position_cost_usdc = 0.0;
+            ps.position_size_shares = 0.0;
             ps.total_exits = ps.total_exits.saturating_add(1);
         } else {
             ps.state = "in_position".to_string();
             ps.entry_quote_usdc = Some(remaining_quote);
             ps.net_quote_usdc = remaining_quote;
+            ps.position_size_shares = remaining_shares;
             ps.open_add_layers = ps.open_add_layers.saturating_sub(1);
             ps.total_reduces = ps.total_reduces.saturating_add(1);
         }
@@ -1833,6 +1850,11 @@ pub(super) async fn execute_live_orders_via_gateway(
         position_state
             .entry_quote_usdc
             .and_then(|v| if v > 0.0 { Some(v) } else { None });
+    let exit_size_override = if position_state.position_size_shares > 0.0 {
+        Some(position_state.position_size_shares)
+    } else {
+        None
+    };
     for gated in decisions {
         let mut decision = gated.decision.clone();
         let action = decision
@@ -1841,9 +1863,12 @@ pub(super) async fn execute_live_orders_via_gateway(
             .unwrap_or_default()
             .to_ascii_lowercase();
         if action == "exit" {
-            if let Some(q) = exit_quote_override {
-                if let Some(obj) = decision.as_object_mut() {
+            if let Some(obj) = decision.as_object_mut() {
+                if let Some(q) = exit_quote_override {
                     obj.insert("quote_size_usdc".to_string(), json!(q));
+                }
+                if let Some(sz) = exit_size_override {
+                    obj.insert("position_size_shares".to_string(), json!(sz));
                 }
             }
         }
@@ -2408,6 +2433,11 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
         position_state
             .entry_quote_usdc
             .and_then(|v| if v > 0.0 { Some(v) } else { None });
+    let exit_size_override = if position_state.position_size_shares > 0.0 {
+        Some(position_state.position_size_shares)
+    } else {
+        None
+    };
 
     for gated in decisions {
         let mut decision = gated.decision.clone();
@@ -2417,9 +2447,12 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
             .unwrap_or_default()
             .eq_ignore_ascii_case("exit")
         {
-            if let Some(q) = exit_quote_override {
-                if let Some(obj) = decision.as_object_mut() {
+            if let Some(obj) = decision.as_object_mut() {
+                if let Some(q) = exit_quote_override {
                     obj.insert("quote_size_usdc".to_string(), json!(q));
+                }
+                if let Some(sz) = exit_size_override {
+                    obj.insert("position_size_shares".to_string(), json!(sz));
                 }
             }
         }

@@ -554,6 +554,8 @@ struct LivePositionState {
     last_fill_pnl_usdc: f64,
     #[serde(default)]
     position_cost_usdc: f64,
+    #[serde(default)]
+    position_size_shares: f64,
     updated_ts_ms: i64,
 }
 
@@ -579,6 +581,7 @@ impl LivePositionState {
             realized_pnl_usdc: 0.0,
             last_fill_pnl_usdc: 0.0,
             position_cost_usdc: 0.0,
+            position_size_shares: 0.0,
             updated_ts_ms: now_ms,
         }
     }
