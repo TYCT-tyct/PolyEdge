@@ -126,6 +126,39 @@ pub(super) fn round_to_tick(price: f64, tick_size: f64, is_buy: bool) -> f64 {
     aligned.clamp(0.01, 0.99)
 }
 
+fn decimal_places_from_step(step: f64, fallback: usize, max_decimals: usize) -> usize {
+    if !step.is_finite() || step <= 0.0 {
+        return fallback.min(max_decimals);
+    }
+    let mut s = format!("{step:.12}");
+    while s.ends_with('0') {
+        s.pop();
+    }
+    if s.ends_with('.') {
+        s.pop();
+    }
+    let dp = s
+        .split_once('.')
+        .map(|(_, frac)| frac.len())
+        .unwrap_or(0usize);
+    dp.min(max_decimals)
+}
+
+fn format_decimal_compact(value: f64, max_decimals: usize) -> String {
+    let mut s = format!("{value:.prec$}", prec = max_decimals);
+    while s.contains('.') && s.ends_with('0') {
+        s.pop();
+    }
+    if s.ends_with('.') {
+        s.pop();
+    }
+    if s.is_empty() {
+        "0".to_string()
+    } else {
+        s
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct LiveMarketTarget {
     pub(super) market_id: String,
@@ -2220,11 +2253,16 @@ pub(super) async fn submit_rust_order(
         .and_then(Value::as_i64)
         .unwrap_or(1_200)
         .clamp(500, 30_000);
-
-    let price_dec =
-        PmDecimal::from_str(&format!("{price:.6}")).map_err(|e| format!("bad price: {e}"))?;
-    let size_dec =
-        PmDecimal::from_str(&format!("{size:.5}")).map_err(|e| format!("bad size: {e}"))?;
+    let tick_size = payload
+        .get("book_meta")
+        .and_then(|v| v.get("tick_size"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.01);
+    let price_decimals = decimal_places_from_step(tick_size, 2, 6);
+    let price_str = format_decimal_compact(price, price_decimals.max(2));
+    let size_str = format_decimal_compact(size, 5);
+    let price_dec = PmDecimal::from_str(&price_str).map_err(|e| format!("bad price: {e}"))?;
+    let size_dec = PmDecimal::from_str(&size_str).map_err(|e| format!("bad size: {e}"))?;
     let order_type = pm_order_type_from_tif(&tif);
     let requested_notional = payload
         .get("buy_amount_usdc")
@@ -2241,7 +2279,7 @@ pub(super) async fn submit_rust_order(
         && requested_notional > 0.0;
 
     let resp = if use_market_buy_amount {
-        let amount_dec = PmDecimal::from_str(&format!("{requested_notional:.6}"))
+        let amount_dec = PmDecimal::from_str(&format_decimal_compact(requested_notional, 6))
             .map_err(|e| format!("bad buy_amount_usdc: {e}"))?;
         let amount =
             PmAmount::usdc(amount_dec).map_err(|e| format!("invalid buy amount (usdc): {e}"))?;
