@@ -16,7 +16,7 @@ feed_reference = { path = "../feed_reference" }
 futures.workspace = true
 market_discovery = { path = "../market_discovery" }
 reqwest.workspace = true
-redis = { version = "0.28", features = ["tokio-comp"] }
+redis = { version = "0.28", features = ["tokio-comp", "connection-manager"] }
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -2720,6 +2720,21 @@ pub(super) async fn strategy_paper(
 ) -> Result<Json<Value>, ApiError> {
     let source_mode = parse_strategy_paper_source(params.source.as_deref());
     let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
+    let _live_source_permit = if matches!(source_mode, StrategyPaperSource::Live | StrategyPaperSource::Auto) {
+        match state.strategy_live_source_slots.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                if let Some(payload) = state.get_runtime_snapshot(market_type).await {
+                    return Ok(Json(payload));
+                }
+                return Err(ApiError::too_many_requests(
+                    "live source busy (too many concurrent requests), retry shortly",
+                ));
+            }
+        }
+    } else {
+        None
+    };
     let autotune_context =
         normalize_autotune_context(params.autotune_context.as_deref(), market_type);
     let use_autotune = params.use_autotune.unwrap_or(false);
@@ -3043,6 +3058,10 @@ pub(super) async fn strategy_live_reset(
     {
         let mut controls = state.live_runtime_controls.write().await;
         controls.clear();
+    }
+    {
+        let mut inflight = state.live_persist_inflight.write().await;
+        inflight.clear();
     }
     {
         let mut cache = state.live_rust_book_cache.write().await;

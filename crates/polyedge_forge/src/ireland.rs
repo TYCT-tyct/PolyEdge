@@ -1045,23 +1045,46 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         selected_by_pair.insert(pair_key.clone(), best.clone());
                     }
                 }
-                let missing_required_pairs: HashSet<String> = required_pair_keys
+                let mut missing_required_pairs: HashSet<String> = required_pair_keys
                     .iter()
                     .filter(|pair| !selected_by_pair.contains_key(*pair))
                     .cloned()
                     .collect();
                 if !missing_required_pairs.is_empty() {
+                    let mut repaired_pairs = Vec::<String>::new();
+                    for pair in missing_required_pairs.clone() {
+                        let fallback = candidates_by_pair
+                            .get(&pair)
+                            .and_then(|candidates| {
+                                candidates.iter().find(|m| {
+                                    now_ms <= m.end_ts_ms.saturating_add(MARKET_STALE_GUARD_MS)
+                                        && now_ms.saturating_add(market_prestart_allow_ms)
+                                            >= m.start_ts_ms
+                                })
+                            })
+                            .cloned();
+                        if let Some(best_effort) = fallback {
+                            selected_by_pair.insert(pair.clone(), best_effort);
+                            repaired_pairs.push(pair);
+                        }
+                    }
+                    missing_required_pairs = required_pair_keys
+                        .iter()
+                        .filter(|pair| !selected_by_pair.contains_key(*pair))
+                        .cloned()
+                        .collect();
                     log_ingest(
                         &persist_tx,
                         "warn",
                         "discovery",
                         &format!(
-                            "required pairs missing after selection: {}",
+                            "required pairs missing after selection: {} (best_effort_repaired={})",
                             missing_required_pairs
                                 .iter()
                                 .cloned()
                                 .collect::<Vec<_>>()
-                                .join(",")
+                                .join(","),
+                            repaired_pairs.join(",")
                         ),
                     );
                 }

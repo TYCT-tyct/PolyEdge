@@ -17,15 +17,18 @@ fn clickhouse_http_client() -> &'static reqwest::Client {
     })
 }
 
+fn redis_manager_optional(state: &ApiState) -> Option<redis::aio::ConnectionManager> {
+    state.redis_manager.clone()
+}
+
+fn redis_manager_required(state: &ApiState) -> Result<redis::aio::ConnectionManager, ApiError> {
+    redis_manager_optional(state).ok_or_else(|| ApiError::internal("redis not configured"))
+}
+
 pub(super) async fn read_key_value(state: &ApiState, key: &str) -> Result<Option<Value>, ApiError> {
-    let Some(client) = state.redis_client.as_ref() else {
+    let Some(mut conn) = redis_manager_optional(state) else {
         return Ok(None);
     };
-
-    let mut conn = client
-        .get_multiplexed_async_connection()
-        .await
-        .map_err(|e| ApiError::internal(format!("redis connect failed: {}", e)))?;
 
     let payload: Option<String> = conn
         .get(key)
@@ -47,15 +50,9 @@ pub(super) async fn write_key_value(
     value: &Value,
     ttl_sec: Option<u32>,
 ) -> Result<(), ApiError> {
-    let Some(client) = state.redis_client.as_ref() else {
-        return Err(ApiError::internal("redis not configured"));
-    };
+    let mut conn = redis_manager_required(state)?;
     let payload = serde_json::to_string(value)
         .map_err(|e| ApiError::internal(format!("redis payload serialize failed: {}", e)))?;
-    let mut conn = client
-        .get_multiplexed_async_connection()
-        .await
-        .map_err(|e| ApiError::internal(format!("redis connect failed: {}", e)))?;
     if let Some(ttl) = ttl_sec {
         let _: () = conn
             .set_ex(key, payload, ttl as u64)
@@ -71,13 +68,9 @@ pub(super) async fn write_key_value(
 }
 
 pub(super) async fn delete_key(state: &ApiState, key: &str) -> Result<(), ApiError> {
-    let Some(client) = state.redis_client.as_ref() else {
+    let Some(mut conn) = redis_manager_optional(state) else {
         return Ok(());
     };
-    let mut conn = client
-        .get_multiplexed_async_connection()
-        .await
-        .map_err(|e| ApiError::internal(format!("redis connect failed: {}", e)))?;
     let _: usize = conn
         .del(key)
         .await
@@ -184,8 +177,8 @@ pub(super) async fn check_clickhouse(ch_url: Option<&str>) -> ServiceHealth {
     }
 }
 
-pub(super) async fn check_redis(client: Option<&redis::Client>) -> ServiceHealth {
-    let Some(client) = client else {
+pub(super) async fn check_redis(manager: Option<redis::aio::ConnectionManager>) -> ServiceHealth {
+    let Some(mut conn) = manager else {
         return ServiceHealth {
             enabled: false,
             ok: true,
@@ -195,12 +188,7 @@ pub(super) async fn check_redis(client: Option<&redis::Client>) -> ServiceHealth
     };
 
     let st = Instant::now();
-    let ping = async {
-        let mut conn = client.get_multiplexed_async_connection().await?;
-        let pong: String = redis::cmd("PING").query_async(&mut conn).await?;
-        Result::<String>::Ok(pong)
-    }
-    .await;
+    let ping = redis::cmd("PING").query_async::<String>(&mut conn).await;
 
     match ping {
         Ok(v) if v.eq_ignore_ascii_case("PONG") => ServiceHealth {

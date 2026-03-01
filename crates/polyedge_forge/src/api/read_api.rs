@@ -17,7 +17,7 @@ pub(super) async fn health_live() -> Json<Value> {
 
 pub(super) async fn health_db(State(state): State<ApiState>) -> Json<HealthResponse> {
     let ch = check_clickhouse(state.ch_url.as_deref()).await;
-    let redis = check_redis(state.redis_client.as_ref()).await;
+    let redis = check_redis(state.redis_manager.clone()).await;
     Json(HealthResponse {
         ok: ch.ok && redis.ok,
         ts_ms: Utc::now().timestamp_millis(),
@@ -98,7 +98,17 @@ pub(super) async fn fetch_latest_snapshot(
         symbol.to_ascii_uppercase(),
         timeframe
     );
-    if let Some(v) = read_key_value(state, &key_direct).await? {
+    if let Some(v) = match read_key_value(state, &key_direct).await {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(
+                key = %key_direct,
+                error = %err.message,
+                "redis latest-direct read failed; fallback to clickhouse"
+            );
+            None
+        }
+    } {
         if is_live_snapshot_fresh(&v, timeframe, now_ms) {
             if snapshot_remaining_ms(&v) > 0 {
                 return Ok(Some(v));
@@ -113,7 +123,17 @@ pub(super) async fn fetch_latest_snapshot(
     }
 
     let tf_key = format!("{}:snapshot:latest:tf:{}", state.redis_prefix, timeframe);
-    let Some(arr_val) = read_key_value(state, &tf_key).await? else {
+    let Some(arr_val) = (match read_key_value(state, &tf_key).await {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(
+                key = %tf_key,
+                error = %err.message,
+                "redis latest-tf read failed; fallback to clickhouse"
+            );
+            None
+        }
+    }) else {
         if fallback_direct.is_some() {
             return Ok(fallback_direct);
         }

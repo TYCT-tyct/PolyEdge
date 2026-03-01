@@ -77,6 +77,7 @@ struct ApiState {
     ch_url: Option<String>,
     redis_prefix: String,
     redis_client: Option<redis::Client>,
+    redis_manager: Option<redis::aio::ConnectionManager>,
     chart_cache: Arc<RwLock<HashMap<String, ChartCacheEntry>>>,
     live_position_states: Arc<RwLock<HashMap<String, LivePositionState>>>,
     live_decision_guard: Arc<RwLock<HashMap<String, i64>>>,
@@ -86,6 +87,7 @@ struct ApiState {
     live_gateway_report_seq: Arc<RwLock<i64>>,
     live_runtime_snapshots: Arc<RwLock<HashMap<String, Value>>>,
     live_runtime_controls: Arc<RwLock<HashMap<String, LiveRuntimeControl>>>,
+    live_persist_inflight: Arc<RwLock<HashSet<String>>>,
     live_execution_aggr_states: Arc<RwLock<HashMap<String, LiveExecutionAggState>>>,
     live_rust_executor: Arc<RwLock<Option<Arc<RustExecutorContext>>>>,
     live_rust_book_cache: Arc<RwLock<HashMap<String, RustBookCacheEntry>>>,
@@ -93,6 +95,7 @@ struct ApiState {
     runtime_alert_throttle: Arc<RwLock<HashMap<String, i64>>>,
     runtime_daily_report_sent: Arc<RwLock<HashSet<String>>>,
     strategy_heavy_slots: Arc<Semaphore>,
+    strategy_live_source_slots: Arc<Semaphore>,
     gateway_http_client: Arc<reqwest::Client>,
 }
 
@@ -1758,6 +1761,22 @@ impl ApiState {
         store.insert(market_type.to_string(), payload);
     }
 
+    async fn persist_live_runtime_state_async(&self, market_type: &str) {
+        {
+            let mut inflight = self.live_persist_inflight.write().await;
+            if !inflight.insert(market_type.to_string()) {
+                return;
+            }
+        }
+        let state = self.clone();
+        let market = market_type.to_string();
+        tokio::spawn(async move {
+            persist_live_runtime_state(&state, &market).await;
+            let mut inflight = state.live_persist_inflight.write().await;
+            inflight.remove(&market);
+        });
+    }
+
     async fn get_live_execution_aggr_state(&self, market_type: &str) -> LiveExecutionAggState {
         let mut store = self.live_execution_aggr_states.write().await;
         store
@@ -2283,6 +2302,13 @@ impl ApiError {
             message: msg.into(),
         }
     }
+
+    fn too_many_requests(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: msg.into(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -2305,6 +2331,17 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         }
         None => None,
     };
+    let redis_manager = if let Some(client) = redis_client.as_ref() {
+        match client.get_connection_manager().await {
+            Ok(manager) => Some(manager),
+            Err(err) => {
+                tracing::warn!(?err, "redis connection manager init failed; redis kv ops degraded");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let gateway_http_client = reqwest::Client::builder()
         .pool_max_idle_per_host(128)
         .pool_idle_timeout(Duration::from_secs(90))
@@ -2316,10 +2353,16 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(1)
         .clamp(1, 8);
+    let strategy_live_source_slots = std::env::var("FORGE_STRATEGY_LIVE_SOURCE_MAX_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(64)
+        .clamp(4, 512);
     let state = ApiState {
         ch_url: cfg.clickhouse_url,
         redis_prefix: cfg.redis_prefix,
         redis_client,
+        redis_manager,
         chart_cache: Arc::new(RwLock::new(HashMap::new())),
         live_position_states: Arc::new(RwLock::new(HashMap::new())),
         live_decision_guard: Arc::new(RwLock::new(HashMap::new())),
@@ -2329,6 +2372,7 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         live_gateway_report_seq: Arc::new(RwLock::new(0)),
         live_runtime_snapshots: Arc::new(RwLock::new(HashMap::new())),
         live_runtime_controls: Arc::new(RwLock::new(HashMap::new())),
+        live_persist_inflight: Arc::new(RwLock::new(HashSet::new())),
         live_execution_aggr_states: Arc::new(RwLock::new(HashMap::new())),
         live_rust_executor: Arc::new(RwLock::new(None)),
         live_rust_book_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -2336,6 +2380,7 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         runtime_alert_throttle: Arc::new(RwLock::new(HashMap::new())),
         runtime_daily_report_sent: Arc::new(RwLock::new(HashSet::new())),
         strategy_heavy_slots: Arc::new(Semaphore::new(strategy_heavy_slots)),
+        strategy_live_source_slots: Arc::new(Semaphore::new(strategy_live_source_slots)),
         gateway_http_client: Arc::new(gateway_http_client),
     };
 
@@ -2834,7 +2879,8 @@ async fn live_runtime_loop(
                         .to_string();
                     let summary = payload.get("summary").cloned().unwrap_or(Value::Null);
                     state.set_runtime_snapshot(market_type, payload).await;
-                    persist_live_runtime_state(&state, market_type).await;
+                    // Persist runtime state off the hot path to avoid Redis latency coupling.
+                    state.persist_live_runtime_state_async(market_type).await;
 
                     if push_cfg.enabled && effective_live_execute && status != "ok" {
                         let alert_key = format!("live-status:{market_type}:{status}");
