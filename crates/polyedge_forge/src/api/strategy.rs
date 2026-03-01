@@ -1457,7 +1457,9 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
     let live_executor_mode = LiveExecutorMode::from_env();
     reconcile_live_reports(state, &live_gateway_cfg, live_executor_mode).await;
     handle_live_pending_timeouts(state, &live_gateway_cfg, live_executor_mode).await;
-    let live_market = resolve_live_market_target(market_type).await.ok();
+    let live_market_res = resolve_live_market_target(market_type).await;
+    let live_market_target_error = live_market_res.as_ref().err().map(|e| e.message.clone());
+    let live_market = live_market_res.ok();
     let position_before_gate = state.get_live_position_state(market_type).await;
     let prefer_action = if live_drain_only {
         if position_before_gate.side.is_some() {
@@ -1947,13 +1949,15 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                             "accepted": false,
                             "action": "none",
                             "side": "NONE",
-                            "reason": "no_live_market_target"
+                            "reason": "no_live_market_target",
+                            "detail": live_market_target_error.clone()
                         }),
                     )
                     .await;
                 json!({
                     "mode": "real_gateway",
                     "error": "no_live_market_target",
+                    "error_detail": live_market_target_error.clone(),
                     "orders": []
                 })
             }

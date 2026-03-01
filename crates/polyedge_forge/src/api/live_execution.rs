@@ -178,6 +178,12 @@ pub(super) struct LiveGatedDecision {
 const LIVE_MARKET_TARGET_CACHE_TTL_MS_DEFAULT: i64 = 8_000;
 const LIVE_MARKET_TARGET_CACHE_TTL_MS_MIN: i64 = 2_000;
 const LIVE_MARKET_TARGET_CACHE_TTL_MS_MAX: i64 = 120_000;
+const LIVE_MARKET_TARGET_STALE_GRACE_MS_DEFAULT: i64 = 20_000;
+const LIVE_MARKET_TARGET_STALE_GRACE_MS_MIN: i64 = 0;
+const LIVE_MARKET_TARGET_STALE_GRACE_MS_MAX: i64 = 180_000;
+const LIVE_MARKET_TARGET_STALE_MAX_AGE_MS_DEFAULT: i64 = 90_000;
+const LIVE_MARKET_TARGET_STALE_MAX_AGE_MS_MIN: i64 = 5_000;
+const LIVE_MARKET_TARGET_STALE_MAX_AGE_MS_MAX: i64 = 600_000;
 const LIVE_CANCEL_FAILURE_FORCE_PAUSE_EXIT_THRESHOLD: u8 = 2;
 const LIVE_CANCEL_FAILURE_FORCE_PAUSE_OTHER_THRESHOLD: u8 = 3;
 
@@ -204,6 +210,45 @@ fn live_market_target_cache_ttl_ms() -> i64 {
             LIVE_MARKET_TARGET_CACHE_TTL_MS_MIN,
             LIVE_MARKET_TARGET_CACHE_TTL_MS_MAX,
         )
+}
+
+fn live_market_target_stale_grace_ms() -> i64 {
+    std::env::var("FORGE_FEV1_LIVE_TARGET_STALE_GRACE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(LIVE_MARKET_TARGET_STALE_GRACE_MS_DEFAULT)
+        .clamp(
+            LIVE_MARKET_TARGET_STALE_GRACE_MS_MIN,
+            LIVE_MARKET_TARGET_STALE_GRACE_MS_MAX,
+        )
+}
+
+fn live_market_target_stale_max_age_ms() -> i64 {
+    std::env::var("FORGE_FEV1_LIVE_TARGET_STALE_MAX_AGE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(LIVE_MARKET_TARGET_STALE_MAX_AGE_MS_DEFAULT)
+        .clamp(
+            LIVE_MARKET_TARGET_STALE_MAX_AGE_MS_MIN,
+            LIVE_MARKET_TARGET_STALE_MAX_AGE_MS_MAX,
+        )
+}
+
+fn stale_target_from_cache(
+    cached: &CachedLiveMarketTarget,
+    now_ms: i64,
+    stale_grace_ms: i64,
+    stale_max_age_ms: i64,
+) -> Option<LiveMarketTarget> {
+    let age_ms = now_ms.saturating_sub(cached.fetched_at_ms);
+    if age_ms > stale_max_age_ms {
+        return None;
+    }
+    let end_ms = parse_end_date_ms(cached.target.end_date.as_deref()).unwrap_or(i64::MAX / 4);
+    if end_ms < now_ms.saturating_sub(stale_grace_ms) {
+        return None;
+    }
+    Some(cached.target.clone())
 }
 
 pub(super) fn live_decision_key(market_type: &str, decision: &Value) -> String {
@@ -495,9 +540,13 @@ pub(super) async fn resolve_live_market_target(
 ) -> Result<LiveMarketTarget, ApiError> {
     let now_ms = Utc::now().timestamp_millis();
     let cache_ttl_ms = live_market_target_cache_ttl_ms();
+    let stale_grace_ms = live_market_target_stale_grace_ms();
+    let stale_max_age_ms = live_market_target_stale_max_age_ms();
+    let mut cached_entry_for_fallback: Option<CachedLiveMarketTarget> = None;
     {
         let cache = live_market_target_cache().read().await;
         if let Some(cached) = cache.get(market_type) {
+            cached_entry_for_fallback = Some(cached.clone());
             let age_ms = now_ms.saturating_sub(cached.fetched_at_ms);
             let end_ms =
                 parse_end_date_ms(cached.target.end_date.as_deref()).unwrap_or(i64::MAX / 4);
@@ -513,10 +562,27 @@ pub(super) async fn resolve_live_market_target(
         timeframes: vec![market_type.to_string()],
         ..DiscoveryConfig::default()
     });
-    let mut markets: Vec<MarketDescriptor> = discovery
-        .discover()
-        .await
-        .map_err(|e| ApiError::internal(format!("market discovery failed: {e}")))?
+    let discovered = match discovery.discover().await {
+        Ok(v) => v,
+        Err(e) => {
+            if let Some(cached) = cached_entry_for_fallback.as_ref() {
+                if let Some(stale) =
+                    stale_target_from_cache(cached, now_ms, stale_grace_ms, stale_max_age_ms)
+                {
+                    tracing::warn!(
+                        market_type = market_type,
+                        error = %e,
+                        stale_grace_ms = stale_grace_ms,
+                        stale_max_age_ms = stale_max_age_ms,
+                        "market discovery failed, fallback to stale cached target"
+                    );
+                    return Ok(stale);
+                }
+            }
+            return Err(ApiError::internal(format!("market discovery failed: {e}")));
+        }
+    };
+    let mut markets: Vec<MarketDescriptor> = discovered
         .into_iter()
         .filter(|m| {
             m.symbol.eq_ignore_ascii_case("BTCUSDT")
@@ -528,6 +594,21 @@ pub(super) async fn resolve_live_market_target(
                 && m.token_id_no.is_some()
         })
         .collect();
+    if markets.is_empty() {
+        if let Some(cached) = cached_entry_for_fallback.as_ref() {
+            if let Some(stale) =
+                stale_target_from_cache(cached, now_ms, stale_grace_ms, stale_max_age_ms)
+            {
+                tracing::warn!(
+                    market_type = market_type,
+                    stale_grace_ms = stale_grace_ms,
+                    stale_max_age_ms = stale_max_age_ms,
+                    "market discovery returned empty, fallback to stale cached target"
+                );
+                return Ok(stale);
+            }
+        }
+    }
     if markets.is_empty() {
         return Err(ApiError::bad_request(format!(
             "no active BTC {market_type} market with token ids"
@@ -2399,6 +2480,185 @@ pub(super) async fn submit_rust_order(
     }))
 }
 
+async fn try_resubmit_after_terminal_reject_rust(
+    state: &ApiState,
+    gateway_cfg: &LiveGatewayConfig,
+    ctx: &Arc<RustExecutorContext>,
+    row: &LivePendingOrder,
+    terminal_status: &str,
+) -> bool {
+    let action = row.action.to_ascii_lowercase();
+    let exit_like = is_live_exit_action(&action);
+    let emergency_exit = exit_like && is_emergency_exit_reason(&row.submit_reason);
+    let max_retry = if emergency_exit { 2 } else { 1 };
+    if row.retry_count >= max_retry {
+        return false;
+    }
+    let target = match resolve_live_market_target(&row.market_type).await {
+        Ok(v) => v,
+        Err(err) => {
+            state
+                .append_live_event(
+                    &row.market_type,
+                    json!({
+                        "accepted": false,
+                        "action": row.action,
+                        "side": row.side,
+                        "round_id": row.round_id,
+                        "reason": "rust_terminal_rejected_resubmit_no_target",
+                        "order_id": row.order_id,
+                        "status": terminal_status,
+                        "error": err.message
+                    }),
+                )
+                .await;
+            return false;
+        }
+    };
+    let mut decision = json!({
+        "action": row.action,
+        "side": row.side,
+        "round_id": row.round_id,
+        "price_cents": row.price_cents,
+        "quote_size_usdc": row.quote_size_usdc,
+        "reason": format!("{}_terminal_retry_fak", row.submit_reason),
+        "tif": "FAK",
+        "style": "taker",
+        "ttl_ms": if emergency_exit { 650 } else { 900 },
+        "max_slippage_bps": if exit_like {
+            (gateway_cfg.exit_slippage_bps + if emergency_exit { 22.0 } else { 14.0 }).max(34.0)
+        } else {
+            (gateway_cfg.entry_slippage_bps + 12.0).max(28.0)
+        }
+    });
+    if exit_like {
+        let ps = state.get_live_position_state(&row.market_type).await;
+        if ps.position_size_shares > 0.0 {
+            if let Some(obj) = decision.as_object_mut() {
+                obj.insert(
+                    "position_size_shares".to_string(),
+                    json!(ps.position_size_shares),
+                );
+            }
+        }
+    }
+    let token_id = token_id_for_decision(&decision, &target).map(str::to_string);
+    let book_snapshot = if let Some(token_id) = token_id {
+        if let Some(cached) = state.get_rust_book_cache(&token_id).await {
+            Some(cached)
+        } else if let Some(v) = fetch_rust_book_snapshot(ctx, &token_id).await {
+            state.put_rust_book_cache(&token_id, v.clone()).await;
+            Some(v)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let Some(payload) = decision_to_live_payload(
+        &decision,
+        &target,
+        gateway_cfg,
+        book_snapshot.as_ref(),
+        Some(row.quote_size_usdc),
+    ) else {
+        state
+            .append_live_event(
+                &row.market_type,
+                json!({
+                    "accepted": false,
+                    "action": row.action,
+                    "side": row.side,
+                    "round_id": row.round_id,
+                    "reason": "rust_terminal_rejected_resubmit_payload_failed",
+                    "order_id": row.order_id,
+                    "status": terminal_status
+                }),
+            )
+            .await;
+        return false;
+    };
+    let now_ms = Utc::now().timestamp_millis();
+    match submit_rust_order(ctx, &payload).await {
+        Ok(submit_resp) => {
+            let accepted = submit_resp
+                .get("accepted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let new_order_id = submit_resp
+                .get("order_id")
+                .and_then(Value::as_str)
+                .filter(|v| !v.trim().is_empty())
+                .map(str::to_string);
+            if accepted {
+                if let Some(new_order_id) = new_order_id {
+                    let mut pending = row.clone();
+                    pending.order_id = new_order_id.clone();
+                    pending.retry_count = pending.retry_count.saturating_add(1);
+                    pending.tif = "FAK".to_string();
+                    pending.style = "taker".to_string();
+                    pending.submitted_ts_ms = now_ms;
+                    pending.cancel_after_ms = if emergency_exit { 700 } else { 1500 };
+                    state.upsert_pending_order(pending).await;
+                    state
+                        .append_live_event(
+                            &row.market_type,
+                            json!({
+                                "accepted": true,
+                                "action": row.action,
+                                "side": row.side,
+                                "round_id": row.round_id,
+                                "reason": "rust_terminal_rejected_resubmitted_fak",
+                                "order_id": row.order_id,
+                                "new_order_id": new_order_id,
+                                "status": terminal_status,
+                                "submit_response": submit_resp,
+                                "book_snapshot": book_snapshot,
+                                "emergency_exit": emergency_exit
+                            }),
+                        )
+                        .await;
+                    return true;
+                }
+            }
+            state
+                .append_live_event(
+                    &row.market_type,
+                    json!({
+                        "accepted": false,
+                        "action": row.action,
+                        "side": row.side,
+                        "round_id": row.round_id,
+                        "reason": "rust_terminal_rejected_resubmit_rejected",
+                        "order_id": row.order_id,
+                        "status": terminal_status,
+                        "submit_response": submit_resp
+                    }),
+                )
+                .await;
+            false
+        }
+        Err(err) => {
+            state
+                .append_live_event(
+                    &row.market_type,
+                    json!({
+                        "accepted": false,
+                        "action": row.action,
+                        "side": row.side,
+                        "round_id": row.round_id,
+                        "reason": "rust_terminal_rejected_resubmit_error",
+                        "order_id": row.order_id,
+                        "status": terminal_status,
+                        "error": err
+                    }),
+                )
+                .await;
+            false
+        }
+    }
+}
+
 pub(super) async fn execute_live_orders_via_rust_sdk(
     state: &ApiState,
     gateway_cfg: &LiveGatewayConfig,
@@ -2664,6 +2924,18 @@ pub(super) async fn reconcile_rust_reports(state: &ApiState, gateway_cfg: &LiveG
                 .await;
         } else if pm_is_terminal_reject(&order.status) {
             let _ = state.remove_pending_order(&row.order_id).await;
+            let terminal_status = format!("{}", order.status);
+            let retried = try_resubmit_after_terminal_reject_rust(
+                state,
+                gateway_cfg,
+                &ctx,
+                &row,
+                &terminal_status,
+            )
+            .await;
+            if retried {
+                continue;
+            }
             apply_pending_revert(state, &row, "rust_order_terminal_rejected").await;
             state
                 .append_live_event(
@@ -2675,7 +2947,7 @@ pub(super) async fn reconcile_rust_reports(state: &ApiState, gateway_cfg: &LiveG
                         "round_id": row.round_id,
                         "reason": "rust_order_terminal_rejected",
                         "order_id": row.order_id,
-                        "status": format!("{}", order.status)
+                        "status": terminal_status
                     }),
                 )
                 .await;
