@@ -926,7 +926,6 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     pair_seen.insert(pair_key);
                     sticky_reused = sticky_reused.saturating_add(1);
                 }
-                let mut selected_by_pair: HashMap<String, MarketMeta> = HashMap::new();
                 let mut candidates_by_pair: HashMap<String, Vec<MarketMeta>> = HashMap::new();
                 for market in markets_by_id.values() {
                     let pair_key = market_pair_key(market);
@@ -935,51 +934,54 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         .or_default()
                         .push(market.clone());
                 }
+                let mut cache_repaired = 0usize;
+                // Keep candidates aligned with feed_polymarket subscription IDs as well.
+                // This prevents stale gaps when discovery and WS subscription briefly diverge.
+                if let Ok(cache_markets) =
+                    discover_markets_from_target_cache(&subscribe_symbols, &subscribe_tfs).await
+                {
+                    for market in cache_markets {
+                        if !market_filter.allows(&market.symbol, &market.timeframe) {
+                            continue;
+                        }
+                        let pair_key = market_pair_key(&market);
+                        let entry = candidates_by_pair.entry(pair_key).or_default();
+                        if entry.iter().any(|m| m.market_id == market.market_id) {
+                            continue;
+                        }
+                        entry.push(market);
+                        cache_repaired = cache_repaired.saturating_add(1);
+                    }
+                }
                 for markets in candidates_by_pair.values_mut() {
                     markets.sort_by_key(|m| market_selection_rank(m, now_ms));
                     markets.dedup_by(|a, b| a.market_id == b.market_id);
                 }
+                let mut selected_by_pair: HashMap<String, MarketMeta> = HashMap::new();
                 for (pair_key, markets) in &candidates_by_pair {
                     if let Some(best) = markets.first() {
                         selected_by_pair.insert(pair_key.clone(), best.clone());
                     }
                 }
-                let mut missing_required_pairs: HashSet<String> = required_pair_keys
+                let missing_required_pairs: HashSet<String> = required_pair_keys
                     .iter()
                     .filter(|pair| !selected_by_pair.contains_key(*pair))
                     .cloned()
                     .collect();
-                let mut cache_repaired = 0usize;
                 if !missing_required_pairs.is_empty() {
-                    if let Ok(cache_markets) =
-                        discover_markets_from_target_cache(&subscribe_symbols, &subscribe_tfs).await
-                    {
-                        for market in cache_markets {
-                            if !market_filter.allows(&market.symbol, &market.timeframe) {
-                                continue;
-                            }
-                            let pair_key = market_pair_key(&market);
-                            if !missing_required_pairs.contains(&pair_key) {
-                                continue;
-                            }
-                            let entry = candidates_by_pair.entry(pair_key.clone()).or_default();
-                            if !entry.iter().any(|m| m.market_id == market.market_id) {
-                                entry.push(market);
-                                entry.sort_by_key(|m| market_selection_rank(m, now_ms));
-                                entry.dedup_by(|a, b| a.market_id == b.market_id);
-                                cache_repaired = cache_repaired.saturating_add(1);
-                            }
-                            if let Some(best) = entry.first() {
-                                selected_by_pair.insert(pair_key.clone(), best.clone());
-                            }
-                            if selected_by_pair.contains_key(&pair_key) {
-                                missing_required_pairs.remove(&pair_key);
-                            }
-                            if missing_required_pairs.is_empty() {
-                                break;
-                            }
-                        }
-                    }
+                    log_ingest(
+                        &persist_tx,
+                        "warn",
+                        "discovery",
+                        &format!(
+                            "required pairs missing after selection: {}",
+                            missing_required_pairs
+                                .iter()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        ),
+                    );
                 }
                 if selected_by_pair.len() != markets_by_id.len() {
                     let mut reduced: HashMap<String, MarketMeta> = HashMap::new();
