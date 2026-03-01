@@ -1569,7 +1569,11 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                         .unwrap_or(dynamic_quote_usdc);
                     let add_scale =
                         dynamic_add_scale(&d, base_add_scale, &capital_before, &capital_cfg);
-                    let scaled_q = (base_q * add_scale).max(live_gateway_cfg.min_quote_usdc);
+                    let px = d.get("price_cents").and_then(Value::as_f64).unwrap_or(50.0);
+                    let scaled_q = enforce_min_order_quote_usdc(
+                        (base_q * add_scale).max(live_gateway_cfg.min_quote_usdc),
+                        px,
+                    );
                     let reason = d
                         .get("reason")
                         .and_then(Value::as_str)
@@ -1641,15 +1645,20 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                         .and_then(Value::as_f64)
                         .unwrap_or(50.0)
                         .clamp(1.0, 99.0);
-                    (px / 100.0).max(live_gateway_cfg.min_quote_usdc)
+                    enforce_min_order_quote_usdc(
+                        (px / 100.0).max(live_gateway_cfg.min_quote_usdc),
+                        px,
+                    )
                 } else {
-                    dynamic_entry_quote(
+                    let q = dynamic_entry_quote(
                         &d,
                         q,
                         live_gateway_cfg.min_quote_usdc,
                         &capital_before,
                         &capital_cfg,
-                    )
+                    );
+                    let px = d.get("price_cents").and_then(Value::as_f64).unwrap_or(50.0);
+                    enforce_min_order_quote_usdc(q, px)
                 };
                 if let Some(obj) = d.as_object_mut() {
                     obj.insert("quote_size_usdc".to_string(), json!(tuned_q));
@@ -1707,7 +1716,11 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                 .and_then(Value::as_f64)
                 .unwrap_or(dynamic_quote_usdc);
             let add_scale = dynamic_add_scale(&d, base_add_scale, &capital_before, &capital_cfg);
-            let scaled_q = (base_q * add_scale).max(live_gateway_cfg.min_quote_usdc);
+            let px = d.get("price_cents").and_then(Value::as_f64).unwrap_or(50.0);
+            let scaled_q = enforce_min_order_quote_usdc(
+                (base_q * add_scale).max(live_gateway_cfg.min_quote_usdc),
+                px,
+            );
             if let Some(obj) = d.as_object_mut() {
                 obj.insert("quote_size_usdc".to_string(), json!(scaled_q));
             }

@@ -266,6 +266,20 @@ fn derive_capital_risk_state(
     }
 }
 
+fn live_min_order_size_shares() -> f64 {
+    std::env::var("FORGE_FEV1_MIN_ORDER_SIZE_SHARES")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(5.0)
+        .clamp(0.01, 1_000.0)
+}
+
+fn enforce_min_order_quote_usdc(quote_usdc: f64, price_cents: f64) -> f64 {
+    let px = (price_cents / 100.0).clamp(0.01, 0.99);
+    let min_quote = live_min_order_size_shares() * px;
+    quote_usdc.max(min_quote)
+}
+
 fn dynamic_entry_quote(
     decision: &Value,
     base_quote: f64,
@@ -756,10 +770,7 @@ impl LiveCapitalConfig {
 
         Self {
             enabled: env_bool!("FORGE_FEV1_CAPITAL_AUTO", true),
-            bankroll_policy_enabled: env_bool!(
-                "FORGE_FEV1_CAPITAL_BANKROLL_POLICY_ENABLED",
-                true
-            ),
+            bankroll_policy_enabled: env_bool!("FORGE_FEV1_CAPITAL_BANKROLL_POLICY_ENABLED", true),
             portfolio_shared: env_bool!("FORGE_FEV1_CAPITAL_PORTFOLIO_SHARED", true),
             use_real_balance: env_bool!("FORGE_FEV1_CAPITAL_USE_REAL_BALANCE", true),
             hard_require_real_balance: env_bool!(
@@ -958,7 +969,13 @@ impl LiveRuntimeConfig {
         let max_trades = std::env::var("FORGE_FEV1_RUNTIME_MAX_TRADES")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .map(|v| if v == 0 { usize::MAX } else { v.clamp(1, 20_000) })
+            .map(|v| {
+                if v == 0 {
+                    usize::MAX
+                } else {
+                    v.clamp(1, 20_000)
+                }
+            })
             .unwrap_or(120);
         let max_orders = std::env::var("FORGE_FEV1_RUNTIME_MAX_ORDERS")
             .ok()

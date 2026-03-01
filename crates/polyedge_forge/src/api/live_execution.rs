@@ -606,20 +606,12 @@ pub(super) fn decision_to_live_payload(
     let mut notes: Vec<String> = Vec::with_capacity(3);
     let is_buy = gateway_side.starts_with("buy_");
     let mut min_order_size = 0.01_f64;
-    let mut size_floor = if is_buy && matches!(tif.as_str(), "FAK" | "FOK") {
-        0.01
-    } else {
-        min_order_size
-    };
+    let mut size_floor = min_order_size;
     let mut size = (quote_size / price).max(size_floor);
     if let Some(book) = book {
         min_order_size = book.min_order_size.max(0.0001);
         let taker_like = style == "taker" || matches!(tif.as_str(), "FAK" | "FOK");
-        size_floor = if is_buy && taker_like {
-            0.01
-        } else {
-            min_order_size
-        };
+        size_floor = min_order_size;
         let tick_size = book.tick_size.max(0.0001);
         price = round_to_tick(price, tick_size, is_buy);
         size = (quote_size / price).max(size_floor);
@@ -694,13 +686,15 @@ pub(super) fn decision_to_live_payload(
             }
             let tick_size = book.tick_size.max(0.0001);
             price = round_to_tick(price, tick_size, is_buy);
-            size_floor = if is_buy { 0.01 } else { min_order_size };
+            size_floor = min_order_size;
             size = (quote_size / price).max(size_floor).max(0.01);
             size = (size * 10_000.0).round() / 10_000.0;
         }
     }
     let taker_like = style == "taker" || matches!(tif.as_str(), "FAK" | "FOK");
-    let requested_notional_usdc = (quote_size * 1_000_000.0).round() / 1_000_000.0;
+    let floor_notional_usdc = (size * price).max(0.0);
+    let requested_notional_usdc =
+        (quote_size.max(floor_notional_usdc) * 1_000_000.0).round() / 1_000_000.0;
     let buy_amount_usdc = if is_buy && taker_like {
         Some(requested_notional_usdc)
     } else {
@@ -3059,7 +3053,7 @@ mod tests {
     }
 
     #[test]
-    fn taker_buy_uses_buy_amount_mode_without_min_order_clamp() {
+    fn taker_buy_uses_buy_amount_mode_with_min_order_size_floor() {
         let decision = json!({
             "action": "enter",
             "side": "UP",
@@ -3090,10 +3084,13 @@ mod tests {
             .unwrap_or_default();
 
         assert!(
-            size > 1.9 && size < 2.1,
-            "size should track $1 / $0.5, got {size}"
+            size >= 5.0,
+            "taker buy must keep min_order_size floor, got {size}"
         );
-        assert!((amount - 1.0).abs() < 1e-9, "buy amount mismatch: {amount}");
+        assert!(
+            (amount - 2.5).abs() < 1e-9,
+            "buy amount should be raised to floor notional, got {amount}"
+        );
         assert_eq!(mode, "buy_usdc");
     }
 
