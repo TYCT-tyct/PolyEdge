@@ -180,12 +180,6 @@ pub(super) struct LiveGatedDecision {
 const LIVE_MARKET_TARGET_CACHE_TTL_MS_DEFAULT: i64 = 8_000;
 const LIVE_MARKET_TARGET_CACHE_TTL_MS_MIN: i64 = 2_000;
 const LIVE_MARKET_TARGET_CACHE_TTL_MS_MAX: i64 = 120_000;
-const LIVE_MARKET_TARGET_STALE_GRACE_MS_DEFAULT: i64 = 20_000;
-const LIVE_MARKET_TARGET_STALE_GRACE_MS_MIN: i64 = 0;
-const LIVE_MARKET_TARGET_STALE_GRACE_MS_MAX: i64 = 180_000;
-const LIVE_MARKET_TARGET_STALE_MAX_AGE_MS_DEFAULT: i64 = 90_000;
-const LIVE_MARKET_TARGET_STALE_MAX_AGE_MS_MIN: i64 = 5_000;
-const LIVE_MARKET_TARGET_STALE_MAX_AGE_MS_MAX: i64 = 600_000;
 const LIVE_MARKET_TARGET_RESOLVE_ATTEMPTS_DEFAULT: i64 = 3;
 const LIVE_MARKET_TARGET_RESOLVE_ATTEMPTS_MIN: i64 = 1;
 const LIVE_MARKET_TARGET_RESOLVE_ATTEMPTS_MAX: i64 = 8;
@@ -223,28 +217,6 @@ fn live_market_target_cache_ttl_ms() -> i64 {
         )
 }
 
-fn live_market_target_stale_grace_ms() -> i64 {
-    std::env::var("FORGE_FEV1_LIVE_TARGET_STALE_GRACE_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .unwrap_or(LIVE_MARKET_TARGET_STALE_GRACE_MS_DEFAULT)
-        .clamp(
-            LIVE_MARKET_TARGET_STALE_GRACE_MS_MIN,
-            LIVE_MARKET_TARGET_STALE_GRACE_MS_MAX,
-        )
-}
-
-fn live_market_target_stale_max_age_ms() -> i64 {
-    std::env::var("FORGE_FEV1_LIVE_TARGET_STALE_MAX_AGE_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .unwrap_or(LIVE_MARKET_TARGET_STALE_MAX_AGE_MS_DEFAULT)
-        .clamp(
-            LIVE_MARKET_TARGET_STALE_MAX_AGE_MS_MIN,
-            LIVE_MARKET_TARGET_STALE_MAX_AGE_MS_MAX,
-        )
-}
-
 fn live_market_target_resolve_attempts() -> usize {
     std::env::var("FORGE_FEV1_LIVE_TARGET_RESOLVE_ATTEMPTS")
         .ok()
@@ -276,23 +248,6 @@ fn live_market_target_switch_guard_ms() -> i64 {
             LIVE_MARKET_TARGET_SWITCH_GUARD_MS_MIN,
             LIVE_MARKET_TARGET_SWITCH_GUARD_MS_MAX,
         )
-}
-
-fn stale_target_from_cache(
-    cached: &CachedLiveMarketTarget,
-    now_ms: i64,
-    stale_grace_ms: i64,
-    stale_max_age_ms: i64,
-) -> Option<LiveMarketTarget> {
-    let age_ms = now_ms.saturating_sub(cached.fetched_at_ms);
-    if age_ms > stale_max_age_ms {
-        return None;
-    }
-    let end_ms = parse_end_date_ms(cached.target.end_date.as_deref()).unwrap_or(i64::MAX / 4);
-    if end_ms < now_ms.saturating_sub(stale_grace_ms) {
-        return None;
-    }
-    Some(cached.target.clone())
 }
 
 pub(super) fn live_decision_key(market_type: &str, decision: &Value) -> String {
@@ -594,20 +549,16 @@ pub(super) async fn resolve_live_market_target(
 ) -> Result<LiveMarketTarget, ApiError> {
     let now_ms = Utc::now().timestamp_millis();
     let cache_ttl_ms = live_market_target_cache_ttl_ms();
-    let stale_grace_ms = live_market_target_stale_grace_ms();
-    let stale_max_age_ms = live_market_target_stale_max_age_ms();
     let resolve_attempts = live_market_target_resolve_attempts();
     let resolve_retry_ms = live_market_target_resolve_retry_ms();
     let switch_guard_ms = live_market_target_switch_guard_ms();
-    let mut cached_entry_for_fallback: Option<CachedLiveMarketTarget> = None;
     {
         let cache = live_market_target_cache().read().await;
         if let Some(cached) = cache.get(market_type) {
-            cached_entry_for_fallback = Some(cached.clone());
             let age_ms = now_ms.saturating_sub(cached.fetched_at_ms);
             let end_ms =
                 parse_end_date_ms(cached.target.end_date.as_deref()).unwrap_or(i64::MAX / 4);
-            if age_ms <= cache_ttl_ms && end_ms >= now_ms.saturating_sub(10_000) {
+            if age_ms <= cache_ttl_ms && end_ms >= now_ms {
                 return Ok(cached.target.clone());
             }
         }
@@ -653,7 +604,7 @@ pub(super) async fn resolve_live_market_target(
             let end_ms = parse_end_date_ms(m.end_date.as_deref()).unwrap_or(i64::MAX / 4);
             let bucket = if end_ms >= now_ms.saturating_add(switch_guard_ms) {
                 0_i64
-            } else if end_ms >= now_ms.saturating_sub(stale_grace_ms) {
+            } else if end_ms >= now_ms {
                 1_i64
             } else {
                 2_i64
@@ -691,22 +642,12 @@ pub(super) async fn resolve_live_market_target(
         }
         return Ok(target);
     }
-
-    if let Some(cached) = cached_entry_for_fallback.as_ref() {
-        if let Some(stale) =
-            stale_target_from_cache(cached, now_ms, stale_grace_ms, stale_max_age_ms)
-        {
-            tracing::warn!(
-                market_type = market_type,
-                stale_grace_ms = stale_grace_ms,
-                stale_max_age_ms = stale_max_age_ms,
-                resolve_attempts = resolve_attempts,
-                last_discovery_error = last_discovery_error.as_deref().unwrap_or("none"),
-                "market target resolve exhausted retries, fallback to stale cached target"
-            );
-            return Ok(stale);
-        }
-    }
+    tracing::warn!(
+        market_type = market_type,
+        resolve_attempts = resolve_attempts,
+        last_discovery_error = last_discovery_error.as_deref().unwrap_or("none"),
+        "market target resolve exhausted retries without stale fallback"
+    );
     Err(ApiError::bad_request(format!(
         "no active BTC {market_type} market with token ids after {} attempts{}",
         resolve_attempts,

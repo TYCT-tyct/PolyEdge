@@ -1065,6 +1065,14 @@ fn runtime_target_prewarm_ms() -> i64 {
         .clamp(5_000, 120_000)
 }
 
+fn runtime_target_keepalive_ms() -> i64 {
+    std::env::var("FORGE_FEV1_RUNTIME_TARGET_KEEPALIVE_MS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(2_500)
+        .clamp(500, 30_000)
+}
+
 #[derive(Debug, Clone)]
 struct LiveRuntimeWakeEvent {
     market_type: String,
@@ -2335,7 +2343,10 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         match client.get_connection_manager().await {
             Ok(manager) => Some(manager),
             Err(err) => {
-                tracing::warn!(?err, "redis connection manager init failed; redis kv ops degraded");
+                tracing::warn!(
+                    ?err,
+                    "redis connection manager init failed; redis kv ops degraded"
+                );
                 None
             }
         }
@@ -2656,6 +2667,7 @@ async fn live_runtime_loop(
         "fev1 live runtime started"
     );
     let mut last_round_seen: HashMap<String, String> = HashMap::new();
+    let mut target_keepalive_at: HashMap<String, i64> = HashMap::new();
     let mut next_wait_ms = bootstrap.loop_interval_ms;
     loop {
         let cfg = LiveRuntimeConfig::from_env();
@@ -2664,6 +2676,7 @@ async fn live_runtime_loop(
         let fast_loop_ms = runtime_fast_loop_ms(cfg.loop_interval_ms);
         let fast_margin = runtime_fast_margin_threshold();
         let target_prewarm_ms = runtime_target_prewarm_ms();
+        let target_keepalive_ms = runtime_target_keepalive_ms();
         let mut cycle_sleep_ms = cfg.loop_interval_ms;
         let wait_ms = next_wait_ms.clamp(20, cfg.loop_interval_ms.max(20));
         let first_wake_event = tokio::select! {
@@ -2711,6 +2724,22 @@ async fn live_runtime_loop(
                 .rev()
                 .find(|ev| ev.market_type.eq_ignore_ascii_case(market_type));
             let now_ms = Utc::now().timestamp_millis();
+            let last_keepalive = target_keepalive_at.get(market_type).copied().unwrap_or(0);
+            let due_keepalive = now_ms.saturating_sub(last_keepalive) >= target_keepalive_ms;
+            if due_keepalive {
+                // Keep target discovery warm during steady-state to reduce market target misses.
+                if matches!(
+                    tokio::time::timeout(
+                        Duration::from_millis(360),
+                        resolve_live_market_target(market_type),
+                    )
+                    .await,
+                    Ok(Ok(_))
+                ) {
+                    target_keepalive_at.insert(market_type.to_string(), now_ms);
+                    cycle_sleep_ms = cycle_sleep_ms.min(fast_loop_ms);
+                }
+            }
             let position_before_cycle = state.get_live_position_state(market_type).await;
             let pending_before_cycle = state.list_pending_orders_for_market(market_type).await;
             let pending_before_count = pending_before_cycle.len();
