@@ -920,13 +920,28 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     .values()
                     .map(|m| format!("{}:{}", m.symbol, m.timeframe))
                     .collect();
+                let mut pair_has_sampling_candidate: HashMap<String, bool> = HashMap::new();
+                for market in markets_by_id.values() {
+                    let pair_key = market_pair_key(market);
+                    let in_window =
+                        market_in_sampling_window(market, now_ms, market_prestart_allow_ms);
+                    pair_has_sampling_candidate
+                        .entry(pair_key)
+                        .and_modify(|v| *v |= in_window)
+                        .or_insert(in_window);
+                }
                 let mut sticky_reused = 0usize;
                 for prev in prev_markets.values() {
                     if !market_filter.allows(&prev.symbol, &prev.timeframe) {
                         continue;
                     }
-                    let pair_key = format!("{}:{}", prev.symbol, prev.timeframe);
-                    if pair_seen.contains(&pair_key) {
+                    let pair_key = market_pair_key(prev);
+                    if pair_seen.contains(&pair_key)
+                        && pair_has_sampling_candidate
+                            .get(&pair_key)
+                            .copied()
+                            .unwrap_or(false)
+                    {
                         continue;
                     }
                     // Discovery can temporarily miss active markets; keep the most recent
@@ -938,7 +953,13 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         continue;
                     }
                     markets_by_id.insert(prev.market_id.clone(), prev.clone());
-                    pair_seen.insert(pair_key);
+                    pair_seen.insert(pair_key.clone());
+                    let prev_in_window =
+                        market_in_sampling_window(prev, now_ms, market_prestart_allow_ms);
+                    pair_has_sampling_candidate
+                        .entry(pair_key)
+                        .and_modify(|v| *v |= prev_in_window)
+                        .or_insert(prev_in_window);
                     sticky_reused = sticky_reused.saturating_add(1);
                 }
                 let mut candidates_by_pair: HashMap<String, Vec<MarketMeta>> = HashMap::new();
