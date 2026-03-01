@@ -287,10 +287,10 @@ impl MarketDiscovery {
                 for market in markets {
                     // Gamma can omit `acceptingOrders` for still-tradable markets.
                     // Treat only explicit `false` as non-tradable.
-                    if !market.active
-                        || market.closed
-                        || matches!(market.accepting_orders, Some(false))
-                    {
+                    // Do not hard-reject inactive markets here. Near-expiry filtering and
+                    // timeframe/type checks already keep scope tight, and keeping inactive
+                    // next-round listings reduces switch lag at window boundaries.
+                    if market.closed || matches!(market.accepting_orders, Some(false)) {
                         continue;
                     }
                     if !seen.insert(market.id.clone()) {
@@ -611,8 +611,6 @@ struct GammaMarket {
     best_ask: Option<f64>,
     #[serde(default)]
     clob_token_ids: Option<String>,
-    #[serde(default)]
-    active: bool,
     #[serde(default)]
     closed: bool,
     #[serde(default)]

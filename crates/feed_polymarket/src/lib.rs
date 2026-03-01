@@ -850,8 +850,6 @@ struct GammaMarketTokens {
     #[serde(default)]
     clob_token_ids: Option<String>,
     #[serde(default)]
-    active: bool,
-    #[serde(default)]
     closed: bool,
     #[serde(default)]
     accepting_orders: Option<bool>,
@@ -887,7 +885,6 @@ async fn fetch_token_market_map(
             .query(&[
                 ("closed", "false"),
                 ("archived", "false"),
-                ("active", "true"),
                 ("limit", limit_s.as_str()),
                 ("offset", offset_s.as_str()),
                 ("order", "volume"),
@@ -908,7 +905,7 @@ async fn fetch_token_market_map(
 
         for market in markets {
             // Gamma may omit `acceptingOrders`; only explicit false should be rejected.
-            if !market.active || market.closed || matches!(market.accepting_orders, Some(false)) {
+            if market.closed || matches!(market.accepting_orders, Some(false)) {
                 continue;
             }
             let Some((yes, no)) = parse_token_pair(market.clob_token_ids.as_deref()) else {
