@@ -2886,7 +2886,7 @@ async fn live_runtime_loop(
                 if matches!(
                     tokio::time::timeout(
                         Duration::from_millis(360),
-                        resolve_live_market_target(market_type),
+                        resolve_live_market_target_with_state(&state, market_type),
                     )
                     .await,
                     Ok(Ok(_))
@@ -3046,7 +3046,7 @@ async fn live_runtime_loop(
                         // Round-switch prewarm is always on, even in paused mode, to eliminate no_live_market_target gaps.
                         let _ = tokio::time::timeout(
                             Duration::from_millis(420),
-                            resolve_live_market_target(market_type),
+                            resolve_live_market_target_with_state(&state, market_type),
                         )
                         .await;
                         cycle_sleep_ms = cycle_sleep_ms.min(fast_loop_ms);

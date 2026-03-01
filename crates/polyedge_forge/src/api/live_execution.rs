@@ -192,6 +192,10 @@ const LIVE_MARKET_TARGET_RESOLVE_RETRY_MS_MAX: i64 = 2_000;
 const LIVE_MARKET_TARGET_SWITCH_GUARD_MS_DEFAULT: i64 = 2_500;
 const LIVE_MARKET_TARGET_SWITCH_GUARD_MS_MIN: i64 = 0;
 const LIVE_MARKET_TARGET_SWITCH_GUARD_MS_MAX: i64 = 30_000;
+const LIVE_MARKET_TARGET_SNAPSHOT_MAX_AGE_MS_DEFAULT: i64 = 8_000;
+const LIVE_MARKET_TARGET_SNAPSHOT_MAX_AGE_MS_MIN: i64 = 1_000;
+const LIVE_MARKET_TARGET_SNAPSHOT_MAX_AGE_MS_MAX: i64 = 120_000;
+const LIVE_TARGET_CACHE_FILE_DEFAULT: &str = "/data/polyedge-forge/cache/target_market_cache.json";
 const LIVE_CANCEL_FAILURE_FORCE_PAUSE_EXIT_THRESHOLD: u8 = 2;
 const LIVE_CANCEL_FAILURE_FORCE_PAUSE_OTHER_THRESHOLD: u8 = 3;
 const LIVE_GTD_MIN_FUTURE_GUARD_SEC_DEFAULT: i64 = 60;
@@ -267,6 +271,25 @@ fn live_market_target_switch_guard_ms() -> i64 {
         )
 }
 
+fn live_market_target_snapshot_max_age_ms() -> i64 {
+    std::env::var("FORGE_FEV1_LIVE_TARGET_SNAPSHOT_MAX_AGE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(LIVE_MARKET_TARGET_SNAPSHOT_MAX_AGE_MS_DEFAULT)
+        .clamp(
+            LIVE_MARKET_TARGET_SNAPSHOT_MAX_AGE_MS_MIN,
+            LIVE_MARKET_TARGET_SNAPSHOT_MAX_AGE_MS_MAX,
+        )
+}
+
+fn live_target_cache_file_path() -> String {
+    std::env::var("FORGE_FEV1_LIVE_TARGET_CACHE_FILE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| LIVE_TARGET_CACHE_FILE_DEFAULT.to_string())
+}
+
 fn live_gtd_min_future_guard_sec() -> i64 {
     std::env::var("FORGE_FEV1_GTD_MIN_FUTURE_GUARD_SEC")
         .ok()
@@ -276,6 +299,103 @@ fn live_gtd_min_future_guard_sec() -> i64 {
             LIVE_GTD_MIN_FUTURE_GUARD_SEC_MIN,
             LIVE_GTD_MIN_FUTURE_GUARD_SEC_MAX,
         )
+}
+
+fn parse_round_end_ts_ms(round_id: &str) -> Option<i64> {
+    round_id.rsplit('_').next()?.parse::<i64>().ok()
+}
+
+fn end_date_iso_from_ms(end_ms: i64) -> Option<String> {
+    DateTime::<Utc>::from_timestamp_millis(end_ms).map(|dt| dt.to_rfc3339())
+}
+
+async fn resolve_token_ids_from_target_cache(
+    market_id: &str,
+    market_type: &str,
+) -> Option<(String, String)> {
+    let cache_path = live_target_cache_file_path();
+    let raw = tokio::fs::read_to_string(&cache_path).await.ok()?;
+    let root: Value = serde_json::from_str(&raw).ok()?;
+    let obj = root.as_object()?;
+    for (_, bucket) in obj {
+        let Some(market_obj) = bucket
+            .as_object()
+            .and_then(|m| m.get(market_id))
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        let tf_ok = market_obj
+            .get("timeframe")
+            .and_then(Value::as_str)
+            .map(|tf| tf.eq_ignore_ascii_case(market_type))
+            .unwrap_or(false);
+        if !tf_ok {
+            continue;
+        }
+        let yes = market_obj
+            .get("yes_token")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        let no = market_obj
+            .get("no_token")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if yes.is_empty() || no.is_empty() {
+            continue;
+        }
+        return Some((yes.to_string(), no.to_string()));
+    }
+    None
+}
+
+async fn resolve_live_target_from_snapshot(
+    state: &ApiState,
+    market_type: &str,
+    now_ms: i64,
+) -> Option<LiveMarketTarget> {
+    let key = format!(
+        "{}:snapshot:latest:BTCUSDT:{market_type}",
+        state.redis_prefix
+    );
+    let snapshot = read_key_json(state, &key).await.ok()?.0;
+    let market_id = snapshot
+        .get("market_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())?
+        .to_string();
+    let round_id = snapshot
+        .get("round_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let sample_ms = snapshot
+        .get("ts_ireland_sample_ms")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let age_ms = now_ms.saturating_sub(sample_ms);
+    if age_ms > live_market_target_snapshot_max_age_ms() {
+        return None;
+    }
+    let end_ms = parse_round_end_ts_ms(round_id).or_else(|| {
+        let remain = snapshot.get("remaining_ms").and_then(Value::as_i64)?;
+        Some(sample_ms.saturating_add(remain.max(0)))
+    })?;
+    if end_ms < now_ms {
+        return None;
+    }
+    let (token_id_yes, token_id_no) =
+        resolve_token_ids_from_target_cache(&market_id, market_type).await?;
+    Some(LiveMarketTarget {
+        market_id,
+        symbol: "BTCUSDT".to_string(),
+        timeframe: market_type.to_string(),
+        token_id_yes,
+        token_id_no,
+        end_date: end_date_iso_from_ms(end_ms),
+    })
 }
 
 pub(super) fn live_decision_key(market_type: &str, decision: &Value) -> String {
@@ -575,6 +695,20 @@ pub(super) fn select_live_decisions(
 pub(super) async fn resolve_live_market_target(
     market_type: &str,
 ) -> Result<LiveMarketTarget, ApiError> {
+    resolve_live_market_target_inner(None, market_type).await
+}
+
+pub(super) async fn resolve_live_market_target_with_state(
+    state: &ApiState,
+    market_type: &str,
+) -> Result<LiveMarketTarget, ApiError> {
+    resolve_live_market_target_inner(Some(state), market_type).await
+}
+
+async fn resolve_live_market_target_inner(
+    state: Option<&ApiState>,
+    market_type: &str,
+) -> Result<LiveMarketTarget, ApiError> {
     let now_ms = Utc::now().timestamp_millis();
     let cache_ttl_ms = live_market_target_cache_ttl_ms();
     let active_cache_max_age_ms = live_market_target_active_cache_max_age_ms();
@@ -672,6 +806,23 @@ pub(super) async fn resolve_live_market_target(
             );
         }
         return Ok(target);
+    }
+    if let Some(state) = state {
+        if let Some(target) = resolve_live_target_from_snapshot(state, market_type, now_ms).await {
+            tracing::warn!(
+                market_type = market_type,
+                "market target resolved from recorder snapshot fallback"
+            );
+            let mut cache = live_market_target_cache().write().await;
+            cache.insert(
+                market_type.to_string(),
+                CachedLiveMarketTarget {
+                    fetched_at_ms: Utc::now().timestamp_millis(),
+                    target: target.clone(),
+                },
+            );
+            return Ok(target);
+        }
     }
     if let Some(cached) = cached_entry {
         let age_ms = now_ms.saturating_sub(cached.fetched_at_ms);
@@ -2030,7 +2181,10 @@ pub(super) async fn handle_pending_timeouts(state: &ApiState, gateway_cfg: &Live
                     row.retry_count < 1
                 };
                 if (maker_tif || emergency_exit) && can_retry {
-                    let maybe_target = resolve_live_market_target(&row.market_type).await.ok();
+                    let maybe_target =
+                        resolve_live_market_target_with_state(state, &row.market_type)
+                            .await
+                            .ok();
                     if let Some(target) = maybe_target {
                         let decision = json!({
                             "action": row.action,
@@ -2774,7 +2928,7 @@ async fn try_resubmit_after_terminal_reject_rust(
     if row.retry_count >= max_retry {
         return false;
     }
-    let target = match resolve_live_market_target(&row.market_type).await {
+    let target = match resolve_live_market_target_with_state(state, &row.market_type).await {
         Ok(v) => v,
         Err(err) => {
             state
@@ -3276,7 +3430,10 @@ pub(super) async fn handle_pending_timeouts_rust(
                     row.retry_count < 1
                 };
                 if (maker_tif || emergency_exit) && can_retry {
-                    let maybe_target = resolve_live_market_target(&row.market_type).await.ok();
+                    let maybe_target =
+                        resolve_live_market_target_with_state(state, &row.market_type)
+                            .await
+                            .ok();
                     if let Some(target) = maybe_target {
                         let decision = json!({
                             "action": row.action,
