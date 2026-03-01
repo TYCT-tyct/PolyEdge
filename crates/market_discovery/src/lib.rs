@@ -410,8 +410,14 @@ fn collapse_to_one_market_per_template(
             m.timeframe.clone().unwrap_or_else(|| "unknown".to_string())
         );
         let end_ms = parse_end_date_ms(m.end_date.as_deref()).unwrap_or(i64::MAX / 4);
-        // Prefer windows that have not ended; then choose the nearest expiry.
-        let ended_penalty = if end_ms < now_ms { 1_i64 } else { 0_i64 };
+        // Prefer windows closest to "now". A just-ended round (within one timeframe)
+        // is still better than a far-future round because it avoids long data gaps.
+        let recent_grace_ms = timeframe_window_ms(m.timeframe.as_deref());
+        let ended_penalty = if end_ms < now_ms.saturating_sub(recent_grace_ms) {
+            1_i64
+        } else {
+            0_i64
+        };
         let distance = end_ms.saturating_sub(now_ms).abs();
         let candidate = (ended_penalty, distance, m);
 
@@ -423,6 +429,16 @@ fn collapse_to_one_market_per_template(
         }
     }
     best.into_values().map(|(_, _, m)| m).collect()
+}
+
+fn timeframe_window_ms(timeframe: Option<&str>) -> i64 {
+    match timeframe {
+        Some("5m") => 5 * 60 * 1_000,
+        Some("15m") => 15 * 60 * 1_000,
+        Some("1h") => 60 * 60 * 1_000,
+        Some("1d") => 24 * 60 * 60 * 1_000,
+        _ => 5 * 60 * 1_000,
+    }
 }
 
 fn detect_symbol(text: &str, allowed_symbols: &[String]) -> Option<String> {
