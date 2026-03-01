@@ -997,12 +997,28 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     .collect::<Vec<_>>();
                 kept_pairs.sort();
                 kept_pairs.dedup();
+                let mut selected_rounds = selected_by_pair
+                    .values()
+                    .map(|m| {
+                        format!(
+                            "{}:{}:{}->{}(start_s={},end_s={})",
+                            m.symbol,
+                            m.timeframe,
+                            m.start_ts_ms,
+                            m.end_ts_ms,
+                            m.start_ts_ms.saturating_sub(now_ms) / 1_000,
+                            m.end_ts_ms.saturating_sub(now_ms) / 1_000
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                selected_rounds.sort();
                 tracing::info!(
                     received_markets = received,
                     kept_markets = markets_by_id.len(),
                     sticky_reused = sticky_reused,
                     cache_repaired = cache_repaired,
                     kept_pairs = kept_pairs.join(","),
+                    selected_rounds = selected_rounds.join(";"),
                     "market meta update applied"
                 );
             }
