@@ -147,16 +147,24 @@ def summarize_payload(payload: dict) -> dict:
     summary = payload.get("summary") or {}
     trades = payload.get("trades") or []
     pnls = [float(t.get("pnl_cents") or 0.0) for t in trades]
-    n = len(pnls)
-    win_rate = (sum(1 for p in pnls if p > 0.0) * 100.0 / n) if n else 0.0
-    avg = (sum(pnls) / n) if n else 0.0
-    tail = pnls[-80:] if n >= 80 else pnls
-    tail_win = (sum(1 for p in tail if p > 0.0) * 100.0 / len(tail)) if tail else 0.0
-    tail_avg = (sum(tail) / len(tail)) if tail else 0.0
+    list_n = len(pnls)
+    summary_n = int(summary.get("trade_count") or 0)
+    n = summary_n if summary_n > 0 else list_n
+    win_rate = float(summary.get("win_rate_pct") or 0.0)
+    avg = float(summary.get("avg_pnl_cents") or 0.0)
+    # /api/strategy/paper may only expose a recent slice of trades in `trades`.
+    # Fall back to full-summary metrics when trade list is too short for reliable tails.
+    if list_n >= 20:
+        tail = pnls[-80:] if list_n >= 80 else pnls
+        tail_win = (sum(1 for p in tail if p > 0.0) * 100.0 / len(tail)) if tail else win_rate
+        tail_avg = (sum(tail) / len(tail)) if tail else avg
+    else:
+        tail_win = win_rate
+        tail_avg = avg
     return {
         "trade_count": n,
-        "win_rate_pct": float(summary.get("win_rate_pct") or win_rate),
-        "avg_pnl_cents": float(summary.get("avg_pnl_cents") or avg),
+        "win_rate_pct": win_rate,
+        "avg_pnl_cents": avg,
         "net_pnl_cents": float(summary.get("net_pnl_cents") or summary.get("total_pnl_cents") or sum(pnls)),
         "max_drawdown_cents": float(summary.get("max_drawdown_cents") or 0.0),
         "last80_win_rate_pct": tail_win,
