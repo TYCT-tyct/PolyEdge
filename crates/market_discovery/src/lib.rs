@@ -212,6 +212,10 @@ impl MarketDiscovery {
         // while still allowing opt-in wider scans via env variables.
         let enddate_limit = env_i64("POLYEDGE_DISCOVERY_ENDDATE_LIMIT", 200, 50, 1000);
         let enddate_pages = env_usize("POLYEDGE_DISCOVERY_ENDDATE_MAX_PAGES", 20, 1, 64);
+        let enddate_desc_limit =
+            env_i64("POLYEDGE_DISCOVERY_ENDDATE_DESC_LIMIT", 300, 50, 1000);
+        let enddate_desc_pages =
+            env_usize("POLYEDGE_DISCOVERY_ENDDATE_DESC_MAX_PAGES", 8, 0, 64);
         let volume_limit = env_i64("POLYEDGE_DISCOVERY_VOLUME_LIMIT", 200, 50, 1000);
         let volume_pages_cfg = env_usize("POLYEDGE_DISCOVERY_VOLUME_MAX_PAGES", 0, 0, 32);
         let volume_pages_fallback = env_usize("POLYEDGE_DISCOVERY_VOLUME_FALLBACK_PAGES", 1, 0, 8);
@@ -221,7 +225,17 @@ impl MarketDiscovery {
             volume_pages_fallback
         };
 
-        let mut plans = Vec::with_capacity(2);
+        let mut plans = Vec::with_capacity(3);
+        if enddate_desc_pages > 0 {
+            // Newest-first scan helps catch the next round quickly at boundary switches,
+            // while near-expiry filtering still trims far-future noise.
+            plans.push(ScanPlan {
+                order: "endDate",
+                ascending: "false",
+                limit: enddate_desc_limit,
+                max_pages: enddate_desc_pages,
+            });
+        }
         plans.push(ScanPlan {
             order: "endDate",
             ascending: "true",
