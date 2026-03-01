@@ -233,13 +233,14 @@ impl MarketDiscovery {
                 let offset = (page_idx as i64) * plan.limit;
                 let limit_s = plan.limit.to_string();
                 let offset_s = offset.to_string();
+                // Do not set `active=true` query param here: Gamma may omit near-expiry
+                // markets under that server-side filter. We filter by `market.active` below.
                 let response = self
                     .http
                     .get(&self.cfg.endpoint)
                     .query(&[
                         ("closed", "false"),
                         ("archived", "false"),
-                        ("active", "true"),
                         ("limit", limit_s.as_str()),
                         ("offset", offset_s.as_str()),
                         ("order", plan.order),
@@ -399,7 +400,7 @@ fn collapse_to_one_market_per_template(
     markets: Vec<MarketDescriptor>,
     now_ms: i64,
 ) -> Vec<MarketDescriptor> {
-    let mut best = std::collections::HashMap::<String, (i64, i64, MarketDescriptor)>::new();
+    let mut best = std::collections::HashMap::<String, (i64, i64, i64, MarketDescriptor)>::new();
     for m in markets {
         let key = format!(
             "{}|{}|{}",
@@ -419,16 +420,18 @@ fn collapse_to_one_market_per_template(
             0_i64
         };
         let distance = end_ms.saturating_sub(now_ms).abs();
-        let candidate = (ended_penalty, distance, m);
+        let candidate = (ended_penalty, distance, end_ms, m);
 
         match best.get(&key) {
-            Some((bp, bd, _)) if (*bp, *bd) <= (candidate.0, candidate.1) => {}
+            Some((bp, bd, be, _))
+                if (*bp, *bd, std::cmp::Reverse(*be))
+                    <= (candidate.0, candidate.1, std::cmp::Reverse(candidate.2)) => {}
             _ => {
                 best.insert(key, candidate);
             }
         }
     }
-    best.into_values().map(|(_, _, m)| m).collect()
+    best.into_values().map(|(_, _, _, m)| m).collect()
 }
 
 fn timeframe_window_ms(timeframe: Option<&str>) -> i64 {
