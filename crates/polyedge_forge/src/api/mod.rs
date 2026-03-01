@@ -25,9 +25,11 @@ use polymarket_client_sdk::clob::types::request::{
     OrderBookSummaryRequest as PmOrderBookSummaryRequest,
 };
 use polymarket_client_sdk::clob::types::{
+    Amount as PmAmount, Side as PmSide, SignatureType as PmSignatureType,
+};
+use polymarket_client_sdk::clob::types::{
     AssetType as PmAssetType, OrderStatusType as PmOrderStatusType, OrderType as PmOrderType,
 };
-use polymarket_client_sdk::clob::types::{Side as PmSide, SignatureType as PmSignatureType};
 use polymarket_client_sdk::clob::{Client as PmClient, Config as PmConfig};
 use polymarket_client_sdk::types::{Address as PmAddress, Decimal as PmDecimal, U256 as PmU256};
 use polymarket_client_sdk::POLYGON;

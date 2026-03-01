@@ -578,53 +578,6 @@ pub(super) fn decision_to_live_payload(
     }
     price_cents = price_cents.clamp(1.0, 99.0);
     let mut price = (price_cents / 100.0).clamp(0.01, 0.99);
-    let mut quote_size = quote_size_override.unwrap_or_else(|| {
-        decision
-            .get("quote_size_usdc")
-            .and_then(Value::as_f64)
-            .unwrap_or(gateway_cfg.min_quote_usdc)
-    });
-    quote_size = quote_size.max(gateway_cfg.min_quote_usdc);
-    let mut size = (quote_size / price).max(0.01);
-    let mut notes: Vec<String> = Vec::with_capacity(2);
-    let is_buy = gateway_side.starts_with("buy_");
-    let mut min_order_size = 0.01_f64;
-    if let Some(book) = book {
-        min_order_size = book.min_order_size.max(0.0001);
-        let tick_size = book.tick_size.max(0.0001);
-        price = round_to_tick(price, tick_size, is_buy);
-        size = (quote_size / price).max(min_order_size);
-
-        let depth_top1 = if is_buy {
-            book.best_ask_size.unwrap_or(0.0)
-        } else {
-            book.best_bid_size.unwrap_or(0.0)
-        };
-        let depth_top3 = if is_buy {
-            book.ask_depth_top3.unwrap_or(0.0)
-        } else {
-            book.bid_depth_top3.unwrap_or(0.0)
-        };
-        if depth_top1.is_finite() && depth_top1 > 0.0 && size > depth_top1 * 1.12 {
-            let capped = (depth_top1 * 0.95).max(min_order_size);
-            if capped < size {
-                size = capped;
-                notes.push("depth_cap_top1".to_string());
-            }
-        }
-        if depth_top3.is_finite() && depth_top3 > 0.0 && size > depth_top3 * 1.25 {
-            if is_exit_like {
-                slippage_bps = (slippage_bps + 12.0).min(500.0);
-                notes.push("depth_thin_exit_force_taker".to_string());
-            } else {
-                slippage_bps = (slippage_bps + 8.0).min(500.0);
-                notes.push("depth_thin_entry_boost_slippage".to_string());
-            }
-        }
-    }
-    size = size.max(min_order_size).max(0.01);
-    size = (size * 10_000.0).round() / 10_000.0;
-
     let mut tif = decision
         .get("tif")
         .and_then(Value::as_str)
@@ -643,6 +596,67 @@ pub(super) fn decision_to_live_payload(
                 "taker".to_string()
             }
         });
+    let mut quote_size = quote_size_override.unwrap_or_else(|| {
+        decision
+            .get("quote_size_usdc")
+            .and_then(Value::as_f64)
+            .unwrap_or(gateway_cfg.min_quote_usdc)
+    });
+    quote_size = quote_size.max(gateway_cfg.min_quote_usdc);
+    let mut notes: Vec<String> = Vec::with_capacity(3);
+    let is_buy = gateway_side.starts_with("buy_");
+    let mut min_order_size = 0.01_f64;
+    let mut size_floor = if is_buy && matches!(tif.as_str(), "FAK" | "FOK") {
+        0.01
+    } else {
+        min_order_size
+    };
+    let mut size = (quote_size / price).max(size_floor);
+    if let Some(book) = book {
+        min_order_size = book.min_order_size.max(0.0001);
+        let taker_like = style == "taker" || matches!(tif.as_str(), "FAK" | "FOK");
+        size_floor = if is_buy && taker_like {
+            0.01
+        } else {
+            min_order_size
+        };
+        let tick_size = book.tick_size.max(0.0001);
+        price = round_to_tick(price, tick_size, is_buy);
+        size = (quote_size / price).max(size_floor);
+
+        let depth_top1 = if is_buy {
+            book.best_ask_size.unwrap_or(0.0)
+        } else {
+            book.best_bid_size.unwrap_or(0.0)
+        };
+        let depth_top3 = if is_buy {
+            book.ask_depth_top3.unwrap_or(0.0)
+        } else {
+            book.bid_depth_top3.unwrap_or(0.0)
+        };
+        if !(is_buy && taker_like)
+            && depth_top1.is_finite()
+            && depth_top1 > 0.0
+            && size > depth_top1 * 1.12
+        {
+            let capped = (depth_top1 * 0.95).max(size_floor);
+            if capped < size {
+                size = capped;
+                notes.push("depth_cap_top1".to_string());
+            }
+        }
+        if depth_top3.is_finite() && depth_top3 > 0.0 && size > depth_top3 * 1.25 {
+            if is_exit_like {
+                slippage_bps = (slippage_bps + 12.0).min(500.0);
+                notes.push("depth_thin_exit_force_taker".to_string());
+            } else {
+                slippage_bps = (slippage_bps + 8.0).min(500.0);
+                notes.push("depth_thin_entry_boost_slippage".to_string());
+            }
+        }
+    }
+    size = size.max(size_floor).max(0.01);
+    size = (size * 10_000.0).round() / 10_000.0;
     if is_exit_like && notes.iter().any(|n| n == "depth_thin_exit_force_taker") {
         tif = "FAK".to_string();
         style = "taker".to_string();
@@ -680,20 +694,37 @@ pub(super) fn decision_to_live_payload(
             }
             let tick_size = book.tick_size.max(0.0001);
             price = round_to_tick(price, tick_size, is_buy);
-            size = (quote_size / price).max(min_order_size).max(0.01);
+            size_floor = if is_buy { 0.01 } else { min_order_size };
+            size = (quote_size / price).max(size_floor).max(0.01);
             size = (size * 10_000.0).round() / 10_000.0;
         }
     }
-    let cache_key = format!(
-        "fev1:{}:{}:{}:{:.4}:{:.4}",
-        target.market_id, gateway_side, action, price, size
-    );
-    Some(json!({
+    let taker_like = style == "taker" || matches!(tif.as_str(), "FAK" | "FOK");
+    let requested_notional_usdc = (quote_size * 1_000_000.0).round() / 1_000_000.0;
+    let buy_amount_usdc = if is_buy && taker_like {
+        Some(requested_notional_usdc)
+    } else {
+        None
+    };
+    let cache_key = if let Some(amount) = buy_amount_usdc {
+        format!(
+            "fev1:{}:{}:{}:{:.4}:{:.4}:a{:.4}",
+            target.market_id, gateway_side, action, price, size, amount
+        )
+    } else {
+        format!(
+            "fev1:{}:{}:{}:{:.4}:{:.4}",
+            target.market_id, gateway_side, action, price, size
+        )
+    };
+    let mut payload = json!({
         "market_id": target.market_id,
         "token_id": token_id,
         "side": gateway_side,
         "price": price,
         "size": size,
+        "quote_size_usdc": requested_notional_usdc,
+        "requested_notional_usdc": requested_notional_usdc,
         "tif": tif,
         "style": style,
         "ttl_ms": ttl_ms,
@@ -717,7 +748,14 @@ pub(super) fn decision_to_live_payload(
         } else {
             Value::Null
         }
-    }))
+    });
+    if let Some(amount) = buy_amount_usdc {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("buy_amount_usdc".to_string(), json!(amount));
+            obj.insert("amount_mode".to_string(), json!("buy_usdc"));
+        }
+    }
+    Some(payload)
 }
 
 pub(super) async fn post_gateway(
@@ -2192,48 +2230,113 @@ pub(super) async fn submit_rust_order(
     let price_dec =
         PmDecimal::from_str(&format!("{price:.6}")).map_err(|e| format!("bad price: {e}"))?;
     let size_dec =
-        PmDecimal::from_str(&format!("{size:.2}")).map_err(|e| format!("bad size: {e}"))?;
+        PmDecimal::from_str(&format!("{size:.5}")).map_err(|e| format!("bad size: {e}"))?;
     let order_type = pm_order_type_from_tif(&tif);
+    let requested_notional = payload
+        .get("buy_amount_usdc")
+        .and_then(Value::as_f64)
+        .or_else(|| {
+            payload
+                .get("requested_notional_usdc")
+                .and_then(Value::as_f64)
+        })
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(size * price);
+    let use_market_buy_amount = matches!(pm_side, PmSide::Buy)
+        && matches!(order_type, PmOrderType::FAK | PmOrderType::FOK)
+        && requested_notional > 0.0;
 
-    let mut builder = ctx
-        .client
-        .limit_order()
-        .token_id(token)
-        .side(pm_side)
-        .price(price_dec)
-        .size(size_dec)
-        .order_type(order_type.clone());
-    let post_only = style == "maker" && matches!(order_type, PmOrderType::GTC | PmOrderType::GTD);
-    builder = builder.post_only(post_only);
-    if matches!(order_type, PmOrderType::GTD) {
-        let expiration = Utc::now() + chrono::Duration::milliseconds(ttl_ms);
-        builder = builder.expiration(expiration);
-    }
-    let signable = builder
-        .build()
-        .await
-        .map_err(|e| format!("build order failed: {e}"))?;
-
-    let signed = ctx
-        .client
-        .sign(&ctx.signer, signable)
-        .await
-        .map_err(|e| format!("sign failed: {e}"))?;
-    let resp = ctx
-        .client
-        .post_order(signed)
-        .await
-        .map_err(|e| format!("post_order failed: {e}"))?;
+    let resp = if use_market_buy_amount {
+        let amount_dec = PmDecimal::from_str(&format!("{requested_notional:.6}"))
+            .map_err(|e| format!("bad buy_amount_usdc: {e}"))?;
+        let amount =
+            PmAmount::usdc(amount_dec).map_err(|e| format!("invalid buy amount (usdc): {e}"))?;
+        let signable = ctx
+            .client
+            .market_order()
+            .token_id(token)
+            .side(pm_side.clone())
+            .order_type(order_type.clone())
+            .price(price_dec)
+            .amount(amount)
+            .build()
+            .await
+            .map_err(|e| format!("build market order failed: {e}"))?;
+        let signed = ctx
+            .client
+            .sign(&ctx.signer, signable)
+            .await
+            .map_err(|e| format!("sign failed: {e}"))?;
+        ctx.client
+            .post_order(signed)
+            .await
+            .map_err(|e| format!("post_order failed: {e}"))?
+    } else {
+        let mut builder = ctx
+            .client
+            .limit_order()
+            .token_id(token)
+            .side(pm_side)
+            .price(price_dec)
+            .size(size_dec)
+            .order_type(order_type.clone());
+        let post_only =
+            style == "maker" && matches!(order_type, PmOrderType::GTC | PmOrderType::GTD);
+        builder = builder.post_only(post_only);
+        if matches!(order_type, PmOrderType::GTD) {
+            let expiration = Utc::now() + chrono::Duration::milliseconds(ttl_ms);
+            builder = builder.expiration(expiration);
+        }
+        let signable = builder
+            .build()
+            .await
+            .map_err(|e| format!("build order failed: {e}"))?;
+        let signed = ctx
+            .client
+            .sign(&ctx.signer, signable)
+            .await
+            .map_err(|e| format!("sign failed: {e}"))?;
+        ctx.client
+            .post_order(signed)
+            .await
+            .map_err(|e| format!("post_order failed: {e}"))?
+    };
     let accepted = resp.success && resp.error_msg.as_deref().unwrap_or_default().is_empty();
+    let making_amount = pm_dec_to_f64(&resp.making_amount);
+    let taking_amount = pm_dec_to_f64(&resp.taking_amount);
+    let accepted_size = if use_market_buy_amount {
+        if taking_amount > 0.0 {
+            taking_amount
+        } else {
+            size
+        }
+    } else if making_amount > 0.0 {
+        making_amount
+    } else {
+        size
+    };
+    let effective_notional = if use_market_buy_amount {
+        if making_amount > 0.0 {
+            making_amount
+        } else {
+            requested_notional
+        }
+    } else if taking_amount > 0.0 {
+        taking_amount
+    } else {
+        size * price
+    };
     Ok(json!({
         "accepted": accepted,
         "order_id": resp.order_id,
         "status": format!("{}", resp.status),
         "error_msg": resp.error_msg,
-        "accepted_size": size,
-        "effective_notional": size * price,
-        "making_amount": pm_dec_to_f64(&resp.making_amount),
-        "taking_amount": pm_dec_to_f64(&resp.taking_amount),
+        "accepted_size": accepted_size,
+        "effective_notional": effective_notional,
+        "making_amount": making_amount,
+        "taking_amount": taking_amount,
+        "requested_notional_usdc": requested_notional,
+        "market_order_amount_mode": use_market_buy_amount,
         "trade_ids": resp.trade_ids,
         "transaction_hashes": resp.transaction_hashes
     }))
@@ -2911,4 +3014,118 @@ pub(super) async fn execute_live_orders(
         out.extend(deferred);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_target() -> LiveMarketTarget {
+        LiveMarketTarget {
+            market_id: "mkt".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            timeframe: "5m".to_string(),
+            token_id_yes: "yes".to_string(),
+            token_id_no: "no".to_string(),
+            end_date: None,
+        }
+    }
+
+    fn test_gateway_cfg() -> LiveGatewayConfig {
+        LiveGatewayConfig {
+            primary_url: "http://127.0.0.1:9001".to_string(),
+            backup_url: None,
+            timeout_ms: 500,
+            min_quote_usdc: 1.0,
+            entry_slippage_bps: 18.0,
+            exit_slippage_bps: 22.0,
+            force_slippage_bps: None,
+            rust_submit_fallback_gateway: true,
+        }
+    }
+
+    fn test_book(min_order_size: f64) -> GatewayBookSnapshot {
+        GatewayBookSnapshot {
+            token_id: "yes".to_string(),
+            min_order_size,
+            tick_size: 0.01,
+            best_bid: Some(0.49),
+            best_ask: Some(0.50),
+            best_bid_size: Some(100.0),
+            best_ask_size: Some(100.0),
+            bid_depth_top3: Some(300.0),
+            ask_depth_top3: Some(300.0),
+        }
+    }
+
+    #[test]
+    fn taker_buy_uses_buy_amount_mode_without_min_order_clamp() {
+        let decision = json!({
+            "action": "enter",
+            "side": "UP",
+            "price_cents": 50.0,
+            "quote_size_usdc": 1.0,
+            "tif": "FAK",
+            "style": "taker"
+        });
+        let payload = decision_to_live_payload(
+            &decision,
+            &test_target(),
+            &test_gateway_cfg(),
+            Some(&test_book(5.0)),
+            None,
+        )
+        .expect("payload");
+        let size = payload
+            .get("size")
+            .and_then(Value::as_f64)
+            .unwrap_or_default();
+        let amount = payload
+            .get("buy_amount_usdc")
+            .and_then(Value::as_f64)
+            .unwrap_or_default();
+        let mode = payload
+            .get("amount_mode")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        assert!(
+            size > 1.9 && size < 2.1,
+            "size should track $1 / $0.5, got {size}"
+        );
+        assert!((amount - 1.0).abs() < 1e-9, "buy amount mismatch: {amount}");
+        assert_eq!(mode, "buy_usdc");
+    }
+
+    #[test]
+    fn maker_buy_still_respects_min_order_size_floor() {
+        let decision = json!({
+            "action": "enter",
+            "side": "UP",
+            "price_cents": 50.0,
+            "quote_size_usdc": 1.0,
+            "tif": "GTD",
+            "style": "maker"
+        });
+        let payload = decision_to_live_payload(
+            &decision,
+            &test_target(),
+            &test_gateway_cfg(),
+            Some(&test_book(5.0)),
+            None,
+        )
+        .expect("payload");
+        let size = payload
+            .get("size")
+            .and_then(Value::as_f64)
+            .unwrap_or_default();
+        assert!(
+            size >= 5.0,
+            "maker buy must keep min_order_size floor, got {size}"
+        );
+        assert!(
+            payload.get("buy_amount_usdc").is_none(),
+            "maker path should stay in share-size mode"
+        );
+    }
 }

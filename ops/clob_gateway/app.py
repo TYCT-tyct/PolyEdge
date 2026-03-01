@@ -14,7 +14,7 @@ from typing import Any, Deque, Dict, Optional, Tuple
 from fastapi import Body, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from py_clob_client.client import ClobClient, POST_ORDER
-from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
+from py_clob_client.clob_types import ApiCreds, MarketOrderArgs, OrderArgs, OrderType
 from py_clob_client.exceptions import PolyApiException
 from py_clob_client.headers.headers import build_hmac_signature
 from py_clob_client.http_helpers.helpers import post as http_post
@@ -470,24 +470,30 @@ def _build_order(payload: dict) -> Tuple[dict, Optional[str]]:
         size = float(payload.get("size"))
     except Exception:
         return {}, "invalid_price_or_size"
+    buy_amount_usdc = _safe_float(payload.get("buy_amount_usdc"))
     requested_price = price
     requested_size = size
     requested_notional = requested_size * requested_price
+    if side == BUY and buy_amount_usdc and buy_amount_usdc > 0.0:
+        requested_notional = float(buy_amount_usdc)
     if not (MIN_PRICE <= price <= MAX_PRICE):
         return {}, "price_out_of_range"
-    if size <= 0.0:
-        return {}, "size_non_positive"
     style = str(payload.get("style") or "taker").strip().lower()
     if style not in {"maker", "taker"}:
         style = "taker"
     market_meta = _get_market_meta(token_id)
-    size = max(size, market_meta.min_order_size)
-    size = round(size, 4)
     ttl_ms = int(payload.get("ttl_ms") or 0)
     tif_raw = str(payload.get("tif") or "FAK")
     order_type, tif_err = _map_tif(tif_raw, ttl_ms)
     if tif_err:
         return {}, tif_err
+    marketable_buy_amount_mode = (
+        side == BUY
+        and style != "maker"
+        and order_type in {OrderType.FAK, OrderType.FOK}
+    )
+    if not marketable_buy_amount_mode and size <= 0.0:
+        return {}, "size_non_positive"
     slippage_bps = max(0.0, float(payload.get("max_slippage_bps") or 0.0))
     if style == "maker":
         if side == BUY and market_meta.best_bid is not None:
@@ -507,20 +513,32 @@ def _build_order(payload: dict) -> Tuple[dict, Optional[str]]:
         # Enforce BUY quote precision to cents before signing.
         # This prevents exchange-side "invalid amounts" for maker/taker accuracy.
         price = _normalize_price(round(price, 2))
-    # For marketable BUY paths, apply a small notional buffer when request is around/below $1.
-    if side == BUY and ENFORCE_MARKETABLE_BUY_MIN:
-        target_notional = MIN_MARKETABLE_BUY_USDC
-        if requested_notional <= MARKETABLE_BUY_BUFFER_TRIGGER_USDC:
-            target_notional = max(target_notional, MARKETABLE_BUY_BUFFER_USDC)
-        if size * price < target_notional:
-            size = round((target_notional / max(price, MIN_PRICE)) + 1e-6, 4)
-    if side == BUY:
-        # CLOB validates BUY maker amount with 2-decimal precision.
-        # Project notional to cents first, then derive share size with <=5 decimals.
-        target_notional = _ceil_cent(size * price)
-        size = round(max(market_meta.min_order_size, target_notional / max(price, MIN_PRICE)), 5)
+    target_buy_amount_usdc: Optional[float] = None
+    if marketable_buy_amount_mode:
+        target_buy_amount_usdc = max(0.01, requested_notional)
+        if ENFORCE_MARKETABLE_BUY_MIN:
+            min_target = MIN_MARKETABLE_BUY_USDC
+            if target_buy_amount_usdc <= MARKETABLE_BUY_BUFFER_TRIGGER_USDC:
+                min_target = max(min_target, MARKETABLE_BUY_BUFFER_USDC)
+            target_buy_amount_usdc = max(target_buy_amount_usdc, min_target)
+        target_buy_amount_usdc = _ceil_cent(target_buy_amount_usdc)
+        size = round(max(0.0001, target_buy_amount_usdc / max(price, MIN_PRICE)), 5)
     else:
+        size = max(size, market_meta.min_order_size)
         size = round(size, 4)
+        if side == BUY and ENFORCE_MARKETABLE_BUY_MIN:
+            target_notional = MIN_MARKETABLE_BUY_USDC
+            if requested_notional <= MARKETABLE_BUY_BUFFER_TRIGGER_USDC:
+                target_notional = max(target_notional, MARKETABLE_BUY_BUFFER_USDC)
+            if size * price < target_notional:
+                size = round((target_notional / max(price, MIN_PRICE)) + 1e-6, 4)
+        if side == BUY:
+            # CLOB validates BUY maker amount with 2-decimal precision.
+            # Project notional to cents first, then derive share size with <=5 decimals.
+            target_notional = _ceil_cent(size * price)
+            size = round(max(market_meta.min_order_size, target_notional / max(price, MIN_PRICE)), 5)
+        else:
+            size = round(size, 4)
     fee_bps = int(payload.get("fee_rate_bps") or market_meta.fee_rate_bps or DEFAULT_FEE_RATE_BPS)
     fee_bps = max(0, min(10_000, fee_bps))
     # For proxy-wallet flow, arbitrary large nonces are frequently rejected.
@@ -532,35 +550,53 @@ def _build_order(payload: dict) -> Tuple[dict, Optional[str]]:
         return {}, "gateway_not_ready"
     try:
         with STATE["client_lock"]:
-            signed = client.create_order(
-                OrderArgs(
-                    token_id=token_id,
-                    price=price,
-                    size=size,
-                    side=side,
-                    fee_rate_bps=fee_bps,
-                    nonce=nonce,
-                    expiration=expiration,
-                    taker=ZERO_ADDRESS,
+            if marketable_buy_amount_mode:
+                signed = client.create_market_order(
+                    MarketOrderArgs(
+                        token_id=token_id,
+                        amount=target_buy_amount_usdc or requested_notional,
+                        side=side,
+                        price=price,
+                        fee_rate_bps=fee_bps,
+                        nonce=nonce,
+                        taker=ZERO_ADDRESS,
+                        order_type=order_type,
+                    )
                 )
-            )
+            else:
+                signed = client.create_order(
+                    OrderArgs(
+                        token_id=token_id,
+                        price=price,
+                        size=size,
+                        side=side,
+                        fee_rate_bps=fee_bps,
+                        nonce=nonce,
+                        expiration=expiration,
+                        taker=ZERO_ADDRESS,
+                    )
+                )
     except Exception as exc:
         return {}, _safe_error(exc)
     order_type_value = order_type.value if hasattr(order_type, "value") else str(order_type)
     body = {"order": signed.dict(), "owner": client.creds.api_key, "orderType": order_type_value}
+    effective_notional = (target_buy_amount_usdc or requested_notional) if marketable_buy_amount_mode else size * price
     return {
         "token_id": token_id,
         "market_id": str(payload.get("market_id") or ""),
         "side": side_raw.strip().lower(),
         "size": size,
+        "amount_mode": "buy_usdc_market" if marketable_buy_amount_mode else "shares",
+        "buy_amount_usdc": target_buy_amount_usdc,
         "ttl_ms": ttl_ms,
         "timeout_ms": int(payload.get("cancel_after_ms") or 0),
         "cache_key": str(payload.get("cache_key") or "").strip(),
         "price": price,
         "requested_price": requested_price,
         "requested_size": requested_size,
+        "requested_buy_amount_usdc": buy_amount_usdc,
         "requested_notional": requested_notional,
-        "effective_notional": size * price,
+        "effective_notional": effective_notional,
         "style": style,
         "market_meta": {
             "min_order_size": market_meta.min_order_size,
