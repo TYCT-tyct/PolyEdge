@@ -39,6 +39,7 @@ struct TargetFetchRes {
 
 const MARKET_FUTURE_GUARD_DEFAULT_MS: i64 = 3 * 60 * 60 * 1000;
 const MARKET_PRESTART_ALLOW_DEFAULT_MS: i64 = 30_000;
+const MARKET_SAMPLE_END_GRACE_DEFAULT_MS: i64 = 300;
 const MARKET_STALE_GUARD_MS: i64 = 5_000;
 const MOTION_PRICE_TAU_SEC: f64 = 1.2;
 const MOTION_VELOCITY_TAU_SEC: f64 = 1.8;
@@ -188,13 +189,18 @@ fn market_pair_key(m: &MarketMeta) -> String {
     format!("{}:{}", m.symbol, m.timeframe)
 }
 
-fn market_in_sampling_window(m: &MarketMeta, now_ms: i64, prestart_allow_ms: i64) -> bool {
+fn market_in_sampling_window(
+    m: &MarketMeta,
+    now_ms: i64,
+    prestart_allow_ms: i64,
+    sample_end_grace_ms: i64,
+) -> bool {
     now_ms.saturating_add(prestart_allow_ms) >= m.start_ts_ms
-        && now_ms <= m.end_ts_ms.saturating_add(MARKET_STALE_GUARD_MS)
+        && now_ms <= m.end_ts_ms.saturating_add(sample_end_grace_ms)
 }
 
-fn market_selection_rank(m: &MarketMeta, now_ms: i64) -> (u8, i64, i64) {
-    if now_ms >= m.start_ts_ms && now_ms <= m.end_ts_ms.saturating_add(MARKET_STALE_GUARD_MS) {
+fn market_selection_rank(m: &MarketMeta, now_ms: i64, sample_end_grace_ms: i64) -> (u8, i64, i64) {
+    if now_ms >= m.start_ts_ms && now_ms <= m.end_ts_ms.saturating_add(sample_end_grace_ms) {
         // Prefer currently active round first, then the one closest to settlement.
         return (
             0,
@@ -586,6 +592,11 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         .and_then(|v| v.trim().parse::<i64>().ok())
         .unwrap_or(MARKET_PRESTART_ALLOW_DEFAULT_MS)
         .clamp(0, 10 * 60 * 1000);
+    let market_sample_end_grace_ms = std::env::var("FORGE_MARKET_SAMPLE_END_GRACE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(MARKET_SAMPLE_END_GRACE_DEFAULT_MS)
+        .clamp(0, 5_000);
 
     let root = PathBuf::from(&args.data_root);
     fs::create_dir_all(root.join("snapshot_100ms")).ok();
@@ -608,6 +619,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         tokyo_input_stale_guard_ms = tokyo_input_stale_guard_ms,
         market_future_guard_ms = market_future_guard_ms,
         market_prestart_allow_ms = market_prestart_allow_ms,
+        market_sample_end_grace_ms = market_sample_end_grace_ms,
         market_filter = %market_filter.summary(),
         ?supported_symbols,
         ?active_symbols,
@@ -849,8 +861,13 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
             let now_ms = Utc::now().timestamp_millis();
             markets.sort_by_key(|m| {
                 (
-                    !market_in_sampling_window(m, now_ms, market_prestart_allow_ms),
-                    market_selection_rank(m, now_ms),
+                    !market_in_sampling_window(
+                        m,
+                        now_ms,
+                        market_prestart_allow_ms,
+                        market_sample_end_grace_ms,
+                    ),
+                    market_selection_rank(m, now_ms, market_sample_end_grace_ms),
                 )
             });
             markets.dedup_by(|a, b| a.market_id == b.market_id);
@@ -924,7 +941,12 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                 for market in markets_by_id.values() {
                     let pair_key = market_pair_key(market);
                     let in_window =
-                        market_in_sampling_window(market, now_ms, market_prestart_allow_ms);
+                        market_in_sampling_window(
+                            market,
+                            now_ms,
+                            market_prestart_allow_ms,
+                            market_sample_end_grace_ms,
+                        );
                     pair_has_sampling_candidate
                         .entry(pair_key)
                         .and_modify(|v| *v |= in_window)
@@ -955,7 +977,12 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     markets_by_id.insert(prev.market_id.clone(), prev.clone());
                     pair_seen.insert(pair_key.clone());
                     let prev_in_window =
-                        market_in_sampling_window(prev, now_ms, market_prestart_allow_ms);
+                        market_in_sampling_window(
+                            prev,
+                            now_ms,
+                            market_prestart_allow_ms,
+                            market_sample_end_grace_ms,
+                        );
                     pair_has_sampling_candidate
                         .entry(pair_key)
                         .and_modify(|v| *v |= prev_in_window)
@@ -992,8 +1019,13 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                 for markets in candidates_by_pair.values_mut() {
                     markets.sort_by_key(|m| {
                         (
-                            !market_in_sampling_window(m, now_ms, market_prestart_allow_ms),
-                            market_selection_rank(m, now_ms),
+                            !market_in_sampling_window(
+                                m,
+                                now_ms,
+                                market_prestart_allow_ms,
+                                market_sample_end_grace_ms,
+                            ),
+                            market_selection_rank(m, now_ms, market_sample_end_grace_ms),
                         )
                     });
                     markets.dedup_by(|a, b| a.market_id == b.market_id);
@@ -1086,17 +1118,34 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     let mut book = book_by_market.get(&market.market_id);
                     if let Some(candidates) = candidate_markets_by_pair.get(&pair_key) {
                         let current_in_window =
-                            market_in_sampling_window(&market, now_ms, market_prestart_allow_ms);
+                            market_in_sampling_window(
+                                &market,
+                                now_ms,
+                                market_prestart_allow_ms,
+                                market_sample_end_grace_ms,
+                            );
                         if !current_in_window || book.is_none() {
                             if let Some(alt_market) = candidates.iter().find(|m| {
-                                market_in_sampling_window(m, now_ms, market_prestart_allow_ms)
+                                market_in_sampling_window(
+                                    m,
+                                    now_ms,
+                                    market_prestart_allow_ms,
+                                    market_sample_end_grace_ms,
+                                )
                                     && book_by_market.contains_key(&m.market_id)
                             }) {
                                 market = alt_market.clone();
                                 book = book_by_market.get(&market.market_id);
                             } else if let Some(alt_market) = candidates
                                 .iter()
-                                .find(|m| market_in_sampling_window(m, now_ms, market_prestart_allow_ms))
+                                .find(|m| {
+                                    market_in_sampling_window(
+                                        m,
+                                        now_ms,
+                                        market_prestart_allow_ms,
+                                        market_sample_end_grace_ms,
+                                    )
+                                })
                             {
                                 market = alt_market.clone();
                                 book = book_by_market.get(&market.market_id);
@@ -1109,7 +1158,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     if now_ms + market_prestart_allow_ms < market.start_ts_ms {
                         continue;
                     }
-                    if now_ms > market.end_ts_ms.saturating_add(MARKET_STALE_GUARD_MS) {
+                    if now_ms > market.end_ts_ms.saturating_add(market_sample_end_grace_ms) {
                         continue;
                     }
 
@@ -2537,6 +2586,22 @@ mod tests {
         assert!(f.allows("BTCUSDT", "15m"));
         assert!(f.allows("ETHUSDT", "5m"));
         assert!(f.allows("ETHUSDT", "15m"));
+    }
+
+    #[test]
+    fn sampling_window_uses_tight_end_grace_for_fast_switch() {
+        let market = MarketMeta {
+            market_id: "m".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            timeframe: "5m".to_string(),
+            title: "BTC".to_string(),
+            target_price: None,
+            start_ts_ms: 1_000,
+            end_ts_ms: 2_000,
+        };
+        assert!(market_in_sampling_window(&market, 1_999, 30_000, 300));
+        assert!(market_in_sampling_window(&market, 2_250, 30_000, 300));
+        assert!(!market_in_sampling_window(&market, 2_301, 30_000, 300));
     }
 
     #[test]

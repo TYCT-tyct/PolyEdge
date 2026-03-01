@@ -35,6 +35,7 @@ pub struct DiscoveryConfig {
     pub max_future_ms_1d: i64,
     pub max_past_ms: i64,
     pub one_market_per_template: bool,
+    pub markets_per_template: usize,
 }
 
 impl Default for DiscoveryConfig {
@@ -54,6 +55,13 @@ impl Default for DiscoveryConfig {
             std::env::var(key)
                 .ok()
                 .and_then(|v| v.trim().parse::<i64>().ok())
+                .unwrap_or(default)
+                .clamp(min, max)
+        }
+        fn env_usize(key: &str, default: usize, min: usize, max: usize) -> usize {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
                 .unwrap_or(default)
                 .clamp(min, max)
         }
@@ -123,6 +131,8 @@ impl Default for DiscoveryConfig {
             // Keep one active market per (symbol, market_type, timeframe) template
             // to prevent stale/future window fanout from diluting strategy decisions.
             one_market_per_template: env_bool("POLYEDGE_DISCOVERY_ONE_PER_TEMPLATE", true),
+            // Keep more than one candidate to allow immediate round switch at boundaries.
+            markets_per_template: env_usize("POLYEDGE_DISCOVERY_MARKETS_PER_TEMPLATE", 2, 1, 8),
         }
     }
 }
@@ -389,18 +399,20 @@ impl MarketDiscovery {
         }
 
         if self.cfg.one_market_per_template {
-            out = collapse_to_one_market_per_template(out, now_ms);
+            out = collapse_to_markets_per_template(out, now_ms, self.cfg.markets_per_template);
         }
 
         Ok(out)
     }
 }
 
-fn collapse_to_one_market_per_template(
+fn collapse_to_markets_per_template(
     markets: Vec<MarketDescriptor>,
     now_ms: i64,
+    keep_per_template: usize,
 ) -> Vec<MarketDescriptor> {
-    let mut best = std::collections::HashMap::<String, (i64, i64, i64, MarketDescriptor)>::new();
+    let keep_per_template = keep_per_template.max(1);
+    let mut grouped = std::collections::HashMap::<String, Vec<MarketDescriptor>>::new();
     for m in markets {
         let key = format!(
             "{}|{}|{}",
@@ -410,28 +422,31 @@ fn collapse_to_one_market_per_template(
                 .unwrap_or_else(|| "unknown".to_string()),
             m.timeframe.clone().unwrap_or_else(|| "unknown".to_string())
         );
-        let end_ms = parse_end_date_ms(m.end_date.as_deref()).unwrap_or(i64::MAX / 4);
-        // Prefer windows closest to "now". Keep only a short grace for just-ended
-        // rounds so discovery quickly advances to the current window.
-        let recent_grace_ms = recent_end_grace_ms(m.timeframe.as_deref());
-        let ended_penalty = if end_ms < now_ms.saturating_sub(recent_grace_ms) {
-            1_i64
-        } else {
-            0_i64
-        };
-        let distance = end_ms.saturating_sub(now_ms).abs();
-        let candidate = (ended_penalty, distance, end_ms, m);
-
-        match best.get(&key) {
-            Some((bp, bd, be, _))
-                if (*bp, *bd, std::cmp::Reverse(*be))
-                    <= (candidate.0, candidate.1, std::cmp::Reverse(candidate.2)) => {}
-            _ => {
-                best.insert(key, candidate);
-            }
-        }
+        grouped.entry(key).or_default().push(m);
     }
-    best.into_values().map(|(_, _, _, m)| m).collect()
+    let mut out = Vec::<MarketDescriptor>::new();
+    for mut entries in grouped.into_values() {
+        entries.sort_by_key(|m| {
+            let end_ms = parse_end_date_ms(m.end_date.as_deref()).unwrap_or(i64::MAX / 4);
+            // Prefer windows closest to "now". Keep only a short grace for just-ended
+            // rounds so discovery quickly advances to the current window.
+            let recent_grace_ms = recent_end_grace_ms(m.timeframe.as_deref());
+            let ended_penalty = if end_ms < now_ms.saturating_sub(recent_grace_ms) {
+                1_i64
+            } else {
+                0_i64
+            };
+            let distance = end_ms.saturating_sub(now_ms).abs();
+            (
+                ended_penalty,
+                distance,
+                std::cmp::Reverse(end_ms),
+                m.market_id.clone(),
+            )
+        });
+        out.extend(entries.into_iter().take(keep_per_template));
+    }
+    out
 }
 
 fn recent_end_grace_ms(timeframe: Option<&str>) -> i64 {
@@ -755,8 +770,45 @@ mod tests {
             mk("future_far", "2026-02-22T16:20:00Z"),
             mk("future_near", "2026-02-22T16:05:00Z"),
         ];
-        let out = collapse_to_one_market_per_template(input, now);
+        let out = collapse_to_markets_per_template(input, now, 1);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].market_id, "future_near");
+    }
+
+    #[test]
+    fn collapse_keeps_current_and_next_when_keep_is_two() {
+        let mk = |id: &str, end_date: &str| MarketDescriptor {
+            market_id: id.to_string(),
+            question: "Bitcoin Up or Down - 5 Minutes".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            market_slug: None,
+            token_id_yes: Some(format!("y-{id}")),
+            token_id_no: Some(format!("n-{id}")),
+            event_slug: None,
+            end_date: Some(end_date.to_string()),
+            event_start_time: None,
+            timeframe: Some("5m".to_string()),
+            market_type: Some("updown".to_string()),
+            best_bid: None,
+            best_ask: None,
+            price_to_beat: None,
+        };
+
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 2, 22, 16, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        let input = vec![
+            mk("past", "2026-02-22T15:54:00Z"),
+            mk("current", "2026-02-22T16:05:00Z"),
+            mk("next", "2026-02-22T16:10:00Z"),
+            mk("far", "2026-02-22T16:25:00Z"),
+        ];
+
+        let mut out = collapse_to_markets_per_template(input, now, 2);
+        out.sort_by(|a, b| a.market_id.cmp(&b.market_id));
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].market_id, "current");
+        assert_eq!(out[1].market_id, "next");
     }
 }
