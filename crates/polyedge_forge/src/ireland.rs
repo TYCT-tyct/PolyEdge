@@ -188,6 +188,11 @@ fn market_pair_key(m: &MarketMeta) -> String {
     format!("{}:{}", m.symbol, m.timeframe)
 }
 
+fn market_in_sampling_window(m: &MarketMeta, now_ms: i64, prestart_allow_ms: i64) -> bool {
+    now_ms.saturating_add(prestart_allow_ms) >= m.start_ts_ms
+        && now_ms <= m.end_ts_ms.saturating_add(MARKET_STALE_GUARD_MS)
+}
+
 fn market_selection_rank(m: &MarketMeta, now_ms: i64) -> (u8, i64, i64) {
     if now_ms >= m.start_ts_ms && now_ms <= m.end_ts_ms.saturating_add(MARKET_STALE_GUARD_MS) {
         // Prefer currently active round first, then the one closest to settlement.
@@ -199,11 +204,7 @@ fn market_selection_rank(m: &MarketMeta, now_ms: i64) -> (u8, i64, i64) {
     }
     if now_ms < m.start_ts_ms {
         // Then prefer the nearest upcoming round.
-        return (
-            1,
-            m.start_ts_ms.saturating_sub(now_ms),
-            m.start_ts_ms.abs(),
-        );
+        return (1, m.start_ts_ms.saturating_sub(now_ms), m.start_ts_ms.abs());
     }
     // Finally keep the most recently ended round as last resort.
     (
@@ -845,7 +846,13 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
             markets_by_id.insert(market.market_id.clone(), market);
         }
         for markets in candidate_markets_by_pair.values_mut() {
-            markets.sort_by_key(|m| market_selection_rank(m, Utc::now().timestamp_millis()));
+            let now_ms = Utc::now().timestamp_millis();
+            markets.sort_by_key(|m| {
+                (
+                    !market_in_sampling_window(m, now_ms, market_prestart_allow_ms),
+                    market_selection_rank(m, now_ms),
+                )
+            });
             markets.dedup_by(|a, b| a.market_id == b.market_id);
         }
         if !markets_by_id.is_empty() {
@@ -962,7 +969,12 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     }
                 }
                 for markets in candidates_by_pair.values_mut() {
-                    markets.sort_by_key(|m| market_selection_rank(m, now_ms));
+                    markets.sort_by_key(|m| {
+                        (
+                            !market_in_sampling_window(m, now_ms, market_prestart_allow_ms),
+                            market_selection_rank(m, now_ms),
+                        )
+                    });
                     markets.dedup_by(|a, b| a.market_id == b.market_id);
                 }
                 let mut selected_by_pair: HashMap<String, MarketMeta> = HashMap::new();
@@ -1051,11 +1063,19 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     let pair_key = market_pair_key(primary_market);
                     let mut market = primary_market.clone();
                     let mut book = book_by_market.get(&market.market_id);
-                    if book.is_none() {
-                        if let Some(candidates) = candidate_markets_by_pair.get(&pair_key) {
-                            if let Some(alt_market) = candidates
+                    if let Some(candidates) = candidate_markets_by_pair.get(&pair_key) {
+                        let current_in_window =
+                            market_in_sampling_window(&market, now_ms, market_prestart_allow_ms);
+                        if !current_in_window || book.is_none() {
+                            if let Some(alt_market) = candidates.iter().find(|m| {
+                                market_in_sampling_window(m, now_ms, market_prestart_allow_ms)
+                                    && book_by_market.contains_key(&m.market_id)
+                            }) {
+                                market = alt_market.clone();
+                                book = book_by_market.get(&market.market_id);
+                            } else if let Some(alt_market) = candidates
                                 .iter()
-                                .find(|m| book_by_market.contains_key(&m.market_id))
+                                .find(|m| market_in_sampling_window(m, now_ms, market_prestart_allow_ms))
                             {
                                 market = alt_market.clone();
                                 book = book_by_market.get(&market.market_id);

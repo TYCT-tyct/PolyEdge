@@ -138,7 +138,11 @@ impl PolymarketFeed {
         let key = self.cache_key();
         let snapshot = {
             let mut cache = target_market_cache().write().await;
-            cache.insert(key, markets.clone());
+            let merged = cache
+                .get(&key)
+                .map(|existing| merge_market_state_maps(existing, markets))
+                .unwrap_or_else(|| markets.clone());
+            cache.insert(key, merged);
             cache.clone()
         };
         if let Err(err) = write_target_market_cache_file(&snapshot).await {
@@ -528,6 +532,63 @@ fn target_market_cache(
     CACHE.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
 }
 
+fn market_state_recency_ms(state: &MarketState) -> i64 {
+    state.yes.ts_exchange_ms.max(state.no.ts_exchange_ms)
+}
+
+fn market_state_timeframe_key(state: &MarketState) -> String {
+    state
+        .timeframe
+        .as_deref()
+        .unwrap_or("unknown")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn target_market_cache_max_per_timeframe() -> usize {
+    std::env::var("POLYEDGE_TARGET_MARKET_CACHE_MAX_PER_TF")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(32)
+        .clamp(1, 256)
+}
+
+fn merge_market_state_maps(
+    existing: &HashMap<String, MarketState>,
+    latest: &HashMap<String, MarketState>,
+) -> HashMap<String, MarketState> {
+    let mut merged = existing.clone();
+    for (market_id, state) in latest {
+        match merged.get(market_id) {
+            Some(prev) if market_state_recency_ms(prev) > market_state_recency_ms(state) => {}
+            _ => {
+                merged.insert(market_id.clone(), state.clone());
+            }
+        }
+    }
+
+    let max_per_tf = target_market_cache_max_per_timeframe();
+    let mut grouped: HashMap<String, Vec<(String, MarketState)>> = HashMap::new();
+    for (market_id, state) in merged {
+        grouped
+            .entry(market_state_timeframe_key(&state))
+            .or_default()
+            .push((market_id, state));
+    }
+
+    let mut pruned = HashMap::<String, MarketState>::new();
+    for mut entries in grouped.into_values() {
+        entries.sort_by_key(|(_, state)| std::cmp::Reverse(market_state_recency_ms(state)));
+        for (idx, (market_id, state)) in entries.into_iter().enumerate() {
+            if idx >= max_per_tf {
+                break;
+            }
+            pruned.insert(market_id, state);
+        }
+    }
+    pruned
+}
+
 fn target_market_cache_file_path() -> PathBuf {
     if let Ok(raw) = std::env::var("POLYEDGE_TARGET_MARKET_CACHE_FILE") {
         let trimmed = raw.trim();
@@ -847,10 +908,7 @@ async fn fetch_token_market_map(
 
         for market in markets {
             // Gamma may omit `acceptingOrders`; only explicit false should be rejected.
-            if !market.active
-                || market.closed
-                || matches!(market.accepting_orders, Some(false))
-            {
+            if !market.active || market.closed || matches!(market.accepting_orders, Some(false)) {
                 continue;
             }
             let Some((yes, no)) = parse_token_pair(market.clob_token_ids.as_deref()) else {
@@ -1388,5 +1446,64 @@ mod tests {
         assert_eq!(yes.asset_id, "yes_token");
         assert_eq!(yes.best_bid, Some(0.63));
         assert_eq!(yes.best_ask, Some(0.64));
+    }
+
+    fn mk_state(market_id: &str, timeframe: &str, ts_ms: i64) -> MarketState {
+        MarketState {
+            market_id: market_id.to_string(),
+            timeframe: Some(timeframe.to_string()),
+            yes_token: format!("{market_id}-yes"),
+            no_token: format!("{market_id}-no"),
+            yes: AssetTop {
+                bid: 0.5,
+                ask: 0.5,
+                bid_size: 1.0,
+                ask_size: 1.0,
+                ts_exchange_ms: ts_ms,
+                recv_ts_local_ns: ts_ms.saturating_mul(1_000_000),
+            },
+            no: AssetTop {
+                bid: 0.5,
+                ask: 0.5,
+                bid_size: 1.0,
+                ask_size: 1.0,
+                ts_exchange_ms: ts_ms,
+                recv_ts_local_ns: ts_ms.saturating_mul(1_000_000),
+            },
+        }
+    }
+
+    #[test]
+    fn merge_market_state_maps_keeps_newer_entry() {
+        let mut old = HashMap::<String, MarketState>::new();
+        old.insert("m1".to_string(), mk_state("m1", "5m", 100));
+        let mut latest = HashMap::<String, MarketState>::new();
+        latest.insert("m1".to_string(), mk_state("m1", "5m", 200));
+
+        let merged = merge_market_state_maps(&old, &latest);
+        let state = merged.get("m1").expect("merged state exists");
+        assert_eq!(market_state_recency_ms(state), 200);
+    }
+
+    #[test]
+    fn merge_market_state_maps_preserves_timeframe_coverage() {
+        // Use a wide limit to verify merge keeps markets from both timeframes.
+        std::env::set_var("POLYEDGE_TARGET_MARKET_CACHE_MAX_PER_TF", "16");
+        let mut old = HashMap::<String, MarketState>::new();
+        old.insert("old-5m".to_string(), mk_state("old-5m", "5m", 100));
+        old.insert("old-15m".to_string(), mk_state("old-15m", "15m", 100));
+
+        let mut latest = HashMap::<String, MarketState>::new();
+        latest.insert("new-5m".to_string(), mk_state("new-5m", "5m", 200));
+
+        let merged = merge_market_state_maps(&old, &latest);
+        let has_5m = merged
+            .values()
+            .any(|s| s.timeframe.as_deref() == Some("5m"));
+        let has_15m = merged
+            .values()
+            .any(|s| s.timeframe.as_deref() == Some("15m"));
+        assert!(has_5m);
+        assert!(has_15m);
     }
 }
