@@ -333,7 +333,7 @@ export function PaperLabPage({
           ...STRATEGY_PAPER_PROFILE,
           lookbackMinutes: PAPER_LOOKBACK_MINUTES,
           useAutotune: strategyUseAutotune,
-          source: strategySource === "live" ? "auto" : "replay",
+          source: strategySource,
           ...(strategySource === "live" ? STRATEGY_LIVE_PROFILE : {})
         });
         const compactData = compactStrategyPayload(data);
