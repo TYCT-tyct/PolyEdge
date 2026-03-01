@@ -255,7 +255,7 @@ fn derive_capital_risk_state(
     } else {
         0.0
     };
-    if dd_pct >= 0.16 || consecutive_losses >= 6 {
+    if dd_pct >= 0.50 || consecutive_losses >= 6 {
         "lockdown"
     } else if dd_pct >= 0.09 || consecutive_losses >= 4 {
         "defensive"
