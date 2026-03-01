@@ -282,6 +282,12 @@ fn strategy_required_points_1s(lookback_minutes: u32) -> u32 {
     lookback_minutes.saturating_mul(60)
 }
 
+fn strategy_required_points_for_resolution(lookback_minutes: u32, sample_resolution_ms: u32) -> u32 {
+    let resolution_ms = sample_resolution_ms.max(1);
+    let points_per_minute = 60_000u32 / resolution_ms;
+    lookback_minutes.saturating_mul(points_per_minute.max(1))
+}
+
 fn strategy_samples_coverage_minutes(samples: &[StrategySample]) -> f64 {
     if samples.len() < 2 {
         return 0.0;
@@ -296,20 +302,26 @@ fn strategy_lookback_meta_json(
     full_history: bool,
     lookback_minutes: u32,
     max_points: u32,
+    sample_resolution_ms: u32,
 ) -> Value {
     let required_points_1s = strategy_required_points_1s(lookback_minutes);
-    let coverage_minutes_by_points = if required_points_1s == 0 {
+    let required_points_effective =
+        strategy_required_points_for_resolution(lookback_minutes, sample_resolution_ms);
+    let coverage_minutes_by_points = if required_points_effective == 0 {
         0.0
     } else {
-        ((lookback_minutes as f64) * (max_points as f64 / required_points_1s as f64).min(1.0))
+        ((lookback_minutes as f64)
+            * (max_points as f64 / required_points_effective as f64).min(1.0))
             .max(0.0)
     };
     json!({
         "requested_lookback_minutes": lookback_minutes,
         "full_history": full_history,
+        "sample_resolution_ms": sample_resolution_ms,
         "required_points_1s": required_points_1s,
+        "required_points_effective": required_points_effective,
         "max_points_effective": max_points,
-        "truncated_by_points": !full_history && max_points < required_points_1s,
+        "truncated_by_points": !full_history && max_points < required_points_effective,
         "coverage_minutes_by_points": coverage_minutes_by_points,
         "coverage_minutes_by_samples": strategy_samples_coverage_minutes(samples)
     })
@@ -2182,7 +2194,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         "lookback_minutes": lookback_minutes,
         "sample_source_mode": sample_source_mode,
         "sample_resolution_ms": sample_resolution_ms,
-        "lookback": strategy_lookback_meta_json(&samples, full_history, lookback_minutes, max_points),
+        "lookback": strategy_lookback_meta_json(&samples, full_history, lookback_minutes, max_points, sample_resolution_ms as u32),
         "full_history": full_history,
         "samples": samples.len(),
         "config_source": config_source,
@@ -2957,7 +2969,7 @@ pub(super) async fn strategy_paper(
                 "max_trades": runtime_defaults.max_trades,
             },
             "lookback_minutes": lookback_minutes,
-            "lookback": strategy_lookback_meta_json(&samples, full_history, lookback_minutes, max_points),
+            "lookback": strategy_lookback_meta_json(&samples, full_history, lookback_minutes, max_points, 1000),
             "samples": samples.len(),
             "current": Value::Null,
             "summary": {
@@ -2996,7 +3008,7 @@ pub(super) async fn strategy_paper(
         "autotune_live_key": live_key_used,
         "autotune_live_found": live_opt.is_some(),
         "lookback_minutes": lookback_minutes,
-        "lookback": strategy_lookback_meta_json(&samples, full_history, lookback_minutes, max_points),
+        "lookback": strategy_lookback_meta_json(&samples, full_history, lookback_minutes, max_points, 1000),
         "runtime_defaults": {
             "lookback_minutes": runtime_defaults.lookback_minutes,
             "max_points": runtime_defaults.max_points,
@@ -3685,7 +3697,7 @@ pub(super) async fn strategy_full(
         "market_type": market_type,
         "full_history": full_history,
         "lookback_minutes": lookback_minutes,
-        "lookback": strategy_lookback_meta_json(&samples, full_history, lookback_minutes, max_points),
+        "lookback": strategy_lookback_meta_json(&samples, full_history, lookback_minutes, max_points, 1000),
         "target_win_rate_pct": target_win_rate,
         "window_trades": window_trades,
         "samples": samples.len(),
@@ -4258,7 +4270,7 @@ pub(super) async fn strategy_optimize(
         "autotune_context": autotune_context,
         "full_history": full_history,
         "lookback_minutes": lookback_minutes,
-        "lookback": strategy_lookback_meta_json(&samples, full_history, lookback_minutes, max_points),
+        "lookback": strategy_lookback_meta_json(&samples, full_history, lookback_minutes, max_points, 1000),
         "samples": samples.len(),
         "samples_train": train_samples.len(),
         "samples_validation": valid_samples.len(),
