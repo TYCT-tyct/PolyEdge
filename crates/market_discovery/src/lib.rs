@@ -224,9 +224,15 @@ impl MarketDiscovery {
         };
 
         let mut plans = Vec::with_capacity(3);
+        // Near-now windows should be preferred for recorder continuity.
+        // Run ascending endDate first so template early-stop does not terminate on far-future markets.
+        plans.push(ScanPlan {
+            order: "endDate",
+            ascending: "true",
+            limit: enddate_limit,
+            max_pages: enddate_pages,
+        });
         if enddate_desc_pages > 0 {
-            // Newest-first scan helps catch the next round quickly at boundary switches,
-            // while near-expiry filtering still trims far-future noise.
             plans.push(ScanPlan {
                 order: "endDate",
                 ascending: "false",
@@ -234,12 +240,6 @@ impl MarketDiscovery {
                 max_pages: enddate_desc_pages,
             });
         }
-        plans.push(ScanPlan {
-            order: "endDate",
-            ascending: "true",
-            limit: enddate_limit,
-            max_pages: enddate_pages,
-        });
         if volume_pages > 0 {
             plans.push(ScanPlan {
                 order: "volume",
