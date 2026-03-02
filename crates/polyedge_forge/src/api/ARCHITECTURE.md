@@ -18,15 +18,23 @@ This document describes the current API module layout after the large-file split
   - Read-only HTTP handlers and websocket payload endpoints.
   - Includes chart/history/latest/round/heatmap/accuracy endpoints.
 
-- `strategy.rs`
-  - Strategy paper/live pipeline.
-  - Optimization and autotune promotion flow.
-  - Strategy data parsing/simulation mapping helpers.
+- `strategy.rs` + `strategy/`
+  - `strategy.rs` keeps shared strategy types/constants and composes subfiles via `include!`.
+  - `strategy/config.rs`: env/profile/default config and guardrails.
+  - `strategy/runtime.rs`: sample parsing/loading and runtime simulation plumbing.
+  - `strategy/handlers.rs`: HTTP handlers for paper/live/autotune endpoints.
+  - `strategy/optimize.rs`: objective/scoring/mutation/optimization loop.
+  - `strategy/autotune.rs`: keying/context and promotion decision helpers.
 
-- `live_execution.rs`
-  - Live order decision gating.
-  - Gateway and Rust SDK execution paths.
-  - Pending-order reconciliation and retry behavior.
+- `live_execution.rs` + `live_execution/`
+  - `live_execution.rs` keeps shared execution types/constants and composes subfiles via `include!`.
+  - `live_execution/config.rs`: gateway/runtime env + cache tuning helpers.
+  - `live_execution/targeting.rs`: target resolution, gating and decision selection helpers.
+  - `live_execution/gateway.rs`: payload building, gateway submit/query and retry shaping.
+  - `live_execution/pending.rs`: pending-order lifecycle and gateway reconciliation.
+  - `live_execution/rust_sdk.rs`: Rust SDK submit path and reconciliation.
+  - `live_execution/orchestrator.rs`: executor mode dispatch and top-level orchestration.
+  - `live_execution/tests.rs`: focused execution behavior tests.
 
 - `infra.rs`
   - Redis read/write helpers.
@@ -47,7 +55,8 @@ This document describes the current API module layout after the large-file split
 
 - `mod.rs` depends on all child modules.
 - Child modules do not depend on each other directly by path import.
-- Child modules use `use super::*;` and consume shared types from `mod.rs`.
+- `strategy/*` and `live_execution/*` are compiled into their parent module via `include!`,
+  so behavior remains in a single Rust module scope while files are physically split.
 - Shared helper modules (`infra`, `snapshot`, `row_utils`, `market_utils`) should stay logic-only and side-effect-light.
 
 ## Routing Ownership
@@ -58,12 +67,12 @@ This document describes the current API module layout after the large-file split
 
 ## Operational Notes
 
-- Changes to live order flow should stay inside `live_execution.rs` whenever possible.
-- Autotune key schema and promotion checks should stay inside `strategy.rs`.
+- Changes to live order flow should stay inside `live_execution/*`.
+- Autotune key schema and promotion checks should stay inside `strategy/*`.
 - Snapshot freshness rules should stay in `snapshot.rs` to avoid duplicated time-window logic.
 
 ## Next Refactor Targets
 
 - Split runtime state mutation helpers from `mod.rs` into a dedicated `runtime_state.rs`.
 - Introduce typed request objects for remaining high-arity internal functions.
-- Gradually reduce `use super::*;` breadth by importing only required items per module.
+- Continue converting `include!` groups into explicit Rust submodules where visibility boundaries are beneficial.
