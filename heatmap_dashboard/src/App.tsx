@@ -5,7 +5,7 @@ import {
     getAccuracySeries,
     getAvailableRounds,
     getChart,
-    getCollectorStatus,
+    getCollectorMetrics,
     getHeatmap,
     getLatestAllRaw,
     getRoundChart,
@@ -22,6 +22,7 @@ import type {
     AvailableRoundsResponse,
     ChartPoint,
     ChartResponse,
+    CollectorMetricsResponse,
     CollectorStatusResponse,
     HeatmapCell,
     HeatmapResponse,
@@ -739,6 +740,7 @@ export default function App() {
   });
   const [stats, setStats] = useState<StatsResponse | null>(null);
   const [collectorStatus, setCollectorStatus] = useState<CollectorStatusResponse | null>(null);
+  const [collectorMetrics, setCollectorMetrics] = useState<CollectorMetricsResponse | null>(null);
   const [chartWindow, setChartWindow] = useState<Record<MarketType, WindowType>>({
     "5m": "30m",
     "15m": "30m"
@@ -1411,8 +1413,9 @@ export default function App() {
         return;
       }
       try {
-        const value = await getCollectorStatus(selectedSymbol);
+        const value = await getCollectorMetrics(selectedSymbol);
         if (alive) {
+          setCollectorMetrics(value);
           setCollectorStatus(value);
         }
       } catch {
@@ -1435,6 +1438,8 @@ export default function App() {
   const explorerDays = useMemo(() => availableRounds[explorerTab]?.days ?? [], [availableRounds, explorerTab]);
   const collector5m = collectorStatus?.timeframes["5m"] ?? null;
   const collector15m = collectorStatus?.timeframes["15m"] ?? null;
+  const collector5mWindow = collectorMetrics?.timeframes["5m"]?.window ?? null;
+  const collector15mWindow = collectorMetrics?.timeframes["15m"]?.window ?? null;
   const collectorOverallText = collectorStatus
     ? collectorStatus.ok
       ? "采集正常"
@@ -1515,6 +1520,22 @@ export default function App() {
                 </span>
                 <span>
                   15m采集: {collector15m?.status ?? "--"} · {formatAgeMs(collector15m?.age_ms ?? null)}
+                </span>
+                <span>
+                  5m覆盖:{" "}
+                  {collector5mWindow != null
+                    ? `${(collector5mWindow.sample_ratio * 100).toFixed(0)}%`
+                    : "--"}
+                  {" · "}
+                  p95链路延迟: {formatAgeMs(collector5mWindow?.path_lag_p95_ms ?? null)}
+                </span>
+                <span>
+                  15m覆盖:{" "}
+                  {collector15mWindow != null
+                    ? `${(collector15mWindow.sample_ratio * 100).toFixed(0)}%`
+                    : "--"}
+                  {" · "}
+                  p95链路延迟: {formatAgeMs(collector15mWindow?.path_lag_p95_ms ?? null)}
                 </span>
               </>
             ) : (
@@ -1709,6 +1730,20 @@ export default function App() {
           <span>
             15m采集延迟: {formatAgeMs(collector15m?.age_ms ?? null)} · 轮次{" "}
             {collector15m?.round_id || "--"}
+          </span>
+          <span>
+            5m覆盖率:{" "}
+            {collector5mWindow != null
+              ? `${(collector5mWindow.sample_ratio * 100).toFixed(0)}%`
+              : "--"}
+            {" · "}p95链路: {formatAgeMs(collector5mWindow?.path_lag_p95_ms ?? null)}
+          </span>
+          <span>
+            15m覆盖率:{" "}
+            {collector15mWindow != null
+              ? `${(collector15mWindow.sample_ratio * 100).toFixed(0)}%`
+              : "--"}
+            {" · "}p95链路: {formatAgeMs(collector15mWindow?.path_lag_p95_ms ?? null)}
           </span>
           {errorText ? <span className="down">{errorText}</span> : null}
         </footer>

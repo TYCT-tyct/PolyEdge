@@ -117,7 +117,6 @@ impl GatewayBookSnapshot {
     }
 }
 
-
 include!("live_execution/config.rs");
 include!("live_execution/targeting.rs");
 include!("live_execution/gateway.rs");

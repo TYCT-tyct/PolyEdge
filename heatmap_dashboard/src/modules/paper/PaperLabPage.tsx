@@ -1,28 +1,22 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
-  getStrategyAutotuneHistory,
-  getStrategyAutotuneLatest,
   getStrategyPaper
 } from "../../api";
 import type { MarketSymbol, MarketType, StrategyPaperResponse } from "../../types";
 
 type TimeMode = "local" | "et";
 type StrategyPaperSource = "replay" | "live";
-const PAPER_AUTOTUNE_DISABLED = true;
 
 const ET_TIMEZONE = "America/New_York";
 const CN_TIMEZONE = "Asia/Shanghai";
 const STRATEGY_POLL_MIN_MS = 3_500;
 const STRATEGY_POLL_MAX_MS = 20_000;
-const AUTOTUNE_POLL_MIN_MS = 6_000;
-const AUTOTUNE_POLL_MAX_MS = 60_000;
 const STRATEGY_PREFS_STORAGE_KEY = "polyedge.strategy.prefs.v4";
 const PAPER_LOOKBACK_MINUTES = 1440;
 
 const STRATEGY_PAPER_PROFILE = Object.freeze({
-  fullHistory: false,
-  useAutotune: false
+  fullHistory: false
 });
 
 const STRATEGY_LIVE_PROFILE = Object.freeze({
@@ -36,7 +30,6 @@ const STRATEGY_ENABLED_SYMBOLS: MarketSymbol[] = ["BTCUSDT", "ETHUSDT", "SOLUSDT
 type StrategyUiPrefs = {
   marketType: MarketType;
   source: StrategyPaperSource;
-  useAutotune: boolean;
 };
 
 function readStrategyUiPrefs(): Partial<StrategyUiPrefs> {
@@ -57,12 +50,9 @@ function readStrategyUiPrefs(): Partial<StrategyUiPrefs> {
       parsed.source === "replay" || parsed.source === "live"
         ? (parsed.source as StrategyPaperSource)
         : undefined;
-    const useAutotune =
-      typeof parsed.useAutotune === "boolean" ? parsed.useAutotune : undefined;
     return {
       marketType,
-      source,
-      useAutotune
+      source
     };
   } catch {
     return {};
@@ -78,10 +68,6 @@ function writeStrategyUiPrefs(prefs: StrategyUiPrefs): void {
   } catch {
     // ignore localStorage failures
   }
-}
-
-function asFiniteNumber(v: unknown): number | null {
-  return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
 function formatTime(ts: number | null | undefined, timeMode: TimeMode): string {
@@ -154,29 +140,7 @@ function strategyPaperSignature(payload: StrategyPaperResponse): string {
     current?.timestamp_ms ?? 0,
     current?.suggested_action ?? "",
     last?.id ?? -1,
-    last?.exit_ts_ms ?? 0,
-    payload.autotune_active_key ?? "",
-    payload.autotune_live_key ?? ""
-  ].join("|");
-}
-
-function autotuneSignature(
-  latest: Record<string, unknown> | null,
-  history: Array<Record<string, unknown>>
-): string {
-  const head = history[0] ?? null;
-  const tail = history[history.length - 1] ?? null;
-  const ts = (row: Record<string, unknown> | null): number =>
-    asFiniteNumber(row?.saved_at_ms) ??
-    asFiniteNumber(row?.updated_at_ms) ??
-    asFiniteNumber(row?.created_at_ms) ??
-    0;
-  return [
-    ts(latest),
-    typeof latest?.source === "string" ? latest.source : "",
-    history.length,
-    ts(head),
-    ts(tail)
+    last?.exit_ts_ms ?? 0
   ].join("|");
 }
 
@@ -251,30 +215,21 @@ export function PaperLabPage({
   const [strategySource, setStrategySource] = useState<StrategyPaperSource>(
     prefs.source ?? "replay"
   );
-  const [strategyUseAutotune] = useState<boolean>(false);
-  const [strategyAutotuneLatest, setStrategyAutotuneLatest] = useState<Record<string, unknown> | null>(null);
-  const [strategyAutotuneHistory, setStrategyAutotuneHistory] = useState<Array<Record<string, unknown>>>([]);
-  const [strategyAutotuneLoading, setStrategyAutotuneLoading] = useState<boolean>(false);
   const [errorText, setErrorText] = useState<string>("");
 
   const strategyInFlightRef = useRef<boolean>(false);
   const strategySigRef = useRef<string>("");
   const strategyUnchangedRef = useRef<number>(0);
-  const strategyAutotuneInFlightRef = useRef<boolean>(false);
-  const strategyAutotuneSigRef = useRef<string>("");
-  const strategyAutotuneUnchangedRef = useRef<number>(0);
   const strategyHasLoadedRef = useRef<boolean>(false);
-  const strategyAutotuneHasLoadedRef = useRef<boolean>(false);
 
   const strategyEnabled = STRATEGY_ENABLED_SYMBOLS.includes(selectedSymbol);
 
   useEffect(() => {
     writeStrategyUiPrefs({
       marketType: strategyMarketType,
-      source: strategySource,
-      useAutotune: strategyUseAutotune
+      source: strategySource
     });
-  }, [strategyMarketType, strategySource, strategyUseAutotune]);
+  }, [strategyMarketType, strategySource]);
 
   useEffect(() => {
     let alive = true;
@@ -333,7 +288,6 @@ export function PaperLabPage({
         const data = await getStrategyPaper(strategyMarketType, {
           ...STRATEGY_PAPER_PROFILE,
           lookbackMinutes: PAPER_LOOKBACK_MINUTES,
-          useAutotune: strategyUseAutotune,
           source: strategySource,
           ...(strategySource === "live" ? STRATEGY_LIVE_PROFILE : {})
         }, selectedSymbol);
@@ -368,101 +322,7 @@ export function PaperLabPage({
         window.clearTimeout(timer);
       }
     };
-  }, [strategyEnabled, selectedSymbol, strategyMarketType, strategySource, strategyUseAutotune]);
-
-  useEffect(() => {
-    let alive = true;
-    if (!strategyEnabled || !strategyUseAutotune) {
-      setStrategyAutotuneLatest(null);
-      setStrategyAutotuneHistory([]);
-      setStrategyAutotuneLoading(false);
-      strategyAutotuneHasLoadedRef.current = false;
-      return () => {
-        alive = false;
-      };
-    }
-
-    let timer: number | null = null;
-    const nextDelayMs = (changed: boolean): number => {
-      if (document.visibilityState !== "visible") {
-        return AUTOTUNE_POLL_MAX_MS;
-      }
-      if (changed) {
-        strategyAutotuneUnchangedRef.current = 0;
-        return AUTOTUNE_POLL_MIN_MS;
-      }
-      strategyAutotuneUnchangedRef.current += 1;
-      return Math.min(
-        AUTOTUNE_POLL_MAX_MS,
-        AUTOTUNE_POLL_MIN_MS + strategyAutotuneUnchangedRef.current * 6_000
-      );
-    };
-
-    const schedule = (delay: number) => {
-      if (!alive) {
-        return;
-      }
-      timer = window.setTimeout(() => {
-        void loop();
-      }, delay);
-    };
-
-    const loop = async () => {
-      if (!alive) {
-        return;
-      }
-      if (document.visibilityState !== "visible") {
-        schedule(AUTOTUNE_POLL_MAX_MS);
-        return;
-      }
-      if (strategyAutotuneInFlightRef.current) {
-        schedule(1_500);
-        return;
-      }
-      strategyAutotuneInFlightRef.current = true;
-      if (!strategyAutotuneHasLoadedRef.current) {
-        setStrategyAutotuneLoading(true);
-      }
-      let changed = false;
-      try {
-        const [latest, history] = await Promise.all([
-          getStrategyAutotuneLatest(strategyMarketType, selectedSymbol),
-          getStrategyAutotuneHistory(strategyMarketType, 20, selectedSymbol)
-        ]);
-        if (!alive) {
-          return;
-        }
-        const latestData = latest.active_data ?? latest.data ?? null;
-        const historyItems = history.items ?? [];
-        const nextSig = autotuneSignature(latestData, historyItems);
-        changed = nextSig !== strategyAutotuneSigRef.current;
-        if (changed) {
-          strategyAutotuneSigRef.current = nextSig;
-          setStrategyAutotuneLatest(latestData);
-          setStrategyAutotuneHistory(historyItems);
-        }
-        strategyAutotuneHasLoadedRef.current = true;
-      } catch (err) {
-        if (alive) {
-          setErrorText(err instanceof Error ? err.message : String(err));
-        }
-      } finally {
-        strategyAutotuneInFlightRef.current = false;
-        if (alive) {
-          setStrategyAutotuneLoading(false);
-          schedule(nextDelayMs(changed));
-        }
-      }
-    };
-
-    void loop();
-    return () => {
-      alive = false;
-      if (timer != null) {
-        window.clearTimeout(timer);
-      }
-    };
-  }, [strategyEnabled, selectedSymbol, strategyMarketType, strategyUseAutotune]);
+  }, [strategyEnabled, selectedSymbol, strategyMarketType, strategySource]);
 
   if (!strategyEnabled) {
     return (
@@ -508,7 +368,6 @@ export function PaperLabPage({
     lastTradeTs != null ? Math.max(0, (nowTs - lastTradeTs) / 60_000) : null;
   const liveExecution = strategyPaper?.live_execution;
   const liveParity = liveExecution?.parity_check;
-  const liveCapital = liveExecution?.capital;
   const liveState = liveExecution?.state_machine;
   const liveEvents = (liveExecution?.events ?? []).slice(-20).reverse();
   const liveOrders = (liveExecution?.execution?.orders ?? []).slice(-20).reverse();
@@ -625,14 +484,6 @@ export function PaperLabPage({
             真实交易
           </button>
         </div>
-        <div className="btn-group">
-          <button className={strategyUseAutotune ? "active" : ""} disabled>
-            AutoTune 开
-          </button>
-          <button className={!strategyUseAutotune ? "active" : ""} disabled>
-            AutoTune 关
-          </button>
-        </div>
         <article className="info-card paper-quote-card">
           <span>盘口状态</span>
           <strong>
@@ -674,14 +525,10 @@ export function PaperLabPage({
               </small>
             </article>
             <article className="info-card">
-              <span>风控仓位</span>
-              <strong>{`${numCell(liveCapital?.state?.last_quote_usdc)?.toFixed(2) ?? "--"} USDC`}</strong>
+              <span>基础下单</span>
+              <strong>{`${numCell(liveExecution?.gateway?.base_quote_usdc)?.toFixed(2) ?? "--"} USDC`}</strong>
               <small>
-                模式 {textCell(liveCapital?.state?.bankroll_mode)} ·
-                日回撤{" "}
-                {numCell(liveCapital?.state?.daily_drawdown_ratio) != null
-                  ? `${(numCell(liveCapital?.state?.daily_drawdown_ratio)! * 100).toFixed(2)}%`
-                  : "--"}
+                最小下单 {`${numCell(liveExecution?.gateway?.min_quote_usdc)?.toFixed(2) ?? "--"} USDC`}
               </small>
             </article>
           </div>
@@ -702,17 +549,15 @@ export function PaperLabPage({
                 </li>
                 <li>
                   <span>未结挂单</span>
-                  <strong>{numCell(liveCapital?.open_pending_orders) ?? 0}</strong>
+                  <strong>{numCell(liveExecution?.gated?.submitted_count) ?? 0}</strong>
                 </li>
                 <li>
-                  <span>可用资金</span>
-                  <strong>{`${numCell(liveCapital?.state?.available_to_trade_usdc)?.toFixed(2) ?? "--"} USDC`}</strong>
+                  <span>净持仓</span>
+                  <strong>{`${numCell(liveState?.net_quote_usdc)?.toFixed(2) ?? "--"} USDC`}</strong>
                 </li>
                 <li>
-                  <span>连赢 / 连亏</span>
-                  <strong>{`${numCell(liveCapital?.state?.consecutive_wins) ?? 0} / ${
-                    numCell(liveCapital?.state?.consecutive_losses) ?? 0
-                  }`}</strong>
+                  <span>累计已实现</span>
+                  <strong>{`${numCell(liveState?.realized_pnl_usdc)?.toFixed(2) ?? "--"} USDC`}</strong>
                 </li>
               </ul>
             </article>
@@ -731,8 +576,8 @@ export function PaperLabPage({
                   <strong>{numCell(liveExecution?.gated?.skipped_count) ?? 0}</strong>
                 </li>
                 <li>
-                  <span>capital skipped</span>
-                  <strong>{numCell(liveCapital?.capital_skipped_count) ?? 0}</strong>
+                  <span>submitted skipped</span>
+                  <strong>{numCell(liveExecution?.gated?.skipped_count) ?? 0}</strong>
                 </li>
                 <li>
                   <span>gateway mode</span>
@@ -824,51 +669,6 @@ export function PaperLabPage({
         </section>
       ) : null}
 
-      {!PAPER_AUTOTUNE_DISABLED ? (
-        <div className="table-wrap">
-          <h3 className="table-title">AutoTune 历史（最近 8 条）</h3>
-          <table className="history-table">
-            <thead>
-              <tr>
-                <th>时间</th>
-                <th>来源</th>
-                <th>entry_base</th>
-                <th>entry_cap</th>
-                <th>止损</th>
-                <th>备注</th>
-              </tr>
-            </thead>
-            <tbody>
-              {strategyAutotuneHistory.slice(0, 8).map((row, idx) => {
-                const cfg =
-                  row.config && typeof row.config === "object"
-                    ? (row.config as Record<string, unknown>)
-                    : null;
-                const ts =
-                  numCell(row.saved_at_ms) ??
-                  numCell(row.updated_at_ms) ??
-                  numCell(row.created_at_ms);
-                return (
-                  <tr key={`auto-${idx}-${ts ?? 0}`}>
-                    <td>{formatTime(ts, timeMode)}</td>
-                    <td>{textCell(row.source)}</td>
-                    <td>{numCell(cfg?.entry_threshold_base)?.toFixed(3) ?? "--"}</td>
-                    <td>{numCell(cfg?.entry_threshold_cap)?.toFixed(3) ?? "--"}</td>
-                    <td>{numCell(cfg?.stop_loss_cents)?.toFixed(2) ?? "--"}</td>
-                    <td>{textCell(row.note)}</td>
-                  </tr>
-                );
-              })}
-              {strategyAutotuneHistory.length === 0 ? (
-                <tr>
-                  <td colSpan={6}>{strategyAutotuneLoading ? "加载中..." : "暂无历史"}</td>
-                </tr>
-              ) : null}
-            </tbody>
-          </table>
-        </div>
-      ) : null}
-
       <div className="table-wrap">
         <h3 className="table-title">交易记录（最近 20 条）</h3>
         <table className="history-table">
@@ -947,9 +747,6 @@ export function PaperLabPage({
           liveCtrl: {strategyPaper?.runtime_control?.mode ?? "normal"}
           {strategyPaper?.runtime_control?.effective_drain_only ? " (drain)" : ""}
         </span>
-        <span>activeKey: {strategyPaper?.autotune_active_key ?? "--"}</span>
-        <span>liveKey: {strategyPaper?.autotune_live_key ?? "--"}</span>
-        <span>autotune: forced_off</span>
         {liveWarmupFallback ? (
           <span className="muted">live 预热中：已自动回退到 replay 展示</span>
         ) : null}

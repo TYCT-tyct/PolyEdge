@@ -3,6 +3,7 @@ import type {
     AvailableRoundsResponse,
     ChartPoint,
     ChartResponse,
+    CollectorMetricsResponse,
     CollectorStatusResponse,
     HeatmapResponse,
     MarketSymbol,
@@ -24,6 +25,7 @@ const responseCache = new Map<string, { expiresAt: number; value: unknown }>();
 const apiSupport: {
   stats: boolean | null;
   collectorStatus: boolean | null;
+  collectorMetrics: boolean | null;
   chart: boolean | null;
   rounds: boolean | null;
   roundsAvailable: boolean | null;
@@ -33,6 +35,7 @@ const apiSupport: {
 } = {
   stats: null,
   collectorStatus: null,
+  collectorMetrics: null,
   chart: null,
   rounds: null,
   roundsAvailable: null,
@@ -52,6 +55,9 @@ function responseCacheTtlMs(path: string): number {
     return 2_000;
   }
   if (path === "/api/collector/status") {
+    return 1_500;
+  }
+  if (path.startsWith("/api/collector/metrics")) {
     return 1_500;
   }
   return 0;
@@ -523,6 +529,30 @@ export async function getCollectorStatus(symbol: MarketSymbol = "BTCUSDT"): Prom
   };
 }
 
+export async function getCollectorMetrics(
+  symbol: MarketSymbol = "BTCUSDT"
+): Promise<CollectorMetricsResponse> {
+  const qs = new URLSearchParams({ symbol });
+  if (apiSupport.collectorMetrics !== false) {
+    try {
+      const data = await requestJson<CollectorMetricsResponse>(`/api/collector/metrics?${qs.toString()}`);
+      apiSupport.collectorMetrics = true;
+      return data;
+    } catch (err) {
+      if (!(err instanceof HttpError) || err.status !== 404) {
+        throw err;
+      }
+      apiSupport.collectorMetrics = false;
+    }
+  }
+  const status = await getCollectorStatus(symbol);
+  return {
+    ...status,
+    symbol,
+    window_ms: 180_000
+  };
+}
+
 export interface LatestRawRow {
   ts_ireland_sample_ms: number;
   symbol: string;
@@ -926,7 +956,6 @@ export interface StrategyPaperQueryOptions {
   lookbackMinutes?: number;
   maxTrades?: number;
   fullHistory?: boolean;
-  useAutotune?: boolean;
   entryThresholdBase?: number;
   entryThresholdCap?: number;
   entryEdgeProb?: number;
@@ -950,8 +979,7 @@ export async function getStrategyPaper(
     profile: options.profile ?? "",
     symbol,
     market_type: marketType,
-    full_history: options.fullHistory ? "true" : "false",
-    use_autotune: options.useAutotune ? "true" : "false",
+    full_history: options.fullHistory ? "true" : "false"
   });
   if (!options.profile) {
     qs.delete("profile");
@@ -1003,49 +1031,6 @@ export async function getStrategyPaper(
     throw new Error("strategy paper response schema mismatch");
   }
   return payload;
-}
-
-export interface StrategyAutotuneLatestResponse {
-  symbol?: string;
-  market_type: MarketType | string;
-  context: string;
-  key: string;
-  found: boolean;
-  data: Record<string, unknown> | null;
-  active_key?: string;
-  active_found?: boolean;
-  active_data?: Record<string, unknown> | null;
-}
-
-export interface StrategyAutotuneHistoryResponse {
-  symbol?: string;
-  market_type: MarketType | string;
-  context: string;
-  key: string;
-  limit: number;
-  count: number;
-  items: Array<Record<string, unknown>>;
-}
-
-export async function getStrategyAutotuneLatest(
-  marketType: MarketType,
-  symbol: MarketSymbol = "BTCUSDT"
-): Promise<StrategyAutotuneLatestResponse> {
-  const qs = new URLSearchParams({ market_type: marketType, symbol });
-  return requestJson<StrategyAutotuneLatestResponse>(`/api/strategy/autotune/latest?${qs.toString()}`);
-}
-
-export async function getStrategyAutotuneHistory(
-  marketType: MarketType,
-  limit = 20,
-  symbol: MarketSymbol = "BTCUSDT"
-): Promise<StrategyAutotuneHistoryResponse> {
-  const qs = new URLSearchParams({
-    market_type: marketType,
-    symbol,
-    limit: String(Math.max(1, Math.min(200, Math.floor(limit))))
-  });
-  return requestJson<StrategyAutotuneHistoryResponse>(`/api/strategy/autotune/history?${qs.toString()}`);
 }
 
 export function connectLiveWs(

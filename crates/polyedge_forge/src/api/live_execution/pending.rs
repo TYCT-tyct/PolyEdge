@@ -6,7 +6,6 @@ pub(super) async fn apply_pending_confirmation(
 ) {
     let now_ms = Utc::now().timestamp_millis();
     let mut ps = state.get_live_position_state(&pending.market_type).await;
-    let capital_cfg = LiveCapitalConfig::from_env();
     let action = pending.action.to_ascii_lowercase();
     let fill_meta = extract_pending_fill_meta(fill_event, pending);
     let fill_price_cents = fill_meta
@@ -31,7 +30,6 @@ pub(super) async fn apply_pending_confirmation(
         (fill_quote_usdc / (fill_price_cents / 100.0).max(0.0001)).max(0.0)
     };
     let fill_cost_usdc = (fill_meta.fee_usdc + fill_meta.slippage_usdc).max(0.0);
-    let mut realized_pnl_usdc = 0.0_f64;
     if action == "enter" {
         ps.state = "in_position".to_string();
         ps.side = Some(pending.side.clone());
@@ -122,7 +120,7 @@ pub(super) async fn apply_pending_confirmation(
             } else {
                 0.0
             };
-            realized_pnl_usdc = gross_pnl_usdc - entry_cost_alloc - fill_cost_usdc;
+            let realized_pnl_usdc = gross_pnl_usdc - entry_cost_alloc - fill_cost_usdc;
             ps.position_cost_usdc = (ps.position_cost_usdc - entry_cost_alloc).max(0.0);
             ps.realized_pnl_usdc += realized_pnl_usdc;
             ps.last_fill_pnl_usdc = realized_pnl_usdc;
@@ -161,19 +159,6 @@ pub(super) async fn apply_pending_confirmation(
     state
         .put_live_position_state(&pending.market_type, ps)
         .await;
-    if realized_pnl_usdc.is_finite() && realized_pnl_usdc.abs() > 1e-9 {
-        let _ = state
-            .update_capital_after_realized_pnl(
-                &pending.market_type,
-                &capital_cfg,
-                realized_pnl_usdc,
-            )
-            .await;
-    } else if action == "enter" || action == "add" {
-        let _ = state
-            .update_capital_after_realized_pnl(&pending.market_type, &capital_cfg, 0.0)
-            .await;
-    }
 }
 
 pub(super) async fn apply_pending_revert(
@@ -910,66 +895,4 @@ pub(super) async fn execute_live_orders_via_gateway(
     out
 }
 
-pub(super) async fn fetch_live_balance_snapshot(
-    state: &ApiState,
-) -> Result<LiveBalanceSnapshot, String> {
-    const USDC_SCALE: f64 = 1_000_000.0;
-    let ctx = get_or_init_rust_executor(state).await?;
-    let req = PmBalanceAllowanceRequest::builder()
-        .asset_type(PmAssetType::Collateral)
-        .build();
-    let response = ctx
-        .client
-        .balance_allowance(req)
-        .await
-        .map_err(|e| format!("balance_allowance failed: {e}"))?;
-    let account = ctx.client.address().to_string();
-    let allowance_raw = response
-        .allowances
-        .iter()
-        .find_map(|(addr, amount)| {
-            if addr.to_string().eq_ignore_ascii_case(&account) {
-                amount.parse::<f64>().ok()
-            } else {
-                None
-            }
-        })
-        .or_else(|| {
-            response
-                .allowances
-                .values()
-                .filter_map(|v| v.parse::<f64>().ok())
-                .fold(None, |acc, v| match acc {
-                    Some(prev) if prev >= v => Some(prev),
-                    _ => Some(v),
-                })
-        })
-        .unwrap_or(0.0);
-    let now_ms = Utc::now().timestamp_millis();
-    let balance_raw = pm_dec_to_f64(&response.balance).max(0.0);
-    let balance = (balance_raw / USDC_SCALE).max(0.0);
-    let allowance = (allowance_raw / USDC_SCALE).max(0.0);
-    let spendable = balance.min(allowance).max(0.0);
-    let raw_allowances = response
-        .allowances
-        .iter()
-        .map(|(addr, amount)| (addr.to_string(), amount.clone()))
-        .collect::<HashMap<String, String>>();
-    let raw = json!({
-        "balance_raw": balance_raw,
-        "balance": balance,
-        "allowance_raw": allowance_raw,
-        "allowances": raw_allowances,
-        "account": account,
-        "asset_type": "COLLATERAL"
-    });
-    Ok(LiveBalanceSnapshot {
-        fetched_at_ms: now_ms,
-        source: "clob_balance_allowance".to_string(),
-        balance_usdc: balance,
-        allowance_usdc: allowance,
-        spendable_usdc: spendable,
-        raw,
-    })
-}
 

@@ -53,7 +53,6 @@ upsert_env "FORGE_FEV1_RUNTIME_MARKETS" "5m" "$ENV_FILE"
 upsert_env "FORGE_FEV1_MIN_QUOTE_USDC" "0.01" "$ENV_FILE"
 upsert_env "FORGE_FEV1_RUNTIME_QUOTE_USDC" "0.01" "$ENV_FILE"
 upsert_env "FORGE_FEV1_LIVE_QUOTE_FROM_PRICE" "true" "$ENV_FILE"
-upsert_env "FORGE_FEV1_CAPITAL_MAX_ADD_LAYERS" "0" "$ENV_FILE"
 restart_api
 
 echo "[roundtrip] wait for entry..."

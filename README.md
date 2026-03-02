@@ -10,7 +10,7 @@ PolyEdge is now a Forge-first repository. Legacy latency-arbitrage stacks and si
 - `crates/feed_reference` - reference feed adapter
 - `crates/market_discovery` - market discovery logic
 - `heatmap_dashboard` - frontend dashboard
-- `scripts/forge` - Forge-only ops and autotune scripts
+- `scripts/forge` - Forge-only ops and deployment scripts
 - `ops/systemd/polyedge-tokyo-disk-guard.*` - Tokyo disk protection timer
 
 ## Run Forge

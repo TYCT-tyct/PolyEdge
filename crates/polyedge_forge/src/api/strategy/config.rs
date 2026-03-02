@@ -225,15 +225,6 @@ fn strategy_heavy_points_threshold() -> u32 {
     )
 }
 
-fn strategy_optimize_guard_max_points() -> u32 {
-    strategy_env_u32(
-        "FORGE_STRATEGY_OPTIMIZE_GUARD_MAX_POINTS",
-        60_000,
-        10_000,
-        600_000,
-    )
-}
-
 fn strategy_heavy_trim_enabled() -> bool {
     strategy_env_bool("FORGE_STRATEGY_HEAVY_TRIM", true)
 }

@@ -56,7 +56,6 @@ def fetch_payload(
         "lookback_minutes": str(lookback_minutes),
         "max_trades": str(max_trades),
         "max_samples": str(max_samples),
-        "use_autotune": "false",
     }
     for k, v in cfg.items():
         q[k] = str(v)

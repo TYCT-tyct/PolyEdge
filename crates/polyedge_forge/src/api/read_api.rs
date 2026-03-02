@@ -572,6 +572,131 @@ pub(super) async fn stats(State(state): State<ApiState>) -> Result<Json<Value>, 
     })))
 }
 
+fn normalize_collector_symbol(raw: Option<&str>) -> String {
+    let symbol = raw
+        .map(|v| {
+            v.trim()
+                .chars()
+                .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                .collect::<String>()
+        })
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if symbol.is_empty() {
+        "BTCUSDT".to_string()
+    } else {
+        symbol
+    }
+}
+
+fn collector_timeframe_status_row(snapshot: Option<&Value>, now_ms: i64) -> (bool, Value) {
+    match snapshot {
+        Some(row) => {
+            let ts_ms = row
+                .get("ts_ireland_sample_ms")
+                .or_else(|| row.get("timestamp_ms"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let age_ms = if ts_ms > 0 {
+                now_ms.saturating_sub(ts_ms)
+            } else {
+                i64::MAX
+            };
+            let remaining_ms = snapshot_remaining_ms(row);
+            let status = if ts_ms <= 0 {
+                "missing"
+            } else if age_ms <= LIVE_SNAPSHOT_MAX_AGE_MS {
+                "ok"
+            } else if age_ms <= LIVE_SNAPSHOT_MAX_AGE_MS * 3 {
+                "lagging"
+            } else {
+                "stalled"
+            };
+            let expose_snapshot = matches!(status, "ok" | "lagging");
+            let ok = status == "ok";
+            (
+                ok,
+                json!({
+                    "status": status,
+                    "timestamp_ms": if ts_ms > 0 { Some(ts_ms) } else { None::<i64> },
+                    "age_ms": if ts_ms > 0 { Some(age_ms) } else { None::<i64> },
+                    "remaining_ms": if expose_snapshot { json!(remaining_ms) } else { Value::Null },
+                    "round_id": if expose_snapshot {
+                        json!(row.get("round_id").and_then(Value::as_str).unwrap_or_default())
+                    } else {
+                        json!("")
+                    },
+                    "path_lag_ms": row_f64(row, "path_lag_ms"),
+                }),
+            )
+        }
+        None => (
+            false,
+            json!({
+                "status": "missing",
+                "timestamp_ms": Value::Null,
+                "age_ms": Value::Null,
+                "remaining_ms": Value::Null,
+                "round_id": "",
+                "path_lag_ms": Value::Null,
+            }),
+        ),
+    }
+}
+
+async fn fetch_collector_window_metrics(
+    state: &ApiState,
+    symbol: &str,
+    timeframe: &str,
+    now_ms: i64,
+    window_ms: i64,
+) -> Result<Option<Value>, ApiError> {
+    let Some(ch_url) = state.ch_url.as_deref() else {
+        return Ok(None);
+    };
+    let clamped_window_ms = window_ms.clamp(60_000, 900_000);
+    let from_ms = now_ms.saturating_sub(clamped_window_ms);
+    let expected_samples = ((clamped_window_ms as f64) / 100.0).round() as i64;
+    let expected_samples = expected_samples.max(1);
+
+    let query = format!(
+        "SELECT
+            count() AS sample_count,
+            uniqExact(round_id) AS round_count,
+            max(ts_ireland_sample_ms) AS latest_sample_ms,
+            avgIf(path_lag_ms, isNotNull(path_lag_ms)) AS path_lag_avg_ms,
+            quantileTDigest(0.95)(path_lag_ms) AS path_lag_p95_ms,
+            avgIf(
+                toFloat64(ts_ireland_sample_ms - ts_pm_recv_ms),
+                ts_pm_recv_ms > 0
+            ) AS ingest_latency_avg_ms
+        FROM polyedge_forge.snapshot_100ms
+        WHERE symbol='{}'
+          AND timeframe='{}'
+          AND ts_ireland_sample_ms >= {}
+        FORMAT JSON",
+        symbol, timeframe, from_ms
+    );
+    let row = rows_from_json(query_clickhouse_json(ch_url, &query).await?)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| json!({}));
+    let sample_count = row_i64(&row, "sample_count").unwrap_or(0).max(0);
+    let latest_sample_ms = row_i64(&row, "latest_sample_ms");
+    let latest_sample_age_ms = latest_sample_ms.map(|ts| now_ms.saturating_sub(ts).max(0));
+    Ok(Some(json!({
+        "sample_count": sample_count,
+        "expected_samples": expected_samples,
+        "sample_ratio": (sample_count as f64 / expected_samples as f64).clamp(0.0, 4.0),
+        "round_count": row_i64(&row, "round_count").unwrap_or(0).max(0),
+        "latest_sample_ms": latest_sample_ms,
+        "latest_sample_age_ms": latest_sample_age_ms,
+        "path_lag_avg_ms": row_f64(&row, "path_lag_avg_ms"),
+        "path_lag_p95_ms": row_f64(&row, "path_lag_p95_ms"),
+        "ingest_latency_avg_ms": row_f64(&row, "ingest_latency_avg_ms"),
+    })))
+}
+
 pub(super) async fn collector_status(
     State(state): State<ApiState>,
 ) -> Result<Json<Value>, ApiError> {
@@ -585,58 +710,53 @@ pub(super) async fn collector_status(
             None => fetch_latest_snapshot_from_clickhouse(&state, "BTCUSDT", tf).await?,
         };
 
-        let status_value = if let Some(row) = snapshot {
-            let ts_ms = row
-                .get("ts_ireland_sample_ms")
-                .or_else(|| row.get("timestamp_ms"))
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
-            let age_ms = if ts_ms > 0 {
-                now_ms.saturating_sub(ts_ms)
-            } else {
-                i64::MAX
-            };
-            let remaining_ms = snapshot_remaining_ms(&row);
-            let status = if ts_ms <= 0 {
-                overall_ok = false;
-                "missing"
-            } else if age_ms <= LIVE_SNAPSHOT_MAX_AGE_MS {
-                "ok"
-            } else if age_ms <= LIVE_SNAPSHOT_MAX_AGE_MS * 3 {
-                overall_ok = false;
-                "lagging"
-            } else {
-                overall_ok = false;
-                "stalled"
-            };
-            let expose_snapshot = matches!(status, "ok" | "lagging");
-            json!({
-                "status": status,
-                "timestamp_ms": if ts_ms > 0 { Some(ts_ms) } else { None::<i64> },
-                "age_ms": if ts_ms > 0 { Some(age_ms) } else { None::<i64> },
-                "remaining_ms": if expose_snapshot { json!(remaining_ms) } else { Value::Null },
-                "round_id": if expose_snapshot {
-                    json!(row.get("round_id").and_then(Value::as_str).unwrap_or_default())
-                } else {
-                    json!("")
-                },
-            })
-        } else {
-            overall_ok = false;
-            json!({
-                "status": "missing",
-                "timestamp_ms": Value::Null,
-                "age_ms": Value::Null,
-                "remaining_ms": Value::Null,
-                "round_id": "",
-            })
-        };
+        let (tf_ok, status_value) = collector_timeframe_status_row(snapshot.as_ref(), now_ms);
+        overall_ok &= tf_ok;
         tf_map.insert(tf.to_string(), status_value);
     }
 
     Ok(Json(json!({
         "ok": overall_ok,
         "ts_ms": now_ms,
+        "timeframes": Value::Object(tf_map),
+    })))
+}
+
+pub(super) async fn collector_metrics(
+    State(state): State<ApiState>,
+    Query(params): Query<CollectorMetricsQueryParams>,
+) -> Result<Json<Value>, ApiError> {
+    let now_ms = Utc::now().timestamp_millis();
+    let symbol = normalize_collector_symbol(params.symbol.as_deref());
+    let window_ms = i64::from(params.window_sec.unwrap_or(180).clamp(60, 900)) * 1000;
+    let mut tf_map = serde_json::Map::new();
+    let mut overall_ok = true;
+
+    for tf in ["5m", "15m"] {
+        let snapshot = match fetch_latest_snapshot(&state, &symbol, tf).await? {
+            Some(v) => Some(v),
+            None => fetch_latest_snapshot_from_clickhouse(&state, &symbol, tf).await?,
+        };
+        let (tf_ok, mut status_value) = collector_timeframe_status_row(snapshot.as_ref(), now_ms);
+        if !tf_ok {
+            overall_ok = false;
+        }
+        let window_metrics =
+            fetch_collector_window_metrics(&state, &symbol, tf, now_ms, window_ms).await?;
+        if let Some(status_obj) = status_value.as_object_mut() {
+            status_obj.insert(
+                "window".to_string(),
+                window_metrics.unwrap_or(Value::Null),
+            );
+        }
+        tf_map.insert(tf.to_string(), status_value);
+    }
+
+    Ok(Json(json!({
+        "ok": overall_ok,
+        "ts_ms": now_ms,
+        "symbol": symbol,
+        "window_ms": window_ms,
         "timeframes": Value::Object(tf_map),
     })))
 }

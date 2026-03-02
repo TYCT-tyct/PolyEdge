@@ -85,6 +85,20 @@ export interface CollectorTimeframeStatus {
   age_ms: number | null;
   remaining_ms: number | null;
   round_id: string;
+  path_lag_ms?: number | null;
+  window?: CollectorWindowMetrics | null;
+}
+
+export interface CollectorWindowMetrics {
+  sample_count: number;
+  expected_samples: number;
+  sample_ratio: number;
+  round_count: number;
+  latest_sample_ms: number | null;
+  latest_sample_age_ms: number | null;
+  path_lag_avg_ms: number | null;
+  path_lag_p95_ms: number | null;
+  ingest_latency_avg_ms: number | null;
 }
 
 export interface CollectorStatusResponse {
@@ -94,6 +108,11 @@ export interface CollectorStatusResponse {
     "5m": CollectorTimeframeStatus;
     "15m": CollectorTimeframeStatus;
   };
+}
+
+export interface CollectorMetricsResponse extends CollectorStatusResponse {
+  symbol: string;
+  window_ms: number;
 }
 
 export interface RoundHistoryRow {
@@ -252,10 +271,6 @@ export interface StrategyPaperResponse {
   source?: "replay" | "live" | "auto" | string;
   source_fallback_error?: string | null;
   market_type: string;
-  autotune_context?: string;
-  autotune_active_key?: string;
-  autotune_live_key?: string;
-  autotune_live_found?: boolean;
   runtime_defaults?: {
     lookback_minutes?: number;
     max_points?: number;
@@ -287,7 +302,6 @@ export interface StrategyPaperResponse {
   samples: number;
   config_source?: string;
   baseline_profile?: string;
-  autotune?: unknown;
   config: {
     entry_threshold_base: number;
     entry_threshold_cap: number;
@@ -384,40 +398,7 @@ export interface StrategyPaperResponse {
       entry_slippage_bps?: number;
       exit_slippage_bps?: number;
       min_quote_usdc?: number;
-    };
-    capital?: {
-      auto_enabled?: boolean;
-      dynamic_quote_usdc?: number;
       base_quote_usdc?: number;
-      target_utilization?: number;
-      reserve_usdc?: number;
-      small_threshold_usdc?: number;
-      max_add_layers?: number;
-      available_after_capital_guard_usdc?: number;
-      capital_skipped_count?: number;
-      open_pending_orders?: number;
-      state?: {
-        market_type?: string;
-        equity_base_usdc?: number;
-        equity_estimate_usdc?: number;
-        max_equity_usdc?: number;
-        realized_pnl_usdc?: number;
-        reserved_pending_usdc?: number;
-        available_to_trade_usdc?: number;
-        utilization_ratio?: number;
-        tune_factor?: number;
-        risk_state?: string;
-        consecutive_wins?: number;
-        consecutive_losses?: number;
-        bankroll_mode?: string;
-        bankroll_defense_armed?: boolean;
-        day_cn_bucket?: number;
-        day_start_equity_usdc?: number;
-        daily_drawdown_ratio?: number;
-        last_realized_pnl_usdc?: number;
-        last_quote_usdc?: number;
-        updated_ts_ms?: number;
-      };
     };
     execution?: {
       mode?: "dry_run" | "real_gateway" | string;

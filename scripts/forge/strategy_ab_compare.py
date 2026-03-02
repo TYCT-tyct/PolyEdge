@@ -14,7 +14,6 @@ def fetch_payload(
     lookback_minutes: int,
     max_trades: int,
     max_samples: int,
-    use_autotune: bool,
     cfg: dict | None,
 ) -> dict:
     q: dict[str, str] = {
@@ -24,7 +23,6 @@ def fetch_payload(
         "lookback_minutes": str(lookback_minutes),
         "max_trades": str(max_trades),
         "max_samples": str(max_samples),
-        "use_autotune": "true" if use_autotune else "false",
     }
     if cfg:
         for k, v in cfg.items():
@@ -114,8 +112,6 @@ def main() -> None:
         default=260000,
         help="Upper bound for /api/strategy/paper max_samples; lower value reduces API memory pressure.",
     )
-    ap.add_argument("--use-autotune-a", action="store_true")
-    ap.add_argument("--use-autotune-b", action="store_true")
     ap.add_argument("--config-a", help="JSON file for query A override params")
     ap.add_argument("--config-b", help="JSON file for query B override params")
     ap.add_argument("--out", help="Optional output json path")
@@ -132,7 +128,6 @@ def main() -> None:
         args.lookback_minutes,
         args.max_trades,
         args.max_samples,
-        args.use_autotune_a,
         cfg_a,
     )
     payload_b = fetch_payload(
@@ -143,7 +138,6 @@ def main() -> None:
         args.lookback_minutes,
         args.max_trades,
         args.max_samples,
-        args.use_autotune_b,
         cfg_b,
     )
     metrics_a = summarize(payload_a)

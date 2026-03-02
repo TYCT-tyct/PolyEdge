@@ -22,9 +22,7 @@ This document describes the current API module layout after the large-file split
   - `strategy.rs` keeps shared strategy types/constants and composes subfiles via `include!`.
   - `strategy/config.rs`: env/profile/default config and guardrails.
   - `strategy/runtime.rs`: sample parsing/loading and runtime simulation plumbing.
-  - `strategy/handlers.rs`: HTTP handlers for paper/live/autotune endpoints.
-  - `strategy/optimize.rs`: objective/scoring/mutation/optimization loop.
-  - `strategy/autotune.rs`: keying/context and promotion decision helpers.
+  - `strategy/handlers.rs`: HTTP handlers for paper/live/control/events endpoints.
 
 - `live_execution.rs` + `live_execution/`
   - `live_execution.rs` keeps shared execution types/constants and composes subfiles via `include!`.
@@ -68,7 +66,6 @@ This document describes the current API module layout after the large-file split
 ## Operational Notes
 
 - Changes to live order flow should stay inside `live_execution/*`.
-- Autotune key schema and promotion checks should stay inside `strategy/*`.
 - Snapshot freshness rules should stay in `snapshot.rs` to avoid duplicated time-window logic.
 
 ## Next Refactor Targets

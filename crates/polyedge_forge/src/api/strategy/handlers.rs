@@ -23,37 +23,13 @@ pub(super) async fn strategy_paper(
     } else {
         None
     };
-    let autotune_context =
-        normalize_autotune_context(params.autotune_context.as_deref(), market_type, symbol);
-    let use_autotune = params.use_autotune.unwrap_or(false);
+
     let mut cfg = StrategyRuntimeConfig::default();
     let mut config_source = "default";
-    let mut autotune_info = Value::Null;
-    let mut autotune_key_used = Value::Null;
-    let (active_opt, active_key_used) =
-        resolve_autotune_active_doc(&state, market_type, symbol).await?;
-    let (live_opt, live_key_used) = resolve_autotune_live_doc(&state, market_type, symbol).await?;
     if let Some(profile_raw) = params.profile.as_deref() {
         if let Some((profile_name, profile_cfg)) = strategy_profile_from_alias(profile_raw) {
             cfg = profile_cfg;
             config_source = profile_name;
-        }
-    }
-    if use_autotune {
-        if let Some(active) = active_opt {
-            cfg = strategy_cfg_from_payload(cfg, &active);
-            config_source = "autotune_active";
-            autotune_info = active;
-            autotune_key_used = Value::String(active_key_used.clone());
-        } else {
-            let (saved_opt, key_used, _) =
-                resolve_autotune_doc(&state, &autotune_context, market_type).await?;
-            if let Some(saved) = saved_opt {
-                cfg = strategy_cfg_from_payload(cfg, &saved);
-                config_source = "autotune_candidate";
-                autotune_info = saved;
-                autotune_key_used = Value::String(key_used);
-            }
         }
     }
     if !matches!(source_mode, StrategyPaperSource::Live) {
@@ -172,6 +148,7 @@ pub(super) async fn strategy_paper(
             cfg.entry_threshold_cap = cfg.entry_threshold_base;
         }
     }
+
     let fixed_guard = strategy_fixed_guard_payload(&cfg);
     let runtime_defaults = LiveRuntimeConfig::from_env();
     let full_history = params.full_history.unwrap_or(false);
@@ -198,10 +175,6 @@ pub(super) async fn strategy_paper(
         .max_trades
         .map(|v| v.max(1) as usize)
         .unwrap_or(usize::MAX);
-    let _live_execute = params.live_execute.unwrap_or(false);
-    let _live_quote_usdc = params.live_quote_usdc.unwrap_or(1.0).clamp(0.5, 1000.0);
-    let _live_max_orders = params.live_max_orders.unwrap_or(1).clamp(1, 8) as usize;
-    let _live_entry_only = params.live_entry_only.unwrap_or(true);
 
     let mut source_fallback_error: Option<String> = None;
     if matches!(
@@ -237,10 +210,6 @@ pub(super) async fn strategy_paper(
             "source_fallback_error": source_fallback_error,
             "market_type": market_type,
             "symbol": symbol,
-            "autotune_context": autotune_context,
-            "autotune_active_key": active_key_used,
-            "autotune_live_key": live_key_used,
-            "autotune_live_found": live_opt.is_some(),
             "fixed_guard": fixed_guard,
             "runtime_defaults": {
                 "lookback_minutes": runtime_defaults.lookback_minutes,
@@ -272,7 +241,6 @@ pub(super) async fn strategy_paper(
     }
 
     let run = run_strategy_simulation(&samples, &cfg, max_trades);
-
     Ok(Json(json!({
         "source": "replay",
         "execution_target": "paper",
@@ -283,10 +251,6 @@ pub(super) async fn strategy_paper(
         "source_fallback_error": source_fallback_error,
         "market_type": market_type,
         "symbol": symbol,
-        "autotune_context": autotune_context,
-        "autotune_active_key": active_key_used,
-        "autotune_live_key": live_key_used,
-        "autotune_live_found": live_opt.is_some(),
         "lookback_minutes": lookback_minutes,
         "lookback": strategy_lookback_meta_json(&samples, full_history, lookback_minutes, max_points, 1000),
         "runtime_defaults": {
@@ -299,8 +263,6 @@ pub(super) async fn strategy_paper(
         "config_source": config_source,
         "baseline_profile": strategy_current_default_profile_name(),
         "fixed_guard": fixed_guard,
-        "autotune": autotune_info,
-        "autotune_key_used": autotune_key_used,
         "config": strategy_cfg_json(&cfg),
         "current": run.current,
         "summary": {
@@ -364,14 +326,6 @@ pub(super) async fn strategy_live_reset(
         cache.clear();
     }
     {
-        let mut cache = state.live_balance_cache.write().await;
-        cache.take();
-    }
-    {
-        let mut capitals = state.live_capital_states.write().await;
-        capitals.clear();
-    }
-    {
         let mut exec = state.live_rust_executor.write().await;
         exec.take();
     }
@@ -407,12 +361,6 @@ pub(super) async fn strategy_live_reset(
     let seq_key = live_gateway_seq_key(&state.redis_prefix);
     if delete_key(&state, &seq_key).await.is_ok() {
         deleted_keys.push(seq_key);
-    }
-    for scope in ["5m", "15m", LIVE_CAPITAL_PORTFOLIO_SCOPE] {
-        let key = live_capital_state_key(&state.redis_prefix, scope);
-        if delete_key(&state, &key).await.is_ok() {
-            deleted_keys.push(key);
-        }
     }
 
     Ok(Json(json!({
@@ -491,10 +439,7 @@ pub(super) async fn strategy_live_control(
     }
 
     let position = state.get_live_position_state(market_type).await;
-    let pending_count = state
-        .list_pending_orders_for_market(market_type)
-        .await
-        .len();
+    let pending_count = state.list_pending_orders_for_market(market_type).await.len();
     let flatten_done = position.side.is_none() && pending_count == 0;
     if matches!(control.mode, LiveRuntimeControlMode::GracefulStop)
         && flatten_done
@@ -526,73 +471,6 @@ pub(super) async fn strategy_live_control(
                 LiveRuntimeConfig::from_env().live_execute
             }
         }
-    })))
-}
-
-#[derive(Debug, Deserialize)]
-pub(super) struct StrategyLiveBalanceQueryParams {
-    market_type: Option<String>,
-    refresh_ms: Option<i64>,
-}
-
-pub(super) async fn strategy_live_balance(
-    State(state): State<ApiState>,
-    Query(params): Query<StrategyLiveBalanceQueryParams>,
-) -> Result<Json<Value>, ApiError> {
-    let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
-    let mut capital_cfg = LiveCapitalConfig::from_env();
-    let refresh_ms = params
-        .refresh_ms
-        .unwrap_or(capital_cfg.balance_refresh_ms)
-        .clamp(500, 120_000);
-    capital_cfg.balance_refresh_ms = refresh_ms;
-    let live_gateway_cfg = LiveGatewayConfig::from_env();
-    let runtime_cfg = LiveRuntimeConfig::from_env();
-    let base_quote_usdc = runtime_cfg.quote_usdc.max(live_gateway_cfg.min_quote_usdc);
-    let (dynamic_quote_usdc, capital_state, balance_sync_ok, balance_sync_error) = state
-        .compute_live_quote_usdc(
-            market_type,
-            base_quote_usdc,
-            live_gateway_cfg.min_quote_usdc,
-            &capital_cfg,
-        )
-        .await;
-    let snapshot = state
-        .get_live_balance_snapshot(refresh_ms)
-        .await
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::internal("live balance unavailable"))?;
-    let capital_scope = if capital_cfg.portfolio_shared {
-        LIVE_CAPITAL_PORTFOLIO_SCOPE
-    } else {
-        market_type
-    };
-    let fixed_guard = strategy_fixed_guard_payload(&StrategyRuntimeConfig::default());
-    Ok(Json(json!({
-        "ok": true,
-        "market_type": market_type,
-        "capital_scope": capital_scope,
-        "fetched_at_ms": snapshot.fetched_at_ms,
-        "fetched_at_iso": DateTime::<Utc>::from_timestamp_millis(snapshot.fetched_at_ms).map(|v| v.to_rfc3339()).unwrap_or_default(),
-        "source": snapshot.source,
-        "balance_usdc": snapshot.balance_usdc,
-        "allowance_usdc": snapshot.allowance_usdc,
-        "spendable_usdc": snapshot.spendable_usdc,
-        "capital_auto_enabled": capital_cfg.enabled,
-        "capital_use_real_balance": capital_cfg.use_real_balance,
-        "base_quote_usdc": base_quote_usdc,
-        "dynamic_quote_usdc": dynamic_quote_usdc,
-        "balance_sync_ok": balance_sync_ok,
-        "balance_sync_error": balance_sync_error,
-        "capital_state_equity_estimate_usdc": capital_state.equity_estimate_usdc,
-        "capital_state_available_to_trade_usdc": capital_state.available_to_trade_usdc,
-        "capital_state_reserved_pending_usdc": capital_state.reserved_pending_usdc,
-        "capital_state_utilization_ratio": capital_state.utilization_ratio,
-        "capital_state_risk_state": capital_state.risk_state,
-        "capital_state_stage": capital_state.capital_stage,
-        "capital_state_tune_factor": capital_state.tune_factor,
-        "raw": snapshot.raw,
-        "fixed_guard": fixed_guard
     })))
 }
 
@@ -761,119 +639,3 @@ pub(super) async fn strategy_live_events(
         "events": filtered
     })))
 }
-
-pub(super) async fn strategy_autotune_latest(
-    State(state): State<ApiState>,
-    Query(params): Query<StrategyAutotuneLatestQueryParams>,
-) -> Result<Json<Value>, ApiError> {
-    let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
-    let symbol = resolve_strategy_symbol(params.symbol.as_deref())?;
-    let context = normalize_autotune_context(params.context.as_deref(), market_type, symbol);
-    let (payload, key, _) = resolve_autotune_doc(&state, &context, market_type).await?;
-    let (active_payload, active_key) = resolve_autotune_active_doc(&state, market_type, symbol).await?;
-    let (live_payload, live_key) = resolve_autotune_live_doc(&state, market_type, symbol).await?;
-    Ok(Json(json!({
-        "market_type": market_type,
-        "symbol": symbol,
-        "context": context,
-        "key": key,
-        "found": payload.is_some(),
-        "data": payload,
-        "active_key": active_key,
-        "active_found": active_payload.is_some(),
-        "active_data": active_payload,
-        "live_key": live_key,
-        "live_found": live_payload.is_some(),
-        "live_data": live_payload,
-    })))
-}
-
-pub(super) async fn strategy_autotune_history(
-    State(state): State<ApiState>,
-    Query(params): Query<StrategyAutotuneHistoryQueryParams>,
-) -> Result<Json<Value>, ApiError> {
-    let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
-    let symbol = resolve_strategy_symbol(params.symbol.as_deref())?;
-    let context = normalize_autotune_context(params.context.as_deref(), market_type, symbol);
-    let limit = params.limit.unwrap_or(20).clamp(1, 200) as usize;
-    let active_key = strategy_autotune_active_history_key(&state.redis_prefix, market_type, symbol);
-    let mut items = read_key_value(&state, &active_key)
-        .await?
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
-    let candidate_key = strategy_autotune_history_key(&state.redis_prefix, &context);
-    let (key_used, source_used) = if items.is_empty() {
-        items = read_key_value(&state, &candidate_key)
-            .await?
-            .and_then(|v| v.as_array().cloned())
-            .unwrap_or_default();
-        (candidate_key, "candidate_context")
-    } else {
-        (active_key, "active_promotions")
-    };
-    if items.len() > limit {
-        items.truncate(limit);
-    }
-    Ok(Json(json!({
-        "market_type": market_type,
-        "symbol": symbol,
-        "context": context,
-        "key": key_used,
-        "source": source_used,
-        "limit": limit,
-        "count": items.len(),
-        "items": items,
-    })))
-}
-
-pub(super) async fn strategy_autotune_set(
-    State(state): State<ApiState>,
-    Json(body): Json<StrategyAutotuneSetBody>,
-) -> Result<Json<Value>, ApiError> {
-    let market_type = resolve_strategy_market_type(body.market_type.as_deref())?;
-    let symbol = resolve_strategy_symbol(body.symbol.as_deref())?;
-    let context = normalize_autotune_context(body.context.as_deref(), market_type, symbol);
-    let key = strategy_autotune_key(&state.redis_prefix, &context);
-    let history_key = strategy_autotune_history_key(&state.redis_prefix, &context);
-    let (previous, previous_key, _) = resolve_autotune_doc(&state, &context, market_type).await?;
-
-    let wrapped = json!({ "config": body.config });
-    let cfg = strategy_cfg_from_payload(StrategyRuntimeConfig::default(), &wrapped);
-    let saved_doc = json!({
-        "saved_at_ms": Utc::now().timestamp_millis(),
-        "market_type": market_type,
-        "symbol": symbol,
-        "context": context.clone(),
-        "source": body.source.unwrap_or_else(|| "manual".to_string()),
-        "note": body.note.unwrap_or_default(),
-        "config": strategy_cfg_json(&cfg),
-    });
-
-    write_key_value(&state, &key, &saved_doc, body.ttl_sec.filter(|v| *v > 0)).await?;
-
-    // Keep a small local history for rollback decisions.
-    let mut history: Vec<Value> = read_key_value(&state, &history_key)
-        .await?
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
-    if let Some(prev) = previous.clone() {
-        history.insert(0, prev);
-    }
-    if history.len() > 40 {
-        history.truncate(40);
-    }
-    let _ = write_key_value(&state, &history_key, &Value::Array(history), None).await;
-
-    Ok(Json(json!({
-        "ok": true,
-        "market_type": market_type,
-        "symbol": symbol,
-        "context": context,
-        "key": key,
-        "history_key": history_key,
-        "previous_found": previous.is_some(),
-        "previous_key": previous_key,
-        "saved": saved_doc,
-    })))
-}
-
