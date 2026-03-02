@@ -61,6 +61,7 @@ const TARGET_CACHE_RETENTION_MS: i64 = 2 * 60 * 60 * 1000;
 const TARGET_RETRY_RETENTION_MS: i64 = 20 * 60 * 1000;
 const ROUND_META_RETENTION_MS: i64 = 6 * 60 * 60 * 1000;
 const EMITTED_ROUND_RETENTION_MS: i64 = 6 * 60 * 60 * 1000;
+const DISCOVERY_EMPTY_GRACE_DEFAULT_MS: i64 = 90_000;
 const TOKYO_INPUT_STALE_GUARD_DEFAULT_MS: i64 = 2_500;
 const INPUT_STALE_WARN_THROTTLE_MS: i64 = 15_000;
 
@@ -280,9 +281,13 @@ struct RoundQualityReport {
     reasons: Vec<String>,
     sample_count: usize,
     expected_samples: usize,
+    reachable_expected_samples: usize,
     coverage_ratio: f64,
     sample_ratio: f64,
+    reachable_sample_ratio: f64,
+    sample_ratio_gate: f64,
     max_gap_ms: i64,
+    avg_gap_ms: i64,
     start_delay_ms: i64,
     end_missing_ms: i64,
     settle_stale_ms: i64,
@@ -363,8 +368,25 @@ impl RoundBuffer {
         let first = self.first_sample_ms.unwrap_or(0);
         let last = self.last_sample_ms.unwrap_or(0);
         let coverage_ms = last.saturating_sub(first).max(0);
+        let avg_gap_ms = if sample_count >= 2 {
+            coverage_ms
+                .div_euclid((sample_count.saturating_sub(1)) as i64)
+                .max(1)
+        } else {
+            i64::MAX
+        };
         let coverage_ratio = coverage_ms as f64 / expected_window_ms as f64;
         let sample_ratio = sample_count as f64 / expected_samples.max(1) as f64;
+        let effective_period_ms = if sample_count >= 2 {
+            avg_gap_ms.max(sample_period_ms.max(1))
+        } else {
+            sample_period_ms.max(1)
+        };
+        let reachable_expected_samples =
+            ((expected_window_ms as f64 / effective_period_ms as f64).ceil() as usize)
+                .saturating_add(1);
+        let reachable_sample_ratio = sample_count as f64 / reachable_expected_samples.max(1) as f64;
+        let sample_ratio_gate = sample_ratio.max(reachable_sample_ratio);
         let start_delay_ms = first.saturating_sub(self.start_ts_ms).max(0);
         let end_missing_ms = self.end_ts_ms.saturating_sub(last).max(0);
         let settle_stale_ms = self
@@ -385,8 +407,18 @@ impl RoundBuffer {
         if coverage_ratio < policy.min_coverage_ratio {
             reasons.push(format!("coverage_ratio={:.4}", coverage_ratio));
         }
-        if sample_ratio < policy.min_sample_ratio {
-            reasons.push(format!("sample_ratio={:.4}", sample_ratio));
+        if sample_ratio_gate < policy.min_sample_ratio {
+            reasons.push(format!(
+                "sample_ratio_gate={:.4}(static={:.4},reachable={:.4})",
+                sample_ratio_gate, sample_ratio, reachable_sample_ratio
+            ));
+        }
+        let avg_gap_guard_ms = policy
+            .max_gap_ms
+            .min(sample_period_ms.saturating_mul(8))
+            .max(sample_period_ms.saturating_mul(2));
+        if sample_count >= 3 && avg_gap_ms > avg_gap_guard_ms {
+            reasons.push(format!("avg_gap={}ms", avg_gap_ms));
         }
         if self.max_gap_ms > policy.max_gap_ms {
             reasons.push(format!("max_gap={}ms", self.max_gap_ms));
@@ -405,9 +437,13 @@ impl RoundBuffer {
             reasons,
             sample_count,
             expected_samples,
+            reachable_expected_samples,
             coverage_ratio,
             sample_ratio,
+            reachable_sample_ratio,
+            sample_ratio_gate,
             max_gap_ms: self.max_gap_ms,
+            avg_gap_ms,
             start_delay_ms,
             end_missing_ms,
             settle_stale_ms,
@@ -604,6 +640,11 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         .and_then(|v| v.trim().parse::<i64>().ok())
         .unwrap_or(MARKET_SAMPLE_END_GRACE_DEFAULT_MS)
         .clamp(0, 5_000);
+    let discovery_empty_grace_ms = std::env::var("FORGE_DISCOVERY_EMPTY_GRACE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(DISCOVERY_EMPTY_GRACE_DEFAULT_MS)
+        .clamp(10_000, 10 * 60 * 1000);
 
     let root = PathBuf::from(&args.data_root);
     fs::create_dir_all(root.join("snapshot_100ms")).ok();
@@ -627,6 +668,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         market_future_guard_ms = market_future_guard_ms,
         market_prestart_allow_ms = market_prestart_allow_ms,
         market_sample_end_grace_ms = market_sample_end_grace_ms,
+        discovery_empty_grace_ms = discovery_empty_grace_ms,
         market_filter = %market_filter.summary(),
         ?supported_symbols,
         ?active_symbols,
@@ -902,6 +944,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
     let mut target_anchor_by_round: HashMap<String, f64> = HashMap::new();
     let mut stale_tokyo_warn_by_symbol: HashMap<String, i64> = HashMap::new();
     let mut committed_rounds: HashMap<String, i64> = HashMap::new();
+    let mut discovery_empty_since_ms: Option<i64> = None;
 
     let mut ingest_seq: u64 = 0;
 
@@ -932,12 +975,15 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                 let received = markets.len();
                 let now_ms = Utc::now().timestamp_millis();
                 let prev_markets = markets_by_id.clone();
+                let prev_primary_by_pair: HashMap<String, MarketMeta> = prev_markets
+                    .values()
+                    .map(|m| (market_pair_key(m), m.clone()))
+                    .collect();
+                let prev_candidate_markets_by_pair = candidate_markets_by_pair.clone();
                 markets_by_id.clear();
-                let mut kept = 0usize;
                 for m in markets {
                     if market_filter.allows(&m.symbol, &m.timeframe) {
                         markets_by_id.insert(m.market_id.clone(), m);
-                        kept = kept.saturating_add(1);
                     }
                 }
                 let mut pair_seen: HashSet<String> = markets_by_id
@@ -1071,6 +1117,30 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             repaired_pairs.push(pair);
                         }
                     }
+                    // If discovery and cache are both temporarily sparse, keep required pairs alive
+                    // with previous still-valid primary markets.
+                    if !missing_required_pairs.is_empty() {
+                        let mut prev_repaired_pairs = Vec::<String>::new();
+                        for pair in missing_required_pairs.clone() {
+                            let Some(prev) = prev_primary_by_pair.get(&pair) else {
+                                continue;
+                            };
+                            if now_ms > prev.end_ts_ms.saturating_add(MARKET_STALE_GUARD_MS) {
+                                continue;
+                            }
+                            if now_ms.saturating_add(market_prestart_allow_ms) < prev.start_ts_ms {
+                                continue;
+                            }
+                            selected_by_pair.insert(pair.clone(), prev.clone());
+                            markets_by_id.insert(prev.market_id.clone(), prev.clone());
+                            let entry = candidates_by_pair.entry(pair.clone()).or_default();
+                            if !entry.iter().any(|m| m.market_id == prev.market_id) {
+                                entry.push(prev.clone());
+                            }
+                            prev_repaired_pairs.push(pair);
+                        }
+                        repaired_pairs.extend(prev_repaired_pairs.into_iter().map(|v| format!("{v}:prev")));
+                    }
                     missing_required_pairs = required_pair_keys
                         .iter()
                         .filter(|pair| !selected_by_pair.contains_key(*pair))
@@ -1090,6 +1160,31 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             repaired_pairs.join(",")
                         ),
                     );
+                }
+                let selected_empty_from_discovery = selected_by_pair.is_empty();
+                let mut discovery_keepalive_reused = false;
+                let mut discovery_keepalive_elapsed_ms = 0_i64;
+                if selected_empty_from_discovery {
+                    let since = *discovery_empty_since_ms.get_or_insert(now_ms);
+                    discovery_keepalive_elapsed_ms = now_ms.saturating_sub(since);
+                    if !prev_primary_by_pair.is_empty()
+                        && discovery_keepalive_elapsed_ms <= discovery_empty_grace_ms
+                    {
+                        markets_by_id = prev_markets;
+                        selected_by_pair = prev_primary_by_pair;
+                        if candidates_by_pair.is_empty() {
+                            candidates_by_pair = prev_candidate_markets_by_pair;
+                        } else {
+                            for (pair, prev_candidates) in prev_candidate_markets_by_pair {
+                                candidates_by_pair
+                                    .entry(pair)
+                                    .or_insert_with(|| prev_candidates);
+                            }
+                        }
+                        discovery_keepalive_reused = true;
+                    }
+                } else {
+                    discovery_empty_since_ms = None;
                 }
                 if selected_by_pair.len() != markets_by_id.len() {
                     let mut reduced: HashMap<String, MarketMeta> = HashMap::new();
@@ -1125,6 +1220,8 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     kept_markets = markets_by_id.len(),
                     sticky_reused = sticky_reused,
                     cache_repaired = cache_repaired,
+                    discovery_keepalive_reused = discovery_keepalive_reused,
+                    discovery_keepalive_elapsed_ms = discovery_keepalive_elapsed_ms,
                     kept_pairs = kept_pairs.join(","),
                     selected_rounds = selected_rounds.join(";"),
                     "market meta update applied"
@@ -1599,12 +1696,16 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                         "info",
                                         "round_quality",
                                         &format!(
-                                            "accepted {} samples={} expected={} coverage={:.3} sample_ratio={:.3} max_gap_ms={}",
+                                            "accepted {} samples={} expected={} reachable_expected={} coverage={:.3} sample_ratio={:.3} reachable_ratio={:.3} gate_ratio={:.3} avg_gap_ms={} max_gap_ms={}",
                                             round_id,
                                             report.sample_count,
                                             report.expected_samples,
+                                            report.reachable_expected_samples,
                                             report.coverage_ratio,
                                             report.sample_ratio,
+                                            report.reachable_sample_ratio,
+                                            report.sample_ratio_gate,
+                                            report.avg_gap_ms,
                                             report.max_gap_ms
                                         ),
                                     );
@@ -1615,12 +1716,16 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                         "warn",
                                         "round_quality",
                                         &format!(
-                                            "quality_warn {} samples={} expected={} coverage={:.3} sample_ratio={:.3} max_gap_ms={} start_delay_ms={} end_missing_ms={} settle_stale_ms={} reason={}",
+                                            "quality_warn {} samples={} expected={} reachable_expected={} coverage={:.3} sample_ratio={:.3} reachable_ratio={:.3} gate_ratio={:.3} avg_gap_ms={} max_gap_ms={} start_delay_ms={} end_missing_ms={} settle_stale_ms={} reason={}",
                                             round_id,
                                             report.sample_count,
                                             report.expected_samples,
+                                            report.reachable_expected_samples,
                                             report.coverage_ratio,
                                             report.sample_ratio,
+                                            report.reachable_sample_ratio,
+                                            report.sample_ratio_gate,
+                                            report.avg_gap_ms,
                                             report.max_gap_ms,
                                             report.start_delay_ms,
                                             report.end_missing_ms,
@@ -1633,8 +1738,12 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                     round_id = %round_id,
                                     sample_count = snapshot_count,
                                     expected_samples = report.expected_samples,
+                                    reachable_expected_samples = report.reachable_expected_samples,
                                     coverage_ratio = report.coverage_ratio,
                                     sample_ratio = report.sample_ratio,
+                                    reachable_sample_ratio = report.reachable_sample_ratio,
+                                    sample_ratio_gate = report.sample_ratio_gate,
+                                    avg_gap_ms = report.avg_gap_ms,
                                     max_gap_ms = report.max_gap_ms,
                                     accepted = report.accept,
                                     "round committed"
@@ -1739,12 +1848,16 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             "warn",
                             "round_quality",
                             &format!(
-                                "stale_committed {} samples={} expected={} coverage={:.3} sample_ratio={:.3} max_gap_ms={} settle_stale_ms={} reason={}",
+                                "stale_committed {} samples={} expected={} reachable_expected={} coverage={:.3} sample_ratio={:.3} reachable_ratio={:.3} gate_ratio={:.3} avg_gap_ms={} max_gap_ms={} settle_stale_ms={} reason={}",
                                 rid,
                                 report.sample_count,
                                 report.expected_samples,
+                                report.reachable_expected_samples,
                                 report.coverage_ratio,
                                 report.sample_ratio,
+                                report.reachable_sample_ratio,
+                                report.sample_ratio_gate,
+                                report.avg_gap_ms,
                                 report.max_gap_ms,
                                 report.settle_stale_ms,
                                 reason
@@ -1754,8 +1867,12 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             round_id = %rid,
                             sample_count = report.sample_count,
                             expected_samples = report.expected_samples,
+                            reachable_expected_samples = report.reachable_expected_samples,
                             coverage_ratio = report.coverage_ratio,
                             sample_ratio = report.sample_ratio,
+                            reachable_sample_ratio = report.reachable_sample_ratio,
+                            sample_ratio_gate = report.sample_ratio_gate,
+                            avg_gap_ms = report.avg_gap_ms,
                             max_gap_ms = report.max_gap_ms,
                             reasons = %reason,
                             "stale round committed with quality warning"
@@ -2560,6 +2677,7 @@ fn aligned_round_timestamp_sec(start_ts_ms: i64, timeframe: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::SnapshotRow;
     use serde_json::json;
 
     #[test]
@@ -2676,6 +2794,115 @@ mod tests {
         };
         assert!(!market_primary_candidate_is_valid(&market, 8_500, 1_000));
         assert!(market_primary_candidate_is_valid(&market, 8_500, 2_000));
+    }
+
+    fn dummy_snapshot(round_id: &str, ts_ms: i64) -> SnapshotRow {
+        SnapshotRow {
+            schema_version: "v1",
+            ingest_seq: 1,
+            ts_ireland_sample_ms: ts_ms,
+            ts_tokyo_recv_ms: None,
+            ts_exchange_ms: None,
+            ts_ireland_recv_ms: None,
+            path_lag_ms: None,
+            symbol: "BTCUSDT".to_string(),
+            ts_pm_recv_ms: ts_ms,
+            market_id: "m".to_string(),
+            timeframe: "5m".to_string(),
+            title: "BTC".to_string(),
+            target_price: Some(100_000.0),
+            mid_yes: 0.5,
+            mid_no: 0.5,
+            mid_yes_smooth: 0.5,
+            mid_no_smooth: 0.5,
+            bid_yes: 0.49,
+            ask_yes: 0.51,
+            bid_no: 0.49,
+            ask_no: 0.51,
+            binance_price: Some(100_100.0),
+            pm_live_btc_price: None,
+            ts_pm_live_exchange_ms: None,
+            ts_pm_live_recv_ms: None,
+            chainlink_price: None,
+            ts_chainlink_exchange_ms: None,
+            ts_chainlink_recv_ms: None,
+            delta_price: Some(100.0),
+            delta_pct: Some(0.001),
+            delta_pct_smooth: Some(0.001),
+            remaining_ms: 0,
+            velocity_bps_per_sec: Some(0.0),
+            acceleration: Some(0.0),
+            round_id: round_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn round_quality_accepts_reachable_baseline_when_coverage_is_good() {
+        let market = MarketMeta {
+            market_id: "m".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            timeframe: "5m".to_string(),
+            title: "BTC".to_string(),
+            target_price: Some(100_000.0),
+            start_ts_ms: 0,
+            end_ts_ms: 300_000,
+        };
+        let mut buffer = RoundBuffer::new("BTCUSDT_5m_0".to_string(), &market);
+        let sample = dummy_snapshot(&buffer.round_id, 0);
+        buffer.snapshots = vec![sample; 1_100];
+        buffer.first_sample_ms = Some(0);
+        buffer.last_sample_ms = Some(299_700);
+        buffer.max_gap_ms = 320;
+        buffer.target_price_latest = Some(100_000.0);
+        buffer.settle_price_latest = Some(100_100.0);
+        buffer.settle_price_latest_ts_ms = Some(299_700);
+        let policy = RoundQualityPolicy {
+            min_coverage_ratio: 0.90,
+            min_sample_ratio: 0.85,
+            max_gap_ms: 2_500,
+            start_tolerance_ms: 35_000,
+            end_tolerance_ms: 10_000,
+            settle_stale_tolerance_ms: 2_500,
+        };
+        let report = buffer.evaluate(&policy, 100);
+        assert!(report.accept);
+        assert!(report.sample_ratio < 0.5);
+        assert!(report.reachable_sample_ratio > 0.95);
+        assert!(report.sample_ratio_gate > policy.min_sample_ratio);
+    }
+
+    #[test]
+    fn round_quality_rejects_sparse_stream_even_if_reachable_ratio_is_high() {
+        let market = MarketMeta {
+            market_id: "m".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            timeframe: "5m".to_string(),
+            title: "BTC".to_string(),
+            target_price: Some(100_000.0),
+            start_ts_ms: 0,
+            end_ts_ms: 300_000,
+        };
+        let mut buffer = RoundBuffer::new("BTCUSDT_5m_0".to_string(), &market);
+        let sample = dummy_snapshot(&buffer.round_id, 0);
+        buffer.snapshots = vec![sample; 220];
+        buffer.first_sample_ms = Some(0);
+        buffer.last_sample_ms = Some(299_700);
+        buffer.max_gap_ms = 1_400;
+        buffer.target_price_latest = Some(100_000.0);
+        buffer.settle_price_latest = Some(100_100.0);
+        buffer.settle_price_latest_ts_ms = Some(299_700);
+        let policy = RoundQualityPolicy {
+            min_coverage_ratio: 0.90,
+            min_sample_ratio: 0.85,
+            max_gap_ms: 2_500,
+            start_tolerance_ms: 35_000,
+            end_tolerance_ms: 10_000,
+            settle_stale_tolerance_ms: 2_500,
+        };
+        let report = buffer.evaluate(&policy, 100);
+        assert!(!report.accept);
+        assert!(report.reachable_sample_ratio > 0.95);
+        assert!(report.reasons.iter().any(|r| r.starts_with("avg_gap=")));
     }
 
     #[test]
