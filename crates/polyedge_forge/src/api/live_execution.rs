@@ -396,6 +396,107 @@ fn parse_round_end_ts_ms(round_id: &str) -> Option<i64> {
     round_id.rsplit('_').next()?.parse::<i64>().ok()
 }
 
+fn live_market_token_cache() -> &'static tokio::sync::RwLock<HashMap<String, (String, String)>> {
+    static CACHE: std::sync::OnceLock<tokio::sync::RwLock<HashMap<String, (String, String)>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
+}
+
+fn live_gamma_market_url_base() -> String {
+    std::env::var("FORGE_FEV1_GAMMA_MARKET_URL_BASE")
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "https://gamma-api.polymarket.com/markets".to_string())
+}
+
+fn live_gamma_market_http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(500))
+            .timeout(Duration::from_millis(1_200))
+            .pool_max_idle_per_host(4)
+            .build()
+            .expect("build gamma market http client")
+    })
+}
+
+fn parse_token_array_field(v: &Value, key: &str) -> Vec<String> {
+    if let Some(arr) = v.get(key).and_then(Value::as_array) {
+        return arr
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    if let Some(raw) = v.get(key).and_then(Value::as_str) {
+        if let Ok(arr) = serde_json::from_str::<Vec<String>>(raw) {
+            return arr
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+async fn resolve_token_ids_from_gamma_market_detail(
+    market_id: &str,
+) -> Option<(String, String)> {
+    {
+        let cache = live_market_token_cache().read().await;
+        if let Some(v) = cache.get(market_id) {
+            return Some(v.clone());
+        }
+    }
+
+    let base = live_gamma_market_url_base();
+    let url = format!("{base}/{market_id}");
+    let client = live_gamma_market_http_client();
+    let resp = client.get(url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let detail = resp.json::<Value>().await.ok()?;
+    let token_ids = parse_token_array_field(&detail, "clobTokenIds");
+    if token_ids.len() < 2 {
+        return None;
+    }
+    let outcomes = parse_token_array_field(&detail, "outcomes");
+
+    let mut up_idx = None;
+    let mut down_idx = None;
+    for (idx, o) in outcomes.iter().enumerate() {
+        let key = o.to_ascii_lowercase();
+        if up_idx.is_none() && (key.contains("up") || key.contains("yes")) {
+            up_idx = Some(idx);
+        }
+        if down_idx.is_none() && (key.contains("down") || key.contains("no")) {
+            down_idx = Some(idx);
+        }
+    }
+    let yes_token = up_idx
+        .and_then(|i| token_ids.get(i))
+        .cloned()
+        .unwrap_or_else(|| token_ids[0].clone());
+    let no_token = down_idx
+        .and_then(|i| token_ids.get(i))
+        .cloned()
+        .unwrap_or_else(|| token_ids[1].clone());
+    if yes_token.is_empty() || no_token.is_empty() || yes_token == no_token {
+        return None;
+    }
+
+    {
+        let mut cache = live_market_token_cache().write().await;
+        cache.insert(market_id.to_string(), (yes_token.clone(), no_token.clone()));
+    }
+    Some((yes_token, no_token))
+}
+
 fn decision_round_matches_target(decision: &Value, target: &LiveMarketTarget) -> bool {
     let round_id = decision
         .get("round_id")
@@ -443,42 +544,62 @@ async fn resolve_token_ids_from_target_cache(
     market_id: &str,
     market_type: &str,
 ) -> Option<(String, String)> {
-    let cache_path = live_target_cache_file_path();
-    let raw = tokio::fs::read_to_string(&cache_path).await.ok()?;
-    let root: Value = serde_json::from_str(&raw).ok()?;
-    let obj = root.as_object()?;
-    for (_, bucket) in obj {
-        let Some(market_obj) = bucket
-            .as_object()
-            .and_then(|m| m.get(market_id))
-            .and_then(Value::as_object)
-        else {
-            continue;
-        };
-        let tf_ok = market_obj
-            .get("timeframe")
-            .and_then(Value::as_str)
-            .map(|tf| tf.eq_ignore_ascii_case(market_type))
-            .unwrap_or(false);
-        if !tf_ok {
-            continue;
+    {
+        let cache = live_market_token_cache().read().await;
+        if let Some(v) = cache.get(market_id) {
+            return Some(v.clone());
         }
-        let yes = market_obj
-            .get("yes_token")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim();
-        let no = market_obj
-            .get("no_token")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim();
-        if yes.is_empty() || no.is_empty() {
-            continue;
-        }
-        return Some((yes.to_string(), no.to_string()));
     }
-    None
+    let cache_path = live_target_cache_file_path();
+    if let Ok(raw) = tokio::fs::read_to_string(&cache_path).await {
+        if let Ok(root) = serde_json::from_str::<Value>(&raw) {
+            if let Some(obj) = root.as_object() {
+                for (_, bucket) in obj {
+                    let Some(market_obj) = bucket
+                        .as_object()
+                        .and_then(|m| m.get(market_id))
+                        .and_then(Value::as_object)
+                    else {
+                        continue;
+                    };
+                    let tf_ok = market_obj
+                        .get("timeframe")
+                        .and_then(Value::as_str)
+                        .map(|tf| tf.eq_ignore_ascii_case(market_type))
+                        .unwrap_or(false);
+                    if !tf_ok {
+                        continue;
+                    }
+                    let yes = market_obj
+                        .get("yes_token")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim();
+                    let no = market_obj
+                        .get("no_token")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim();
+                    if yes.is_empty() || no.is_empty() {
+                        continue;
+                    }
+                    let pair = (yes.to_string(), no.to_string());
+                    let mut cache = live_market_token_cache().write().await;
+                    cache.insert(market_id.to_string(), pair.clone());
+                    return Some(pair);
+                }
+            }
+        }
+    }
+    let from_gamma = resolve_token_ids_from_gamma_market_detail(market_id).await;
+    if from_gamma.is_some() {
+        tracing::warn!(
+            market_id = market_id,
+            market_type = market_type,
+            "resolved token ids via gamma market detail fallback"
+        );
+    }
+    from_gamma
 }
 
 async fn resolve_live_target_from_snapshot(
