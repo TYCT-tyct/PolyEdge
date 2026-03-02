@@ -66,6 +66,8 @@ const ROUND_DROP_ON_QUALITY_FAIL_DEFAULT: bool = true;
 const TOKYO_INPUT_STALE_GUARD_DEFAULT_MS: i64 = 2_500;
 const INPUT_STALE_WARN_THROTTLE_MS: i64 = 15_000;
 const MARKET_SELECTION_FALLBACK_PREWARM_DEFAULT_MS: i64 = 180_000;
+const QUOTE_FALLBACK_MAX_AGE_5M_MS: i64 = 6 * 60 * 1_000;
+const QUOTE_FALLBACK_MAX_AGE_15M_MS: i64 = 18 * 60 * 1_000;
 
 fn env_flag(key: &str, default: bool) -> bool {
     std::env::var(key)
@@ -498,6 +500,39 @@ struct StableQuote {
     ask_yes: f64,
     bid_no: f64,
     ask_no: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QuoteCacheEntry {
+    ts_ms: i64,
+    quote: StableQuote,
+}
+
+fn quote_fallback_max_age_ms(timeframe: &str) -> i64 {
+    match timeframe {
+        "5m" => QUOTE_FALLBACK_MAX_AGE_5M_MS,
+        "15m" => QUOTE_FALLBACK_MAX_AGE_15M_MS,
+        _ => QUOTE_FALLBACK_MAX_AGE_5M_MS,
+    }
+}
+
+fn pick_fresh_cached_quote(
+    market_cached: Option<QuoteCacheEntry>,
+    pair_cached: Option<QuoteCacheEntry>,
+    now_ms: i64,
+    max_age_ms: i64,
+) -> Option<StableQuote> {
+    if let Some(cached) = market_cached {
+        if now_ms.saturating_sub(cached.ts_ms) <= max_age_ms {
+            return Some(cached.quote);
+        }
+    }
+    if let Some(cached) = pair_cached {
+        if now_ms.saturating_sub(cached.ts_ms) <= max_age_ms {
+            return Some(cached.quote);
+        }
+    }
+    None
 }
 
 fn fused_up_probability(quote: &StableQuote, prev_up: Option<f64>) -> f64 {
@@ -941,7 +976,8 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
     let mut tokyo_by_symbol: HashMap<String, TokyoBinanceLocal> = HashMap::new();
     let mut chainlink_by_symbol: HashMap<String, ChainlinkLocal> = HashMap::new();
     let mut book_by_market: HashMap<String, BookTop> = HashMap::new();
-    let mut quote_cache_by_market: HashMap<String, (f64, f64, f64, f64)> = HashMap::new();
+    let mut quote_cache_by_market: HashMap<String, QuoteCacheEntry> = HashMap::new();
+    let mut quote_cache_by_pair: HashMap<String, QuoteCacheEntry> = HashMap::new();
     let mut markets_by_id: HashMap<String, MarketMeta> = HashMap::new();
     let mut candidate_markets_by_pair: HashMap<String, Vec<MarketMeta>> = HashMap::new();
     if let Ok(seed_markets) =
@@ -1001,6 +1037,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
     let mut target_retry_after_ms: HashMap<String, i64> = HashMap::new();
     let mut target_anchor_by_round: HashMap<String, f64> = HashMap::new();
     let mut stale_tokyo_warn_by_symbol: HashMap<String, i64> = HashMap::new();
+    let mut stale_book_warn_by_pair: HashMap<String, i64> = HashMap::new();
     let mut committed_rounds: HashMap<String, i64> = HashMap::new();
     let mut discovery_empty_since_ms: Option<i64> = None;
 
@@ -1409,33 +1446,78 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         continue;
                     }
 
-                    let Some(book) = book else {
-                        continue;
-                    };
-                    let stable_quote = match stabilize_book_quotes(
-                        book,
-                        quote_cache_by_market.get(&market.market_id).copied(),
-                    ) {
-                        Some(v) => v,
+                    let pair_key = market_pair_key(&market);
+                    let max_quote_fallback_age_ms = quote_fallback_max_age_ms(&market.timeframe);
+                    let market_cached_quote = quote_cache_by_market.get(&market.market_id).copied();
+                    let pair_cached_quote = quote_cache_by_pair.get(&pair_key).copied();
+                    let mut used_cached_quote = false;
+                    let stable_quote = match book {
+                        Some(book_top) => stabilize_book_quotes(
+                            book_top,
+                            market_cached_quote.map(|v| {
+                                (
+                                    v.quote.bid_yes,
+                                    v.quote.ask_yes,
+                                    v.quote.bid_no,
+                                    v.quote.ask_no,
+                                )
+                            }),
+                        )
+                        .or_else(|| {
+                            used_cached_quote = true;
+                            pick_fresh_cached_quote(
+                                market_cached_quote,
+                                pair_cached_quote,
+                                now_ms,
+                                max_quote_fallback_age_ms,
+                            )
+                        }),
                         None => {
+                            used_cached_quote = true;
+                            pick_fresh_cached_quote(
+                                market_cached_quote,
+                                pair_cached_quote,
+                                now_ms,
+                                max_quote_fallback_age_ms,
+                            )
+                        }
+                    };
+                    let Some(stable_quote) = stable_quote else {
+                        if book.is_some() {
                             log_ingest(
                                 &persist_tx,
                                 "warn",
                                 "book_quality",
                                 &format!("invalid book skipped market_id={}", market.market_id),
                             );
-                            continue;
                         }
+                        continue;
                     };
-                    quote_cache_by_market.insert(
-                        market.market_id.clone(),
-                        (
-                            stable_quote.bid_yes,
-                            stable_quote.ask_yes,
-                            stable_quote.bid_no,
-                            stable_quote.ask_no,
-                        ),
-                    );
+                    if used_cached_quote {
+                        let warn_at = stale_book_warn_by_pair.entry(pair_key.clone()).or_insert(0);
+                        if now_ms.saturating_sub(*warn_at) >= INPUT_STALE_WARN_THROTTLE_MS {
+                            log_ingest(
+                                &persist_tx,
+                                "warn",
+                                "book_quality",
+                                &format!(
+                                    "book_missing_fallback_used symbol={} tf={} market_id={} fallback_age_limit_ms={}",
+                                    market.symbol,
+                                    market.timeframe,
+                                    market.market_id,
+                                    max_quote_fallback_age_ms
+                                ),
+                            );
+                            *warn_at = now_ms;
+                        }
+                    } else {
+                        let cache_entry = QuoteCacheEntry {
+                            ts_ms: now_ms,
+                            quote: stable_quote,
+                        };
+                        quote_cache_by_market.insert(market.market_id.clone(), cache_entry);
+                        quote_cache_by_pair.insert(pair_key, cache_entry);
+                    }
 
                     let tokyo = tokyo_by_symbol.get(&market.symbol);
                     let chainlink = chainlink_by_symbol.get(&market.symbol);
@@ -1678,6 +1760,19 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         continue;
                     }
 
+                    let ts_pm_recv_ms = if let Some(book_top) = book {
+                        if book_top.recv_ts_local_ns > 0 {
+                            book_top.recv_ts_local_ns / 1_000_000
+                        } else {
+                            book_top.ts_ms
+                        }
+                    } else {
+                        market_cached_quote
+                            .map(|v| v.ts_ms)
+                            .or_else(|| pair_cached_quote.map(|v| v.ts_ms))
+                            .unwrap_or(now_ms)
+                    };
+
                     ingest_seq = ingest_seq.saturating_add(1);
                     let row = SnapshotRow {
                         schema_version: "forge_snapshot_v1",
@@ -1696,11 +1791,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         path_lag_ms: tokyo_fresh
                             .map(|v| v.ts_ireland_recv_ms.saturating_sub(v.ts_tokyo_recv_ms) as f64),
                         symbol: market.symbol.clone(),
-                        ts_pm_recv_ms: if book.recv_ts_local_ns > 0 {
-                            book.recv_ts_local_ns / 1_000_000
-                        } else {
-                            book.ts_ms
-                        },
+                        ts_pm_recv_ms,
                         market_id: market.market_id.clone(),
                         timeframe: market.timeframe.clone(),
                         title: market.title.clone(),
@@ -2081,6 +2172,11 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     book_by_market.retain(|market_id, _| active_market_ids.contains(market_id.as_str()));
                     quote_cache_by_market
                         .retain(|market_id, _| active_market_ids.contains(market_id.as_str()));
+                    quote_cache_by_pair.retain(|pair, entry| {
+                        required_pair_keys.contains(pair)
+                            && now_ms.saturating_sub(entry.ts_ms)
+                                <= RECORDER_STALE_STATE_RETENTION_MS
+                    });
 
                     tokyo_by_symbol.retain(|symbol, row| {
                         active_symbols_set.contains(symbol.as_str())
@@ -2094,6 +2190,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     });
                     stale_tokyo_warn_by_symbol
                         .retain(|symbol, _| active_symbols_set.contains(symbol.as_str()));
+                    stale_book_warn_by_pair.retain(|pair, _| required_pair_keys.contains(pair));
                     motion_by_key.retain(|key, state| {
                         let symbol = key.split('|').next().unwrap_or_default();
                         active_symbols_set.contains(symbol)
