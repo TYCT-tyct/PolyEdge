@@ -679,31 +679,33 @@ async fn resolve_live_target_from_snapshot(
     }
 
     let tf_key = format!("{}:snapshot:latest:tf:{market_type}", state.redis_prefix);
-    let tf_snapshot = read_key_json(state, &tf_key).await.ok()?.0;
-    let mut btc_rows: Vec<&Value> = match tf_snapshot.as_array() {
-        Some(rows) => rows
-            .iter()
-            .filter(|row| {
-                row.get("symbol")
-                    .and_then(Value::as_str)
-                    .map(|s| s.eq_ignore_ascii_case("BTCUSDT"))
-                    .unwrap_or(false)
-            })
-            .collect(),
-        None => Vec::new(),
-    };
-    btc_rows.sort_by_key(|row| {
-        std::cmp::Reverse(
-            row.get("ts_ireland_sample_ms")
-                .and_then(Value::as_i64)
-                .unwrap_or(0),
-        )
-    });
-    for row in btc_rows {
-        if let Some(target) =
-            try_snapshot_candidate(state, market_type, now_ms, row, "tf_snapshot").await
-        {
-            return Some(target);
+    if let Ok(tf_snapshot_json) = read_key_json(state, &tf_key).await {
+        let tf_snapshot = tf_snapshot_json.0;
+        let mut btc_rows: Vec<&Value> = match tf_snapshot.as_array() {
+            Some(rows) => rows
+                .iter()
+                .filter(|row| {
+                    row.get("symbol")
+                        .and_then(Value::as_str)
+                        .map(|s| s.eq_ignore_ascii_case("BTCUSDT"))
+                        .unwrap_or(false)
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        btc_rows.sort_by_key(|row| {
+            std::cmp::Reverse(
+                row.get("ts_ireland_sample_ms")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+            )
+        });
+        for row in btc_rows {
+            if let Some(target) =
+                try_snapshot_candidate(state, market_type, now_ms, row, "tf_snapshot").await
+            {
+                return Some(target);
+            }
         }
     }
 
@@ -1122,8 +1124,6 @@ async fn resolve_live_market_target_inner(
                         .as_deref()
                         .map(|tf| tf.eq_ignore_ascii_case(market_type))
                         .unwrap_or(false)
-                    && m.token_id_yes.is_some()
-                    && m.token_id_no.is_some()
             })
             .collect();
         if markets.is_empty() {
@@ -1131,6 +1131,28 @@ async fn resolve_live_market_target_inner(
                 tokio::time::sleep(Duration::from_millis(resolve_retry_ms)).await;
             }
             continue;
+        }
+        {
+            let mut token_cache = live_market_token_cache().write().await;
+            for m in &markets {
+                let yes = m
+                    .token_id_yes
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default();
+                let no = m
+                    .token_id_no
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default();
+                if yes.is_empty() || no.is_empty() || yes == no {
+                    continue;
+                }
+                token_cache.insert(
+                    m.market_id.clone(),
+                    (yes.to_string(), no.to_string()),
+                );
+            }
         }
         markets.sort_by_key(|m| {
             let end_ms = parse_end_date_ms(m.end_date.as_deref()).unwrap_or(i64::MAX / 4);
@@ -1153,26 +1175,48 @@ async fn resolve_live_market_target_inner(
                 m.market_id.clone(),
             )
         });
-        let best = markets.remove(0);
-        let target = LiveMarketTarget {
-            market_id: best.market_id,
-            symbol: best.symbol,
-            timeframe: best.timeframe.unwrap_or_else(|| market_type.to_string()),
-            token_id_yes: best.token_id_yes.unwrap_or_default(),
-            token_id_no: best.token_id_no.unwrap_or_default(),
-            end_date: best.end_date,
-        };
-        {
-            let mut cache = live_market_target_cache().write().await;
-            cache.insert(
-                market_type.to_string(),
-                CachedLiveMarketTarget {
-                    fetched_at_ms: Utc::now().timestamp_millis(),
-                    target: target.clone(),
-                },
-            );
+        for candidate in markets {
+            let token_pair = match (
+                candidate
+                    .token_id_yes
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty()),
+                candidate
+                    .token_id_no
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty()),
+            ) {
+                (Some(yes), Some(no)) if yes != no => Some((yes.to_string(), no.to_string())),
+                _ => resolve_token_ids_from_target_cache(&candidate.market_id, market_type).await,
+            };
+            let Some((token_id_yes, token_id_no)) = token_pair else {
+                continue;
+            };
+            let target = LiveMarketTarget {
+                market_id: candidate.market_id,
+                symbol: candidate.symbol,
+                timeframe: candidate.timeframe.unwrap_or_else(|| market_type.to_string()),
+                token_id_yes,
+                token_id_no,
+                end_date: candidate.end_date,
+            };
+            {
+                let mut cache = live_market_target_cache().write().await;
+                cache.insert(
+                    market_type.to_string(),
+                    CachedLiveMarketTarget {
+                        fetched_at_ms: Utc::now().timestamp_millis(),
+                        target: target.clone(),
+                    },
+                );
+            }
+            return Ok(target);
         }
-        return Ok(target);
+        if attempt_idx + 1 < resolve_attempts && resolve_retry_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(resolve_retry_ms)).await;
+        }
     }
     if let Some(state) = state {
         if let Some(target) = resolve_live_target_from_snapshot(state, market_type, now_ms).await {
