@@ -486,59 +486,106 @@ async fn resolve_live_target_from_snapshot(
     market_type: &str,
     now_ms: i64,
 ) -> Option<LiveMarketTarget> {
-    let key = format!(
+    async fn try_snapshot_candidate(
+        _state: &ApiState,
+        market_type: &str,
+        now_ms: i64,
+        snapshot: &Value,
+        source: &str,
+    ) -> Option<LiveMarketTarget> {
+        let market_id = snapshot
+            .get("market_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())?
+            .to_string();
+        let round_id = snapshot
+            .get("round_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let sample_ms = snapshot
+            .get("ts_ireland_sample_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let age_ms = now_ms.saturating_sub(sample_ms);
+        let fresh_max_age_ms = live_market_target_snapshot_max_age_ms();
+        let stale_max_age_ms = live_market_target_snapshot_stale_max_age_ms();
+        if age_ms > stale_max_age_ms {
+            return None;
+        }
+        let end_ms = parse_round_end_ts_ms(round_id).or_else(|| {
+            let remain = snapshot.get("remaining_ms").and_then(Value::as_i64)?;
+            Some(sample_ms.saturating_add(remain.max(0)))
+        })?;
+        if end_ms < now_ms {
+            return None;
+        }
+        let (token_id_yes, token_id_no) =
+            resolve_token_ids_from_target_cache(&market_id, market_type).await?;
+        if age_ms > fresh_max_age_ms {
+            tracing::warn!(
+                market_type = market_type,
+                market_id = market_id,
+                source = source,
+                age_ms = age_ms,
+                fresh_max_age_ms = fresh_max_age_ms,
+                stale_max_age_ms = stale_max_age_ms,
+                end_ms = end_ms,
+                "using stale-but-active snapshot fallback for live market target"
+            );
+        }
+        Some(LiveMarketTarget {
+            market_id,
+            symbol: "BTCUSDT".to_string(),
+            timeframe: market_type.to_string(),
+            token_id_yes,
+            token_id_no,
+            end_date: end_date_iso_from_ms(end_ms),
+        })
+    }
+
+    let symbol_key = format!(
         "{}:snapshot:latest:BTCUSDT:{market_type}",
         state.redis_prefix
     );
-    let snapshot = read_key_json(state, &key).await.ok()?.0;
-    let market_id = snapshot
-        .get("market_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())?
-        .to_string();
-    let round_id = snapshot
-        .get("round_id")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let sample_ms = snapshot
-        .get("ts_ireland_sample_ms")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let age_ms = now_ms.saturating_sub(sample_ms);
-    let fresh_max_age_ms = live_market_target_snapshot_max_age_ms();
-    let stale_max_age_ms = live_market_target_snapshot_stale_max_age_ms();
-    if age_ms > stale_max_age_ms {
-        return None;
+    if let Ok(snapshot_json) = read_key_json(state, &symbol_key).await {
+        let snapshot = snapshot_json.0;
+        if let Some(target) =
+            try_snapshot_candidate(state, market_type, now_ms, &snapshot, "symbol_snapshot").await
+        {
+            return Some(target);
+        }
     }
-    let end_ms = parse_round_end_ts_ms(round_id).or_else(|| {
-        let remain = snapshot.get("remaining_ms").and_then(Value::as_i64)?;
-        Some(sample_ms.saturating_add(remain.max(0)))
-    })?;
-    if end_ms < now_ms {
-        return None;
+
+    let tf_key = format!("{}:snapshot:latest:tf:{market_type}", state.redis_prefix);
+    let tf_snapshot = read_key_json(state, &tf_key).await.ok()?.0;
+    let mut btc_rows: Vec<&Value> = match tf_snapshot.as_array() {
+        Some(rows) => rows
+            .iter()
+            .filter(|row| {
+                row.get("symbol")
+                    .and_then(Value::as_str)
+                    .map(|s| s.eq_ignore_ascii_case("BTCUSDT"))
+                    .unwrap_or(false)
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    btc_rows.sort_by_key(|row| {
+        std::cmp::Reverse(
+            row.get("ts_ireland_sample_ms")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+        )
+    });
+    for row in btc_rows {
+        if let Some(target) =
+            try_snapshot_candidate(state, market_type, now_ms, row, "tf_snapshot").await
+        {
+            return Some(target);
+        }
     }
-    if age_ms > fresh_max_age_ms {
-        tracing::warn!(
-            market_type = market_type,
-            market_id = market_id,
-            age_ms = age_ms,
-            fresh_max_age_ms = fresh_max_age_ms,
-            stale_max_age_ms = stale_max_age_ms,
-            end_ms = end_ms,
-            "using stale-but-active snapshot fallback for live market target"
-        );
-    }
-    let (token_id_yes, token_id_no) =
-        resolve_token_ids_from_target_cache(&market_id, market_type).await?;
-    Some(LiveMarketTarget {
-        market_id,
-        symbol: "BTCUSDT".to_string(),
-        timeframe: market_type.to_string(),
-        token_id_yes,
-        token_id_no,
-        end_date: end_date_iso_from_ms(end_ms),
-    })
+    None
 }
 
 pub(super) fn live_decision_key(market_type: &str, decision: &Value) -> String {
