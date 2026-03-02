@@ -175,14 +175,6 @@ pub struct DirectionSignal {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CapitalUpdate {
-    pub available_usdc: f64,
-    /// "Base quote size" used by Predator C+ sizing logic. Interpreted as USDC notional.
-    pub base_quote_size: f64,
-    pub ts_ms: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProbabilityEstimate {
     pub p_fast: f64,
     pub p_settle: f64,
@@ -734,14 +726,6 @@ pub struct ExecutionFunnel {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CapitalState {
-    pub equity_usdc: f64,
-    pub alloc_usdc: f64,
-    pub kelly_fraction: f64,
-    pub drawdown_pct: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RateBudgetState {
     pub rps_limit: f64,
     pub burst: f64,
@@ -892,7 +876,6 @@ pub enum EngineEvent {
     Fill(FillEvent),
     ShadowShot(ShadowShot),
     ShadowOutcome(ShadowOutcome),
-    CapitalUpdate(CapitalUpdate),
     Pnl(PnLSnapshot),
     Control(ControlCommand),
 }

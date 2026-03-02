@@ -536,7 +536,7 @@ export function PaperLabPage({
             <article className="live-block">
               <header>
                 <h3>状态机</h3>
-                <small>实时持仓与资金状态</small>
+                <small>实时持仓状态</small>
               </header>
               <ul className="diag-list">
                 <li>
