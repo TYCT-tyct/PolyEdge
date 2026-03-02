@@ -1049,20 +1049,18 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     .values()
                     .map(|m| format!("{}:{}", m.symbol, m.timeframe))
                     .collect();
-                let mut pair_has_sampling_candidate: HashMap<String, bool> = HashMap::new();
+                let mut pair_has_warmable_candidate: HashMap<String, bool> = HashMap::new();
                 for market in markets_by_id.values() {
                     let pair_key = market_pair_key(market);
-                    let in_window =
-                        market_in_sampling_window(
-                            market,
-                            now_ms,
-                            market_prestart_allow_ms,
-                            market_sample_end_grace_ms,
-                        );
-                    pair_has_sampling_candidate
+                    let warmable = market_candidate_is_warmable(
+                        market,
+                        now_ms,
+                        market_selection_fallback_prewarm_ms,
+                    );
+                    pair_has_warmable_candidate
                         .entry(pair_key)
-                        .and_modify(|v| *v |= in_window)
-                        .or_insert(in_window);
+                        .and_modify(|v| *v |= warmable)
+                        .or_insert(warmable);
                 }
                 let mut sticky_reused = 0usize;
                 for prev in prev_markets.values() {
@@ -1071,7 +1069,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     }
                     let pair_key = market_pair_key(prev);
                     if pair_seen.contains(&pair_key)
-                        && pair_has_sampling_candidate
+                        && pair_has_warmable_candidate
                             .get(&pair_key)
                             .copied()
                             .unwrap_or(false)
@@ -1080,25 +1078,24 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     }
                     // Discovery can temporarily miss active markets; keep the most recent
                     // still-valid market meta to avoid short data gaps on critical pairs.
-                    if now_ms > prev.end_ts_ms.saturating_add(MARKET_STALE_GUARD_MS) {
-                        continue;
-                    }
-                    if now_ms.saturating_add(market_prestart_allow_ms) < prev.start_ts_ms {
+                    if !market_candidate_is_warmable(
+                        prev,
+                        now_ms,
+                        market_selection_fallback_prewarm_ms,
+                    ) {
                         continue;
                     }
                     markets_by_id.insert(prev.market_id.clone(), prev.clone());
                     pair_seen.insert(pair_key.clone());
-                    let prev_in_window =
-                        market_in_sampling_window(
-                            prev,
-                            now_ms,
-                            market_prestart_allow_ms,
-                            market_sample_end_grace_ms,
-                        );
-                    pair_has_sampling_candidate
+                    let prev_warmable = market_candidate_is_warmable(
+                        prev,
+                        now_ms,
+                        market_selection_fallback_prewarm_ms,
+                    );
+                    pair_has_warmable_candidate
                         .entry(pair_key)
-                        .and_modify(|v| *v |= prev_in_window)
-                        .or_insert(prev_in_window);
+                        .and_modify(|v| *v |= prev_warmable)
+                        .or_insert(prev_warmable);
                     sticky_reused = sticky_reused.saturating_add(1);
                 }
                 let mut candidates_by_pair: HashMap<String, Vec<MarketMeta>> = HashMap::new();
@@ -1210,6 +1207,26 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             prev_repaired_pairs.push(pair);
                         }
                         repaired_pairs.extend(prev_repaired_pairs.into_iter().map(|v| format!("{v}:prev")));
+                    }
+                    // Last-resort: keep required pairs non-empty by pinning nearest candidate.
+                    // This avoids full pair drop when discovery is briefly sparse around boundaries.
+                    if !missing_required_pairs.is_empty() {
+                        let mut nearest_repaired_pairs = Vec::<String>::new();
+                        for pair in missing_required_pairs.clone() {
+                            let fallback = candidates_by_pair
+                                .get(&pair)
+                                .and_then(|candidates| candidates.first())
+                                .cloned();
+                            if let Some(nearest) = fallback {
+                                selected_by_pair.insert(pair.clone(), nearest);
+                                nearest_repaired_pairs.push(pair);
+                            }
+                        }
+                        repaired_pairs.extend(
+                            nearest_repaired_pairs
+                                .into_iter()
+                                .map(|v| format!("{v}:nearest")),
+                        );
                     }
                     missing_required_pairs = required_pair_keys
                         .iter()
