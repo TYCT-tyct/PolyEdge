@@ -585,6 +585,68 @@ async fn resolve_live_target_from_snapshot(
             return Some(target);
         }
     }
+
+    let pattern = format!(
+        "{}:snapshot:latest:BTCUSDT:{}:*",
+        state.redis_prefix, market_type
+    );
+    let mut history_keys = Vec::<String>::new();
+    if let Some(mut conn) = state.redis_manager.clone() {
+        let mut cursor: u64 = 0;
+        loop {
+            let scanned: redis::RedisResult<(u64, Vec<String>)> = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(96)
+                .query_async(&mut conn)
+                .await;
+            let Ok((next, mut keys)) = scanned else {
+                break;
+            };
+            history_keys.append(&mut keys);
+            if next == 0 || history_keys.len() >= 320 {
+                break;
+            }
+            cursor = next;
+        }
+    }
+    if !history_keys.is_empty() {
+        let mut best: Option<(i64, LiveMarketTarget)> = None;
+        for key in history_keys {
+            let Ok(snapshot_json) = read_key_json(state, &key).await else {
+                continue;
+            };
+            let snapshot = snapshot_json.0;
+            let Some(target) = try_snapshot_candidate(
+                state,
+                market_type,
+                now_ms,
+                &snapshot,
+                "symbol_history_scan",
+            )
+            .await
+            else {
+                continue;
+            };
+            let sample_ms = snapshot
+                .get("ts_ireland_sample_ms")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            match &best {
+                Some((best_ts, _)) if *best_ts >= sample_ms => {}
+                _ => best = Some((sample_ms, target)),
+            }
+        }
+        if let Some((_, target)) = best {
+            tracing::warn!(
+                market_type = market_type,
+                "market target resolved from symbol history scan fallback"
+            );
+            return Some(target);
+        }
+    }
     None
 }
 
