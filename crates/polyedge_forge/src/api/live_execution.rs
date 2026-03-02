@@ -1097,6 +1097,19 @@ async fn resolve_live_market_target_inner(
             }
         }
     }
+    if let Some(state) = state {
+        if let Some(target) = resolve_live_target_from_snapshot(state, market_type, now_ms).await {
+            let mut cache = live_market_target_cache().write().await;
+            cache.insert(
+                market_type.to_string(),
+                CachedLiveMarketTarget {
+                    fetched_at_ms: Utc::now().timestamp_millis(),
+                    target: target.clone(),
+                },
+            );
+            return Ok(target);
+        }
+    }
 
     let discovery = MarketDiscovery::new(DiscoveryConfig {
         symbols: vec!["BTCUSDT".to_string()],

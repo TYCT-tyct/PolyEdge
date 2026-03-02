@@ -220,10 +220,11 @@ fn market_selection_rank(m: &MarketMeta, now_ms: i64, sample_end_grace_ms: i64) 
     )
 }
 
-fn market_primary_candidate_is_valid(m: &MarketMeta, now_ms: i64) -> bool {
-    // Do not keep long-ended rounds as the pair's primary market. This prevents
-    // boundary stalls from pinning the pipeline to stale round IDs.
-    now_ms < m.start_ts_ms || now_ms <= m.end_ts_ms.saturating_add(MARKET_STALE_GUARD_MS)
+fn market_primary_candidate_is_valid(m: &MarketMeta, now_ms: i64, prestart_allow_ms: i64) -> bool {
+    // Keep the pair primary on currently tradable rounds and near-future rounds inside
+    // prestart window, but still reject long-ended rounds.
+    now_ms.saturating_add(prestart_allow_ms) >= m.start_ts_ms
+        && now_ms <= m.end_ts_ms.saturating_add(MARKET_STALE_GUARD_MS)
 }
 
 fn round_meta_is_fresh(round_id: &str, now_ms: i64, retention_ms: i64) -> bool {
@@ -1040,7 +1041,9 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                 for (pair_key, markets) in &candidates_by_pair {
                     if let Some(best) = markets
                         .iter()
-                        .find(|m| market_primary_candidate_is_valid(m, now_ms))
+                        .find(|m| {
+                            market_primary_candidate_is_valid(m, now_ms, market_prestart_allow_ms)
+                        })
                     {
                         selected_by_pair.insert(pair_key.clone(), best.clone());
                     }
@@ -2647,15 +2650,32 @@ mod tests {
             start_ts_ms: 1_000,
             end_ts_ms: 2_000,
         };
-        assert!(market_primary_candidate_is_valid(&market, 2_001));
+        assert!(market_primary_candidate_is_valid(&market, 2_001, 30_000));
         assert!(market_primary_candidate_is_valid(
             &market,
-            2_000 + MARKET_STALE_GUARD_MS
+            2_000 + MARKET_STALE_GUARD_MS,
+            30_000
         ));
         assert!(!market_primary_candidate_is_valid(
             &market,
-            2_001 + MARKET_STALE_GUARD_MS
+            2_001 + MARKET_STALE_GUARD_MS,
+            30_000
         ));
+    }
+
+    #[test]
+    fn primary_candidate_allows_prestart_window() {
+        let market = MarketMeta {
+            market_id: "m".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            timeframe: "5m".to_string(),
+            title: "BTC".to_string(),
+            target_price: None,
+            start_ts_ms: 10_000,
+            end_ts_ms: 40_000,
+        };
+        assert!(!market_primary_candidate_is_valid(&market, 8_500, 1_000));
+        assert!(market_primary_candidate_is_valid(&market, 8_500, 2_000));
     }
 
     #[test]
