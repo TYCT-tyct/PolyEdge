@@ -392,8 +392,25 @@ fn live_fixed_entry_size_shares() -> Option<f64> {
         .filter(|v| *v > 0.0)
 }
 
+fn timeframe_duration_ms(tf: &str) -> Option<i64> {
+    match tf.trim().to_ascii_lowercase().as_str() {
+        "1m" => Some(60_000),
+        "5m" => Some(300_000),
+        "15m" => Some(900_000),
+        "30m" => Some(1_800_000),
+        "1h" => Some(3_600_000),
+        "2h" => Some(7_200_000),
+        "4h" => Some(14_400_000),
+        _ => None,
+    }
+}
+
 fn parse_round_end_ts_ms(round_id: &str) -> Option<i64> {
-    round_id.rsplit('_').next()?.parse::<i64>().ok()
+    let mut parts = round_id.rsplit('_');
+    let start_ms = parts.next()?.parse::<i64>().ok()?;
+    let timeframe = parts.next()?;
+    let dur_ms = timeframe_duration_ms(timeframe)?;
+    Some(start_ms.saturating_add(dur_ms))
 }
 
 fn live_market_token_cache() -> &'static tokio::sync::RwLock<HashMap<String, (String, String)>> {
@@ -4879,13 +4896,26 @@ mod tests {
 
     #[test]
     fn decision_round_target_match_rejects_cross_round_target() {
-        let end_ms = 1_700_000_000_000_i64;
+        let start_ms = 1_700_000_000_000_i64;
         let mut target = test_target();
-        target.end_date = end_date_iso_from_ms(end_ms);
-        let ok = json!({"round_id": format!("BTCUSDT_5m_{end_ms}")});
-        let bad = json!({"round_id": format!("BTCUSDT_5m_{}", end_ms + 300_000)});
+        target.end_date = end_date_iso_from_ms(start_ms + 300_000);
+        let ok = json!({"round_id": format!("BTCUSDT_5m_{start_ms}")});
+        let bad = json!({"round_id": format!("BTCUSDT_5m_{}", start_ms + 300_000)});
         assert!(decision_round_matches_target(&ok, &target));
         assert!(!decision_round_matches_target(&bad, &target));
+    }
+
+    #[test]
+    fn parse_round_end_ts_uses_timeframe_duration() {
+        let start = 1_700_000_000_000_i64;
+        assert_eq!(
+            parse_round_end_ts_ms(&format!("BTCUSDT_5m_{start}")),
+            Some(start + 300_000)
+        );
+        assert_eq!(
+            parse_round_end_ts_ms(&format!("BTCUSDT_15m_{start}")),
+            Some(start + 900_000)
+        );
     }
 
     #[test]
