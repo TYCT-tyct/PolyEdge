@@ -1788,6 +1788,7 @@ pub(super) fn extract_order_id_from_gateway_record(row: &Value) -> Option<String
 struct PendingFillMeta {
     fill_price_cents: Option<f64>,
     fill_quote_usdc: Option<f64>,
+    fill_size_shares: Option<f64>,
     fee_usdc: f64,
     slippage_usdc: f64,
 }
@@ -1877,6 +1878,9 @@ fn extract_pending_fill_meta(
     let quote_direct = collect_candidates(
         fill,
         &[
+            "fill_quote_usdc",
+            "filled_quote_usdc",
+            "executed_quote_usdc",
             "effective_notional",
             "filled_notional",
             "executed_notional",
@@ -1891,6 +1895,8 @@ fn extract_pending_fill_meta(
     let size_candidates = collect_candidates(
         fill,
         &[
+            "fill_size_shares",
+            "size_matched",
             "filled_size",
             "executed_size",
             "matched_size",
@@ -1898,9 +1904,10 @@ fn extract_pending_fill_meta(
             "size",
         ],
     );
+    let fill_size_shares = size_candidates.into_iter().find(|v| *v > 0.0);
     let quote_from_size = if let (Some(px_c), Some(sz)) = (
         fill_price_cents,
-        size_candidates.into_iter().find(|v| *v > 0.0),
+        fill_size_shares,
     ) {
         Some((px_c / 100.0) * sz)
     } else {
@@ -1939,6 +1946,7 @@ fn extract_pending_fill_meta(
     PendingFillMeta {
         fill_price_cents,
         fill_quote_usdc,
+        fill_size_shares,
         fee_usdc,
         slippage_usdc: explicit_slippage_usdc.max(inferred_slippage_usdc),
     }
@@ -1959,11 +1967,17 @@ pub(super) async fn apply_pending_confirmation(
         .fill_price_cents
         .unwrap_or(pending.price_cents)
         .max(0.01);
+    let fill_size_shares = fill_meta
+        .fill_size_shares
+        .filter(|v| v.is_finite() && *v > 0.0);
     let fill_quote_usdc = fill_meta
         .fill_quote_usdc
+        .or_else(|| fill_size_shares.map(|sz| sz * (fill_price_cents / 100.0)))
         .unwrap_or(pending.quote_size_usdc.max(0.0))
         .max(0.0);
-    let fill_shares = fill_quote_usdc / (fill_price_cents / 100.0).max(0.0001);
+    let fill_shares = fill_size_shares
+        .unwrap_or_else(|| fill_quote_usdc / (fill_price_cents / 100.0).max(0.0001))
+        .max(0.0);
     let fill_cost_usdc = (fill_meta.fee_usdc + fill_meta.slippage_usdc).max(0.0);
     let mut realized_pnl_usdc = 0.0_f64;
     if action == "enter" {
@@ -2689,7 +2703,9 @@ pub(super) fn fill_event_from_open_order(
         "order_id": order.id,
         "fill_price_cents": fill_price * 100.0,
         "fill_quote_usdc": fill_quote,
+        "fill_size_shares": fill_size,
         "size_matched": fill_size,
+        "matched_size": fill_size,
         "associate_trades": order.associate_trades,
     })
 }
@@ -4102,6 +4118,39 @@ mod tests {
         assert!(
             px >= 0.52 - 1e-9,
             "entry retry should move buy price up by >=1 tick, got {px}"
+        );
+    }
+
+    #[test]
+    fn extract_fill_meta_prefers_size_matched_over_quote_backsolve() {
+        let pending = LivePendingOrder {
+            market_type: "5m".to_string(),
+            order_id: "oid".to_string(),
+            action: "enter".to_string(),
+            side: "UP".to_string(),
+            round_id: "r".to_string(),
+            decision_key: "k".to_string(),
+            price_cents: 99.0,
+            quote_size_usdc: 4.95,
+            tif: "FAK".to_string(),
+            style: "taker".to_string(),
+            submit_reason: "test".to_string(),
+            submitted_ts_ms: 0,
+            cancel_after_ms: 1000,
+            retry_count: 0,
+        };
+        let fill = json!({
+            "event": "order_terminal",
+            "state": "filled",
+            "fill_price_cents": 81.0,
+            "fill_quote_usdc": 4.95,
+            "size_matched": 6.111111
+        });
+        let meta = extract_pending_fill_meta(Some(&fill), &pending);
+        let shares = meta.fill_size_shares.unwrap_or(0.0);
+        assert!(
+            (shares - 6.111111).abs() < 1e-6,
+            "should keep exact matched shares, got {shares}"
         );
     }
 }
