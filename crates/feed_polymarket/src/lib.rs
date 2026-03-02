@@ -307,6 +307,15 @@ impl PolymarketFeed {
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut idle_tick = tokio::time::interval(Duration::from_secs(5));
         idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Re-discover market set periodically and reconnect immediately when IDs change.
+        // This prevents waiting for coarse refresh windows at round boundaries.
+        let rediscover_every = std::env::var("POLYEDGE_MARKET_REDISCOVER_SEC")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(5)
+            .clamp(2, 60);
+        let mut rediscover_tick = tokio::time::interval(Duration::from_secs(rediscover_every));
+        rediscover_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_update_at = Instant::now();
         // Many Polymarket markets (especially 5m/15m contracts) expire quickly. If the WS
         // connection stays up, we would otherwise keep subscribing to stale/closed assets and
@@ -384,6 +393,34 @@ impl PolymarketFeed {
                             "polymarket market ws idle too long, reconnecting"
                         );
                         break;
+                    }
+                }
+                _ = rediscover_tick.tick() => {
+                    match self.discover_target_markets().await {
+                        Ok(latest_markets) => {
+                            let current_ids = markets.keys().cloned().collect::<HashSet<_>>();
+                            let latest_ids = latest_markets.keys().cloned().collect::<HashSet<_>>();
+                            if current_ids != latest_ids {
+                                let added = latest_ids.difference(&current_ids).count();
+                                let removed = current_ids.difference(&latest_ids).count();
+                                tracing::info!(
+                                    current_market_count = markets.len(),
+                                    discovered_market_count = latest_markets.len(),
+                                    added,
+                                    removed,
+                                    rediscover_sec = rediscover_every,
+                                    "polymarket market set changed, reconnecting"
+                                );
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                rediscover_sec = rediscover_every,
+                                "polymarket market rediscover failed"
+                            );
+                        }
                     }
                 }
                 _ = &mut refresh_deadline => {
