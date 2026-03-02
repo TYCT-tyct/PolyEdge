@@ -1830,10 +1830,46 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                         "submit_accepted_missing_order_id".to_string()
                     } else {
                         record
-                            .get("error")
+                            .get("reject_reason")
                             .and_then(Value::as_str)
+                            .filter(|v| !v.trim().is_empty())
+                            .or_else(|| {
+                                record
+                                    .get("response")
+                                    .and_then(|v| v.get("error_msg"))
+                                    .and_then(Value::as_str)
+                                    .filter(|v| !v.trim().is_empty())
+                            })
+                            .or_else(|| {
+                                record
+                                    .get("response")
+                                    .and_then(|v| v.get("status"))
+                                    .and_then(Value::as_str)
+                                    .filter(|v| !v.trim().is_empty())
+                            })
+                            .or_else(|| {
+                                record
+                                    .get("error")
+                                    .and_then(Value::as_str)
+                                    .filter(|v| !v.trim().is_empty())
+                            })
                             .unwrap_or("rejected")
                             .to_string()
+                    };
+                    if !accepted && event_reason.eq_ignore_ascii_case("rejected") {
+                        tracing::warn!(
+                            market_type = market_type,
+                            action = action,
+                            side = side,
+                            "live order rejected without detailed reason in execution record"
+                        );
+                    }
+                    let event_reason = if accepted {
+                        "submit_accepted_pending_confirm".to_string()
+                    } else if accepted_raw && order_id.is_none() {
+                        "submit_accepted_missing_order_id".to_string()
+                    } else {
+                        event_reason
                     };
                     if accepted {
                         if action == "enter" || action == "add" {

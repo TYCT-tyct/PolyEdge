@@ -195,6 +195,9 @@ const LIVE_MARKET_TARGET_SWITCH_GUARD_MS_MAX: i64 = 30_000;
 const LIVE_MARKET_TARGET_SNAPSHOT_MAX_AGE_MS_DEFAULT: i64 = 8_000;
 const LIVE_MARKET_TARGET_SNAPSHOT_MAX_AGE_MS_MIN: i64 = 1_000;
 const LIVE_MARKET_TARGET_SNAPSHOT_MAX_AGE_MS_MAX: i64 = 120_000;
+const LIVE_MARKET_TARGET_SNAPSHOT_STALE_MAX_AGE_MS_DEFAULT: i64 = 45_000;
+const LIVE_MARKET_TARGET_SNAPSHOT_STALE_MAX_AGE_MS_MIN: i64 = 5_000;
+const LIVE_MARKET_TARGET_SNAPSHOT_STALE_MAX_AGE_MS_MAX: i64 = 300_000;
 const LIVE_TARGET_CACHE_FILE_DEFAULT: &str = "/data/polyedge-forge/cache/target_market_cache.json";
 const LIVE_ENTRY_MAKER_MAX_WAIT_MS_DEFAULT: i64 = 850;
 const LIVE_ENTRY_MAKER_MAX_WAIT_MS_MIN: i64 = 500;
@@ -296,6 +299,17 @@ fn live_market_target_snapshot_max_age_ms() -> i64 {
         .clamp(
             LIVE_MARKET_TARGET_SNAPSHOT_MAX_AGE_MS_MIN,
             LIVE_MARKET_TARGET_SNAPSHOT_MAX_AGE_MS_MAX,
+        )
+}
+
+fn live_market_target_snapshot_stale_max_age_ms() -> i64 {
+    std::env::var("FORGE_FEV1_LIVE_TARGET_SNAPSHOT_STALE_MAX_AGE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(LIVE_MARKET_TARGET_SNAPSHOT_STALE_MAX_AGE_MS_DEFAULT)
+        .clamp(
+            LIVE_MARKET_TARGET_SNAPSHOT_STALE_MAX_AGE_MS_MIN,
+            LIVE_MARKET_TARGET_SNAPSHOT_STALE_MAX_AGE_MS_MAX,
         )
 }
 
@@ -492,7 +506,9 @@ async fn resolve_live_target_from_snapshot(
         .and_then(Value::as_i64)
         .unwrap_or(0);
     let age_ms = now_ms.saturating_sub(sample_ms);
-    if age_ms > live_market_target_snapshot_max_age_ms() {
+    let fresh_max_age_ms = live_market_target_snapshot_max_age_ms();
+    let stale_max_age_ms = live_market_target_snapshot_stale_max_age_ms();
+    if age_ms > stale_max_age_ms {
         return None;
     }
     let end_ms = parse_round_end_ts_ms(round_id).or_else(|| {
@@ -501,6 +517,17 @@ async fn resolve_live_target_from_snapshot(
     })?;
     if end_ms < now_ms {
         return None;
+    }
+    if age_ms > fresh_max_age_ms {
+        tracing::warn!(
+            market_type = market_type,
+            market_id = market_id,
+            age_ms = age_ms,
+            fresh_max_age_ms = fresh_max_age_ms,
+            stale_max_age_ms = stale_max_age_ms,
+            end_ms = end_ms,
+            "using stale-but-active snapshot fallback for live market target"
+        );
     }
     let (token_id_yes, token_id_no) =
         resolve_token_ids_from_target_cache(&market_id, market_type).await?;
