@@ -128,6 +128,10 @@ pub(super) fn round_to_tick(price: f64, tick_size: f64, is_buy: bool) -> f64 {
     aligned.clamp(0.01, 0.99)
 }
 
+fn round_lot_size(size: f64) -> f64 {
+    ((size.max(0.0) * 100.0).round() / 100.0).max(0.01)
+}
+
 fn decimal_places_from_step(step: f64, fallback: usize, max_decimals: usize) -> usize {
     if !step.is_finite() || step <= 0.0 {
         return fallback.min(max_decimals);
@@ -216,6 +220,9 @@ const LIVE_CANCEL_FAILURE_FORCE_PAUSE_OTHER_THRESHOLD: u8 = 3;
 const LIVE_GTD_MIN_FUTURE_GUARD_SEC_DEFAULT: i64 = 60;
 const LIVE_GTD_MIN_FUTURE_GUARD_SEC_MIN: i64 = 30;
 const LIVE_GTD_MIN_FUTURE_GUARD_SEC_MAX: i64 = 240;
+const LIVE_GTD_EXPIRATION_SAFETY_SEC_DEFAULT: i64 = 8;
+const LIVE_GTD_EXPIRATION_SAFETY_SEC_MIN: i64 = 0;
+const LIVE_GTD_EXPIRATION_SAFETY_SEC_MAX: i64 = 30;
 const LIVE_ROUND_TARGET_MATCH_TOLERANCE_MS_DEFAULT: i64 = 5_000;
 const LIVE_ROUND_TARGET_MATCH_TOLERANCE_MS_MIN: i64 = 0;
 const LIVE_ROUND_TARGET_MATCH_TOLERANCE_MS_MAX: i64 = 120_000;
@@ -370,6 +377,17 @@ fn live_gtd_min_future_guard_sec() -> i64 {
         .clamp(
             LIVE_GTD_MIN_FUTURE_GUARD_SEC_MIN,
             LIVE_GTD_MIN_FUTURE_GUARD_SEC_MAX,
+        )
+}
+
+fn live_gtd_expiration_safety_sec() -> i64 {
+    std::env::var("FORGE_FEV1_GTD_EXPIRATION_SAFETY_SEC")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(LIVE_GTD_EXPIRATION_SAFETY_SEC_DEFAULT)
+        .clamp(
+            LIVE_GTD_EXPIRATION_SAFETY_SEC_MIN,
+            LIVE_GTD_EXPIRATION_SAFETY_SEC_MAX,
         )
 }
 
@@ -1487,8 +1505,7 @@ pub(super) fn decision_to_live_payload(
             }
         }
     }
-    size = size.max(size_floor).max(0.01);
-    size = (size * 10_000.0).round() / 10_000.0;
+    size = round_lot_size(size.max(size_floor));
     if is_exit_like && notes.iter().any(|n| n == "depth_thin_exit_force_taker") {
         tif = "FAK".to_string();
         style = "taker".to_string();
@@ -1581,14 +1598,15 @@ pub(super) fn decision_to_live_payload(
             let tick_size = book.tick_size.max(0.0001);
             price = round_to_tick(price, tick_size, is_buy);
             size_floor = min_order_size;
-            size = forced_size_shares
-                .unwrap_or_else(|| (quote_size / price).max(size_floor))
-                .max(0.01);
-            size = (size * 10_000.0).round() / 10_000.0;
+            size = round_lot_size(
+                forced_size_shares
+                    .unwrap_or_else(|| (quote_size / price).max(size_floor))
+                    .max(0.01),
+            );
         }
     }
     if let Some(forced) = forced_size_shares {
-        size = forced.max(size_floor).max(0.01);
+        size = round_lot_size(forced.max(size_floor).max(0.01));
         if is_exit_like {
             notes.push("force_exit_full_size".to_string());
         } else {
@@ -2030,7 +2048,7 @@ pub(super) fn build_retry_payload(current: &Value, reason: &str, attempt: usize)
             if let Some(sz) = lock_retry_size {
                 obj.insert(
                     "size".to_string(),
-                    json!((sz * 10_000.0).round() / 10_000.0),
+                    json!(round_lot_size(sz)),
                 );
             } else if let Some(q) = obj
                 .get("quote_size_usdc")
@@ -2041,7 +2059,7 @@ pub(super) fn build_retry_payload(current: &Value, reason: &str, attempt: usize)
                 let resized = (q / shifted_price).max(0.01);
                 obj.insert(
                     "size".to_string(),
-                    json!((resized * 10_000.0).round() / 10_000.0),
+                    json!(round_lot_size(resized)),
                 );
             }
         }
@@ -3585,7 +3603,7 @@ pub(super) async fn submit_rust_order(
         .unwrap_or(0.01);
     let price_decimals = decimal_places_from_step(tick_size, 2, 6);
     let price_str = format_decimal_compact(price, price_decimals.max(2));
-    let size_str = format_decimal_compact(size, 5);
+    let size_str = format_decimal_compact(round_lot_size(size), 2);
     let price_dec = PmDecimal::from_str(&price_str).map_err(|e| format!("bad price: {e}"))?;
     let size_dec = PmDecimal::from_str(&size_str).map_err(|e| format!("bad size: {e}"))?;
     let order_type = pm_order_type_from_tif(&tif);
@@ -3644,8 +3662,12 @@ pub(super) async fn submit_rust_order(
             // Polymarket GTD requires expiration to be sufficiently in the future
             // (server-side security threshold, typically >= 60s).
             let ttl_sec = ((ttl_ms + 999) / 1000).max(1);
-            let expiration =
-                Utc::now() + chrono::Duration::seconds(live_gtd_min_future_guard_sec() + ttl_sec);
+            let expiration = Utc::now()
+                + chrono::Duration::seconds(
+                    live_gtd_min_future_guard_sec()
+                        + live_gtd_expiration_safety_sec()
+                        + ttl_sec,
+                );
             builder = builder.expiration(expiration);
         }
         let signable = builder
