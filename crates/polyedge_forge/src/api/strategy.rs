@@ -1853,6 +1853,12 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                                     .and_then(Value::as_str)
                                     .filter(|v| !v.trim().is_empty())
                             })
+                            .or_else(|| {
+                                record
+                                    .get("reason")
+                                    .and_then(Value::as_str)
+                                    .filter(|v| !v.trim().is_empty())
+                            })
                             .unwrap_or("rejected")
                             .to_string()
                     };
