@@ -66,10 +66,12 @@ body {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 18px;
 }
 
 .hero-left {
+  flex: 1 1 460px;
   min-width: 0;
 }
 
@@ -96,6 +98,8 @@ body {
   font-weight: 600;
   margin-left: 8px;
   font-size: 0.72em;
+  display: inline-block;
+  white-space: nowrap;
 }
 
 .hero-sub {
@@ -110,14 +114,22 @@ body {
   display: grid;
   gap: 10px;
   justify-items: end;
-  flex-shrink: 0;
+  flex: 1 1 560px;
+  width: min(100%, 700px);
+  margin-left: auto;
 }
 
 .hero-meta {
   display: flex;
   align-items: center;
   gap: 8px;
+  width: 100%;
   flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.hero-right .btn-group {
+  width: 100%;
   justify-content: flex-end;
 }
 
@@ -1067,6 +1079,7 @@ select:focus {
   }
 
   .hero-right {
+    width: 100%;
     justify-items: flex-start;
   }
 
