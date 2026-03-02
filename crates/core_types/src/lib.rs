@@ -798,7 +798,6 @@ pub struct ShadowShot {
     #[serde(default = "default_execution_style")]
     pub execution_style: ExecutionStyle,
     /// Positive means: our fast reference tick arrived earlier than the Polymarket book update.
-    /// See docs/metrics_contract.md for the contract definition.
     #[serde(default)]
     pub book_top_lag_ms: f64,
     /// Execution venue request/ack duration only (real in live mode).

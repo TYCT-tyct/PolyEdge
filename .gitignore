@@ -1,10 +1,13 @@
-# Rust
+# Build outputs
 /target
 **/target/
 **/*.rs.bk
-Cargo.lock
 
-# Python
+# Frontend
+**/node_modules/
+**/dist/
+
+# Python/local runtime artifacts
 __pycache__/
 *.py[cod]
 *.so
@@ -13,33 +16,24 @@ venv/
 env/
 .env
 
-# Frontend
-**/node_modules/
-**/dist/
-
-# Datasets & Temp
+# Local data, temp and logs
 datasets/
-crates/replay_engine/datasets/
 tmp/
+artifacts/
 *.log
+*.out
 *.tar.gz
+tmp_*
+temp_*
+debug_*.json
+diff_files.txt
 
-# IDEs
+# IDE/editor
 .idea
 .vscode
 *.iml
 
-# Deployment Artifacts
-setup_remote.sh
-deploy.tar.gz
-settings.local.json
-optimized.env.example
-debug_*.json
-scripts/deploy_optimize.sh
-scripts/network_optimize.sh
-scripts/latency_probe/live_latency.py
-
-# Secrets / keys (must never be committed)
+# Secrets / local machine state
 keys/
 temp_keys/
 *.pem
@@ -47,35 +41,10 @@ temp_keys/
 *.key
 *.p12
 *.pfx
+*.marker
 .claude
 .agent
 .codex
 .cursor
 .gemini
 .shared
-
-# Local machine artifacts
-*.marker
-
-# One-off review artifacts
-.ai_slop_*.txt
-ai_slop_diff.txt
-modify_configs.py
-
-# Local prompt scratch / generated analysis artifacts
-.github/prompts/
-artifacts/
-diff_files.txt
-tmp_*
-temp_*
-*.out
-
-# Local strategy-rewrite experiments
-configs/strategy_rewrite_aggressive.toml
-configs/strategy_rewrite_baseline.toml
-configs/strategy_rewrite_defensive.toml
-scripts/kline_live_monitor.py
-scripts/plot_official_kline_5m.py
-scripts/plot_official_kline_5m_linear_1s.py
-scripts/run_kline_with_monitor.ps1
-scripts/run_strategy_rewrite_test.ps1

@@ -1,26 +1,35 @@
-# PolyEdge (FEV1-Only Workspace)
+# PolyEdge (Forge-Only)
 
-This repository now keeps only the active FEV1 runtime chain:
+PolyEdge is now a Forge-first repository. Legacy latency-arbitrage stacks and side systems were removed.
 
-- `crates/polyedge_forge` - dashboard API, paper simulation, market data aggregation
+## Kept Components
+
+- `crates/polyedge_forge` - recorder, API, paper/live strategy runtime
+- `crates/core_types` - shared domain types
+- `crates/feed_polymarket` - Polymarket feed adapter
+- `crates/feed_reference` - reference feed adapter
+- `crates/market_discovery` - market discovery logic
 - `heatmap_dashboard` - frontend dashboard
+- `scripts/forge` - Forge-only ops and autotune scripts
+- `ops/systemd/polyedge-tokyo-disk-guard.*` - Tokyo disk protection timer
 
-All legacy strategy stacks and their dependent crates/configs have been removed from the workspace.
-
-## Run
+## Run Forge
 
 ```bash
-cargo run -p polyedge_forge
+cargo run -p polyedge_forge -- ireland-recorder
 ```
 
-## Frontend
+```bash
+cargo run -p polyedge_forge -- ireland-api
+```
 
 ```bash
-npm --prefix heatmap_dashboard install
+cargo run -p polyedge_forge -- tokyo-relay
+```
+
+## Build Dashboard
+
+```bash
+npm --prefix heatmap_dashboard ci
 npm --prefix heatmap_dashboard run build
 ```
-
-## Notes
-
-- Paper simulation remains available in `polyedge_forge`.
-- Live execution should only be enabled explicitly by runtime config/flag.

@@ -1,1 +1,0 @@
-Alert definitions live here.

@@ -16,18 +16,15 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          python-version: "3.11"
+          node-version: "20"
 
       - name: Cargo Tests
         run: cargo test --workspace --all-targets --quiet
 
-      - name: Python Syntax Check
+      - name: Frontend Build
         run: |
-          python -m py_compile scripts/*.py
-          python -m py_compile scripts/latency_probe/*.py
-
-      - name: Metrics Contract Gate
-        run: python scripts/validate_metrics_contract.py
+          npm --prefix heatmap_dashboard ci
+          npm --prefix heatmap_dashboard run build

@@ -1,23 +1,25 @@
 # CLAUDE.md
 
-## Current Project Scope
+## Project Scope
 
-The workspace is intentionally reduced to FEV1-active services only:
+This repository is Forge-only:
 
-- `polyedge_forge`
-- shared runtime crates they directly depend on
+- `polyedge_forge` runtime + its direct dependency crates
+- `heatmap_dashboard`
+- Forge deployment/maintenance scripts under `scripts/forge`
 
-Legacy strategy modules are no longer part of active code paths.
+All legacy latency-arbitrage side stacks are intentionally removed.
 
 ## Primary Commands
 
 ```bash
 cargo check -p polyedge_forge
-cargo run -p polyedge_forge
+cargo test --workspace --all-targets
+npm --prefix heatmap_dashboard ci
 npm --prefix heatmap_dashboard run build
 ```
 
-## Operational Rule
+## Runtime Rule
 
-- Paper simulation runs by default through `polyedge_forge`.
-- Live execution must be explicitly enabled by runtime switch/config.
+- Paper is always available in Forge.
+- Live execution must be explicitly enabled by env/config gate.
