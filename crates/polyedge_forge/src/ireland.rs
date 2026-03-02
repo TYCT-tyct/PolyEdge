@@ -62,6 +62,7 @@ const TARGET_RETRY_RETENTION_MS: i64 = 20 * 60 * 1000;
 const ROUND_META_RETENTION_MS: i64 = 6 * 60 * 60 * 1000;
 const EMITTED_ROUND_RETENTION_MS: i64 = 6 * 60 * 60 * 1000;
 const DISCOVERY_EMPTY_GRACE_DEFAULT_MS: i64 = 90_000;
+const ROUND_DROP_ON_QUALITY_FAIL_DEFAULT: bool = true;
 const TOKYO_INPUT_STALE_GUARD_DEFAULT_MS: i64 = 2_500;
 const INPUT_STALE_WARN_THROTTLE_MS: i64 = 15_000;
 
@@ -79,6 +80,13 @@ fn env_flag(key: &str, default: bool) -> bool {
 
 fn chainlink_runtime_enabled() -> bool {
     env_flag("FORGE_CHAINLINK_ENABLED", false)
+}
+
+fn round_drop_on_quality_fail_enabled() -> bool {
+    env_flag(
+        "FORGE_ROUND_DROP_ON_QUALITY_FAIL",
+        ROUND_DROP_ON_QUALITY_FAIL_DEFAULT,
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -645,6 +653,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         .and_then(|v| v.trim().parse::<i64>().ok())
         .unwrap_or(DISCOVERY_EMPTY_GRACE_DEFAULT_MS)
         .clamp(10_000, 10 * 60 * 1000);
+    let round_drop_on_quality_fail = round_drop_on_quality_fail_enabled();
 
     let root = PathBuf::from(&args.data_root);
     fs::create_dir_all(root.join("snapshot_100ms")).ok();
@@ -669,6 +678,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         market_prestart_allow_ms = market_prestart_allow_ms,
         market_sample_end_grace_ms = market_sample_end_grace_ms,
         discovery_empty_grace_ms = discovery_empty_grace_ms,
+        round_drop_on_quality_fail = round_drop_on_quality_fail,
         market_filter = %market_filter.summary(),
         ?supported_symbols,
         ?active_symbols,
@@ -1679,6 +1689,38 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                 );
                                 continue;
                             }
+                            if !report.accept && round_drop_on_quality_fail {
+                                let reason = report.reasons.join(",");
+                                log_ingest(
+                                    &persist_tx,
+                                    "warn",
+                                    "round_quality",
+                                    &format!(
+                                        "drop_low_quality_round {} samples={} expected={} reachable_expected={} coverage={:.3} sample_ratio={:.3} reachable_ratio={:.3} gate_ratio={:.3} avg_gap_ms={} max_gap_ms={} start_delay_ms={} end_missing_ms={} settle_stale_ms={} reason={}",
+                                        round_id,
+                                        report.sample_count,
+                                        report.expected_samples,
+                                        report.reachable_expected_samples,
+                                        report.coverage_ratio,
+                                        report.sample_ratio,
+                                        report.reachable_sample_ratio,
+                                        report.sample_ratio_gate,
+                                        report.avg_gap_ms,
+                                        report.max_gap_ms,
+                                        report.start_delay_ms,
+                                        report.end_missing_ms,
+                                        report.settle_stale_ms,
+                                        reason
+                                    ),
+                                );
+                                tracing::warn!(
+                                    round_id = %round_id,
+                                    accepted = report.accept,
+                                    reasons = %reason,
+                                    "drop round due to quality gate"
+                                );
+                                continue;
+                            }
                             let snapshot_count = buffer.snapshots.len();
                             if let Err(err) = commit_tx
                                 .send(RoundCommit {
@@ -1824,6 +1866,40 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                     "skip_duplicate_stale_round {} reason=already_committed_in_process",
                                     round.round_id
                                 ),
+                            );
+                            continue;
+                        }
+                        if !report.accept && round_drop_on_quality_fail {
+                            let reason = if report.reasons.is_empty() {
+                                "quality_reject".to_string()
+                            } else {
+                                report.reasons.join(",")
+                            };
+                            log_ingest(
+                                &persist_tx,
+                                "warn",
+                                "round_quality",
+                                &format!(
+                                    "drop_low_quality_stale_round {} samples={} expected={} reachable_expected={} coverage={:.3} sample_ratio={:.3} reachable_ratio={:.3} gate_ratio={:.3} avg_gap_ms={} max_gap_ms={} settle_stale_ms={} reason={}",
+                                    rid,
+                                    report.sample_count,
+                                    report.expected_samples,
+                                    report.reachable_expected_samples,
+                                    report.coverage_ratio,
+                                    report.sample_ratio,
+                                    report.reachable_sample_ratio,
+                                    report.sample_ratio_gate,
+                                    report.avg_gap_ms,
+                                    report.max_gap_ms,
+                                    report.settle_stale_ms,
+                                    reason
+                                ),
+                            );
+                            tracing::warn!(
+                                round_id = %rid,
+                                accepted = report.accept,
+                                reasons = %reason,
+                                "drop stale round due to quality gate"
                             );
                             continue;
                         }
