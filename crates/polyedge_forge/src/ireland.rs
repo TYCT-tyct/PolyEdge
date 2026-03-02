@@ -61,7 +61,7 @@ const TARGET_CACHE_RETENTION_MS: i64 = 2 * 60 * 60 * 1000;
 const TARGET_RETRY_RETENTION_MS: i64 = 20 * 60 * 1000;
 const ROUND_META_RETENTION_MS: i64 = 6 * 60 * 60 * 1000;
 const EMITTED_ROUND_RETENTION_MS: i64 = 6 * 60 * 60 * 1000;
-const DISCOVERY_EMPTY_GRACE_DEFAULT_MS: i64 = 90_000;
+const DISCOVERY_EMPTY_GRACE_DEFAULT_MS: i64 = 8_000;
 const ROUND_DROP_ON_QUALITY_FAIL_DEFAULT: bool = true;
 const TOKYO_INPUT_STALE_GUARD_DEFAULT_MS: i64 = 2_500;
 const INPUT_STALE_WARN_THROTTLE_MS: i64 = 15_000;
@@ -1213,18 +1213,46 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                 if selected_empty_from_discovery {
                     let since = *discovery_empty_since_ms.get_or_insert(now_ms);
                     discovery_keepalive_elapsed_ms = now_ms.saturating_sub(since);
-                    if !prev_primary_by_pair.is_empty()
+                    let valid_prev_primary_by_pair = prev_primary_by_pair
+                        .iter()
+                        .filter_map(|(pair, market)| {
+                            if market_primary_candidate_is_valid(
+                                market,
+                                now_ms,
+                                market_prestart_allow_ms,
+                            ) {
+                                Some((pair.clone(), market.clone()))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<HashMap<_, _>>();
+                    if !valid_prev_primary_by_pair.is_empty()
                         && discovery_keepalive_elapsed_ms <= discovery_empty_grace_ms
                     {
-                        markets_by_id = prev_markets;
-                        selected_by_pair = prev_primary_by_pair;
-                        if candidates_by_pair.is_empty() {
-                            candidates_by_pair = prev_candidate_markets_by_pair;
-                        } else {
-                            for (pair, prev_candidates) in prev_candidate_markets_by_pair {
-                                candidates_by_pair
-                                    .entry(pair)
-                                    .or_insert_with(|| prev_candidates);
+                        selected_by_pair = valid_prev_primary_by_pair;
+                        markets_by_id.clear();
+                        for market in selected_by_pair.values() {
+                            markets_by_id.insert(market.market_id.clone(), market.clone());
+                        }
+                        for (pair, prev_candidates) in prev_candidate_markets_by_pair {
+                            let valid_candidates = prev_candidates
+                                .into_iter()
+                                .filter(|market| {
+                                    market_primary_candidate_is_valid(
+                                        market,
+                                        now_ms,
+                                        market_prestart_allow_ms,
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            if valid_candidates.is_empty() {
+                                continue;
+                            }
+                            if candidates_by_pair.is_empty() {
+                                candidates_by_pair.insert(pair.clone(), valid_candidates);
+                            } else {
+                                candidates_by_pair.entry(pair).or_insert(valid_candidates);
                             }
                         }
                         discovery_keepalive_reused = true;

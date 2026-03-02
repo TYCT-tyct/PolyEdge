@@ -457,6 +457,16 @@ function bucketizePoints(points: ChartPoint[]): ChartPoint[] {
   let lastRoundId = "";
 
   for (const agg of ordered) {
+    if (lastObs && lastRoundId && agg.roundId !== lastRoundId) {
+      const switchTs = agg.bucketStartMs - 1;
+      const lastTs = out[out.length - 1]?.timestamp_ms ?? Number.NEGATIVE_INFINITY;
+      if (Number.isFinite(switchTs) && switchTs > lastTs) {
+        // Force a hard visual break at round boundaries to avoid "tailing" illusion.
+        out.push(synthPoint(lastObs.source, switchTs, null, null, null, true));
+      }
+      lastObs = null;
+    }
+
     if (
       lastObs &&
       lastBucketStartMs != null &&

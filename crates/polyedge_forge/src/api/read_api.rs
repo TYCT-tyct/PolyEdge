@@ -85,9 +85,11 @@ pub(super) async fn fetch_latest_snapshot(
 ) -> Result<Option<Value>, ApiError> {
     let now_ms = Utc::now().timestamp_millis();
     if state.redis_client.is_none() {
-        let row = fetch_latest_snapshot_from_clickhouse(state, symbol, timeframe).await?;
+        let row = fetch_latest_snapshot_from_clickhouse(state, symbol, timeframe, now_ms).await?;
         return Ok(row.filter(|v| {
-            is_live_snapshot_fresh(v, timeframe, now_ms) || is_live_snapshot_recent(v, now_ms)
+            is_live_snapshot_fresh(v, timeframe, now_ms)
+                || (is_live_snapshot_recent(v, now_ms)
+                    && is_live_snapshot_round_active(v, timeframe, now_ms))
         }));
     }
 
@@ -110,13 +112,11 @@ pub(super) async fn fetch_latest_snapshot(
         }
     } {
         if is_live_snapshot_fresh(&v, timeframe, now_ms) {
-            if snapshot_remaining_ms(&v) > 0 {
+            if is_live_snapshot_round_active(&v, timeframe, now_ms) {
                 return Ok(Some(v));
             }
-            fallback_direct = Some(v);
         } else if is_live_snapshot_recent(&v, now_ms) {
-            let pri = snapshot_priority(&v, timeframe, now_ms);
-            if pri.0 > 0 {
+            if is_live_snapshot_round_active(&v, timeframe, now_ms) {
                 fallback_direct = Some(v);
             }
         }
@@ -165,15 +165,16 @@ pub(super) async fn fetch_latest_snapshot(
             continue;
         }
         let pri = snapshot_priority(row, timeframe, now_ms);
-        if is_live_snapshot_fresh(row, timeframe, now_ms) {
+        if is_live_snapshot_fresh(row, timeframe, now_ms)
+            && is_live_snapshot_round_active(row, timeframe, now_ms)
+        {
             if best_fresh_priority.map(|v| pri > v).unwrap_or(true) {
                 best_fresh_priority = Some(pri);
                 best_fresh = Some(row.clone());
             }
-        } else if is_live_snapshot_recent(row, now_ms) {
-            if pri.0 <= 0 {
-                continue;
-            }
+        } else if is_live_snapshot_recent(row, now_ms)
+            && is_live_snapshot_round_active(row, timeframe, now_ms)
+        {
             if best_recent_priority.map(|v| pri > v).unwrap_or(true) {
                 best_recent_priority = Some(pri);
                 best_recent = Some(row.clone());
@@ -193,9 +194,11 @@ pub(super) async fn fetch_latest_snapshot(
         return Ok(best_recent);
     }
 
-    let row = fetch_latest_snapshot_from_clickhouse(state, symbol, timeframe).await?;
+    let row = fetch_latest_snapshot_from_clickhouse(state, symbol, timeframe, now_ms).await?;
     Ok(row.filter(|v| {
-        is_live_snapshot_fresh(v, timeframe, now_ms) || is_live_snapshot_recent(v, now_ms)
+        is_live_snapshot_fresh(v, timeframe, now_ms)
+            || (is_live_snapshot_recent(v, now_ms)
+                && is_live_snapshot_round_active(v, timeframe, now_ms))
     }))
 }
 
@@ -203,10 +206,12 @@ pub(super) async fn fetch_latest_snapshot_from_clickhouse(
     state: &ApiState,
     symbol: &str,
     timeframe: &str,
+    now_ms: i64,
 ) -> Result<Option<Value>, ApiError> {
     let Some(ch_url) = state.ch_url.as_deref() else {
         return Ok(None);
     };
+    let from_ms = now_ms.saturating_sub(LIVE_SNAPSHOT_FALLBACK_MAX_AGE_MS.saturating_mul(3));
     let query = format!(
         "SELECT
             schema_version,
@@ -236,11 +241,13 @@ pub(super) async fn fetch_latest_snapshot_from_clickhouse(
             acceleration
         FROM polyedge_forge.snapshot_100ms
         WHERE symbol='{}' AND timeframe='{}'
-        ORDER BY (remaining_ms > 0) DESC, ts_ireland_sample_ms DESC
+          AND ts_ireland_sample_ms >= {}
+        ORDER BY ts_ireland_sample_ms DESC
         LIMIT 1
         FORMAT JSON",
         symbol.to_ascii_uppercase(),
-        timeframe
+        timeframe,
+        from_ms
     );
     let rows = rows_from_json(query_clickhouse_json(ch_url, &query).await?);
     Ok(rows.into_iter().next())
@@ -748,7 +755,7 @@ pub(super) async fn collector_status(
     for tf in ["5m", "15m"] {
         let snapshot = match fetch_latest_snapshot(&state, "BTCUSDT", tf).await? {
             Some(v) => Some(v),
-            None => fetch_latest_snapshot_from_clickhouse(&state, "BTCUSDT", tf).await?,
+            None => fetch_latest_snapshot_from_clickhouse(&state, "BTCUSDT", tf, now_ms).await?,
         };
 
         let (tf_ok, status_value) = collector_timeframe_status_row(snapshot.as_ref(), now_ms);
@@ -776,7 +783,7 @@ pub(super) async fn collector_metrics(
     for tf in ["5m", "15m"] {
         let snapshot = match fetch_latest_snapshot(&state, &symbol, tf).await? {
             Some(v) => Some(v),
-            None => fetch_latest_snapshot_from_clickhouse(&state, &symbol, tf).await?,
+            None => fetch_latest_snapshot_from_clickhouse(&state, &symbol, tf, now_ms).await?,
         };
         let (tf_ok, mut status_value) = collector_timeframe_status_row(snapshot.as_ref(), now_ms);
         if !tf_ok {

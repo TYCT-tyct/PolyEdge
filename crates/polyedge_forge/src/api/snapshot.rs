@@ -1,5 +1,28 @@
 use super::*;
 
+pub(super) fn snapshot_round_end_ms(snapshot: &Value, market_type: &str) -> Option<i64> {
+    let round_id = snapshot
+        .get("round_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let start_ms = parse_round_start_ms(round_id)?;
+    Some(start_ms.saturating_add(market_type_to_ms(market_type)))
+}
+
+pub(super) fn is_live_snapshot_round_active(
+    snapshot: &Value,
+    market_type: &str,
+    now_ms: i64,
+) -> bool {
+    let rem_ms = snapshot_remaining_ms(snapshot);
+    if rem_ms > 0 {
+        return true;
+    }
+    snapshot_round_end_ms(snapshot, market_type)
+        .map(|end_ms| now_ms <= end_ms.saturating_add(LIVE_ROUND_END_GRACE_MS))
+        .unwrap_or(false)
+}
+
 pub(super) fn is_live_snapshot_fresh(snapshot: &Value, market_type: &str, now_ms: i64) -> bool {
     let ts_ms = snapshot
         .get("ts_ireland_sample_ms")
@@ -12,22 +35,13 @@ pub(super) fn is_live_snapshot_fresh(snapshot: &Value, market_type: &str, now_ms
         return false;
     }
 
-    let remaining_ms = snapshot
-        .get("remaining_ms")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    if remaining_ms <= 0 && now_ms.saturating_sub(ts_ms) > LIVE_ROUND_END_GRACE_MS {
-        return false;
-    }
-
-    let round_id = snapshot
-        .get("round_id")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let start_ms = parse_round_start_ms(round_id).unwrap_or(0);
-    if start_ms > 0 {
-        let end_ms = start_ms.saturating_add(market_type_to_ms(market_type));
-        if now_ms > end_ms.saturating_add(LIVE_ROUND_END_GRACE_MS) {
+    let rem_ms = snapshot_remaining_ms(snapshot);
+    if rem_ms <= 0 {
+        if let Some(end_ms) = snapshot_round_end_ms(snapshot, market_type) {
+            if now_ms > end_ms.saturating_add(LIVE_ROUND_END_GRACE_MS) {
+                return false;
+            }
+        } else if now_ms.saturating_sub(ts_ms) > LIVE_ROUND_END_GRACE_MS {
             return false;
         }
     }

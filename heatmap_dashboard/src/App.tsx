@@ -49,6 +49,8 @@ const WINDOW_OPTIONS: Array<{ value: WindowType; label: string }> = [
 const LIVE_POLL_MS = 2_200;
 const WS_STALE_FALLBACK_MS = 3000;
 const LIVE_UI_MIN_INTERVAL_MS = 900;
+const LIVE_ROUND_SWITCH_GRACE_MS = 1_500;
+const LIVE_POLL_ROW_MAX_AGE_MS = 12_000;
 const ET_TIMEZONE = "America/New_York";
 const COLLECTOR_POLL_MS = 10_000;
 const SYMBOL_OPTIONS: Array<{ value: MarketSymbol; label: string }> = [
@@ -414,6 +416,22 @@ function formatBps(v: number | null | undefined, unit = "bps/s"): string {
   }
   const sign = v > 0 ? "+" : "";
   return `${sign}${v.toFixed(2)} ${unit}`;
+}
+
+function roundDurationMs(marketType: MarketType): number {
+  return marketType === "5m" ? 5 * 60 * 1000 : 15 * 60 * 1000;
+}
+
+function parseRoundStartMs(roundId: string | null | undefined): number | null {
+  if (!roundId) {
+    return null;
+  }
+  const parts = roundId.split("_");
+  const tail = Number(parts[parts.length - 1] ?? 0);
+  if (!Number.isFinite(tail) || tail <= 0) {
+    return null;
+  }
+  return tail;
 }
 
 function summarizeGaps(points: ChartPoint[]): { count: number; maxGapMs: number } {
@@ -1004,15 +1022,39 @@ export default function App() {
         let latest5: (typeof rows)[number] | undefined;
         let latest15: (typeof rows)[number] | undefined;
         const symbol = selectedSymbolRef.current;
+        const nowMs = Date.now();
+        const isRowUsable = (row: (typeof rows)[number], marketType: MarketType): boolean => {
+          const tsMs = row.ts_ireland_sample_ms;
+          if (!Number.isFinite(tsMs) || tsMs <= 0) {
+            return false;
+          }
+          if (nowMs - tsMs > LIVE_POLL_ROW_MAX_AGE_MS) {
+            return false;
+          }
+          if (row.remaining_ms > 0) {
+            return true;
+          }
+          const startMs = parseRoundStartMs(row.round_id);
+          if (startMs != null) {
+            return nowMs <= startMs + roundDurationMs(marketType) + LIVE_ROUND_SWITCH_GRACE_MS;
+          }
+          return nowMs - tsMs <= LIVE_ROUND_SWITCH_GRACE_MS;
+        };
         for (const row of rows) {
           if (!row.symbol || row.symbol.toUpperCase() !== symbol) {
             continue;
           }
           if (row.timeframe === "5m") {
+            if (!isRowUsable(row, "5m")) {
+              continue;
+            }
             if (!latest5 || row.ts_ireland_sample_ms > latest5.ts_ireland_sample_ms) {
               latest5 = row;
             }
           } else if (row.timeframe === "15m") {
+            if (!isRowUsable(row, "15m")) {
+              continue;
+            }
             if (!latest15 || row.ts_ireland_sample_ms > latest15.ts_ireland_sample_ms) {
               latest15 = row;
             }
