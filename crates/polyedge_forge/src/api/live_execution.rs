@@ -213,6 +213,9 @@ const LIVE_CANCEL_FAILURE_FORCE_PAUSE_OTHER_THRESHOLD: u8 = 3;
 const LIVE_GTD_MIN_FUTURE_GUARD_SEC_DEFAULT: i64 = 60;
 const LIVE_GTD_MIN_FUTURE_GUARD_SEC_MIN: i64 = 30;
 const LIVE_GTD_MIN_FUTURE_GUARD_SEC_MAX: i64 = 240;
+const LIVE_ROUND_TARGET_MATCH_TOLERANCE_MS_DEFAULT: i64 = 5_000;
+const LIVE_ROUND_TARGET_MATCH_TOLERANCE_MS_MIN: i64 = 0;
+const LIVE_ROUND_TARGET_MATCH_TOLERANCE_MS_MAX: i64 = 120_000;
 
 #[derive(Debug, Clone)]
 struct CachedLiveMarketTarget {
@@ -354,8 +357,40 @@ fn live_gtd_min_future_guard_sec() -> i64 {
         )
 }
 
+fn live_round_target_match_tolerance_ms() -> i64 {
+    std::env::var("FORGE_FEV1_ROUND_TARGET_MATCH_TOLERANCE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(LIVE_ROUND_TARGET_MATCH_TOLERANCE_MS_DEFAULT)
+        .clamp(
+            LIVE_ROUND_TARGET_MATCH_TOLERANCE_MS_MIN,
+            LIVE_ROUND_TARGET_MATCH_TOLERANCE_MS_MAX,
+        )
+}
+
 fn parse_round_end_ts_ms(round_id: &str) -> Option<i64> {
     round_id.rsplit('_').next()?.parse::<i64>().ok()
+}
+
+fn decision_round_matches_target(decision: &Value, target: &LiveMarketTarget) -> bool {
+    let round_id = decision
+        .get("round_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if round_id.is_empty() {
+        return true;
+    }
+    let Some(decision_end_ms) = parse_round_end_ts_ms(round_id) else {
+        return true;
+    };
+    let Some(target_end_ms) = parse_end_date_ms(target.end_date.as_deref()) else {
+        return true;
+    };
+    decision_end_ms
+        .saturating_sub(target_end_ms)
+        .abs()
+        <= live_round_target_match_tolerance_ms()
 }
 
 fn is_entry_action(action: &str) -> bool {
@@ -1630,7 +1665,19 @@ pub(super) fn build_retry_payload(current: &Value, reason: &str, attempt: usize)
                     }
                 }),
             );
-            if let Some(q) = obj
+            let locked_exit_size = if is_exit_like {
+                obj.get("size")
+                    .and_then(Value::as_f64)
+                    .filter(|v| v.is_finite() && *v > 0.0)
+            } else {
+                None
+            };
+            if let Some(sz) = locked_exit_size {
+                obj.insert(
+                    "size".to_string(),
+                    json!((sz * 10_000.0).round() / 10_000.0),
+                );
+            } else if let Some(q) = obj
                 .get("quote_size_usdc")
                 .and_then(Value::as_f64)
                 .or_else(|| obj.get("requested_notional_usdc").and_then(Value::as_f64))
@@ -2300,6 +2347,26 @@ pub(super) async fn handle_pending_timeouts(state: &ApiState, gateway_cfg: &Live
                             .await
                             .ok();
                     if let Some(target) = maybe_target {
+                        let round_check = json!({ "round_id": row.round_id });
+                        if !decision_round_matches_target(&round_check, &target) {
+                            state
+                                .append_live_event(
+                                    &row.market_type,
+                                    json!({
+                                        "accepted": false,
+                                        "action": row.action,
+                                        "side": row.side,
+                                        "round_id": row.round_id,
+                                        "reason": "local_timeout_cancelled_round_target_mismatch",
+                                        "order_id": row.order_id,
+                                        "target_market_id": target.market_id,
+                                        "target_end_date": target.end_date
+                                    }),
+                                )
+                                .await;
+                            apply_pending_revert(state, &row, "local_timeout_cancel").await;
+                            continue;
+                        }
                         let decision = json!({
                             "action": row.action,
                             "side": row.side,
@@ -2481,6 +2548,18 @@ pub(super) async fn execute_live_orders_via_gateway(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_ascii_lowercase();
+        if !decision_round_matches_target(&decision, target) {
+            out.push(json!({
+                "ok": false,
+                "reason": "round_target_mismatch",
+                "decision_key": gated.decision_key,
+                "decision_round_id": decision.get("round_id").and_then(Value::as_str),
+                "target_market_id": target.market_id,
+                "target_end_date": target.end_date,
+                "decision": decision
+            }));
+            continue;
+        }
         if action == "exit" {
             if let Some(obj) = decision.as_object_mut() {
                 if let Some(q) = exit_quote_override {
@@ -3066,6 +3145,26 @@ async fn try_resubmit_after_terminal_reject_rust(
             return false;
         }
     };
+    let round_check = json!({ "round_id": row.round_id });
+    if !decision_round_matches_target(&round_check, &target) {
+        state
+            .append_live_event(
+                &row.market_type,
+                json!({
+                    "accepted": false,
+                    "action": row.action,
+                    "side": row.side,
+                    "round_id": row.round_id,
+                    "reason": "rust_terminal_rejected_resubmit_round_target_mismatch",
+                    "order_id": row.order_id,
+                    "status": terminal_status,
+                    "target_market_id": target.market_id,
+                    "target_end_date": target.end_date
+                }),
+            )
+            .await;
+        return false;
+    }
     let mut decision = json!({
         "action": row.action,
         "side": row.side,
@@ -3253,6 +3352,19 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
 
     for gated in decisions {
         let mut decision = gated.decision.clone();
+        if !decision_round_matches_target(&decision, target) {
+            out.push(json!({
+                "ok": false,
+                "accepted": false,
+                "reason": "round_target_mismatch",
+                "decision_key": gated.decision_key,
+                "decision_round_id": decision.get("round_id").and_then(Value::as_str),
+                "target_market_id": target.market_id,
+                "target_end_date": target.end_date,
+                "decision": decision
+            }));
+            continue;
+        }
         if decision
             .get("action")
             .and_then(Value::as_str)
@@ -3573,6 +3685,26 @@ pub(super) async fn handle_pending_timeouts_rust(
                             .await
                             .ok();
                     if let Some(target) = maybe_target {
+                        let round_check = json!({ "round_id": row.round_id });
+                        if !decision_round_matches_target(&round_check, &target) {
+                            state
+                                .append_live_event(
+                                    &row.market_type,
+                                    json!({
+                                        "accepted": false,
+                                        "action": row.action,
+                                        "side": row.side,
+                                        "round_id": row.round_id,
+                                        "reason": "rust_timeout_cancelled_round_target_mismatch",
+                                        "order_id": row.order_id,
+                                        "target_market_id": target.market_id,
+                                        "target_end_date": target.end_date
+                                    }),
+                                )
+                                .await;
+                            apply_pending_revert(state, &row, "rust_local_timeout_cancel").await;
+                            continue;
+                        }
                         let decision = json!({
                             "action": row.action,
                             "side": row.side,
@@ -4119,6 +4251,42 @@ mod tests {
             px >= 0.52 - 1e-9,
             "entry retry should move buy price up by >=1 tick, got {px}"
         );
+    }
+
+    #[test]
+    fn retry_payload_exit_keeps_full_size() {
+        let cur = json!({
+            "action": "exit",
+            "reason": "signal_reverse",
+            "side": "sell_yes",
+            "price": 0.60,
+            "size": 6.1,
+            "quote_size_usdc": 3.0,
+            "tif": "FAK",
+            "style": "taker",
+            "ttl_ms": 900,
+            "max_slippage_bps": 22.0,
+            "book_meta": {
+                "tick_size": 0.01
+            }
+        });
+        let nxt = build_retry_payload(&cur, "UNMATCHED", 0).expect("retry payload");
+        let sz = nxt.get("size").and_then(Value::as_f64).unwrap_or_default();
+        assert!(
+            (sz - 6.1).abs() < 1e-9,
+            "exit retry must keep full size, got {sz}"
+        );
+    }
+
+    #[test]
+    fn decision_round_target_match_rejects_cross_round_target() {
+        let end_ms = 1_700_000_000_000_i64;
+        let mut target = test_target();
+        target.end_date = end_date_iso_from_ms(end_ms);
+        let ok = json!({"round_id": format!("BTCUSDT_5m_{end_ms}")});
+        let bad = json!({"round_id": format!("BTCUSDT_5m_{}", end_ms + 300_000)});
+        assert!(decision_round_matches_target(&ok, &target));
+        assert!(!decision_round_matches_target(&bad, &target));
     }
 
     #[test]
