@@ -1,0 +1,12 @@
+[Unit]
+Description=PolyEdge Tokyo disk guard
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+Environment=ROOT_USAGE_PCT=85
+Environment=JOURNAL_KEEP=200M
+Environment=REPO_DIR=/home/ubuntu/PolyEdge
+ExecStart=/home/ubuntu/PolyEdge/scripts/forge/tokyo_disk_guard.sh
+

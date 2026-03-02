@@ -69,7 +69,6 @@ pub struct SnapshotRow {
     pub pm_live_btc_price: Option<f64>,
     pub ts_pm_live_exchange_ms: Option<i64>,
     pub ts_pm_live_recv_ms: Option<i64>,
-    // Backward-compatible alias fields used by older dashboards/readers.
     pub chainlink_price: Option<f64>,
     pub ts_chainlink_exchange_ms: Option<i64>,
     pub ts_chainlink_recv_ms: Option<i64>,

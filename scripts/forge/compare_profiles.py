@@ -40,6 +40,7 @@ def load_cfg(path: str) -> dict:
 
 def fetch_payload(
     base_url: str,
+    symbol: str,
     market_type: str,
     lookback_minutes: int,
     max_trades: int,
@@ -49,6 +50,7 @@ def fetch_payload(
     retries: int,
 ) -> dict:
     q = {
+        "symbol": symbol,
         "market_type": market_type,
         "full_history": "false",
         "lookback_minutes": str(lookback_minutes),
@@ -123,6 +125,7 @@ def score_window(m: dict, min_trades: int, trade_target: int, win_floor: float) 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Compare cand_v2 against all profiles under unified baseline.")
     ap.add_argument("--base-url", default="http://127.0.0.1:9810")
+    ap.add_argument("--symbol", default="BTCUSDT")
     ap.add_argument("--market-type", default="5m")
     ap.add_argument("--lookbacks", default="720,1440,2880")
     ap.add_argument("--max-trades", type=int, default=1400)
@@ -159,6 +162,7 @@ def main() -> None:
         for lb in lookbacks:
             payload = fetch_payload(
                 args.base_url,
+                args.symbol,
                 args.market_type,
                 lb,
                 args.max_trades,
@@ -218,6 +222,7 @@ def main() -> None:
 
     out = {
         "query": {
+            "symbol": args.symbol,
             "market_type": args.market_type,
             "lookbacks": lookbacks,
             "full_history": False,

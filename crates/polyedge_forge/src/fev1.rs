@@ -873,7 +873,6 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
         "confidence": confidence,
         "p_fair_up": last_p_fair_up,
         "edge_prob": last_edge_prob,
-        // Compatibility fields for dashboard cards (legacy shape).
         "timestamp_ms": last_ts_ms,
         "round_id": last_round_id,
         "remaining_s": last_remaining_s,

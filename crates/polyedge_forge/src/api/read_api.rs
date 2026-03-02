@@ -382,50 +382,6 @@ pub(super) async fn latest_all(State(state): State<ApiState>) -> Result<Json<Val
     Ok(Json(payload))
 }
 
-pub(super) async fn latest_timeframe(
-    State(state): State<ApiState>,
-    AxumPath(timeframe): AxumPath<String>,
-) -> Result<Json<Value>, ApiError> {
-    if timeframe.trim().is_empty() {
-        return Err(ApiError::bad_request("empty timeframe"));
-    }
-    let key = format!("{}:snapshot:latest:tf:{}", state.redis_prefix, timeframe);
-    read_key_json(&state, &key).await
-}
-
-pub(super) async fn latest_symbol_tf(
-    State(state): State<ApiState>,
-    AxumPath((symbol, timeframe)): AxumPath<(String, String)>,
-) -> Result<Json<Value>, ApiError> {
-    if symbol.trim().is_empty() || timeframe.trim().is_empty() {
-        return Err(ApiError::bad_request("empty symbol/timeframe"));
-    }
-    let key = format!(
-        "{}:snapshot:latest:{}:{}",
-        state.redis_prefix,
-        symbol.to_ascii_uppercase(),
-        timeframe
-    );
-    read_key_json(&state, &key).await
-}
-
-pub(super) async fn latest_market(
-    State(state): State<ApiState>,
-    AxumPath((symbol, timeframe, market_id)): AxumPath<(String, String, String)>,
-) -> Result<Json<Value>, ApiError> {
-    if symbol.trim().is_empty() || timeframe.trim().is_empty() || market_id.trim().is_empty() {
-        return Err(ApiError::bad_request("empty symbol/timeframe/market_id"));
-    }
-    let key = format!(
-        "{}:snapshot:latest:{}:{}:{}",
-        state.redis_prefix,
-        symbol.to_ascii_uppercase(),
-        timeframe,
-        market_id
-    );
-    read_key_json(&state, &key).await
-}
-
 pub(super) async fn history_symbol_timeframe(
     State(state): State<ApiState>,
     AxumPath((symbol_raw, timeframe_raw)): AxumPath<(String, String)>,

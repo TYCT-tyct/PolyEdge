@@ -107,6 +107,7 @@ def only_params(cfg: dict) -> dict:
 
 def fetch_payload(
     base_url: str,
+    symbol: str,
     market_type: str,
     full_history: bool,
     lookback_minutes: int,
@@ -117,6 +118,7 @@ def fetch_payload(
     retries: int,
 ) -> dict:
     q: dict[str, str] = {
+        "symbol": symbol,
         "market_type": market_type,
         "full_history": "true" if full_history else "false",
         "lookback_minutes": str(lookback_minutes),
@@ -198,6 +200,7 @@ def score_window(metrics: dict, min_trades: int, trade_target: int, win_floor: f
 
 def evaluate_cfg(
     base_url: str,
+    symbol: str,
     market_type: str,
     full_history: bool,
     lookbacks: list[int],
@@ -215,6 +218,7 @@ def evaluate_cfg(
     for lb in lookbacks:
         payload = fetch_payload(
             base_url,
+            symbol,
             market_type,
             full_history,
             lb,
@@ -290,6 +294,7 @@ def save_checkpoint(path: Path, generation: int, best_cfg: dict, best_metrics: d
 def main() -> None:
     ap = argparse.ArgumentParser(description="Parallel guarded parameter search for /api/strategy/paper (autotune off).")
     ap.add_argument("--base-url", default="http://127.0.0.1:9810")
+    ap.add_argument("--symbol", default="BTCUSDT")
     ap.add_argument("--market-type", default="5m")
     ap.add_argument("--seed-config", required=True)
     ap.add_argument(
@@ -330,6 +335,7 @@ def main() -> None:
 
     seed_metrics = evaluate_cfg(
         args.base_url,
+        args.symbol,
         args.market_type,
         args.full_history,
         lookbacks,
@@ -363,6 +369,7 @@ def main() -> None:
                 ex.submit(
                     evaluate_cfg,
                     args.base_url,
+                    args.symbol,
                     args.market_type,
                     args.full_history,
                     lookbacks,
@@ -431,6 +438,7 @@ def main() -> None:
 
     result = {
         "search": {
+            "symbol": args.symbol,
             "market_type": args.market_type,
             "full_history": args.full_history,
             "lookbacks": lookbacks,

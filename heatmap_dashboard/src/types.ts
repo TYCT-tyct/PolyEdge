@@ -248,6 +248,7 @@ export interface StrategyLivePositionState {
 }
 
 export interface StrategyPaperResponse {
+  symbol?: string;
   source?: "replay" | "live" | "auto" | string;
   source_fallback_error?: string | null;
   market_type: string;

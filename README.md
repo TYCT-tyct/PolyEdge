@@ -3,8 +3,6 @@
 This repository now keeps only the active FEV1 runtime chain:
 
 - `crates/polyedge_forge` - dashboard API, paper simulation, market data aggregation
-- `crates/feeder_tokyo` - Tokyo feed sender/receiver path
-- `crates/polyedge_data_backend` - backend data API/storage service
 - `heatmap_dashboard` - frontend dashboard
 
 All legacy strategy stacks and their dependent crates/configs have been removed from the workspace.

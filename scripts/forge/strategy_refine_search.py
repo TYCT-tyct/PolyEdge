@@ -60,6 +60,7 @@ def get_json(base_url: str, path: str, query: dict, timeout: int, retries: int) 
 
 def eval_cfg(
     base_url: str,
+    symbol: str,
     market_type: str,
     full_history: bool,
     lookback_minutes: int,
@@ -71,6 +72,7 @@ def eval_cfg(
     retries: int,
 ) -> dict:
     q = {
+        "symbol": symbol,
         "market_type": market_type,
         "full_history": "true" if full_history else "false",
         "lookback_minutes": str(lookback_minutes),
@@ -177,6 +179,7 @@ def mutate(cfg: dict, scale: float) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Refine local neighborhood around a seed config.")
     ap.add_argument("--base-url", default="http://127.0.0.1:9810")
+    ap.add_argument("--symbol", default="BTCUSDT")
     ap.add_argument("--market-type", default="5m")
     ap.add_argument(
         "--full-history",
@@ -205,6 +208,7 @@ def main() -> None:
     best_cfg = dict(base_cfg)
     best = eval_cfg(
         args.base_url,
+        args.symbol,
         args.market_type,
         args.full_history,
         args.lookback_minutes,
@@ -222,6 +226,7 @@ def main() -> None:
         cand = mutate(best_cfg if random.random() < 0.70 else base_cfg, scale)
         res = eval_cfg(
             args.base_url,
+            args.symbol,
             args.market_type,
             args.full_history,
             args.lookback_minutes,

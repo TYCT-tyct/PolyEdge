@@ -31,6 +31,7 @@ const STRATEGY_LIVE_PROFILE = Object.freeze({
   liveMaxOrders: 1,
   liveEntryOnly: true
 });
+const STRATEGY_ENABLED_SYMBOLS: MarketSymbol[] = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"];
 
 type StrategyUiPrefs = {
   marketType: MarketType;
@@ -141,6 +142,7 @@ function strategyPaperSignature(payload: StrategyPaperResponse): string {
   const current = payload.current;
   const last = payload.trades[payload.trades.length - 1];
   return [
+    payload.symbol ?? "",
     payload.source ?? "",
     payload.market_type,
     payload.samples,
@@ -264,7 +266,7 @@ export function PaperLabPage({
   const strategyHasLoadedRef = useRef<boolean>(false);
   const strategyAutotuneHasLoadedRef = useRef<boolean>(false);
 
-  const strategyEnabled = selectedSymbol === "BTCUSDT";
+  const strategyEnabled = STRATEGY_ENABLED_SYMBOLS.includes(selectedSymbol);
 
   useEffect(() => {
     writeStrategyUiPrefs({
@@ -334,7 +336,7 @@ export function PaperLabPage({
           useAutotune: strategyUseAutotune,
           source: strategySource,
           ...(strategySource === "live" ? STRATEGY_LIVE_PROFILE : {})
-        });
+        }, selectedSymbol);
         const compactData = compactStrategyPayload(data);
         if (alive) {
           const nextSig = strategyPaperSignature(compactData);
@@ -366,7 +368,7 @@ export function PaperLabPage({
         window.clearTimeout(timer);
       }
     };
-  }, [strategyEnabled, strategyMarketType, strategySource, strategyUseAutotune]);
+  }, [strategyEnabled, selectedSymbol, strategyMarketType, strategySource, strategyUseAutotune]);
 
   useEffect(() => {
     let alive = true;
@@ -424,8 +426,8 @@ export function PaperLabPage({
       let changed = false;
       try {
         const [latest, history] = await Promise.all([
-          getStrategyAutotuneLatest(strategyMarketType),
-          getStrategyAutotuneHistory(strategyMarketType, 20)
+          getStrategyAutotuneLatest(strategyMarketType, selectedSymbol),
+          getStrategyAutotuneHistory(strategyMarketType, 20, selectedSymbol)
         ]);
         if (!alive) {
           return;
@@ -460,7 +462,7 @@ export function PaperLabPage({
         window.clearTimeout(timer);
       }
     };
-  }, [strategyEnabled, strategyMarketType, strategyUseAutotune]);
+  }, [strategyEnabled, selectedSymbol, strategyMarketType, strategyUseAutotune]);
 
   if (!strategyEnabled) {
     return (
@@ -469,7 +471,7 @@ export function PaperLabPage({
           <div>
             <h2>Paper 模块</h2>
             <p className="muted">
-              当前仅 BTCUSDT 开启 Paper/Live 策略计算。其他币种仍保持采集展示，不执行策略。
+              {selectedSymbol} 暂未开启 Paper/Live 策略计算，请检查后端 FORGE_STRATEGY_SYMBOLS 配置。
             </p>
           </div>
         </header>
@@ -531,7 +533,7 @@ export function PaperLabPage({
     <section className="panel">
       <header className="panel-head">
         <div>
-          <h2>策略 Paper（{strategyMarketType}全时段）</h2>
+          <h2>策略 Paper（{selectedSymbol} · {strategyMarketType}全时段）</h2>
           <p className="muted">单模型双向策略：自动判断 UP/DOWN，具体入场/加仓/退出行为以后端策略参数为准。</p>
         </div>
         <div className="panel-actions">
@@ -920,6 +922,7 @@ export function PaperLabPage({
 
       <footer className="status-row">
         <span>source: {strategyPaper?.source ?? "--"}</span>
+        <span>symbol: {strategyPaper?.symbol ?? selectedSymbol}</span>
         <span>profile: {effectiveProfile}</span>
         <span>profileSource: {profileSource}</span>
         <span>market: {strategyMarketType}</span>

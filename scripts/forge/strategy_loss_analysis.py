@@ -40,6 +40,7 @@ def load_cfg(path: str | None) -> dict:
 
 def fetch_payload(
     base_url: str,
+    symbol: str,
     market_type: str,
     full_history: bool,
     lookback_minutes: int,
@@ -48,6 +49,7 @@ def fetch_payload(
     timeout: int,
 ) -> dict:
     q = {
+        "symbol": symbol,
         "market_type": market_type,
         "full_history": "true" if full_history else "false",
         "lookback_minutes": str(lookback_minutes),
@@ -179,6 +181,7 @@ def delta(a: dict, b: dict) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Analyze why pnl/drawdown happen under unified baseline.")
     ap.add_argument("--base-url", default="http://127.0.0.1:9810")
+    ap.add_argument("--symbol", default="BTCUSDT")
     ap.add_argument("--market-type", default="5m")
     ap.add_argument(
         "--full-history",
@@ -198,6 +201,7 @@ def main() -> None:
 
     pa = fetch_payload(
         args.base_url,
+        args.symbol,
         args.market_type,
         args.full_history,
         args.lookback_minutes,
@@ -207,6 +211,7 @@ def main() -> None:
     )
     pb = fetch_payload(
         args.base_url,
+        args.symbol,
         args.market_type,
         args.full_history,
         args.lookback_minutes,
@@ -219,6 +224,7 @@ def main() -> None:
 
     report = {
         "query": {
+            "symbol": args.symbol,
             "market_type": args.market_type,
             "full_history": args.full_history,
             "lookback_minutes": args.lookback_minutes,

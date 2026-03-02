@@ -5,8 +5,6 @@
 The workspace is intentionally reduced to FEV1-active services only:
 
 - `polyedge_forge`
-- `feeder_tokyo`
-- `polyedge_data_backend`
 - shared runtime crates they directly depend on
 
 Legacy strategy modules are no longer part of active code paths.
@@ -14,7 +12,7 @@ Legacy strategy modules are no longer part of active code paths.
 ## Primary Commands
 
 ```bash
-cargo check -p polyedge_forge -p feeder_tokyo -p polyedge_data_backend
+cargo check -p polyedge_forge
 cargo run -p polyedge_forge
 npm --prefix heatmap_dashboard run build
 ```

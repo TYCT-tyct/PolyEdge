@@ -1,0 +1,12 @@
+[Unit]
+Description=Run PolyEdge Tokyo disk guard every 30 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=30min
+Unit=polyedge-tokyo-disk-guard.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+

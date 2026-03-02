@@ -8,6 +8,7 @@ from pathlib import Path
 
 def fetch_payload(
     base_url: str,
+    symbol: str,
     market_type: str,
     full_history: bool,
     lookback_minutes: int,
@@ -17,6 +18,7 @@ def fetch_payload(
     cfg: dict | None,
 ) -> dict:
     q: dict[str, str] = {
+        "symbol": symbol,
         "market_type": market_type,
         "full_history": "true" if full_history else "false",
         "lookback_minutes": str(lookback_minutes),
@@ -97,6 +99,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="A/B compare strategy paper metrics under same query window.")
     ap.add_argument("--url-a", default="http://127.0.0.1:9810")
     ap.add_argument("--url-b", default="http://127.0.0.1:9810")
+    ap.add_argument("--symbol", default="BTCUSDT")
     ap.add_argument("--market-type", default="5m")
     ap.add_argument(
         "--full-history",
@@ -123,6 +126,7 @@ def main() -> None:
 
     payload_a = fetch_payload(
         args.url_a,
+        args.symbol,
         args.market_type,
         args.full_history,
         args.lookback_minutes,
@@ -133,6 +137,7 @@ def main() -> None:
     )
     payload_b = fetch_payload(
         args.url_b,
+        args.symbol,
         args.market_type,
         args.full_history,
         args.lookback_minutes,
@@ -150,6 +155,7 @@ def main() -> None:
         "b": metrics_b,
         "delta_b_minus_a": delta,
         "query": {
+            "symbol": args.symbol,
             "market_type": args.market_type,
             "full_history": args.full_history,
             "lookback_minutes": args.lookback_minutes,

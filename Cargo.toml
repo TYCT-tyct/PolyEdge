@@ -6,12 +6,7 @@ members = [
   "crates/feed_polymarket",
   "crates/feed_reference",
   "crates/market_discovery",
-  "crates/direction_detector",
-  "crates/poly_wire",
-  "crates/feeder_tokyo",
-  "crates/polyedge_data_backend",
   "crates/polyedge_forge",
-  "crates/polyedge_hyper_mesh",
 ]
 
 [workspace.package]

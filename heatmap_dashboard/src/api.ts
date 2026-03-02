@@ -888,11 +888,13 @@ export interface StrategyPaperQueryOptions {
 
 export async function getStrategyPaper(
   marketType: MarketType = "5m",
-  options: StrategyPaperQueryOptions = {}
+  options: StrategyPaperQueryOptions = {},
+  symbol: MarketSymbol = "BTCUSDT"
 ): Promise<StrategyPaperResponse> {
   const qs = new URLSearchParams({
     source: options.source ?? "replay",
     profile: options.profile ?? "",
+    symbol,
     market_type: marketType,
     full_history: options.fullHistory ? "true" : "false",
     use_autotune: options.useAutotune ? "true" : "false",
@@ -950,10 +952,10 @@ export async function getStrategyPaper(
 }
 
 export interface StrategyAutotuneLatestResponse {
+  symbol?: string;
   market_type: MarketType | string;
   context: string;
   key: string;
-  from_legacy: boolean;
   found: boolean;
   data: Record<string, unknown> | null;
   active_key?: string;
@@ -962,28 +964,31 @@ export interface StrategyAutotuneLatestResponse {
 }
 
 export interface StrategyAutotuneHistoryResponse {
+  symbol?: string;
   market_type: MarketType | string;
   context: string;
   key: string;
-  from_legacy: boolean;
   limit: number;
   count: number;
   items: Array<Record<string, unknown>>;
 }
 
 export async function getStrategyAutotuneLatest(
-  marketType: MarketType
+  marketType: MarketType,
+  symbol: MarketSymbol = "BTCUSDT"
 ): Promise<StrategyAutotuneLatestResponse> {
-  const qs = new URLSearchParams({ market_type: marketType });
+  const qs = new URLSearchParams({ market_type: marketType, symbol });
   return requestJson<StrategyAutotuneLatestResponse>(`/api/strategy/autotune/latest?${qs.toString()}`);
 }
 
 export async function getStrategyAutotuneHistory(
   marketType: MarketType,
-  limit = 20
+  limit = 20,
+  symbol: MarketSymbol = "BTCUSDT"
 ): Promise<StrategyAutotuneHistoryResponse> {
   const qs = new URLSearchParams({
     market_type: marketType,
+    symbol,
     limit: String(Math.max(1, Math.min(200, Math.floor(limit))))
   });
   return requestJson<StrategyAutotuneHistoryResponse>(`/api/strategy/autotune/history?${qs.toString()}`);

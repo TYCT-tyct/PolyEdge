@@ -3661,7 +3661,7 @@ pub(super) async fn strategy_autotune_latest(
     let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
     let symbol = resolve_strategy_symbol(params.symbol.as_deref())?;
     let context = normalize_autotune_context(params.context.as_deref(), market_type, symbol);
-    let (payload, key, from_legacy) = resolve_autotune_doc(&state, &context, market_type).await?;
+    let (payload, key, _) = resolve_autotune_doc(&state, &context, market_type).await?;
     let (active_payload, active_key) = resolve_autotune_active_doc(&state, market_type, symbol).await?;
     let (live_payload, live_key) = resolve_autotune_live_doc(&state, market_type, symbol).await?;
     Ok(Json(json!({
@@ -3669,7 +3669,6 @@ pub(super) async fn strategy_autotune_latest(
         "symbol": symbol,
         "context": context,
         "key": key,
-        "from_legacy": from_legacy,
         "found": payload.is_some(),
         "data": payload,
         "active_key": active_key,
@@ -3713,7 +3712,6 @@ pub(super) async fn strategy_autotune_history(
         "context": context,
         "key": key_used,
         "source": source_used,
-        "from_legacy": false,
         "limit": limit,
         "count": items.len(),
         "items": items,
@@ -3729,8 +3727,7 @@ pub(super) async fn strategy_autotune_set(
     let context = normalize_autotune_context(body.context.as_deref(), market_type, symbol);
     let key = strategy_autotune_key(&state.redis_prefix, &context);
     let history_key = strategy_autotune_history_key(&state.redis_prefix, &context);
-    let (previous, previous_key, previous_from_legacy) =
-        resolve_autotune_doc(&state, &context, market_type).await?;
+    let (previous, previous_key, _) = resolve_autotune_doc(&state, &context, market_type).await?;
 
     let wrapped = json!({ "config": body.config });
     let cfg = strategy_cfg_from_payload(StrategyRuntimeConfig::default(), &wrapped);
@@ -3768,7 +3765,6 @@ pub(super) async fn strategy_autotune_set(
         "history_key": history_key,
         "previous_found": previous.is_some(),
         "previous_key": previous_key,
-        "previous_from_legacy": previous_from_legacy,
         "saved": saved_doc,
     })))
 }
@@ -3866,210 +3862,6 @@ pub(super) fn build_strategy_arms(
         arms.truncate(max_arms);
     }
     arms
-}
-
-pub(super) fn group_round_samples(samples: &[StrategySample]) -> Vec<Vec<StrategySample>> {
-    let mut rounds = Vec::<Vec<StrategySample>>::new();
-    let mut cur: Vec<StrategySample> = Vec::new();
-    let mut cur_id = String::new();
-    for s in samples {
-        if cur_id.is_empty() || cur_id == s.round_id {
-            cur_id = s.round_id.clone();
-            cur.push(s.clone());
-        } else {
-            rounds.push(cur);
-            cur = vec![s.clone()];
-            cur_id = s.round_id.clone();
-        }
-    }
-    if !cur.is_empty() {
-        rounds.push(cur);
-    }
-    rounds
-}
-
-pub(super) async fn strategy_full(
-    State(state): State<ApiState>,
-    Query(params): Query<StrategyFullQueryParams>,
-) -> Result<Json<Value>, ApiError> {
-    let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
-    let symbol = resolve_strategy_symbol(params.symbol.as_deref())?;
-    let full_history = params.full_history.unwrap_or(true);
-    let lookback_minutes = params
-        .lookback_minutes
-        .unwrap_or(if full_history { 30 * 24 * 60 } else { 12 * 60 })
-        .clamp(30, 365 * 24 * 60);
-    let max_points = strategy_resolve_max_points(
-        full_history,
-        lookback_minutes,
-        params.max_points,
-        params.max_samples,
-    );
-    let _heavy_permit = strategy_acquire_heavy_permit(&state, full_history, max_points).await;
-    let max_trades = params.max_trades.unwrap_or(300).clamp(20, 1000) as usize;
-    let max_arms = params.max_arms.unwrap_or(8).clamp(2, 24) as usize;
-    let window_trades = params.window_trades.unwrap_or(50).clamp(10, 200) as usize;
-    let target_win_rate = params.target_win_rate.unwrap_or(90.0).clamp(40.0, 99.9);
-
-    let samples = load_strategy_samples(
-        &state,
-        symbol,
-        market_type,
-        full_history,
-        lookback_minutes,
-        max_points,
-    )
-    .await?;
-    if samples.len() < 20 {
-        return Ok(Json(json!({
-            "market_type": market_type,
-            "symbol": symbol,
-            "full_history": full_history,
-            "samples": samples.len(),
-            "error": "not enough samples",
-        })));
-    }
-
-    let mapped_samples = map_samples_to_fev1(&samples);
-    let base_cfg = StrategyRuntimeConfig::default();
-    let arms = build_strategy_arms(base_cfg, max_arms);
-    let mut evaluations: Vec<Value> = Vec::new();
-    for (name, cfg) in &arms {
-        let run = run_strategy_simulation_on_mapped(&mapped_samples, cfg, max_trades);
-        let rs = compute_rolling_stats(&run.all_trade_pnls, window_trades);
-        let objective = if rs.windows > 0 {
-            rs.latest_win_rate_pct * 2.8
-                + rs.avg_win_rate_pct * 1.7
-                + rs.min_win_rate_pct * 0.6
-                + run.avg_pnl_cents * 2.0
-                + run.total_pnl_cents.max(0.0) * 0.02
-                - run.max_drawdown_cents * 0.02
-                + if rs.latest_win_rate_pct >= target_win_rate {
-                    120.0
-                } else {
-                    0.0
-                }
-        } else {
-            run.win_rate_pct + run.avg_pnl_cents + run.total_pnl_cents.max(0.0) * 0.01 - 120.0
-        };
-        evaluations.push(json!({
-            "name": name,
-            "objective": objective,
-            "summary": {
-                "trade_count": run.trade_count,
-                "win_rate_pct": run.win_rate_pct,
-                "avg_pnl_cents": run.avg_pnl_cents,
-                "avg_duration_s": run.avg_duration_s,
-                "total_pnl_cents": run.total_pnl_cents,
-                "max_drawdown_cents": run.max_drawdown_cents,
-                "max_profit_trade_cents": run.max_profit_trade_cents,
-                "blocked_exits": run.blocked_exits,
-                "emergency_wide_exit_count": run.emergency_wide_exit_count,
-                "execution_penalty_cents_total": run.execution_penalty_cents_total,
-            },
-            "rolling_window": rolling_stats_json(rs),
-            "config": strategy_cfg_json(cfg),
-            "trades": run.trades,
-            "current": run.current,
-        }));
-    }
-    evaluations.sort_by(|a, b| {
-        let av = row_f64(a, "objective").unwrap_or(f64::NEG_INFINITY);
-        let bv = row_f64(b, "objective").unwrap_or(f64::NEG_INFINITY);
-        bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let best = evaluations.first().cloned().unwrap_or(Value::Null);
-    let max_win_rate = evaluations
-        .iter()
-        .map(|v| {
-            v.get("rolling_window")
-                .and_then(|s| s.get("latest_win_rate_pct"))
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0)
-        })
-        .fold(0.0_f64, f64::max);
-    let max_profit_per_trade_cents = evaluations
-        .iter()
-        .map(|v| {
-            v.get("summary")
-                .and_then(|s| s.get("max_profit_trade_cents"))
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0)
-        })
-        .fold(f64::NEG_INFINITY, f64::max);
-
-    // Lightweight online learner (UCB1) replay by round for arm adaptation preview.
-    let rounds = group_round_samples(&samples);
-    let mut plays = vec![0usize; arms.len()];
-    let mut reward_sum = vec![0.0_f64; arms.len()];
-    let mut wins = vec![0usize; arms.len()];
-    for r in &rounds {
-        let total_played: usize = plays.iter().sum();
-        let mut best_idx = 0usize;
-        let mut best_ucb = f64::NEG_INFINITY;
-        for idx in 0..arms.len() {
-            if plays[idx] == 0 {
-                best_idx = idx;
-                break;
-            }
-            let mean = reward_sum[idx] / plays[idx] as f64;
-            let explore = (2.0 * ((total_played + 1) as f64).ln() / plays[idx] as f64).sqrt();
-            let ucb = mean + explore;
-            if ucb > best_ucb {
-                best_ucb = ucb;
-                best_idx = idx;
-            }
-        }
-        let run = run_strategy_simulation(r, &arms[best_idx].1, 40);
-        plays[best_idx] += 1;
-        reward_sum[best_idx] += run.total_pnl_cents;
-        if run.total_pnl_cents > 0.0 {
-            wins[best_idx] += 1;
-        }
-    }
-    let learner_arms: Vec<Value> = arms
-        .iter()
-        .enumerate()
-        .map(|(i, (name, _))| {
-            let p = plays[i];
-            let mean = if p > 0 { reward_sum[i] / p as f64 } else { 0.0 };
-            let wr = if p > 0 {
-                (wins[i] as f64) * 100.0 / p as f64
-            } else {
-                0.0
-            };
-            json!({
-                "name": name,
-                "plays": p,
-                "win_rate_pct": wr,
-                "mean_round_pnl_cents": mean,
-                "total_round_pnl_cents": reward_sum[i]
-            })
-        })
-        .collect();
-
-    Ok(Json(json!({
-        "market_type": market_type,
-        "symbol": symbol,
-        "full_history": full_history,
-        "lookback_minutes": lookback_minutes,
-        "lookback": strategy_lookback_meta_json(&samples, full_history, lookback_minutes, max_points, 1000),
-        "target_win_rate_pct": target_win_rate,
-        "window_trades": window_trades,
-        "samples": samples.len(),
-        "rounds": rounds.len(),
-        "arms_tested": evaluations.len(),
-        "best": best,
-        "top_arms": evaluations.iter().take(5).cloned().collect::<Vec<_>>(),
-        "metrics": {
-            "estimated_max_win_rate_pct": max_win_rate,
-            "estimated_max_profit_per_trade_cents": if max_profit_per_trade_cents.is_finite() { max_profit_per_trade_cents } else { 0.0 }
-        },
-        "learner_ucb": {
-            "arms": learner_arms
-        }
-    })))
 }
 
 pub(super) fn clamp_runtime_cfg(cfg: &mut StrategyRuntimeConfig) {
@@ -4754,15 +4546,8 @@ pub(super) async fn resolve_autotune_active_doc(
     symbol: &str,
 ) -> Result<(Option<Value>, String), ApiError> {
     let key = strategy_autotune_active_key(&state.redis_prefix, market_type, symbol);
-    if let Some(payload) = read_key_value(state, &key).await? {
-        return Ok((Some(payload), key));
-    }
-    let legacy_key = format!(
-        "{}:strategy:autotune:active:{}",
-        state.redis_prefix, market_type
-    );
-    let payload = read_key_value(state, &legacy_key).await?;
-    Ok((payload, legacy_key))
+    let payload = read_key_value(state, &key).await?;
+    Ok((payload, key))
 }
 
 pub(super) async fn resolve_autotune_live_doc(
@@ -4771,12 +4556,8 @@ pub(super) async fn resolve_autotune_live_doc(
     symbol: &str,
 ) -> Result<(Option<Value>, String), ApiError> {
     let key = strategy_autotune_live_key(&state.redis_prefix, market_type, symbol);
-    if let Some(payload) = read_key_value(state, &key).await? {
-        return Ok((Some(payload), key));
-    }
-    let legacy_key = format!("{}:strategy:autotune:live:{}", state.redis_prefix, market_type);
-    let payload = read_key_value(state, &legacy_key).await?;
-    Ok((payload, legacy_key))
+    let payload = read_key_value(state, &key).await?;
+    Ok((payload, key))
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]

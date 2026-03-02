@@ -21,8 +21,16 @@ def trade_stats(trades: list[dict]) -> tuple[float, float, float]:
     return wins * 100.0 / n, total / n, total
 
 
-def eval_config(base_url: str, market_type: str, cfg: dict, lookback_minutes: int, max_trades: int) -> dict:
+def eval_config(
+    base_url: str,
+    symbol: str,
+    market_type: str,
+    cfg: dict,
+    lookback_minutes: int,
+    max_trades: int,
+) -> dict:
     query = {
+        "symbol": symbol,
         "market_type": market_type,
         "full_history": "true",
         "lookback_minutes": str(lookback_minutes),
@@ -86,6 +94,7 @@ def eval_config(base_url: str, market_type: str, cfg: dict, lookback_minutes: in
 def main() -> None:
     ap = argparse.ArgumentParser(description="Seed sweep for fixed (non-autotune) strategy config.")
     ap.add_argument("--base-url", default="http://127.0.0.1:9810")
+    ap.add_argument("--symbol", default="BTCUSDT")
     ap.add_argument("--market-type", default="5m")
     ap.add_argument("--seed-from", type=int, default=1)
     ap.add_argument("--seed-to", type=int, default=40)
@@ -101,7 +110,12 @@ def main() -> None:
     args = ap.parse_args()
 
     baseline = eval_config(
-        args.base_url, args.market_type, {}, args.lookback_minutes, args.max_trades
+        args.base_url,
+        args.symbol,
+        args.market_type,
+        {},
+        args.lookback_minutes,
+        args.max_trades,
     )
     print(
         "BASELINE",
@@ -135,6 +149,7 @@ def main() -> None:
                 "/api/strategy/optimize",
                 {
                     "market_type": args.market_type,
+                    "symbol": args.symbol,
                     "target_win_rate": str(args.target_win_rate),
                     "window_trades": str(args.window_trades),
                     "max_arms": str(args.max_arms),
@@ -153,6 +168,7 @@ def main() -> None:
                 continue
             result = eval_config(
                 args.base_url,
+                args.symbol,
                 args.market_type,
                 cfg,
                 args.lookback_minutes,

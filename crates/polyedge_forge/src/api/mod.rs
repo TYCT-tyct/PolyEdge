@@ -2325,20 +2325,6 @@ fn parse_strategy_paper_source(raw: Option<&str>) -> StrategyPaperSource {
 }
 
 #[derive(Debug, Deserialize)]
-struct StrategyFullQueryParams {
-    market_type: Option<String>,
-    symbol: Option<String>,
-    lookback_minutes: Option<u32>,
-    max_points: Option<u32>,
-    max_samples: Option<u32>,
-    max_trades: Option<u32>,
-    full_history: Option<bool>,
-    max_arms: Option<u32>,
-    window_trades: Option<u32>,
-    target_win_rate: Option<f64>,
-}
-
-#[derive(Debug, Deserialize)]
 struct StrategyOptimizeQueryParams {
     market_type: Option<String>,
     symbol: Option<String>,
@@ -2529,12 +2515,6 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         .route("/health/live", get(health_live))
         .route("/health/db", get(health_db))
         .route("/api/latest/all", get(latest_all))
-        .route("/api/latest/tf/{timeframe}", get(latest_timeframe))
-        .route("/api/latest/{symbol}/{timeframe}", get(latest_symbol_tf))
-        .route(
-            "/api/latest/{symbol}/{timeframe}/{market_id}",
-            get(latest_market),
-        )
         .route(
             "/api/history/{symbol}/{timeframe}",
             get(history_symbol_timeframe),
@@ -2548,7 +2528,6 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         .route("/api/heatmap", get(heatmap))
         .route("/api/accuracy_series", get(accuracy_series))
         .route("/api/strategy/paper", get(strategy_paper))
-        .route("/api/strategy/full", get(strategy_full))
         .route("/api/strategy/optimize", get(strategy_optimize))
         .route(
             "/api/strategy/autotune/latest",

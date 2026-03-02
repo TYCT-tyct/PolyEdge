@@ -11,6 +11,7 @@ OUT_ROOT="${OUT_ROOT:-/tmp/polyedge_bg}"
 ARCHIVE_ROOT="${ARCHIVE_ROOT:-$OUT_ROOT/archive}"
 
 MODE="${MODE:-parallel}" # parallel|refine
+SYMBOL="${SYMBOL:-BTCUSDT}" # BTCUSDT|ETHUSDT|SOLUSDT|XRPUSDT
 MARKET_TYPE="${MARKET_TYPE:-5m}" # 5m only in current production phase
 SEED_CONFIG="${SEED_CONFIG:-configs/strategy-profiles/manual_hi_freq_2026_02_27.full.json}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:9810}"
@@ -40,12 +41,12 @@ JOB_TAG="${JOB_TAG:-${MODE}_${MARKET_TYPE}}"
 
 usage() {
   cat <<'USAGE'
-Usage: run_lowprio_optimize.sh [--mode parallel|refine] [--market-type 5m] [--seed-config PATH]
+Usage: run_lowprio_optimize.sh [--mode parallel|refine] [--symbol SYMBOL] [--market-type 5m] [--seed-config PATH]
                                [--job-tag TAG] [--max-samples N] [--workers N]
 
 Environment overrides:
   REPO_DIR OUT_ROOT ARCHIVE_ROOT BASE_URL
-  MODE MARKET_TYPE SEED_CONFIG LOOKBACKS MAX_TRADES MAX_SAMPLES
+  MODE SYMBOL MARKET_TYPE SEED_CONFIG LOOKBACKS MAX_TRADES MAX_SAMPLES
   WORKERS GENERATIONS POPULATION MIN_TRADES TRADE_TARGET WIN_FLOOR SEED
   REFINE_ITERS RETRIES TIMEOUT NICE_LEVEL JOB_TAG
   REFINE_LOOKBACK_MINUTES REFINE_MAX_TRADES REFINE_MIN_TRADES REFINE_WIN_FLOOR
@@ -55,6 +56,7 @@ USAGE
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mode) MODE="${2:-}"; shift 2 ;;
+    --symbol) SYMBOL="${2:-}"; shift 2 ;;
     --market-type) MARKET_TYPE="${2:-}"; shift 2 ;;
     --seed-config) SEED_CONFIG="${2:-}"; shift 2 ;;
     --job-tag) JOB_TAG="${2:-}"; shift 2 ;;
@@ -76,7 +78,7 @@ fi
 
 mkdir -p "$OUT_ROOT" "$ARCHIVE_ROOT"
 ts="$(date -u +%Y%m%dT%H%M%SZ)"
-job_id="${JOB_TAG}_${ts}"
+job_id="${JOB_TAG}_${SYMBOL}_${ts}"
 log_file="$OUT_ROOT/${job_id}.log"
 checkpoint_file="$OUT_ROOT/${job_id}.checkpoint.json"
 result_file="$OUT_ROOT/${job_id}.result.json"
@@ -99,6 +101,7 @@ if [[ "$MODE" == "parallel" ]]; then
   cmd=(
     python3 -u scripts/forge/strategy_parallel_search.py
     --base-url "$BASE_URL"
+    --symbol "$SYMBOL"
     --market-type "$MARKET_TYPE"
     --seed-config "$SEED_CONFIG"
     --lookbacks "$LOOKBACKS"
@@ -120,6 +123,7 @@ else
   cmd=(
     python3 -u scripts/forge/strategy_refine_search.py
     --base-url "$BASE_URL"
+    --symbol "$SYMBOL"
     --market-type "$MARKET_TYPE"
     --input "$SEED_CONFIG"
     --iters "$REFINE_ITERS"
@@ -137,6 +141,7 @@ fi
   printf '{\n'
   printf '  "job_id": "%s",\n' "$job_id"
   printf '  "mode": "%s",\n' "$MODE"
+  printf '  "symbol": "%s",\n' "$SYMBOL"
   printf '  "market_type": "%s",\n' "$MARKET_TYPE"
   printf '  "seed_config": "%s",\n' "$SEED_CONFIG"
   printf '  "base_url": "%s",\n' "$BASE_URL"

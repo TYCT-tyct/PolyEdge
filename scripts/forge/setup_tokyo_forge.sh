@@ -17,6 +17,7 @@ fi
 
 cd "$REPO_DIR"
 ~/.cargo/bin/cargo build -p polyedge_forge --release
+chmod +x "$REPO_DIR/scripts/forge/tokyo_disk_guard.sh"
 
 sudo tee /etc/systemd/system/polyedge-forge-tokyo.service >/dev/null <<UNIT
 [Unit]
@@ -42,5 +43,11 @@ sudo systemctl daemon-reload
 sudo systemctl enable polyedge-forge-tokyo.service
 sudo systemctl restart polyedge-forge-tokyo.service
 sudo systemctl --no-pager --full status polyedge-forge-tokyo.service | sed -n '1,25p'
+
+sudo cp "$REPO_DIR/ops/systemd/polyedge-tokyo-disk-guard.service" /etc/systemd/system/
+sudo cp "$REPO_DIR/ops/systemd/polyedge-tokyo-disk-guard.timer" /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now polyedge-tokyo-disk-guard.timer
+sudo systemctl --no-pager --full status polyedge-tokyo-disk-guard.timer | sed -n '1,15p'
 
 echo "[forge-tokyo] done"
