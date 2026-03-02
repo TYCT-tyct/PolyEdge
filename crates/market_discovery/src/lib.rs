@@ -212,10 +212,8 @@ impl MarketDiscovery {
         // while still allowing opt-in wider scans via env variables.
         let enddate_limit = env_i64("POLYEDGE_DISCOVERY_ENDDATE_LIMIT", 200, 50, 1000);
         let enddate_pages = env_usize("POLYEDGE_DISCOVERY_ENDDATE_MAX_PAGES", 20, 1, 64);
-        let enddate_desc_limit =
-            env_i64("POLYEDGE_DISCOVERY_ENDDATE_DESC_LIMIT", 300, 50, 1000);
-        let enddate_desc_pages =
-            env_usize("POLYEDGE_DISCOVERY_ENDDATE_DESC_MAX_PAGES", 8, 0, 64);
+        let enddate_desc_limit = env_i64("POLYEDGE_DISCOVERY_ENDDATE_DESC_LIMIT", 300, 50, 1000);
+        let enddate_desc_pages = env_usize("POLYEDGE_DISCOVERY_ENDDATE_DESC_MAX_PAGES", 8, 0, 64);
         let volume_limit = env_i64("POLYEDGE_DISCOVERY_VOLUME_LIMIT", 200, 50, 1000);
         let volume_pages_cfg = env_usize("POLYEDGE_DISCOVERY_VOLUME_MAX_PAGES", 0, 0, 32);
         let volume_pages_fallback = env_usize("POLYEDGE_DISCOVERY_VOLUME_FALLBACK_PAGES", 1, 0, 8);
@@ -299,12 +297,11 @@ impl MarketDiscovery {
                 }
 
                 for market in markets {
-                    // Gamma can omit `acceptingOrders` for still-tradable markets.
-                    // Treat only explicit `false` as non-tradable.
-                    // Do not hard-reject inactive markets here. Near-expiry filtering and
-                    // timeframe/type checks already keep scope tight, and keeping inactive
-                    // next-round listings reduces switch lag at window boundaries.
-                    if market.closed || matches!(market.accepting_orders, Some(false)) {
+                    // Do not hard-reject `acceptingOrders=false` here.
+                    // Around round boundaries, Gamma can temporarily report the next window
+                    // with `acceptingOrders=false`, and filtering it out causes 60-90s switch gaps.
+                    // We keep discovery broad and let recorder-side window guards decide sampling.
+                    if market.closed {
                         continue;
                     }
                     if !seen.insert(market.id.clone()) {
@@ -627,8 +624,6 @@ struct GammaMarket {
     clob_token_ids: Option<String>,
     #[serde(default)]
     closed: bool,
-    #[serde(default)]
-    accepting_orders: Option<bool>,
     #[serde(default)]
     events: Option<Vec<GammaEvent>>,
 }
