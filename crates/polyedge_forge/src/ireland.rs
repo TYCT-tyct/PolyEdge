@@ -65,7 +65,10 @@ const DISCOVERY_EMPTY_GRACE_DEFAULT_MS: i64 = 8_000;
 const ROUND_DROP_ON_QUALITY_FAIL_DEFAULT: bool = true;
 const TOKYO_INPUT_STALE_GUARD_DEFAULT_MS: i64 = 2_500;
 const INPUT_STALE_WARN_THROTTLE_MS: i64 = 15_000;
-const MARKET_SELECTION_FALLBACK_PREWARM_DEFAULT_MS: i64 = 180_000;
+const MARKET_SELECTION_FALLBACK_PREWARM_DEFAULT_MS: i64 = 300_000;
+const MARKET_CANDIDATE_POOL_DEFAULT_SIZE: usize = 3;
+const DISCOVERY_PREWARM_LEAD_DEFAULT_MS: i64 = 300_000;
+const DISCOVERY_PREWARM_REFRESH_DEFAULT_SEC: u64 = 2;
 const QUOTE_FALLBACK_MAX_AGE_5M_MS: i64 = 6 * 60 * 1_000;
 const QUOTE_FALLBACK_MAX_AGE_15M_MS: i64 = 18 * 60 * 1_000;
 
@@ -230,6 +233,23 @@ fn market_selection_rank(m: &MarketMeta, now_ms: i64, sample_end_grace_ms: i64) 
         now_ms.saturating_sub(m.end_ts_ms),
         m.start_ts_ms.saturating_abs(),
     )
+}
+
+fn trim_candidate_pool(
+    markets: &mut Vec<MarketMeta>,
+    now_ms: i64,
+    prestart_allow_ms: i64,
+    sample_end_grace_ms: i64,
+    max_candidates: usize,
+) {
+    markets.sort_by_key(|m| {
+        (
+            !market_in_sampling_window(m, now_ms, prestart_allow_ms, sample_end_grace_ms),
+            market_selection_rank(m, now_ms, sample_end_grace_ms),
+        )
+    });
+    markets.dedup_by(|a, b| a.market_id == b.market_id);
+    markets.truncate(max_candidates.max(1));
 }
 
 fn market_primary_candidate_is_valid(m: &MarketMeta, now_ms: i64, prestart_allow_ms: i64) -> bool {
@@ -720,6 +740,11 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
             .and_then(|v| v.trim().parse::<i64>().ok())
             .unwrap_or(MARKET_SELECTION_FALLBACK_PREWARM_DEFAULT_MS)
             .clamp(30_000, 15 * 60 * 1_000);
+    let market_candidate_pool_size = std::env::var("FORGE_MARKET_CANDIDATE_POOL_SIZE")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(MARKET_CANDIDATE_POOL_DEFAULT_SIZE)
+        .clamp(2, 8);
     let discovery_empty_grace_ms = std::env::var("FORGE_DISCOVERY_EMPTY_GRACE_MS")
         .ok()
         .and_then(|v| v.trim().parse::<i64>().ok())
@@ -750,6 +775,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         market_prestart_allow_ms = market_prestart_allow_ms,
         market_sample_end_grace_ms = market_sample_end_grace_ms,
         market_selection_fallback_prewarm_ms = market_selection_fallback_prewarm_ms,
+        market_candidate_pool_size = market_candidate_pool_size,
         discovery_empty_grace_ms = discovery_empty_grace_ms,
         round_drop_on_quality_fail = round_drop_on_quality_fail,
         market_filter = %market_filter.summary(),
@@ -1002,18 +1028,13 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         }
         for markets in candidate_markets_by_pair.values_mut() {
             let now_ms = Utc::now().timestamp_millis();
-            markets.sort_by_key(|m| {
-                (
-                    !market_in_sampling_window(
-                        m,
-                        now_ms,
-                        market_prestart_allow_ms,
-                        market_sample_end_grace_ms,
-                    ),
-                    market_selection_rank(m, now_ms, market_sample_end_grace_ms),
-                )
-            });
-            markets.dedup_by(|a, b| a.market_id == b.market_id);
+            trim_candidate_pool(
+                markets,
+                now_ms,
+                market_prestart_allow_ms,
+                market_sample_end_grace_ms,
+                market_candidate_pool_size,
+            );
         }
         if !markets_by_id.is_empty() {
             let mut seeded_pairs = markets_by_id
@@ -1163,18 +1184,13 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     }
                 }
                 for markets in candidates_by_pair.values_mut() {
-                    markets.sort_by_key(|m| {
-                        (
-                            !market_in_sampling_window(
-                                m,
-                                now_ms,
-                                market_prestart_allow_ms,
-                                market_sample_end_grace_ms,
-                            ),
-                            market_selection_rank(m, now_ms, market_sample_end_grace_ms),
-                        )
-                    });
-                    markets.dedup_by(|a, b| a.market_id == b.market_id);
+                    trim_candidate_pool(
+                        markets,
+                        now_ms,
+                        market_prestart_allow_ms,
+                        market_sample_end_grace_ms,
+                        market_candidate_pool_size,
+                    );
                 }
                 let mut selected_by_pair: HashMap<String, MarketMeta> = HashMap::new();
                 for (pair_key, markets) in &candidates_by_pair {
@@ -1344,6 +1360,15 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         reduced.insert(market.market_id.clone(), market.clone());
                     }
                     markets_by_id = reduced;
+                }
+                for markets in candidates_by_pair.values_mut() {
+                    trim_candidate_pool(
+                        markets,
+                        now_ms,
+                        market_prestart_allow_ms,
+                        market_sample_end_grace_ms,
+                        market_candidate_pool_size,
+                    );
                 }
                 candidate_markets_by_pair = candidates_by_pair;
                 let mut kept_pairs = markets_by_id
@@ -2457,15 +2482,50 @@ fn spawn_market_discovery_reader(
     tx: mpsc::UnboundedSender<Vec<MarketMeta>>,
     persist: mpsc::UnboundedSender<PersistEvent>,
 ) {
+    fn has_near_upcoming_markets(
+        markets: &[MarketMeta],
+        now_ms: i64,
+        prewarm_lead_ms: i64,
+    ) -> bool {
+        markets.iter().any(|m| {
+            let lead = m.start_ts_ms.saturating_sub(now_ms);
+            lead >= 0 && lead <= prewarm_lead_ms
+        })
+    }
+
     tokio::spawn(async move {
-        let base_refresh = refresh_sec.max(10);
+        let base_refresh = refresh_sec.max(2);
+        let discovery_prewarm_lead_ms = std::env::var("FORGE_DISCOVERY_PREWARM_LEAD_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(DISCOVERY_PREWARM_LEAD_DEFAULT_MS)
+            .clamp(60_000, 15 * 60 * 1_000);
+        let discovery_prewarm_refresh_sec = std::env::var("FORGE_DISCOVERY_PREWARM_REFRESH_SEC")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DISCOVERY_PREWARM_REFRESH_DEFAULT_SEC)
+            .clamp(1, 10)
+            .min(base_refresh);
         let mut current_wait = base_refresh;
         let max_wait = base_refresh.saturating_mul(8).min(600);
         let mut last_markets: Vec<MarketMeta> = Vec::new();
         loop {
             match discover_markets(&symbols, &timeframes).await {
                 Ok(markets) => {
-                    tracing::info!(market_count = markets.len(), "discovery succeeded");
+                    let now_ms = Utc::now().timestamp_millis();
+                    let prewarm_polling =
+                        has_near_upcoming_markets(&markets, now_ms, discovery_prewarm_lead_ms);
+                    current_wait = if prewarm_polling {
+                        discovery_prewarm_refresh_sec
+                    } else {
+                        base_refresh
+                    };
+                    tracing::info!(
+                        market_count = markets.len(),
+                        prewarm_polling = prewarm_polling,
+                        poll_wait_sec = current_wait,
+                        "discovery succeeded"
+                    );
                     log_ingest(
                         &persist,
                         "info",
@@ -2476,15 +2536,24 @@ fn spawn_market_discovery_reader(
                         return;
                     }
                     last_markets = markets;
-                    current_wait = base_refresh;
                 }
                 Err(err) => {
                     if let Ok(fallback) =
                         discover_markets_from_target_cache(&symbols, &timeframes).await
                     {
+                        let now_ms = Utc::now().timestamp_millis();
+                        let prewarm_polling =
+                            has_near_upcoming_markets(&fallback, now_ms, discovery_prewarm_lead_ms);
+                        current_wait = if prewarm_polling {
+                            discovery_prewarm_refresh_sec
+                        } else {
+                            base_refresh
+                        };
                         tracing::warn!(
                             fallback_market_count = fallback.len(),
                             error = %err,
+                            prewarm_polling = prewarm_polling,
+                            poll_wait_sec = current_wait,
                             "discovery failed; using cache fallback"
                         );
                         log_ingest(
@@ -2500,14 +2569,26 @@ fn spawn_market_discovery_reader(
                             return;
                         }
                         last_markets = fallback;
-                        current_wait = base_refresh;
                         tokio::time::sleep(Duration::from_secs(current_wait.max(1))).await;
                         continue;
                     }
                     if !last_markets.is_empty() {
+                        let now_ms = Utc::now().timestamp_millis();
+                        let prewarm_polling = has_near_upcoming_markets(
+                            &last_markets,
+                            now_ms,
+                            discovery_prewarm_lead_ms,
+                        );
+                        current_wait = if prewarm_polling {
+                            discovery_prewarm_refresh_sec
+                        } else {
+                            base_refresh
+                        };
                         tracing::warn!(
                             fallback_market_count = last_markets.len(),
                             error = %err,
+                            prewarm_polling = prewarm_polling,
+                            poll_wait_sec = current_wait,
                             "discovery failed; reusing last known markets"
                         );
                         log_ingest(
@@ -2522,7 +2603,6 @@ fn spawn_market_discovery_reader(
                         if tx.send(last_markets.clone()).is_err() {
                             return;
                         }
-                        current_wait = base_refresh;
                         tokio::time::sleep(Duration::from_secs(current_wait.max(1))).await;
                         continue;
                     }
@@ -3155,6 +3235,30 @@ mod tests {
             2_000 + MARKET_STALE_GUARD_MS + 1,
             180_000
         ));
+    }
+
+    #[test]
+    fn trim_candidate_pool_keeps_current_next_next2() {
+        let now_ms = 1_000_000;
+        let mk = |id: &str, start: i64, end: i64| MarketMeta {
+            market_id: id.to_string(),
+            symbol: "BTCUSDT".to_string(),
+            timeframe: "5m".to_string(),
+            title: "BTC".to_string(),
+            target_price: None,
+            start_ts_ms: start,
+            end_ts_ms: end,
+        };
+        let mut markets = vec![
+            mk("past", now_ms - 600_000, now_ms - 300_000),
+            mk("current", now_ms - 60_000, now_ms + 240_000),
+            mk("next", now_ms + 240_000, now_ms + 540_000),
+            mk("next2", now_ms + 540_000, now_ms + 840_000),
+            mk("next3", now_ms + 840_000, now_ms + 1_140_000),
+        ];
+        trim_candidate_pool(&mut markets, now_ms, 30_000, 300, 3);
+        let ids = markets.into_iter().map(|m| m.market_id).collect::<Vec<_>>();
+        assert_eq!(ids, vec!["current", "next", "next2"]);
     }
 
     fn dummy_snapshot(round_id: &str, ts_ms: i64) -> SnapshotRow {

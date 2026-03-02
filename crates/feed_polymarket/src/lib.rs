@@ -888,14 +888,27 @@ struct GammaMarketTokens {
     clob_token_ids: Option<String>,
     #[serde(default)]
     closed: bool,
-    #[serde(default)]
-    accepting_orders: Option<bool>,
 }
 
 async fn fetch_token_market_map(
     gamma_endpoint: &str,
     token_ids: &[String],
 ) -> Result<HashMap<String, String>> {
+    fn env_i64(key: &str, default: i64, min: i64, max: i64) -> i64 {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(default)
+            .clamp(min, max)
+    }
+    fn env_usize(key: &str, default: usize, min: usize, max: usize) -> usize {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(default)
+            .clamp(min, max)
+    }
+
     let mut wanted = HashSet::<String>::new();
     for t in token_ids {
         let t = t.trim();
@@ -909,53 +922,63 @@ async fn fetch_token_market_map(
 
     let http = Client::new();
     let mut out = HashMap::<String, String>::new();
+    let limit = env_i64("POLYEDGE_TOKEN_MAP_QUERY_LIMIT", 500, 100, 1_000);
+    let enddate_pages = env_usize("POLYEDGE_TOKEN_MAP_ENDDATE_PAGES", 10, 1, 64);
+    let volume_pages = env_usize("POLYEDGE_TOKEN_MAP_VOLUME_PAGES", 6, 0, 64);
+    let mut scan_plans = vec![("endDate", "true", enddate_pages)];
+    if volume_pages > 0 {
+        scan_plans.push(("volume", "false", volume_pages));
+    }
 
-    let limit: i64 = 1000;
-    for offset in [0_i64, 1000, 2000, 3000] {
-        if wanted.is_empty() {
-            break;
-        }
-        let limit_s = limit.to_string();
-        let offset_s = offset.to_string();
-        let markets: Vec<GammaMarketTokens> = http
-            .get(gamma_endpoint)
-            .query(&[
-                ("closed", "false"),
-                ("archived", "false"),
-                ("limit", limit_s.as_str()),
-                ("offset", offset_s.as_str()),
-                ("order", "volume"),
-                ("ascending", "false"),
-            ])
-            .send()
-            .await
-            .context("gamma request")?
-            .error_for_status()
-            .context("gamma status")?
-            .json()
-            .await
-            .context("gamma json")?;
-
-        if markets.is_empty() {
-            break;
-        }
-
-        for market in markets {
-            // Gamma may omit `acceptingOrders`; only explicit false should be rejected.
-            if market.closed || matches!(market.accepting_orders, Some(false)) {
-                continue;
-            }
-            let Some((yes, no)) = parse_token_pair(market.clob_token_ids.as_deref()) else {
-                continue;
-            };
-            if wanted.remove(&yes) {
-                out.insert(yes, market.id.clone());
-            }
-            if wanted.remove(&no) {
-                out.insert(no, market.id.clone());
-            }
+    for (order, ascending, pages) in scan_plans {
+        for page_idx in 0..pages {
             if wanted.is_empty() {
                 break;
+            }
+            let offset = (page_idx as i64) * limit;
+            let limit_s = limit.to_string();
+            let offset_s = offset.to_string();
+            let markets: Vec<GammaMarketTokens> = http
+                .get(gamma_endpoint)
+                .query(&[
+                    ("closed", "false"),
+                    ("archived", "false"),
+                    ("limit", limit_s.as_str()),
+                    ("offset", offset_s.as_str()),
+                    ("order", order),
+                    ("ascending", ascending),
+                ])
+                .send()
+                .await
+                .context("gamma request")?
+                .error_for_status()
+                .context("gamma status")?
+                .json()
+                .await
+                .context("gamma json")?;
+
+            if markets.is_empty() {
+                break;
+            }
+
+            for market in markets {
+                // Do not filter by `acceptingOrders`: around boundaries, the next round
+                // can be visible but temporarily non-accepting; we still need token->market mapping.
+                if market.closed {
+                    continue;
+                }
+                let Some((yes, no)) = parse_token_pair(market.clob_token_ids.as_deref()) else {
+                    continue;
+                };
+                if wanted.remove(&yes) {
+                    out.insert(yes, market.id.clone());
+                }
+                if wanted.remove(&no) {
+                    out.insert(no, market.id.clone());
+                }
+                if wanted.is_empty() {
+                    break;
+                }
             }
         }
     }

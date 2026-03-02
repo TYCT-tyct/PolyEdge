@@ -100,13 +100,13 @@ impl Default for DiscoveryConfig {
             near_expiry_only: env_bool("POLYEDGE_DISCOVERY_NEAR_EXPIRY_ONLY", true),
             max_future_ms_5m: env_i64_ms(
                 "POLYEDGE_DISCOVERY_MAX_FUTURE_MS_5M",
-                25 * 60 * 1_000,
+                30 * 60 * 1_000,
                 30_000,
                 24 * 60 * 60 * 1_000,
             ),
             max_future_ms_15m: env_i64_ms(
                 "POLYEDGE_DISCOVERY_MAX_FUTURE_MS_15M",
-                70 * 60 * 1_000,
+                90 * 60 * 1_000,
                 30_000,
                 24 * 60 * 60 * 1_000,
             ),
@@ -131,8 +131,8 @@ impl Default for DiscoveryConfig {
             // Keep one active market per (symbol, market_type, timeframe) template
             // to prevent stale/future window fanout from diluting strategy decisions.
             one_market_per_template: env_bool("POLYEDGE_DISCOVERY_ONE_PER_TEMPLATE", true),
-            // Keep more than one candidate to allow immediate round switch at boundaries.
-            markets_per_template: env_usize("POLYEDGE_DISCOVERY_MARKETS_PER_TEMPLATE", 2, 1, 8),
+            // Keep at least 3 candidates (current + next + next-next) for fast round switching.
+            markets_per_template: env_usize("POLYEDGE_DISCOVERY_MARKETS_PER_TEMPLATE", 3, 1, 8),
         }
     }
 }
@@ -439,21 +439,23 @@ fn collapse_to_markets_per_template(
     for mut entries in grouped.into_values() {
         entries.sort_by_key(|m| {
             let end_ms = parse_end_date_ms(m.end_date.as_deref()).unwrap_or(i64::MAX / 4);
-            // Prefer windows closest to "now". Keep only a short grace for just-ended
-            // rounds so discovery quickly advances to the current window.
-            let recent_grace_ms = recent_end_grace_ms(m.timeframe.as_deref());
-            let ended_penalty = if end_ms < now_ms.saturating_sub(recent_grace_ms) {
-                1_i64
+            if end_ms >= now_ms {
+                // Keep upcoming windows first (current -> next -> next-next).
+                return (
+                    0_u8,
+                    0_u8,
+                    end_ms.saturating_sub(now_ms),
+                    m.market_id.clone(),
+                );
+            }
+            let overdue_ms = now_ms.saturating_sub(end_ms);
+            // Keep just-ended rounds only as a short emergency fallback.
+            let ended_bucket = if overdue_ms <= recent_end_grace_ms(m.timeframe.as_deref()) {
+                0_u8
             } else {
-                0_i64
+                1_u8
             };
-            let distance = end_ms.saturating_sub(now_ms).abs();
-            (
-                ended_penalty,
-                distance,
-                std::cmp::Reverse(end_ms),
-                m.market_id.clone(),
-            )
+            (1_u8, ended_bucket, overdue_ms, m.market_id.clone())
         });
         out.extend(entries.into_iter().take(keep_per_template));
     }
@@ -817,5 +819,44 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].market_id, "current");
         assert_eq!(out[1].market_id, "next");
+    }
+
+    #[test]
+    fn collapse_prefers_current_next_next2_when_keep_is_three() {
+        let mk = |id: &str, end_date: &str| MarketDescriptor {
+            market_id: id.to_string(),
+            question: "Bitcoin Up or Down - 5 Minutes".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            market_slug: None,
+            token_id_yes: Some(format!("y-{id}")),
+            token_id_no: Some(format!("n-{id}")),
+            event_slug: None,
+            end_date: Some(end_date.to_string()),
+            event_start_time: None,
+            timeframe: Some("5m".to_string()),
+            market_type: Some("updown".to_string()),
+            best_bid: None,
+            best_ask: None,
+            price_to_beat: None,
+        };
+
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 2, 22, 16, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        let input = vec![
+            mk("past", "2026-02-22T15:59:40Z"),
+            mk("current", "2026-02-22T16:05:00Z"),
+            mk("next", "2026-02-22T16:10:00Z"),
+            mk("next2", "2026-02-22T16:15:00Z"),
+            mk("far", "2026-02-22T16:30:00Z"),
+        ];
+
+        let mut out = collapse_to_markets_per_template(input, now, 3);
+        out.sort_by(|a, b| a.market_id.cmp(&b.market_id));
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].market_id, "current");
+        assert_eq!(out[1].market_id, "next");
+        assert_eq!(out[2].market_id, "next2");
     }
 }

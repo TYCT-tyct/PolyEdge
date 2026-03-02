@@ -54,7 +54,7 @@ pub struct IrelandRecorderArgs {
     pub active_timeframes: String,
     #[arg(long, env = "FORGE_ACTIVE_SYMBOL_TIMEFRAMES", default_value = "")]
     pub active_symbol_timeframes: String,
-    #[arg(long, env = "FORGE_DISCOVERY_REFRESH_SEC", default_value_t = 60)]
+    #[arg(long, env = "FORGE_DISCOVERY_REFRESH_SEC", default_value_t = 5)]
     pub discovery_refresh_sec: u64,
     #[arg(long, env = "FORGE_CH_URL", default_value = "http://127.0.0.1:8123")]
     pub clickhouse_url: String,
