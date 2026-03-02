@@ -1479,7 +1479,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
     };
     let (_, live_market_res, position_before_gate) = tokio::join!(
         maintenance_fut,
-        resolve_live_market_target(market_type),
+        resolve_live_market_target_with_state(state, market_type),
         state.get_live_position_state(market_type)
     );
     let live_market_target_error = live_market_res.as_ref().err().map(|e| e.message.clone());

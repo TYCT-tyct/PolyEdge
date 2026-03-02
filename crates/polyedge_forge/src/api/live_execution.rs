@@ -798,12 +798,6 @@ pub(super) fn select_live_decisions(
     selected
 }
 
-pub(super) async fn resolve_live_market_target(
-    market_type: &str,
-) -> Result<LiveMarketTarget, ApiError> {
-    resolve_live_market_target_inner(None, market_type).await
-}
-
 pub(super) async fn resolve_live_market_target_with_state(
     state: &ApiState,
     market_type: &str,
