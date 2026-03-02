@@ -179,6 +179,17 @@
     }
 
     #[test]
+    fn can_retry_only_on_liquidity_like_errors() {
+        assert!(can_retry_on_liquidity("insufficient liquidity"));
+        assert!(can_retry_on_liquidity("no orders found to match with FAK order"));
+        assert!(!can_retry_on_liquidity(
+            "unauthorized: invalid api key or signature"
+        ));
+        assert!(!can_retry_on_liquidity("insufficient balance"));
+        assert!(!can_retry_on_liquidity("bad request: min order size violation"));
+    }
+
+    #[test]
     fn retry_payload_exit_keeps_full_size() {
         let cur = json!({
             "action": "exit",

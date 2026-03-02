@@ -47,7 +47,6 @@ use snapshot::*;
 use strategy::*;
 
 mod infra;
-#[allow(dead_code)]
 mod live_execution;
 mod market_utils;
 mod read_api;
@@ -104,7 +103,6 @@ struct ChartCacheEntry {
 
 const CHART_CACHE_TTL_MS: u64 = 900;
 const CHART_CACHE_MAX_ENTRIES: usize = 120;
-#[allow(dead_code)]
 const LIVE_DECISION_GUARD_TTL_MS: i64 = 45_000;
 const LIVE_EVENT_LOG_MAX_DEFAULT: usize = 4_000;
 const LIVE_EVENT_LOG_MAX_MIN: usize = 200;
@@ -112,9 +110,7 @@ const LIVE_EVENT_LOG_MAX_MAX: usize = 20_000;
 const LIVE_EVENT_LOG_TTL_SEC_DEFAULT: u32 = 7 * 24 * 3600;
 const LIVE_EVENT_LOG_TTL_SEC_MIN: u32 = 3600;
 const LIVE_EVENT_LOG_TTL_SEC_MAX: u32 = 30 * 24 * 3600;
-#[allow(dead_code)]
 const LIVE_RUST_BOOK_CACHE_TTL_MS: u64 = 260;
-#[allow(dead_code)]
 const LIVE_RUST_BOOK_CACHE_MAX: usize = 512;
 const LIVE_ALERT_THROTTLE_DEFAULT_MS: i64 = 5 * 60_000;
 
@@ -193,14 +189,12 @@ fn classify_live_event_type(event: &Value) -> &'static str {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LiveExecutorMode {
     Gateway,
     RustSdk,
 }
 
-#[allow(dead_code)]
 impl LiveExecutorMode {
     fn from_env() -> Self {
         let raw = std::env::var("FORGE_FEV1_EXECUTOR")
@@ -212,17 +206,9 @@ impl LiveExecutorMode {
             _ => Self::Gateway,
         }
     }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Gateway => "clob_gateway",
-            Self::RustSdk => "rust_sdk",
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct RustExecutorConfig {
     host: String,
     private_key: String,
@@ -233,7 +219,6 @@ struct RustExecutorConfig {
     nonce: Option<u32>,
 }
 
-#[allow(dead_code)]
 impl RustExecutorConfig {
     fn from_env() -> Result<Self, String> {
         let host = std::env::var("FORGE_FEV1_CLOB_HOST")
@@ -298,14 +283,12 @@ impl RustExecutorConfig {
     }
 }
 
-#[allow(dead_code)]
 struct RustExecutorContext {
     client: PmClient<PmAuthenticated<PmNormal>>,
     signer: Box<dyn PmSigner + Send + Sync>,
 }
 
 #[derive(Clone)]
-#[allow(dead_code)]
 struct RustBookCacheEntry {
     fetched_at: Instant,
     snapshot: GatewayBookSnapshot,
@@ -557,6 +540,409 @@ fn runtime_target_keepalive_ms() -> i64 {
         .clamp(500, 30_000)
 }
 
+fn live_min_entry_score() -> f64 {
+    std::env::var("FORGE_FEV1_LIVE_MIN_ENTRY_SCORE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.66)
+        .clamp(0.45, 0.98)
+}
+
+fn live_min_net_edge_cents() -> f64 {
+    std::env::var("FORGE_FEV1_LIVE_MIN_NET_EDGE_CENTS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(1.10)
+        .clamp(0.0, 40.0)
+}
+
+fn live_score_edge_scale_cents() -> f64 {
+    std::env::var("FORGE_FEV1_LIVE_SCORE_EDGE_SCALE_CENTS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(12.0)
+        .clamp(1.0, 80.0)
+}
+
+fn live_regime_min_trades() -> usize {
+    std::env::var("FORGE_FEV1_LIVE_REGIME_MIN_TRADES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(120)
+        .clamp(20, 20_000)
+}
+
+fn live_regime_min_win_rate_pct() -> f64 {
+    std::env::var("FORGE_FEV1_LIVE_REGIME_MIN_WIN_RATE_PCT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(57.0)
+        .clamp(45.0, 99.0)
+}
+
+fn live_regime_min_net_margin_pct() -> f64 {
+    std::env::var("FORGE_FEV1_LIVE_REGIME_MIN_NET_MARGIN_PCT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(8.5)
+        .clamp(-50.0, 90.0)
+}
+
+fn live_auto_score_enabled() -> bool {
+    std::env::var("FORGE_FEV1_LIVE_AUTO_SCORE_ENABLED")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(true)
+}
+
+fn live_auto_score_min_trades() -> usize {
+    std::env::var("FORGE_FEV1_LIVE_AUTO_SCORE_MIN_TRADES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(160)
+        .clamp(40, 40_000)
+}
+
+fn live_auto_score_step() -> f64 {
+    std::env::var("FORGE_FEV1_LIVE_AUTO_SCORE_GRID_STEP")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.01)
+        .clamp(0.005, 0.05)
+}
+
+fn live_auto_score_min_subset() -> usize {
+    std::env::var("FORGE_FEV1_LIVE_AUTO_SCORE_MIN_SUBSET")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(24)
+        .clamp(10, 5_000)
+}
+
+fn live_auto_score_max_relax() -> f64 {
+    std::env::var("FORGE_FEV1_LIVE_AUTO_SCORE_MAX_RELAX")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.08)
+        .clamp(0.0, 0.30)
+}
+
+fn live_auto_score_max_tighten() -> f64 {
+    std::env::var("FORGE_FEV1_LIVE_AUTO_SCORE_MAX_TIGHTEN")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.16)
+        .clamp(0.0, 0.40)
+}
+
+fn decision_action_count(decisions: &[Value], action: &str) -> usize {
+    decisions
+        .iter()
+        .filter(|d| {
+            d.get("action")
+                .and_then(Value::as_str)
+                .map(|a| a.eq_ignore_ascii_case(action))
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+fn decision_action_count_from_orders(orders: &[Value], action: &str) -> usize {
+    orders
+        .iter()
+        .filter(|row| {
+            row.get("decision")
+                .and_then(|d| d.get("action"))
+                .and_then(Value::as_str)
+                .map(|a| a.eq_ignore_ascii_case(action))
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+fn parse_trade_score_pnl_pairs(trades: &[Value]) -> Vec<(f64, f64)> {
+    let mut out = Vec::<(f64, f64)>::new();
+    for t in trades {
+        let score = t
+            .get("entry_score")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0)
+            .abs();
+        let pnl = t
+            .get("pnl_net_cents")
+            .and_then(Value::as_f64)
+            .or_else(|| t.get("pnl_cents").and_then(Value::as_f64))
+            .unwrap_or(0.0);
+        if score.is_finite() && pnl.is_finite() {
+            out.push((score, pnl));
+        }
+    }
+    out
+}
+
+fn derive_auto_entry_score_threshold(
+    trades: &[Value],
+    base_threshold: f64,
+) -> Option<(f64, Value)> {
+    if !live_auto_score_enabled() {
+        return None;
+    }
+    let pairs = parse_trade_score_pnl_pairs(trades);
+    if pairs.len() < live_auto_score_min_trades() {
+        return None;
+    }
+    let step = live_auto_score_step();
+    let min_subset = live_auto_score_min_subset().max((pairs.len() as f64 * 0.12).round() as usize);
+    let left = (base_threshold - live_auto_score_max_relax()).clamp(0.40, 0.97);
+    let right = (base_threshold + live_auto_score_max_tighten()).clamp(left, 0.99);
+
+    let mut best_threshold = base_threshold;
+    let mut best_objective = f64::NEG_INFINITY;
+    let mut best_count = 0usize;
+    let mut best_avg = 0.0_f64;
+    let mut best_win_rate = 0.0_f64;
+    let mut cursor = left;
+    while cursor <= right + 1e-9 {
+        let mut count = 0usize;
+        let mut wins = 0usize;
+        let mut total = 0.0_f64;
+        for (score, pnl) in &pairs {
+            if *score + 1e-12 >= cursor {
+                count = count.saturating_add(1);
+                total += *pnl;
+                if *pnl > 0.0 {
+                    wins = wins.saturating_add(1);
+                }
+            }
+        }
+        if count >= min_subset {
+            let avg = total / count as f64;
+            let win_rate = if count > 0 {
+                (wins as f64) * 100.0 / count as f64
+            } else {
+                0.0
+            };
+            if avg > 0.0 {
+                let objective = avg * (count as f64).sqrt();
+                if objective > best_objective
+                    || ((objective - best_objective).abs() <= 1e-9
+                        && (avg > best_avg
+                            || ((avg - best_avg).abs() <= 1e-9 && count > best_count)))
+                {
+                    best_objective = objective;
+                    best_threshold = cursor;
+                    best_count = count;
+                    best_avg = avg;
+                    best_win_rate = win_rate;
+                }
+            }
+        }
+        cursor += step;
+    }
+
+    if !best_objective.is_finite() {
+        return None;
+    }
+    Some((
+        best_threshold.clamp(0.40, 0.99),
+        json!({
+            "enabled": true,
+            "sample_count": pairs.len(),
+            "selected_count": best_count,
+            "objective": best_objective,
+            "avg_pnl_cents": best_avg,
+            "win_rate_pct": best_win_rate,
+            "base_threshold": base_threshold,
+            "selected_threshold": best_threshold,
+            "grid_left": left,
+            "grid_right": right,
+            "grid_step": step,
+            "min_subset": min_subset
+        }),
+    ))
+}
+
+fn gate_live_decisions_by_profitability(
+    decisions: &[Value],
+    summary: &Value,
+    trades: &[Value],
+    gateway_cfg: &LiveGatewayConfig,
+) -> (Vec<Value>, Vec<Value>, Value) {
+    if decisions.is_empty() {
+        return (
+            Vec::new(),
+            Vec::new(),
+            json!({
+                "enabled": true,
+                "selected_count": 0,
+                "skipped_count": 0
+            }),
+        );
+    }
+
+    let base_score = live_min_entry_score();
+    let base_net_edge = live_min_net_edge_cents();
+    let score_edge_scale = live_score_edge_scale_cents();
+    let regime_min_trades = live_regime_min_trades();
+    let regime_min_win_rate = live_regime_min_win_rate_pct();
+    let regime_min_margin = live_regime_min_net_margin_pct();
+
+    let trade_count = summary
+        .get("trade_count")
+        .and_then(Value::as_u64)
+        .map(|v| v as usize)
+        .or_else(|| {
+            summary
+                .get("trade_count")
+                .and_then(Value::as_i64)
+                .map(|v| v.max(0) as usize)
+        })
+        .unwrap_or(0);
+    let win_rate = summary
+        .get("win_rate_pct")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let net_margin = summary
+        .get("net_margin_pct")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+
+    let (effective_score, auto_diag) =
+        if let Some((auto_score, diag)) = derive_auto_entry_score_threshold(trades, base_score) {
+            (auto_score, diag)
+        } else {
+            (
+                base_score,
+                json!({
+                    "enabled": live_auto_score_enabled(),
+                    "sample_count": parse_trade_score_pnl_pairs(trades).len(),
+                    "selected_threshold": base_score
+                }),
+            )
+        };
+
+    let regime_known = trade_count >= regime_min_trades;
+    let regime_ok =
+        !regime_known || (win_rate >= regime_min_win_rate && net_margin >= regime_min_margin);
+    let warmup_extra_score = if regime_known { 0.0 } else { 0.04 };
+    let warmup_extra_edge = if regime_known { 0.0 } else { 0.35 };
+    let required_score = (effective_score + warmup_extra_score).clamp(0.40, 0.995);
+    let required_edge = (base_net_edge + warmup_extra_edge).max(0.0);
+
+    let entry_fee_floor_cents = if trade_count > 0 {
+        summary
+            .get("total_entry_fee_cents")
+            .and_then(Value::as_f64)
+            .map(|v| (v / trade_count as f64).max(0.0))
+            .unwrap_or(1.2)
+    } else {
+        1.2
+    };
+
+    let mut selected = Vec::<Value>::new();
+    let mut skipped = Vec::<Value>::new();
+    for decision in decisions {
+        let action = decision
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let is_entry_like = action == "enter" || action == "add";
+        if !is_entry_like {
+            selected.push(decision.clone());
+            continue;
+        }
+        if !regime_ok {
+            skipped.push(json!({
+                "reason": "regime_gate_block",
+                "decision": decision,
+                "regime": {
+                    "trade_count": trade_count,
+                    "win_rate_pct": win_rate,
+                    "net_margin_pct": net_margin
+                }
+            }));
+            continue;
+        }
+        let score = decision
+            .get("edge_score")
+            .and_then(Value::as_f64)
+            .or_else(|| decision.get("entry_score").and_then(Value::as_f64))
+            .unwrap_or(0.0)
+            .abs();
+        if score < required_score {
+            skipped.push(json!({
+                "reason": "entry_score_below_profit_gate",
+                "decision": decision,
+                "score": score,
+                "required_score": required_score
+            }));
+            continue;
+        }
+        let quote_usdc = decision
+            .get("quote_size_usdc")
+            .and_then(Value::as_f64)
+            .unwrap_or(gateway_cfg.min_quote_usdc.max(0.01))
+            .max(0.01);
+        let slippage_bps = decision
+            .get("max_slippage_bps")
+            .and_then(Value::as_f64)
+            .unwrap_or(gateway_cfg.entry_slippage_bps)
+            .clamp(0.0, 800.0);
+        let slippage_cost_cents = quote_usdc * (slippage_bps / 10_000.0) * 100.0;
+        let model_edge_cents = (score - effective_score).max(0.0) * score_edge_scale;
+        let estimated_net_edge = model_edge_cents - slippage_cost_cents - entry_fee_floor_cents;
+        if estimated_net_edge < required_edge {
+            skipped.push(json!({
+                "reason": "net_edge_below_profit_gate",
+                "decision": decision,
+                "estimated_net_edge_cents": estimated_net_edge,
+                "required_net_edge_cents": required_edge,
+                "model_edge_cents": model_edge_cents,
+                "slippage_cost_cents": slippage_cost_cents,
+                "entry_fee_floor_cents": entry_fee_floor_cents
+            }));
+            continue;
+        }
+        selected.push(decision.clone());
+    }
+
+    let selected_count = selected.len();
+    let skipped_count = skipped.len();
+    (
+        selected,
+        skipped,
+        json!({
+            "enabled": true,
+            "base_min_entry_score": base_score,
+            "effective_min_entry_score": effective_score,
+            "required_entry_score": required_score,
+            "base_min_net_edge_cents": base_net_edge,
+            "required_net_edge_cents": required_edge,
+            "score_edge_scale_cents": score_edge_scale,
+            "entry_fee_floor_cents": entry_fee_floor_cents,
+            "regime": {
+                "known": regime_known,
+                "ok": regime_ok,
+                "trade_count": trade_count,
+                "win_rate_pct": win_rate,
+                "net_margin_pct": net_margin,
+                "min_trades": regime_min_trades,
+                "min_win_rate_pct": regime_min_win_rate,
+                "min_net_margin_pct": regime_min_margin
+            },
+            "auto_score": auto_diag,
+            "selected_count": selected_count,
+            "skipped_count": skipped_count
+        }),
+    )
+}
+
 #[derive(Debug, Clone)]
 struct LiveRuntimeWakeEvent {
     market_type: String,
@@ -616,7 +1002,6 @@ fn live_snapshot_event_channel(prefix: &str) -> String {
     format!("{prefix}:snapshot:events")
 }
 
-#[allow(dead_code)]
 fn is_liquidity_reject_reason(reason: &str) -> bool {
     let r = reason.trim().to_ascii_lowercase();
     r.contains("unmatched")
@@ -1938,12 +2323,233 @@ async fn live_runtime_loop(
                         cycle_sleep_ms = cycle_sleep_ms.min(fast_loop_ms);
                     }
 
-                    let status = payload
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .unwrap_or("ok")
-                        .to_string();
                     let summary = payload.get("summary").cloned().unwrap_or(Value::Null);
+                    let trades = payload
+                        .get("trades")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let paper_decisions =
+                        fev1::build_live_decisions_from_trades(&trades, cfg.quote_usdc);
+                    let latest_ts_ms = payload
+                        .get("current")
+                        .and_then(|v| v.get("timestamp_ms"))
+                        .and_then(Value::as_i64)
+                        .unwrap_or(now_ms);
+                    let prefer_action =
+                        if effective_drain_only || position_before_cycle.side.is_some() {
+                            Some("exit")
+                        } else {
+                            None
+                        };
+                    let selected_decisions = select_live_decisions(
+                        &paper_decisions,
+                        latest_ts_ms,
+                        cfg.max_orders.max(1),
+                        effective_drain_only,
+                        prefer_action,
+                    );
+                    let executor_mode = LiveExecutorMode::from_env();
+                    let gateway_cfg = LiveGatewayConfig::from_env();
+                    let (gateway_cfg_tuned, _) = state
+                        .apply_aggressiveness_to_gateway_cfg(market_type, &gateway_cfg)
+                        .await;
+                    if effective_live_execute || pending_before_count > 0 {
+                        reconcile_live_reports(&state, &gateway_cfg_tuned, executor_mode).await;
+                        handle_live_pending_timeouts(&state, &gateway_cfg_tuned, executor_mode)
+                            .await;
+                    }
+
+                    let (profit_selected, profit_skipped, profit_gate_meta) =
+                        gate_live_decisions_by_profitability(
+                            &selected_decisions,
+                            &summary,
+                            &trades,
+                            &gateway_cfg_tuned,
+                        );
+                    let (gated, mut state_skipped, position_for_submit) = gate_live_decisions(
+                        &state,
+                        market_type,
+                        &profit_selected,
+                        effective_live_execute,
+                    )
+                    .await;
+                    let mut skipped_decisions = profit_skipped;
+                    skipped_decisions.append(&mut state_skipped);
+                    let submitted_decisions: Vec<Value> =
+                        gated.iter().map(|g| g.decision.clone()).collect();
+                    let mut execution_orders = Vec::<Value>::new();
+                    let execution_mode = if effective_live_execute {
+                        "live"
+                    } else {
+                        "dry_run"
+                    }
+                    .to_string();
+                    let mut execution_status = if effective_live_execute {
+                        "idle"
+                    } else {
+                        "dry_run"
+                    }
+                    .to_string();
+                    let mut execution_target = Value::Null;
+                    if effective_live_execute {
+                        if gated.is_empty() {
+                            execution_status = "all_rejected".to_string();
+                        } else {
+                            let resolved_target = if let Some(locked_target) =
+                                build_position_locked_target(market_type, &position_for_submit)
+                            {
+                                Some(locked_target)
+                            } else {
+                                resolve_live_market_target_with_state(&state, market_type)
+                                    .await
+                                    .ok()
+                            };
+                            if let Some(target) = resolved_target {
+                                execution_target = json!({
+                                    "market_id": target.market_id.clone(),
+                                    "symbol": target.symbol.clone(),
+                                    "timeframe": target.timeframe.clone(),
+                                    "token_id_yes": target.token_id_yes.clone(),
+                                    "token_id_no": target.token_id_no.clone(),
+                                    "end_date": target.end_date.clone()
+                                });
+                                execution_orders = execute_live_orders(
+                                    &state,
+                                    &gateway_cfg_tuned,
+                                    executor_mode,
+                                    market_type,
+                                    &target,
+                                    &position_for_submit,
+                                    &gated,
+                                )
+                                .await;
+                                reconcile_live_reports(&state, &gateway_cfg_tuned, executor_mode)
+                                    .await;
+                                handle_live_pending_timeouts(
+                                    &state,
+                                    &gateway_cfg_tuned,
+                                    executor_mode,
+                                )
+                                .await;
+                                let accepted_count = execution_orders
+                                    .iter()
+                                    .filter(|row| {
+                                        row.get("accepted")
+                                            .and_then(Value::as_bool)
+                                            .unwrap_or(false)
+                                    })
+                                    .count();
+                                execution_status = if accepted_count > 0
+                                    || execution_orders
+                                        .iter()
+                                        .any(|row| row.get("decision").is_some())
+                                {
+                                    "submitted".to_string()
+                                } else {
+                                    "all_rejected".to_string()
+                                };
+                            } else {
+                                execution_status = "target_missing".to_string();
+                            }
+                        }
+                    }
+
+                    let aggr_orders = if effective_live_execute {
+                        execution_orders
+                            .iter()
+                            .filter(|row| row.get("decision").is_some())
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+                    let exec_aggr = state
+                        .update_live_execution_aggr_from_orders(market_type, &aggr_orders)
+                        .await;
+                    let state_machine = state.get_live_position_state(market_type).await;
+                    let live_events = state.list_live_events(market_type, 60).await;
+
+                    let live_submitted_count = execution_orders
+                        .iter()
+                        .filter(|row| row.get("decision").is_some())
+                        .count();
+                    let live_accepted_count = execution_orders
+                        .iter()
+                        .filter(|row| {
+                            row.get("accepted")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false)
+                        })
+                        .count();
+                    let live_rejected_count =
+                        live_submitted_count.saturating_sub(live_accepted_count);
+                    let live_execution_payload = json!({
+                        "summary": {
+                            "decision_count": selected_decisions.len(),
+                            "mode": if effective_live_execute { execution_mode.clone() } else { "paper_only".to_string() },
+                        },
+                        "decisions": selected_decisions,
+                        "paper_records": paper_decisions,
+                        "live_records": execution_orders,
+                        "parity_check": {
+                            "status": execution_status.clone(),
+                            "level": if effective_live_execute { "warn" } else { "ok" },
+                            "paper": {
+                                "decision_count": submitted_decisions.len(),
+                                "entry_count": decision_action_count(&submitted_decisions, "enter"),
+                                "add_count": decision_action_count(&submitted_decisions, "add"),
+                                "reduce_count": decision_action_count(&submitted_decisions, "reduce"),
+                                "exit_count": decision_action_count(&submitted_decisions, "exit")
+                            },
+                            "live": {
+                                "submitted_count": live_submitted_count,
+                                "submitted_entry_count": decision_action_count_from_orders(&aggr_orders, "enter"),
+                                "submitted_add_count": decision_action_count_from_orders(&aggr_orders, "add"),
+                                "submitted_reduce_count": decision_action_count_from_orders(&aggr_orders, "reduce"),
+                                "submitted_exit_count": decision_action_count_from_orders(&aggr_orders, "exit"),
+                                "accepted_count": live_accepted_count,
+                                "rejected_count": live_rejected_count,
+                                "skipped_count": skipped_decisions.len(),
+                                "no_live_market_target": execution_target.is_null()
+                            }
+                        },
+                        "profit_gate": profit_gate_meta,
+                        "gated": {
+                            "selected_count": submitted_decisions.len(),
+                            "submitted_count": live_submitted_count,
+                            "skipped_count": skipped_decisions.len(),
+                            "submitted_decisions": submitted_decisions,
+                            "skipped_decisions": skipped_decisions
+                        },
+                        "execution_target": execution_target,
+                        "execution": {
+                            "mode": execution_mode,
+                            "orders": aggr_orders
+                        },
+                        "state_machine": state_machine,
+                        "events": live_events
+                    });
+
+                    let status = if effective_live_execute {
+                        match execution_status.as_str() {
+                            "submitted" => "ok",
+                            "target_missing" => "target_missing",
+                            "all_rejected" => "all_rejected",
+                            _ => "blocked_by_gate_or_state",
+                        }
+                    } else {
+                        payload
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("ok")
+                    }
+                    .to_string();
+                    if let Some(obj) = payload.as_object_mut() {
+                        obj.insert("execution_aggressiveness".to_string(), json!(exec_aggr));
+                        obj.insert("live_execution".to_string(), live_execution_payload);
+                        obj.insert("status".to_string(), Value::String(status.clone()));
+                    }
                     state.set_runtime_snapshot(market_type, payload).await;
                     // Persist runtime state off the hot path to avoid Redis latency coupling.
                     state.persist_live_runtime_state_async(market_type).await;

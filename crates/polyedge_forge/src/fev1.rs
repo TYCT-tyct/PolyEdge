@@ -660,7 +660,8 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
             let cluster_cooldown_ok = sample.ts_ms >= loss_cluster_cooldown_until_ts_ms;
             let round_entries = entries_by_round.get(&sample.round_id).copied().unwrap_or(0);
             let within_limit = round_entries < cfg.max_entries_per_round;
-            let edge_ok = signal.edge_prob.abs() >= dynamic_edge_req;
+            let directional_edge = signal.edge_prob * side.dir();
+            let edge_ok = directional_edge >= dynamic_edge_req;
             let score_ok = score.abs() >= dynamic_entry_threshold;
             let fair_conf = if side == Side::Up {
                 signal.p_fair_up
@@ -905,8 +906,7 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn build_decisions_from_trades(trades: &[Value], quote: f64) -> Vec<Value> {
+pub fn build_live_decisions_from_trades(trades: &[Value], quote: f64) -> Vec<Value> {
     let mut decisions: Vec<Value> = Vec::with_capacity(trades.len().saturating_mul(2));
     for trade in trades {
         let side = trade
@@ -1036,7 +1036,7 @@ fn is_replay_only_exit_reason(reason: &str) -> bool {
 mod tests {
     use serde_json::json;
 
-    use super::{build_decisions_from_trades, simulate, RuntimeConfig, Sample};
+    use super::{build_live_decisions_from_trades, simulate, RuntimeConfig, Sample};
 
     #[test]
     fn replay_only_force_close_is_filtered_out_from_execution_decisions() {
@@ -1053,7 +1053,7 @@ mod tests {
             "entry_remaining_ms": 120_000_i64,
             "exit_remaining_ms": 85_000_i64
         })];
-        let decisions = build_decisions_from_trades(&trades, 1.0);
+        let decisions = build_live_decisions_from_trades(&trades, 1.0);
         assert_eq!(
             decisions.len(),
             1,
@@ -1080,7 +1080,7 @@ mod tests {
             "entry_remaining_ms": 150_000_i64,
             "exit_remaining_ms": 110_000_i64
         })];
-        let decisions = build_decisions_from_trades(&trades, 1.0);
+        let decisions = build_live_decisions_from_trades(&trades, 1.0);
         assert_eq!(decisions.len(), 2);
         assert_eq!(
             decisions[0].get("action").and_then(|v| v.as_str()),
@@ -1473,5 +1473,119 @@ mod tests {
             .and_then(|v| v.get("exit_reason"))
             .and_then(|v| v.as_str());
         assert_eq!(last_reason, Some("stop_loss"));
+    }
+
+    #[test]
+    fn directional_edge_guard_blocks_entry_when_edge_opposes_side() {
+        let cfg = RuntimeConfig {
+            entry_threshold_base: 0.10,
+            entry_threshold_cap: 0.25,
+            spread_limit_prob: 0.05,
+            entry_edge_prob: 0.01,
+            entry_min_potential_cents: 1.0,
+            entry_max_price_cents: 95.0,
+            min_hold_ms: 0,
+            stop_loss_cents: 50.0,
+            reverse_signal_threshold: -0.9,
+            reverse_signal_ticks: 12,
+            trail_activate_profit_cents: 99.0,
+            trail_drawdown_cents: 99.0,
+            take_profit_near_max_cents: 99.0,
+            endgame_take_profit_cents: 99.0,
+            endgame_remaining_ms: 1_000,
+            liquidity_widen_prob: 0.2,
+            cooldown_ms: 0,
+            max_entries_per_round: 10,
+            max_exec_spread_cents: 3.0,
+            slippage_cents_per_side: 0.0,
+            fee_cents_per_side: 0.0,
+            emergency_wide_spread_penalty_ratio: 1.0,
+            stop_loss_grace_ticks: 0,
+            stop_loss_hard_mult: 1.5,
+            stop_loss_reverse_extra_ticks: 1,
+            loss_cluster_limit: 0,
+            loss_cluster_cooldown_ms: 0,
+            noise_gate_enabled: false,
+            noise_gate_threshold_add: 0.0,
+            noise_gate_edge_add: 0.0,
+            noise_gate_spread_scale: 1.0,
+            vic_enabled: true,
+            vic_target_entries_per_hour: 120.0,
+            vic_deadband_ratio: 0.0,
+            vic_threshold_relax_max: 0.0,
+            vic_edge_relax_max: 0.02,
+            vic_spread_relax_max: 0.0,
+        };
+
+        // Keep trend strongly UP, but make p_up slightly above fair value:
+        // score stays positive while edge_prob is negative.
+        let samples = vec![
+            Sample {
+                ts_ms: 1_000,
+                round_id: "r-1".to_string(),
+                remaining_ms: 200_000,
+                p_up: 0.9340,
+                delta_pct: 0.20,
+                velocity: 10.0,
+                acceleration: 20.0,
+                bid_yes: 0.53,
+                ask_yes: 0.54,
+                bid_no: 0.46,
+                ask_no: 0.47,
+                spread_up: 0.01,
+                spread_down: 0.01,
+                spread_mid: 0.01,
+            },
+            Sample {
+                ts_ms: 2_000,
+                round_id: "r-1".to_string(),
+                remaining_ms: 199_000,
+                p_up: 0.9340,
+                delta_pct: 0.20,
+                velocity: 10.0,
+                acceleration: 20.0,
+                bid_yes: 0.53,
+                ask_yes: 0.54,
+                bid_no: 0.46,
+                ask_no: 0.47,
+                spread_up: 0.01,
+                spread_down: 0.01,
+                spread_mid: 0.01,
+            },
+            Sample {
+                ts_ms: 3_000,
+                round_id: "r-1".to_string(),
+                remaining_ms: 198_000,
+                p_up: 0.9340,
+                delta_pct: 0.20,
+                velocity: 10.0,
+                acceleration: 20.0,
+                bid_yes: 0.53,
+                ask_yes: 0.54,
+                bid_no: 0.46,
+                ask_no: 0.47,
+                spread_up: 0.01,
+                spread_down: 0.01,
+                spread_mid: 0.01,
+            },
+        ];
+
+        let run = simulate(&samples, &cfg, 32);
+        let score = run
+            .current
+            .get("score")
+            .and_then(|v| v.as_f64())
+            .unwrap_or_default();
+        let edge = run
+            .current
+            .get("edge_prob")
+            .and_then(|v| v.as_f64())
+            .unwrap_or_default();
+        assert!(score > 0.0, "precondition failed: expected positive score");
+        assert!(edge < 0.0, "precondition failed: expected negative edge");
+        assert_eq!(
+            run.trade_count, 0,
+            "entry should be blocked when edge direction opposes trade side"
+        );
     }
 }
