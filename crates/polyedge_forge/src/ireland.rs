@@ -65,6 +65,7 @@ const DISCOVERY_EMPTY_GRACE_DEFAULT_MS: i64 = 8_000;
 const ROUND_DROP_ON_QUALITY_FAIL_DEFAULT: bool = true;
 const TOKYO_INPUT_STALE_GUARD_DEFAULT_MS: i64 = 2_500;
 const INPUT_STALE_WARN_THROTTLE_MS: i64 = 15_000;
+const MARKET_SELECTION_FALLBACK_PREWARM_DEFAULT_MS: i64 = 180_000;
 
 fn env_flag(key: &str, default: bool) -> bool {
     std::env::var(key)
@@ -233,6 +234,11 @@ fn market_primary_candidate_is_valid(m: &MarketMeta, now_ms: i64, prestart_allow
     // Keep the pair primary on currently tradable rounds and near-future rounds inside
     // prestart window, but still reject long-ended rounds.
     now_ms.saturating_add(prestart_allow_ms) >= m.start_ts_ms
+        && now_ms <= m.end_ts_ms.saturating_add(MARKET_STALE_GUARD_MS)
+}
+
+fn market_candidate_is_warmable(m: &MarketMeta, now_ms: i64, prewarm_ms: i64) -> bool {
+    now_ms.saturating_add(prewarm_ms) >= m.start_ts_ms
         && now_ms <= m.end_ts_ms.saturating_add(MARKET_STALE_GUARD_MS)
 }
 
@@ -673,6 +679,12 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         .and_then(|v| v.trim().parse::<i64>().ok())
         .unwrap_or(MARKET_SAMPLE_END_GRACE_DEFAULT_MS)
         .clamp(0, 5_000);
+    let market_selection_fallback_prewarm_ms =
+        std::env::var("FORGE_MARKET_SELECTION_FALLBACK_PREWARM_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(MARKET_SELECTION_FALLBACK_PREWARM_DEFAULT_MS)
+            .clamp(30_000, 15 * 60 * 1_000);
     let discovery_empty_grace_ms = std::env::var("FORGE_DISCOVERY_EMPTY_GRACE_MS")
         .ok()
         .and_then(|v| v.trim().parse::<i64>().ok())
@@ -702,6 +714,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         market_future_guard_ms = market_future_guard_ms,
         market_prestart_allow_ms = market_prestart_allow_ms,
         market_sample_end_grace_ms = market_sample_end_grace_ms,
+        market_selection_fallback_prewarm_ms = market_selection_fallback_prewarm_ms,
         discovery_empty_grace_ms = discovery_empty_grace_ms,
         round_drop_on_quality_fail = round_drop_on_quality_fail,
         market_filter = %market_filter.summary(),
@@ -1138,6 +1151,14 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         })
                     {
                         selected_by_pair.insert(pair_key.clone(), best.clone());
+                    } else if let Some(best) = markets.iter().find(|m| {
+                        market_candidate_is_warmable(
+                            m,
+                            now_ms,
+                            market_selection_fallback_prewarm_ms,
+                        )
+                    }) {
+                        selected_by_pair.insert(pair_key.clone(), best.clone());
                     }
                 }
                 let mut missing_required_pairs: HashSet<String> = required_pair_keys
@@ -1152,9 +1173,11 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             .get(&pair)
                             .and_then(|candidates| {
                                 candidates.iter().find(|m| {
-                                    now_ms <= m.end_ts_ms.saturating_add(MARKET_STALE_GUARD_MS)
-                                        && now_ms.saturating_add(market_prestart_allow_ms)
-                                            >= m.start_ts_ms
+                                    market_candidate_is_warmable(
+                                        m,
+                                        now_ms,
+                                        market_selection_fallback_prewarm_ms,
+                                    )
                                 })
                             })
                             .cloned();
@@ -1171,10 +1194,11 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             let Some(prev) = prev_primary_by_pair.get(&pair) else {
                                 continue;
                             };
-                            if now_ms > prev.end_ts_ms.saturating_add(MARKET_STALE_GUARD_MS) {
-                                continue;
-                            }
-                            if now_ms.saturating_add(market_prestart_allow_ms) < prev.start_ts_ms {
+                            if !market_candidate_is_warmable(
+                                prev,
+                                now_ms,
+                                market_selection_fallback_prewarm_ms,
+                            ) {
                                 continue;
                             }
                             selected_by_pair.insert(pair.clone(), prev.clone());
@@ -1216,10 +1240,10 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     let valid_prev_primary_by_pair = prev_primary_by_pair
                         .iter()
                         .filter_map(|(pair, market)| {
-                            if market_primary_candidate_is_valid(
+                            if market_candidate_is_warmable(
                                 market,
                                 now_ms,
-                                market_prestart_allow_ms,
+                                market_selection_fallback_prewarm_ms,
                             ) {
                                 Some((pair.clone(), market.clone()))
                             } else {
@@ -1239,10 +1263,10 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             let valid_candidates = prev_candidates
                                 .into_iter()
                                 .filter(|market| {
-                                    market_primary_candidate_is_valid(
+                                    market_candidate_is_warmable(
                                         market,
                                         now_ms,
-                                        market_prestart_allow_ms,
+                                        market_selection_fallback_prewarm_ms,
                                     )
                                 })
                                 .collect::<Vec<_>>();
@@ -2979,6 +3003,44 @@ mod tests {
         };
         assert!(!market_primary_candidate_is_valid(&market, 8_500, 1_000));
         assert!(market_primary_candidate_is_valid(&market, 8_500, 2_000));
+    }
+
+    #[test]
+    fn warmable_candidate_accepts_farther_prestart_window() {
+        let market = MarketMeta {
+            market_id: "m".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            timeframe: "5m".to_string(),
+            title: "BTC".to_string(),
+            target_price: None,
+            start_ts_ms: 100_000,
+            end_ts_ms: 400_000,
+        };
+        assert!(!market_candidate_is_warmable(&market, 20_000, 60_000));
+        assert!(market_candidate_is_warmable(&market, 20_000, 90_000));
+    }
+
+    #[test]
+    fn warmable_candidate_still_rejects_long_ended_round() {
+        let market = MarketMeta {
+            market_id: "m".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            timeframe: "5m".to_string(),
+            title: "BTC".to_string(),
+            target_price: None,
+            start_ts_ms: 1_000,
+            end_ts_ms: 2_000,
+        };
+        assert!(market_candidate_is_warmable(
+            &market,
+            2_000 + MARKET_STALE_GUARD_MS,
+            180_000
+        ));
+        assert!(!market_candidate_is_warmable(
+            &market,
+            2_000 + MARKET_STALE_GUARD_MS + 1,
+            180_000
+        ));
     }
 
     fn dummy_snapshot(round_id: &str, ts_ms: i64) -> SnapshotRow {
