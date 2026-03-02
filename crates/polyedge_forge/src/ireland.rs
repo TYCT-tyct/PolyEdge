@@ -242,6 +242,27 @@ fn round_meta_is_fresh(round_id: &str, now_ms: i64, retention_ms: i64) -> bool {
         .unwrap_or(false)
 }
 
+fn trim_map_by_key_ts_desc<V, F>(map: &mut HashMap<String, V>, cap: usize, mut ts_of: F) -> usize
+where
+    F: FnMut(&str, &V) -> i64,
+{
+    if cap == 0 || map.len() <= cap {
+        return 0;
+    }
+    let mut ordered = map
+        .iter()
+        .map(|(k, v)| (k.clone(), ts_of(k, v)))
+        .collect::<Vec<_>>();
+    ordered.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    let mut dropped = 0usize;
+    for (k, _) in ordered.into_iter().skip(cap) {
+        if map.remove(&k).is_some() {
+            dropped = dropped.saturating_add(1);
+        }
+    }
+    dropped
+}
+
 fn ema_alpha_from_tau(dt_s: f64, tau_s: f64) -> f64 {
     if !dt_s.is_finite() || !tau_s.is_finite() || dt_s <= 0.0 || tau_s <= 0.0 {
         return 1.0;
@@ -390,9 +411,9 @@ impl RoundBuffer {
         } else {
             sample_period_ms.max(1)
         };
-        let reachable_expected_samples =
-            ((expected_window_ms as f64 / effective_period_ms as f64).ceil() as usize)
-                .saturating_add(1);
+        let reachable_expected_samples = ((expected_window_ms as f64 / effective_period_ms as f64)
+            .ceil() as usize)
+            .saturating_add(1);
         let reachable_sample_ratio = sample_count as f64 / reachable_expected_samples.max(1) as f64;
         let sample_ratio_gate = sample_ratio.max(reachable_sample_ratio);
         let start_delay_ms = first.saturating_sub(self.start_ts_ms).max(0);
@@ -624,6 +645,10 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         .iter()
         .flat_map(|(symbol, tfs)| tfs.iter().map(move |tf| format!("{symbol}:{tf}")))
         .collect();
+    let active_pair_count = required_pair_keys.len().max(1);
+    let motion_state_cap = active_pair_count.saturating_mul(64).clamp(256, 20_000);
+    let target_cache_cap = active_pair_count.saturating_mul(1024).clamp(2_048, 200_000);
+    let round_state_cap = active_pair_count.saturating_mul(2048).clamp(4_096, 400_000);
     let active_symbols_set: HashSet<String> = subscribe_symbols
         .iter()
         .map(|v| v.to_ascii_uppercase())
@@ -683,8 +708,15 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         ?supported_symbols,
         ?active_symbols,
         ?active_tfs,
+        active_pair_count = active_pair_count,
+        motion_state_cap = motion_state_cap,
+        target_cache_cap = target_cache_cap,
+        round_state_cap = round_state_cap,
         api_bind = %args.api_bind,
         clickhouse_url = %args.clickhouse_url,
+        clickhouse_snapshot_ttl_days = args.clickhouse_snapshot_ttl_days,
+        clickhouse_processed_ttl_days = args.clickhouse_processed_ttl_days,
+        clickhouse_round_ttl_days = args.clickhouse_round_ttl_days,
         redis_url = %args.redis_url,
         "ireland recorder started"
     );
@@ -706,6 +738,9 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         clickhouse_snapshot_table: args.clickhouse_snapshot_table.clone(),
         clickhouse_processed_table: args.clickhouse_processed_table.clone(),
         clickhouse_round_table: args.clickhouse_round_table.clone(),
+        clickhouse_snapshot_ttl_days: args.clickhouse_snapshot_ttl_days.clamp(1, 3650),
+        clickhouse_processed_ttl_days: args.clickhouse_processed_ttl_days.clamp(1, 3650),
+        clickhouse_round_ttl_days: args.clickhouse_round_ttl_days.clamp(1, 3650),
         redis_url: normalize_opt_url(&args.redis_url),
         redis_prefix: args.redis_prefix.clone(),
         redis_ttl_sec: args.redis_ttl_sec.max(60),
@@ -970,6 +1005,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                 let now = Utc::now().timestamp_millis();
                 tokyo_by_symbol.insert(msg.symbol.clone(), TokyoBinanceLocal {
                     ts_tokyo_recv_ms: msg.ts_tokyo_recv_ms,
+                    ts_tokyo_send_ms: msg.ts_tokyo_send_ms,
                     ts_exchange_ms: msg.ts_exchange_ms,
                     ts_ireland_recv_ms: now,
                     binance_price: msg.binance_price,
@@ -1579,10 +1615,17 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         ingest_seq,
                         ts_ireland_sample_ms: now_ms,
                         ts_tokyo_recv_ms: tokyo_fresh.map(|v| v.ts_tokyo_recv_ms),
+                        ts_tokyo_send_ms: tokyo_fresh.map(|v| v.ts_tokyo_send_ms),
                         ts_exchange_ms: tokyo_fresh.map(|v| v.ts_exchange_ms),
                         ts_ireland_recv_ms: tokyo_fresh.map(|v| v.ts_ireland_recv_ms),
+                        tokyo_relay_proc_lag_ms: tokyo_fresh.map(|v| {
+                            v.ts_tokyo_send_ms.saturating_sub(v.ts_tokyo_recv_ms) as f64
+                        }),
+                        cross_region_net_lag_ms: tokyo_fresh.map(|v| {
+                            v.ts_ireland_recv_ms.saturating_sub(v.ts_tokyo_send_ms) as f64
+                        }),
                         path_lag_ms: tokyo_fresh
-                            .map(|v| (v.ts_ireland_recv_ms - v.ts_tokyo_recv_ms).max(0) as f64),
+                            .map(|v| v.ts_ireland_recv_ms.saturating_sub(v.ts_tokyo_recv_ms) as f64),
                         symbol: market.symbol.clone(),
                         ts_pm_recv_ms: if book.recv_ts_local_ns > 0 {
                             book.recv_ts_local_ns / 1_000_000
@@ -2005,6 +2048,44 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         now_ms.saturating_sub(*committed_at_ms) <= EMITTED_ROUND_RETENTION_MS
                             && round_meta_is_fresh(round_id, now_ms, ROUND_META_RETENTION_MS)
                     });
+
+                    let mut dropped_state_entries = 0usize;
+                    dropped_state_entries = dropped_state_entries.saturating_add(
+                        trim_map_by_key_ts_desc(&mut motion_by_key, motion_state_cap, |_, v| v.ts_ms),
+                    );
+                    dropped_state_entries = dropped_state_entries.saturating_add(
+                        trim_map_by_key_ts_desc(&mut target_cache, target_cache_cap, |_, (cached_at, _)| *cached_at),
+                    );
+                    dropped_state_entries = dropped_state_entries.saturating_add(
+                        trim_map_by_key_ts_desc(&mut target_retry_after_ms, target_cache_cap, |_, retry_after_ms| *retry_after_ms),
+                    );
+                    dropped_state_entries = dropped_state_entries.saturating_add(
+                        trim_map_by_key_ts_desc(&mut prob_smooth_by_round, round_state_cap, |_, v| v.ts_ms),
+                    );
+                    dropped_state_entries = dropped_state_entries.saturating_add(
+                        trim_map_by_key_ts_desc(&mut target_anchor_by_round, round_state_cap, |round_id, _| {
+                            round_end_ts_ms_from_round_id(round_id).unwrap_or(i64::MIN)
+                        }),
+                    );
+                    dropped_state_entries = dropped_state_entries.saturating_add(
+                        trim_map_by_key_ts_desc(&mut emitted_rounds, round_state_cap, |_, closed_at_ms| *closed_at_ms),
+                    );
+                    dropped_state_entries = dropped_state_entries.saturating_add(
+                        trim_map_by_key_ts_desc(&mut committed_rounds, round_state_cap, |_, committed_at_ms| *committed_at_ms),
+                    );
+                    if dropped_state_entries > 0 {
+                        tracing::warn!(
+                            dropped_state_entries,
+                            motion_state_len = motion_by_key.len(),
+                            target_cache_len = target_cache.len(),
+                            target_retry_len = target_retry_after_ms.len(),
+                            prob_state_len = prob_smooth_by_round.len(),
+                            target_anchor_len = target_anchor_by_round.len(),
+                            emitted_round_len = emitted_rounds.len(),
+                            committed_round_len = committed_rounds.len(),
+                            "housekeeping state cap enforced"
+                        );
+                    }
                 }
             }
         }
@@ -2878,8 +2959,11 @@ mod tests {
             ingest_seq: 1,
             ts_ireland_sample_ms: ts_ms,
             ts_tokyo_recv_ms: None,
+            ts_tokyo_send_ms: None,
             ts_exchange_ms: None,
             ts_ireland_recv_ms: None,
+            tokyo_relay_proc_lag_ms: None,
+            cross_region_net_lag_ms: None,
             path_lag_ms: None,
             symbol: "BTCUSDT".to_string(),
             ts_pm_recv_ms: ts_ms,

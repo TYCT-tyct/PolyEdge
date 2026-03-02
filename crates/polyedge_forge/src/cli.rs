@@ -74,6 +74,12 @@ pub struct IrelandRecorderArgs {
     pub clickhouse_processed_table: String,
     #[arg(long, env = "FORGE_CH_ROUND_TABLE", default_value = "rounds")]
     pub clickhouse_round_table: String,
+    #[arg(long, env = "FORGE_CH_SNAPSHOT_TTL_DAYS", default_value_t = 14)]
+    pub clickhouse_snapshot_ttl_days: u16,
+    #[arg(long, env = "FORGE_CH_PROCESSED_TTL_DAYS", default_value_t = 14)]
+    pub clickhouse_processed_ttl_days: u16,
+    #[arg(long, env = "FORGE_CH_ROUND_TTL_DAYS", default_value_t = 180)]
+    pub clickhouse_round_ttl_days: u16,
     #[arg(
         long,
         env = "FORGE_REDIS_URL",

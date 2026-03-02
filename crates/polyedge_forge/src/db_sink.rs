@@ -16,6 +16,9 @@ pub struct DbSinkConfig {
     pub clickhouse_snapshot_table: String,
     pub clickhouse_processed_table: String,
     pub clickhouse_round_table: String,
+    pub clickhouse_snapshot_ttl_days: u16,
+    pub clickhouse_processed_ttl_days: u16,
+    pub clickhouse_round_ttl_days: u16,
     pub redis_url: Option<String>,
     pub redis_prefix: String,
     pub redis_ttl_sec: u64,
@@ -46,6 +49,13 @@ pub fn normalize_opt_url(raw: &str) -> Option<String> {
 struct RedisSnapshot {
     schema_version: String,
     ts_ireland_sample_ms: i64,
+    ts_tokyo_recv_ms: Option<i64>,
+    ts_tokyo_send_ms: Option<i64>,
+    ts_exchange_ms: Option<i64>,
+    ts_ireland_recv_ms: Option<i64>,
+    tokyo_relay_proc_lag_ms: Option<f64>,
+    cross_region_net_lag_ms: Option<f64>,
+    path_lag_ms: Option<f64>,
     symbol: String,
     timeframe: String,
     market_id: String,
@@ -76,6 +86,13 @@ impl RedisSnapshot {
         Self {
             schema_version: row.schema_version.to_string(),
             ts_ireland_sample_ms: row.ts_ireland_sample_ms,
+            ts_tokyo_recv_ms: row.ts_tokyo_recv_ms,
+            ts_tokyo_send_ms: row.ts_tokyo_send_ms,
+            ts_exchange_ms: row.ts_exchange_ms,
+            ts_ireland_recv_ms: row.ts_ireland_recv_ms,
+            tokyo_relay_proc_lag_ms: row.tokyo_relay_proc_lag_ms,
+            cross_region_net_lag_ms: row.cross_region_net_lag_ms,
+            path_lag_ms: row.path_lag_ms,
             symbol: row.symbol.clone(),
             timeframe: row.timeframe.clone(),
             market_id: row.market_id.clone(),
@@ -253,6 +270,8 @@ fn sanitize_snapshot_row(mut row: SnapshotRow) -> Option<SnapshotRow> {
     {
         return None;
     }
+    row.tokyo_relay_proc_lag_ms = sanitize_optional_f64(row.tokyo_relay_proc_lag_ms);
+    row.cross_region_net_lag_ms = sanitize_optional_f64(row.cross_region_net_lag_ms);
     row.path_lag_ms = sanitize_optional_f64(row.path_lag_ms);
     row.target_price = sanitize_optional_f64(row.target_price);
     row.binance_price = sanitize_optional_f64(row.binance_price);
@@ -297,6 +316,21 @@ async fn init_clickhouse(ch_url: &str, cfg: &DbSinkConfig) -> Result<()> {
     let snapshot_tbl = &cfg.clickhouse_snapshot_table;
     let processed_tbl = &cfg.clickhouse_processed_table;
     let round_tbl = &cfg.clickhouse_round_table;
+    let snapshot_ttl_days = cfg.clickhouse_snapshot_ttl_days.max(1);
+    let processed_ttl_days = cfg.clickhouse_processed_ttl_days.max(1);
+    let round_ttl_days = cfg.clickhouse_round_ttl_days.max(1);
+    let snapshot_ttl_expr = format!(
+        "fromUnixTimestamp64Milli(ts_ireland_sample_ms) + INTERVAL {} DAY",
+        snapshot_ttl_days
+    );
+    let processed_ttl_expr = format!(
+        "fromUnixTimestamp64Milli(ts_ireland_sample_ms) + INTERVAL {} DAY",
+        processed_ttl_days
+    );
+    let round_ttl_expr = format!(
+        "fromUnixTimestamp64Milli(ts_recorded_ms) + INTERVAL {} DAY",
+        round_ttl_days
+    );
 
     execute_clickhouse_query(ch_url, &format!("CREATE DATABASE IF NOT EXISTS {}", db)).await?;
 
@@ -306,8 +340,11 @@ async fn init_clickhouse(ch_url: &str, cfg: &DbSinkConfig) -> Result<()> {
             ingest_seq UInt64,
             ts_ireland_sample_ms Int64,
             ts_tokyo_recv_ms Nullable(Int64),
+            ts_tokyo_send_ms Nullable(Int64),
             ts_exchange_ms Nullable(Int64),
             ts_ireland_recv_ms Nullable(Int64),
+            tokyo_relay_proc_lag_ms Nullable(Float64),
+            cross_region_net_lag_ms Nullable(Float64),
             path_lag_ms Nullable(Float64),
             symbol LowCardinality(String),
             ts_pm_recv_ms Int64,
@@ -342,12 +379,25 @@ async fn init_clickhouse(ch_url: &str, cfg: &DbSinkConfig) -> Result<()> {
         ENGINE = MergeTree
         PARTITION BY toDate(fromUnixTimestamp64Milli(ts_ireland_sample_ms))
         ORDER BY (symbol, timeframe, market_id, ts_ireland_sample_ms)
+        TTL {} DELETE
         SETTINGS index_granularity = 8192",
-        db, snapshot_tbl
+        db, snapshot_tbl, snapshot_ttl_expr
     );
     execute_clickhouse_query(ch_url, &create_snapshot_tbl).await?;
 
     let alter_snapshot_queries = [
+        format!(
+            "ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS ts_tokyo_send_ms Nullable(Int64) AFTER ts_tokyo_recv_ms",
+            db, snapshot_tbl
+        ),
+        format!(
+            "ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS tokyo_relay_proc_lag_ms Nullable(Float64) AFTER ts_ireland_recv_ms",
+            db, snapshot_tbl
+        ),
+        format!(
+            "ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS cross_region_net_lag_ms Nullable(Float64) AFTER tokyo_relay_proc_lag_ms",
+            db, snapshot_tbl
+        ),
         format!(
             "ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS pm_live_btc_price Nullable(Float64) AFTER binance_price",
             db, snapshot_tbl
@@ -371,6 +421,10 @@ async fn init_clickhouse(ch_url: &str, cfg: &DbSinkConfig) -> Result<()> {
         format!(
             "ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS delta_pct_smooth Nullable(Float64) AFTER delta_pct",
             db, snapshot_tbl
+        ),
+        format!(
+            "ALTER TABLE {}.{} MODIFY TTL {}",
+            db, snapshot_tbl, snapshot_ttl_expr
         ),
     ];
     for q in alter_snapshot_queries {
@@ -407,10 +461,19 @@ async fn init_clickhouse(ch_url: &str, cfg: &DbSinkConfig) -> Result<()> {
         ENGINE = MergeTree
         PARTITION BY toDate(fromUnixTimestamp64Milli(ts_ireland_sample_ms))
         ORDER BY (symbol, timeframe, round_id, ts_ireland_sample_ms)
+        TTL {} DELETE
         SETTINGS index_granularity = 8192",
-        db, processed_tbl
+        db, processed_tbl, processed_ttl_expr
     );
     execute_clickhouse_query(ch_url, &create_processed_tbl).await?;
+    execute_clickhouse_query(
+        ch_url,
+        &format!(
+            "ALTER TABLE {}.{} MODIFY TTL {}",
+            db, processed_tbl, processed_ttl_expr
+        ),
+    )
+    .await?;
 
     let mv_name = format!("mv_{}_to_{}", snapshot_tbl, processed_tbl);
     let create_processed_mv = format!(
@@ -464,10 +527,19 @@ async fn init_clickhouse(ch_url: &str, cfg: &DbSinkConfig) -> Result<()> {
         ENGINE = MergeTree
         PARTITION BY toDate(fromUnixTimestamp64Milli(end_ts_ms))
         ORDER BY (symbol, timeframe, end_ts_ms, market_id)
+        TTL {} DELETE
         SETTINGS index_granularity = 8192",
-        db, round_tbl
+        db, round_tbl, round_ttl_expr
     );
     execute_clickhouse_query(ch_url, &create_round_tbl).await?;
+    execute_clickhouse_query(
+        ch_url,
+        &format!(
+            "ALTER TABLE {}.{} MODIFY TTL {}",
+            db, round_tbl, round_ttl_expr
+        ),
+    )
+    .await?;
 
     Ok(())
 }

@@ -626,6 +626,8 @@ fn collector_timeframe_status_row(snapshot: Option<&Value>, now_ms: i64) -> (boo
                     } else {
                         json!("")
                     },
+                    "tokyo_relay_proc_lag_ms": row_f64(row, "tokyo_relay_proc_lag_ms"),
+                    "cross_region_net_lag_ms": row_f64(row, "cross_region_net_lag_ms"),
                     "path_lag_ms": row_f64(row, "path_lag_ms"),
                 }),
             )
@@ -638,6 +640,8 @@ fn collector_timeframe_status_row(snapshot: Option<&Value>, now_ms: i64) -> (boo
                 "age_ms": Value::Null,
                 "remaining_ms": Value::Null,
                 "round_id": "",
+                "tokyo_relay_proc_lag_ms": Value::Null,
+                "cross_region_net_lag_ms": Value::Null,
                 "path_lag_ms": Value::Null,
             }),
         ),
@@ -659,7 +663,29 @@ async fn fetch_collector_window_metrics(
     let expected_samples = ((clamped_window_ms as f64) / 100.0).round() as i64;
     let expected_samples = expected_samples.max(1);
 
-    let query = format!(
+    let extended_query = format!(
+        "SELECT
+            count() AS sample_count,
+            uniqExact(round_id) AS round_count,
+            max(ts_ireland_sample_ms) AS latest_sample_ms,
+            avgIf(tokyo_relay_proc_lag_ms, isNotNull(tokyo_relay_proc_lag_ms)) AS tokyo_relay_proc_lag_avg_ms,
+            quantileTDigest(0.95)(tokyo_relay_proc_lag_ms) AS tokyo_relay_proc_lag_p95_ms,
+            avgIf(cross_region_net_lag_ms, isNotNull(cross_region_net_lag_ms)) AS cross_region_net_lag_avg_ms,
+            quantileTDigest(0.95)(cross_region_net_lag_ms) AS cross_region_net_lag_p95_ms,
+            avgIf(path_lag_ms, isNotNull(path_lag_ms)) AS path_lag_avg_ms,
+            quantileTDigest(0.95)(path_lag_ms) AS path_lag_p95_ms,
+            avgIf(
+                toFloat64(ts_ireland_sample_ms - ts_pm_recv_ms),
+                ts_pm_recv_ms > 0
+            ) AS ingest_latency_avg_ms
+        FROM polyedge_forge.snapshot_100ms
+        WHERE symbol='{}'
+          AND timeframe='{}'
+          AND ts_ireland_sample_ms >= {}
+        FORMAT JSON",
+        symbol, timeframe, from_ms
+    );
+    let legacy_query = format!(
         "SELECT
             count() AS sample_count,
             uniqExact(round_id) AS round_count,
@@ -677,7 +703,18 @@ async fn fetch_collector_window_metrics(
         FORMAT JSON",
         symbol, timeframe, from_ms
     );
-    let row = rows_from_json(query_clickhouse_json(ch_url, &query).await?)
+    let query_result = match query_clickhouse_json(ch_url, &extended_query).await {
+        Ok(v) => v,
+        Err(err)
+            if err.message.contains("Unknown expression identifier")
+                || err.message.contains("Unknown identifier")
+                || err.message.contains("There is no column") =>
+        {
+            query_clickhouse_json(ch_url, &legacy_query).await?
+        }
+        Err(err) => return Err(err),
+    };
+    let row = rows_from_json(query_result)
         .into_iter()
         .next()
         .unwrap_or_else(|| json!({}));
@@ -691,6 +728,10 @@ async fn fetch_collector_window_metrics(
         "round_count": row_i64(&row, "round_count").unwrap_or(0).max(0),
         "latest_sample_ms": latest_sample_ms,
         "latest_sample_age_ms": latest_sample_age_ms,
+        "tokyo_relay_proc_lag_avg_ms": row_f64(&row, "tokyo_relay_proc_lag_avg_ms"),
+        "tokyo_relay_proc_lag_p95_ms": row_f64(&row, "tokyo_relay_proc_lag_p95_ms"),
+        "cross_region_net_lag_avg_ms": row_f64(&row, "cross_region_net_lag_avg_ms"),
+        "cross_region_net_lag_p95_ms": row_f64(&row, "cross_region_net_lag_p95_ms"),
         "path_lag_avg_ms": row_f64(&row, "path_lag_avg_ms"),
         "path_lag_p95_ms": row_f64(&row, "path_lag_p95_ms"),
         "ingest_latency_avg_ms": row_f64(&row, "ingest_latency_avg_ms"),
@@ -744,10 +785,7 @@ pub(super) async fn collector_metrics(
         let window_metrics =
             fetch_collector_window_metrics(&state, &symbol, tf, now_ms, window_ms).await?;
         if let Some(status_obj) = status_value.as_object_mut() {
-            status_obj.insert(
-                "window".to_string(),
-                window_metrics.unwrap_or(Value::Null),
-            );
+            status_obj.insert("window".to_string(), window_metrics.unwrap_or(Value::Null));
         }
         tf_map.insert(tf.to_string(), status_value);
     }

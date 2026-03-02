@@ -12,6 +12,7 @@ pub struct TokyoBinanceWire {
 #[derive(Debug, Clone)]
 pub struct TokyoBinanceLocal {
     pub ts_tokyo_recv_ms: i64,
+    pub ts_tokyo_send_ms: i64,
     pub ts_exchange_ms: i64,
     pub ts_ireland_recv_ms: i64,
     pub binance_price: f64,
@@ -43,8 +44,11 @@ pub struct SnapshotRow {
     pub ts_ireland_sample_ms: i64,
 
     pub ts_tokyo_recv_ms: Option<i64>,
+    pub ts_tokyo_send_ms: Option<i64>,
     pub ts_exchange_ms: Option<i64>,
     pub ts_ireland_recv_ms: Option<i64>,
+    pub tokyo_relay_proc_lag_ms: Option<f64>,
+    pub cross_region_net_lag_ms: Option<f64>,
     pub path_lag_ms: Option<f64>,
 
     pub symbol: String,
