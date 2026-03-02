@@ -216,6 +216,8 @@ const LIVE_GTD_MIN_FUTURE_GUARD_SEC_MAX: i64 = 240;
 const LIVE_ROUND_TARGET_MATCH_TOLERANCE_MS_DEFAULT: i64 = 5_000;
 const LIVE_ROUND_TARGET_MATCH_TOLERANCE_MS_MIN: i64 = 0;
 const LIVE_ROUND_TARGET_MATCH_TOLERANCE_MS_MAX: i64 = 120_000;
+const LIVE_FIXED_ENTRY_SIZE_SHARES_MIN: f64 = 0.0;
+const LIVE_FIXED_ENTRY_SIZE_SHARES_MAX: f64 = 1_000.0;
 
 #[derive(Debug, Clone)]
 struct CachedLiveMarketTarget {
@@ -366,6 +368,14 @@ fn live_round_target_match_tolerance_ms() -> i64 {
             LIVE_ROUND_TARGET_MATCH_TOLERANCE_MS_MIN,
             LIVE_ROUND_TARGET_MATCH_TOLERANCE_MS_MAX,
         )
+}
+
+fn live_fixed_entry_size_shares() -> Option<f64> {
+    std::env::var("FORGE_FEV1_FIXED_ENTRY_SIZE_SHARES")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .map(|v| v.clamp(LIVE_FIXED_ENTRY_SIZE_SHARES_MIN, LIVE_FIXED_ENTRY_SIZE_SHARES_MAX))
+        .filter(|v| *v > 0.0)
 }
 
 fn parse_round_end_ts_ms(round_id: &str) -> Option<i64> {
@@ -1089,6 +1099,11 @@ pub(super) fn decision_to_live_payload(
     quote_size = quote_size.max(gateway_cfg.min_quote_usdc);
     let mut notes: Vec<String> = Vec::with_capacity(3);
     let is_buy = gateway_side.starts_with("buy_");
+    let fixed_entry_size_shares = if !is_exit_like {
+        live_fixed_entry_size_shares()
+    } else {
+        None
+    };
     let forced_exit_size_shares = if is_exit_like {
         decision
             .get("position_size_shares")
@@ -1097,16 +1112,17 @@ pub(super) fn decision_to_live_payload(
     } else {
         None
     };
+    let forced_size_shares = forced_exit_size_shares.or(fixed_entry_size_shares);
     let mut min_order_size = 0.01_f64;
     let mut size_floor = min_order_size;
-    let mut size = forced_exit_size_shares.unwrap_or_else(|| (quote_size / price).max(size_floor));
+    let mut size = forced_size_shares.unwrap_or_else(|| (quote_size / price).max(size_floor));
     if let Some(book) = book {
         min_order_size = book.min_order_size.max(0.0001);
         let taker_like = style == "taker" || matches!(tif.as_str(), "FAK" | "FOK");
         size_floor = min_order_size;
         let tick_size = book.tick_size.max(0.0001);
         price = round_to_tick(price, tick_size, is_buy);
-        size = forced_exit_size_shares.unwrap_or_else(|| (quote_size / price).max(size_floor));
+        size = forced_size_shares.unwrap_or_else(|| (quote_size / price).max(size_floor));
 
         let depth_top1 = if is_buy {
             book.best_ask_size.unwrap_or(0.0)
@@ -1118,7 +1134,7 @@ pub(super) fn decision_to_live_payload(
         } else {
             book.bid_depth_top3.unwrap_or(0.0)
         };
-        if forced_exit_size_shares.is_none()
+        if forced_size_shares.is_none()
             && !(is_buy && taker_like)
             && depth_top1.is_finite()
             && depth_top1 > 0.0
@@ -1234,21 +1250,25 @@ pub(super) fn decision_to_live_payload(
             let tick_size = book.tick_size.max(0.0001);
             price = round_to_tick(price, tick_size, is_buy);
             size_floor = min_order_size;
-            size = forced_exit_size_shares
+            size = forced_size_shares
                 .unwrap_or_else(|| (quote_size / price).max(size_floor))
                 .max(0.01);
             size = (size * 10_000.0).round() / 10_000.0;
         }
     }
-    if let Some(forced) = forced_exit_size_shares {
+    if let Some(forced) = forced_size_shares {
         size = forced.max(size_floor).max(0.01);
-        notes.push("force_exit_full_size".to_string());
+        if is_exit_like {
+            notes.push("force_exit_full_size".to_string());
+        } else {
+            notes.push("force_entry_fixed_size".to_string());
+        }
     }
     let taker_like = style == "taker" || matches!(tif.as_str(), "FAK" | "FOK");
     let floor_notional_usdc = (size * price).max(0.0);
     let requested_notional_usdc =
         (quote_size.max(floor_notional_usdc) * 1_000_000.0).round() / 1_000_000.0;
-    let buy_amount_usdc = if is_buy && taker_like {
+    let buy_amount_usdc = if is_buy && taker_like && fixed_entry_size_shares.is_none() {
         Some(requested_notional_usdc)
     } else {
         None
@@ -1659,14 +1679,24 @@ pub(super) fn build_retry_payload(current: &Value, reason: &str, attempt: usize)
                     }
                 }),
             );
-            let locked_exit_size = if is_exit_like {
+            let lock_retry_size = if is_exit_like
+                || (matches!(action.as_str(), "enter" | "add")
+                    && live_fixed_entry_size_shares().is_some())
+            {
                 obj.get("size")
                     .and_then(Value::as_f64)
                     .filter(|v| v.is_finite() && *v > 0.0)
+                    .or_else(|| {
+                        if matches!(action.as_str(), "enter" | "add") {
+                            live_fixed_entry_size_shares()
+                        } else {
+                            None
+                        }
+                    })
             } else {
                 None
             };
-            if let Some(sz) = locked_exit_size {
+            if let Some(sz) = lock_retry_size {
                 obj.insert(
                     "size".to_string(),
                     json!((sz * 10_000.0).round() / 10_000.0),
