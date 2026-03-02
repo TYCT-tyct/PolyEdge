@@ -248,6 +248,60 @@ function finiteOrNull(v: number | null | undefined): number | null {
   return v != null && Number.isFinite(v) ? v : null;
 }
 
+function isFiniteNumber(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v);
+}
+
+function isObjectRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null;
+}
+
+function isStrategyPaperSummary(v: unknown): v is StrategyPaperResponse["summary"] {
+  if (!isObjectRecord(v)) {
+    return false;
+  }
+  return (
+    isFiniteNumber(v.trade_count) &&
+    isFiniteNumber(v.win_rate_pct) &&
+    isFiniteNumber(v.avg_pnl_cents) &&
+    isFiniteNumber(v.total_pnl_cents) &&
+    isFiniteNumber(v.net_pnl_cents) &&
+    isFiniteNumber(v.gross_pnl_cents) &&
+    isFiniteNumber(v.total_cost_cents) &&
+    isFiniteNumber(v.total_entry_fee_cents) &&
+    isFiniteNumber(v.total_exit_fee_cents) &&
+    isFiniteNumber(v.total_slippage_cents) &&
+    isFiniteNumber(v.net_margin_pct) &&
+    isFiniteNumber(v.max_drawdown_cents)
+  );
+}
+
+function isStrategyPaperConfig(v: unknown): boolean {
+  if (!isObjectRecord(v)) {
+    return false;
+  }
+  return (
+    isFiniteNumber(v.entry_threshold_base) &&
+    isFiniteNumber(v.entry_threshold_cap) &&
+    isFiniteNumber(v.spread_limit_prob) &&
+    isFiniteNumber(v.stop_loss_cents) &&
+    isFiniteNumber(v.trail_drawdown_cents) &&
+    isFiniteNumber(v.reverse_signal_threshold) &&
+    isFiniteNumber(v.reverse_signal_ticks)
+  );
+}
+
+function isStrategyPaperResponsePayload(v: Record<string, unknown>): v is StrategyPaperResponse {
+  return (
+    typeof v.market_type === "string" &&
+    isFiniteNumber(v.lookback_minutes) &&
+    isFiniteNumber(v.samples) &&
+    Array.isArray(v.trades) &&
+    isStrategyPaperSummary(v.summary) &&
+    isStrategyPaperConfig(v.config)
+  );
+}
+
 function roundOutcome(
   settlePrice: number | null | undefined,
   targetPrice: number | null | undefined,
@@ -945,10 +999,10 @@ export async function getStrategyPaper(
   if (typeof payload.error === "string" && payload.error.trim()) {
     throw new Error(payload.error);
   }
-  if (typeof payload.summary !== "object" || payload.summary == null) {
-    throw new Error("strategy paper response missing summary");
+  if (!isStrategyPaperResponsePayload(payload)) {
+    throw new Error("strategy paper response schema mismatch");
   }
-  return payload as unknown as StrategyPaperResponse;
+  return payload;
 }
 
 export interface StrategyAutotuneLatestResponse {

@@ -1335,9 +1335,9 @@ async fn prefetch_gateway_books_for_tokens(
     gateway_cfg: &LiveGatewayConfig,
     token_ids: &[String],
 ) -> HashMap<String, Option<GatewayBookSnapshot>> {
-    let futures = token_ids.iter().cloned().map(|token_id| async move {
-        let snap = fetch_gateway_book_snapshot(client, gateway_cfg, &token_id).await;
-        (token_id, snap)
+    let futures = token_ids.iter().map(|token_id| async move {
+        let snap = fetch_gateway_book_snapshot(client, gateway_cfg, token_id).await;
+        (token_id.clone(), snap)
     });
     let rows = join_all(futures).await;
     rows.into_iter().collect()
@@ -1350,10 +1350,11 @@ async fn prefetch_rust_books_for_tokens(
     gateway_cfg: &LiveGatewayConfig,
     token_ids: &[String],
 ) -> HashMap<String, Option<GatewayBookSnapshot>> {
-    let futures = token_ids.iter().cloned().map(|token_id| {
+    let futures = token_ids.iter().map(|token_id| {
         let state = state.clone();
         let ctx = Arc::clone(ctx);
         let gateway_cfg = gateway_cfg.clone();
+        let token_id = token_id.clone();
         async move {
             let snapshot = if let Some(cached) = state.get_rust_book_cache(&token_id).await {
                 Some(cached)
@@ -1904,16 +1905,14 @@ pub(super) fn apply_emergency_exit_overrides(
             .get("ttl_ms")
             .and_then(Value::as_i64)
             .unwrap_or(900)
-            .min(700)
-            .max(350);
+            .clamp(350, 700);
         obj.insert("ttl_ms".to_string(), json!(ttl_ms));
         let slippage = obj
             .get("max_slippage_bps")
             .and_then(Value::as_f64)
             .unwrap_or(gateway_cfg.exit_slippage_bps)
             .max(gateway_cfg.exit_slippage_bps + 14.0)
-            .max(34.0)
-            .min(140.0);
+            .clamp(34.0, 140.0);
         obj.insert("max_slippage_bps".to_string(), json!(slippage));
         obj.insert("emergency_exit".to_string(), Value::Bool(true));
     }
@@ -2028,12 +2027,10 @@ pub(super) fn build_retry_payload(current: &Value, reason: &str, attempt: usize)
                     } else {
                         "exit_fak_ladder_step_2"
                     }
+                } else if attempt == 0 {
+                    "entry_fak_ladder_step_1"
                 } else {
-                    if attempt == 0 {
-                        "entry_fak_ladder_step_1"
-                    } else {
-                        "entry_fak_ladder_step_2"
-                    }
+                    "entry_fak_ladder_step_2"
                 }),
             );
             let lock_retry_size = if is_exit_like
@@ -3096,17 +3093,7 @@ pub(super) fn build_position_locked_target(
     if market_id.is_empty() || token_id.is_empty() {
         return None;
     }
-    let side = position_state
-        .side
-        .as_deref()
-        .unwrap_or("UP")
-        .trim()
-        .to_ascii_uppercase();
-    let (token_id_yes, token_id_no) = if side == "DOWN" {
-        (token_id.clone(), token_id.clone())
-    } else {
-        (token_id.clone(), token_id.clone())
-    };
+    let (token_id_yes, token_id_no) = (token_id.clone(), token_id.clone());
     let symbol = position_state
         .entry_round_id
         .as_deref()
@@ -3653,7 +3640,7 @@ pub(super) async fn submit_rust_order(
             .client
             .market_order()
             .token_id(token)
-            .side(pm_side.clone())
+            .side(pm_side)
             .order_type(order_type.clone())
             .price(price_dec)
             .amount(amount)
