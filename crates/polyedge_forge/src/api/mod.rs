@@ -47,6 +47,7 @@ use snapshot::*;
 use strategy::*;
 
 mod infra;
+#[allow(dead_code)]
 mod live_execution;
 mod market_utils;
 mod read_api;
@@ -103,6 +104,7 @@ struct ChartCacheEntry {
 
 const CHART_CACHE_TTL_MS: u64 = 900;
 const CHART_CACHE_MAX_ENTRIES: usize = 120;
+#[allow(dead_code)]
 const LIVE_DECISION_GUARD_TTL_MS: i64 = 45_000;
 const LIVE_EVENT_LOG_MAX_DEFAULT: usize = 4_000;
 const LIVE_EVENT_LOG_MAX_MIN: usize = 200;
@@ -110,7 +112,9 @@ const LIVE_EVENT_LOG_MAX_MAX: usize = 20_000;
 const LIVE_EVENT_LOG_TTL_SEC_DEFAULT: u32 = 7 * 24 * 3600;
 const LIVE_EVENT_LOG_TTL_SEC_MIN: u32 = 3600;
 const LIVE_EVENT_LOG_TTL_SEC_MAX: u32 = 30 * 24 * 3600;
+#[allow(dead_code)]
 const LIVE_RUST_BOOK_CACHE_TTL_MS: u64 = 260;
+#[allow(dead_code)]
 const LIVE_RUST_BOOK_CACHE_MAX: usize = 512;
 const LIVE_ALERT_THROTTLE_DEFAULT_MS: i64 = 5 * 60_000;
 
@@ -189,26 +193,14 @@ fn classify_live_event_type(event: &Value) -> &'static str {
     }
 }
 
-fn live_min_order_size_shares() -> f64 {
-    std::env::var("FORGE_FEV1_MIN_ORDER_SIZE_SHARES")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(5.0)
-        .clamp(0.01, 1_000.0)
-}
-
-fn enforce_min_order_quote_usdc(quote_usdc: f64, price_cents: f64) -> f64 {
-    let px = (price_cents / 100.0).clamp(0.01, 0.99);
-    let min_quote = live_min_order_size_shares() * px;
-    quote_usdc.max(min_quote)
-}
-
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LiveExecutorMode {
     Gateway,
     RustSdk,
 }
 
+#[allow(dead_code)]
 impl LiveExecutorMode {
     fn from_env() -> Self {
         let raw = std::env::var("FORGE_FEV1_EXECUTOR")
@@ -230,6 +222,7 @@ impl LiveExecutorMode {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct RustExecutorConfig {
     host: String,
     private_key: String,
@@ -240,6 +233,7 @@ struct RustExecutorConfig {
     nonce: Option<u32>,
 }
 
+#[allow(dead_code)]
 impl RustExecutorConfig {
     fn from_env() -> Result<Self, String> {
         let host = std::env::var("FORGE_FEV1_CLOB_HOST")
@@ -304,12 +298,14 @@ impl RustExecutorConfig {
     }
 }
 
+#[allow(dead_code)]
 struct RustExecutorContext {
     client: PmClient<PmAuthenticated<PmNormal>>,
     signer: Box<dyn PmSigner + Send + Sync>,
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct RustBookCacheEntry {
     fetched_at: Instant,
     snapshot: GatewayBookSnapshot,
@@ -620,6 +616,7 @@ fn live_snapshot_event_channel(prefix: &str) -> String {
     format!("{prefix}:snapshot:events")
 }
 
+#[allow(dead_code)]
 fn is_liquidity_reject_reason(reason: &str) -> bool {
     let r = reason.trim().to_ascii_lowercase();
     r.contains("unmatched")
@@ -790,6 +787,7 @@ impl ApiState {
         controls.insert(market_type.to_string(), next);
     }
 
+    #[allow(dead_code)]
     async fn check_and_mark_live_decision(
         &self,
         key: &str,
@@ -902,6 +900,7 @@ impl ApiState {
             .clone()
     }
 
+    #[allow(dead_code)]
     async fn apply_aggressiveness_to_gateway_cfg(
         &self,
         market_type: &str,
@@ -915,6 +914,7 @@ impl ApiState {
         (tuned, s)
     }
 
+    #[allow(dead_code)]
     async fn update_live_execution_aggr_from_orders(
         &self,
         market_type: &str,
@@ -1040,11 +1040,13 @@ impl ApiState {
         st.clone()
     }
 
+    #[allow(dead_code)]
     async fn upsert_pending_order(&self, row: LivePendingOrder) {
         let mut pending = self.live_pending_orders.write().await;
         pending.insert(row.order_id.clone(), row);
     }
 
+    #[allow(dead_code)]
     async fn remove_pending_order(&self, order_id: &str) -> Option<LivePendingOrder> {
         let mut pending = self.live_pending_orders.write().await;
         pending.remove(order_id)
@@ -1064,6 +1066,7 @@ impl ApiState {
             .collect()
     }
 
+    #[allow(dead_code)]
     async fn pending_flags_for_market(&self, market_type: &str) -> (bool, bool) {
         let pending = self.live_pending_orders.read().await;
         let mut has_enter_pending = false;
@@ -1095,6 +1098,7 @@ impl ApiState {
         *current = seq;
     }
 
+    #[allow(dead_code)]
     async fn get_rust_book_cache(&self, token_id: &str) -> Option<GatewayBookSnapshot> {
         let cache = self.live_rust_book_cache.read().await;
         let row = cache.get(token_id)?;
@@ -1104,6 +1108,7 @@ impl ApiState {
         Some(row.snapshot.clone())
     }
 
+    #[allow(dead_code)]
     async fn put_rust_book_cache(&self, token_id: &str, snapshot: GatewayBookSnapshot) {
         let mut cache = self.live_rust_book_cache.write().await;
         if cache.len() >= LIVE_RUST_BOOK_CACHE_MAX {

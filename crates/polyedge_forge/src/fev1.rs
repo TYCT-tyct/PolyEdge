@@ -91,7 +91,6 @@ pub struct RuntimeConfig {
 pub struct SimulationResult {
     pub current: Value,
     pub trades: Vec<Value>,
-    pub all_trade_pnls: Vec<f64>,
     pub trade_count: usize,
     pub win_rate_pct: f64,
     pub avg_pnl_cents: f64,
@@ -199,14 +198,6 @@ impl LiveOrderGateway for ArmedSimulatedGateway {
             reason: "accepted".to_string(),
         }
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct DualExecutionResult {
-    pub summary: Value,
-    pub decisions: Vec<Value>,
-    pub paper_records: Vec<Value>,
-    pub live_records: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -893,7 +884,6 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
     SimulationResult {
         current,
         trades: trades_view,
-        all_trade_pnls,
         trade_count,
         win_rate_pct,
         avg_pnl_cents,
@@ -915,6 +905,7 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn build_decisions_from_trades(trades: &[Value], quote: f64) -> Vec<Value> {
     let mut decisions: Vec<Value> = Vec::with_capacity(trades.len().saturating_mul(2));
     for trade in trades {
@@ -1034,90 +1025,11 @@ fn build_decisions_from_trades(trades: &[Value], quote: f64) -> Vec<Value> {
 }
 
 #[inline]
+#[cfg_attr(not(test), allow(dead_code))]
 fn is_replay_only_exit_reason(reason: &str) -> bool {
     reason
         .trim()
         .eq_ignore_ascii_case("end_of_samples_force_close")
-}
-
-/// 对已有 SimulationResult 附加 gateway 执行记录，生成完整的双视图输出。
-pub fn build_gateway_execution<G: LiveOrderGateway>(
-    run: &SimulationResult,
-    quote_size_usdc: f64,
-    gateway: &G,
-) -> DualExecutionResult {
-    let quote = quote_size_usdc.max(0.01);
-    let decisions = build_decisions_from_trades(&run.trades, quote);
-
-    let mut live_records = Vec::<Value>::with_capacity(decisions.len());
-    for d in &decisions {
-        let action_str = d
-            .get("action")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let action = if action_str == "enter" {
-            OrderAction::Enter
-        } else {
-            OrderAction::Exit
-        };
-        let side_str = d
-            .get("side")
-            .and_then(Value::as_str)
-            .unwrap_or("UP")
-            .to_ascii_uppercase();
-        let side = if side_str == "DOWN" {
-            Side::Down
-        } else {
-            Side::Up
-        };
-        let intent = OrderIntent {
-            ts_ms: d.get("ts_ms").and_then(Value::as_i64).unwrap_or(0),
-            round_id: d
-                .get("round_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            side,
-            action,
-            price_cents: 0.0,
-            quote_size_usdc: d
-                .get("quote_size_usdc")
-                .and_then(Value::as_f64)
-                .unwrap_or(quote),
-            reason: d
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-        };
-        let result = gateway.submit(&intent);
-        live_records.push(json!({
-            "ts_ms": intent.ts_ms,
-            "round_id": intent.round_id,
-            "action": action_str,
-            "side": side_str,
-            "accepted": result.accepted,
-            "request_id": result.request_id,
-            "reason": result.reason
-        }));
-    }
-
-    let accepted = live_records
-        .iter()
-        .filter(|r| r.get("accepted").and_then(Value::as_bool).unwrap_or(false))
-        .count();
-
-    DualExecutionResult {
-        summary: json!({
-            "decision_count": decisions.len(),
-            "live_accept_count": accepted,
-            "quote_size_usdc": quote
-        }),
-        decisions: decisions.clone(),
-        paper_records: decisions,
-        live_records,
-    }
 }
 
 #[cfg(test)]

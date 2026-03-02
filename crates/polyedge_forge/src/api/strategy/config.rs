@@ -122,18 +122,6 @@ fn live_execution_market_allowed(market_type: &str) -> bool {
         .any(|v| v.as_str() == market_type)
 }
 
-fn live_quote_from_price_enabled() -> bool {
-    std::env::var("FORGE_FEV1_LIVE_QUOTE_FROM_PRICE")
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
 fn resolve_strategy_market_type(raw: Option<&str>) -> Result<&'static str, ApiError> {
     let market_type = if let Some(mt) = raw {
         normalize_market_type(mt).ok_or_else(|| ApiError::bad_request("invalid market_type"))?

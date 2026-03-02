@@ -144,29 +144,6 @@ pub(super) struct StrategySimulationResult {
 }
 
 
-pub(super) fn run_summary_json(run: &StrategySimulationResult) -> Value {
-    json!({
-        "trade_count": run.trade_count,
-        "win_rate_pct": run.win_rate_pct,
-        "avg_pnl_cents": run.avg_pnl_cents,
-        "avg_duration_s": run.avg_duration_s,
-        "total_pnl_cents": run.total_pnl_cents,
-        "net_pnl_cents": run.net_pnl_cents,
-        "gross_pnl_cents": run.gross_pnl_cents,
-        "total_cost_cents": run.total_cost_cents,
-        "total_entry_fee_cents": run.total_entry_fee_cents,
-        "total_exit_fee_cents": run.total_exit_fee_cents,
-        "total_slippage_cents": run.total_slippage_cents,
-        "total_impact_cents": run.total_impact_cents,
-        "net_margin_pct": run.net_margin_pct,
-        "max_drawdown_cents": run.max_drawdown_cents,
-        "max_profit_trade_cents": run.max_profit_trade_cents,
-        "blocked_exits": run.blocked_exits,
-        "emergency_wide_exit_count": run.emergency_wide_exit_count,
-        "execution_penalty_cents_total": run.execution_penalty_cents_total,
-    })
-}
-
 pub(super) fn strategy_cfg_json(cfg: &StrategyRuntimeConfig) -> Value {
     json!({
         "entry_threshold_base": cfg.entry_threshold_base,
