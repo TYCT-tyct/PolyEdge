@@ -132,6 +132,10 @@ fn round_lot_size(size: f64) -> f64 {
     ((size.max(0.0) * 100.0).round() / 100.0).max(0.01)
 }
 
+fn floor_lot_size(size: f64) -> f64 {
+    ((size.max(0.0) * 100.0).floor() / 100.0).max(0.01)
+}
+
 fn decimal_places_from_step(step: f64, fallback: usize, max_decimals: usize) -> usize {
     if !step.is_finite() || step <= 0.0 {
         return fallback.min(max_decimals);
@@ -1606,7 +1610,11 @@ pub(super) fn decision_to_live_payload(
         }
     }
     if let Some(forced) = forced_size_shares {
-        size = round_lot_size(forced.max(size_floor).max(0.01));
+        size = if is_exit_like {
+            floor_lot_size(forced.max(size_floor).max(0.01))
+        } else {
+            round_lot_size(forced.max(size_floor).max(0.01))
+        };
         if is_exit_like {
             notes.push("force_exit_full_size".to_string());
         } else {
@@ -3607,17 +3615,32 @@ pub(super) async fn submit_rust_order(
     let price_dec = PmDecimal::from_str(&price_str).map_err(|e| format!("bad price: {e}"))?;
     let size_dec = PmDecimal::from_str(&size_str).map_err(|e| format!("bad size: {e}"))?;
     let order_type = pm_order_type_from_tif(&tif);
+    let amount_mode_buy_usdc = payload
+        .get("amount_mode")
+        .and_then(Value::as_str)
+        .map(|v| v.eq_ignore_ascii_case("buy_usdc"))
+        .unwrap_or(false)
+        || payload
+            .get("buy_amount_usdc")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .is_some();
     let requested_notional = payload
         .get("buy_amount_usdc")
         .and_then(Value::as_f64)
         .or_else(|| {
-            payload
-                .get("requested_notional_usdc")
-                .and_then(Value::as_f64)
+            if amount_mode_buy_usdc {
+                None
+            } else {
+                payload
+                    .get("requested_notional_usdc")
+                    .and_then(Value::as_f64)
+            }
         })
         .filter(|v| v.is_finite() && *v > 0.0)
         .unwrap_or(size * price);
-    let use_market_buy_amount = matches!(pm_side, PmSide::Buy)
+    let use_market_buy_amount = amount_mode_buy_usdc
+        && matches!(pm_side, PmSide::Buy)
         && matches!(order_type, PmOrderType::FAK | PmOrderType::FOK)
         && requested_notional > 0.0;
 
