@@ -2303,15 +2303,31 @@ pub(super) async fn apply_pending_confirmation(
         .or_else(|| fill_size_shares.map(|sz| sz * (fill_price_cents / 100.0)))
         .unwrap_or(pending.quote_size_usdc.max(0.0))
         .max(0.0);
-    let fill_shares = fill_size_shares
-        .unwrap_or_else(|| fill_quote_usdc / (fill_price_cents / 100.0).max(0.0001))
-        .max(0.0);
+    let fill_shares = if let Some(sz) = fill_size_shares {
+        sz.max(0.0)
+    } else if fill_meta.fill_quote_usdc.is_some() {
+        (fill_quote_usdc / (fill_price_cents / 100.0).max(0.0001)).max(0.0)
+    } else if pending.order_size_shares > 0.0 {
+        pending.order_size_shares.max(0.0)
+    } else {
+        (fill_quote_usdc / (fill_price_cents / 100.0).max(0.0001)).max(0.0)
+    };
     let fill_cost_usdc = (fill_meta.fee_usdc + fill_meta.slippage_usdc).max(0.0);
     let mut realized_pnl_usdc = 0.0_f64;
     if action == "enter" {
         ps.state = "in_position".to_string();
         ps.side = Some(pending.side.clone());
         ps.entry_round_id = Some(pending.round_id.clone());
+        ps.entry_market_id = if pending.market_id.trim().is_empty() {
+            None
+        } else {
+            Some(pending.market_id.trim().to_string())
+        };
+        ps.entry_token_id = if pending.token_id.trim().is_empty() {
+            None
+        } else {
+            Some(pending.token_id.trim().to_string())
+        };
         ps.entry_ts_ms = Some(pending.submitted_ts_ms);
         ps.entry_price_cents = Some(fill_price_cents);
         ps.entry_quote_usdc = Some(fill_quote_usdc);
@@ -2341,6 +2357,24 @@ pub(super) async fn apply_pending_confirmation(
         ps.state = "in_position".to_string();
         ps.side = Some(pending.side.clone());
         ps.entry_round_id = Some(pending.round_id.clone());
+        if ps
+            .entry_market_id
+            .as_deref()
+            .map(|v| v.trim().is_empty())
+            .unwrap_or(true)
+            && !pending.market_id.trim().is_empty()
+        {
+            ps.entry_market_id = Some(pending.market_id.trim().to_string());
+        }
+        if ps
+            .entry_token_id
+            .as_deref()
+            .map(|v| v.trim().is_empty())
+            .unwrap_or(true)
+            && !pending.token_id.trim().is_empty()
+        {
+            ps.entry_token_id = Some(pending.token_id.trim().to_string());
+        }
         ps.entry_ts_ms = Some(pending.submitted_ts_ms);
         ps.entry_price_cents = Some(next_price);
         ps.vwap_entry_cents = Some(next_price);
@@ -2383,6 +2417,8 @@ pub(super) async fn apply_pending_confirmation(
             ps.state = "flat".to_string();
             ps.side = None;
             ps.entry_round_id = None;
+            ps.entry_market_id = None;
+            ps.entry_token_id = None;
             ps.entry_ts_ms = None;
             ps.entry_price_cents = None;
             ps.entry_quote_usdc = None;
@@ -2434,6 +2470,8 @@ pub(super) async fn apply_pending_revert(
         ps.state = "flat".to_string();
         ps.side = None;
         ps.entry_round_id = None;
+        ps.entry_market_id = None;
+        ps.entry_token_id = None;
         ps.entry_ts_ms = None;
         ps.entry_price_cents = None;
         ps.entry_quote_usdc = None;
@@ -2628,8 +2666,15 @@ pub(super) async fn handle_pending_timeouts(state: &ApiState, gateway_cfg: &Live
                             .await
                             .ok();
                     if let Some(target) = maybe_target {
+                        let mut effective_target = target.clone();
+                        apply_pending_target_override(&mut effective_target, &row);
                         let round_check = json!({ "round_id": row.round_id });
-                        if !decision_round_matches_target(&round_check, &target) {
+                        let bypass_round_guard = is_live_exit_action(&row.action)
+                            && !row.market_id.trim().is_empty()
+                            && !row.token_id.trim().is_empty();
+                        if !decision_round_matches_target(&round_check, &effective_target)
+                            && !bypass_round_guard
+                        {
                             state
                                 .append_live_event(
                                     &row.market_type,
@@ -2640,8 +2685,8 @@ pub(super) async fn handle_pending_timeouts(state: &ApiState, gateway_cfg: &Live
                                         "round_id": row.round_id,
                                         "reason": "local_timeout_cancelled_round_target_mismatch",
                                         "order_id": row.order_id,
-                                        "target_market_id": target.market_id,
-                                        "target_end_date": target.end_date
+                                        "target_market_id": effective_target.market_id,
+                                        "target_end_date": effective_target.end_date
                                     }),
                                 )
                                 .await;
@@ -2661,7 +2706,7 @@ pub(super) async fn handle_pending_timeouts(state: &ApiState, gateway_cfg: &Live
                             "max_slippage_bps": fallback_slippage_bps
                         });
                         let token_id =
-                            token_id_for_decision(&decision, &target).map(str::to_string);
+                            token_id_for_decision(&decision, &effective_target).map(str::to_string);
                         let book_snapshot = if let Some(token_id) = token_id {
                             fetch_gateway_book_snapshot(client, gateway_cfg, &token_id).await
                         } else {
@@ -2669,7 +2714,7 @@ pub(super) async fn handle_pending_timeouts(state: &ApiState, gateway_cfg: &Live
                         };
                         if let Some(payload) = decision_to_live_payload(
                             &decision,
-                            &target,
+                            &effective_target,
                             gateway_cfg,
                             book_snapshot.as_ref(),
                             Some(row.quote_size_usdc),
@@ -2802,6 +2847,188 @@ pub(super) fn token_id_for_decision<'a>(
     }
 }
 
+fn align_exit_decision_side_with_position(
+    decision: &mut Value,
+    position_state: &LivePositionState,
+) -> bool {
+    let action = decision
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !is_live_exit_action(&action) {
+        return false;
+    }
+    let Some(locked_side) = position_state.side.as_deref() else {
+        return false;
+    };
+    let locked_side = locked_side.trim().to_ascii_uppercase();
+    if locked_side.is_empty() {
+        return false;
+    }
+    let current_side = decision
+        .get("side")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_uppercase();
+    if current_side == locked_side {
+        return false;
+    }
+    if let Some(obj) = decision.as_object_mut() {
+        obj.insert("side".to_string(), json!(locked_side));
+        obj.insert(
+            "execution_notes_override".to_string(),
+            json!("exit_side_aligned_to_locked_position"),
+        );
+        return true;
+    }
+    false
+}
+
+fn apply_pending_target_override(target: &mut LiveMarketTarget, row: &LivePendingOrder) {
+    if !row.market_id.trim().is_empty() {
+        target.market_id = row.market_id.trim().to_string();
+    }
+    if !row.token_id.trim().is_empty() {
+        let token = row.token_id.trim().to_string();
+        if row.side.eq_ignore_ascii_case("UP") {
+            target.token_id_yes = token.clone();
+            if target.token_id_no.trim().is_empty() {
+                target.token_id_no = token;
+            }
+        } else if row.side.eq_ignore_ascii_case("DOWN") {
+            target.token_id_no = token.clone();
+            if target.token_id_yes.trim().is_empty() {
+                target.token_id_yes = token;
+            }
+        } else {
+            target.token_id_yes = token.clone();
+            target.token_id_no = token;
+        }
+    }
+    if let Some(end_ms) = parse_round_end_ts_ms(&row.round_id) {
+        target.end_date = end_date_iso_from_ms(end_ms);
+    }
+}
+
+fn build_effective_target_for_decision(
+    target: &LiveMarketTarget,
+    decision: &Value,
+    position_state: &LivePositionState,
+) -> LiveMarketTarget {
+    let mut effective = target.clone();
+    let action = decision
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !is_live_exit_action(&action) {
+        return effective;
+    }
+    if let Some(mid) = position_state.entry_market_id.as_deref() {
+        let mid = mid.trim();
+        if !mid.is_empty() {
+            effective.market_id = mid.to_string();
+        }
+    }
+    if let Some(token) = position_state.entry_token_id.as_deref() {
+        let token = token.trim();
+        if !token.is_empty() {
+            let pos_side = position_state
+                .side
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_uppercase();
+            if pos_side == "DOWN" {
+                effective.token_id_no = token.to_string();
+                if effective.token_id_yes.trim().is_empty() {
+                    effective.token_id_yes = token.to_string();
+                }
+            } else {
+                effective.token_id_yes = token.to_string();
+                if effective.token_id_no.trim().is_empty() {
+                    effective.token_id_no = token.to_string();
+                }
+            }
+        }
+    }
+    if let Some(end_ms) = position_state
+        .entry_round_id
+        .as_deref()
+        .and_then(parse_round_end_ts_ms)
+    {
+        effective.end_date = end_date_iso_from_ms(end_ms);
+    }
+    effective
+}
+
+fn should_bypass_round_match_for_locked_exit(
+    decision: &Value,
+    position_state: &LivePositionState,
+) -> bool {
+    let action = decision
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    is_live_exit_action(&action)
+        && position_state.position_size_shares > 0.0
+        && position_state
+            .entry_market_id
+            .as_deref()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+        && position_state
+            .entry_token_id
+            .as_deref()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+}
+
+pub(super) fn build_position_locked_target(
+    market_type: &str,
+    position_state: &LivePositionState,
+) -> Option<LiveMarketTarget> {
+    let market_id = position_state.entry_market_id.as_deref()?.trim().to_string();
+    let token_id = position_state.entry_token_id.as_deref()?.trim().to_string();
+    if market_id.is_empty() || token_id.is_empty() {
+        return None;
+    }
+    let side = position_state
+        .side
+        .as_deref()
+        .unwrap_or("UP")
+        .trim()
+        .to_ascii_uppercase();
+    let (token_id_yes, token_id_no) = if side == "DOWN" {
+        (token_id.clone(), token_id.clone())
+    } else {
+        (token_id.clone(), token_id.clone())
+    };
+    let symbol = position_state
+        .entry_round_id
+        .as_deref()
+        .and_then(|rid| rid.split('_').next())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("BTCUSDT")
+        .to_string();
+    let end_date = position_state
+        .entry_round_id
+        .as_deref()
+        .and_then(parse_round_end_ts_ms)
+        .and_then(end_date_iso_from_ms);
+    Some(LiveMarketTarget {
+        market_id,
+        symbol,
+        timeframe: market_type.to_string(),
+        token_id_yes,
+        token_id_no,
+        end_date,
+    })
+}
+
 pub(super) async fn execute_live_orders_via_gateway(
     state: &ApiState,
     gateway_cfg: &LiveGatewayConfig,
@@ -2824,19 +3051,22 @@ pub(super) async fn execute_live_orders_via_gateway(
     };
     for gated in decisions {
         let mut decision = gated.decision.clone();
+        let _side_aligned = align_exit_decision_side_with_position(&mut decision, position_state);
         let action = decision
             .get("action")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_ascii_lowercase();
-        if !decision_round_matches_target(&decision, target) {
+        let effective_target = build_effective_target_for_decision(target, &decision, position_state);
+        let bypass_round_guard = should_bypass_round_match_for_locked_exit(&decision, position_state);
+        if !decision_round_matches_target(&decision, &effective_target) && !bypass_round_guard {
             out.push(json!({
                 "ok": false,
                 "reason": "round_target_mismatch",
                 "decision_key": gated.decision_key,
                 "decision_round_id": decision.get("round_id").and_then(Value::as_str),
-                "target_market_id": target.market_id,
-                "target_end_date": target.end_date,
+                "target_market_id": effective_target.market_id,
+                "target_end_date": effective_target.end_date,
                 "decision": decision
             }));
             continue;
@@ -2852,7 +3082,7 @@ pub(super) async fn execute_live_orders_via_gateway(
             }
         }
         apply_emergency_exit_overrides(&mut decision, gateway_cfg);
-        let token_id = token_id_for_decision(&decision, target).map(str::to_string);
+        let token_id = token_id_for_decision(&decision, &effective_target).map(str::to_string);
         let book_snapshot = if let Some(token_id) = token_id.clone() {
             match book_cache.get(&token_id) {
                 Some(cached) => cached.clone(),
@@ -2866,7 +3096,13 @@ pub(super) async fn execute_live_orders_via_gateway(
             None
         };
         let Some(payload) =
-            decision_to_live_payload(&decision, target, gateway_cfg, book_snapshot.as_ref(), None)
+            decision_to_live_payload(
+                &decision,
+                &effective_target,
+                gateway_cfg,
+                book_snapshot.as_ref(),
+                None,
+            )
         else {
             out.push(json!({
                 "ok": false,
@@ -2953,6 +3189,8 @@ pub(super) async fn execute_live_orders_via_gateway(
             "attempts": attempts,
             "order_latency_ms": order_started.elapsed().as_millis() as u64,
             "book_snapshot": book_snapshot,
+            "target_market_id": effective_target.market_id,
+            "round_guard_bypassed": bypass_round_guard,
             "price_trace": build_execution_price_trace(
                 &decision,
                 &payload,
@@ -3426,24 +3664,29 @@ async fn try_resubmit_after_terminal_reject_rust(
             return false;
         }
     };
+    let mut effective_target = target.clone();
+    apply_pending_target_override(&mut effective_target, row);
     let round_check = json!({ "round_id": row.round_id });
-    if !decision_round_matches_target(&round_check, &target) {
+    let bypass_round_guard = is_live_exit_action(&action)
+        && !row.market_id.trim().is_empty()
+        && !row.token_id.trim().is_empty();
+    if !decision_round_matches_target(&round_check, &effective_target) && !bypass_round_guard {
         state
             .append_live_event(
                 &row.market_type,
                 json!({
                     "accepted": false,
                     "action": row.action,
-                    "side": row.side,
-                    "round_id": row.round_id,
-                    "reason": "rust_terminal_rejected_resubmit_round_target_mismatch",
-                    "order_id": row.order_id,
-                    "status": terminal_status,
-                    "target_market_id": target.market_id,
-                    "target_end_date": target.end_date
-                }),
-            )
-            .await;
+                        "side": row.side,
+                        "round_id": row.round_id,
+                        "reason": "rust_terminal_rejected_resubmit_round_target_mismatch",
+                        "order_id": row.order_id,
+                        "status": terminal_status,
+                        "target_market_id": effective_target.market_id,
+                        "target_end_date": effective_target.end_date
+                    }),
+                )
+                .await;
         return false;
     }
     let mut decision = json!({
@@ -3473,7 +3716,7 @@ async fn try_resubmit_after_terminal_reject_rust(
             }
         }
     }
-    let token_id = token_id_for_decision(&decision, &target).map(str::to_string);
+    let token_id = token_id_for_decision(&decision, &effective_target).map(str::to_string);
     let book_snapshot = if let Some(token_id) = token_id {
         if let Some(cached) = state.get_rust_book_cache(&token_id).await {
             Some(cached)
@@ -3488,7 +3731,7 @@ async fn try_resubmit_after_terminal_reject_rust(
     };
     let Some(payload) = decision_to_live_payload(
         &decision,
-        &target,
+        &effective_target,
         gateway_cfg,
         book_snapshot.as_ref(),
         Some(row.quote_size_usdc),
@@ -3633,15 +3876,18 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
 
     for gated in decisions {
         let mut decision = gated.decision.clone();
-        if !decision_round_matches_target(&decision, target) {
+        let _side_aligned = align_exit_decision_side_with_position(&mut decision, position_state);
+        let effective_target = build_effective_target_for_decision(target, &decision, position_state);
+        let bypass_round_guard = should_bypass_round_match_for_locked_exit(&decision, position_state);
+        if !decision_round_matches_target(&decision, &effective_target) && !bypass_round_guard {
             out.push(json!({
                 "ok": false,
                 "accepted": false,
                 "reason": "round_target_mismatch",
                 "decision_key": gated.decision_key,
                 "decision_round_id": decision.get("round_id").and_then(Value::as_str),
-                "target_market_id": target.market_id,
-                "target_end_date": target.end_date,
+                "target_market_id": effective_target.market_id,
+                "target_end_date": effective_target.end_date,
                 "decision": decision
             }));
             continue;
@@ -3662,7 +3908,7 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
             }
         }
         apply_emergency_exit_overrides(&mut decision, gateway_cfg);
-        let token_id = token_id_for_decision(&decision, target).map(str::to_string);
+        let token_id = token_id_for_decision(&decision, &effective_target).map(str::to_string);
         let book_snapshot = if let Some(token_id) = token_id.clone() {
             match book_cache.get(&token_id) {
                 Some(cached) => cached.clone(),
@@ -3689,7 +3935,13 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
             None
         };
         let Some(payload) =
-            decision_to_live_payload(&decision, target, gateway_cfg, book_snapshot.as_ref(), None)
+            decision_to_live_payload(
+                &decision,
+                &effective_target,
+                gateway_cfg,
+                book_snapshot.as_ref(),
+                None,
+            )
         else {
             out.push(json!({
                 "ok": false,
@@ -3822,6 +4074,8 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
             "executor": executed_via,
             "order_latency_ms": order_started.elapsed().as_millis() as u64,
             "book_snapshot": book_snapshot,
+            "target_market_id": effective_target.market_id,
+            "round_guard_bypassed": bypass_round_guard,
             "price_trace": build_execution_price_trace(
                 &decision,
                 &payload,
@@ -3966,8 +4220,15 @@ pub(super) async fn handle_pending_timeouts_rust(
                             .await
                             .ok();
                     if let Some(target) = maybe_target {
+                        let mut effective_target = target.clone();
+                        apply_pending_target_override(&mut effective_target, &row);
                         let round_check = json!({ "round_id": row.round_id });
-                        if !decision_round_matches_target(&round_check, &target) {
+                        let bypass_round_guard = is_live_exit_action(&row.action)
+                            && !row.market_id.trim().is_empty()
+                            && !row.token_id.trim().is_empty();
+                        if !decision_round_matches_target(&round_check, &effective_target)
+                            && !bypass_round_guard
+                        {
                             state
                                 .append_live_event(
                                     &row.market_type,
@@ -3978,8 +4239,8 @@ pub(super) async fn handle_pending_timeouts_rust(
                                         "round_id": row.round_id,
                                         "reason": "rust_timeout_cancelled_round_target_mismatch",
                                         "order_id": row.order_id,
-                                        "target_market_id": target.market_id,
-                                        "target_end_date": target.end_date
+                                        "target_market_id": effective_target.market_id,
+                                        "target_end_date": effective_target.end_date
                                     }),
                                 )
                                 .await;
@@ -3999,7 +4260,7 @@ pub(super) async fn handle_pending_timeouts_rust(
                             "max_slippage_bps": fallback_slippage_bps
                         });
                         let token_id =
-                            token_id_for_decision(&decision, &target).map(str::to_string);
+                            token_id_for_decision(&decision, &effective_target).map(str::to_string);
                         let book_snapshot = if let Some(token_id) = token_id {
                             if let Some(cached) = state.get_rust_book_cache(&token_id).await {
                                 Some(cached)
@@ -4015,7 +4276,7 @@ pub(super) async fn handle_pending_timeouts_rust(
                         };
                         if let Some(payload) = decision_to_live_payload(
                             &decision,
-                            &target,
+                            &effective_target,
                             gateway_cfg,
                             book_snapshot.as_ref(),
                             Some(row.quote_size_usdc),
@@ -4575,12 +4836,15 @@ mod tests {
         let pending = LivePendingOrder {
             market_type: "5m".to_string(),
             order_id: "oid".to_string(),
+            market_id: "mkt".to_string(),
+            token_id: "yes".to_string(),
             action: "enter".to_string(),
             side: "UP".to_string(),
             round_id: "r".to_string(),
             decision_key: "k".to_string(),
             price_cents: 99.0,
             quote_size_usdc: 4.95,
+            order_size_shares: 5.0,
             tif: "FAK".to_string(),
             style: "taker".to_string(),
             submit_reason: "test".to_string(),

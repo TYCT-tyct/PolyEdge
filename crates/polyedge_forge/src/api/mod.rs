@@ -617,6 +617,10 @@ struct LivePositionState {
     state: String,
     side: Option<String>,
     entry_round_id: Option<String>,
+    #[serde(default)]
+    entry_market_id: Option<String>,
+    #[serde(default)]
+    entry_token_id: Option<String>,
     entry_ts_ms: Option<i64>,
     entry_price_cents: Option<f64>,
     entry_quote_usdc: Option<f64>,
@@ -652,6 +656,8 @@ impl LivePositionState {
             state: "flat".to_string(),
             side: None,
             entry_round_id: None,
+            entry_market_id: None,
+            entry_token_id: None,
             entry_ts_ms: None,
             entry_price_cents: None,
             entry_quote_usdc: None,
@@ -986,12 +992,18 @@ impl LiveCapitalConfig {
 struct LivePendingOrder {
     market_type: String,
     order_id: String,
+    #[serde(default)]
+    market_id: String,
+    #[serde(default)]
+    token_id: String,
     action: String,
     side: String,
     round_id: String,
     decision_key: String,
     price_cents: f64,
     quote_size_usdc: f64,
+    #[serde(default)]
+    order_size_shares: f64,
     #[serde(default)]
     tif: String,
     #[serde(default)]
@@ -2242,6 +2254,7 @@ struct StrategyPaperQueryParams {
     source: Option<String>,
     profile: Option<String>,
     market_type: Option<String>,
+    symbol: Option<String>,
     autotune_context: Option<String>,
     lookback_minutes: Option<u32>,
     max_points: Option<u32>,
@@ -2314,6 +2327,7 @@ fn parse_strategy_paper_source(raw: Option<&str>) -> StrategyPaperSource {
 #[derive(Debug, Deserialize)]
 struct StrategyFullQueryParams {
     market_type: Option<String>,
+    symbol: Option<String>,
     lookback_minutes: Option<u32>,
     max_points: Option<u32>,
     max_samples: Option<u32>,
@@ -2327,6 +2341,7 @@ struct StrategyFullQueryParams {
 #[derive(Debug, Deserialize)]
 struct StrategyOptimizeQueryParams {
     market_type: Option<String>,
+    symbol: Option<String>,
     autotune_context: Option<String>,
     lookback_minutes: Option<u32>,
     max_points: Option<u32>,
@@ -2350,12 +2365,14 @@ struct StrategyOptimizeQueryParams {
 #[derive(Debug, Deserialize)]
 struct StrategyAutotuneLatestQueryParams {
     market_type: Option<String>,
+    symbol: Option<String>,
     context: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct StrategyAutotuneHistoryQueryParams {
     market_type: Option<String>,
+    symbol: Option<String>,
     context: Option<String>,
     limit: Option<u32>,
 }
@@ -2363,6 +2380,7 @@ struct StrategyAutotuneHistoryQueryParams {
 #[derive(Debug, Deserialize)]
 struct StrategyAutotuneSetBody {
     market_type: Option<String>,
+    symbol: Option<String>,
     context: Option<String>,
     config: Value,
     ttl_sec: Option<u32>,
