@@ -458,12 +458,10 @@ function bucketizePoints(points: ChartPoint[]): ChartPoint[] {
 
   for (const agg of ordered) {
     if (lastObs && lastRoundId && agg.roundId !== lastRoundId) {
-      const switchTs = agg.bucketStartMs - 1;
       const lastTs = out[out.length - 1]?.timestamp_ms ?? Number.NEGATIVE_INFINITY;
-      if (Number.isFinite(switchTs) && switchTs > lastTs) {
-        // Force a hard visual break at round boundaries to avoid "tailing" illusion.
-        out.push(synthPoint(lastObs.source, switchTs, null, null, null, true));
-      }
+      const switchTs = Math.max(lastTs + 1, agg.bucketStartMs);
+      // Force a hard visual break at round boundaries to avoid any cross-round curve.
+      out.push(synthPoint(lastObs.source, switchTs, null, null, null, true));
       lastObs = null;
     }
 
@@ -490,7 +488,9 @@ function bucketizePoints(points: ChartPoint[]): ChartPoint[] {
       }
     }
 
-    const ts = agg.bucketStartMs + ONE_SECOND_MS - 1;
+    const minAllowedTs =
+      (out[out.length - 1]?.timestamp_ms ?? Number.NEGATIVE_INFINITY) + 1;
+    const ts = Math.max(agg.bucketStartMs + ONE_SECOND_MS - 1, minAllowedTs);
     const observedDelta = median(agg.deltas) ?? resolveDeltaPct(agg.source) ?? lastObs?.delta ?? null;
     let observedPair = normalizePairedCentsSoft(median(agg.ups), median(agg.downs));
     if (observedPair.up == null && observedPair.down == null && lastObs && agg.roundId === lastRoundId) {

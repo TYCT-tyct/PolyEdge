@@ -44,7 +44,7 @@ struct TargetFetchRes {
 // Removed: MARKET_FUTURE_GUARD_DEFAULT_MS (replaced by market_prestart_allow_ms)
 const MARKET_PRESTART_ALLOW_DEFAULT_MS: i64 = 30_000;
 const MARKET_SAMPLE_END_GRACE_DEFAULT_MS: i64 = 300;
-const MARKET_STALE_GUARD_DEFAULT_MS: i64 = 1_000;
+const MARKET_STALE_GUARD_DEFAULT_MS: i64 = 300;
 const MOTION_PRICE_TAU_SEC: f64 = 1.2;
 const MOTION_VELOCITY_TAU_SEC: f64 = 1.8;
 const MOTION_MIN_DT_SEC: f64 = 0.02;
@@ -1928,7 +1928,8 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         }
                     };
 
-                    let motion_key = format!("{}|{}", market.symbol, market.timeframe);
+                    let motion_key =
+                        format!("{}|{}|{}", market.symbol, market.timeframe, round_start);
                     let (velocity, acceleration) = match binance_price {
                         Some(px) if px.is_finite() && px > 0.0 => {
                             if let Some(prev) = motion_by_key.get(&motion_key).copied() {
