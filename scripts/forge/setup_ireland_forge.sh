@@ -78,6 +78,8 @@ if [ -f "$ENV_FILE" ]; then
   upsert_env "FORGE_FEV1_RUNTIME_MAX_TRADES" "$RUNTIME_MAX_TRADES" "$ENV_FILE"
   upsert_env "FORGE_FEV1_LIVE_EXECUTE" "$RUNTIME_LIVE_EXECUTE" "$ENV_FILE"
   upsert_env "FORGE_FEV1_RUNTIME_DRAIN_ONLY" "false" "$ENV_FILE"
+  upsert_env "FORGE_MARKET_SWITCH_MIN_HOLD_MS" "1500" "$ENV_FILE"
+  upsert_env "FORGE_MARKET_STALE_GUARD_MS" "1000" "$ENV_FILE"
 fi
 
 # Always rebuild dashboard static assets before restarting API service.
