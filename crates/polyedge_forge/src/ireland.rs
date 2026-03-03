@@ -70,8 +70,11 @@ const MARKET_SELECTION_FALLBACK_PREWARM_DEFAULT_MS: i64 = 300_000;
 const MARKET_CANDIDATE_POOL_DEFAULT_SIZE: usize = 3;
 const DISCOVERY_PREWARM_LEAD_DEFAULT_MS: i64 = 300_000;
 const DISCOVERY_PREWARM_REFRESH_DEFAULT_SEC: u64 = 2;
-const QUOTE_FALLBACK_MAX_AGE_5M_MS: i64 = 6 * 60 * 1_000;
-const QUOTE_FALLBACK_MAX_AGE_15M_MS: i64 = 18 * 60 * 1_000;
+const BOOK_STALE_MAX_AGE_5M_MS: i64 = 8_000;
+const BOOK_STALE_MAX_AGE_15M_MS: i64 = 12_000;
+const QUOTE_FALLBACK_MAX_AGE_5M_MS: i64 = 12_000;
+const QUOTE_FALLBACK_MAX_AGE_15M_MS: i64 = 20_000;
+const QUOTE_CROSS_MARKET_BRIDGE_MAX_AGE_MS: i64 = 1_500;
 
 fn env_flag(key: &str, default: bool) -> bool {
     std::env::var(key)
@@ -523,8 +526,9 @@ struct StableQuote {
     ask_no: f64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct QuoteCacheEntry {
+    market_id: String,
     ts_ms: i64,
     quote: StableQuote,
 }
@@ -537,9 +541,37 @@ fn quote_fallback_max_age_ms(timeframe: &str) -> i64 {
     }
 }
 
+fn book_stale_max_age_ms(timeframe: &str) -> i64 {
+    match timeframe {
+        "5m" => BOOK_STALE_MAX_AGE_5M_MS,
+        "15m" => BOOK_STALE_MAX_AGE_15M_MS,
+        _ => BOOK_STALE_MAX_AGE_5M_MS,
+    }
+}
+
+fn book_seen_ts_ms(book: &BookTop) -> i64 {
+    if book.recv_ts_local_ns > 0 {
+        book.recv_ts_local_ns / 1_000_000
+    } else {
+        book.ts_ms
+    }
+}
+
+fn pick_fresh_book_for_market<'a>(
+    market: &MarketMeta,
+    now_ms: i64,
+    books: &'a HashMap<String, BookTop>,
+) -> Option<&'a BookTop> {
+    let max_age_ms = book_stale_max_age_ms(&market.timeframe);
+    books
+        .get(&market.market_id)
+        .filter(|book| now_ms.saturating_sub(book_seen_ts_ms(book)) <= max_age_ms)
+}
+
 fn pick_fresh_cached_quote(
-    market_cached: Option<QuoteCacheEntry>,
-    pair_cached: Option<QuoteCacheEntry>,
+    market_id: &str,
+    market_cached: Option<&QuoteCacheEntry>,
+    pair_cached: Option<&QuoteCacheEntry>,
     now_ms: i64,
     max_age_ms: i64,
 ) -> Option<StableQuote> {
@@ -549,7 +581,14 @@ fn pick_fresh_cached_quote(
         }
     }
     if let Some(cached) = pair_cached {
-        if now_ms.saturating_sub(cached.ts_ms) <= max_age_ms {
+        let age_ms = now_ms.saturating_sub(cached.ts_ms);
+        let same_market = cached.market_id == market_id;
+        let allowed_age = if same_market {
+            max_age_ms
+        } else {
+            QUOTE_CROSS_MARKET_BRIDGE_MAX_AGE_MS
+        };
+        if age_ms <= allowed_age {
             return Some(cached.quote);
         }
     }
@@ -1452,7 +1491,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                 for primary_market in markets_by_id.values() {
                     let pair_key = market_pair_key(primary_market);
                     let mut market = primary_market.clone();
-                    let mut book = book_by_market.get(&market.market_id);
+                    let mut book = pick_fresh_book_for_market(&market, now_ms, &book_by_market);
                     if let Some(candidates) = candidate_markets_by_pair.get(&pair_key) {
                         let current_in_window =
                             market_in_sampling_window(
@@ -1469,10 +1508,11 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                     market_prestart_allow_ms,
                                     market_sample_end_grace_ms,
                                 )
-                                    && book_by_market.contains_key(&m.market_id)
+                                    && pick_fresh_book_for_market(m, now_ms, &book_by_market)
+                                        .is_some()
                             }) {
                                 market = alt_market.clone();
-                                book = book_by_market.get(&market.market_id);
+                                book = pick_fresh_book_for_market(&market, now_ms, &book_by_market);
                             } else if let Some(alt_market) = candidates
                                 .iter()
                                 .find(|m| {
@@ -1485,7 +1525,18 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                 })
                             {
                                 market = alt_market.clone();
-                                book = book_by_market.get(&market.market_id);
+                                book = pick_fresh_book_for_market(&market, now_ms, &book_by_market);
+                            }
+                        }
+                        // Discovery can briefly point to future round metadata before the
+                        // currently tradable round is reflected. Prefer any candidate with
+                        // fresh book data to avoid 4-5 minute sampling blackouts.
+                        if now_ms + market_prestart_allow_ms < market.start_ts_ms {
+                            if let Some(alt_market) = candidates.iter().find(|m| {
+                                pick_fresh_book_for_market(m, now_ms, &book_by_market).is_some()
+                            }) {
+                                market = alt_market.clone();
+                                book = pick_fresh_book_for_market(&market, now_ms, &book_by_market);
                             }
                         }
                     }
@@ -1500,33 +1551,36 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
 
                     let pair_key = market_pair_key(&market);
                     let max_quote_fallback_age_ms = quote_fallback_max_age_ms(&market.timeframe);
-                    let market_cached_quote = quote_cache_by_market.get(&market.market_id).copied();
-                    let pair_cached_quote = quote_cache_by_pair.get(&pair_key).copied();
+                    let market_cached_quote = quote_cache_by_market.get(&market.market_id);
+                    let pair_cached_quote = quote_cache_by_pair.get(&pair_key);
+                    let market_cached_quote_sides = market_cached_quote.map(|v| {
+                        (
+                            v.quote.bid_yes,
+                            v.quote.ask_yes,
+                            v.quote.bid_no,
+                            v.quote.ask_no,
+                        )
+                    });
+                    let market_cached_ts_ms = market_cached_quote.map(|v| v.ts_ms);
+                    let pair_cached_ts_ms = pair_cached_quote.map(|v| v.ts_ms);
                     let mut used_cached_quote = false;
                     let stable_quote = match book {
-                        Some(book_top) => stabilize_book_quotes(
-                            book_top,
-                            market_cached_quote.map(|v| {
-                                (
-                                    v.quote.bid_yes,
-                                    v.quote.ask_yes,
-                                    v.quote.bid_no,
-                                    v.quote.ask_no,
-                                )
-                            }),
-                        )
-                        .or_else(|| {
+                        Some(book_top) => {
+                            stabilize_book_quotes(book_top, market_cached_quote_sides).or_else(|| {
                             used_cached_quote = true;
                             pick_fresh_cached_quote(
+                                &market.market_id,
                                 market_cached_quote,
                                 pair_cached_quote,
                                 now_ms,
                                 max_quote_fallback_age_ms,
                             )
-                        }),
+                        })
+                        }
                         None => {
                             used_cached_quote = true;
                             pick_fresh_cached_quote(
+                                &market.market_id,
                                 market_cached_quote,
                                 pair_cached_quote,
                                 now_ms,
@@ -1564,10 +1618,12 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         }
                     } else {
                         let cache_entry = QuoteCacheEntry {
+                            market_id: market.market_id.clone(),
                             ts_ms: now_ms,
                             quote: stable_quote,
                         };
-                        quote_cache_by_market.insert(market.market_id.clone(), cache_entry);
+                        quote_cache_by_market
+                            .insert(market.market_id.clone(), cache_entry.clone());
                         quote_cache_by_pair.insert(pair_key, cache_entry);
                     }
 
@@ -1819,10 +1875,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             book_top.ts_ms
                         }
                     } else {
-                        market_cached_quote
-                            .map(|v| v.ts_ms)
-                            .or_else(|| pair_cached_quote.map(|v| v.ts_ms))
-                            .unwrap_or(now_ms)
+                        market_cached_ts_ms.or(pair_cached_ts_ms).unwrap_or(now_ms)
                     };
 
                     ingest_seq = ingest_seq.saturating_add(1);
