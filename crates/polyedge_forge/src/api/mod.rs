@@ -123,6 +123,28 @@ const RUNTIME_EVENT_SAMPLE_BUFFER_MAX_DEFAULT: usize = 140_000;
 const RUNTIME_EVENT_SAMPLE_BUFFER_MAX_MIN: usize = 10_000;
 const RUNTIME_EVENT_SAMPLE_BUFFER_MAX_MAX: usize = 600_000;
 
+fn default_runtime_symbol() -> String {
+    "BTCUSDT".to_string()
+}
+
+fn normalize_runtime_symbol(raw: &str) -> Option<String> {
+    match raw.trim().to_ascii_uppercase().as_str() {
+        "BTC" | "BTCUSDT" | "XBT" => Some("BTCUSDT".to_string()),
+        "ETH" | "ETHUSDT" | "ETHER" => Some("ETHUSDT".to_string()),
+        "SOL" | "SOLUSDT" => Some("SOLUSDT".to_string()),
+        "XRP" | "XRPUSDT" | "RIPPLE" => Some("XRPUSDT".to_string()),
+        _ => None,
+    }
+}
+
+fn runtime_event_sample_scope_key(symbol: &str, market_type: &str) -> String {
+    format!(
+        "{}|{}",
+        symbol.trim().to_ascii_uppercase(),
+        market_type.trim().to_ascii_lowercase()
+    )
+}
+
 fn runtime_event_sample_buffer_max() -> usize {
     std::env::var("FORGE_STRATEGY_RUNTIME_EVENT_BUFFER_MAX_POINTS")
         .ok()
@@ -297,6 +319,8 @@ struct RustBookCacheEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LivePositionState {
+    #[serde(default = "default_runtime_symbol")]
+    symbol: String,
     market_type: String,
     state: String,
     side: Option<String>,
@@ -334,8 +358,9 @@ struct LivePositionState {
 }
 
 impl LivePositionState {
-    fn flat(market_type: &str, now_ms: i64) -> Self {
+    fn flat(symbol: &str, market_type: &str, now_ms: i64) -> Self {
         Self {
+            symbol: symbol.to_ascii_uppercase(),
             market_type: market_type.to_string(),
             state: "flat".to_string(),
             side: None,
@@ -365,6 +390,8 @@ impl LivePositionState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LivePendingOrder {
+    #[serde(default = "default_runtime_symbol")]
+    symbol: String,
     market_type: String,
     order_id: String,
     #[serde(default)]
@@ -401,6 +428,7 @@ struct LiveRuntimeConfig {
     max_orders: usize,
     drain_only: bool,
     quote_usdc: f64,
+    symbol: String,
     markets: Vec<String>,
 }
 
@@ -472,6 +500,15 @@ impl LiveRuntimeConfig {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(1.0)
             .clamp(0.01, 500.0);
+        let symbol = std::env::var("FORGE_FEV1_RUNTIME_SYMBOL")
+            .ok()
+            .and_then(|raw| normalize_runtime_symbol(&raw))
+            .or_else(|| {
+                std::env::var("FORGE_FEV1_RUNTIME_SYMBOLS")
+                    .ok()
+                    .and_then(|raw| raw.split(',').find_map(normalize_runtime_symbol))
+            })
+            .unwrap_or_else(default_runtime_symbol);
         let markets = std::env::var("FORGE_FEV1_RUNTIME_MARKETS")
             .ok()
             .map(|raw| {
@@ -492,6 +529,7 @@ impl LiveRuntimeConfig {
             max_orders,
             drain_only,
             quote_usdc,
+            symbol,
             markets,
         }
     }
@@ -1002,6 +1040,7 @@ fn gate_live_decisions_by_profitability(
 
 #[derive(Debug, Clone)]
 struct LiveRuntimeWakeEvent {
+    symbol: String,
     market_type: String,
     source: String,
     ts_ms: i64,
@@ -1043,7 +1082,11 @@ impl LiveExecutionAggState {
     }
 }
 
-fn parse_snapshot_event(v: &Value) -> Option<(String, Option<i64>)> {
+fn parse_snapshot_event(v: &Value) -> Option<(String, String, Option<i64>)> {
+    let symbol = v
+        .get("symbol")
+        .and_then(Value::as_str)
+        .and_then(normalize_runtime_symbol)?;
     let tf = v
         .get("timeframe")
         .and_then(Value::as_str)
@@ -1054,7 +1097,7 @@ fn parse_snapshot_event(v: &Value) -> Option<(String, Option<i64>)> {
         .or_else(|| v.get("ts_ms").and_then(Value::as_i64))
         .filter(|v| *v > 0);
     if tf == "5m" || tf == "15m" {
-        Some((tf, sample_ts_ms))
+        Some((symbol, tf, sample_ts_ms))
     } else {
         None
     }
@@ -1203,15 +1246,20 @@ impl ApiState {
             }
         }
         let mut states = self.live_position_states.write().await;
+        let runtime_symbol = LiveRuntimeConfig::from_env().symbol;
         let entry = states
             .entry(market_type.to_string())
-            .or_insert_with(|| LivePositionState::flat(market_type, now_ms));
+            .or_insert_with(|| LivePositionState::flat(&runtime_symbol, market_type, now_ms));
         entry.clone()
     }
 
     async fn put_live_position_state(&self, market_type: &str, next: LivePositionState) {
         let mut states = self.live_position_states.write().await;
-        states.insert(market_type.to_string(), next);
+        let mut normalized = next;
+        if normalized.symbol.trim().is_empty() {
+            normalized.symbol = LiveRuntimeConfig::from_env().symbol;
+        }
+        states.insert(market_type.to_string(), normalized);
     }
 
     async fn get_live_runtime_control(&self, market_type: &str) -> LiveRuntimeControl {
@@ -1323,13 +1371,19 @@ impl ApiState {
         store.insert(market_type.to_string(), payload);
     }
 
-    async fn upsert_runtime_event_sample(&self, market_type: &str, sample: StrategySample) {
-        self.upsert_runtime_event_samples_batch(market_type, vec![sample])
+    async fn upsert_runtime_event_sample(
+        &self,
+        symbol: &str,
+        market_type: &str,
+        sample: StrategySample,
+    ) {
+        self.upsert_runtime_event_samples_batch(symbol, market_type, vec![sample])
             .await;
     }
 
     async fn upsert_runtime_event_samples_batch(
         &self,
+        symbol: &str,
         market_type: &str,
         mut samples: Vec<StrategySample>,
     ) {
@@ -1338,8 +1392,9 @@ impl ApiState {
         }
         samples.sort_by_key(|s| s.ts_ms);
         let mut store = self.runtime_event_samples.write().await;
+        let scope_key = runtime_event_sample_scope_key(symbol, market_type);
         let entry = store
-            .entry(market_type.to_string())
+            .entry(scope_key)
             .or_insert_with(|| RuntimeEventSampleBuffer {
                 updated_at_ms: 0,
                 samples: VecDeque::new(),
@@ -1364,12 +1419,14 @@ impl ApiState {
 
     async fn get_runtime_event_samples(
         &self,
+        symbol: &str,
         market_type: &str,
         lookback_minutes: u32,
         max_points: u32,
     ) -> Option<Arc<Vec<StrategySample>>> {
         let store = self.runtime_event_samples.read().await;
-        let rows = store.get(market_type)?;
+        let scope_key = runtime_event_sample_scope_key(symbol, market_type);
+        let rows = store.get(&scope_key)?;
         if rows.samples.is_empty() {
             return None;
         }
@@ -1392,7 +1449,7 @@ impl ApiState {
         Some(Arc::new(out))
     }
 
-    async fn preload_runtime_event_samples_from_redis(&self, markets: &[String]) {
+    async fn preload_runtime_event_samples_from_redis(&self, symbol: &str, markets: &[String]) {
         let Some(mut conn) = self.redis_manager.clone() else {
             return;
         };
@@ -1402,7 +1459,11 @@ impl ApiState {
             if market != "5m" && market != "15m" {
                 continue;
             }
-            let key = format!("{}:snapshot:ring:BTCUSDT:{market}", self.redis_prefix);
+            let key = format!(
+                "{}:snapshot:ring:{}:{market}",
+                self.redis_prefix,
+                symbol.trim().to_ascii_uppercase()
+            );
             let rows: Vec<String> = match conn.lrange(&key, -ring_take, -1_isize).await {
                 Ok(v) => v,
                 Err(err) => {
@@ -1418,15 +1479,17 @@ impl ApiState {
                 let Ok(v) = serde_json::from_str::<Value>(&row) else {
                     continue;
                 };
-                let Some((tf, _, sample)) = strategy_sample_from_snapshot_event(&v) else {
+                let Some((ev_symbol, tf, _, sample)) = strategy_sample_from_snapshot_event(&v)
+                else {
                     continue;
                 };
-                if tf.eq_ignore_ascii_case(&market) {
+                if tf.eq_ignore_ascii_case(&market) && ev_symbol.eq_ignore_ascii_case(symbol) {
                     samples.push(sample);
                 }
             }
             if !samples.is_empty() {
-                self.upsert_runtime_event_samples_batch(&market, samples).await;
+                self.upsert_runtime_event_samples_batch(symbol, &market, samples)
+                    .await;
             }
         }
     }
@@ -2144,15 +2207,20 @@ async fn live_runtime_snapshot_event_listener(
                             continue;
                         }
                     };
-                    let Some((market_type, sample_ts_ms)) = parse_snapshot_event(&payload_value) else {
+                    let Some((symbol, market_type, sample_ts_ms)) =
+                        parse_snapshot_event(&payload_value)
+                    else {
                         continue;
                     };
-                    if let Some((sample_tf, _, sample)) =
+                    if let Some((sample_symbol, sample_tf, _, sample)) =
                         strategy_sample_from_snapshot_event(&payload_value)
                     {
-                        state.upsert_runtime_event_sample(&sample_tf, sample).await;
+                        state
+                            .upsert_runtime_event_sample(&sample_symbol, &sample_tf, sample)
+                            .await;
                     }
                     let _ = wake_tx.send(LiveRuntimeWakeEvent {
+                        symbol,
                         market_type,
                         source: "redis_snapshot_event".to_string(),
                         ts_ms: Utc::now().timestamp_millis(),
@@ -2179,7 +2247,16 @@ async fn restore_live_runtime_state(
         let key = live_position_state_key(&state.redis_prefix, market);
         if let Some(v) = read_key_value(state, &key).await? {
             if let Ok(parsed) = serde_json::from_value::<LivePositionState>(v) {
-                state.put_live_position_state(market, parsed).await;
+                if parsed.symbol.eq_ignore_ascii_case(&cfg.symbol) {
+                    state.put_live_position_state(market, parsed).await;
+                } else {
+                    tracing::warn!(
+                        market_type = market,
+                        persisted_symbol = %parsed.symbol,
+                        runtime_symbol = %cfg.symbol,
+                        "skip restoring live position state due to symbol mismatch"
+                    );
+                }
             }
         }
         let control_key = live_runtime_control_key(&state.redis_prefix, market);
@@ -2227,7 +2304,7 @@ async fn restore_live_runtime_state(
         *seq = max_event_seq;
     }
     state
-        .preload_runtime_event_samples_from_redis(&cfg.markets)
+        .preload_runtime_event_samples_from_redis(&cfg.symbol, &cfg.markets)
         .await;
     Ok(())
 }
@@ -2276,6 +2353,7 @@ async fn live_runtime_loop(
 ) {
     tracing::info!(
         markets = ?bootstrap.markets,
+        symbol = %bootstrap.symbol,
         live_execute = bootstrap.live_execute,
         loop_ms = bootstrap.loop_interval_ms,
         "fev1 live runtime started"
@@ -2363,10 +2441,11 @@ async fn live_runtime_loop(
         let wake_markets: HashSet<String> = wake_events
             .iter()
             .filter_map(|ev| {
-                if cfg
-                    .markets
-                    .iter()
-                    .any(|m| m.eq_ignore_ascii_case(&ev.market_type))
+                if ev.symbol.eq_ignore_ascii_case(&cfg.symbol)
+                    && cfg
+                        .markets
+                        .iter()
+                        .any(|m| m.eq_ignore_ascii_case(&ev.market_type))
                 {
                     Some(ev.market_type.to_ascii_lowercase())
                 } else {
@@ -2387,10 +2466,11 @@ async fn live_runtime_loop(
 
         for market in &cfg.markets {
             let market_type = market.as_str();
-            let trigger_for_market = wake_events
-                .iter()
-                .rev()
-                .find(|ev| ev.market_type.eq_ignore_ascii_case(market_type));
+            let runtime_symbol = cfg.symbol.as_str();
+            let trigger_for_market = wake_events.iter().rev().find(|ev| {
+                ev.market_type.eq_ignore_ascii_case(market_type)
+                    && ev.symbol.eq_ignore_ascii_case(runtime_symbol)
+            });
             let now_ms = Utc::now().timestamp_millis();
             let is_wake_hit = wake_markets.contains(&market_type.to_ascii_lowercase());
             let due_at_ms = market_next_due_ms
@@ -2412,7 +2492,7 @@ async fn live_runtime_loop(
                 if matches!(
                     tokio::time::timeout(
                         Duration::from_millis(360),
-                        resolve_live_market_target_with_state(&state, market_type),
+                        resolve_live_market_target_with_state(&state, runtime_symbol, market_type),
                     )
                     .await,
                     Ok(Ok(_))
@@ -2477,8 +2557,9 @@ async fn live_runtime_loop(
                 .copied()
                 .unwrap_or(0);
             let force_poll_due = now_ms.saturating_sub(last_eval_ms) >= idle_force_poll_ms;
-            let must_run_without_new_sample =
-                effective_drain_only || position_before_cycle.side.is_some() || pending_before_count > 0;
+            let must_run_without_new_sample = effective_drain_only
+                || position_before_cycle.side.is_some()
+                || pending_before_count > 0;
             let event_idle_skip = snapshot_event_available
                 && !must_run_without_new_sample
                 && !due_keepalive
@@ -2493,6 +2574,7 @@ async fn live_runtime_loop(
             let runtime_cfg_source = "live_default";
             match strategy_paper_live(StrategyPaperLiveReq {
                 state: &state,
+                symbol: runtime_symbol,
                 market_type,
                 full_history: false,
                 lookback_minutes: cfg.lookback_minutes,
@@ -2559,6 +2641,7 @@ async fn live_runtime_loop(
                                 "round_switched": round_switched,
                                 "target_prewarm_ms": target_prewarm_ms,
                                 "trigger_source": trigger_for_market.map(|v| v.source.clone()),
+                                "trigger_symbol": trigger_for_market.map(|v| v.symbol.clone()),
                                 "trigger_market": trigger_for_market.map(|v| v.market_type.clone()),
                                 "trigger_ts_ms": trigger_for_market.map(|v| v.ts_ms),
                                 "live_arm_required": live_arm_required,
@@ -2618,7 +2701,11 @@ async fn live_runtime_loop(
                         // Round-switch prewarm is always on, even in paused mode, to eliminate no_live_market_target gaps.
                         let _ = tokio::time::timeout(
                             Duration::from_millis(420),
-                            resolve_live_market_target_with_state(&state, market_type),
+                            resolve_live_market_target_with_state(
+                                &state,
+                                runtime_symbol,
+                                market_type,
+                            ),
                         )
                         .await;
                         market_sleep_ms = market_sleep_ms.min(fast_loop_ms);
@@ -2703,9 +2790,13 @@ async fn live_runtime_loop(
                             {
                                 Some(locked_target)
                             } else {
-                                resolve_live_market_target_fast_with_state(&state, market_type)
-                                    .await
-                                    .ok()
+                                resolve_live_market_target_fast_with_state(
+                                    &state,
+                                    runtime_symbol,
+                                    market_type,
+                                )
+                                .await
+                                .ok()
                             };
                             if let Some(target) = resolved_target {
                                 execution_target = json!({
@@ -2982,7 +3073,10 @@ async fn live_runtime_loop(
                 }
             }
             let pending_after_count = if effective_live_execute || pending_before_count > 0 {
-                state.list_pending_orders_for_market(market_type).await.len()
+                state
+                    .list_pending_orders_for_market(market_type)
+                    .await
+                    .len()
             } else {
                 0
             };
@@ -3052,14 +3146,16 @@ mod tests {
             "ts_ireland_sample_ms": 123_456_i64
         });
         let parsed = parse_snapshot_event(&payload).expect("parse snapshot event");
-        assert_eq!(parsed.0, "5m");
-        assert_eq!(parsed.1, Some(123_456_i64));
+        assert_eq!(parsed.0, "BTCUSDT");
+        assert_eq!(parsed.1, "5m");
+        assert_eq!(parsed.2, Some(123_456_i64));
     }
 
     #[test]
     fn parse_snapshot_event_rejects_unsupported_timeframe() {
         let payload = json!({
             "event": "snapshot_updated",
+            "symbol": "BTCUSDT",
             "timeframe": "30m",
             "ts_ireland_sample_ms": 123_456_i64
         });
@@ -3086,8 +3182,9 @@ mod tests {
             "acceleration": 0.6
         });
         let parsed = strategy_sample_from_snapshot_event(&payload).expect("runtime sample");
-        assert_eq!(parsed.0, "5m");
-        assert_eq!(parsed.1, 123_456_i64);
+        assert_eq!(parsed.0, "BTCUSDT");
+        assert_eq!(parsed.1, "5m");
+        assert_eq!(parsed.2, 123_456_i64);
     }
 
     #[test]

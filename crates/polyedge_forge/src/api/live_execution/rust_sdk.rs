@@ -425,7 +425,7 @@ async fn try_resubmit_after_terminal_reject_rust(
         return false;
     }
     let now_ms = Utc::now().timestamp_millis();
-    let target = match resolve_live_market_target_with_state(state, &row.market_type).await {
+    let target = match resolve_live_market_target_with_state(state, &row.symbol, &row.market_type).await {
         Ok(v) => v,
         Err(err) => {
             state
@@ -952,10 +952,13 @@ pub(super) async fn handle_pending_timeouts_rust(
                             .max(exec_cfg.entry_slippage_bps)
                             + 10.0
                     };
-                    let maybe_target =
-                        resolve_live_market_target_with_state(state, &row.market_type)
-                            .await
-                            .ok();
+                    let maybe_target = resolve_live_market_target_with_state(
+                        state,
+                        &row.symbol,
+                        &row.market_type,
+                    )
+                    .await
+                    .ok();
                     if let Some(target) = maybe_target {
                         let mut effective_target = target.clone();
                         apply_pending_target_override(&mut effective_target, &row);

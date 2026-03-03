@@ -33,6 +33,7 @@ pub(super) async fn apply_pending_confirmation(
     let fill_cost_usdc = quantize_usdc_micros((fill_meta.fee_usdc + fill_meta.slippage_usdc).max(0.0));
     if action == "enter" {
         ps.state = "in_position".to_string();
+        ps.symbol = pending.symbol.trim().to_ascii_uppercase();
         ps.side = Some(pending.side.clone());
         ps.entry_round_id = Some(pending.round_id.clone());
         ps.entry_market_id = if pending.market_id.trim().is_empty() {
@@ -72,6 +73,7 @@ pub(super) async fn apply_pending_confirmation(
             fill_price_cents
         };
         ps.state = "in_position".to_string();
+        ps.symbol = pending.symbol.trim().to_ascii_uppercase();
         ps.side = Some(pending.side.clone());
         ps.entry_round_id = Some(pending.round_id.clone());
         if ps
@@ -520,12 +522,20 @@ pub(super) fn build_position_locked_target(
     }
     let (token_id_yes, token_id_no) = (token_id.clone(), token_id.clone());
     let symbol = position_state
+        .symbol
+        .trim()
+        .to_ascii_uppercase();
+    let symbol = if !symbol.is_empty() {
+        symbol
+    } else {
+        position_state
         .entry_round_id
         .as_deref()
         .and_then(|rid| rid.split('_').next())
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or("BTCUSDT")
-        .to_string();
+        .map(|s| s.to_ascii_uppercase())
+        .unwrap_or_else(default_runtime_symbol)
+    };
     let end_date = position_state
         .entry_round_id
         .as_deref()

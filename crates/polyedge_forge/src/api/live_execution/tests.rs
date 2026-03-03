@@ -306,6 +306,7 @@
     #[test]
     fn extract_fill_meta_prefers_size_matched_over_quote_backsolve() {
         let pending = LivePendingOrder {
+            symbol: "BTCUSDT".to_string(),
             market_type: "5m".to_string(),
             order_id: "oid".to_string(),
             market_id: "mkt".to_string(),

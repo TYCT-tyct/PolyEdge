@@ -111,11 +111,13 @@ async fn resolve_token_ids_from_target_cache(
 
 async fn resolve_live_target_from_snapshot(
     state: &ApiState,
+    symbol: &str,
     market_type: &str,
     now_ms: i64,
 ) -> Option<LiveMarketTarget> {
     async fn try_snapshot_candidate(
         _state: &ApiState,
+        symbol: &str,
         market_type: &str,
         now_ms: i64,
         snapshot: &Value,
@@ -164,7 +166,7 @@ async fn resolve_live_target_from_snapshot(
         }
         Some(LiveMarketTarget {
             market_id,
-            symbol: "BTCUSDT".to_string(),
+            symbol: symbol.to_ascii_uppercase(),
             timeframe: market_type.to_string(),
             token_id_yes,
             token_id_no,
@@ -173,13 +175,22 @@ async fn resolve_live_target_from_snapshot(
     }
 
     let symbol_key = format!(
-        "{}:snapshot:latest:BTCUSDT:{market_type}",
-        state.redis_prefix
+        "{}:snapshot:latest:{}:{market_type}",
+        state.redis_prefix,
+        symbol.trim().to_ascii_uppercase()
     );
     if let Ok(snapshot_json) = read_key_json(state, &symbol_key).await {
         let snapshot = snapshot_json.0;
         if let Some(target) =
-            try_snapshot_candidate(state, market_type, now_ms, &snapshot, "symbol_snapshot").await
+            try_snapshot_candidate(
+                state,
+                symbol,
+                market_type,
+                now_ms,
+                &snapshot,
+                "symbol_snapshot",
+            )
+            .await
         {
             return Some(target);
         }
@@ -188,28 +199,29 @@ async fn resolve_live_target_from_snapshot(
     let tf_key = format!("{}:snapshot:latest:tf:{market_type}", state.redis_prefix);
     if let Ok(tf_snapshot_json) = read_key_json(state, &tf_key).await {
         let tf_snapshot = tf_snapshot_json.0;
-        let mut btc_rows: Vec<&Value> = match tf_snapshot.as_array() {
+        let mut symbol_rows: Vec<&Value> = match tf_snapshot.as_array() {
             Some(rows) => rows
                 .iter()
                 .filter(|row| {
                     row.get("symbol")
                         .and_then(Value::as_str)
-                        .map(|s| s.eq_ignore_ascii_case("BTCUSDT"))
+                        .map(|s| s.eq_ignore_ascii_case(symbol))
                         .unwrap_or(false)
                 })
                 .collect(),
             None => Vec::new(),
         };
-        btc_rows.sort_by_key(|row| {
+        symbol_rows.sort_by_key(|row| {
             std::cmp::Reverse(
                 row.get("ts_ireland_sample_ms")
                     .and_then(Value::as_i64)
                     .unwrap_or(0),
             )
         });
-        for row in btc_rows {
+        for row in symbol_rows {
             if let Some(target) =
-                try_snapshot_candidate(state, market_type, now_ms, row, "tf_snapshot").await
+                try_snapshot_candidate(state, symbol, market_type, now_ms, row, "tf_snapshot")
+                    .await
             {
                 return Some(target);
             }
@@ -217,8 +229,10 @@ async fn resolve_live_target_from_snapshot(
     }
 
     let pattern = format!(
-        "{}:snapshot:latest:BTCUSDT:{}:*",
-        state.redis_prefix, market_type
+        "{}:snapshot:latest:{}:{}:*",
+        state.redis_prefix,
+        symbol.trim().to_ascii_uppercase(),
+        market_type
     );
     let mut history_keys = Vec::<String>::new();
     if let Some(mut conn) = state.redis_manager.clone() {
@@ -251,6 +265,7 @@ async fn resolve_live_target_from_snapshot(
             let snapshot = snapshot_json.0;
             let Some(target) = try_snapshot_candidate(
                 state,
+                symbol,
                 market_type,
                 now_ms,
                 &snapshot,
@@ -609,22 +624,33 @@ pub(super) fn select_live_decisions(
     selected
 }
 
+fn live_market_target_cache_scope_key(symbol: &str, market_type: &str) -> String {
+    format!(
+        "{}:{}",
+        symbol.trim().to_ascii_uppercase(),
+        market_type.trim().to_ascii_lowercase()
+    )
+}
+
 pub(super) async fn resolve_live_market_target_with_state(
     state: &ApiState,
+    symbol: &str,
     market_type: &str,
 ) -> Result<LiveMarketTarget, ApiError> {
-    resolve_live_market_target_inner(Some(state), market_type, true).await
+    resolve_live_market_target_inner(Some(state), symbol, market_type, true).await
 }
 
 pub(super) async fn resolve_live_market_target_fast_with_state(
     state: &ApiState,
+    symbol: &str,
     market_type: &str,
 ) -> Result<LiveMarketTarget, ApiError> {
-    resolve_live_market_target_inner(Some(state), market_type, false).await
+    resolve_live_market_target_inner(Some(state), symbol, market_type, false).await
 }
 
 async fn resolve_live_market_target_inner(
     state: Option<&ApiState>,
+    symbol: &str,
     market_type: &str,
     allow_discovery: bool,
 ) -> Result<LiveMarketTarget, ApiError> {
@@ -637,7 +663,8 @@ async fn resolve_live_market_target_inner(
     let mut cached_entry: Option<CachedLiveMarketTarget> = None;
     {
         let cache = live_market_target_cache().read().await;
-        if let Some(cached) = cache.get(market_type) {
+        let cache_key = live_market_target_cache_scope_key(symbol, market_type);
+        if let Some(cached) = cache.get(&cache_key) {
             cached_entry = Some(cached.clone());
             let age_ms = now_ms.saturating_sub(cached.fetched_at_ms);
             let end_ms =
@@ -648,10 +675,11 @@ async fn resolve_live_market_target_inner(
         }
     }
     if let Some(state) = state {
-        if let Some(target) = resolve_live_target_from_snapshot(state, market_type, now_ms).await {
+        if let Some(target) = resolve_live_target_from_snapshot(state, symbol, market_type, now_ms).await {
             let mut cache = live_market_target_cache().write().await;
+            let cache_key = live_market_target_cache_scope_key(symbol, market_type);
             cache.insert(
-                market_type.to_string(),
+                cache_key,
                 CachedLiveMarketTarget {
                     fetched_at_ms: Utc::now().timestamp_millis(),
                     target: target.clone(),
@@ -664,7 +692,7 @@ async fn resolve_live_market_target_inner(
     let mut last_discovery_error: Option<String> = None;
     if allow_discovery {
         let discovery = MarketDiscovery::new(DiscoveryConfig {
-            symbols: vec!["BTCUSDT".to_string()],
+            symbols: vec![symbol.trim().to_ascii_uppercase()],
             market_types: vec!["updown".to_string()],
             timeframes: vec![market_type.to_string()],
             ..DiscoveryConfig::default()
@@ -683,7 +711,7 @@ async fn resolve_live_market_target_inner(
             let mut markets: Vec<MarketDescriptor> = discovered
                 .into_iter()
                 .filter(|m| {
-                    m.symbol.eq_ignore_ascii_case("BTCUSDT")
+                    m.symbol.eq_ignore_ascii_case(symbol)
                         && m.timeframe
                             .as_deref()
                             .map(|tf| tf.eq_ignore_ascii_case(market_type))
@@ -765,8 +793,9 @@ async fn resolve_live_market_target_inner(
                 };
                 {
                     let mut cache = live_market_target_cache().write().await;
+                    let cache_key = live_market_target_cache_scope_key(symbol, market_type);
                     cache.insert(
-                        market_type.to_string(),
+                        cache_key,
                         CachedLiveMarketTarget {
                             fetched_at_ms: Utc::now().timestamp_millis(),
                             target: target.clone(),
@@ -781,14 +810,15 @@ async fn resolve_live_market_target_inner(
         }
     }
     if let Some(state) = state {
-        if let Some(target) = resolve_live_target_from_snapshot(state, market_type, now_ms).await {
+        if let Some(target) = resolve_live_target_from_snapshot(state, symbol, market_type, now_ms).await {
             tracing::warn!(
                 market_type = market_type,
                 "market target resolved from recorder snapshot fallback"
             );
             let mut cache = live_market_target_cache().write().await;
+            let cache_key = live_market_target_cache_scope_key(symbol, market_type);
             cache.insert(
-                market_type.to_string(),
+                cache_key,
                 CachedLiveMarketTarget {
                     fetched_at_ms: Utc::now().timestamp_millis(),
                     target: target.clone(),
@@ -819,7 +849,7 @@ async fn resolve_live_market_target_inner(
             "market target resolve exhausted retries without stale fallback"
         );
         Err(ApiError::bad_request(format!(
-            "no active BTC {market_type} market with token ids after {} attempts{}",
+            "no active {symbol} {market_type} market with token ids after {} attempts{}",
             resolve_attempts,
             last_discovery_error
                 .as_ref()
@@ -828,7 +858,7 @@ async fn resolve_live_market_target_inner(
         )))
     } else {
         Err(ApiError::bad_request(format!(
-            "fast market target resolve miss for {market_type} (cache/snapshot only)"
+            "fast market target resolve miss for {symbol}/{market_type} (cache/snapshot only)"
         )))
     }
 }

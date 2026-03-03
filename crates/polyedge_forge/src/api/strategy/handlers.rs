@@ -177,18 +177,28 @@ pub(super) async fn strategy_paper(
         .unwrap_or(usize::MAX);
 
     let mut source_fallback_error: Option<String> = None;
+    let runtime_symbol = runtime_defaults.symbol.to_ascii_uppercase();
     if matches!(
         source_mode,
         StrategyPaperSource::Live | StrategyPaperSource::Auto
     ) {
-        if let Some(payload) = state.get_runtime_snapshot(market_type).await {
+        if !symbol.eq_ignore_ascii_case(&runtime_symbol) {
+            let mismatch_msg = format!(
+                "live runtime symbol mismatch: requested={symbol}, runtime={runtime_symbol}"
+            );
+            if matches!(source_mode, StrategyPaperSource::Live) {
+                return Err(ApiError::bad_request(mismatch_msg));
+            }
+            source_fallback_error = Some(mismatch_msg);
+        } else if let Some(payload) = state.get_runtime_snapshot(market_type).await {
             return Ok(Json(payload));
+        } else {
+            let warmup_msg = "live runtime warming up (no snapshot yet)";
+            if matches!(source_mode, StrategyPaperSource::Live) {
+                return Err(ApiError::bad_request(warmup_msg));
+            }
+            source_fallback_error = Some(warmup_msg.to_string());
         }
-        let warmup_msg = "live runtime warming up (no snapshot yet)";
-        if matches!(source_mode, StrategyPaperSource::Live) {
-            return Err(ApiError::bad_request(warmup_msg));
-        }
-        source_fallback_error = Some(warmup_msg.to_string());
     }
 
     let samples = load_strategy_samples(
@@ -293,6 +303,7 @@ pub(super) async fn strategy_live_reset(
     State(state): State<ApiState>,
 ) -> Result<Json<Value>, ApiError> {
     let now_ms = Utc::now().timestamp_millis();
+    let runtime_cfg = LiveRuntimeConfig::from_env();
     {
         let mut events = state.live_events.write().await;
         events.clear();
@@ -331,7 +342,10 @@ pub(super) async fn strategy_live_reset(
     }
     for market in ["5m", "15m"] {
         state
-            .put_live_position_state(market, LivePositionState::flat(market, now_ms))
+            .put_live_position_state(
+                market,
+                LivePositionState::flat(&runtime_cfg.symbol, market, now_ms),
+            )
             .await;
         state
             .put_live_runtime_control(market, LiveRuntimeControl::normal(now_ms))

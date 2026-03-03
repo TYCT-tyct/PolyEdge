@@ -121,13 +121,13 @@ pub(super) fn parse_strategy_rows(rows: Vec<Value>) -> Vec<StrategySample> {
 
 pub(super) fn strategy_sample_from_snapshot_event(
     event: &Value,
-) -> Option<(String, i64, StrategySample)> {
+) -> Option<(String, String, i64, StrategySample)> {
     let symbol = event
         .get("symbol")
         .and_then(Value::as_str)
         .map(|v| v.trim().to_ascii_uppercase())
         .unwrap_or_default();
-    if symbol != "BTCUSDT" {
+    if symbol.is_empty() {
         return None;
     }
     let timeframe = event
@@ -201,6 +201,7 @@ pub(super) fn strategy_sample_from_snapshot_event(
         .max(0);
 
     Some((
+        symbol,
         timeframe,
         ts_ms,
         StrategySample {
@@ -291,6 +292,7 @@ pub(super) fn strategy_cfg_json(cfg: &StrategyRuntimeConfig) -> Value {
 
 pub(super) struct StrategyPaperLiveReq<'a> {
     pub(super) state: &'a ApiState,
+    pub(super) symbol: &'a str,
     pub(super) market_type: &'a str,
     pub(super) full_history: bool,
     pub(super) lookback_minutes: u32,
@@ -307,6 +309,7 @@ pub(super) struct StrategyPaperLiveReq<'a> {
 pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result<Value, ApiError> {
     let StrategyPaperLiveReq {
         state,
+        symbol,
         market_type,
         full_history,
         lookback_minutes,
@@ -339,7 +342,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         None
     };
 
-    let sample_symbol = "BTCUSDT";
+    let sample_symbol = symbol;
     let sample_resolution_ms = if full_history { 1000 } else { 100 };
     let sample_source_mode = if full_history {
         "replay_bucket_1s"
@@ -377,6 +380,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
             "engine_version": "v1",
             "status": "warmup",
             "market_type": market_type,
+            "symbol": sample_symbol,
             "lookback_minutes": lookback_minutes,
             "sample_source_mode": sample_source_mode,
             "sample_resolution_ms": sample_resolution_ms,
@@ -475,6 +479,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         "engine_version": "v1",
         "status": if live_execute_effective { "blocked_by_gate_or_state" } else { "ok" },
         "market_type": market_type,
+        "symbol": sample_symbol,
         "lookback_minutes": lookback_minutes,
         "sample_source_mode": sample_source_mode,
         "sample_resolution_ms": sample_resolution_ms,
@@ -780,9 +785,9 @@ pub(super) async fn load_strategy_samples_runtime_stream(
     lookback_minutes: u32,
     max_points: u32,
 ) -> Result<Arc<Vec<StrategySample>>, ApiError> {
-    if strategy_runtime_event_cache_enabled() && symbol.eq_ignore_ascii_case("BTCUSDT") {
+    if strategy_runtime_event_cache_enabled() {
         if let Some(samples) = state
-            .get_runtime_event_samples(market_type, lookback_minutes, max_points)
+            .get_runtime_event_samples(symbol, market_type, lookback_minutes, max_points)
             .await
         {
             if samples.len() >= 20 {
