@@ -76,11 +76,14 @@ const MARKET_SELECTION_FALLBACK_PREWARM_DEFAULT_MS: i64 = 300_000;
 const MARKET_CANDIDATE_POOL_DEFAULT_SIZE: usize = 3;
 const DISCOVERY_PREWARM_LEAD_DEFAULT_MS: i64 = 300_000;
 const DISCOVERY_PREWARM_REFRESH_DEFAULT_SEC: u64 = 2;
+const MARKET_SWITCH_MIN_HOLD_DEFAULT_MS: i64 = 1_500;
 const BOOK_STALE_MAX_AGE_5M_MS: i64 = 8_000;
 const BOOK_STALE_MAX_AGE_15M_MS: i64 = 12_000;
 const QUOTE_FALLBACK_MAX_AGE_5M_MS: i64 = 12_000;
 const QUOTE_FALLBACK_MAX_AGE_15M_MS: i64 = 20_000;
 const QUOTE_CROSS_MARKET_BRIDGE_MAX_AGE_MS: i64 = 1_500;
+const SWITCH_GUARD_LOG_THROTTLE_MS: i64 = 10_000;
+const SWITCH_STATS_REPORT_INTERVAL_MS: i64 = 60_000;
 
 fn env_flag(key: &str, default: bool) -> bool {
     std::env::var(key)
@@ -744,6 +747,11 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(MARKET_CANDIDATE_POOL_DEFAULT_SIZE)
         .clamp(2, 8);
+    let market_switch_min_hold_ms = std::env::var("FORGE_MARKET_SWITCH_MIN_HOLD_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(MARKET_SWITCH_MIN_HOLD_DEFAULT_MS)
+        .clamp(0, 15_000);
     let discovery_empty_grace_ms = std::env::var("FORGE_DISCOVERY_EMPTY_GRACE_MS")
         .ok()
         .and_then(|v| v.trim().parse::<i64>().ok())
@@ -775,6 +783,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         market_sample_end_grace_ms = market_sample_end_grace_ms,
         market_selection_fallback_prewarm_ms = market_selection_fallback_prewarm_ms,
         market_candidate_pool_size = market_candidate_pool_size,
+        market_switch_min_hold_ms = market_switch_min_hold_ms,
         discovery_empty_grace_ms = discovery_empty_grace_ms,
         round_drop_on_quality_fail = round_drop_on_quality_fail,
         market_filter = %market_filter.summary(),
@@ -1063,6 +1072,13 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
     let mut discovery_empty_since_ms: Option<i64> = None;
     let mut switch_epoch_by_pair: HashMap<String, u64> = HashMap::new();
     let mut switch_market_by_pair: HashMap<String, String> = HashMap::new();
+    let mut switch_last_change_ms_by_pair: HashMap<String, i64> = HashMap::new();
+    let mut switch_expected_start_by_pair: HashMap<String, i64> = HashMap::new();
+    let mut switch_guard_warn_by_pair: HashMap<String, i64> = HashMap::new();
+    let mut switch_count_by_pair: HashMap<String, u64> = HashMap::new();
+    let mut switch_guard_suppress_count_by_pair: HashMap<String, u64> = HashMap::new();
+    let mut sampling_gap_count_by_pair: HashMap<String, u64> = HashMap::new();
+    let mut book_fallback_count_by_pair: HashMap<String, u64> = HashMap::new();
 
     let mut ingest_seq: u64 = 0;
     let mut last_sample_time_ms: i64 = 0;
@@ -1073,6 +1089,9 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
     let mut next_housekeeping_ms = Utc::now()
         .timestamp_millis()
         .saturating_add(RECORDER_HOUSEKEEPING_INTERVAL_MS);
+    let mut next_switch_stats_report_ms = Utc::now()
+        .timestamp_millis()
+        .saturating_add(SWITCH_STATS_REPORT_INTERVAL_MS);
 
     loop {
         tokio::select! {
@@ -1429,6 +1448,10 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             let warn_at = sample_gap_warn_by_pair
                                 .entry(pair_key.to_string())
                                 .or_insert(0);
+                            sampling_gap_count_by_pair
+                                .entry(pair_key.to_string())
+                                .and_modify(|v| *v = v.saturating_add(1))
+                                .or_insert(1);
                             if now_ms.saturating_sub(*warn_at) >= INPUT_STALE_WARN_THROTTLE_MS {
                                 log_ingest(
                                     &persist_tx,
@@ -1482,25 +1505,71 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     };
 
                     let mut market = switch_snapshot.active_market.clone();
-                    let mut book = pick_fresh_book_for_market(&market, now_ms, &book_by_market);
-                    if book.is_none() {
-                        if let Some(alt_market) = pair_candidates.iter().find(|candidate| {
-                            market_in_sampling_window(
-                                candidate,
-                                now_ms,
-                                market_prestart_allow_ms,
-                                market_sample_end_grace_ms,
-                            ) && pick_fresh_book_for_market(candidate, now_ms, &book_by_market).is_some()
-                        }) {
-                            market = alt_market.clone();
-                            book = pick_fresh_book_for_market(&market, now_ms, &book_by_market);
-                        } else if let Some(alt_market) = pair_candidates.iter().find(|candidate| {
-                            pick_fresh_book_for_market(candidate, now_ms, &book_by_market).is_some()
-                        }) {
-                            market = alt_market.clone();
-                            book = pick_fresh_book_for_market(&market, now_ms, &book_by_market);
+                    if let Some(previous_market_id) = switch_market_by_pair.get(&pair_key) {
+                        if previous_market_id != &market.market_id {
+                            let previous_market = pair_candidates
+                                .iter()
+                                .find(|candidate| candidate.market_id == *previous_market_id);
+                            if let Some(previous_market) = previous_market {
+                                let same_round = previous_market.start_ts_ms == market.start_ts_ms;
+                                let previous_expected_start = switch_expected_start_by_pair
+                                    .get(&pair_key)
+                                    .copied()
+                                    .unwrap_or(i64::MIN);
+                                let expected_round_changed =
+                                    previous_expected_start != switch_snapshot.expected_start_ms;
+                                let recently_switched = switch_last_change_ms_by_pair
+                                    .get(&pair_key)
+                                    .copied()
+                                    .map(|ts| now_ms.saturating_sub(ts) < market_switch_min_hold_ms)
+                                    .unwrap_or(false);
+                                let previous_still_warmable = market_in_sampling_window(
+                                    previous_market,
+                                    now_ms,
+                                    market_prestart_allow_ms,
+                                    market_sample_end_grace_ms,
+                                );
+                                let guard_hit = previous_still_warmable
+                                    && (same_round
+                                        || (!expected_round_changed && recently_switched));
+                                if guard_hit {
+                                    market = previous_market.clone();
+                                    switch_guard_suppress_count_by_pair
+                                        .entry(pair_key.clone())
+                                        .and_modify(|v| *v = v.saturating_add(1))
+                                        .or_insert(1);
+                                    let warn_at =
+                                        switch_guard_warn_by_pair.entry(pair_key.clone()).or_insert(0);
+                                    if now_ms.saturating_sub(*warn_at)
+                                        >= SWITCH_GUARD_LOG_THROTTLE_MS
+                                    {
+                                        let reason = if same_round {
+                                            "same_round_sticky"
+                                        } else {
+                                            "min_hold_guard"
+                                        };
+                                        log_ingest(
+                                            &persist_tx,
+                                            "info",
+                                            "market_switch_guard",
+                                            &format!(
+                                                "pair={} keep_market_id={} reject_market_id={} reason={} hold_ms={} expected_start_ms={}",
+                                                pair_key,
+                                                previous_market.market_id,
+                                                switch_snapshot.active_market.market_id,
+                                                reason,
+                                                market_switch_min_hold_ms,
+                                                switch_snapshot.expected_start_ms,
+                                            ),
+                                        );
+                                        *warn_at = now_ms;
+                                    }
+                                }
+                            }
                         }
                     }
+
+                    let book = pick_fresh_book_for_market(&market, now_ms, &book_by_market);
 
                     let future_sampling_allowed = now_ms + market_prestart_allow_ms < market.start_ts_ms
                         && book.is_some();
@@ -1546,7 +1615,14 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                 ),
                             );
                             switch_market_by_pair.insert(pair_key.clone(), market.market_id.clone());
+                            switch_last_change_ms_by_pair.insert(pair_key.clone(), now_ms);
+                            switch_count_by_pair
+                                .entry(pair_key.clone())
+                                .and_modify(|v| *v = v.saturating_add(1))
+                                .or_insert(1);
                         }
+                        switch_expected_start_by_pair
+                            .insert(pair_key.clone(), switch_snapshot.expected_start_ms);
                         *switch_epoch_by_pair.entry(pair_key.clone()).or_insert(0)
                     };
 
@@ -1600,6 +1676,10 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         continue;
                     };
                     if used_cached_quote {
+                        book_fallback_count_by_pair
+                            .entry(pair_key.clone())
+                            .and_modify(|v| *v = v.saturating_add(1))
+                            .or_insert(1);
                         let warn_at = stale_book_warn_by_pair.entry(pair_key.clone()).or_insert(0);
                         if now_ms.saturating_sub(*warn_at) >= INPUT_STALE_WARN_THROTTLE_MS {
                             log_ingest(
@@ -2402,6 +2482,17 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     stale_tokyo_warn_by_symbol
                         .retain(|symbol, _| active_symbols_set.contains(symbol.as_str()));
                     stale_book_warn_by_pair.retain(|pair, _| required_pair_keys.contains(pair));
+                    sample_gap_warn_by_pair.retain(|pair, _| required_pair_keys.contains(pair));
+                    switch_market_by_pair.retain(|pair, _| required_pair_keys.contains(pair));
+                    switch_epoch_by_pair.retain(|pair, _| required_pair_keys.contains(pair));
+                    switch_last_change_ms_by_pair.retain(|pair, _| required_pair_keys.contains(pair));
+                    switch_expected_start_by_pair.retain(|pair, _| required_pair_keys.contains(pair));
+                    switch_guard_warn_by_pair.retain(|pair, _| required_pair_keys.contains(pair));
+                    switch_count_by_pair.retain(|pair, _| required_pair_keys.contains(pair));
+                    switch_guard_suppress_count_by_pair
+                        .retain(|pair, _| required_pair_keys.contains(pair));
+                    sampling_gap_count_by_pair.retain(|pair, _| required_pair_keys.contains(pair));
+                    book_fallback_count_by_pair.retain(|pair, _| required_pair_keys.contains(pair));
                     round_finalize_defer_warn_at_ms.retain(|round_id, warn_at_ms| {
                         round_meta_is_fresh(round_id, now_ms, ROUND_META_RETENTION_MS)
                             && now_ms.saturating_sub(*warn_at_ms) <= EMITTED_ROUND_RETENTION_MS
@@ -2466,6 +2557,46 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             committed_round_len = committed_rounds.len(),
                             "housekeeping state cap enforced"
                         );
+                    }
+
+                    if now_ms >= next_switch_stats_report_ms {
+                        next_switch_stats_report_ms =
+                            now_ms.saturating_add(SWITCH_STATS_REPORT_INTERVAL_MS);
+                        let mut pairs = required_pair_keys.iter().cloned().collect::<Vec<_>>();
+                        pairs.sort();
+                        for pair in pairs {
+                            let switch_count =
+                                switch_count_by_pair.get(&pair).copied().unwrap_or(0);
+                            let guard_suppressed = switch_guard_suppress_count_by_pair
+                                .get(&pair)
+                                .copied()
+                                .unwrap_or(0);
+                            let gap_count =
+                                sampling_gap_count_by_pair.get(&pair).copied().unwrap_or(0);
+                            let fallback_count =
+                                book_fallback_count_by_pair.get(&pair).copied().unwrap_or(0);
+                            let current_market = switch_market_by_pair
+                                .get(&pair)
+                                .cloned()
+                                .unwrap_or_else(|| "-".to_string());
+                            let current_epoch =
+                                switch_epoch_by_pair.get(&pair).copied().unwrap_or(0);
+                            log_ingest(
+                                &persist_tx,
+                                "info",
+                                "collector_switch_stats",
+                                &format!(
+                                    "pair={} epoch={} market_id={} switches={} guard_suppressed={} sampling_gaps={} book_fallbacks={}",
+                                    pair,
+                                    current_epoch,
+                                    current_market,
+                                    switch_count,
+                                    guard_suppressed,
+                                    gap_count,
+                                    fallback_count
+                                ),
+                            );
+                        }
                     }
                 }
             }

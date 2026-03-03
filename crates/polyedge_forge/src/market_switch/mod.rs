@@ -71,7 +71,13 @@ pub fn resolve_switch_snapshot(
     let expected_start_ms = expected_round_start_ms(now_ms, timeframe)?;
 
     let mut ordered = candidates.to_vec();
-    ordered.sort_by_key(|m| m.start_ts_ms);
+    ordered.sort_by(|a, b| {
+        (a.start_ts_ms, a.end_ts_ms, a.market_id.as_str()).cmp(&(
+            b.start_ts_ms,
+            b.end_ts_ms,
+            b.market_id.as_str(),
+        ))
+    });
     ordered.dedup_by(|a, b| a.market_id == b.market_id);
 
     let exact_expected = ordered
@@ -206,5 +212,24 @@ mod tests {
         .expect("snapshot");
         assert!(snapshot.degraded);
         assert_eq!(snapshot.phase, SwitchPhase::Degraded);
+    }
+
+    #[test]
+    fn switch_selection_is_stable_for_same_round_candidates() {
+        let now_ms = 1_705_000;
+        let snapshot = resolve_switch_snapshot(
+            "BTCUSDT:5m",
+            &[
+                mk("z-last", 1_500_000, 1_800_000),
+                mk("a-first", 1_500_000, 1_800_000),
+            ],
+            now_ms,
+            30_000,
+            300_000,
+            300,
+            5_000,
+        )
+        .expect("snapshot");
+        assert_eq!(snapshot.active_market.market_id, "a-first");
     }
 }
