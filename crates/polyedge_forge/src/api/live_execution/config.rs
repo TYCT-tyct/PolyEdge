@@ -17,15 +17,15 @@ fn floor_lot_size(size: f64) -> f64 {
     ((size.max(0.0) * 100.0).floor() / 100.0).max(0.01)
 }
 
-const USDC_MICRO_SCALE: f64 = 1_000_000.0;
+const USDC_MICRO_SCALE_F64: f64 = 1_000_000.0;
 
 pub(super) fn usdc_to_micros(value: f64) -> i64 {
     let clamped = if value.is_finite() { value.max(0.0) } else { 0.0 };
-    (clamped * USDC_MICRO_SCALE).round() as i64
+    (clamped * USDC_MICRO_SCALE_F64).round() as i64
 }
 
 pub(super) fn micros_to_usdc(value: i64) -> f64 {
-    (value as f64) / USDC_MICRO_SCALE
+    (value as f64) / USDC_MICRO_SCALE_F64
 }
 
 pub(super) fn quantize_usdc_micros(value: f64) -> f64 {
@@ -41,9 +41,7 @@ fn live_quote_amount_decimals() -> u32 {
 }
 
 pub(super) fn ceil_quote_amount_usdc(value: f64) -> f64 {
-    let decimals = live_quote_amount_decimals();
-    let scale = 10_f64.powi(decimals as i32);
-    ((value.max(0.0) * scale).ceil() / scale).max(0.0)
+    ceil_usdc_to_decimals(value, live_quote_amount_decimals())
 }
 
 fn live_market_buy_amount_decimals() -> u32 {
@@ -55,9 +53,19 @@ fn live_market_buy_amount_decimals() -> u32 {
 }
 
 pub(super) fn ceil_market_buy_amount_usdc(value: f64) -> f64 {
-    let decimals = live_market_buy_amount_decimals();
-    let scale = 10_f64.powi(decimals as i32);
-    ((value.max(0.0) * scale).ceil() / scale).max(0.0)
+    ceil_usdc_to_decimals(value, live_market_buy_amount_decimals())
+}
+
+fn ceil_usdc_to_decimals(value: f64, decimals: u32) -> f64 {
+    let decimals = decimals.clamp(0, 6);
+    let micros = usdc_to_micros(value).max(0);
+    let step = 10_i64.pow(6_u32.saturating_sub(decimals));
+    let aligned = if step <= 1 {
+        micros
+    } else {
+        ((micros + (step - 1)) / step) * step
+    };
+    micros_to_usdc(aligned)
 }
 
 fn decimal_places_from_step(step: f64, fallback: usize, max_decimals: usize) -> usize {
