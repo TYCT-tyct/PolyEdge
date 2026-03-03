@@ -44,7 +44,7 @@ struct TargetFetchRes {
 // Removed: MARKET_FUTURE_GUARD_DEFAULT_MS (replaced by market_prestart_allow_ms)
 const MARKET_PRESTART_ALLOW_DEFAULT_MS: i64 = 30_000;
 const MARKET_SAMPLE_END_GRACE_DEFAULT_MS: i64 = 300;
-const MARKET_STALE_GUARD_MS: i64 = 5_000;
+const MARKET_STALE_GUARD_DEFAULT_MS: i64 = 1_000;
 const MOTION_PRICE_TAU_SEC: f64 = 1.2;
 const MOTION_VELOCITY_TAU_SEC: f64 = 1.8;
 const MOTION_MIN_DT_SEC: f64 = 0.02;
@@ -213,9 +213,14 @@ fn round_end_ts_ms_from_round_id(round_id: &str) -> Option<i64> {
     Some(start_ms.saturating_add(tf_ms))
 }
 
-fn market_candidate_is_warmable(m: &MarketMeta, now_ms: i64, prewarm_ms: i64) -> bool {
+fn market_candidate_is_warmable(
+    m: &MarketMeta,
+    now_ms: i64,
+    prewarm_ms: i64,
+    stale_guard_ms: i64,
+) -> bool {
     now_ms.saturating_add(prewarm_ms) >= m.start_ts_ms
-        && now_ms <= m.end_ts_ms.saturating_add(MARKET_STALE_GUARD_MS)
+        && now_ms <= m.end_ts_ms.saturating_add(stale_guard_ms)
 }
 
 fn round_meta_is_fresh(round_id: &str, now_ms: i64, retention_ms: i64) -> bool {
@@ -736,6 +741,11 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         .and_then(|v| v.trim().parse::<i64>().ok())
         .unwrap_or(MARKET_SAMPLE_END_GRACE_DEFAULT_MS)
         .clamp(0, 5_000);
+    let market_stale_guard_ms = std::env::var("FORGE_MARKET_STALE_GUARD_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(MARKET_STALE_GUARD_DEFAULT_MS)
+        .clamp(300, 10_000);
     let market_selection_fallback_prewarm_ms =
         std::env::var("FORGE_MARKET_SELECTION_FALLBACK_PREWARM_MS")
             .ok()
@@ -781,6 +791,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         // Removed: market_future_guard_ms (unused)
         market_prestart_allow_ms = market_prestart_allow_ms,
         market_sample_end_grace_ms = market_sample_end_grace_ms,
+        market_stale_guard_ms = market_stale_guard_ms,
         market_selection_fallback_prewarm_ms = market_selection_fallback_prewarm_ms,
         market_candidate_pool_size = market_candidate_pool_size,
         market_switch_min_hold_ms = market_switch_min_hold_ms,
@@ -1025,7 +1036,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
             if seed_now_ms.saturating_add(market_prestart_allow_ms) < market.start_ts_ms {
                 continue;
             }
-            if seed_now_ms > market.end_ts_ms.saturating_add(MARKET_STALE_GUARD_MS) {
+            if seed_now_ms > market.end_ts_ms.saturating_add(market_stale_guard_ms) {
                 continue;
             }
             candidate_markets_by_pair
@@ -1137,6 +1148,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         market,
                         now_ms,
                         market_selection_fallback_prewarm_ms,
+                        market_stale_guard_ms,
                     );
                     pair_has_warmable_candidate
                         .entry(pair_key)
@@ -1163,6 +1175,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         prev,
                         now_ms,
                         market_selection_fallback_prewarm_ms,
+                        market_stale_guard_ms,
                     ) {
                         continue;
                     }
@@ -1172,6 +1185,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         prev,
                         now_ms,
                         market_selection_fallback_prewarm_ms,
+                        market_stale_guard_ms,
                     );
                     pair_has_warmable_candidate
                         .entry(pair_key)
@@ -1227,7 +1241,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         market_prestart_allow_ms,
                         market_selection_fallback_prewarm_ms,
                         market_sample_end_grace_ms,
-                        MARKET_STALE_GUARD_MS,
+                        market_stale_guard_ms,
                     ) {
                         selected_by_pair.insert(pair_key.clone(), snapshot.active_market);
                     }
@@ -1250,7 +1264,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                     market_prestart_allow_ms,
                                     market_selection_fallback_prewarm_ms,
                                     market_sample_end_grace_ms,
-                                    MARKET_STALE_GUARD_MS,
+                                    market_stale_guard_ms,
                                 )
                             })
                             .map(|snapshot| snapshot.active_market);
@@ -1280,6 +1294,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                 prev,
                                 now_ms,
                                 market_selection_fallback_prewarm_ms,
+                                market_stale_guard_ms,
                             ) {
                                 continue;
                             }
@@ -1326,6 +1341,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                 market,
                                 now_ms,
                                 market_selection_fallback_prewarm_ms,
+                                market_stale_guard_ms,
                             ) {
                                 Some((pair.clone(), market.clone()))
                             } else {
@@ -1349,6 +1365,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                         market,
                                         now_ms,
                                         market_selection_fallback_prewarm_ms,
+                                        market_stale_guard_ms,
                                     )
                                 })
                                 .collect::<Vec<_>>();
@@ -1499,7 +1516,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         market_prestart_allow_ms,
                         market_selection_fallback_prewarm_ms,
                         market_sample_end_grace_ms,
-                        MARKET_STALE_GUARD_MS,
+                        market_stale_guard_ms,
                     ) else {
                         continue;
                     };
@@ -2251,7 +2268,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                 let stale_round_ids: Vec<String> = round_buffers
                     .iter()
                     .filter_map(|(rid, buf)| {
-                        if now_ms > buf.end_ts_ms.saturating_add(MARKET_STALE_GUARD_MS)
+                        if now_ms > buf.end_ts_ms.saturating_add(market_stale_guard_ms)
                             && !emitted_rounds.contains_key(rid)
                         {
                             Some(rid.clone())
@@ -3492,8 +3509,18 @@ mod tests {
             start_ts_ms: 100_000,
             end_ts_ms: 400_000,
         };
-        assert!(!market_candidate_is_warmable(&market, 20_000, 60_000));
-        assert!(market_candidate_is_warmable(&market, 20_000, 90_000));
+        assert!(!market_candidate_is_warmable(
+            &market,
+            20_000,
+            60_000,
+            MARKET_STALE_GUARD_DEFAULT_MS
+        ));
+        assert!(market_candidate_is_warmable(
+            &market,
+            20_000,
+            90_000,
+            MARKET_STALE_GUARD_DEFAULT_MS
+        ));
     }
 
     #[test]
@@ -3509,13 +3536,15 @@ mod tests {
         };
         assert!(market_candidate_is_warmable(
             &market,
-            2_000 + MARKET_STALE_GUARD_MS,
-            180_000
+            2_000 + MARKET_STALE_GUARD_DEFAULT_MS,
+            180_000,
+            MARKET_STALE_GUARD_DEFAULT_MS
         ));
         assert!(!market_candidate_is_warmable(
             &market,
-            2_000 + MARKET_STALE_GUARD_MS + 1,
-            180_000
+            2_000 + MARKET_STALE_GUARD_DEFAULT_MS + 1,
+            180_000,
+            MARKET_STALE_GUARD_DEFAULT_MS
         ));
     }
 
