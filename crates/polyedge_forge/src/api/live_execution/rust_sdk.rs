@@ -193,6 +193,27 @@ pub(super) async fn fetch_rust_book_snapshot(
     })
 }
 
+async fn get_or_fetch_book_snapshot_cached(
+    state: &ApiState,
+    ctx: &Arc<RustExecutorContext>,
+    token_id: &str,
+    local_cache: &mut HashMap<String, Option<GatewayBookSnapshot>>,
+) -> Option<GatewayBookSnapshot> {
+    if let Some(cached) = local_cache.get(token_id) {
+        return cached.clone();
+    }
+    let snapshot = if let Some(cached) = state.get_rust_book_cache(token_id).await {
+        Some(cached)
+    } else if let Some(v) = fetch_rust_book_snapshot(ctx, token_id).await {
+        state.put_rust_book_cache(token_id, v.clone()).await;
+        Some(v)
+    } else {
+        None
+    };
+    local_cache.insert(token_id.to_string(), snapshot.clone());
+    snapshot
+}
+
 pub(super) async fn submit_rust_order(
     ctx: &RustExecutorContext,
     payload: &Value,
@@ -394,6 +415,7 @@ async fn try_resubmit_after_terminal_reject_rust(
     ctx: &Arc<RustExecutorContext>,
     row: &LivePendingOrder,
     terminal_status: &str,
+    retry_book_cache: &mut HashMap<String, Option<GatewayBookSnapshot>>,
 ) -> bool {
     let action = row.action.to_ascii_lowercase();
     let exit_like = is_live_exit_action(&action);
@@ -502,14 +524,7 @@ async fn try_resubmit_after_terminal_reject_rust(
     }
     let token_id = token_id_for_decision(&decision, &effective_target).map(str::to_string);
     let book_snapshot = if let Some(token_id) = token_id {
-        if let Some(cached) = state.get_rust_book_cache(&token_id).await {
-            Some(cached)
-        } else if let Some(v) = fetch_rust_book_snapshot(ctx, &token_id).await {
-            state.put_rust_book_cache(&token_id, v.clone()).await;
-            Some(v)
-        } else {
-            None
-        }
+        get_or_fetch_book_snapshot_cached(state, ctx, &token_id, retry_book_cache).await
     } else {
         None
     };
@@ -674,21 +689,7 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
         let token_id =
             token_id_for_decision(&prepared.decision, &prepared.effective_target).map(str::to_string);
         let book_snapshot = if let Some(token_id) = token_id.clone() {
-            match book_cache.get(&token_id) {
-                Some(cached) => cached.clone(),
-                None => {
-                    let fetched = if let Some(cached) = state.get_rust_book_cache(&token_id).await {
-                        Some(cached)
-                    } else if let Some(v) = fetch_rust_book_snapshot(&ctx, &token_id).await {
-                        state.put_rust_book_cache(&token_id, v.clone()).await;
-                        Some(v)
-                    } else {
-                        None
-                    };
-                    book_cache.insert(token_id.clone(), fetched.clone());
-                    fetched
-                }
-            }
+            get_or_fetch_book_snapshot_cached(state, &ctx, &token_id, &mut book_cache).await
         } else {
             None
         };
@@ -815,8 +816,16 @@ pub(super) async fn reconcile_rust_reports(state: &ApiState, exec_cfg: &LiveExec
     if pending.is_empty() {
         return;
     }
-    for row in pending {
-        let status = ctx.client.order(&row.order_id).await;
+    let status_rows = join_all(pending.into_iter().map(|row| {
+        let ctx = Arc::clone(&ctx);
+        async move {
+            let status = ctx.client.order(&row.order_id).await;
+            (row, status)
+        }
+    }))
+    .await;
+    let mut retry_book_cache = HashMap::<String, Option<GatewayBookSnapshot>>::new();
+    for (row, status) in status_rows {
         let Ok(order) = status else {
             continue;
         };
@@ -852,6 +861,7 @@ pub(super) async fn reconcile_rust_reports(state: &ApiState, exec_cfg: &LiveExec
                 &ctx,
                 &row,
                 &terminal_status,
+                &mut retry_book_cache,
             )
             .await;
             if retried {
@@ -889,11 +899,24 @@ pub(super) async fn handle_pending_timeouts_rust(
     };
     let now_ms = Utc::now().timestamp_millis();
     let pending = state.list_pending_orders().await;
-    for row in pending {
-        if now_ms.saturating_sub(row.submitted_ts_ms) < pending_cancel_due_ms(&row) {
-            continue;
+    let due_rows = pending
+        .into_iter()
+        .filter(|row| now_ms.saturating_sub(row.submitted_ts_ms) >= pending_cancel_due_ms(row))
+        .collect::<Vec<_>>();
+    if due_rows.is_empty() {
+        return;
+    }
+    let cancel_results = join_all(due_rows.into_iter().map(|row| {
+        let ctx = Arc::clone(&ctx);
+        async move {
+            let result = ctx.client.cancel_order(&row.order_id).await;
+            (row, result)
         }
-        match ctx.client.cancel_order(&row.order_id).await {
+    }))
+    .await;
+    let mut timeout_book_cache = HashMap::<String, Option<GatewayBookSnapshot>>::new();
+    for (row, cancel_result) in cancel_results {
+        match cancel_result {
             Ok(resp) => {
                 let _ = state.remove_pending_order(&row.order_id).await;
                 let maker_tif = matches!(
@@ -1003,15 +1026,13 @@ pub(super) async fn handle_pending_timeouts_rust(
                         let token_id =
                             token_id_for_decision(&decision, &effective_target).map(str::to_string);
                         let book_snapshot = if let Some(token_id) = token_id {
-                            if let Some(cached) = state.get_rust_book_cache(&token_id).await {
-                                Some(cached)
-                            } else if let Some(v) = fetch_rust_book_snapshot(&ctx, &token_id).await
-                            {
-                                state.put_rust_book_cache(&token_id, v.clone()).await;
-                                Some(v)
-                            } else {
-                                None
-                            }
+                            get_or_fetch_book_snapshot_cached(
+                                state,
+                                &ctx,
+                                &token_id,
+                                &mut timeout_book_cache,
+                            )
+                            .await
                         } else {
                             None
                         };
