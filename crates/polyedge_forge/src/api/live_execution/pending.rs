@@ -20,6 +20,7 @@ pub(super) async fn apply_pending_confirmation(
         .or_else(|| fill_size_shares.map(|sz| sz * (fill_price_cents / 100.0)))
         .unwrap_or(pending.quote_size_usdc.max(0.0))
         .max(0.0);
+    let fill_quote_usdc = quantize_usdc_micros(fill_quote_usdc);
     let fill_shares = if let Some(sz) = fill_size_shares {
         sz.max(0.0)
     } else if fill_meta.fill_quote_usdc.is_some() {
@@ -29,7 +30,7 @@ pub(super) async fn apply_pending_confirmation(
     } else {
         (fill_quote_usdc / (fill_price_cents / 100.0).max(0.0001)).max(0.0)
     };
-    let fill_cost_usdc = (fill_meta.fee_usdc + fill_meta.slippage_usdc).max(0.0);
+    let fill_cost_usdc = quantize_usdc_micros((fill_meta.fee_usdc + fill_meta.slippage_usdc).max(0.0));
     if action == "enter" {
         ps.state = "in_position".to_string();
         ps.side = Some(pending.side.clone());
@@ -64,7 +65,7 @@ pub(super) async fn apply_pending_confirmation(
             .vwap_entry_cents
             .or(ps.entry_price_cents)
             .unwrap_or(fill_price_cents);
-        let next_quote = prev_quote + add_quote;
+        let next_quote = quantize_usdc_micros(prev_quote + add_quote);
         let next_price = if next_quote > 1e-9 {
             (prev_price * prev_quote + fill_price_cents * add_quote) / next_quote
         } else {
@@ -98,7 +99,8 @@ pub(super) async fn apply_pending_confirmation(
         ps.net_quote_usdc = next_quote;
         ps.total_adds = ps.total_adds.saturating_add(1);
         ps.open_add_layers = ps.open_add_layers.saturating_add(1);
-        ps.position_cost_usdc += fill_cost_usdc;
+        ps.position_cost_usdc =
+            micros_to_usdc(usdc_to_micros(ps.position_cost_usdc) + usdc_to_micros(fill_cost_usdc));
         ps.position_size_shares = (ps.position_size_shares + fill_shares).max(0.0);
         ps.last_fill_pnl_usdc = 0.0;
     } else if action == "reduce" || action == "exit" {
@@ -120,15 +122,20 @@ pub(super) async fn apply_pending_confirmation(
             } else {
                 0.0
             };
-            let realized_pnl_usdc = gross_pnl_usdc - entry_cost_alloc - fill_cost_usdc;
-            ps.position_cost_usdc = (ps.position_cost_usdc - entry_cost_alloc).max(0.0);
-            ps.realized_pnl_usdc += realized_pnl_usdc;
-            ps.last_fill_pnl_usdc = realized_pnl_usdc;
+            let gross_micro = usdc_to_micros(gross_pnl_usdc);
+            let alloc_micro = usdc_to_micros(entry_cost_alloc);
+            let fill_cost_micro = usdc_to_micros(fill_cost_usdc);
+            let realized_micro = gross_micro - alloc_micro - fill_cost_micro;
+            let next_cost_micro = (usdc_to_micros(ps.position_cost_usdc) - alloc_micro).max(0);
+            ps.position_cost_usdc = micros_to_usdc(next_cost_micro);
+            ps.realized_pnl_usdc = micros_to_usdc(usdc_to_micros(ps.realized_pnl_usdc) + realized_micro);
+            ps.last_fill_pnl_usdc = micros_to_usdc(realized_micro);
         } else {
             ps.last_fill_pnl_usdc = 0.0;
         }
         let remaining_shares = (prev_shares - close_shares).max(0.0);
-        let remaining_quote = (remaining_shares * (entry_price_cents / 100.0)).max(0.0);
+        let remaining_quote =
+            quantize_usdc_micros((remaining_shares * (entry_price_cents / 100.0)).max(0.0));
         if action == "exit" || remaining_shares <= 1e-6 {
             ps.state = "flat".to_string();
             ps.side = None;

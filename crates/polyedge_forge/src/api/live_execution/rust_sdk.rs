@@ -272,14 +272,21 @@ pub(super) async fn submit_rust_order(
         })
         .filter(|v| v.is_finite() && *v > 0.0)
         .unwrap_or(size * price);
+    let requested_notional = if amount_mode_buy_usdc {
+        ceil_market_buy_amount_usdc(requested_notional)
+    } else {
+        ceil_quote_amount_usdc(requested_notional)
+    };
     let use_market_buy_amount = amount_mode_buy_usdc
         && matches!(pm_side, PmSide::Buy)
         && matches!(order_type, PmOrderType::FAK | PmOrderType::FOK)
         && requested_notional > 0.0;
 
     let resp = if use_market_buy_amount {
-        let amount_dec = PmDecimal::from_str(&format_decimal_compact(requested_notional, 6))
-            .map_err(|e| format!("bad buy_amount_usdc: {e}"))?;
+        let amount_decimals = live_market_buy_amount_decimals() as usize;
+        let amount_dec =
+            PmDecimal::from_str(&format_decimal_compact(requested_notional, amount_decimals))
+                .map_err(|e| format!("bad buy_amount_usdc: {e}"))?;
         let amount =
             PmAmount::usdc(amount_dec).map_err(|e| format!("invalid buy amount (usdc): {e}"))?;
         let signable = ctx

@@ -17,6 +17,21 @@ fn floor_lot_size(size: f64) -> f64 {
     ((size.max(0.0) * 100.0).floor() / 100.0).max(0.01)
 }
 
+const USDC_MICRO_SCALE: f64 = 1_000_000.0;
+
+pub(super) fn usdc_to_micros(value: f64) -> i64 {
+    let clamped = if value.is_finite() { value.max(0.0) } else { 0.0 };
+    (clamped * USDC_MICRO_SCALE).round() as i64
+}
+
+pub(super) fn micros_to_usdc(value: i64) -> f64 {
+    (value as f64) / USDC_MICRO_SCALE
+}
+
+pub(super) fn quantize_usdc_micros(value: f64) -> f64 {
+    micros_to_usdc(usdc_to_micros(value))
+}
+
 fn live_quote_amount_decimals() -> u32 {
     std::env::var("FORGE_FEV1_QUOTE_AMOUNT_DECIMALS")
         .ok()
@@ -27,6 +42,20 @@ fn live_quote_amount_decimals() -> u32 {
 
 pub(super) fn ceil_quote_amount_usdc(value: f64) -> f64 {
     let decimals = live_quote_amount_decimals();
+    let scale = 10_f64.powi(decimals as i32);
+    ((value.max(0.0) * scale).ceil() / scale).max(0.0)
+}
+
+fn live_market_buy_amount_decimals() -> u32 {
+    std::env::var("FORGE_FEV1_MARKET_BUY_AMOUNT_DECIMALS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(2)
+        .clamp(0, 2)
+}
+
+pub(super) fn ceil_market_buy_amount_usdc(value: f64) -> f64 {
+    let decimals = live_market_buy_amount_decimals();
     let scale = 10_f64.powi(decimals as i32);
     ((value.max(0.0) * scale).ceil() / scale).max(0.0)
 }

@@ -72,6 +72,7 @@ This document describes the current API module layout after the large-file split
   - `FORGE_FEV1_LIVE_HARD_KILL=true` force-disables live submit without touching strategy runtime.
   - `FORGE_FEV1_REQUIRE_FIXED_ENTRY_SIZE=true` blocks entry/add unless `FORGE_FEV1_FIXED_ENTRY_SIZE_SHARES` is configured.
   - `FORGE_FEV1_LIVE_MAX_OPEN_POSITIONS=1` enforces single-position rollout during early production.
+  - `FORGE_FEV1_MARKET_BUY_AMOUNT_DECIMALS=2` keeps market BUY notional aligned to cent precision.
 
 ## Next Refactor Targets
 

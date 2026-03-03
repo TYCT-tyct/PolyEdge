@@ -338,3 +338,23 @@
             "should keep exact matched shares, got {shares}"
         );
     }
+
+    #[test]
+    fn market_buy_amount_is_ceiled_to_two_decimals() {
+        let v = ceil_market_buy_amount_usdc(1.001);
+        assert!(
+            (v - 1.01).abs() < 1e-9,
+            "market buy amount should ceil to cent precision, got {v}"
+        );
+    }
+
+    #[test]
+    fn usdc_micro_roundtrip_is_stable() {
+        let v = 12.345_678_4;
+        let micros = usdc_to_micros(v);
+        let roundtrip = micros_to_usdc(micros);
+        assert!(
+            (roundtrip - 12.345_678).abs() < 1e-9,
+            "micro-usdc roundtrip should be stable, got {roundtrip}"
+        );
+    }

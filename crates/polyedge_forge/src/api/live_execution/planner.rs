@@ -64,7 +64,7 @@ pub(super) fn decision_to_live_payload(
             .and_then(Value::as_f64)
             .unwrap_or(exec_cfg.min_quote_usdc)
     });
-    quote_size = quote_size.max(exec_cfg.min_quote_usdc);
+    quote_size = quantize_usdc_micros(quote_size.max(exec_cfg.min_quote_usdc));
     let mut notes: Vec<String> = Vec::with_capacity(3);
     let is_buy = gateway_side.starts_with("buy_");
     let fixed_entry_size_shares = if !is_exit_like {
@@ -237,10 +237,11 @@ pub(super) fn decision_to_live_payload(
         }
     }
     let taker_like = style == "taker" || matches!(tif.as_str(), "FAK" | "FOK");
-    let floor_notional_usdc = (size * price).max(0.0);
-    let requested_notional_usdc = ceil_quote_amount_usdc(quote_size.max(floor_notional_usdc));
+    let floor_notional_usdc = quantize_usdc_micros((size * price).max(0.0));
+    let requested_notional_usdc =
+        ceil_quote_amount_usdc(quantize_usdc_micros(quote_size.max(floor_notional_usdc)));
     let buy_amount_usdc = if is_buy && taker_like && fixed_entry_size_shares.is_none() {
-        Some(requested_notional_usdc)
+        Some(ceil_market_buy_amount_usdc(requested_notional_usdc))
     } else {
         None
     };
