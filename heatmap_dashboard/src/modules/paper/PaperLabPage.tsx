@@ -12,6 +12,10 @@ const ET_TIMEZONE = "America/New_York";
 const CN_TIMEZONE = "Asia/Shanghai";
 const STRATEGY_POLL_MIN_MS = 3_500;
 const STRATEGY_POLL_MAX_MS = 20_000;
+const STRATEGY_REPLAY_POLL_MIN_MS = 12_000;
+const STRATEGY_REPLAY_POLL_MAX_MS = 30_000;
+const STRATEGY_REPLAY_TIMEOUT_MS = 25_000;
+const STRATEGY_LIVE_HISTORY_REFRESH_MS = 90_000;
 const STRATEGY_PREFS_STORAGE_KEY = "polyedge.strategy.prefs.v4";
 const PAPER_LOOKBACK_MINUTES = 1440;
 
@@ -199,6 +203,32 @@ function compactStrategyPayload(payload: StrategyPaperResponse): StrategyPaperRe
   return { ...payload, trades: trimmedTrades, live_execution: compactLive };
 }
 
+function mergeLiveWithReplayHistory(
+  live: StrategyPaperResponse,
+  replayHistory: StrategyPaperResponse | null
+): StrategyPaperResponse {
+  if (!replayHistory) {
+    return live;
+  }
+  const liveSymbol = (live.symbol ?? "").trim().toUpperCase();
+  const replaySymbol = (replayHistory.symbol ?? "").trim().toUpperCase();
+  if (liveSymbol && replaySymbol && liveSymbol !== replaySymbol) {
+    return live;
+  }
+  if (live.market_type !== replayHistory.market_type) {
+    return live;
+  }
+  const hasReplayTrades = Array.isArray(replayHistory.trades) && replayHistory.trades.length > 0;
+  return {
+    ...live,
+    trades: hasReplayTrades ? replayHistory.trades : live.trades,
+    summary: replayHistory.summary ?? live.summary,
+    lookback: replayHistory.lookback ?? live.lookback,
+    lookback_minutes: replayHistory.lookback_minutes ?? live.lookback_minutes,
+    samples: replayHistory.samples ?? live.samples
+  };
+}
+
 export function PaperLabPage({
   selectedSymbol,
   timeMode
@@ -221,6 +251,9 @@ export function PaperLabPage({
   const strategySigRef = useRef<string>("");
   const strategyUnchangedRef = useRef<number>(0);
   const strategyHasLoadedRef = useRef<boolean>(false);
+  const liveHistoryRef = useRef<StrategyPaperResponse | null>(null);
+  const liveHistoryUpdatedAtRef = useRef<number>(0);
+  const liveHistoryInFlightRef = useRef<boolean>(false);
 
   const strategyEnabled = STRATEGY_ENABLED_SYMBOLS.includes(selectedSymbol);
 
@@ -237,6 +270,9 @@ export function PaperLabPage({
       setStrategyPaper(null);
       setStrategyLoading(false);
       strategyHasLoadedRef.current = false;
+      liveHistoryRef.current = null;
+      liveHistoryUpdatedAtRef.current = 0;
+      liveHistoryInFlightRef.current = false;
       return () => {
         alive = false;
       };
@@ -246,6 +282,17 @@ export function PaperLabPage({
     const nextDelayMs = (changed: boolean): number => {
       if (document.visibilityState !== "visible") {
         return STRATEGY_POLL_MAX_MS;
+      }
+      if (strategySource === "replay") {
+        if (changed) {
+          strategyUnchangedRef.current = 0;
+          return STRATEGY_REPLAY_POLL_MIN_MS;
+        }
+        strategyUnchangedRef.current += 1;
+        return Math.min(
+          STRATEGY_REPLAY_POLL_MAX_MS,
+          STRATEGY_REPLAY_POLL_MIN_MS + strategyUnchangedRef.current * 2_000
+        );
       }
       if (changed) {
         strategyUnchangedRef.current = 0;
@@ -285,13 +332,56 @@ export function PaperLabPage({
       }
       let changed = false;
       try {
+        const requestTimeoutMs =
+          strategySource === "replay" ? STRATEGY_REPLAY_TIMEOUT_MS : undefined;
         const data = await getStrategyPaper(strategyMarketType, {
           ...STRATEGY_PAPER_PROFILE,
           lookbackMinutes: PAPER_LOOKBACK_MINUTES,
           source: strategySource,
+          timeoutMs: requestTimeoutMs,
           ...(strategySource === "live" ? STRATEGY_LIVE_PROFILE : {})
         }, selectedSymbol);
-        const compactData = compactStrategyPayload(data);
+        if (strategySource === "live") {
+          const now = Date.now();
+          const historyStale =
+            liveHistoryRef.current == null ||
+            now - liveHistoryUpdatedAtRef.current >= STRATEGY_LIVE_HISTORY_REFRESH_MS;
+          if (historyStale && !liveHistoryInFlightRef.current) {
+            liveHistoryInFlightRef.current = true;
+            void getStrategyPaper(
+              strategyMarketType,
+              {
+                ...STRATEGY_PAPER_PROFILE,
+                lookbackMinutes: PAPER_LOOKBACK_MINUTES,
+                source: "replay",
+                timeoutMs: STRATEGY_REPLAY_TIMEOUT_MS
+              },
+              selectedSymbol
+            )
+              .then((historyPayload) => {
+                if (!alive) {
+                  return;
+                }
+                liveHistoryRef.current = compactStrategyPayload(historyPayload);
+                liveHistoryUpdatedAtRef.current = Date.now();
+              })
+              .catch(() => {
+                // Keep realtime path independent from heavy replay history path.
+              })
+              .finally(() => {
+                liveHistoryInFlightRef.current = false;
+              });
+          }
+        } else {
+          liveHistoryRef.current = null;
+          liveHistoryUpdatedAtRef.current = 0;
+          liveHistoryInFlightRef.current = false;
+        }
+        const mergedData =
+          strategySource === "live"
+            ? mergeLiveWithReplayHistory(data, liveHistoryRef.current)
+            : data;
+        const compactData = compactStrategyPayload(mergedData);
         if (alive) {
           const nextSig = strategyPaperSignature(compactData);
           changed = nextSig !== strategySigRef.current;
@@ -304,7 +394,34 @@ export function PaperLabPage({
         }
       } catch (err) {
         if (alive) {
-          setErrorText(err instanceof Error ? err.message : String(err));
+          const message = err instanceof Error ? err.message : String(err);
+          if (strategySource === "live") {
+            try {
+              const replayFallback = await getStrategyPaper(
+                strategyMarketType,
+                {
+                  ...STRATEGY_PAPER_PROFILE,
+                  lookbackMinutes: PAPER_LOOKBACK_MINUTES,
+                  source: "replay",
+                  timeoutMs: STRATEGY_REPLAY_TIMEOUT_MS
+                },
+                selectedSymbol
+              );
+              const compactFallback = compactStrategyPayload(replayFallback);
+              const nextSig = strategyPaperSignature(compactFallback);
+              changed = nextSig !== strategySigRef.current;
+              if (changed) {
+                strategySigRef.current = nextSig;
+                setStrategyPaper(compactFallback);
+              }
+              strategyHasLoadedRef.current = true;
+              setErrorText(`live unavailable, fallback replay: ${message}`);
+            } catch {
+              setErrorText(message);
+            }
+          } else {
+            setErrorText(message);
+          }
         }
       } finally {
         strategyInFlightRef.current = false;
@@ -426,6 +543,18 @@ export function PaperLabPage({
       ? `${lookbackCoverageMinutes.toFixed(0)}/${lookbackRequestedMinutes.toFixed(0)}m`
       : "--";
   const lookbackTruncated = lookbackMeta?.truncated_by_points === true;
+  const liveHistoryState =
+    strategySource !== "live"
+      ? "inactive"
+      : liveHistoryInFlightRef.current
+      ? "syncing"
+      : liveHistoryRef.current
+      ? "ready"
+      : "pending";
+  const liveHistoryAgeSec =
+    strategySource === "live" && liveHistoryUpdatedAtRef.current > 0
+      ? Math.max(0, (Date.now() - liveHistoryUpdatedAtRef.current) / 1000)
+      : null;
   const profileSource = strategyPaper?.config_source ?? "--";
   const effectiveProfile =
     !strategyPaper
@@ -892,6 +1021,12 @@ export function PaperLabPage({
           coverage: {lookbackCoverageLabel}
           {lookbackTruncated ? " (truncated)" : ""}
         </span>
+        {strategySource === "live" ? (
+          <span>
+            history: {liveHistoryState}
+            {liveHistoryAgeSec != null ? ` (${liveHistoryAgeSec.toFixed(0)}s)` : ""}
+          </span>
+        ) : null}
         <span>
           liveCtrl: {strategyPaper?.runtime_control?.mode ?? "normal"}
           {strategyPaper?.runtime_control?.effective_drain_only ? " (drain)" : ""}

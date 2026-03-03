@@ -136,7 +136,7 @@ function buildWsUrl(path: string): string {
   return `${protocol}://${window.location.host}${path}`;
 }
 
-async function requestJson<T>(path: string): Promise<T> {
+async function requestJson<T>(path: string, timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<T> {
   const key = buildHttpUrl(path);
   const ttlMs = responseCacheTtlMs(path);
   if (ttlMs > 0) {
@@ -155,7 +155,7 @@ async function requestJson<T>(path: string): Promise<T> {
     const timer = window.setTimeout(() => {
       timeoutTriggered = true;
       controller.abort();
-    }, REQUEST_TIMEOUT_MS);
+    }, timeoutMs);
     let resp: Response;
     try {
       resp = await fetch(key, { cache: "no-store", signal: controller.signal });
@@ -165,7 +165,7 @@ async function requestJson<T>(path: string): Promise<T> {
           ? err.name === "AbortError"
           : typeof err === "object" && err != null && (err as { name?: string }).name === "AbortError";
       if (aborted && timeoutTriggered) {
-        throw new HttpError(408, `Request timeout after ${REQUEST_TIMEOUT_MS}ms: ${path}`);
+        throw new HttpError(408, `Request timeout after ${timeoutMs}ms: ${path}`);
       }
       throw err;
     } finally {
@@ -1028,6 +1028,7 @@ export interface StrategyPaperQueryOptions {
   liveQuoteUsdc?: number;
   liveMaxOrders?: number;
   liveEntryOnly?: boolean;
+  timeoutMs?: number;
 }
 
 export async function getStrategyPaper(
@@ -1084,7 +1085,10 @@ export async function getStrategyPaper(
   if (options.liveEntryOnly != null) {
     qs.set("live_entry_only", options.liveEntryOnly ? "true" : "false");
   }
-  const payload = await requestJson<Record<string, unknown>>(`/api/strategy/paper?${qs.toString()}`);
+  const payload = await requestJson<Record<string, unknown>>(
+    `/api/strategy/paper?${qs.toString()}`,
+    options.timeoutMs ?? REQUEST_TIMEOUT_MS
+  );
   if (typeof payload.error === "string" && payload.error.trim()) {
     throw new Error(payload.error);
   }
