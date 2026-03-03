@@ -1276,10 +1276,16 @@ export default function App() {
       return;
     }
     let alive = true;
+    let inFlight = false;
+    let timer: number | null = null;
     const load = async () => {
+      if (!alive || inFlight) {
+        return;
+      }
       if (document.visibilityState !== "visible") {
         return;
       }
+      inFlight = true;
       try {
         const [r5, r15] = await Promise.all([
           getRoundHistory("5m", 250, selectedSymbol),
@@ -1292,14 +1298,33 @@ export default function App() {
         if (alive) {
           setErrorText(err instanceof Error ? err.message : String(err));
         }
+      } finally {
+        inFlight = false;
       }
     };
-    const first = window.setTimeout(load, 1_200);
-    const id = window.setInterval(load, 45_000);
+    const loop = async () => {
+      if (!alive) {
+        return;
+      }
+      await load();
+      const rem5 = stableLiveRef.current["5m"]?.time_remaining_s ?? Number.POSITIVE_INFINITY;
+      const rem15 = stableLiveRef.current["15m"]?.time_remaining_s ?? Number.POSITIVE_INFINITY;
+      const nearestBoundarySec = Math.min(rem5, rem15);
+      const delay =
+        nearestBoundarySec <= 1.5
+          ? 1_800
+          : nearestBoundarySec <= 8
+            ? 3_500
+            : 12_000;
+      timer = window.setTimeout(loop, delay);
+    };
+    const first = window.setTimeout(loop, 1_200);
     return () => {
       alive = false;
       window.clearTimeout(first);
-      window.clearInterval(id);
+      if (timer != null) {
+        window.clearTimeout(timer);
+      }
     };
   }, [selectedSymbol, isMarketView]);
 

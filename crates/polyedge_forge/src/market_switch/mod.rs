@@ -97,8 +97,7 @@ pub fn resolve_switch_snapshot(
     let near_future = ordered
         .iter()
         .filter(|m| {
-            m.start_ts_ms > now_ms
-                && m.start_ts_ms.saturating_sub(now_ms) <= near_future_allow_ms
+            m.start_ts_ms > now_ms && m.start_ts_ms.saturating_sub(now_ms) <= near_future_allow_ms
         })
         .min_by_key(|m| m.start_ts_ms)
         .cloned();

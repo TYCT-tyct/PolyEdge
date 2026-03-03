@@ -387,8 +387,69 @@ function normalizeChartPoint(p: ChartPoint): ChartPoint {
   };
 }
 
+function roundEndMs(round: {
+  end_ts_ms?: number | null;
+  end_time_ms?: number | null;
+}): number | null {
+  return finiteOrNull(round.end_ts_ms) ?? finiteOrNull(round.end_time_ms) ?? null;
+}
+
+function appendRoundSettlementAnchors(
+  points: ChartPoint[],
+  rounds: Array<{
+    round_id: string;
+    outcome?: number | null;
+    end_ts_ms?: number | null;
+    end_time_ms?: number | null;
+    target_price?: number | null;
+  }>
+): ChartPoint[] {
+  if (!rounds.length) {
+    return points;
+  }
+  const out = [...points];
+  const resolvedUp = RESOLVED_UP_PRICE_CENTS / 100;
+  const resolvedDown = RESOLVED_DOWN_PRICE_CENTS / 100;
+  for (const round of rounds) {
+    const roundId = typeof round.round_id === "string" ? round.round_id : "";
+    const outcome = finiteOrNull(round.outcome);
+    const endMs = roundEndMs(round);
+    if (!roundId || outcome == null || endMs == null || endMs <= 0) {
+      continue;
+    }
+    const up = outcome >= 0.5 ? resolvedUp : resolvedDown;
+    const down = 1 - up;
+    const hasNearby = out.some(
+      (p) => p.round_id === roundId && Math.abs(p.timestamp_ms - endMs) <= 350
+    );
+    if (hasNearby) {
+      continue;
+    }
+    out.push(
+      normalizeChartPoint({
+        timestamp_ms: Math.round(endMs),
+        delta_pct: null,
+        delta_pct_smooth: null,
+        mid_yes: up,
+        mid_no: down,
+        mid_yes_smooth: up,
+        mid_no_smooth: down,
+        best_bid_up: up,
+        best_ask_up: up,
+        best_bid_down: down,
+        best_ask_down: down,
+        round_id: roundId,
+        time_remaining_s: 0,
+        btc_price: null,
+        target_price: finiteOrNull(round.target_price)
+      })
+    );
+  }
+  return out;
+}
+
 function normalizeChartResponse(data: ChartResponse): ChartResponse {
-  const sorted = [...data.points]
+  const sorted = appendRoundSettlementAnchors(data.points, data.rounds)
     .map((p) => normalizeChartPoint(p))
     .filter((p) => p.timestamp_ms > 0)
     .sort((a, b) => {

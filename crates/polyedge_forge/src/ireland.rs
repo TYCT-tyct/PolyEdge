@@ -67,7 +67,9 @@ const ROUND_META_RETENTION_MS: i64 = 6 * 60 * 60 * 1000;
 const EMITTED_ROUND_RETENTION_MS: i64 = 6 * 60 * 60 * 1000;
 const DISCOVERY_EMPTY_GRACE_DEFAULT_MS: i64 = 8_000;
 const SAMPLE_GAP_WARN_MS: i64 = 1000;
-const ROUND_DROP_ON_QUALITY_FAIL_DEFAULT: bool = true;
+const ROUND_DROP_ON_QUALITY_FAIL_DEFAULT: bool = false;
+const ROUND_FINALIZE_RETRY_GRACE_MS: i64 = 45_000;
+const ROUND_FINALIZE_DEFER_LOG_THROTTLE_MS: i64 = 15_000;
 const TOKYO_INPUT_STALE_GUARD_DEFAULT_MS: i64 = 2_500;
 const INPUT_STALE_WARN_THROTTLE_MS: i64 = 15_000;
 const MARKET_SELECTION_FALLBACK_PREWARM_DEFAULT_MS: i64 = 300_000;
@@ -276,7 +278,7 @@ impl RoundQualityPolicy {
             max_gap_ms: args.round_max_gap_ms.max(base_gap).max(1_000),
             start_tolerance_ms: args.round_start_tolerance_ms.max(base_tol).max(500),
             end_tolerance_ms: args.round_end_tolerance_ms.max(base_tol).max(500),
-            settle_stale_tolerance_ms: sample_period_ms.saturating_mul(25).max(1_500),
+            settle_stale_tolerance_ms: sample_period_ms.saturating_mul(120).max(12_000),
         }
     }
 }
@@ -358,10 +360,17 @@ impl RoundBuffer {
             self.target_price_latest = Some(v);
         }
         if let Some(v) = row.binance_price {
-            self.settle_price_latest = Some(v);
-            self.settle_price_latest_ts_ms = Some(ts);
+            self.observe_settle_price(v, ts);
         }
         self.snapshots.push(row);
+    }
+
+    fn observe_settle_price(&mut self, price: f64, ts_ms: i64) {
+        if !price.is_finite() || price <= 0.0 {
+            return;
+        }
+        self.settle_price_latest = Some(price);
+        self.settle_price_latest_ts_ms = Some(ts_ms.max(0));
     }
 
     fn evaluate(&self, policy: &RoundQualityPolicy, sample_period_ms: i64) -> RoundQualityReport {
@@ -454,6 +463,15 @@ impl RoundBuffer {
             end_missing_ms,
             settle_stale_ms,
         }
+    }
+}
+
+fn maybe_update_round_settle_from_tokyo(
+    buffer: &mut RoundBuffer,
+    tokyo_by_symbol: &HashMap<String, TokyoBinanceLocal>,
+) {
+    if let Some(tokyo) = tokyo_by_symbol.get(&buffer.symbol) {
+        buffer.observe_settle_price(tokyo.binance_price, tokyo.ts_ireland_recv_ms);
     }
 }
 
@@ -1040,6 +1058,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
     let mut target_anchor_by_round: HashMap<String, f64> = HashMap::new();
     let mut stale_tokyo_warn_by_symbol: HashMap<String, i64> = HashMap::new();
     let mut stale_book_warn_by_pair: HashMap<String, i64> = HashMap::new();
+    let mut round_finalize_defer_warn_at_ms: HashMap<String, i64> = HashMap::new();
     let mut committed_rounds: HashMap<String, i64> = HashMap::new();
     let mut discovery_empty_since_ms: Option<i64> = None;
     let mut switch_epoch_by_pair: HashMap<String, u64> = HashMap::new();
@@ -1395,6 +1414,9 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                 prob_smooth_by_round.retain(|_, v| {
                     now_ms.saturating_sub(v.ts_ms) <= PROB_STATE_RETENTION_MS
                 });
+                for buffer in round_buffers.values_mut() {
+                    maybe_update_round_settle_from_tokyo(buffer, &tokyo_by_symbol);
+                }
 
                 // Gap detection: warn if sampling interval exceeds threshold
                 if last_sample_time_ms > 0 {
@@ -1936,10 +1958,8 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
 
                     let remaining_ms = market.end_ts_ms.saturating_sub(now_ms);
                     if remaining_ms <= 0 && !emitted_rounds.contains_key(&round_id) {
-                        emitted_rounds.insert(round_id.clone(), now_ms);
-                        if let Some(buffer) = round_buffers.remove(&round_id) {
-                            target_anchor_by_round.remove(&round_id);
-                            prob_smooth_by_round.remove(&round_id);
+                        if let Some(mut buffer) = round_buffers.remove(&round_id) {
+                            maybe_update_round_settle_from_tokyo(&mut buffer, &tokyo_by_symbol);
                             let report = buffer.evaluate(&quality_policy, sample_period_ms);
                             let target = buffer.target_price_latest.unwrap_or(0.0);
                             let settle = buffer.settle_price_latest.unwrap_or(0.0);
@@ -1947,31 +1967,68 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                 .reasons
                                 .iter()
                                 .any(|r| r.starts_with("stale_settle="));
+                            let finalize_age_ms = now_ms.saturating_sub(buffer.end_ts_ms).max(0);
+                            let force_finalize = finalize_age_ms >= ROUND_FINALIZE_RETRY_GRACE_MS;
                             if !(target.is_finite() && target > 0.0 && settle.is_finite() && settle > 0.0)
                             {
+                                if !force_finalize {
+                                    round_buffers.insert(round_id.clone(), buffer);
+                                    let warn_at = round_finalize_defer_warn_at_ms
+                                        .entry(round_id.clone())
+                                        .or_insert(0);
+                                    if now_ms.saturating_sub(*warn_at)
+                                        >= ROUND_FINALIZE_DEFER_LOG_THROTTLE_MS
+                                    {
+                                        log_ingest(
+                                            &persist_tx,
+                                            "warn",
+                                            "round_quality",
+                                            &format!(
+                                                "defer_round_finalize {} age_ms={} target={} settle={} reason=invalid_target_or_settle",
+                                                round_id, finalize_age_ms, target, settle
+                                            ),
+                                        );
+                                        *warn_at = now_ms;
+                                    }
+                                    continue;
+                                }
+                                emitted_rounds.insert(round_id.clone(), now_ms);
+                                round_finalize_defer_warn_at_ms.remove(&round_id);
                                 log_ingest(
                                     &persist_tx,
                                     "warn",
                                     "round_quality",
                                     &format!(
-                                        "skip_invalid_round {} target={} settle={} reason=invalid_target_or_settle",
-                                        round_id, target, settle
+                                        "drop_invalid_round {} age_ms={} target={} settle={} reason=invalid_target_or_settle",
+                                        round_id, finalize_age_ms, target, settle
                                     ),
                                 );
                                 continue;
                             }
-                            if settle_stale {
-                                log_ingest(
-                                    &persist_tx,
-                                    "warn",
-                                    "round_quality",
-                                    &format!(
-                                        "skip_invalid_round {} target={} settle={} reason=stale_settle",
-                                        round_id, target, settle
-                                    ),
-                                );
+                            if settle_stale && !force_finalize {
+                                round_buffers.insert(round_id.clone(), buffer);
+                                let warn_at = round_finalize_defer_warn_at_ms
+                                    .entry(round_id.clone())
+                                    .or_insert(0);
+                                if now_ms.saturating_sub(*warn_at)
+                                    >= ROUND_FINALIZE_DEFER_LOG_THROTTLE_MS
+                                {
+                                    log_ingest(
+                                        &persist_tx,
+                                        "warn",
+                                        "round_quality",
+                                        &format!(
+                                            "defer_round_finalize {} age_ms={} target={} settle={} reason=stale_settle",
+                                            round_id, finalize_age_ms, target, settle
+                                        ),
+                                    );
+                                    *warn_at = now_ms;
+                                }
                                 continue;
                             }
+
+                            target_anchor_by_round.remove(&round_id);
+                            prob_smooth_by_round.remove(&round_id);
                             let round = RoundRow {
                                 round_id: buffer.round_id.clone(),
                                 market_id: buffer.market_id.clone(),
@@ -1986,6 +2043,8 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                 ts_recorded_ms: now_ms,
                             };
                             if committed_rounds.contains_key(&round.round_id) {
+                                emitted_rounds.insert(round_id.clone(), now_ms);
+                                round_finalize_defer_warn_at_ms.remove(&round_id);
                                 log_ingest(
                                     &persist_tx,
                                     "warn",
@@ -1998,6 +2057,8 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                 continue;
                             }
                             if !report.accept && round_drop_on_quality_fail {
+                                emitted_rounds.insert(round_id.clone(), now_ms);
+                                round_finalize_defer_warn_at_ms.remove(&round_id);
                                 let reason = report.reasons.join(",");
                                 log_ingest(
                                     &persist_tx,
@@ -2037,8 +2098,12 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                 })
                                 .await
                             {
+                                emitted_rounds.insert(round_id.clone(), now_ms);
+                                round_finalize_defer_warn_at_ms.remove(&round_id);
                                 tracing::error!(?err, "commit queue closed; dropping round");
                             } else {
+                                emitted_rounds.insert(round_id.clone(), now_ms);
+                                round_finalize_defer_warn_at_ms.remove(&round_id);
                                 committed_rounds.insert(round_id.clone(), now_ms);
                                 if report.accept {
                                     log_ingest(
@@ -2116,10 +2181,8 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     })
                     .collect();
                 for rid in stale_round_ids {
-                    emitted_rounds.insert(rid.clone(), now_ms);
-                    if let Some(buffer) = round_buffers.remove(&rid) {
-                        target_anchor_by_round.remove(&rid);
-                        prob_smooth_by_round.remove(&rid);
+                    if let Some(mut buffer) = round_buffers.remove(&rid) {
+                        maybe_update_round_settle_from_tokyo(&mut buffer, &tokyo_by_symbol);
                         let report = buffer.evaluate(&quality_policy, sample_period_ms);
                         let target = buffer.target_price_latest.unwrap_or(0.0);
                         let settle = buffer.settle_price_latest.unwrap_or(0.0);
@@ -2127,31 +2190,66 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             .reasons
                             .iter()
                             .any(|r| r.starts_with("stale_settle="));
+                        let finalize_age_ms = now_ms.saturating_sub(buffer.end_ts_ms).max(0);
+                        let force_finalize = finalize_age_ms >= ROUND_FINALIZE_RETRY_GRACE_MS;
+
                         if !(target.is_finite() && target > 0.0 && settle.is_finite() && settle > 0.0)
                         {
+                            if !force_finalize {
+                                round_buffers.insert(rid.clone(), buffer);
+                                let warn_at =
+                                    round_finalize_defer_warn_at_ms.entry(rid.clone()).or_insert(0);
+                                if now_ms.saturating_sub(*warn_at)
+                                    >= ROUND_FINALIZE_DEFER_LOG_THROTTLE_MS
+                                {
+                                    log_ingest(
+                                        &persist_tx,
+                                        "warn",
+                                        "round_quality",
+                                        &format!(
+                                            "defer_stale_round_finalize {} age_ms={} target={} settle={} reason=invalid_target_or_settle",
+                                            rid, finalize_age_ms, target, settle
+                                        ),
+                                    );
+                                    *warn_at = now_ms;
+                                }
+                                continue;
+                            }
+                            emitted_rounds.insert(rid.clone(), now_ms);
+                            round_finalize_defer_warn_at_ms.remove(&rid);
                             log_ingest(
                                 &persist_tx,
                                 "warn",
                                 "round_quality",
                                 &format!(
-                                    "skip_invalid_stale_round {} target={} settle={} reason=invalid_target_or_settle",
-                                    rid, target, settle
+                                    "drop_invalid_stale_round {} age_ms={} target={} settle={} reason=invalid_target_or_settle",
+                                    rid, finalize_age_ms, target, settle
                                 ),
                             );
                             continue;
                         }
-                        if settle_stale {
-                            log_ingest(
-                                &persist_tx,
-                                "warn",
-                                "round_quality",
-                                &format!(
-                                    "skip_invalid_stale_round {} target={} settle={} reason=stale_settle",
-                                    rid, target, settle
-                                ),
-                            );
+                        if settle_stale && !force_finalize {
+                            round_buffers.insert(rid.clone(), buffer);
+                            let warn_at = round_finalize_defer_warn_at_ms.entry(rid.clone()).or_insert(0);
+                            if now_ms.saturating_sub(*warn_at)
+                                >= ROUND_FINALIZE_DEFER_LOG_THROTTLE_MS
+                            {
+                                log_ingest(
+                                    &persist_tx,
+                                    "warn",
+                                    "round_quality",
+                                    &format!(
+                                        "defer_stale_round_finalize {} age_ms={} target={} settle={} reason=stale_settle",
+                                        rid, finalize_age_ms, target, settle
+                                    ),
+                                );
+                                *warn_at = now_ms;
+                            }
                             continue;
                         }
+
+                        target_anchor_by_round.remove(&rid);
+                        prob_smooth_by_round.remove(&rid);
                         let round = RoundRow {
                             round_id: buffer.round_id.clone(),
                             market_id: buffer.market_id.clone(),
@@ -2166,6 +2264,8 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             ts_recorded_ms: now_ms,
                         };
                         if committed_rounds.contains_key(&round.round_id) {
+                            emitted_rounds.insert(rid.clone(), now_ms);
+                            round_finalize_defer_warn_at_ms.remove(&rid);
                             log_ingest(
                                 &persist_tx,
                                 "warn",
@@ -2178,6 +2278,8 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             continue;
                         }
                         if !report.accept && round_drop_on_quality_fail {
+                            emitted_rounds.insert(rid.clone(), now_ms);
+                            round_finalize_defer_warn_at_ms.remove(&rid);
                             let reason = if report.reasons.is_empty() {
                                 "quality_reject".to_string()
                             } else {
@@ -2223,9 +2325,13 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             })
                             .await
                         {
+                            emitted_rounds.insert(rid.clone(), now_ms);
+                            round_finalize_defer_warn_at_ms.remove(&rid);
                             tracing::error!(?err, "commit queue closed; dropping stale round");
                             continue;
                         }
+                        emitted_rounds.insert(rid.clone(), now_ms);
+                        round_finalize_defer_warn_at_ms.remove(&rid);
                         committed_rounds.insert(rid.clone(), now_ms);
                         log_ingest(
                             &persist_tx,
@@ -2296,6 +2402,10 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     stale_tokyo_warn_by_symbol
                         .retain(|symbol, _| active_symbols_set.contains(symbol.as_str()));
                     stale_book_warn_by_pair.retain(|pair, _| required_pair_keys.contains(pair));
+                    round_finalize_defer_warn_at_ms.retain(|round_id, warn_at_ms| {
+                        round_meta_is_fresh(round_id, now_ms, ROUND_META_RETENTION_MS)
+                            && now_ms.saturating_sub(*warn_at_ms) <= EMITTED_ROUND_RETENTION_MS
+                    });
                     motion_by_key.retain(|key, state| {
                         let symbol = key.split('|').next().unwrap_or_default();
                         active_symbols_set.contains(symbol)
