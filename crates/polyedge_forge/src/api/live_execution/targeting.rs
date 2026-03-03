@@ -316,6 +316,11 @@ pub(super) async fn gate_live_decisions(
     mark_attempts: bool,
 ) -> (Vec<LiveGatedDecision>, Vec<Value>, LivePositionState) {
     let now_ms = Utc::now().timestamp_millis();
+    let max_open_positions = live_max_open_positions();
+    let require_fixed_entry_size = live_require_fixed_entry_size();
+    let fixed_entry_size_shares = live_fixed_entry_size_shares();
+    let open_positions_total = state.count_open_positions().await;
+    let mut enter_pending_total = state.count_entry_pending_orders().await;
     let mut position_state = state.get_live_position_state(market_type).await;
     let mut virtual_side = position_state.side.clone();
     let (mut has_enter_pending, mut has_exit_pending) =
@@ -358,6 +363,32 @@ pub(super) async fn gate_live_decisions(
                 "decision": normalized
             }));
             continue;
+        }
+        if mark_attempts
+            && matches!(action.as_str(), "enter" | "add")
+            && require_fixed_entry_size
+            && fixed_entry_size_shares.is_none()
+        {
+            skipped.push(json!({
+                "reason": "fixed_entry_size_required",
+                "required_env": "FORGE_FEV1_FIXED_ENTRY_SIZE_SHARES",
+                "decision": normalized
+            }));
+            continue;
+        }
+        if action == "enter" && virtual_side.is_none() {
+            // Cross-market cap: count currently open positions plus in-flight enter orders.
+            let projected = open_positions_total.saturating_add(enter_pending_total);
+            if projected >= max_open_positions {
+                skipped.push(json!({
+                    "reason": "global_open_position_cap",
+                    "max_open_positions": max_open_positions,
+                    "open_positions": open_positions_total,
+                    "enter_pending": enter_pending_total,
+                    "decision": normalized
+                }));
+                continue;
+            }
         }
         if matches!(action.as_str(), "enter" | "add")
             && position_state.state.eq_ignore_ascii_case("exit_pending")
@@ -445,6 +476,7 @@ pub(super) async fn gate_live_decisions(
             }));
             continue;
         }
+        let opened_new_position = action == "enter" && virtual_side.is_none();
         if matches!(action.as_str(), "enter" | "add") {
             virtual_side = Some(side.clone());
             has_enter_pending = true;
@@ -453,6 +485,9 @@ pub(super) async fn gate_live_decisions(
             has_exit_pending = true;
         } else {
             has_exit_pending = true;
+        }
+        if opened_new_position {
+            enter_pending_total = enter_pending_total.saturating_add(1);
         }
         accepted.push(LiveGatedDecision {
             decision: normalized,

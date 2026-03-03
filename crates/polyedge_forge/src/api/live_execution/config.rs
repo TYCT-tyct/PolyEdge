@@ -125,8 +125,12 @@ const LIVE_GTD_EXPIRATION_SAFETY_SEC_MAX: i64 = 30;
 const LIVE_ROUND_TARGET_MATCH_TOLERANCE_MS_DEFAULT: i64 = 5_000;
 const LIVE_ROUND_TARGET_MATCH_TOLERANCE_MS_MIN: i64 = 0;
 const LIVE_ROUND_TARGET_MATCH_TOLERANCE_MS_MAX: i64 = 120_000;
+const LIVE_REQUIRE_FIXED_ENTRY_SIZE_DEFAULT: bool = true;
 const LIVE_FIXED_ENTRY_SIZE_SHARES_MIN: f64 = 0.0;
 const LIVE_FIXED_ENTRY_SIZE_SHARES_MAX: f64 = 1_000.0;
+const LIVE_MAX_OPEN_POSITIONS_DEFAULT: usize = 1;
+const LIVE_MAX_OPEN_POSITIONS_MIN: usize = 1;
+const LIVE_MAX_OPEN_POSITIONS_MAX: usize = 4;
 
 #[derive(Debug, Clone)]
 struct CachedLiveMarketTarget {
@@ -299,6 +303,26 @@ fn live_round_target_match_tolerance_ms() -> i64 {
             LIVE_ROUND_TARGET_MATCH_TOLERANCE_MS_MIN,
             LIVE_ROUND_TARGET_MATCH_TOLERANCE_MS_MAX,
         )
+}
+
+fn live_require_fixed_entry_size() -> bool {
+    std::env::var("FORGE_FEV1_REQUIRE_FIXED_ENTRY_SIZE")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(LIVE_REQUIRE_FIXED_ENTRY_SIZE_DEFAULT)
+}
+
+fn live_max_open_positions() -> usize {
+    std::env::var("FORGE_FEV1_LIVE_MAX_OPEN_POSITIONS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(LIVE_MAX_OPEN_POSITIONS_DEFAULT)
+        .clamp(LIVE_MAX_OPEN_POSITIONS_MIN, LIVE_MAX_OPEN_POSITIONS_MAX)
 }
 
 fn live_fixed_entry_size_shares() -> Option<f64> {

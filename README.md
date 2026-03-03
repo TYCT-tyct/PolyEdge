@@ -33,3 +33,11 @@ cargo run -p polyedge_forge -- tokyo-relay
 npm --prefix heatmap_dashboard ci
 npm --prefix heatmap_dashboard run build
 ```
+
+## Live Execution Profiles
+
+Runtime/live parameter presets are in:
+
+- `scripts/forge/live_execution_profiles.env`
+
+Use `COMMON` + one profile block (`SHADOW`, `CANARY`, or `FULL`) to keep rollout reproducible.

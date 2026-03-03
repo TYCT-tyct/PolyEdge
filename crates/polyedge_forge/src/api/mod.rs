@@ -548,6 +548,18 @@ fn live_submit_effective_armed() -> bool {
     !live_submit_arm_required() || live_submit_armed()
 }
 
+fn live_hard_kill_enabled() -> bool {
+    std::env::var("FORGE_FEV1_LIVE_HARD_KILL")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn live_min_entry_score() -> f64 {
     std::env::var("FORGE_FEV1_LIVE_MIN_ENTRY_SCORE")
         .ok()
@@ -1450,6 +1462,14 @@ impl ApiState {
         pending.values().cloned().collect()
     }
 
+    async fn count_entry_pending_orders(&self) -> usize {
+        let pending = self.live_pending_orders.read().await;
+        pending
+            .values()
+            .filter(|row| row.action.eq_ignore_ascii_case("enter"))
+            .count()
+    }
+
     async fn list_pending_orders_for_market(&self, market_type: &str) -> Vec<LivePendingOrder> {
         let pending = self.live_pending_orders.read().await;
         pending
@@ -1457,6 +1477,20 @@ impl ApiState {
             .filter(|p| p.market_type.eq_ignore_ascii_case(market_type))
             .cloned()
             .collect()
+    }
+
+    async fn count_open_positions(&self) -> usize {
+        let rows = self.live_position_states.read().await;
+        rows.values()
+            .filter(|row| {
+                row.position_size_shares > 0.0
+                    || row
+                        .side
+                        .as_deref()
+                        .map(|v| !v.trim().is_empty())
+                        .unwrap_or(false)
+            })
+            .count()
     }
 
     #[allow(dead_code)]
@@ -2195,6 +2229,7 @@ async fn live_runtime_loop(
             let live_arm_required = live_submit_arm_required();
             let live_armed = live_submit_armed();
             let live_submit_allowed = live_submit_effective_armed();
+            let live_hard_kill = live_hard_kill_enabled();
             match runtime_control.mode {
                 LiveRuntimeControlMode::Normal => {}
                 LiveRuntimeControlMode::ForcePause => {
@@ -2217,6 +2252,10 @@ async fn live_runtime_loop(
                         effective_live_execute = true;
                     }
                 }
+            }
+            if live_hard_kill {
+                effective_live_execute = false;
+                effective_drain_only = true;
             }
             if effective_live_execute && !live_submit_allowed {
                 effective_live_execute = false;
@@ -2286,6 +2325,7 @@ async fn live_runtime_loop(
                                 "live_arm_required": live_arm_required,
                                 "live_armed": live_armed,
                                 "live_submit_allowed": live_submit_allowed,
+                                "live_hard_kill": live_hard_kill,
                             }),
                         );
                         obj.insert("execution_aggressiveness".to_string(), json!(exec_aggr));
