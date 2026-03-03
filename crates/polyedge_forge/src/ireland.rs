@@ -18,6 +18,10 @@ use crate::api::{run_api_server, ApiConfig};
 use crate::cli::{IrelandApiArgs, IrelandRecorderArgs};
 use crate::common::{parse_lower_csv, parse_timestamp_ms, parse_upper_csv, timeframe_to_ms};
 use crate::db_sink::{normalize_opt_url, run_db_sink, DbEvent, DbSinkConfig};
+use crate::market_data_exchange::{
+    market_in_sampling_window, market_pair_key, trim_candidate_pool,
+};
+use crate::market_switch::resolve_switch_snapshot;
 use crate::models::{
     ChainlinkLocal, MarketMeta, MotionState, PersistEvent, RoundRow, SnapshotRow,
     TokyoBinanceLocal, TokyoBinanceWire,
@@ -202,58 +206,6 @@ fn round_end_ts_ms_from_round_id(round_id: &str) -> Option<i64> {
     let timeframe = parts.next()?;
     let tf_ms = timeframe_to_ms(timeframe)?;
     Some(start_ms.saturating_add(tf_ms))
-}
-
-fn market_pair_key(m: &MarketMeta) -> String {
-    format!("{}:{}", m.symbol, m.timeframe)
-}
-
-fn market_in_sampling_window(
-    m: &MarketMeta,
-    now_ms: i64,
-    prestart_allow_ms: i64,
-    sample_end_grace_ms: i64,
-) -> bool {
-    now_ms.saturating_add(prestart_allow_ms) >= m.start_ts_ms
-        && now_ms <= m.end_ts_ms.saturating_add(sample_end_grace_ms)
-}
-
-fn market_selection_rank(m: &MarketMeta, now_ms: i64, sample_end_grace_ms: i64) -> (u8, i64, i64) {
-    if now_ms >= m.start_ts_ms && now_ms <= m.end_ts_ms.saturating_add(sample_end_grace_ms) {
-        // Prefer currently active round first, then the one closest to settlement.
-        return (
-            0,
-            m.end_ts_ms.saturating_sub(now_ms).abs(),
-            m.start_ts_ms.abs(),
-        );
-    }
-    if now_ms < m.start_ts_ms {
-        // Then prefer the nearest upcoming round.
-        return (1, m.start_ts_ms.saturating_sub(now_ms), m.start_ts_ms.abs());
-    }
-    // Finally keep the most recently ended round as last resort.
-    (
-        2,
-        now_ms.saturating_sub(m.end_ts_ms),
-        m.start_ts_ms.saturating_abs(),
-    )
-}
-
-fn trim_candidate_pool(
-    markets: &mut Vec<MarketMeta>,
-    now_ms: i64,
-    prestart_allow_ms: i64,
-    sample_end_grace_ms: i64,
-    max_candidates: usize,
-) {
-    markets.sort_by_key(|m| {
-        (
-            !market_in_sampling_window(m, now_ms, prestart_allow_ms, sample_end_grace_ms),
-            market_selection_rank(m, now_ms, sample_end_grace_ms),
-        )
-    });
-    markets.dedup_by(|a, b| a.market_id == b.market_id);
-    markets.truncate(max_candidates.max(1));
 }
 
 fn market_primary_candidate_is_valid(m: &MarketMeta, now_ms: i64, prestart_allow_ms: i64) -> bool {
@@ -1097,6 +1049,8 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
     let mut stale_book_warn_by_pair: HashMap<String, i64> = HashMap::new();
     let mut committed_rounds: HashMap<String, i64> = HashMap::new();
     let mut discovery_empty_since_ms: Option<i64> = None;
+    let mut switch_epoch_by_pair: HashMap<String, u64> = HashMap::new();
+    let mut switch_market_by_pair: HashMap<String, String> = HashMap::new();
 
     let mut ingest_seq: u64 = 0;
     let mut last_sample_time_ms: i64 = 0;
@@ -1464,13 +1418,12 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                 if last_sample_time_ms > 0 {
                     let gap_ms = now_ms.saturating_sub(last_sample_time_ms);
                     if gap_ms > SAMPLE_GAP_WARN_MS {
-                        let active_pairs: Vec<String> = markets_by_id
-                            .values()
-                            .map(|m| market_pair_key(m))
-                            .collect();
-                        for pair_key in active_pairs.iter() {
+                        for pair_key in required_pair_keys.iter() {
+                            if !candidate_markets_by_pair.contains_key(pair_key) {
+                                continue;
+                            }
                             let warn_at = sample_gap_warn_by_pair
-                                .entry(pair_key.clone())
+                                .entry(pair_key.to_string())
                                 .or_insert(0);
                             if now_ms.saturating_sub(*warn_at) >= INPUT_STALE_WARN_THROTTLE_MS {
                                 log_ingest(
@@ -1488,60 +1441,57 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     }
                 }
 
-                for primary_market in markets_by_id.values() {
-                    let pair_key = market_pair_key(primary_market);
-                    let mut market = primary_market.clone();
+                let mut sampling_pairs = required_pair_keys.iter().cloned().collect::<Vec<_>>();
+                sampling_pairs.sort();
+                for pair_key in sampling_pairs {
+                    let fallback_candidates;
+                    let pair_candidates = if let Some(existing) = candidate_markets_by_pair.get(&pair_key) {
+                        existing.as_slice()
+                    } else {
+                        let mut split = pair_key.split(':');
+                        let symbol = split.next().unwrap_or_default();
+                        let timeframe = split.next().unwrap_or_default();
+                        fallback_candidates = markets_by_id
+                            .values()
+                            .filter(|market| {
+                                market.symbol.eq_ignore_ascii_case(symbol)
+                                    && market.timeframe.eq_ignore_ascii_case(timeframe)
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        if fallback_candidates.is_empty() {
+                            continue;
+                        }
+                        fallback_candidates.as_slice()
+                    };
+
+                    let Some(switch_snapshot) = resolve_switch_snapshot(
+                        &pair_key,
+                        pair_candidates,
+                        now_ms,
+                        market_prestart_allow_ms,
+                        market_sample_end_grace_ms,
+                        MARKET_STALE_GUARD_MS,
+                    ) else {
+                        continue;
+                    };
+
+                    let mut market = switch_snapshot.active_market.clone();
                     let mut book = pick_fresh_book_for_market(&market, now_ms, &book_by_market);
-                    if let Some(candidates) = candidate_markets_by_pair.get(&pair_key) {
-                        let current_in_window =
+                    if book.is_none() {
+                        if let Some(alt_market) = pair_candidates.iter().find(|candidate| {
                             market_in_sampling_window(
-                                &market,
+                                candidate,
                                 now_ms,
                                 market_prestart_allow_ms,
                                 market_sample_end_grace_ms,
-                            );
-                        if !current_in_window || book.is_none() {
-                            if let Some(alt_market) = candidates.iter().find(|m| {
-                                market_in_sampling_window(
-                                    m,
-                                    now_ms,
-                                    market_prestart_allow_ms,
-                                    market_sample_end_grace_ms,
-                                )
-                                    && pick_fresh_book_for_market(m, now_ms, &book_by_market)
-                                        .is_some()
-                            }) {
-                                market = alt_market.clone();
-                                book = pick_fresh_book_for_market(&market, now_ms, &book_by_market);
-                            } else if let Some(alt_market) = candidates
-                                .iter()
-                                .find(|m| {
-                                    market_in_sampling_window(
-                                        m,
-                                        now_ms,
-                                        market_prestart_allow_ms,
-                                        market_sample_end_grace_ms,
-                                    )
-                                })
-                            {
-                                market = alt_market.clone();
-                                book = pick_fresh_book_for_market(&market, now_ms, &book_by_market);
-                            }
-                        }
-                        // Discovery can briefly point to future round metadata before the
-                        // currently tradable round is reflected. Prefer any candidate with
-                        // fresh book data to avoid 4-5 minute sampling blackouts.
-                        if now_ms + market_prestart_allow_ms < market.start_ts_ms {
-                            if let Some(alt_market) = candidates.iter().find(|m| {
-                                pick_fresh_book_for_market(m, now_ms, &book_by_market).is_some()
-                            }) {
-                                market = alt_market.clone();
-                                book = pick_fresh_book_for_market(&market, now_ms, &book_by_market);
-                            }
+                            ) && pick_fresh_book_for_market(candidate, now_ms, &book_by_market).is_some()
+                        }) {
+                            market = alt_market.clone();
+                            book = pick_fresh_book_for_market(&market, now_ms, &book_by_market);
                         }
                     }
-                    // Simplified boundary check: only use prestart_allow for early detection
-                    // and end grace for late detection (removed redundant future_guard)
+
                     if now_ms + market_prestart_allow_ms < market.start_ts_ms {
                         continue;
                     }
@@ -1549,7 +1499,45 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         continue;
                     }
 
-                    let pair_key = market_pair_key(&market);
+                    let switch_epoch = {
+                        let previous = switch_market_by_pair.get(&pair_key);
+                        if previous != Some(&market.market_id) {
+                            let epoch = switch_epoch_by_pair
+                                .entry(pair_key.clone())
+                                .and_modify(|v| *v = v.saturating_add(1))
+                                .or_insert(1);
+                            let next_id = switch_snapshot
+                                .next_market
+                                .as_ref()
+                                .map(|m| m.market_id.as_str())
+                                .unwrap_or("-");
+                            let next2_id = switch_snapshot
+                                .next2_market
+                                .as_ref()
+                                .map(|m| m.market_id.as_str())
+                                .unwrap_or("-");
+                            log_ingest(
+                                &persist_tx,
+                                "info",
+                                "market_switch",
+                                &format!(
+                                    "pair={} epoch={} market_id={} expected_start_ms={} phase={:?} degraded={} reason={} next_market_id={} next2_market_id={}",
+                                    switch_snapshot.pair_key,
+                                    *epoch,
+                                    market.market_id,
+                                    switch_snapshot.expected_start_ms,
+                                    switch_snapshot.phase,
+                                    switch_snapshot.degraded,
+                                    switch_snapshot.reason,
+                                    next_id,
+                                    next2_id,
+                                ),
+                            );
+                            switch_market_by_pair.insert(pair_key.clone(), market.market_id.clone());
+                        }
+                        *switch_epoch_by_pair.entry(pair_key.clone()).or_insert(0)
+                    };
+
                     let max_quote_fallback_age_ms = quote_fallback_max_age_ms(&market.timeframe);
                     let market_cached_quote = quote_cache_by_market.get(&market.market_id);
                     let pair_cached_quote = quote_cache_by_pair.get(&pair_key);
@@ -1624,7 +1612,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         };
                         quote_cache_by_market
                             .insert(market.market_id.clone(), cache_entry.clone());
-                        quote_cache_by_pair.insert(pair_key, cache_entry);
+                        quote_cache_by_pair.insert(pair_key.clone(), cache_entry);
                     }
 
                     let tokyo = tokyo_by_symbol.get(&market.symbol);
@@ -1729,6 +1717,25 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         .filter(|v| v.is_finite() && *v > 0.0)
                     {
                         target_anchor_by_round.insert(round_id.clone(), target);
+                    }
+                    if switch_snapshot.degraded {
+                        let warn_at = stale_book_warn_by_pair.entry(pair_key.clone()).or_insert(0);
+                        if now_ms.saturating_sub(*warn_at) >= INPUT_STALE_WARN_THROTTLE_MS {
+                            log_ingest(
+                                &persist_tx,
+                                "warn",
+                                "market_switch",
+                                &format!(
+                                    "pair={} epoch={} degraded_active_market market_id={} reason={} phase={:?}",
+                                    pair_key,
+                                    switch_epoch,
+                                    market.market_id,
+                                    switch_snapshot.reason,
+                                    switch_snapshot.phase,
+                                ),
+                            );
+                            *warn_at = now_ms;
+                        }
                     }
 
                     let delta_price = match (binance_price, target_price) {

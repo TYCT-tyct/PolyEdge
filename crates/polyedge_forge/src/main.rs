@@ -6,6 +6,8 @@ mod common;
 mod db_sink;
 mod fev1;
 mod ireland;
+mod market_data_exchange;
+mod market_switch;
 mod models;
 mod persist;
 mod tokyo;
