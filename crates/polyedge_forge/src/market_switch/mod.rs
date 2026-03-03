@@ -60,6 +60,7 @@ pub fn resolve_switch_snapshot(
     candidates: &[MarketMeta],
     now_ms: i64,
     prestart_allow_ms: i64,
+    near_future_allow_ms: i64,
     sample_end_grace_ms: i64,
     stale_guard_ms: i64,
 ) -> Option<SwitchSnapshot> {
@@ -96,7 +97,8 @@ pub fn resolve_switch_snapshot(
     let near_future = ordered
         .iter()
         .filter(|m| {
-            m.start_ts_ms > now_ms && m.start_ts_ms.saturating_sub(now_ms) <= prestart_allow_ms
+            m.start_ts_ms > now_ms
+                && m.start_ts_ms.saturating_sub(now_ms) <= near_future_allow_ms
         })
         .min_by_key(|m| m.start_ts_ms)
         .cloned();
@@ -165,6 +167,7 @@ mod tests {
             ],
             now_ms,
             30_000,
+            300_000,
             300,
             5_000,
         )
@@ -182,6 +185,7 @@ mod tests {
             &[mk("future", 2_240_000, 2_540_000)],
             now_ms,
             30_000,
+            30_000,
             300,
             5_000,
         );
@@ -195,6 +199,7 @@ mod tests {
             "BTCUSDT:5m",
             &[mk("prev", 1_700_000, 2_000_000)],
             now_ms,
+            30_000,
             30_000,
             300,
             5_000,

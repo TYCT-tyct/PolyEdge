@@ -1470,6 +1470,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         pair_candidates,
                         now_ms,
                         market_prestart_allow_ms,
+                        market_selection_fallback_prewarm_ms,
                         market_sample_end_grace_ms,
                         MARKET_STALE_GUARD_MS,
                     ) else {
@@ -1489,10 +1490,17 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         }) {
                             market = alt_market.clone();
                             book = pick_fresh_book_for_market(&market, now_ms, &book_by_market);
+                        } else if let Some(alt_market) = pair_candidates.iter().find(|candidate| {
+                            pick_fresh_book_for_market(candidate, now_ms, &book_by_market).is_some()
+                        }) {
+                            market = alt_market.clone();
+                            book = pick_fresh_book_for_market(&market, now_ms, &book_by_market);
                         }
                     }
 
-                    if now_ms + market_prestart_allow_ms < market.start_ts_ms {
+                    let future_sampling_allowed = now_ms + market_prestart_allow_ms < market.start_ts_ms
+                        && book.is_some();
+                    if now_ms + market_prestart_allow_ms < market.start_ts_ms && !future_sampling_allowed {
                         continue;
                     }
                     if now_ms > market.end_ts_ms.saturating_add(market_sample_end_grace_ms) {
