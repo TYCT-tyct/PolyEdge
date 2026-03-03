@@ -549,6 +549,14 @@ fn runtime_event_idle_poll_ms() -> i64 {
         .clamp(200, 20_000)
 }
 
+fn runtime_env_refresh_ms() -> i64 {
+    std::env::var("FORGE_FEV1_RUNTIME_ENV_REFRESH_MS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(1_000)
+        .clamp(100, 10_000)
+}
+
 fn live_submit_arm_required() -> bool {
     std::env::var("FORGE_FEV1_LIVE_ARM_REQUIRED")
         .ok()
@@ -2278,16 +2286,47 @@ async fn live_runtime_loop(
     let mut market_last_strategy_eval_ms: HashMap<String, i64> = HashMap::new();
     let mut market_last_strategy_sample_ts_ms: HashMap<String, i64> = HashMap::new();
     let snapshot_event_available = state.redis_client.is_some();
+    let mut cached_cfg = LiveRuntimeConfig::from_env();
+    let mut cached_push_cfg = ServerChanConfig::from_env();
+    let mut cached_exec_cfg = LiveExecutionConfig::from_env();
+    let mut cached_fast_enabled = runtime_fast_loop_enabled();
+    let mut cached_fast_margin = runtime_fast_margin_threshold();
+    let mut cached_target_prewarm_ms = runtime_target_prewarm_ms();
+    let mut cached_target_keepalive_ms = runtime_target_keepalive_ms();
+    let mut cached_idle_force_poll_ms = runtime_event_idle_poll_ms();
+    let mut cached_live_arm_required = live_submit_arm_required();
+    let mut cached_live_armed = live_submit_armed();
+    let mut cached_live_submit_allowed = live_submit_effective_armed();
+    let mut cached_live_hard_kill = live_hard_kill_enabled();
+    let mut env_refresh_ms = runtime_env_refresh_ms();
+    let mut last_env_refresh_ms = Utc::now().timestamp_millis();
     loop {
-        let cfg = LiveRuntimeConfig::from_env();
-        let push_cfg = ServerChanConfig::from_env();
-        let fast_enabled = runtime_fast_loop_enabled();
-        let fast_loop_ms = runtime_fast_loop_ms(cfg.loop_interval_ms);
-        let fast_margin = runtime_fast_margin_threshold();
-        let target_prewarm_ms = runtime_target_prewarm_ms();
-        let target_keepalive_ms = runtime_target_keepalive_ms();
-        let idle_force_poll_ms = runtime_event_idle_poll_ms();
         let now_for_wait = Utc::now().timestamp_millis();
+        if now_for_wait.saturating_sub(last_env_refresh_ms) >= env_refresh_ms {
+            cached_cfg = LiveRuntimeConfig::from_env();
+            cached_push_cfg = ServerChanConfig::from_env();
+            cached_exec_cfg = LiveExecutionConfig::from_env();
+            cached_fast_enabled = runtime_fast_loop_enabled();
+            cached_fast_margin = runtime_fast_margin_threshold();
+            cached_target_prewarm_ms = runtime_target_prewarm_ms();
+            cached_target_keepalive_ms = runtime_target_keepalive_ms();
+            cached_idle_force_poll_ms = runtime_event_idle_poll_ms();
+            cached_live_arm_required = live_submit_arm_required();
+            cached_live_armed = live_submit_armed();
+            cached_live_submit_allowed = live_submit_effective_armed();
+            cached_live_hard_kill = live_hard_kill_enabled();
+            env_refresh_ms = runtime_env_refresh_ms();
+            last_env_refresh_ms = now_for_wait;
+        }
+        let cfg = cached_cfg.clone();
+        let push_cfg = cached_push_cfg.clone();
+        let base_exec_cfg = cached_exec_cfg.clone();
+        let fast_enabled = cached_fast_enabled;
+        let fast_loop_ms = runtime_fast_loop_ms(cfg.loop_interval_ms);
+        let fast_margin = cached_fast_margin;
+        let target_prewarm_ms = cached_target_prewarm_ms;
+        let target_keepalive_ms = cached_target_keepalive_ms;
+        let idle_force_poll_ms = cached_idle_force_poll_ms;
         market_next_due_ms.retain(|k, _| cfg.markets.iter().any(|m| m.eq_ignore_ascii_case(k)));
         for market in &cfg.markets {
             market_next_due_ms
@@ -2389,10 +2428,10 @@ async fn live_runtime_loop(
             let exec_aggr = state.get_live_execution_aggr_state(market_type).await;
             let mut effective_live_execute = cfg.live_execute;
             let mut effective_drain_only = cfg.drain_only;
-            let live_arm_required = live_submit_arm_required();
-            let live_armed = live_submit_armed();
-            let live_submit_allowed = live_submit_effective_armed();
-            let live_hard_kill = live_hard_kill_enabled();
+            let live_arm_required = cached_live_arm_required;
+            let live_armed = cached_live_armed;
+            let live_submit_allowed = cached_live_submit_allowed;
+            let live_hard_kill = cached_live_hard_kill;
             match runtime_control.mode {
                 LiveRuntimeControlMode::Normal => {}
                 LiveRuntimeControlMode::ForcePause => {
@@ -2615,9 +2654,8 @@ async fn live_runtime_loop(
                         effective_drain_only,
                         prefer_action,
                     );
-                    let exec_cfg = LiveExecutionConfig::from_env();
                     let (exec_cfg_tuned, _) = state
-                        .apply_aggressiveness_to_execution_cfg(market_type, &exec_cfg)
+                        .apply_aggressiveness_to_execution_cfg(market_type, &base_exec_cfg)
                         .await;
                     if effective_live_execute || pending_before_count > 0 {
                         reconcile_live_reports(&state, &exec_cfg_tuned).await;
