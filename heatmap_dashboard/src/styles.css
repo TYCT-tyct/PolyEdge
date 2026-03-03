@@ -753,7 +753,7 @@ body {
 
 .live-tables-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
   gap: 10px;
 }
 
@@ -765,7 +765,9 @@ body {
 }
 
 .live-exec-table td,
-.live-event-table td {
+.live-event-table td,
+.live-paper-fill-table td,
+.live-lineage-table td {
   font-size: 12px;
 }
 

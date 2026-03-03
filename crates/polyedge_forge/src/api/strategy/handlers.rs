@@ -5,6 +5,7 @@ pub(super) async fn strategy_paper(
     let source_mode = parse_strategy_paper_source(params.source.as_deref());
     let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
     let symbol = resolve_strategy_symbol(params.symbol.as_deref())?;
+    let baseline_profile = strategy_current_default_profile_name_for_scope(symbol, market_type);
     let _live_source_permit = if matches!(
         source_mode,
         StrategyPaperSource::Live | StrategyPaperSource::Auto
@@ -24,8 +25,8 @@ pub(super) async fn strategy_paper(
         None
     };
 
-    let mut cfg = StrategyRuntimeConfig::default();
-    let mut config_source = "default";
+    let mut cfg = strategy_current_default_config_for_scope(symbol, market_type);
+    let mut config_source = baseline_profile;
     if let Some(profile_raw) = params.profile.as_deref() {
         if let Some((profile_name, profile_cfg)) = strategy_profile_from_alias(profile_raw) {
             cfg = profile_cfg;
@@ -149,7 +150,7 @@ pub(super) async fn strategy_paper(
         }
     }
 
-    let fixed_guard = strategy_fixed_guard_payload(&cfg);
+    let fixed_guard = strategy_fixed_guard_payload(&cfg, config_source);
     let runtime_defaults = LiveRuntimeConfig::from_env();
     let full_history = params.full_history.unwrap_or(false);
     let lookback_minutes = params
@@ -210,6 +211,7 @@ pub(super) async fn strategy_paper(
         max_points,
     )
     .await?;
+    let fee_ctx = strategy_live_fee_context(&state, symbol, market_type).await;
     if samples.len() < 20 {
         return Ok(Json(json!({
             "source": "replay",
@@ -229,6 +231,7 @@ pub(super) async fn strategy_paper(
             "lookback_minutes": lookback_minutes,
             "lookback": strategy_lookback_meta_json(&samples, full_history, lookback_minutes, max_points, 1000),
             "samples": samples.len(),
+            "paper_cost_model": strategy_paper_cost_model_json(&cfg, fee_ctx.as_ref()),
             "current": Value::Null,
             "summary": {
                 "trade_count": 0,
@@ -250,7 +253,7 @@ pub(super) async fn strategy_paper(
         })));
     }
 
-    let run = run_strategy_simulation(&samples, &cfg, max_trades);
+    let run = run_strategy_simulation_with_fee_context(&samples, &cfg, max_trades, fee_ctx.as_ref());
     Ok(Json(json!({
         "source": "replay",
         "execution_target": "paper",
@@ -271,9 +274,10 @@ pub(super) async fn strategy_paper(
         "full_history": full_history,
         "samples": samples.len(),
         "config_source": config_source,
-        "baseline_profile": strategy_current_default_profile_name(),
+        "baseline_profile": baseline_profile,
         "fixed_guard": fixed_guard,
         "config": strategy_cfg_json(&cfg),
+        "paper_cost_model": strategy_paper_cost_model_json(&cfg, fee_ctx.as_ref()),
         "current": run.current,
         "summary": {
             "trade_count": run.trade_count,
@@ -334,6 +338,10 @@ pub(super) async fn strategy_live_reset(
     }
     {
         let mut cache = state.live_rust_book_cache.write().await;
+        cache.clear();
+    }
+    {
+        let mut cache = state.live_official_fee_cache.write().await;
         cache.clear();
     }
     {
@@ -504,6 +512,38 @@ pub(super) struct StrategyLiveEventsQueryParams {
     accepted: Option<bool>,
 }
 
+fn collect_event_latency_values(events: &[Value], key: &str) -> Vec<f64> {
+    events
+        .iter()
+        .filter_map(|ev| ev.get(key).and_then(Value::as_f64))
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .collect()
+}
+
+fn latency_stats_from_samples(samples: &[f64]) -> Value {
+    if samples.is_empty() {
+        return json!({
+            "count": 0,
+            "avg_ms": Value::Null,
+            "p50_ms": Value::Null,
+            "p95_ms": Value::Null,
+            "max_ms": Value::Null
+        });
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let avg = sorted.iter().sum::<f64>() / sorted.len() as f64;
+    let p50_idx = ((sorted.len() - 1) as f64 * 0.50).round() as usize;
+    let p95_idx = ((sorted.len() - 1) as f64 * 0.95).round() as usize;
+    json!({
+        "count": sorted.len(),
+        "avg_ms": avg,
+        "p50_ms": sorted.get(p50_idx).copied(),
+        "p95_ms": sorted.get(p95_idx).copied(),
+        "max_ms": sorted.last().copied()
+    })
+}
+
 pub(super) async fn strategy_live_events(
     State(state): State<ApiState>,
     Query(params): Query<StrategyLiveEventsQueryParams>,
@@ -590,8 +630,6 @@ pub(super) async fn strategy_live_events(
     let mut by_event_type = HashMap::<String, usize>::new();
     let mut accept_count = 0usize;
     let mut reject_like_count = 0usize;
-    let mut order_latency_sum = 0f64;
-    let mut order_latency_n = 0usize;
     for ev in &filtered {
         let reason = ev
             .get("reason")
@@ -622,19 +660,26 @@ pub(super) async fn strategy_live_events(
         {
             reject_like_count += 1;
         }
-        if let Some(lat_ms) = ev.get("order_latency_ms").and_then(Value::as_f64) {
-            order_latency_sum += lat_ms.max(0.0);
-            order_latency_n += 1;
-        }
     }
     let mut reason_top = by_reason.into_iter().collect::<Vec<_>>();
     reason_top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     reason_top.truncate(20);
-    let avg_order_latency_ms = if order_latency_n > 0 {
-        order_latency_sum / order_latency_n as f64
-    } else {
-        0.0
-    };
+    let order_latency = latency_stats_from_samples(&collect_event_latency_values(
+        &filtered,
+        "order_latency_ms",
+    ));
+    let signal_to_submit_latency = latency_stats_from_samples(&collect_event_latency_values(
+        &filtered,
+        "signal_to_submit_ms",
+    ));
+    let signal_to_ack_latency = latency_stats_from_samples(&collect_event_latency_values(
+        &filtered,
+        "signal_to_ack_ms",
+    ));
+    let submit_to_ack_latency = latency_stats_from_samples(&collect_event_latency_values(
+        &filtered,
+        "submit_to_ack_ms",
+    ));
 
     Ok(Json(json!({
         "ok": true,
@@ -652,7 +697,12 @@ pub(super) async fn strategy_live_events(
             "event_count": filtered.len(),
             "accept_count": accept_count,
             "reject_like_count": reject_like_count,
-            "avg_order_latency_ms": avg_order_latency_ms,
+            "latency": {
+                "order_latency_ms": order_latency,
+                "signal_to_submit_ms": signal_to_submit_latency,
+                "signal_to_ack_ms": signal_to_ack_latency,
+                "submit_to_ack_ms": submit_to_ack_latency
+            },
             "reason_top": reason_top,
             "by_action": by_action,
             "by_event_type": by_event_type

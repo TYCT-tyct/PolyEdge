@@ -315,6 +315,7 @@
             side: "UP".to_string(),
             round_id: "r".to_string(),
             decision_key: "k".to_string(),
+            decision_id: "did".to_string(),
             price_cents: 99.0,
             quote_size_usdc: 4.95,
             order_size_shares: 5.0,

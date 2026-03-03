@@ -238,6 +238,7 @@ export interface StrategyLiveExecutionOrder {
   accepted?: boolean;
   endpoint?: string;
   decision_key?: string;
+  decision_id?: string;
   request?: Record<string, unknown>;
   final_request?: Record<string, unknown>;
   response?: Record<string, unknown>;
@@ -250,6 +251,32 @@ export interface StrategyLiveExecutionOrder {
   round_guard_bypassed?: boolean;
   price_trace?: Record<string, unknown>;
   decision?: StrategyLiveDecision;
+}
+
+export interface StrategyLiveOrderLineage {
+  decision_id?: string;
+  order_ids?: string[];
+  pending_order_ids?: string[];
+  pending_count?: number;
+  last_reason?: string;
+  last_event_type?: string;
+  last_status?: string;
+  last_ts_ms?: number;
+}
+
+export interface StrategyLiveExecutionSummary {
+  decision_count?: number;
+  mode?: string;
+  latency?: Record<string, unknown>;
+  price_parity?: Record<string, unknown>;
+  realized_net_pnl_cents?: number;
+  paper_live_fill_count?: number;
+  fills?: {
+    fill_event_count?: number;
+    fill_decision_count?: number;
+    realized_net_pnl_cents?: number;
+    total_fill_cost_cents?: number;
+  };
 }
 
 export interface StrategyLivePositionState {
@@ -379,10 +406,11 @@ export interface StrategyPaperResponse {
     max_drawdown_cents: number;
   };
   live_execution?: {
-    summary?: Record<string, unknown>;
+    summary?: StrategyLiveExecutionSummary;
     decisions?: StrategyLiveDecision[];
     paper_records?: Record<string, unknown>[];
     live_records?: Record<string, unknown>[];
+    order_lineage?: StrategyLiveOrderLineage[];
     parity_check?: {
       status?: "ok" | "dry_run" | "blocked_no_market_target" | "blocked_by_gate_or_state" | "gateway_rejected_all" | string;
       level?: "ok" | "warn" | "critical" | string;

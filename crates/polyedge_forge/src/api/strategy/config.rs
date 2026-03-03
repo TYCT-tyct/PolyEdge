@@ -357,51 +357,119 @@ impl Drop for StrategyHeavyScope {
 
 fn strategy_select_profile_name() -> &'static str {
     if let Ok(raw) = std::env::var("FORGE_STRATEGY_BASE_PROFILE") {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "profit_max" | "manual_profit_max" | "max" | "fev1_manual_profit_max_2026_02_27" => {
-                return STRATEGY_PROFILE_PROFIT_MAX;
-            }
-            "hi_win" | "manual_hi_win" | "safe" | "fev1_manual_hi_win_2026_02_27" => {
-                return STRATEGY_PROFILE_HI_WIN;
-            }
-            "hi_freq" | "manual_hi_freq" | "freq" | "fev1_manual_hi_freq_2026_02_27" => {
-                return STRATEGY_PROFILE_HI_FREQ;
-            }
-            "balanced" | "manual_balanced" | "fev1_manual_balanced_2026_02_28" => {
-                return STRATEGY_PROFILE_BALANCED;
-            }
-            "cand_growth_mix" | "growth_mix" | "growth" | "fev1_cand_growth_mix_2026_02_28" => {
-                return STRATEGY_PROFILE_CAND_GROWTH_MIX;
-            }
-            _ => {}
+        if let Some(profile) = strategy_profile_name_from_alias(raw.trim()) {
+            return profile;
         }
     }
     STRATEGY_PROFILE_HI_WIN
 }
 
-fn strategy_current_default_profile_name() -> &'static str {
+fn strategy_profile_name_from_alias(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "profit_max" | "manual_profit_max" | "max" | "fev1_manual_profit_max_2026_02_27" => {
+            Some(STRATEGY_PROFILE_PROFIT_MAX)
+        }
+        "hi_win" | "manual_hi_win" | "safe" | "safety" | "fev1_manual_hi_win_2026_02_27" => {
+            Some(STRATEGY_PROFILE_HI_WIN)
+        }
+        "hi_freq" | "manual_hi_freq" | "freq" | "fev1_manual_hi_freq_2026_02_27" => {
+            Some(STRATEGY_PROFILE_HI_FREQ)
+        }
+        "balanced" | "manual_balanced" | "fev1_manual_balanced_2026_02_28" => {
+            Some(STRATEGY_PROFILE_BALANCED)
+        }
+        "cand_growth_mix" | "growth_mix" | "growth" | "fev1_cand_growth_mix_2026_02_28" => {
+            Some(STRATEGY_PROFILE_CAND_GROWTH_MIX)
+        }
+        _ => None,
+    }
+}
+
+fn strategy_scope_profile_overrides() -> &'static HashMap<String, &'static str> {
+    static OVERRIDES: OnceLock<HashMap<String, &'static str>> = OnceLock::new();
+    OVERRIDES.get_or_init(|| {
+        let mut out = HashMap::<String, &'static str>::new();
+        let Ok(raw) = std::env::var("FORGE_STRATEGY_BASE_PROFILE_BY_SCOPE") else {
+            return out;
+        };
+        for entry in raw.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+            let Some((scope_raw, profile_raw)) = entry.split_once('=') else {
+                continue;
+            };
+            let scope = scope_raw.trim();
+            let Some(profile) = strategy_profile_name_from_alias(profile_raw.trim()) else {
+                continue;
+            };
+            if let Some((symbol_raw, market_raw)) = scope.split_once(':') {
+                let symbol = normalize_strategy_symbol(symbol_raw);
+                let market = normalize_market_type(market_raw);
+                match (symbol, market) {
+                    (Some(sym), Some(mt)) => {
+                        out.insert(format!("{sym}|{mt}"), profile);
+                    }
+                    (Some(sym), None) => {
+                        out.insert(format!("{sym}|*"), profile);
+                    }
+                    (None, Some(mt)) => {
+                        out.insert(format!("*|{mt}"), profile);
+                    }
+                    (None, None) => {}
+                }
+            } else if let Some(sym) = normalize_strategy_symbol(scope) {
+                out.insert(format!("{sym}|*"), profile);
+            } else if let Some(mt) = normalize_market_type(scope) {
+                out.insert(format!("*|{mt}"), profile);
+            }
+        }
+        out
+    })
+}
+
+fn strategy_profile_name_for_scope(symbol: &str, market_type: &str) -> &'static str {
+    let symbol = normalize_strategy_symbol(symbol).unwrap_or("BTCUSDT");
+    let market_type = normalize_market_type(market_type).unwrap_or("5m");
+    let overrides = strategy_scope_profile_overrides();
+    if let Some(profile) = overrides.get(&format!("{symbol}|{market_type}")) {
+        return profile;
+    }
+    if let Some(profile) = overrides.get(&format!("{symbol}|*")) {
+        return profile;
+    }
+    if let Some(profile) = overrides.get(&format!("*|{market_type}")) {
+        return profile;
+    }
     strategy_select_profile_name()
 }
 
+pub(super) fn strategy_current_default_profile_name_for_scope(
+    symbol: &str,
+    market_type: &str,
+) -> &'static str {
+    strategy_profile_name_for_scope(symbol, market_type)
+}
+
 fn strategy_profile_from_alias(raw: &str) -> Option<(&'static str, StrategyRuntimeConfig)> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "profit_max" | "manual_profit_max" | "max" | "fev1_manual_profit_max_2026_02_27" => {
-            Some((STRATEGY_PROFILE_PROFIT_MAX, strategy_profit_max_config()))
-        }
-        "hi_win" | "manual_hi_win" | "safe" | "safety" | "fev1_manual_hi_win_2026_02_27" => {
-            Some((STRATEGY_PROFILE_HI_WIN, strategy_hi_win_config()))
-        }
-        "hi_freq" | "manual_hi_freq" | "freq" | "fev1_manual_hi_freq_2026_02_27" => {
-            Some((STRATEGY_PROFILE_HI_FREQ, strategy_hi_freq_config()))
-        }
-        "balanced" | "manual_balanced" | "fev1_manual_balanced_2026_02_28" => {
-            Some((STRATEGY_PROFILE_BALANCED, strategy_balanced_config()))
-        }
-        "cand_growth_mix" | "growth_mix" | "growth" | "fev1_cand_growth_mix_2026_02_28" => Some((
-            STRATEGY_PROFILE_CAND_GROWTH_MIX,
-            strategy_cand_growth_mix_config(),
-        )),
-        _ => None,
+    let profile = strategy_profile_name_from_alias(raw)?;
+    let cfg = match profile {
+        STRATEGY_PROFILE_HI_WIN => strategy_hi_win_config(),
+        STRATEGY_PROFILE_HI_FREQ => strategy_hi_freq_config(),
+        STRATEGY_PROFILE_BALANCED => strategy_balanced_config(),
+        STRATEGY_PROFILE_CAND_GROWTH_MIX => strategy_cand_growth_mix_config(),
+        _ => strategy_profit_max_config(),
+    };
+    Some((profile, cfg))
+}
+
+pub(super) fn strategy_current_default_config_for_scope(
+    symbol: &str,
+    market_type: &str,
+) -> StrategyRuntimeConfig {
+    match strategy_current_default_profile_name_for_scope(symbol, market_type) {
+        STRATEGY_PROFILE_HI_WIN => strategy_hi_win_config(),
+        STRATEGY_PROFILE_HI_FREQ => strategy_hi_freq_config(),
+        STRATEGY_PROFILE_BALANCED => strategy_balanced_config(),
+        STRATEGY_PROFILE_CAND_GROWTH_MIX => strategy_cand_growth_mix_config(),
+        _ => strategy_profit_max_config(),
     }
 }
 
@@ -417,21 +485,20 @@ fn strategy_env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-fn strategy_cfg_hash(cfg: &StrategyRuntimeConfig) -> String {
+fn strategy_cfg_hash(cfg: &StrategyRuntimeConfig, profile_name: &str) -> String {
     let mut hasher = Sha256::new();
-    let profile = strategy_current_default_profile_name();
     let canonical = serde_json::to_string(&strategy_cfg_json(cfg)).unwrap_or_default();
-    hasher.update(profile.as_bytes());
+    hasher.update(profile_name.as_bytes());
     hasher.update(b"|");
     hasher.update(canonical.as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
-fn strategy_fixed_guard_payload(cfg: &StrategyRuntimeConfig) -> Value {
+fn strategy_fixed_guard_payload(cfg: &StrategyRuntimeConfig, profile_name: &str) -> Value {
     let enabled = strategy_env_bool("FORGE_STRATEGY_FIXED_GUARD_ENABLED", true);
     let enforce_live = strategy_env_bool("FORGE_STRATEGY_FIXED_GUARD_ENFORCE_LIVE", true);
     let allow_mismatch = strategy_env_bool("FORGE_STRATEGY_FIXED_GUARD_ALLOW_MISMATCH", false);
-    let current_hash = strategy_cfg_hash(cfg);
+    let current_hash = strategy_cfg_hash(cfg, profile_name);
     let expected_hash = std::env::var("FORGE_STRATEGY_FIXED_GUARD_EXPECTED_HASH")
         .ok()
         .map(|v| v.trim().to_ascii_lowercase())
@@ -459,7 +526,7 @@ fn strategy_fixed_guard_payload(cfg: &StrategyRuntimeConfig) -> Value {
         "enforce_live": enforce_live,
         "allow_mismatch": allow_mismatch,
         "mode": mode,
-        "profile": strategy_current_default_profile_name(),
+        "profile": profile_name,
         "current_hash": current_hash,
         "expected_hash": expected_hash,
         "mismatch": mismatch,
@@ -721,13 +788,7 @@ fn strategy_cand_growth_mix_config() -> StrategyRuntimeConfig {
 }
 
 pub(super) fn strategy_current_default_config() -> StrategyRuntimeConfig {
-    match strategy_select_profile_name() {
-        STRATEGY_PROFILE_HI_WIN => strategy_hi_win_config(),
-        STRATEGY_PROFILE_HI_FREQ => strategy_hi_freq_config(),
-        STRATEGY_PROFILE_BALANCED => strategy_balanced_config(),
-        STRATEGY_PROFILE_CAND_GROWTH_MIX => strategy_cand_growth_mix_config(),
-        _ => strategy_profit_max_config(),
-    }
+    strategy_current_default_config_for_scope("BTCUSDT", "5m")
 }
 
 impl Default for StrategyRuntimeConfig {

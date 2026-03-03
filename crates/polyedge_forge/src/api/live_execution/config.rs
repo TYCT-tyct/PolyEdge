@@ -172,6 +172,12 @@ const LIVE_MAX_COMPLETED_TRADES_DEFAULT: usize = 0;
 const LIVE_MAX_COMPLETED_TRADES_MIN: usize = 0;
 const LIVE_MAX_COMPLETED_TRADES_MAX: usize = 1_000;
 const LIVE_ALLOW_ADDS_DEFAULT: bool = true;
+const LIVE_SIGNAL_ENTRY_FRESHNESS_MS_DEFAULT: i64 = 2_000;
+const LIVE_SIGNAL_ENTRY_FRESHNESS_MS_MIN: i64 = 200;
+const LIVE_SIGNAL_ENTRY_FRESHNESS_MS_MAX: i64 = 60_000;
+const LIVE_SIGNAL_EXIT_FRESHNESS_MS_DEFAULT: i64 = 5_000;
+const LIVE_SIGNAL_EXIT_FRESHNESS_MS_MIN: i64 = 500;
+const LIVE_SIGNAL_EXIT_FRESHNESS_MS_MAX: i64 = 120_000;
 
 #[derive(Debug, Clone)]
 struct CachedLiveMarketTarget {
@@ -429,6 +435,28 @@ fn live_allow_add_orders() -> bool {
             )
         })
         .unwrap_or(LIVE_ALLOW_ADDS_DEFAULT)
+}
+
+pub(super) fn live_signal_entry_freshness_ms() -> i64 {
+    std::env::var("FORGE_FEV1_LIVE_SIGNAL_ENTRY_FRESHNESS_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(LIVE_SIGNAL_ENTRY_FRESHNESS_MS_DEFAULT)
+        .clamp(
+            LIVE_SIGNAL_ENTRY_FRESHNESS_MS_MIN,
+            LIVE_SIGNAL_ENTRY_FRESHNESS_MS_MAX,
+        )
+}
+
+pub(super) fn live_signal_exit_freshness_ms() -> i64 {
+    std::env::var("FORGE_FEV1_LIVE_SIGNAL_EXIT_FRESHNESS_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(LIVE_SIGNAL_EXIT_FRESHNESS_MS_DEFAULT)
+        .clamp(
+            LIVE_SIGNAL_EXIT_FRESHNESS_MS_MIN,
+            LIVE_SIGNAL_EXIT_FRESHNESS_MS_MAX,
+        )
 }
 
 fn live_fixed_entry_size_shares() -> Option<f64> {

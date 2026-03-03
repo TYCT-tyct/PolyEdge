@@ -227,6 +227,7 @@ pub(super) fn strategy_sample_from_snapshot_event(
 pub(super) struct StrategySimulationResult {
     current: Value,
     trades: Vec<Value>,
+    signal_decisions: Vec<Value>,
     trade_count: usize,
     win_rate_pct: f64,
     avg_pnl_cents: f64,
@@ -290,10 +291,79 @@ pub(super) fn strategy_cfg_json(cfg: &StrategyRuntimeConfig) -> Value {
     })
 }
 
+fn strategy_official_fee_enabled() -> bool {
+    std::env::var("FORGE_STRATEGY_OFFICIAL_FEE_ENABLED")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(true)
+}
+
+pub(super) async fn strategy_live_fee_context(
+    state: &ApiState,
+    symbol: &str,
+    market_type: &str,
+) -> Option<fev1::FeeModelContext> {
+    if !strategy_official_fee_enabled() {
+        return None;
+    }
+    let target = resolve_live_market_target_fast_with_state(state, symbol, market_type)
+        .await
+        .ok()?;
+    let up_taker_fee_bps = get_official_fee_bps_for_token(state, &target.token_id_yes).await;
+    let down_taker_fee_bps = get_official_fee_bps_for_token(state, &target.token_id_no).await;
+    if up_taker_fee_bps.is_none() && down_taker_fee_bps.is_none() {
+        return None;
+    }
+    Some(fev1::FeeModelContext {
+        up_taker_fee_bps,
+        down_taker_fee_bps,
+    })
+}
+
+pub(super) fn strategy_paper_cost_model_json(
+    cfg: &StrategyRuntimeConfig,
+    fee_ctx: Option<&fev1::FeeModelContext>,
+) -> Value {
+    json!({
+        "engine": "fev1_simulated_cost_model",
+        "official_exchange_fill_model": false,
+        "notes": [
+            "paper cost is heuristic simulation, not official exchange fill replay",
+            "calibrate with live price_parity and latency metrics before widening size"
+        ],
+        "components": {
+            "entry_price_cents": "ask_raw + slippage + fee + impact",
+            "exit_price_cents": "bid_raw - slippage - fee - impact",
+            "slippage_cents_per_side": cfg.slippage_cents_per_side,
+            "fee_cents_per_side_base": cfg.fee_cents_per_side,
+            "fee_model": if let Some(ctx) = fee_ctx {
+                json!({
+                    "mode": "official_fee_rate_bps",
+                    "up_taker_fee_bps": ctx.up_taker_fee_bps,
+                    "down_taker_fee_bps": ctx.down_taker_fee_bps,
+                    "fallback": "dynamic_taker_fee_cents(price_cents)"
+                })
+            } else {
+                json!({
+                    "mode": "dynamic_taker_fee_curve",
+                    "formula": "dynamic_taker_fee_cents(price_cents)"
+                })
+            },
+            "impact_model": "execution_impact_cents(sample, side, cfg, remaining_ms, emergency)"
+        }
+    })
+}
+
 pub(super) struct StrategyPaperLiveReq<'a> {
     pub(super) state: &'a ApiState,
     pub(super) symbol: &'a str,
     pub(super) market_type: &'a str,
+    pub(super) baseline_profile: &'a str,
     pub(super) full_history: bool,
     pub(super) lookback_minutes: u32,
     pub(super) max_points: u32,
@@ -311,6 +381,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         state,
         symbol,
         market_type,
+        baseline_profile,
         full_history,
         lookback_minutes,
         max_points,
@@ -323,7 +394,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         live_drain_only,
     } = req;
 
-    let fixed_guard = strategy_fixed_guard_payload(cfg);
+    let fixed_guard = strategy_fixed_guard_payload(cfg, config_source);
     let runtime_defaults = LiveRuntimeConfig::from_env();
     let live_enabled = fev1::ExecutionGate::from_env().live_enabled;
     let live_allowed = live_execution_market_allowed(market_type);
@@ -369,6 +440,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         )
         .await?
     };
+    let fee_ctx = strategy_live_fee_context(state, sample_symbol, market_type).await;
 
     if samples.len() < 20 {
         return Ok(json!({
@@ -397,9 +469,10 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
             "live_max_orders": live_max_orders,
             "samples": samples.len(),
             "config_source": config_source,
-            "baseline_profile": strategy_current_default_profile_name(),
+            "baseline_profile": baseline_profile,
             "fixed_guard": fixed_guard,
             "config": strategy_cfg_json(cfg),
+            "paper_cost_model": strategy_paper_cost_model_json(cfg, fee_ctx.as_ref()),
             "current": Value::Null,
             "summary": {
                 "trade_count": 0,
@@ -422,10 +495,17 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                 "execution_penalty_cents_total": 0.0,
             },
             "trades": [],
+            "signal_decisions": [],
             "live_execution": {
                 "summary": {
                     "decision_count": 0,
                     "mode": if live_execute_effective { "live_ready" } else { "paper_only" },
+                    "latency": {
+                        "signal_to_submit_ms": { "count": 0, "avg_ms": Value::Null, "p50_ms": Value::Null, "p95_ms": Value::Null, "max_ms": Value::Null },
+                        "signal_to_ack_ms": { "count": 0, "avg_ms": Value::Null, "p50_ms": Value::Null, "p95_ms": Value::Null, "max_ms": Value::Null },
+                        "submit_to_ack_ms": { "count": 0, "avg_ms": Value::Null, "p50_ms": Value::Null, "p95_ms": Value::Null, "max_ms": Value::Null },
+                        "order_latency_ms": { "count": 0, "avg_ms": Value::Null, "p50_ms": Value::Null, "p95_ms": Value::Null, "max_ms": Value::Null }
+                    }
                 },
                 "decisions": [],
                 "paper_records": [],
@@ -469,7 +549,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         }));
     }
 
-    let run = run_strategy_simulation(&samples, cfg, max_trades);
+    let run = run_strategy_simulation_with_fee_context(&samples, cfg, max_trades, fee_ctx.as_ref());
     Ok(json!({
         "source": "live",
         "execution_target": "live",
@@ -496,9 +576,10 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         "live_max_orders": live_max_orders,
         "samples": samples.len(),
         "config_source": config_source,
-        "baseline_profile": strategy_current_default_profile_name(),
+        "baseline_profile": baseline_profile,
         "fixed_guard": fixed_guard,
         "config": strategy_cfg_json(cfg),
+        "paper_cost_model": strategy_paper_cost_model_json(cfg, fee_ctx.as_ref()),
         "current": run.current,
         "summary": {
             "trade_count": run.trade_count,
@@ -521,10 +602,17 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
             "execution_penalty_cents_total": run.execution_penalty_cents_total,
         },
         "trades": run.trades,
+        "signal_decisions": run.signal_decisions,
         "live_execution": {
             "summary": {
                 "decision_count": 0,
                 "mode": if live_execute_effective { "signal_only" } else { "dry_run" },
+                "latency": {
+                    "signal_to_submit_ms": { "count": 0, "avg_ms": Value::Null, "p50_ms": Value::Null, "p95_ms": Value::Null, "max_ms": Value::Null },
+                    "signal_to_ack_ms": { "count": 0, "avg_ms": Value::Null, "p50_ms": Value::Null, "p95_ms": Value::Null, "max_ms": Value::Null },
+                    "submit_to_ack_ms": { "count": 0, "avg_ms": Value::Null, "p50_ms": Value::Null, "p95_ms": Value::Null, "max_ms": Value::Null },
+                    "order_latency_ms": { "count": 0, "avg_ms": Value::Null, "p50_ms": Value::Null, "p95_ms": Value::Null, "max_ms": Value::Null }
+                }
             },
             "decisions": [],
             "paper_records": [],
@@ -639,6 +727,7 @@ pub(super) fn map_simulation_result(run: fev1::SimulationResult) -> StrategySimu
     StrategySimulationResult {
         current: run.current,
         trades: run.trades,
+        signal_decisions: run.signal_decisions,
         trade_count: run.trade_count,
         win_rate_pct: run.win_rate_pct,
         avg_pnl_cents: run.avg_pnl_cents,
@@ -660,22 +749,47 @@ pub(super) fn map_simulation_result(run: fev1::SimulationResult) -> StrategySimu
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn run_strategy_simulation(
     samples: &[StrategySample],
     cfg: &StrategyRuntimeConfig,
     max_trades: usize,
 ) -> StrategySimulationResult {
-    let mapped_samples = map_samples_to_fev1(samples);
-    run_strategy_simulation_on_mapped(&mapped_samples, cfg, max_trades)
+    run_strategy_simulation_with_fee_context(samples, cfg, max_trades, None)
 }
 
+pub(super) fn run_strategy_simulation_with_fee_context(
+    samples: &[StrategySample],
+    cfg: &StrategyRuntimeConfig,
+    max_trades: usize,
+    fee_ctx: Option<&fev1::FeeModelContext>,
+) -> StrategySimulationResult {
+    let mapped_samples = map_samples_to_fev1(samples);
+    run_strategy_simulation_on_mapped_with_fee_context(&mapped_samples, cfg, max_trades, fee_ctx)
+}
+
+#[allow(dead_code)]
 pub(super) fn run_strategy_simulation_on_mapped(
     mapped_samples: &[fev1::Sample],
     cfg: &StrategyRuntimeConfig,
     max_trades: usize,
 ) -> StrategySimulationResult {
+    run_strategy_simulation_on_mapped_with_fee_context(mapped_samples, cfg, max_trades, None)
+}
+
+pub(super) fn run_strategy_simulation_on_mapped_with_fee_context(
+    mapped_samples: &[fev1::Sample],
+    cfg: &StrategyRuntimeConfig,
+    max_trades: usize,
+    fee_ctx: Option<&fev1::FeeModelContext>,
+) -> StrategySimulationResult {
     let mapped_cfg = map_cfg_to_fev1(cfg);
-    map_simulation_result(fev1::simulate(mapped_samples, &mapped_cfg, max_trades))
+    map_simulation_result(fev1::simulate_with_fee_context(
+        mapped_samples,
+        &mapped_cfg,
+        max_trades,
+        fee_ctx,
+    ))
 }
 
 pub(super) async fn load_strategy_samples(

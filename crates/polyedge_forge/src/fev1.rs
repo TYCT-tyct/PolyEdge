@@ -87,10 +87,17 @@ pub struct RuntimeConfig {
     pub vic_spread_relax_max: f64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FeeModelContext {
+    pub up_taker_fee_bps: Option<u32>,
+    pub down_taker_fee_bps: Option<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SimulationResult {
     pub current: Value,
     pub trades: Vec<Value>,
+    pub signal_decisions: Vec<Value>,
     pub trade_count: usize,
     pub win_rate_pct: f64,
     pub avg_pnl_cents: f64,
@@ -109,6 +116,16 @@ pub struct SimulationResult {
     pub total_impact_cents: f64,
     pub total_cost_cents: f64,
     pub net_margin_pct: f64,
+}
+
+fn decision_id(action: &str, side: Side, round_id: &str, ts_ms: i64) -> String {
+    format!(
+        "fev1:{}:{}:{}:{}",
+        action.to_ascii_lowercase(),
+        side.as_str().to_ascii_uppercase(),
+        round_id,
+        ts_ms
+    )
 }
 
 #[allow(dead_code)]
@@ -257,6 +274,28 @@ fn dynamic_taker_fee_cents(price_cents: f64) -> f64 {
     let fee_usdc = (price_cents / 100.0) * fee_rate;
     let fee_usdc_rounded_4dp = (fee_usdc * 10_000.0).round() / 10_000.0;
     (fee_usdc_rounded_4dp * 100.0).clamp(0.0, 12.0)
+}
+
+fn fee_cents_from_bps(price_cents: f64, fee_bps: u32) -> f64 {
+    if !price_cents.is_finite() || price_cents <= 0.0 {
+        return 0.0;
+    }
+    let rate = (fee_bps as f64 / 10_000.0).clamp(0.0, 0.99);
+    let fee_usdc = (price_cents / 100.0) * rate;
+    let fee_usdc_rounded_4dp = (fee_usdc * 10_000.0).round() / 10_000.0;
+    (fee_usdc_rounded_4dp * 100.0).clamp(0.0, 12.0)
+}
+
+fn taker_fee_cents(price_cents: f64, side: Side, fee_ctx: Option<&FeeModelContext>) -> f64 {
+    let fee_bps = fee_ctx.and_then(|ctx| match side {
+        Side::Up => ctx.up_taker_fee_bps,
+        Side::Down => ctx.down_taker_fee_bps,
+    });
+    if let Some(bps) = fee_bps {
+        fee_cents_from_bps(price_cents, bps)
+    } else {
+        dynamic_taker_fee_cents(price_cents)
+    }
 }
 
 fn side_bid(sample: &Sample, side: Side) -> f64 {
@@ -435,11 +474,22 @@ fn max_drawdown_from_pnls(pnls: &[f64]) -> f64 {
     max_dd.max(0.0)
 }
 
+#[allow(dead_code)]
 pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> SimulationResult {
+    simulate_with_fee_context(samples, cfg, max_trades, None)
+}
+
+pub fn simulate_with_fee_context(
+    samples: &[Sample],
+    cfg: &RuntimeConfig,
+    max_trades: usize,
+    fee_ctx: Option<&FeeModelContext>,
+) -> SimulationResult {
     let mut p_hist = VecDeque::<f64>::with_capacity(24);
     let mut score_hist = VecDeque::<f64>::with_capacity(24);
     let mut position: Option<Position> = None;
     let mut trades = Vec::<Value>::new();
+    let mut signal_decisions = Vec::<Value>::new();
     let mut entries_by_round: HashMap<String, usize> = HashMap::new();
     let mut last_exit_ts_ms = 0_i64;
     let mut blocked_exits = 0usize;
@@ -487,7 +537,7 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
         if let Some(pos) = position.as_mut() {
             let bid_raw = side_bid(sample, pos.side) * 100.0;
             let spread_side_cents = side_spread(sample, pos.side) * 100.0;
-            let exit_fee = cfg.fee_cents_per_side + dynamic_taker_fee_cents(bid_raw);
+            let exit_fee = cfg.fee_cents_per_side + taker_fee_cents(bid_raw, pos.side, fee_ctx);
             let mut exit_impact_cents =
                 execution_impact_cents(sample, pos.side, cfg, sample.remaining_ms, false);
             let mut exit_exec =
@@ -636,6 +686,43 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
                     "exit_spread_cents": spread_side_cents,
                     "loss_cluster_streak_after_exit": loss_cluster_streak,
                 }));
+                let final_reason = if escalated_for_blocked_exit {
+                    "blocked_exit_escalation"
+                } else {
+                    reason
+                };
+                let final_reason_lc = final_reason.to_ascii_lowercase();
+                let take_profit_exit = final_reason_lc.contains("take_profit");
+                let emergency_exit = matches!(
+                    final_reason_lc.as_str(),
+                    "stop_loss"
+                        | "signal_reverse"
+                        | "trail_drawdown"
+                        | "liquidity_widen"
+                        | "round_rollover"
+                );
+                let (exit_tif, exit_style, exit_ttl_ms, exit_slippage_bps) =
+                    if take_profit_exit && !emergency_exit && sample.remaining_ms > 30_000 {
+                        ("GTD", "maker", 1_100_i64, 10.0_f64)
+                    } else if sample.remaining_ms <= 30_000 {
+                        ("FAK", "taker", 900_i64, 30.0_f64)
+                    } else {
+                        ("FAK", "taker", 1_000_i64, 22.0_f64)
+                    };
+                signal_decisions.push(json!({
+                    "decision_id": decision_id("exit", pos.side, &sample.round_id, sample.ts_ms),
+                    "action": "exit",
+                    "side": pos.side.as_str(),
+                    "round_id": sample.round_id,
+                    "ts_ms": sample.ts_ms,
+                    "reason": final_reason,
+                    "price_cents": bid_raw.clamp(1.0, 99.0),
+                    "remaining_ms": sample.remaining_ms,
+                    "tif": exit_tif,
+                    "style": exit_style,
+                    "ttl_ms": exit_ttl_ms,
+                    "max_slippage_bps": exit_slippage_bps
+                }));
                 trade_id += 1;
                 position = None;
                 last_exit_ts_ms = sample.ts_ms;
@@ -671,7 +758,7 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
             let confidence_ok = fair_conf >= 0.56;
             let spread_ok = sample.spread_mid <= dynamic_spread_limit_prob
                 && spread_side_cents <= dynamic_max_exec_spread;
-            let fee = cfg.fee_cents_per_side + dynamic_taker_fee_cents(ask_raw);
+            let fee = cfg.fee_cents_per_side + taker_fee_cents(ask_raw, side, fee_ctx);
             let entry_impact_cents =
                 execution_impact_cents(sample, side, cfg, sample.remaining_ms, false);
             let entry_exec = ask_raw + cfg.slippage_cents_per_side + fee + entry_impact_cents;
@@ -705,6 +792,31 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
                     blocked_exit_streak: 0,
                     soft_stop_pending_ticks: 0,
                 });
+                let entry_reason = "fev1_signal_entry";
+                let entry_score = score.abs();
+                let (entry_tif, entry_style, entry_ttl_ms, entry_slippage_bps) =
+                    if sample.remaining_ms <= 120_000 || entry_score >= 0.80 {
+                        ("FAK", "taker", 900_i64, 24.0_f64)
+                    } else {
+                        ("GTD", "maker", 900_i64, 10.0_f64)
+                    };
+                signal_decisions.push(json!({
+                    "decision_id": decision_id("enter", side, &sample.round_id, sample.ts_ms),
+                    "action": "enter",
+                    "side": side.as_str(),
+                    "round_id": sample.round_id,
+                    "ts_ms": sample.ts_ms,
+                    "reason": entry_reason,
+                    "price_cents": ask_raw.clamp(1.0, 99.0),
+                    "entry_score": entry_score,
+                    "edge_score": entry_score,
+                    "entry_remaining_ms": sample.remaining_ms,
+                    "remaining_ms": sample.remaining_ms,
+                    "tif": entry_tif,
+                    "style": entry_style,
+                    "ttl_ms": entry_ttl_ms,
+                    "max_slippage_bps": entry_slippage_bps
+                }));
                 *entries_by_round.entry(sample.round_id.clone()).or_insert(0) += 1;
                 total_entries = total_entries.saturating_add(1);
             }
@@ -722,7 +834,7 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
 
     if let (Some(pos), Some(last)) = (position.take(), samples.last()) {
         let bid_raw = side_bid(last, pos.side) * 100.0;
-        let exit_fee = cfg.fee_cents_per_side + dynamic_taker_fee_cents(bid_raw);
+        let exit_fee = cfg.fee_cents_per_side + taker_fee_cents(bid_raw, pos.side, fee_ctx);
         let exit_impact_cents =
             execution_impact_cents(last, pos.side, cfg, last.remaining_ms, false);
         let exit_exec = bid_raw - cfg.slippage_cents_per_side - exit_fee - exit_impact_cents;
@@ -885,6 +997,7 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
     SimulationResult {
         current,
         trades: trades_view,
+        signal_decisions,
         trade_count,
         win_rate_pct,
         avg_pnl_cents,
@@ -906,191 +1019,9 @@ pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> S
     }
 }
 
-pub fn build_live_decisions_from_trades(trades: &[Value], quote: f64) -> Vec<Value> {
-    let mut decisions: Vec<Value> = Vec::with_capacity(trades.len().saturating_mul(2));
-    for trade in trades {
-        let side = trade
-            .get("side")
-            .and_then(Value::as_str)
-            .unwrap_or("UP")
-            .to_ascii_uppercase();
-        let round_id = trade
-            .get("entry_round_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let entry_ts_ms = trade
-            .get("entry_ts_ms")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        let exit_ts_ms = trade.get("exit_ts_ms").and_then(Value::as_i64).unwrap_or(0);
-        let entry_reason = trade
-            .get("entry_reason")
-            .and_then(Value::as_str)
-            .unwrap_or("fev1_signal_entry");
-        let exit_reason = trade
-            .get("exit_reason")
-            .and_then(Value::as_str)
-            .unwrap_or("strategy_exit");
-        let entry_price_cents = trade
-            .get("entry_price_raw_cents")
-            .and_then(Value::as_f64)
-            .or_else(|| trade.get("entry_price_cents").and_then(Value::as_f64))
-            .unwrap_or(50.0)
-            .clamp(1.0, 99.0);
-        let exit_price_cents = trade
-            .get("exit_price_raw_cents")
-            .and_then(Value::as_f64)
-            .or_else(|| trade.get("exit_price_cents").and_then(Value::as_f64))
-            .unwrap_or(50.0)
-            .clamp(1.0, 99.0);
-        let entry_score = trade
-            .get("entry_score")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0)
-            .abs();
-        let entry_remaining_ms = trade
-            .get("entry_remaining_ms")
-            .and_then(Value::as_i64)
-            .unwrap_or(0)
-            .max(0);
-        let exit_remaining_ms = trade
-            .get("exit_remaining_ms")
-            .and_then(Value::as_i64)
-            .unwrap_or(0)
-            .max(0);
-        let (entry_tif, entry_style, entry_ttl_ms, entry_slippage_bps) =
-            if entry_remaining_ms <= 120_000 || entry_score >= 0.80 {
-                ("FAK", "taker", 900_i64, 24.0_f64)
-            } else {
-                ("GTD", "maker", 900_i64, 10.0_f64)
-            };
-        let exit_reason_lc = exit_reason.to_ascii_lowercase();
-        let take_profit_exit = exit_reason_lc.contains("take_profit");
-        let emergency_exit = matches!(
-            exit_reason_lc.as_str(),
-            "stop_loss"
-                | "signal_reverse"
-                | "trail_drawdown"
-                | "liquidity_widen"
-                | "round_rollover"
-        );
-        let (exit_tif, exit_style, exit_ttl_ms, exit_slippage_bps) =
-            if take_profit_exit && !emergency_exit && exit_remaining_ms > 30_000 {
-                ("GTD", "maker", 1_100_i64, 10.0_f64)
-            } else if exit_remaining_ms <= 30_000 {
-                ("FAK", "taker", 900_i64, 30.0_f64)
-            } else {
-                ("FAK", "taker", 1_000_i64, 22.0_f64)
-            };
-
-        if entry_ts_ms > 0 {
-            decisions.push(json!({
-                "action": "enter",
-                "side": side,
-                "round_id": round_id,
-                "ts_ms": entry_ts_ms,
-                "reason": entry_reason,
-                "quote_size_usdc": quote,
-                "price_cents": entry_price_cents,
-                "entry_score": entry_score,
-                "edge_score": entry_score,
-                "entry_remaining_ms": entry_remaining_ms,
-                "remaining_ms": entry_remaining_ms,
-                "tif": entry_tif,
-                "style": entry_style,
-                "ttl_ms": entry_ttl_ms,
-                "max_slippage_bps": entry_slippage_bps
-            }));
-        }
-        if exit_ts_ms > 0 && !is_replay_only_exit_reason(exit_reason) {
-            decisions.push(json!({
-                "action": "exit",
-                "side": side,
-                "round_id": round_id,
-                "ts_ms": exit_ts_ms,
-                "reason": exit_reason,
-                "quote_size_usdc": quote,
-                "price_cents": exit_price_cents,
-                "remaining_ms": exit_remaining_ms,
-                "tif": exit_tif,
-                "style": exit_style,
-                "ttl_ms": exit_ttl_ms,
-                "max_slippage_bps": exit_slippage_bps
-            }));
-        }
-    }
-    decisions.sort_by_key(|d| d.get("ts_ms").and_then(Value::as_i64).unwrap_or(0));
-    decisions
-}
-
-#[inline]
-#[cfg_attr(not(test), allow(dead_code))]
-fn is_replay_only_exit_reason(reason: &str) -> bool {
-    reason
-        .trim()
-        .eq_ignore_ascii_case("end_of_samples_force_close")
-}
-
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
-    use super::{build_live_decisions_from_trades, simulate, RuntimeConfig, Sample};
-
-    #[test]
-    fn replay_only_force_close_is_filtered_out_from_execution_decisions() {
-        let trades = vec![json!({
-            "id": 1,
-            "side": "UP",
-            "entry_round_id": "r-1",
-            "entry_ts_ms": 1000_i64,
-            "exit_ts_ms": 1300_i64,
-            "entry_reason": "fev1_signal_entry",
-            "exit_reason": "end_of_samples_force_close",
-            "entry_price_raw_cents": 52.0,
-            "exit_price_raw_cents": 54.0,
-            "entry_remaining_ms": 120_000_i64,
-            "exit_remaining_ms": 85_000_i64
-        })];
-        let decisions = build_live_decisions_from_trades(&trades, 1.0);
-        assert_eq!(
-            decisions.len(),
-            1,
-            "replay-only exit should not generate live decision"
-        );
-        assert_eq!(
-            decisions[0].get("action").and_then(|v| v.as_str()),
-            Some("enter")
-        );
-    }
-
-    #[test]
-    fn normal_exit_is_kept_for_live_execution_decisions() {
-        let trades = vec![json!({
-            "id": 2,
-            "side": "DOWN",
-            "entry_round_id": "r-2",
-            "entry_ts_ms": 2000_i64,
-            "exit_ts_ms": 2800_i64,
-            "entry_reason": "fev1_signal_entry",
-            "exit_reason": "signal_reverse",
-            "entry_price_raw_cents": 48.0,
-            "exit_price_raw_cents": 44.0,
-            "entry_remaining_ms": 150_000_i64,
-            "exit_remaining_ms": 110_000_i64
-        })];
-        let decisions = build_live_decisions_from_trades(&trades, 1.0);
-        assert_eq!(decisions.len(), 2);
-        assert_eq!(
-            decisions[0].get("action").and_then(|v| v.as_str()),
-            Some("enter")
-        );
-        assert_eq!(
-            decisions[1].get("action").and_then(|v| v.as_str()),
-            Some("exit")
-        );
-    }
+    use super::{simulate, RuntimeConfig, Sample};
 
     #[test]
     fn blocked_non_emergency_exits_are_escalated() {
@@ -1215,6 +1146,37 @@ mod tests {
                 .unwrap_or(false)
         });
         assert!(has_escalation, "expected blocked_exit_escalation trade");
+        assert!(
+            !run.signal_decisions.is_empty(),
+            "expected signal decisions from simulation"
+        );
+        assert!(
+            run.signal_decisions.iter().all(|d| {
+                d.get("decision_id")
+                    .and_then(|v| v.as_str())
+                    .map(|v| !v.trim().is_empty())
+                    .unwrap_or(false)
+            }),
+            "every signal decision should carry a non-empty decision_id"
+        );
+        assert!(
+            run.signal_decisions.iter().any(|d| {
+                d.get("action")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.eq_ignore_ascii_case("enter"))
+                    .unwrap_or(false)
+            }),
+            "expected at least one enter decision"
+        );
+        assert!(
+            run.signal_decisions.iter().any(|d| {
+                d.get("action")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.eq_ignore_ascii_case("exit"))
+                    .unwrap_or(false)
+            }),
+            "expected at least one exit decision"
+        );
     }
 
     #[test]

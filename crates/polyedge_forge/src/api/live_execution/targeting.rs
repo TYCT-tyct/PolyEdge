@@ -574,9 +574,9 @@ pub(super) fn select_live_decisions(
                 .unwrap_or_default()
                 .to_ascii_lowercase();
             let freshness_ms = if action == "enter" || action == "add" {
-                20_000
+                live_signal_entry_freshness_ms()
             } else {
-                90_000
+                live_signal_exit_freshness_ms()
             };
             let round_ok = d
                 .get("round_id")
@@ -607,9 +607,9 @@ pub(super) fn select_live_decisions(
                 .unwrap_or_default()
                 .to_ascii_lowercase();
             let freshness_ms = if action == "enter" || action == "add" {
-                20_000
+                live_signal_entry_freshness_ms()
             } else {
-                90_000
+                live_signal_exit_freshness_ms()
             };
             let action_ok = if drain_only {
                 action == "exit" || action == "reduce"

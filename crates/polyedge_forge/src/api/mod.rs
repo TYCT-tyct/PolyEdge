@@ -1,5 +1,5 @@
 use std::cmp::min;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::str::FromStr;
@@ -87,6 +87,7 @@ struct ApiState {
     live_execution_aggr_states: Arc<RwLock<HashMap<String, LiveExecutionAggState>>>,
     live_rust_executor: Arc<RwLock<Option<Arc<RustExecutorContext>>>>,
     live_rust_book_cache: Arc<RwLock<HashMap<String, RustBookCacheEntry>>>,
+    live_official_fee_cache: Arc<RwLock<HashMap<String, RustFeeRateCacheEntry>>>,
     runtime_alert_throttle: Arc<RwLock<HashMap<String, i64>>>,
     runtime_daily_report_sent: Arc<RwLock<HashSet<String>>>,
     strategy_heavy_slots: Arc<Semaphore>,
@@ -118,6 +119,12 @@ const LIVE_EVENT_LOG_TTL_SEC_MIN: u32 = 3600;
 const LIVE_EVENT_LOG_TTL_SEC_MAX: u32 = 30 * 24 * 3600;
 const LIVE_RUST_BOOK_CACHE_TTL_MS: u64 = 260;
 const LIVE_RUST_BOOK_CACHE_MAX: usize = 512;
+const LIVE_OFFICIAL_FEE_CACHE_TTL_MS_DEFAULT: u64 = 30_000;
+const LIVE_OFFICIAL_FEE_CACHE_TTL_MS_MIN: u64 = 1_000;
+const LIVE_OFFICIAL_FEE_CACHE_TTL_MS_MAX: u64 = 300_000;
+const LIVE_OFFICIAL_FEE_CACHE_MAX_DEFAULT: usize = 2_048;
+const LIVE_OFFICIAL_FEE_CACHE_MAX_MIN: usize = 128;
+const LIVE_OFFICIAL_FEE_CACHE_MAX_MAX: usize = 20_000;
 const LIVE_ALERT_THROTTLE_DEFAULT_MS: i64 = 5 * 60_000;
 const RUNTIME_EVENT_SAMPLE_BUFFER_MAX_DEFAULT: usize = 140_000;
 const RUNTIME_EVENT_SAMPLE_BUFFER_MAX_MIN: usize = 10_000;
@@ -325,6 +332,12 @@ struct RustBookCacheEntry {
     snapshot: GatewayBookSnapshot,
 }
 
+#[derive(Clone)]
+struct RustFeeRateCacheEntry {
+    fetched_at: Instant,
+    fee_bps: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LivePositionState {
     #[serde(default = "default_runtime_symbol")]
@@ -410,6 +423,8 @@ struct LivePendingOrder {
     side: String,
     round_id: String,
     decision_key: String,
+    #[serde(default)]
+    decision_id: String,
     price_cents: f64,
     quote_size_usdc: f64,
     #[serde(default)]
@@ -643,6 +658,18 @@ fn live_hard_kill_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn live_profit_gate_enabled() -> bool {
+    std::env::var("FORGE_FEV1_LIVE_PROFIT_GATE_ENABLED")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn live_min_entry_score() -> f64 {
     std::env::var("FORGE_FEV1_LIVE_MIN_ENTRY_SCORE")
         .ok()
@@ -743,6 +770,56 @@ fn live_auto_score_max_tighten() -> f64 {
         .clamp(0.0, 0.40)
 }
 
+fn normalize_runtime_signal_decisions(
+    market_type: &str,
+    decisions: Vec<Value>,
+    quote_usdc: f64,
+) -> Vec<Value> {
+    let default_quote = quote_usdc.max(0.01);
+    decisions
+        .into_iter()
+        .filter_map(|mut decision| {
+            let obj = decision.as_object_mut()?;
+            let quote_ok = obj
+                .get("quote_size_usdc")
+                .and_then(Value::as_f64)
+                .map(|v| v > 0.0)
+                .unwrap_or(false);
+            if !quote_ok {
+                obj.insert("quote_size_usdc".to_string(), json!(default_quote));
+            }
+
+            let has_decision_id = obj
+                .get("decision_id")
+                .and_then(Value::as_str)
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
+            if !has_decision_id {
+                let action = obj
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_ascii_lowercase();
+                let side = obj
+                    .get("side")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_ascii_uppercase();
+                let round_id = obj.get("round_id").and_then(Value::as_str).unwrap_or("na");
+                let ts_ms = obj.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
+                obj.insert(
+                    "decision_id".to_string(),
+                    Value::String(format!(
+                        "fev1:{}:{}:{}:{}:{}",
+                        market_type, action, side, round_id, ts_ms
+                    )),
+                );
+            }
+            Some(decision)
+        })
+        .collect()
+}
+
 fn decision_action_count(decisions: &[Value], action: &str) -> usize {
     decisions
         .iter()
@@ -766,6 +843,308 @@ fn decision_action_count_from_orders(orders: &[Value], action: &str) -> usize {
                 .unwrap_or(false)
         })
         .count()
+}
+
+fn collect_latency_values_ms(rows: &[Value], key: &str) -> Vec<f64> {
+    rows.iter()
+        .filter_map(|row| row.get(key).and_then(Value::as_f64))
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .collect()
+}
+
+fn latency_percentile_ms(sorted_samples: &[f64], p: f64) -> Option<f64> {
+    if sorted_samples.is_empty() {
+        return None;
+    }
+    let p = p.clamp(0.0, 1.0);
+    let rank = ((sorted_samples.len() - 1) as f64 * p).round() as usize;
+    sorted_samples.get(rank).copied()
+}
+
+fn latency_stats_json(samples: &[f64]) -> Value {
+    if samples.is_empty() {
+        return json!({
+            "count": 0,
+            "avg_ms": Value::Null,
+            "p50_ms": Value::Null,
+            "p95_ms": Value::Null,
+            "max_ms": Value::Null
+        });
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let avg = sorted.iter().sum::<f64>() / sorted.len() as f64;
+    json!({
+        "count": sorted.len(),
+        "avg_ms": avg,
+        "p50_ms": latency_percentile_ms(&sorted, 0.50),
+        "p95_ms": latency_percentile_ms(&sorted, 0.95),
+        "max_ms": sorted.last().copied()
+    })
+}
+
+fn summarize_live_order_latency(orders: &[Value]) -> Value {
+    let signal_to_submit = collect_latency_values_ms(orders, "signal_to_submit_ms");
+    let signal_to_ack = collect_latency_values_ms(orders, "signal_to_ack_ms");
+    let submit_to_ack = collect_latency_values_ms(orders, "submit_to_ack_ms");
+    let order_latency = collect_latency_values_ms(orders, "order_latency_ms");
+    json!({
+        "signal_to_submit_ms": latency_stats_json(&signal_to_submit),
+        "signal_to_ack_ms": latency_stats_json(&signal_to_ack),
+        "submit_to_ack_ms": latency_stats_json(&submit_to_ack),
+        "order_latency_ms": latency_stats_json(&order_latency),
+    })
+}
+
+fn collect_price_trace_delta_values_cents(orders: &[Value], key: &str) -> Vec<f64> {
+    orders
+        .iter()
+        .filter_map(|row| row.get("price_trace"))
+        .filter_map(|trace| trace.get(key).and_then(Value::as_f64))
+        .filter(|v| v.is_finite())
+        .collect()
+}
+
+fn price_drift_stats_json(signed_samples: &[f64]) -> Value {
+    if signed_samples.is_empty() {
+        return json!({
+            "count": 0,
+            "avg_abs_cents": Value::Null,
+            "p50_abs_cents": Value::Null,
+            "p95_abs_cents": Value::Null,
+            "max_abs_cents": Value::Null,
+            "avg_signed_cents": Value::Null
+        });
+    }
+    let mut abs_values = signed_samples.iter().map(|v| v.abs()).collect::<Vec<_>>();
+    abs_values.sort_by(|a, b| a.total_cmp(b));
+    let avg_abs = abs_values.iter().sum::<f64>() / abs_values.len() as f64;
+    let avg_signed = signed_samples.iter().sum::<f64>() / signed_samples.len() as f64;
+    json!({
+        "count": abs_values.len(),
+        "avg_abs_cents": avg_abs,
+        "p50_abs_cents": latency_percentile_ms(&abs_values, 0.50),
+        "p95_abs_cents": latency_percentile_ms(&abs_values, 0.95),
+        "max_abs_cents": abs_values.last().copied(),
+        "avg_signed_cents": avg_signed
+    })
+}
+
+fn summarize_live_price_parity(orders: &[Value]) -> Value {
+    let signal_vs_submit = collect_price_trace_delta_values_cents(orders, "signal_vs_submit_cents");
+    let signal_vs_accepted =
+        collect_price_trace_delta_values_cents(orders, "signal_vs_accepted_cents");
+    json!({
+        "signal_vs_submit_cents": price_drift_stats_json(&signal_vs_submit),
+        "signal_vs_accepted_cents": price_drift_stats_json(&signal_vs_accepted)
+    })
+}
+
+fn extract_decision_id(node: &Value) -> Option<String> {
+    node.get("decision_id")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            node.get("decision").and_then(|decision| {
+                decision
+                    .get("decision_id")
+                    .and_then(Value::as_str)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+        })
+}
+
+fn build_live_fill_decision_map(events: &[Value]) -> (HashMap<String, Value>, Value) {
+    let mut by_decision = HashMap::<String, Value>::new();
+    let mut fill_event_count = 0_usize;
+    let mut realized_net_pnl_cents = 0.0_f64;
+    let mut total_fill_cost_cents = 0.0_f64;
+
+    for ev in events {
+        let reason = ev
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let is_fill = reason.contains("terminal_filled")
+            || ev.get("fill_price_cents").and_then(Value::as_f64).is_some()
+            || ev.get("fill_quote_usdc").and_then(Value::as_f64).is_some();
+        if !is_fill {
+            continue;
+        }
+
+        fill_event_count = fill_event_count.saturating_add(1);
+        realized_net_pnl_cents += ev
+            .get("fill_pnl_cents_net")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        total_fill_cost_cents += ev
+            .get("fill_cost_cents")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+
+        let Some(decision_id) = extract_decision_id(ev) else {
+            continue;
+        };
+        let ts_ms = ev.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
+        let should_replace = by_decision
+            .get(&decision_id)
+            .and_then(|prev| prev.get("ts_ms").and_then(Value::as_i64))
+            .map(|prev_ts| ts_ms >= prev_ts)
+            .unwrap_or(true);
+        if !should_replace {
+            continue;
+        }
+
+        by_decision.insert(
+            decision_id.clone(),
+            json!({
+                "decision_id": decision_id,
+                "ts_ms": ts_ms,
+                "order_id": ev.get("order_id").cloned().unwrap_or(Value::Null),
+                "action": ev.get("action").cloned().unwrap_or(Value::Null),
+                "side": ev.get("side").cloned().unwrap_or(Value::Null),
+                "fill_price_cents": ev.get("fill_price_cents").cloned().unwrap_or(Value::Null),
+                "fill_quote_usdc": ev.get("fill_quote_usdc").cloned().unwrap_or(Value::Null),
+                "fill_size_shares": ev.get("fill_size_shares").cloned().unwrap_or(Value::Null),
+                "fill_fee_cents": ev.get("fill_fee_cents").cloned().unwrap_or(Value::Null),
+                "fill_slippage_cents": ev.get("fill_slippage_cents").cloned().unwrap_or(Value::Null),
+                "fill_cost_cents": ev.get("fill_cost_cents").cloned().unwrap_or(Value::Null),
+                "fill_pnl_cents_net": ev.get("fill_pnl_cents_net").cloned().unwrap_or(Value::Null)
+            }),
+        );
+    }
+
+    let summary = json!({
+        "fill_event_count": fill_event_count,
+        "fill_decision_count": by_decision.len(),
+        "realized_net_pnl_cents": realized_net_pnl_cents,
+        "total_fill_cost_cents": total_fill_cost_cents
+    });
+    (by_decision, summary)
+}
+
+fn enrich_paper_records_with_live_fills(
+    paper_records: &[Value],
+    fill_by_decision: &HashMap<String, Value>,
+) -> (Vec<Value>, usize) {
+    let mut matched = 0_usize;
+    let mut out = Vec::<Value>::with_capacity(paper_records.len());
+    for record in paper_records {
+        let mut next = record.clone();
+        let Some(decision_id) = extract_decision_id(record) else {
+            out.push(next);
+            continue;
+        };
+        let Some(fill_row) = fill_by_decision.get(&decision_id) else {
+            out.push(next);
+            continue;
+        };
+        if let Some(obj) = next.as_object_mut() {
+            obj.insert("live_fill".to_string(), fill_row.clone());
+            obj.insert(
+                "live_fill_price_cents".to_string(),
+                fill_row
+                    .get("fill_price_cents")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+            obj.insert(
+                "live_fill_pnl_cents_net".to_string(),
+                fill_row
+                    .get("fill_pnl_cents_net")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+        }
+        matched = matched.saturating_add(1);
+        out.push(next);
+    }
+    (out, matched)
+}
+
+fn build_live_order_lineage(events: &[Value], pending_rows: &[LivePendingOrder]) -> Vec<Value> {
+    #[derive(Default)]
+    struct LineageAcc {
+        order_ids: BTreeSet<String>,
+        pending_order_ids: BTreeSet<String>,
+        last_reason: String,
+        last_event_type: String,
+        last_status: String,
+        last_ts_ms: i64,
+    }
+
+    let mut acc = HashMap::<String, LineageAcc>::new();
+    for ev in events {
+        let Some(decision_id) = extract_decision_id(ev) else {
+            continue;
+        };
+        let ts_ms = ev.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
+        let row = acc.entry(decision_id).or_default();
+        if let Some(order_id) = extract_order_id_from_live_event(ev) {
+            row.order_ids.insert(order_id);
+        }
+        if ts_ms >= row.last_ts_ms {
+            row.last_ts_ms = ts_ms;
+            row.last_reason = ev
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            row.last_event_type = ev
+                .get("event_type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            row.last_status = if ev.get("accepted").and_then(Value::as_bool).unwrap_or(false) {
+                "accepted".to_string()
+            } else if row.last_reason.contains("filled") {
+                "filled".to_string()
+            } else if row.last_reason.contains("pending") {
+                "pending".to_string()
+            } else if row.last_reason.contains("reject") {
+                "rejected".to_string()
+            } else {
+                "unknown".to_string()
+            };
+        }
+    }
+
+    for row in pending_rows {
+        if row.decision_id.trim().is_empty() {
+            continue;
+        }
+        let entry = acc.entry(row.decision_id.clone()).or_default();
+        if !row.order_id.trim().is_empty() {
+            entry.order_ids.insert(row.order_id.clone());
+            entry.pending_order_ids.insert(row.order_id.clone());
+        }
+        entry.last_status = "pending".to_string();
+        entry.last_ts_ms = entry.last_ts_ms.max(row.submitted_ts_ms);
+    }
+
+    let mut rows = acc
+        .into_iter()
+        .map(|(decision_id, row)| {
+            let pending_count = row.pending_order_ids.len();
+            json!({
+                "decision_id": decision_id,
+                "order_ids": row.order_ids.into_iter().collect::<Vec<_>>(),
+                "pending_order_ids": row.pending_order_ids.into_iter().collect::<Vec<_>>(),
+                "pending_count": pending_count,
+                "last_reason": row.last_reason,
+                "last_event_type": row.last_event_type,
+                "last_status": row.last_status,
+                "last_ts_ms": row.last_ts_ms
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|row| {
+        std::cmp::Reverse(row.get("last_ts_ms").and_then(Value::as_i64).unwrap_or(0))
+    });
+    rows
 }
 
 fn parse_trade_score_pnl_pairs(trades: &[Value]) -> Vec<(f64, f64)> {
@@ -876,13 +1255,26 @@ fn gate_live_decisions_by_profitability(
     trades: &[Value],
     gateway_cfg: &LiveExecutionConfig,
 ) -> (Vec<Value>, Vec<Value>, Value) {
+    let enabled = live_profit_gate_enabled();
     if decisions.is_empty() {
         return (
             Vec::new(),
             Vec::new(),
             json!({
-                "enabled": true,
+                "enabled": enabled,
                 "selected_count": 0,
+                "skipped_count": 0
+            }),
+        );
+    }
+    if !enabled {
+        return (
+            decisions.to_vec(),
+            Vec::new(),
+            json!({
+                "enabled": false,
+                "mode": "pass_through",
+                "selected_count": decisions.len(),
                 "skipped_count": 0
             }),
         );
@@ -1021,7 +1413,7 @@ fn gate_live_decisions_by_profitability(
         selected,
         skipped,
         json!({
-            "enabled": true,
+            "enabled": enabled,
             "base_min_entry_score": base_score,
             "effective_min_entry_score": effective_score,
             "required_entry_score": required_score,
@@ -1276,7 +1668,11 @@ impl ApiState {
         states.insert(scope_key, normalized);
     }
 
-    async fn get_live_runtime_control(&self, symbol: &str, market_type: &str) -> LiveRuntimeControl {
+    async fn get_live_runtime_control(
+        &self,
+        symbol: &str,
+        market_type: &str,
+    ) -> LiveRuntimeControl {
         let now_ms = Utc::now().timestamp_millis();
         let scope_key = runtime_scope_key(symbol, market_type);
         {
@@ -1567,7 +1963,9 @@ impl ApiState {
         market_type: &str,
         cfg: &LiveExecutionConfig,
     ) -> (LiveExecutionConfig, LiveExecutionAggState) {
-        let s = self.get_live_execution_aggr_state(symbol, market_type).await;
+        let s = self
+            .get_live_execution_aggr_state(symbol, market_type)
+            .await;
         let mut tuned = cfg.clone();
         tuned.entry_slippage_bps =
             (cfg.entry_slippage_bps * s.entry_slippage_mult).clamp(0.0, 500.0);
@@ -1822,6 +2220,65 @@ impl ApiState {
             RustBookCacheEntry {
                 fetched_at: Instant::now(),
                 snapshot,
+            },
+        );
+    }
+
+    #[allow(dead_code)]
+    async fn get_cached_official_fee_bps(&self, token_id: &str) -> Option<u32> {
+        let ttl_ms = std::env::var("FORGE_FEV1_OFFICIAL_FEE_CACHE_TTL_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(LIVE_OFFICIAL_FEE_CACHE_TTL_MS_DEFAULT)
+            .clamp(
+                LIVE_OFFICIAL_FEE_CACHE_TTL_MS_MIN,
+                LIVE_OFFICIAL_FEE_CACHE_TTL_MS_MAX,
+            );
+        let cache = self.live_official_fee_cache.read().await;
+        let row = cache.get(token_id)?;
+        if row.fetched_at.elapsed() > Duration::from_millis(ttl_ms) {
+            return None;
+        }
+        Some(row.fee_bps)
+    }
+
+    #[allow(dead_code)]
+    async fn put_cached_official_fee_bps(&self, token_id: &str, fee_bps: u32) {
+        let max_entries = std::env::var("FORGE_FEV1_OFFICIAL_FEE_CACHE_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(LIVE_OFFICIAL_FEE_CACHE_MAX_DEFAULT)
+            .clamp(
+                LIVE_OFFICIAL_FEE_CACHE_MAX_MIN,
+                LIVE_OFFICIAL_FEE_CACHE_MAX_MAX,
+            );
+        let mut cache = self.live_official_fee_cache.write().await;
+        if cache.len() >= max_entries {
+            let mut stale_keys = Vec::new();
+            for (k, v) in cache.iter() {
+                if v.fetched_at.elapsed()
+                    > Duration::from_millis(LIVE_OFFICIAL_FEE_CACHE_TTL_MS_MAX)
+                {
+                    stale_keys.push(k.clone());
+                }
+                if stale_keys.len() >= 128 {
+                    break;
+                }
+            }
+            for key in stale_keys {
+                cache.remove(&key);
+            }
+            if cache.len() >= max_entries {
+                if let Some(first_key) = cache.keys().next().cloned() {
+                    cache.remove(&first_key);
+                }
+            }
+        }
+        cache.insert(
+            token_id.to_string(),
+            RustFeeRateCacheEntry {
+                fetched_at: Instant::now(),
+                fee_bps,
             },
         );
     }
@@ -2129,6 +2586,7 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         live_execution_aggr_states: Arc::new(RwLock::new(HashMap::new())),
         live_rust_executor: Arc::new(RwLock::new(None)),
         live_rust_book_cache: Arc::new(RwLock::new(HashMap::new())),
+        live_official_fee_cache: Arc::new(RwLock::new(HashMap::new())),
         runtime_alert_throttle: Arc::new(RwLock::new(HashMap::new())),
         runtime_daily_report_sent: Arc::new(RwLock::new(HashSet::new())),
         strategy_heavy_slots: Arc::new(Semaphore::new(strategy_heavy_slots)),
@@ -2651,12 +3109,15 @@ async fn live_runtime_loop(
                 market_next_due_ms.insert(market_type.to_string(), next_due);
                 continue;
             }
-            let strategy_cfg = StrategyRuntimeConfig::default();
-            let runtime_cfg_source = "live_default";
+            let runtime_cfg_source =
+                strategy_current_default_profile_name_for_scope(runtime_symbol, market_type);
+            let strategy_cfg =
+                strategy_current_default_config_for_scope(runtime_symbol, market_type);
             match strategy_paper_live(StrategyPaperLiveReq {
                 state: &state,
                 symbol: runtime_symbol,
                 market_type,
+                baseline_profile: runtime_cfg_source,
                 full_history: false,
                 lookback_minutes: cfg.lookback_minutes,
                 max_points: cfg.max_points,
@@ -2802,8 +3263,16 @@ async fn live_runtime_loop(
                         .and_then(Value::as_array)
                         .cloned()
                         .unwrap_or_default();
-                    let paper_decisions =
-                        fev1::build_live_decisions_from_trades(&trades, cfg.quote_usdc);
+                    let signal_decisions = payload
+                        .get("signal_decisions")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let paper_decisions = normalize_runtime_signal_decisions(
+                        market_type,
+                        signal_decisions,
+                        cfg.quote_usdc,
+                    );
                     let latest_ts_ms = payload
                         .get("current")
                         .and_then(|v| v.get("timestamp_ms"))
@@ -2947,9 +3416,31 @@ async fn live_runtime_loop(
                     let state_machine = state
                         .get_live_position_state(runtime_symbol, market_type)
                         .await;
-                    let live_events = state
-                        .list_live_events(runtime_symbol, market_type, 60)
+                    let live_events_all = state
+                        .list_live_events(runtime_symbol, market_type, live_event_log_max())
                         .await;
+                    let pending_rows = state
+                        .list_pending_orders_for_market(runtime_symbol, market_type)
+                        .await;
+                    let (live_fill_by_decision, live_fill_summary) =
+                        build_live_fill_decision_map(&live_events_all);
+                    let (paper_records_enriched, paper_live_fill_count) =
+                        enrich_paper_records_with_live_fills(
+                            &paper_decisions,
+                            &live_fill_by_decision,
+                        );
+                    let live_order_lineage =
+                        build_live_order_lineage(&live_events_all, &pending_rows);
+                    let live_realized_net_pnl_cents = state_machine.realized_pnl_usdc * 100.0;
+                    let live_events = live_events_all
+                        .iter()
+                        .rev()
+                        .take(60)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>();
 
                     let live_submitted_count = execution_orders
                         .iter()
@@ -2965,14 +3456,22 @@ async fn live_runtime_loop(
                         .count();
                     let live_rejected_count =
                         live_submitted_count.saturating_sub(live_accepted_count);
+                    let live_latency = summarize_live_order_latency(&aggr_orders);
+                    let live_price_parity = summarize_live_price_parity(&aggr_orders);
                     let live_execution_payload = json!({
                         "summary": {
                             "decision_count": selected_decisions.len(),
                             "mode": if effective_live_execute { execution_mode.clone() } else { "paper_only".to_string() },
+                            "latency": live_latency,
+                            "price_parity": live_price_parity,
+                            "realized_net_pnl_cents": live_realized_net_pnl_cents,
+                            "paper_live_fill_count": paper_live_fill_count,
+                            "fills": live_fill_summary,
                         },
                         "decisions": selected_decisions,
-                        "paper_records": paper_decisions,
+                        "paper_records": paper_records_enriched,
                         "live_records": execution_orders,
+                        "order_lineage": live_order_lineage,
                         "parity_check": {
                             "status": execution_status.clone(),
                             "level": if effective_live_execute { "warn" } else { "ok" },
@@ -3383,5 +3882,139 @@ mod tests {
         let latest_ts_ms = 250_000_i64;
         let selected = select_live_decisions(&decisions, latest_ts_ms, 1, false, Some("enter"));
         assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn normalize_runtime_signal_decisions_backfills_quote_and_decision_id() {
+        let decisions = vec![json!({
+            "action": "enter",
+            "side": "UP",
+            "round_id": "r-1",
+            "ts_ms": 12_345_i64
+        })];
+        let normalized = normalize_runtime_signal_decisions("5m", decisions, 2.5);
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(
+            normalized[0].get("quote_size_usdc").and_then(Value::as_f64),
+            Some(2.5)
+        );
+        assert_eq!(
+            normalized[0].get("decision_id").and_then(Value::as_str),
+            Some("fev1:5m:enter:UP:r-1:12345")
+        );
+    }
+
+    #[test]
+    fn normalize_runtime_signal_decisions_preserves_existing_decision_id() {
+        let decisions = vec![json!({
+            "decision_id": "custom-id",
+            "action": "exit",
+            "side": "DOWN",
+            "round_id": "r-2",
+            "ts_ms": 9_999_i64,
+            "quote_size_usdc": 1.2
+        })];
+        let normalized = normalize_runtime_signal_decisions("15m", decisions, 3.0);
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(
+            normalized[0].get("decision_id").and_then(Value::as_str),
+            Some("custom-id")
+        );
+        assert_eq!(
+            normalized[0].get("quote_size_usdc").and_then(Value::as_f64),
+            Some(1.2)
+        );
+    }
+
+    #[test]
+    fn summarize_live_order_latency_reports_percentiles() {
+        let orders = vec![
+            json!({
+                "signal_to_submit_ms": 8.0,
+                "signal_to_ack_ms": 74.0,
+                "submit_to_ack_ms": 66.0,
+                "order_latency_ms": 68.0
+            }),
+            json!({
+                "signal_to_submit_ms": 14.0,
+                "signal_to_ack_ms": 88.0,
+                "submit_to_ack_ms": 74.0,
+                "order_latency_ms": 75.0
+            }),
+            json!({
+                "signal_to_submit_ms": 22.0,
+                "signal_to_ack_ms": 130.0,
+                "submit_to_ack_ms": 108.0,
+                "order_latency_ms": 111.0
+            }),
+        ];
+        let summary = summarize_live_order_latency(&orders);
+        assert_eq!(
+            summary
+                .get("signal_to_submit_ms")
+                .and_then(|v| v.get("count"))
+                .and_then(Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(
+            summary
+                .get("signal_to_submit_ms")
+                .and_then(|v| v.get("p50_ms"))
+                .and_then(Value::as_f64),
+            Some(14.0)
+        );
+        assert_eq!(
+            summary
+                .get("signal_to_ack_ms")
+                .and_then(|v| v.get("p95_ms"))
+                .and_then(Value::as_f64),
+            Some(130.0)
+        );
+    }
+
+    #[test]
+    fn summarize_live_price_parity_reports_abs_percentiles() {
+        let orders = vec![
+            json!({
+                "price_trace": {
+                    "signal_vs_submit_cents": 1.2,
+                    "signal_vs_accepted_cents": -0.8
+                }
+            }),
+            json!({
+                "price_trace": {
+                    "signal_vs_submit_cents": -2.0,
+                    "signal_vs_accepted_cents": -1.4
+                }
+            }),
+            json!({
+                "price_trace": {
+                    "signal_vs_submit_cents": 0.6,
+                    "signal_vs_accepted_cents": 0.4
+                }
+            }),
+        ];
+        let parity = summarize_live_price_parity(&orders);
+        assert_eq!(
+            parity
+                .get("signal_vs_submit_cents")
+                .and_then(|v| v.get("count"))
+                .and_then(Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(
+            parity
+                .get("signal_vs_submit_cents")
+                .and_then(|v| v.get("p50_abs_cents"))
+                .and_then(Value::as_f64),
+            Some(1.2)
+        );
+        assert_eq!(
+            parity
+                .get("signal_vs_accepted_cents")
+                .and_then(|v| v.get("p95_abs_cents"))
+                .and_then(Value::as_f64),
+            Some(1.4)
+        );
     }
 }

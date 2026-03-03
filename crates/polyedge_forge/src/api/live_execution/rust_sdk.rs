@@ -54,6 +54,105 @@ fn cancel_failure_pause_threshold(action: &str) -> u8 {
     }
 }
 
+fn initial_pending_cancel_after_ms(action: &str, tif: &str) -> i64 {
+    let maker_tif = matches!(tif.to_ascii_uppercase().as_str(), "GTD" | "GTC" | "POST_ONLY");
+    if is_entry_action(action) && maker_tif {
+        live_entry_maker_max_wait_ms()
+    } else if is_entry_action(action) {
+        live_entry_fak_cancel_after_ms()
+    } else if is_live_exit_action(action) {
+        900
+    } else {
+        1_200
+    }
+}
+
+fn build_pending_from_accepted_submission(
+    symbol: &str,
+    market_type: &str,
+    decision_key: &str,
+    decision_id: &str,
+    decision: &Value,
+    effective_target: &LiveMarketTarget,
+    payload: &Value,
+    order_id: &str,
+    submitted_ts_ms: i64,
+) -> LivePendingOrder {
+    let action = decision
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let side = decision
+        .get("side")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let tif = payload
+        .get("tif")
+        .and_then(Value::as_str)
+        .unwrap_or("FAK")
+        .to_ascii_uppercase();
+    let style = payload
+        .get("style")
+        .and_then(Value::as_str)
+        .unwrap_or("taker")
+        .to_ascii_lowercase();
+    let quote_size_usdc = payload
+        .get("quote_size_usdc")
+        .and_then(Value::as_f64)
+        .or_else(|| decision.get("quote_size_usdc").and_then(Value::as_f64))
+        .unwrap_or(0.0)
+        .max(0.0);
+    let order_size_shares = payload
+        .get("size")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
+        .max(0.0);
+    let price_cents = payload
+        .get("price")
+        .and_then(Value::as_f64)
+        .map(|v| v * 100.0)
+        .or_else(|| decision.get("price_cents").and_then(Value::as_f64))
+        .unwrap_or(0.0)
+        .clamp(0.01, 99.99);
+    let token_id = payload
+        .get("token_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    LivePendingOrder {
+        symbol: symbol.trim().to_ascii_uppercase(),
+        market_type: market_type.to_string(),
+        order_id: order_id.to_string(),
+        market_id: effective_target.market_id.clone(),
+        token_id,
+        action: action.clone(),
+        side,
+        round_id: decision
+            .get("round_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        decision_key: decision_key.to_string(),
+        decision_id: decision_id.to_string(),
+        price_cents,
+        quote_size_usdc,
+        order_size_shares,
+        tif: tif.clone(),
+        style,
+        submit_reason: decision
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("live_submit")
+            .to_string(),
+        submitted_ts_ms,
+        cancel_after_ms: initial_pending_cancel_after_ms(&action, &tif),
+        retry_count: 0,
+    }
+}
+
 pub(super) async fn handle_cancel_failure_with_escalation(
     state: &ApiState,
     pending: &LivePendingOrder,
@@ -71,6 +170,8 @@ pub(super) async fn handle_cancel_failure_with_escalation(
                 "action": retry.action,
                 "side": retry.side,
                 "round_id": retry.round_id,
+                "decision_id": retry.decision_id,
+                "decision_key": retry.decision_key,
                 "reason": format!("{reason}_requeued"),
                 "order_id": retry.order_id,
                 "retry_count": retry.retry_count,
@@ -106,6 +207,8 @@ pub(super) async fn handle_cancel_failure_with_escalation(
                 "action": retry.action,
                 "side": retry.side,
                 "round_id": retry.round_id,
+                "decision_id": retry.decision_id,
+                "decision_key": retry.decision_key,
                 "reason": "auto_force_pause_cancel_failure",
                 "order_id": retry.order_id,
                 "retry_count": retry.retry_count,
@@ -212,6 +315,88 @@ async fn get_or_fetch_book_snapshot_cached(
     };
     local_cache.insert(token_id.to_string(), snapshot.clone());
     snapshot
+}
+
+fn parse_fee_bps_from_value(v: &Value) -> Option<u32> {
+    v.get("base_fee")
+        .and_then(Value::as_u64)
+        .map(|v| v as u32)
+        .or_else(|| {
+            v.get("base_fee")
+                .and_then(Value::as_str)
+                .and_then(|raw| raw.trim().parse::<u32>().ok())
+        })
+}
+
+async fn fetch_official_fee_bps_http_fallback(state: &ApiState, token_id: &str) -> Option<u32> {
+    let host = std::env::var("FORGE_FEV1_CLOB_HOST")
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "https://clob.polymarket.com".to_string());
+    let url = format!("{host}/fee-rate");
+    let resp = state
+        .gateway_http_client
+        .get(url)
+        .query(&[("asset_id", token_id)])
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.json::<Value>().await.ok()?;
+    parse_fee_bps_from_value(&body)
+}
+
+pub(super) async fn get_official_fee_bps_for_token(state: &ApiState, token_id: &str) -> Option<u32> {
+    let token_id = token_id.trim();
+    if token_id.is_empty() {
+        return None;
+    }
+    if let Some(cached) = state.get_cached_official_fee_bps(token_id).await {
+        return Some(cached);
+    }
+    let has_private_key = std::env::var("FORGE_FEV1_PRIVATE_KEY")
+        .ok()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    if has_private_key {
+        if let (Some(ctx), Ok(token)) = (
+            get_or_init_rust_executor(state).await.ok(),
+            PmU256::from_str(token_id),
+        ) {
+            if let Ok(resp) = ctx.client.fee_rate_bps(token).await {
+                let bps = resp.base_fee;
+                state.put_cached_official_fee_bps(token_id, bps).await;
+                return Some(bps);
+            }
+        }
+    }
+    let bps = fetch_official_fee_bps_http_fallback(state, token_id).await?;
+    state.put_cached_official_fee_bps(token_id, bps).await;
+    Some(bps)
+}
+
+async fn prefetch_official_fee_bps_for_tokens(
+    state: &ApiState,
+    token_ids: &[String],
+) -> HashMap<String, u32> {
+    let futures = token_ids.iter().map(|token_id| {
+        let state = state.clone();
+        let token_id = token_id.clone();
+        async move {
+            let fee_bps = get_official_fee_bps_for_token(&state, &token_id).await;
+            (token_id, fee_bps)
+        }
+    });
+    let mut out = HashMap::<String, u32>::new();
+    for (token_id, fee_bps) in join_all(futures).await {
+        if let Some(fee_bps) = fee_bps {
+            out.insert(token_id, fee_bps);
+        }
+    }
+    out
 }
 
 pub(super) async fn submit_rust_order(
@@ -436,6 +621,8 @@ async fn try_resubmit_after_terminal_reject_rust(
                         "action": row.action,
                         "side": row.side,
                         "round_id": row.round_id,
+                        "decision_id": row.decision_id,
+                        "decision_key": row.decision_key,
                         "reason": "rust_terminal_rejected_resubmit_no_target",
                         "order_id": row.order_id,
                         "status": terminal_status,
@@ -461,6 +648,8 @@ async fn try_resubmit_after_terminal_reject_rust(
                     "action": row.action,
                         "side": row.side,
                         "round_id": row.round_id,
+                        "decision_id": row.decision_id,
+                        "decision_key": row.decision_key,
                         "reason": "rust_terminal_rejected_resubmit_round_target_mismatch",
                         "order_id": row.order_id,
                         "status": terminal_status,
@@ -484,6 +673,8 @@ async fn try_resubmit_after_terminal_reject_rust(
                     "action": row.action,
                     "side": row.side,
                     "round_id": row.round_id,
+                    "decision_id": row.decision_id,
+                    "decision_key": row.decision_key,
                     "reason": format!("rust_terminal_rejected_resubmit_{reason}"),
                     "order_id": row.order_id,
                     "status": terminal_status,
@@ -496,6 +687,7 @@ async fn try_resubmit_after_terminal_reject_rust(
         return false;
     }
     let mut decision = json!({
+        "decision_id": row.decision_id,
         "action": row.action,
         "side": row.side,
         "round_id": row.round_id,
@@ -581,6 +773,8 @@ async fn try_resubmit_after_terminal_reject_rust(
                                 "action": row.action,
                                 "side": row.side,
                                 "round_id": row.round_id,
+                                "decision_id": row.decision_id,
+                                "decision_key": row.decision_key,
                                 "reason": "rust_terminal_rejected_resubmitted_fak",
                                 "order_id": row.order_id,
                                 "new_order_id": new_order_id,
@@ -602,6 +796,8 @@ async fn try_resubmit_after_terminal_reject_rust(
                         "action": row.action,
                         "side": row.side,
                         "round_id": row.round_id,
+                        "decision_id": row.decision_id,
+                        "decision_key": row.decision_key,
                         "reason": "rust_terminal_rejected_resubmit_rejected",
                         "order_id": row.order_id,
                         "status": terminal_status,
@@ -620,6 +816,8 @@ async fn try_resubmit_after_terminal_reject_rust(
                         "action": row.action,
                         "side": row.side,
                         "round_id": row.round_id,
+                        "decision_id": row.decision_id,
+                        "decision_key": row.decision_key,
                         "reason": "rust_terminal_rejected_resubmit_error",
                         "order_id": row.order_id,
                         "status": terminal_status,
@@ -661,6 +859,7 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
     let mut out = Vec::<Value>::with_capacity(decisions.len());
     let token_ids = collect_decision_token_ids(target, decisions);
     let mut book_cache = prefetch_rust_books_for_tokens(state, &ctx, &token_ids).await;
+    let mut official_fee_bps_cache = prefetch_official_fee_bps_for_tokens(state, &token_ids).await;
     let exit_quote_override =
         position_state
             .entry_quote_usdc
@@ -672,6 +871,59 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
     };
 
     for gated in decisions {
+        let action = gated
+            .decision
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let freshness_ms = if action == "enter" || action == "add" {
+            live_signal_entry_freshness_ms()
+        } else {
+            live_signal_exit_freshness_ms()
+        };
+        let now_ms = Utc::now().timestamp_millis();
+        let decision_ts_ms_raw = gated
+            .decision
+            .get("ts_ms")
+            .and_then(Value::as_i64)
+            .filter(|v| *v > 0);
+        if let Some(decision_ts_ms_raw) = decision_ts_ms_raw {
+            let stale_ms = now_ms.saturating_sub(decision_ts_ms_raw);
+            if stale_ms > freshness_ms {
+                let skipped = json!({
+                    "ok": false,
+                    "accepted": false,
+                    "decision_key": gated.decision_key,
+                    "decision_id": gated.decision.get("decision_id").and_then(Value::as_str),
+                    "decision": gated.decision.clone(),
+                    "reason": "decision_stale_pre_submit",
+                    "stale_ms": stale_ms,
+                    "freshness_ms": freshness_ms,
+                    "executor": "rust_sdk"
+                });
+                state
+                    .append_live_event(
+                        &position_state.symbol,
+                        &position_state.market_type,
+                        json!({
+                            "accepted": false,
+                            "action": action,
+                            "side": gated.decision.get("side").and_then(Value::as_str).unwrap_or("unknown"),
+                            "round_id": gated.decision.get("round_id").and_then(Value::as_str),
+                            "decision_id": gated.decision.get("decision_id").and_then(Value::as_str),
+                            "decision_key": gated.decision_key,
+                            "reason": "decision_stale_pre_submit",
+                            "stale_ms": stale_ms,
+                            "freshness_ms": freshness_ms
+                        }),
+                    )
+                    .await;
+                out.push(skipped);
+                continue;
+            }
+        }
+
         let prepared = match prepare_live_decision_for_submission(
             gated,
             target,
@@ -686,8 +938,28 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                 continue;
             }
         };
+        let decision_id = prepared
+            .decision
+            .get("decision_id")
+            .and_then(Value::as_str)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| gated.decision_key.clone());
         let token_id =
             token_id_for_decision(&prepared.decision, &prepared.effective_target).map(str::to_string);
+        let official_fee_bps = if let Some(token_id) = token_id.as_deref() {
+            if let Some(cached) = official_fee_bps_cache.get(token_id).copied() {
+                Some(cached)
+            } else {
+                let fetched = get_official_fee_bps_for_token(state, token_id).await;
+                if let Some(v) = fetched {
+                    official_fee_bps_cache.insert(token_id.to_string(), v);
+                }
+                fetched
+            }
+        } else {
+            None
+        };
         let book_snapshot = if let Some(token_id) = token_id.clone() {
             get_or_fetch_book_snapshot_cached(state, &ctx, &token_id, &mut book_cache).await
         } else {
@@ -719,13 +991,22 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
         let mut final_error: Option<String> = None;
         let mut final_reject_reason: Option<String> = None;
         let executed_via = "rust_sdk";
-        let submitted_ts_ms = Utc::now().timestamp_millis();
+        let decision_ts_ms = prepared
+            .decision
+            .get("ts_ms")
+            .and_then(Value::as_i64)
+            .filter(|v| *v > 0);
+        let submit_start_ts_ms = Utc::now().timestamp_millis();
+        let mut ack_ts_ms = submit_start_ts_ms;
         let order_started = Instant::now();
         for attempt in 0..3usize {
+            let attempt_started_ts_ms = Utc::now().timestamp_millis();
             let attempt_started = Instant::now();
             let submit = submit_rust_order(&ctx, &attempt_payload).await;
             match submit {
                 Ok(resp) => {
+                    let attempt_completed_ts_ms = Utc::now().timestamp_millis();
+                    ack_ts_ms = ack_ts_ms.max(attempt_completed_ts_ms);
                     let accept = resp
                         .get("accepted")
                         .and_then(Value::as_bool)
@@ -738,6 +1019,8 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                     attempts.push(json!({
                         "attempt": attempt + 1,
                         "executor": "rust_sdk",
+                        "started_ts_ms": attempt_started_ts_ms,
+                        "completed_ts_ms": attempt_completed_ts_ms,
                         "latency_ms": attempt_started.elapsed().as_millis() as u64,
                         "request": attempt_payload.clone(),
                         "accepted": accept,
@@ -759,9 +1042,13 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                     break;
                 }
                 Err(err) => {
+                    let attempt_completed_ts_ms = Utc::now().timestamp_millis();
+                    ack_ts_ms = ack_ts_ms.max(attempt_completed_ts_ms);
                     attempts.push(json!({
                         "attempt": attempt + 1,
                         "executor": "rust_sdk",
+                        "started_ts_ms": attempt_started_ts_ms,
+                        "completed_ts_ms": attempt_completed_ts_ms,
                         "latency_ms": attempt_started.elapsed().as_millis() as u64,
                         "request": attempt_payload.clone(),
                         "accepted": false,
@@ -791,26 +1078,39 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
         let final_price = attempt_payload.get("price").and_then(Value::as_f64);
         let final_size = attempt_payload.get("size").and_then(Value::as_f64);
         let final_quote = attempt_payload.get("quote_size_usdc").and_then(Value::as_f64);
-        out.push(json!({
+        let signal_to_submit_ms = decision_ts_ms.map(|ts| submit_start_ts_ms.saturating_sub(ts));
+        let signal_to_ack_ms = decision_ts_ms.map(|ts| ack_ts_ms.saturating_sub(ts));
+        let submit_to_ack_ms = ack_ts_ms.saturating_sub(submit_start_ts_ms);
+        let order_latency_ms = order_started.elapsed().as_millis() as u64;
+        let row = json!({
             "ok": accepted,
             "accepted": accepted,
-            "submitted_ts_ms": submitted_ts_ms,
+            "submitted_ts_ms": submit_start_ts_ms,
+            "submit_start_ts_ms": submit_start_ts_ms,
+            "ack_ts_ms": ack_ts_ms,
+            "decision_ts_ms": decision_ts_ms,
+            "signal_to_submit_ms": signal_to_submit_ms,
+            "signal_to_ack_ms": signal_to_ack_ms,
+            "submit_to_ack_ms": submit_to_ack_ms,
             "symbol": position_state.symbol,
             "market_type": position_state.market_type,
             "decision_key": gated.decision_key,
+            "decision_id": decision_id,
             "decision": prepared.decision,
             "order_id": final_order_id,
-            "request": payload,
-            "final_request": attempt_payload,
+            "request": payload.clone(),
+            "final_request": attempt_payload.clone(),
             "response": final_response,
             "error": final_error,
             "reject_reason": final_reject_reason,
             "attempts": attempts,
             "executor": executed_via,
-            "order_latency_ms": order_started.elapsed().as_millis() as u64,
+            "order_latency_ms": order_latency_ms,
             "book_snapshot": book_snapshot,
             "target_market_id": prepared.effective_target.market_id,
             "target_token_id": token_id,
+            "official_fee_bps": official_fee_bps,
+            "official_fee_rate": official_fee_bps.map(|bps| (bps as f64) / 10_000.0),
             "round_guard_bypassed": prepared.bypass_round_guard,
             "request_price": request_price,
             "request_size_shares": request_size,
@@ -824,7 +1124,60 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                 &attempt_payload,
                 final_response.as_ref()
             )
-        }));
+        });
+        if accepted {
+            if let Some(order_id) = row.get("order_id").and_then(Value::as_str) {
+                if !order_id.trim().is_empty() {
+                    let pending = build_pending_from_accepted_submission(
+                        &position_state.symbol,
+                        &position_state.market_type,
+                        &gated.decision_key,
+                        &decision_id,
+                        &prepared.decision,
+                        &prepared.effective_target,
+                        &attempt_payload,
+                        order_id,
+                        submit_start_ts_ms,
+                    );
+                    state.upsert_pending_order(pending).await;
+                }
+            }
+        }
+        let submit_event_reason = if accepted {
+            "rust_order_submit_accepted"
+        } else if final_error.is_some() {
+            "rust_order_submit_error"
+        } else {
+            "rust_order_submit_rejected"
+        };
+        state
+            .append_live_event(
+                &position_state.symbol,
+                &position_state.market_type,
+                json!({
+                    "accepted": accepted,
+                    "action": prepared.decision.get("action").and_then(Value::as_str).unwrap_or("unknown"),
+                    "side": prepared.decision.get("side").and_then(Value::as_str).unwrap_or("unknown"),
+                    "round_id": prepared.decision.get("round_id").and_then(Value::as_str),
+                    "decision_id": decision_id,
+                    "decision_key": gated.decision_key,
+                    "reason": submit_event_reason,
+                    "order_id": row.get("order_id").cloned().unwrap_or(Value::Null),
+                    "executor": executed_via,
+                    "attempt_count": row.get("attempts").and_then(Value::as_array).map(|v| v.len()).unwrap_or(0),
+                    "order_latency_ms": order_latency_ms,
+                    "signal_to_submit_ms": signal_to_submit_ms,
+                    "signal_to_ack_ms": signal_to_ack_ms,
+                    "submit_to_ack_ms": submit_to_ack_ms,
+                    "submit_start_ts_ms": submit_start_ts_ms,
+                    "ack_ts_ms": ack_ts_ms,
+                    "official_fee_bps": official_fee_bps,
+                    "reject_reason": row.get("reject_reason").cloned().unwrap_or(Value::Null),
+                    "error": row.get("error").cloned().unwrap_or(Value::Null),
+                }),
+            )
+            .await;
+        out.push(row);
     }
     out
 }
@@ -857,6 +1210,7 @@ pub(super) async fn reconcile_rust_reports(state: &ApiState, exec_cfg: &LiveExec
         if pm_is_terminal_fill(&order.status) {
             let _ = state.remove_pending_order(&row.order_id).await;
             let fill_event = fill_event_from_open_order(&order);
+            let fill_meta = extract_pending_fill_meta(Some(&fill_event), &row);
             apply_pending_confirmation(
                 state,
                 &row,
@@ -864,6 +1218,30 @@ pub(super) async fn reconcile_rust_reports(state: &ApiState, exec_cfg: &LiveExec
                 Some(&fill_event),
             )
             .await;
+            let ps_after = state
+                .get_live_position_state(&row.symbol, &row.market_type)
+                .await;
+            let fill_price_cents = fill_meta
+                .fill_price_cents
+                .unwrap_or(row.price_cents)
+                .max(0.01);
+            let fill_quote_usdc = fill_meta
+                .fill_quote_usdc
+                .unwrap_or(row.quote_size_usdc.max(0.0))
+                .max(0.0);
+            let fill_size_shares = fill_meta
+                .fill_size_shares
+                .unwrap_or_else(|| {
+                    if fill_quote_usdc > 0.0 {
+                        fill_quote_usdc / (fill_price_cents / 100.0).max(0.0001)
+                    } else {
+                        row.order_size_shares.max(0.0)
+                    }
+                })
+                .max(0.0);
+            let fill_fee_cents = (fill_meta.fee_usdc.max(0.0)) * 100.0;
+            let fill_slippage_cents = (fill_meta.slippage_usdc.max(0.0)) * 100.0;
+            let fill_cost_cents = fill_fee_cents + fill_slippage_cents;
             state
                 .append_live_event(
                     &row.symbol, &row.market_type,
@@ -872,8 +1250,18 @@ pub(super) async fn reconcile_rust_reports(state: &ApiState, exec_cfg: &LiveExec
                         "action": row.action,
                         "side": row.side,
                         "round_id": row.round_id,
+                        "decision_id": row.decision_id,
+                        "decision_key": row.decision_key,
                         "reason": "rust_order_terminal_filled",
-                        "order_id": row.order_id
+                        "order_id": row.order_id,
+                        "fill_price_cents": fill_price_cents,
+                        "fill_quote_usdc": fill_quote_usdc,
+                        "fill_size_shares": fill_size_shares,
+                        "fill_fee_cents": fill_fee_cents,
+                        "fill_slippage_cents": fill_slippage_cents,
+                        "fill_cost_cents": fill_cost_cents,
+                        "fill_pnl_cents_net": ps_after.last_fill_pnl_usdc * 100.0,
+                        "position_realized_pnl_cents": ps_after.realized_pnl_usdc * 100.0
                     }),
                 )
                 .await;
@@ -901,6 +1289,8 @@ pub(super) async fn reconcile_rust_reports(state: &ApiState, exec_cfg: &LiveExec
                         "action": row.action,
                         "side": row.side,
                         "round_id": row.round_id,
+                        "decision_id": row.decision_id,
+                        "decision_key": row.decision_key,
                         "reason": "rust_order_terminal_rejected",
                         "order_id": row.order_id,
                         "status": terminal_status
@@ -1002,6 +1392,8 @@ pub(super) async fn handle_pending_timeouts_rust(
                                         "action": row.action,
                                         "side": row.side,
                                         "round_id": row.round_id,
+                                        "decision_id": row.decision_id,
+                                        "decision_key": row.decision_key,
                                         "reason": "rust_timeout_cancelled_round_target_mismatch",
                                         "order_id": row.order_id,
                                         "target_market_id": effective_target.market_id,
@@ -1028,6 +1420,8 @@ pub(super) async fn handle_pending_timeouts_rust(
                                         "action": row.action,
                                         "side": row.side,
                                         "round_id": row.round_id,
+                                        "decision_id": row.decision_id,
+                                        "decision_key": row.decision_key,
                                         "reason": format!("rust_timeout_cancelled_{reason}"),
                                         "order_id": row.order_id,
                                         "target_market_id": effective_target.market_id,
@@ -1040,6 +1434,7 @@ pub(super) async fn handle_pending_timeouts_rust(
                             continue;
                         }
                         let decision = json!({
+                            "decision_id": row.decision_id,
                             "action": row.action,
                             "side": row.side,
                             "round_id": row.round_id,
@@ -1105,8 +1500,11 @@ pub(super) async fn handle_pending_timeouts_rust(
                                                     "action": row.action,
                                                     "side": row.side,
                                                     "round_id": row.round_id,
+                                                    "decision_id": row.decision_id,
+                                                    "decision_key": row.decision_key,
                                                     "reason": "rust_timeout_cancelled_resubmitted_fak",
                                                     "order_id": row.order_id,
+                                                    "new_order_id": order_id,
                                                     "cancelled": resp.canceled,
                                                     "not_cancelled": resp.not_canceled,
                                                     "submit_response": submit_resp,
@@ -1126,6 +1524,8 @@ pub(super) async fn handle_pending_timeouts_rust(
                                             "action": row.action,
                                             "side": row.side,
                                             "round_id": row.round_id,
+                                            "decision_id": row.decision_id,
+                                            "decision_key": row.decision_key,
                                             "reason": "rust_timeout_cancelled_fak_resubmit_rejected",
                                             "order_id": row.order_id,
                                             "cancelled": resp.canceled,
@@ -1147,6 +1547,8 @@ pub(super) async fn handle_pending_timeouts_rust(
                             "action": row.action,
                             "side": row.side,
                             "round_id": row.round_id,
+                            "decision_id": row.decision_id,
+                            "decision_key": row.decision_key,
                             "reason": "rust_timeout_cancelled",
                             "order_id": row.order_id,
                             "cancelled": resp.canceled,

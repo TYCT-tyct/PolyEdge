@@ -156,6 +156,10 @@ function numCell(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
+function objCell(v: unknown): Record<string, unknown> | null {
+  return v != null && typeof v === "object" ? (v as Record<string, unknown>) : null;
+}
+
 function compactStrategyPayload(payload: StrategyPaperResponse): StrategyPaperResponse {
   const trimmedTrades = payload.trades.length > 60 ? payload.trades.slice(-60) : payload.trades;
   const live = payload.live_execution;
@@ -176,6 +180,10 @@ function compactStrategyPayload(payload: StrategyPaperResponse): StrategyPaperRe
       live.live_records && live.live_records.length > 60
         ? live.live_records.slice(live.live_records.length - 60)
         : live.live_records,
+    order_lineage:
+      live.order_lineage && live.order_lineage.length > 80
+        ? live.order_lineage.slice(live.order_lineage.length - 80)
+        : live.order_lineage,
     events:
       live.events && live.events.length > 50
         ? live.events.slice(live.events.length - 50)
@@ -484,13 +492,38 @@ export function PaperLabPage({
   const idleMinutes =
     lastTradeTs != null ? Math.max(0, (nowTs - lastTradeTs) / 60_000) : null;
   const liveExecution = strategyPaper?.live_execution;
+  const liveSummary = liveExecution?.summary;
   const liveParity = liveExecution?.parity_check;
   const liveState = liveExecution?.state_machine;
   const runtimeControl = strategyPaper?.runtime_control;
   const executionAggr = strategyPaper?.execution_aggressiveness;
   const executionTarget = liveExecution?.execution_target;
+  const liveRealizedNetCents =
+    numCell(liveSummary?.realized_net_pnl_cents) ??
+    numCell(liveSummary?.fills?.realized_net_pnl_cents) ??
+    (numCell(liveState?.realized_pnl_usdc) != null
+      ? numCell(liveState?.realized_pnl_usdc)! * 100
+      : null);
+  const liveFillEventCount = numCell(liveSummary?.fills?.fill_event_count);
+  const liveFillDecisionCount = numCell(liveSummary?.fills?.fill_decision_count);
+  const liveFillCostCents = numCell(liveSummary?.fills?.total_fill_cost_cents);
+  const livePaperFillCount = numCell(liveSummary?.paper_live_fill_count);
   const liveEvents = (liveExecution?.events ?? []).slice(-20).reverse();
   const liveOrders = (liveExecution?.execution?.orders ?? []).slice(-20).reverse();
+  const livePaperRecords = (liveExecution?.paper_records ?? [])
+    .slice(-20)
+    .reverse();
+  const liveOrderLineage = (liveExecution?.order_lineage ?? [])
+    .slice(-20)
+    .reverse();
+  const lineagePendingDecisionCount = liveOrderLineage.filter((row) => {
+    const pendingCount = numCell(row.pending_count);
+    return pendingCount != null && pendingCount > 0;
+  }).length;
+  const lineagePendingOrderCount = liveOrderLineage.reduce((sum, row) => {
+    const pendingCount = numCell(row.pending_count) ?? 0;
+    return sum + pendingCount;
+  }, 0);
   const liveOrderLatencies = liveOrders
     .map((row) => numCell(row.order_latency_ms))
     .filter((v): v is number => v != null && Number.isFinite(v) && v >= 0);
@@ -562,6 +595,10 @@ export function PaperLabPage({
       : profileSource === "default"
       ? strategyPaper.baseline_profile ?? "default"
       : profileSource;
+  const displayedNetCents =
+    strategySource === "live" && liveRealizedNetCents != null
+      ? liveRealizedNetCents
+      : summaryNet;
 
   return (
     <section className="panel">
@@ -598,14 +635,20 @@ export function PaperLabPage({
         </article>
         <article className="info-card">
           <span>累计净收益</span>
-          <strong className={(summaryNet ?? 0) >= 0 ? "up" : "down"}>
-            {summaryNet != null ? `${summaryNet.toFixed(2)}¢` : "--"}
+          <strong className={(displayedNetCents ?? 0) >= 0 ? "up" : "down"}>
+            {displayedNetCents != null ? `${displayedNetCents.toFixed(2)}¢` : "--"}
           </strong>
           <small>
             交易 {summary?.trade_count ?? 0} · 胜率 {summary ? `${summary.win_rate_pct.toFixed(1)}%` : "--"} · 窗口{" "}
             {strategyPaper?.lookback_minutes ?? "--"}m · 覆盖 {lookbackCoverageLabel}
             {lookbackTruncated ? " (截断)" : ""}
           </small>
+          {strategySource === "live" ? (
+            <small>
+              Paper {summaryNet != null ? `${summaryNet.toFixed(2)}¢` : "--"} · Live{" "}
+              {liveRealizedNetCents != null ? `${liveRealizedNetCents.toFixed(2)}¢` : "--"}
+            </small>
+          ) : null}
         </article>
         <article className="info-card">
           <span>均值 / 回撤</span>
@@ -715,6 +758,16 @@ export function PaperLabPage({
               <small>top reason: {textCell(topSkipReason)}</small>
             </article>
             <article className="info-card">
+              <span>真实成交覆盖</span>
+              <strong>
+                {`${livePaperFillCount ?? 0} / ${liveFillDecisionCount ?? 0}`}
+              </strong>
+              <small>
+                fill events {liveFillEventCount ?? 0} · fill cost{" "}
+                {liveFillCostCents != null ? `${liveFillCostCents.toFixed(2)}¢` : "--"}
+              </small>
+            </article>
+            <article className="info-card">
               <span>控制模式</span>
               <strong>{textCell(runtimeControl?.mode)}</strong>
               <small>
@@ -821,6 +874,10 @@ export function PaperLabPage({
                   <strong>{numCell(runtimeControl?.pending_orders_before_cycle) ?? 0}</strong>
                 </li>
                 <li>
+                  <span>lineage pending</span>
+                  <strong>{`${lineagePendingDecisionCount}/${lineagePendingOrderCount}`}</strong>
+                </li>
+                <li>
                   <span>trigger</span>
                   <strong>{textCell(runtimeControl?.trigger_source)}</strong>
                 </li>
@@ -847,6 +904,7 @@ export function PaperLabPage({
                     <th>结果</th>
                     <th>动作</th>
                     <th>方向</th>
+                    <th>decision_id</th>
                     <th>轮次</th>
                     <th>order_id</th>
                     <th>请求</th>
@@ -870,8 +928,14 @@ export function PaperLabPage({
                         : row.request && typeof row.request === "object"
                         ? (row.request as Record<string, unknown>)
                         : null;
-                    const reqPrice = numCell(finalRequest?.price_cents);
-                    const reqSize = numCell(finalRequest?.size_shares);
+                    const reqPrice =
+                      numCell(finalRequest?.price_cents) ??
+                      (numCell(finalRequest?.price) != null
+                        ? numCell(finalRequest?.price)! * 100
+                        : null);
+                    const reqSize =
+                      numCell(finalRequest?.size_shares) ??
+                      numCell(finalRequest?.size);
                     const reqTif = textCell(finalRequest?.tif);
                     const reqStyle = textCell(finalRequest?.style);
                     const reqQuote = numCell(finalRequest?.quote_size_usdc);
@@ -883,6 +947,7 @@ export function PaperLabPage({
                         </td>
                         <td>{textCell(row.decision?.action)}</td>
                         <td>{textCell(row.decision?.side)}</td>
+                        <td>{shortRoundId(textCell(row.decision_id ?? row.decision?.decision_id))}</td>
                         <td>{shortRoundId(textCell(row.decision?.round_id))}</td>
                         <td>{orderId}</td>
                         <td>
@@ -903,7 +968,7 @@ export function PaperLabPage({
                   })}
                   {liveOrders.length === 0 ? (
                     <tr>
-                      <td colSpan={8}>暂无真实下单记录</td>
+                      <td colSpan={9}>暂无真实下单记录</td>
                     </tr>
                   ) : null}
                 </tbody>
@@ -918,7 +983,9 @@ export function PaperLabPage({
                     <th>结果</th>
                     <th>动作</th>
                     <th>方向</th>
+                    <th>decision_id</th>
                     <th>order_id</th>
+                    <th>成交价</th>
                     <th>原因</th>
                   </tr>
                 </thead>
@@ -931,13 +998,106 @@ export function PaperLabPage({
                       </td>
                       <td>{textCell(row.action)}</td>
                       <td>{textCell(row.side)}</td>
+                      <td>{shortRoundId(textCell(row.decision_id))}</td>
                       <td>{textCell(row.order_id)}</td>
+                      <td>
+                        {numCell(row.fill_price_cents) != null
+                          ? `${numCell(row.fill_price_cents)!.toFixed(2)}¢`
+                          : "--"}
+                      </td>
                       <td>{textCell(row.reason)}</td>
                     </tr>
                   ))}
                   {liveEvents.length === 0 ? (
                     <tr>
-                      <td colSpan={6}>暂无链路事件</td>
+                      <td colSpan={8}>暂无链路事件</td>
+                    </tr>
+                  ) : null}
+                </tbody>
+              </table>
+            </div>
+            <div className="table-wrap">
+              <h3 className="table-title">Paper 信号与真实成交对照（最近 20）</h3>
+              <table className="history-table live-paper-fill-table">
+                <thead>
+                  <tr>
+                    <th>动作</th>
+                    <th>方向</th>
+                    <th>decision_id</th>
+                    <th>信号价</th>
+                    <th>真实成交价</th>
+                    <th>真实净盈亏</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {livePaperRecords.map((row, idx) => {
+                    const liveFill = objCell(row.live_fill);
+                    const paperPrice = numCell(row.price_cents);
+                    const fillPrice =
+                      numCell(row.live_fill_price_cents) ??
+                      numCell(liveFill?.fill_price_cents);
+                    const fillNetPnl =
+                      numCell(row.live_fill_pnl_cents_net) ??
+                      numCell(liveFill?.fill_pnl_cents_net);
+                    return (
+                      <tr key={`live-paper-fill-${idx}`}>
+                        <td>{textCell(row.action)}</td>
+                        <td>{textCell(row.side)}</td>
+                        <td>{shortRoundId(textCell(row.decision_id))}</td>
+                        <td>{paperPrice != null ? `${paperPrice.toFixed(2)}¢` : "--"}</td>
+                        <td>{fillPrice != null ? `${fillPrice.toFixed(2)}¢` : "--"}</td>
+                        <td className={fillNetPnl != null && fillNetPnl < 0 ? "down" : "up"}>
+                          {fillNetPnl != null ? `${fillNetPnl.toFixed(2)}¢` : "--"}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  {livePaperRecords.length === 0 ? (
+                    <tr>
+                      <td colSpan={6}>暂无 Paper / Live 对照数据</td>
+                    </tr>
+                  ) : null}
+                </tbody>
+              </table>
+            </div>
+            <div className="table-wrap">
+              <h3 className="table-title">订单映射 Lineage（最近 20）</h3>
+              <table className="history-table live-lineage-table">
+                <thead>
+                  <tr>
+                    <th>decision_id</th>
+                    <th>order_ids</th>
+                    <th>pending</th>
+                    <th>状态</th>
+                    <th>原因</th>
+                    <th>更新时间</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {liveOrderLineage.map((row, idx) => {
+                    const orderIds = Array.isArray(row.order_ids)
+                      ? row.order_ids
+                          .map((v) => textCell(v))
+                          .filter((v) => v !== "--")
+                          .join(", ")
+                      : "--";
+                    const pendingCount = numCell(row.pending_count);
+                    return (
+                      <tr key={`live-lineage-${idx}`}>
+                        <td>{shortRoundId(textCell(row.decision_id))}</td>
+                        <td>{orderIds === "" ? "--" : orderIds}</td>
+                        <td className={pendingCount != null && pendingCount > 0 ? "down" : "up"}>
+                          {pendingCount != null ? pendingCount : "--"}
+                        </td>
+                        <td>{textCell(row.last_status)}</td>
+                        <td>{textCell(row.last_reason)}</td>
+                        <td>{formatClockTime(numCell(row.last_ts_ms), timeMode)}</td>
+                      </tr>
+                    );
+                  })}
+                  {liveOrderLineage.length === 0 ? (
+                    <tr>
+                      <td colSpan={6}>暂无订单映射数据</td>
                     </tr>
                   ) : null}
                 </tbody>
