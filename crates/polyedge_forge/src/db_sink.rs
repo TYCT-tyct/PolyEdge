@@ -221,6 +221,14 @@ pub async fn run_db_sink(cfg: DbSinkConfig, mut rx: mpsc::Receiver<DbEvent>) {
     }
 }
 
+fn redis_snapshot_ring_max() -> i64 {
+    std::env::var("FORGE_SNAPSHOT_REDIS_RING_MAX")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(20_000)
+        .clamp(2_000, 500_000)
+}
+
 async fn flush_batches(
     cfg: &DbSinkConfig,
     snapshot_batch: &mut Vec<SnapshotRow>,
@@ -839,6 +847,40 @@ async fn flush_redis_latest(
             cfg.redis_ttl_sec,
         )
         .await?;
+
+    let ring_max = redis_snapshot_ring_max();
+    let mut ring_batch: HashMap<(String, String), Vec<String>> = HashMap::new();
+    for row in rows {
+        let snap = RedisSnapshot::from_row(row);
+        let payload = serde_json::to_string(&snap)?;
+        ring_batch
+            .entry((snap.symbol, snap.timeframe))
+            .or_default()
+            .push(payload);
+    }
+    for ((symbol, timeframe), payloads) in ring_batch {
+        if payloads.is_empty() {
+            continue;
+        }
+        let ring_key = format!(
+            "{}:snapshot:ring:{}:{}",
+            cfg.redis_prefix, symbol, timeframe
+        );
+        let mut pipe = redis::pipe();
+        for payload in payloads {
+            pipe.cmd("RPUSH").arg(&ring_key).arg(payload).ignore();
+        }
+        pipe.cmd("LTRIM")
+            .arg(&ring_key)
+            .arg(-ring_max)
+            .arg(-1_i64)
+            .ignore();
+        pipe.cmd("EXPIRE")
+            .arg(&ring_key)
+            .arg(cfg.redis_ttl_sec)
+            .ignore();
+        pipe.query_async::<()>(conn).await?;
+    }
 
     let event_channel = format!("{}:snapshot:events", cfg.redis_prefix);
     for (symbol, timeframe, market_id) in changed_markets {

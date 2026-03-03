@@ -1316,6 +1316,19 @@ impl ApiState {
     }
 
     async fn upsert_runtime_event_sample(&self, market_type: &str, sample: StrategySample) {
+        self.upsert_runtime_event_samples_batch(market_type, vec![sample])
+            .await;
+    }
+
+    async fn upsert_runtime_event_samples_batch(
+        &self,
+        market_type: &str,
+        mut samples: Vec<StrategySample>,
+    ) {
+        if samples.is_empty() {
+            return;
+        }
+        samples.sort_by_key(|s| s.ts_ms);
         let mut store = self.runtime_event_samples.write().await;
         let entry = store
             .entry(market_type.to_string())
@@ -1323,15 +1336,17 @@ impl ApiState {
                 updated_at_ms: 0,
                 samples: VecDeque::new(),
             });
-        entry.updated_at_ms = sample.ts_ms;
-        if let Some(last) = entry.samples.back_mut() {
-            if last.round_id == sample.round_id && last.ts_ms / 1000 == sample.ts_ms / 1000 {
-                *last = sample;
+        for sample in samples {
+            entry.updated_at_ms = sample.ts_ms;
+            if let Some(last) = entry.samples.back_mut() {
+                if last.round_id == sample.round_id && last.ts_ms / 1000 == sample.ts_ms / 1000 {
+                    *last = sample;
+                } else {
+                    entry.samples.push_back(sample);
+                }
             } else {
                 entry.samples.push_back(sample);
             }
-        } else {
-            entry.samples.push_back(sample);
         }
         let max_points = runtime_event_sample_buffer_max();
         while entry.samples.len() > max_points {
@@ -1367,6 +1382,45 @@ impl ApiState {
             out.drain(0..trim);
         }
         Some(Arc::new(out))
+    }
+
+    async fn preload_runtime_event_samples_from_redis(&self, markets: &[String]) {
+        let Some(mut conn) = self.redis_manager.clone() else {
+            return;
+        };
+        let ring_take = runtime_event_sample_buffer_max().min(40_000) as isize;
+        for market in markets {
+            let market = market.trim().to_ascii_lowercase();
+            if market != "5m" && market != "15m" {
+                continue;
+            }
+            let key = format!("{}:snapshot:ring:BTCUSDT:{market}", self.redis_prefix);
+            let rows: Vec<String> = match conn.lrange(&key, -ring_take, -1_isize).await {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::debug!(?err, key = %key, "runtime preload ring lrange failed");
+                    continue;
+                }
+            };
+            if rows.is_empty() {
+                continue;
+            }
+            let mut samples = Vec::<StrategySample>::new();
+            for row in rows {
+                let Ok(v) = serde_json::from_str::<Value>(&row) else {
+                    continue;
+                };
+                let Some((tf, _, sample)) = strategy_sample_from_snapshot_event(&v) else {
+                    continue;
+                };
+                if tf.eq_ignore_ascii_case(&market) {
+                    samples.push(sample);
+                }
+            }
+            if !samples.is_empty() {
+                self.upsert_runtime_event_samples_batch(&market, samples).await;
+            }
+        }
     }
 
     async fn persist_live_runtime_state_async(&self, market_type: &str) {
@@ -2164,6 +2218,9 @@ async fn restore_live_runtime_state(
         let mut seq = state.live_event_seq.write().await;
         *seq = max_event_seq;
     }
+    state
+        .preload_runtime_event_samples_from_redis(&cfg.markets)
+        .await;
     Ok(())
 }
 
