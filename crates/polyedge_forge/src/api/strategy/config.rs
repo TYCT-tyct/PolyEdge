@@ -31,6 +31,10 @@ fn strategy_runtime_stream_enabled() -> bool {
     strategy_env_bool("FORGE_STRATEGY_RUNTIME_STREAM_ENABLED", true)
 }
 
+fn strategy_runtime_event_cache_enabled() -> bool {
+    strategy_env_bool("FORGE_STRATEGY_RUNTIME_EVENT_CACHE_ENABLED", true)
+}
+
 fn strategy_runtime_stream_reload_sec() -> u64 {
     strategy_env_u32("FORGE_STRATEGY_RUNTIME_STREAM_RELOAD_SEC", 180, 10, 3_600) as u64
 }

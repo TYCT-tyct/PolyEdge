@@ -138,6 +138,16 @@ struct RedisSnapshotEvent {
     round_id: String,
     ts_ireland_sample_ms: i64,
     remaining_ms: i64,
+    mid_yes: f64,
+    mid_yes_smooth: f64,
+    bid_yes: f64,
+    ask_yes: f64,
+    bid_no: f64,
+    ask_no: f64,
+    delta_pct: Option<f64>,
+    delta_pct_smooth: Option<f64>,
+    velocity_bps_per_sec: Option<f64>,
+    acceleration: Option<f64>,
     source: &'static str,
 }
 
@@ -847,6 +857,16 @@ async fn flush_redis_latest(
             round_id: snap.round_id.clone(),
             ts_ireland_sample_ms: snap.ts_ireland_sample_ms,
             remaining_ms: snap.remaining_ms,
+            mid_yes: snap.mid_yes,
+            mid_yes_smooth: snap.mid_yes_smooth,
+            bid_yes: snap.bid_yes,
+            ask_yes: snap.ask_yes,
+            bid_no: snap.bid_no,
+            ask_no: snap.ask_no,
+            delta_pct: snap.delta_pct,
+            delta_pct_smooth: snap.delta_pct_smooth,
+            velocity_bps_per_sec: snap.velocity_bps_per_sec,
+            acceleration: snap.acceleration,
             source: "db_sink",
         })?;
         if let Err(err) = conn.publish::<_, _, i64>(&event_channel, payload).await {

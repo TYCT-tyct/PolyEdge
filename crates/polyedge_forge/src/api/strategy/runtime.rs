@@ -119,6 +119,109 @@ pub(super) fn parse_strategy_rows(rows: Vec<Value>) -> Vec<StrategySample> {
     out
 }
 
+pub(super) fn strategy_sample_from_snapshot_event(
+    event: &Value,
+) -> Option<(String, i64, StrategySample)> {
+    let symbol = event
+        .get("symbol")
+        .and_then(Value::as_str)
+        .map(|v| v.trim().to_ascii_uppercase())
+        .unwrap_or_default();
+    if symbol != "BTCUSDT" {
+        return None;
+    }
+    let timeframe = event
+        .get("timeframe")
+        .and_then(Value::as_str)
+        .map(|v| v.trim().to_ascii_lowercase())?;
+    if timeframe != "5m" && timeframe != "15m" {
+        return None;
+    }
+    let ts_ms = event.get("ts_ireland_sample_ms").and_then(Value::as_i64)?;
+    if ts_ms <= 0 {
+        return None;
+    }
+    let round_id = event
+        .get("round_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())?
+        .to_string();
+
+    let mut p_up = event
+        .get("mid_yes_smooth")
+        .and_then(Value::as_f64)
+        .or_else(|| event.get("mid_yes").and_then(Value::as_f64))
+        .unwrap_or(0.5);
+    if !p_up.is_finite() {
+        p_up = 0.5;
+    }
+    p_up = p_up.clamp(0.0, 1.0);
+    let p_no_mid = event
+        .get("mid_no_smooth")
+        .and_then(Value::as_f64)
+        .or_else(|| event.get("mid_no").and_then(Value::as_f64))
+        .unwrap_or((1.0 - p_up).clamp(0.0, 1.0));
+    let bid_yes = event
+        .get("bid_yes")
+        .and_then(Value::as_f64)
+        .unwrap_or((p_up - 0.006).clamp(0.0, 1.0));
+    let ask_yes = event
+        .get("ask_yes")
+        .and_then(Value::as_f64)
+        .unwrap_or((p_up + 0.006).clamp(0.0, 1.0));
+    let bid_no = event
+        .get("bid_no")
+        .and_then(Value::as_f64)
+        .unwrap_or((p_no_mid - 0.006).clamp(0.0, 1.0));
+    let ask_no = event
+        .get("ask_no")
+        .and_then(Value::as_f64)
+        .unwrap_or((p_no_mid + 0.006).clamp(0.0, 1.0));
+    let spread_up = (ask_yes - bid_yes).abs().clamp(0.003, 0.04);
+    let spread_down = (ask_no - bid_no).abs().clamp(0.003, 0.04);
+    let spread_mid = ((spread_up + spread_down) * 0.5).clamp(0.001, 0.08);
+    let delta_pct = event
+        .get("delta_pct_smooth")
+        .and_then(Value::as_f64)
+        .or_else(|| event.get("delta_pct").and_then(Value::as_f64))
+        .unwrap_or(0.0);
+    let velocity = event
+        .get("velocity_bps_per_sec")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let acceleration = event
+        .get("acceleration")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let remaining_ms = event
+        .get("remaining_ms")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .max(0);
+
+    Some((
+        timeframe,
+        ts_ms,
+        StrategySample {
+            ts_ms,
+            round_id,
+            remaining_ms,
+            p_up,
+            delta_pct,
+            velocity,
+            acceleration,
+            bid_yes,
+            ask_yes,
+            bid_no,
+            ask_no,
+            spread_up,
+            spread_down,
+            spread_mid,
+        },
+    ))
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct StrategySimulationResult {
     current: Value,
@@ -677,6 +780,16 @@ pub(super) async fn load_strategy_samples_runtime_stream(
     lookback_minutes: u32,
     max_points: u32,
 ) -> Result<Arc<Vec<StrategySample>>, ApiError> {
+    if strategy_runtime_event_cache_enabled() && symbol.eq_ignore_ascii_case("BTCUSDT") {
+        if let Some(samples) = state
+            .get_runtime_event_samples(market_type, lookback_minutes, max_points)
+            .await
+        {
+            if samples.len() >= 20 {
+                return Ok(samples);
+            }
+        }
+    }
     if !strategy_runtime_stream_enabled() {
         return load_strategy_samples(
             state,

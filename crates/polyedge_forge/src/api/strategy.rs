@@ -8,20 +8,20 @@ use tokio::sync::OwnedSemaphorePermit;
 
 #[derive(Debug, Clone)]
 pub(super) struct StrategySample {
-    ts_ms: i64,
-    round_id: String,
-    remaining_ms: i64,
-    p_up: f64,
-    delta_pct: f64,
-    velocity: f64,
-    acceleration: f64,
-    bid_yes: f64,
-    ask_yes: f64,
-    bid_no: f64,
-    ask_no: f64,
-    spread_up: f64,
-    spread_down: f64,
-    spread_mid: f64,
+    pub(super) ts_ms: i64,
+    pub(super) round_id: String,
+    pub(super) remaining_ms: i64,
+    pub(super) p_up: f64,
+    pub(super) delta_pct: f64,
+    pub(super) velocity: f64,
+    pub(super) acceleration: f64,
+    pub(super) bid_yes: f64,
+    pub(super) ask_yes: f64,
+    pub(super) bid_no: f64,
+    pub(super) ask_no: f64,
+    pub(super) spread_up: f64,
+    pub(super) spread_down: f64,
+    pub(super) spread_mid: f64,
 }
 
 #[derive(Debug, Clone, Copy)]

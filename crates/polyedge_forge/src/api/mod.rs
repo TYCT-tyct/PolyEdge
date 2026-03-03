@@ -91,6 +91,7 @@ struct ApiState {
     runtime_daily_report_sent: Arc<RwLock<HashSet<String>>>,
     strategy_heavy_slots: Arc<Semaphore>,
     strategy_live_source_slots: Arc<Semaphore>,
+    runtime_event_samples: Arc<RwLock<HashMap<String, RuntimeEventSampleBuffer>>>,
     gateway_http_client: Arc<reqwest::Client>,
 }
 
@@ -98,6 +99,12 @@ struct ApiState {
 struct ChartCacheEntry {
     created_at: Instant,
     payload: Value,
+}
+
+#[derive(Clone)]
+struct RuntimeEventSampleBuffer {
+    updated_at_ms: i64,
+    samples: VecDeque<StrategySample>,
 }
 
 const CHART_CACHE_TTL_MS: u64 = 900;
@@ -112,6 +119,20 @@ const LIVE_EVENT_LOG_TTL_SEC_MAX: u32 = 30 * 24 * 3600;
 const LIVE_RUST_BOOK_CACHE_TTL_MS: u64 = 260;
 const LIVE_RUST_BOOK_CACHE_MAX: usize = 512;
 const LIVE_ALERT_THROTTLE_DEFAULT_MS: i64 = 5 * 60_000;
+const RUNTIME_EVENT_SAMPLE_BUFFER_MAX_DEFAULT: usize = 140_000;
+const RUNTIME_EVENT_SAMPLE_BUFFER_MAX_MIN: usize = 10_000;
+const RUNTIME_EVENT_SAMPLE_BUFFER_MAX_MAX: usize = 600_000;
+
+fn runtime_event_sample_buffer_max() -> usize {
+    std::env::var("FORGE_STRATEGY_RUNTIME_EVENT_BUFFER_MAX_POINTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(RUNTIME_EVENT_SAMPLE_BUFFER_MAX_DEFAULT)
+        .clamp(
+            RUNTIME_EVENT_SAMPLE_BUFFER_MAX_MIN,
+            RUNTIME_EVENT_SAMPLE_BUFFER_MAX_MAX,
+        )
+}
 
 fn live_event_log_max() -> usize {
     std::env::var("FORGE_FEV1_LIVE_EVENT_LOG_MAX")
@@ -1014,8 +1035,7 @@ impl LiveExecutionAggState {
     }
 }
 
-fn parse_snapshot_event(payload: &str) -> Option<(String, Option<i64>)> {
-    let v: Value = serde_json::from_str(payload).ok()?;
+fn parse_snapshot_event(v: &Value) -> Option<(String, Option<i64>)> {
     let tf = v
         .get("timeframe")
         .and_then(Value::as_str)
@@ -1293,6 +1313,60 @@ impl ApiState {
     async fn set_runtime_snapshot(&self, market_type: &str, payload: Value) {
         let mut store = self.live_runtime_snapshots.write().await;
         store.insert(market_type.to_string(), payload);
+    }
+
+    async fn upsert_runtime_event_sample(&self, market_type: &str, sample: StrategySample) {
+        let mut store = self.runtime_event_samples.write().await;
+        let entry = store
+            .entry(market_type.to_string())
+            .or_insert_with(|| RuntimeEventSampleBuffer {
+                updated_at_ms: 0,
+                samples: VecDeque::new(),
+            });
+        entry.updated_at_ms = sample.ts_ms;
+        if let Some(last) = entry.samples.back_mut() {
+            if last.round_id == sample.round_id && last.ts_ms / 1000 == sample.ts_ms / 1000 {
+                *last = sample;
+            } else {
+                entry.samples.push_back(sample);
+            }
+        } else {
+            entry.samples.push_back(sample);
+        }
+        let max_points = runtime_event_sample_buffer_max();
+        while entry.samples.len() > max_points {
+            entry.samples.pop_front();
+        }
+    }
+
+    async fn get_runtime_event_samples(
+        &self,
+        market_type: &str,
+        lookback_minutes: u32,
+        max_points: u32,
+    ) -> Option<Arc<Vec<StrategySample>>> {
+        let store = self.runtime_event_samples.read().await;
+        let rows = store.get(market_type)?;
+        if rows.samples.is_empty() {
+            return None;
+        }
+        let now_ms = Utc::now().timestamp_millis();
+        let from_ms = now_ms.saturating_sub(i64::from(lookback_minutes) * 60_000);
+        let mut out = rows
+            .samples
+            .iter()
+            .filter(|row| row.ts_ms >= from_ms)
+            .cloned()
+            .collect::<Vec<_>>();
+        if out.is_empty() {
+            return None;
+        }
+        let max_points = max_points as usize;
+        if out.len() > max_points {
+            let trim = out.len().saturating_sub(max_points);
+            out.drain(0..trim);
+        }
+        Some(Arc::new(out))
     }
 
     async fn persist_live_runtime_state_async(&self, market_type: &str) {
@@ -1878,6 +1952,7 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         runtime_daily_report_sent: Arc::new(RwLock::new(HashSet::new())),
         strategy_heavy_slots: Arc::new(Semaphore::new(strategy_heavy_slots)),
         strategy_live_source_slots: Arc::new(Semaphore::new(strategy_live_source_slots)),
+        runtime_event_samples: Arc::new(RwLock::new(HashMap::new())),
         gateway_http_client: Arc::new(gateway_http_client),
     };
 
@@ -2000,9 +2075,21 @@ async fn live_runtime_snapshot_event_listener(
                             continue;
                         }
                     };
-                    let Some((market_type, sample_ts_ms)) = parse_snapshot_event(&payload) else {
+                    let payload_value: Value = match serde_json::from_str(&payload) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            tracing::warn!(?err, "runtime pubsub json decode failed");
+                            continue;
+                        }
+                    };
+                    let Some((market_type, sample_ts_ms)) = parse_snapshot_event(&payload_value) else {
                         continue;
                     };
+                    if let Some((sample_tf, _, sample)) =
+                        strategy_sample_from_snapshot_event(&payload_value)
+                    {
+                        state.upsert_runtime_event_sample(&sample_tf, sample).await;
+                    }
                     let _ = wake_tx.send(LiveRuntimeWakeEvent {
                         market_type,
                         source: "redis_snapshot_event".to_string(),
@@ -2867,8 +2954,7 @@ mod tests {
             "symbol": "BTCUSDT",
             "timeframe": "5m",
             "ts_ireland_sample_ms": 123_456_i64
-        })
-        .to_string();
+        });
         let parsed = parse_snapshot_event(&payload).expect("parse snapshot event");
         assert_eq!(parsed.0, "5m");
         assert_eq!(parsed.1, Some(123_456_i64));
@@ -2880,9 +2966,32 @@ mod tests {
             "event": "snapshot_updated",
             "timeframe": "30m",
             "ts_ireland_sample_ms": 123_456_i64
-        })
-        .to_string();
+        });
         assert!(parse_snapshot_event(&payload).is_none());
+    }
+
+    #[test]
+    fn strategy_sample_from_snapshot_event_builds_runtime_sample() {
+        let payload = json!({
+            "symbol": "BTCUSDT",
+            "timeframe": "5m",
+            "round_id": "BTCUSDT_5m_123000",
+            "ts_ireland_sample_ms": 123_456_i64,
+            "remaining_ms": 40_000_i64,
+            "mid_yes_smooth": 0.62,
+            "mid_yes": 0.61,
+            "mid_no_smooth": 0.38,
+            "bid_yes": 0.615,
+            "ask_yes": 0.625,
+            "bid_no": 0.375,
+            "ask_no": 0.385,
+            "delta_pct_smooth": 0.12,
+            "velocity_bps_per_sec": 8.0,
+            "acceleration": 0.6
+        });
+        let parsed = strategy_sample_from_snapshot_event(&payload).expect("runtime sample");
+        assert_eq!(parsed.0, "5m");
+        assert_eq!(parsed.1, 123_456_i64);
     }
 
     #[test]
