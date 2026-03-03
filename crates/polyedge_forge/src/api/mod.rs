@@ -2981,10 +2981,11 @@ async fn live_runtime_loop(
                     }
                 }
             }
-            let pending_after_count = state
-                .list_pending_orders_for_market(market_type)
-                .await
-                .len();
+            let pending_after_count = if effective_live_execute || pending_before_count > 0 {
+                state.list_pending_orders_for_market(market_type).await.len()
+            } else {
+                0
+            };
             if pending_after_count > 0 {
                 market_sleep_ms = market_sleep_ms.min(fast_loop_ms.min(80));
             }
