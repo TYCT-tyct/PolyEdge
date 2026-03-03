@@ -17,6 +17,20 @@ fn floor_lot_size(size: f64) -> f64 {
     ((size.max(0.0) * 100.0).floor() / 100.0).max(0.01)
 }
 
+fn live_quote_amount_decimals() -> u32 {
+    std::env::var("FORGE_FEV1_QUOTE_AMOUNT_DECIMALS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(2)
+        .clamp(0, 6)
+}
+
+pub(super) fn ceil_quote_amount_usdc(value: f64) -> f64 {
+    let decimals = live_quote_amount_decimals();
+    let scale = 10_f64.powi(decimals as i32);
+    ((value.max(0.0) * scale).ceil() / scale).max(0.0)
+}
+
 fn decimal_places_from_step(step: f64, fallback: usize, max_decimals: usize) -> usize {
     if !step.is_finite() || step <= 0.0 {
         return fallback.min(max_decimals);

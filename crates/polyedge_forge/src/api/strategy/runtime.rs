@@ -221,11 +221,15 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
     let runtime_defaults = LiveRuntimeConfig::from_env();
     let live_enabled = fev1::ExecutionGate::from_env().live_enabled;
     let live_allowed = live_execution_market_allowed(market_type);
-    let live_execute_effective = live_execute && live_allowed && live_enabled && !live_drain_only;
+    let live_submit_allowed = live_submit_effective_armed();
+    let live_execute_effective =
+        live_execute && live_allowed && live_enabled && !live_drain_only && live_submit_allowed;
     let live_execute_block_reason = if live_execute && !live_allowed {
         Some("market_not_enabled_for_live_execution")
     } else if live_execute && !live_enabled {
         Some("live_execution_disabled_by_env")
+    } else if live_execute && !live_submit_allowed {
+        Some("live_submit_not_armed")
     } else if live_execute && live_drain_only {
         Some("drain_mode_no_new_orders")
     } else {

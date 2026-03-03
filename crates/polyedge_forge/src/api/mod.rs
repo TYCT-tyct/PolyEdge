@@ -81,7 +81,6 @@ struct ApiState {
     live_events: Arc<RwLock<VecDeque<Value>>>,
     live_event_seq: Arc<RwLock<u64>>,
     live_pending_orders: Arc<RwLock<HashMap<String, LivePendingOrder>>>,
-    live_gateway_report_seq: Arc<RwLock<i64>>,
     live_runtime_snapshots: Arc<RwLock<HashMap<String, Value>>>,
     live_runtime_controls: Arc<RwLock<HashMap<String, LiveRuntimeControl>>>,
     live_persist_inflight: Arc<RwLock<HashSet<String>>>,
@@ -186,25 +185,6 @@ fn classify_live_event_type(event: &Value) -> &'static str {
         "state"
     } else {
         "execution"
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LiveExecutorMode {
-    Gateway,
-    RustSdk,
-}
-
-impl LiveExecutorMode {
-    fn from_env() -> Self {
-        let raw = std::env::var("FORGE_FEV1_EXECUTOR")
-            .ok()
-            .map(|v| v.trim().to_ascii_lowercase())
-            .unwrap_or_else(|| "gateway".to_string());
-        match raw.as_str() {
-            "rust" | "rust_sdk" | "rust-native" | "rust_native" => Self::RustSdk,
-            _ => Self::Gateway,
-        }
     }
 }
 
@@ -540,6 +520,34 @@ fn runtime_target_keepalive_ms() -> i64 {
         .clamp(500, 30_000)
 }
 
+fn live_submit_arm_required() -> bool {
+    std::env::var("FORGE_FEV1_LIVE_ARM_REQUIRED")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(true)
+}
+
+fn live_submit_armed() -> bool {
+    std::env::var("FORGE_FEV1_LIVE_ARMED")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn live_submit_effective_armed() -> bool {
+    !live_submit_arm_required() || live_submit_armed()
+}
+
 fn live_min_entry_score() -> f64 {
     std::env::var("FORGE_FEV1_LIVE_MIN_ENTRY_SCORE")
         .ok()
@@ -771,7 +779,7 @@ fn gate_live_decisions_by_profitability(
     decisions: &[Value],
     summary: &Value,
     trades: &[Value],
-    gateway_cfg: &LiveGatewayConfig,
+    gateway_cfg: &LiveExecutionConfig,
 ) -> (Vec<Value>, Vec<Value>, Value) {
     if decisions.is_empty() {
         return (
@@ -1286,11 +1294,11 @@ impl ApiState {
     }
 
     #[allow(dead_code)]
-    async fn apply_aggressiveness_to_gateway_cfg(
+    async fn apply_aggressiveness_to_execution_cfg(
         &self,
         market_type: &str,
-        cfg: &LiveGatewayConfig,
-    ) -> (LiveGatewayConfig, LiveExecutionAggState) {
+        cfg: &LiveExecutionConfig,
+    ) -> (LiveExecutionConfig, LiveExecutionAggState) {
         let s = self.get_live_execution_aggr_state(market_type).await;
         let mut tuned = cfg.clone();
         tuned.entry_slippage_bps =
@@ -1472,15 +1480,6 @@ impl ApiState {
             }
         }
         (has_enter_pending, has_exit_pending)
-    }
-
-    async fn get_gateway_report_seq(&self) -> i64 {
-        *self.live_gateway_report_seq.read().await
-    }
-
-    async fn set_gateway_report_seq(&self, seq: i64) {
-        let mut current = self.live_gateway_report_seq.write().await;
-        *current = seq;
     }
 
     #[allow(dead_code)]
@@ -1821,7 +1820,6 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         live_events: Arc::new(RwLock::new(VecDeque::new())),
         live_event_seq: Arc::new(RwLock::new(0)),
         live_pending_orders: Arc::new(RwLock::new(HashMap::new())),
-        live_gateway_report_seq: Arc::new(RwLock::new(0)),
         live_runtime_snapshots: Arc::new(RwLock::new(HashMap::new())),
         live_runtime_controls: Arc::new(RwLock::new(HashMap::new())),
         live_persist_inflight: Arc::new(RwLock::new(HashSet::new())),
@@ -1899,10 +1897,6 @@ fn live_events_key(redis_prefix: &str, market_type: &str) -> String {
 
 fn live_runtime_control_key(redis_prefix: &str, market_type: &str) -> String {
     format!("{redis_prefix}:fev1:live:runtime_control:{market_type}")
-}
-
-fn live_gateway_seq_key(redis_prefix: &str) -> String {
-    format!("{redis_prefix}:fev1:live:gateway_seq")
 }
 
 fn start_live_runtime(state: ApiState) {
@@ -2018,11 +2012,6 @@ async fn restore_live_runtime_state(
             }
         }
     }
-    let seq_key = live_gateway_seq_key(&state.redis_prefix);
-    if let Some(v) = read_key_value(state, &seq_key).await? {
-        let seq = v.get("seq").and_then(Value::as_i64).unwrap_or(0);
-        state.set_gateway_report_seq(seq).await;
-    }
     if !restored_events.is_empty() {
         restored_events.sort_by_key(|ev| ev.get("ts_ms").and_then(Value::as_i64).unwrap_or(0));
         let max_len = live_event_log_max();
@@ -2066,10 +2055,6 @@ async fn persist_live_runtime_state(state: &ApiState, market_type: &str) {
     )
     .await;
 
-    let seq = state.get_gateway_report_seq().await;
-    let seq_key = live_gateway_seq_key(&state.redis_prefix);
-    let _ = write_key_value(state, &seq_key, &json!({ "seq": seq }), Some(2 * 24 * 3600)).await;
-
     let events_key = live_events_key(&state.redis_prefix, market_type);
     let events_rows = state
         .list_live_events(market_type, live_event_log_max())
@@ -2096,7 +2081,7 @@ async fn live_runtime_loop(
     );
     let mut last_round_seen: HashMap<String, String> = HashMap::new();
     let mut target_keepalive_at: HashMap<String, i64> = HashMap::new();
-    let mut next_wait_ms = bootstrap.loop_interval_ms;
+    let mut market_next_due_ms: HashMap<String, i64> = HashMap::new();
     loop {
         let cfg = LiveRuntimeConfig::from_env();
         let push_cfg = ServerChanConfig::from_env();
@@ -2105,8 +2090,26 @@ async fn live_runtime_loop(
         let fast_margin = runtime_fast_margin_threshold();
         let target_prewarm_ms = runtime_target_prewarm_ms();
         let target_keepalive_ms = runtime_target_keepalive_ms();
-        let mut cycle_sleep_ms = cfg.loop_interval_ms;
-        let wait_ms = next_wait_ms.clamp(20, cfg.loop_interval_ms.max(20));
+        let now_for_wait = Utc::now().timestamp_millis();
+        market_next_due_ms.retain(|k, _| cfg.markets.iter().any(|m| m.eq_ignore_ascii_case(k)));
+        for market in &cfg.markets {
+            market_next_due_ms
+                .entry(market.to_string())
+                .or_insert(now_for_wait);
+        }
+        let earliest_due_ms = cfg
+            .markets
+            .iter()
+            .filter_map(|m| market_next_due_ms.get(m))
+            .copied()
+            .min()
+            .unwrap_or(now_for_wait);
+        let wait_budget_ms = if cfg.enabled {
+            earliest_due_ms.saturating_sub(now_for_wait).max(0) as u64
+        } else {
+            cfg.loop_interval_ms
+        };
+        let wait_ms = wait_budget_ms.clamp(8, cfg.loop_interval_ms.max(8));
         let first_wake_event = tokio::select! {
             maybe = wake_rx.recv() => maybe,
             _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => None,
@@ -2137,21 +2140,35 @@ async fn live_runtime_loop(
             .collect();
         let wake_event_scope_enabled = !wake_markets.is_empty();
         if !cfg.enabled {
-            next_wait_ms = cfg.loop_interval_ms;
+            let next_due = Utc::now()
+                .timestamp_millis()
+                .saturating_add(cfg.loop_interval_ms as i64);
+            for market in &cfg.markets {
+                market_next_due_ms.insert(market.to_string(), next_due);
+            }
             continue;
         }
 
         for market in &cfg.markets {
             let market_type = market.as_str();
-            if wake_event_scope_enabled && !wake_markets.contains(&market_type.to_ascii_lowercase())
-            {
-                continue;
-            }
             let trigger_for_market = wake_events
                 .iter()
                 .rev()
                 .find(|ev| ev.market_type.eq_ignore_ascii_case(market_type));
             let now_ms = Utc::now().timestamp_millis();
+            let is_wake_hit = wake_markets.contains(&market_type.to_ascii_lowercase());
+            let due_at_ms = market_next_due_ms
+                .get(market_type)
+                .copied()
+                .unwrap_or(now_ms);
+            let due_cycle = now_ms >= due_at_ms;
+            if wake_event_scope_enabled && !is_wake_hit && !due_cycle {
+                continue;
+            }
+            if !wake_event_scope_enabled && !due_cycle && trigger_for_market.is_none() {
+                continue;
+            }
+            let mut market_sleep_ms = cfg.loop_interval_ms;
             let last_keepalive = target_keepalive_at.get(market_type).copied().unwrap_or(0);
             let due_keepalive = now_ms.saturating_sub(last_keepalive) >= target_keepalive_ms;
             if due_keepalive {
@@ -2165,7 +2182,7 @@ async fn live_runtime_loop(
                     Ok(Ok(_))
                 ) {
                     target_keepalive_at.insert(market_type.to_string(), now_ms);
-                    cycle_sleep_ms = cycle_sleep_ms.min(fast_loop_ms);
+                    market_sleep_ms = market_sleep_ms.min(fast_loop_ms);
                 }
             }
             let position_before_cycle = state.get_live_position_state(market_type).await;
@@ -2175,6 +2192,9 @@ async fn live_runtime_loop(
             let exec_aggr = state.get_live_execution_aggr_state(market_type).await;
             let mut effective_live_execute = cfg.live_execute;
             let mut effective_drain_only = cfg.drain_only;
+            let live_arm_required = live_submit_arm_required();
+            let live_armed = live_submit_armed();
+            let live_submit_allowed = live_submit_effective_armed();
             match runtime_control.mode {
                 LiveRuntimeControlMode::Normal => {}
                 LiveRuntimeControlMode::ForcePause => {
@@ -2197,6 +2217,9 @@ async fn live_runtime_loop(
                         effective_live_execute = true;
                     }
                 }
+            }
+            if effective_live_execute && !live_submit_allowed {
+                effective_live_execute = false;
             }
             let strategy_cfg = StrategyRuntimeConfig::default();
             let runtime_cfg_source = "live_default";
@@ -2260,6 +2283,9 @@ async fn live_runtime_loop(
                                 "trigger_source": trigger_for_market.map(|v| v.source.clone()),
                                 "trigger_market": trigger_for_market.map(|v| v.market_type.clone()),
                                 "trigger_ts_ms": trigger_for_market.map(|v| v.ts_ms),
+                                "live_arm_required": live_arm_required,
+                                "live_armed": live_armed,
+                                "live_submit_allowed": live_submit_allowed,
                             }),
                         );
                         obj.insert("execution_aggressiveness".to_string(), json!(exec_aggr));
@@ -2298,11 +2324,11 @@ async fn live_runtime_loop(
                             }
                         }
                         if fast_path {
-                            cycle_sleep_ms = cycle_sleep_ms.min(fast_loop_ms);
+                            market_sleep_ms = market_sleep_ms.min(fast_loop_ms);
                         }
                         if round_switched {
                             // Event-driven assist: immediately tighten next cycle on round rollover.
-                            cycle_sleep_ms = cycle_sleep_ms.min(fast_loop_ms);
+                            market_sleep_ms = market_sleep_ms.min(fast_loop_ms);
                         }
                     }
 
@@ -2316,11 +2342,11 @@ async fn live_runtime_loop(
                             resolve_live_market_target_with_state(&state, market_type),
                         )
                         .await;
-                        cycle_sleep_ms = cycle_sleep_ms.min(fast_loop_ms);
+                        market_sleep_ms = market_sleep_ms.min(fast_loop_ms);
                     }
 
                     if wake_event_scope_enabled {
-                        cycle_sleep_ms = cycle_sleep_ms.min(fast_loop_ms);
+                        market_sleep_ms = market_sleep_ms.min(fast_loop_ms);
                     }
 
                     let summary = payload.get("summary").cloned().unwrap_or(Value::Null);
@@ -2349,15 +2375,13 @@ async fn live_runtime_loop(
                         effective_drain_only,
                         prefer_action,
                     );
-                    let executor_mode = LiveExecutorMode::from_env();
-                    let gateway_cfg = LiveGatewayConfig::from_env();
-                    let (gateway_cfg_tuned, _) = state
-                        .apply_aggressiveness_to_gateway_cfg(market_type, &gateway_cfg)
+                    let exec_cfg = LiveExecutionConfig::from_env();
+                    let (exec_cfg_tuned, _) = state
+                        .apply_aggressiveness_to_execution_cfg(market_type, &exec_cfg)
                         .await;
                     if effective_live_execute || pending_before_count > 0 {
-                        reconcile_live_reports(&state, &gateway_cfg_tuned, executor_mode).await;
-                        handle_live_pending_timeouts(&state, &gateway_cfg_tuned, executor_mode)
-                            .await;
+                        reconcile_live_reports(&state, &exec_cfg_tuned).await;
+                        handle_live_pending_timeouts(&state, &exec_cfg_tuned).await;
                     }
 
                     let (profit_selected, profit_skipped, profit_gate_meta) =
@@ -2365,7 +2389,7 @@ async fn live_runtime_loop(
                             &selected_decisions,
                             &summary,
                             &trades,
-                            &gateway_cfg_tuned,
+                            &exec_cfg_tuned,
                         );
                     let (gated, mut state_skipped, position_for_submit) = gate_live_decisions(
                         &state,
@@ -2416,22 +2440,15 @@ async fn live_runtime_loop(
                                 });
                                 execution_orders = execute_live_orders(
                                     &state,
-                                    &gateway_cfg_tuned,
-                                    executor_mode,
+                                    &exec_cfg_tuned,
                                     market_type,
                                     &target,
                                     &position_for_submit,
                                     &gated,
                                 )
                                 .await;
-                                reconcile_live_reports(&state, &gateway_cfg_tuned, executor_mode)
-                                    .await;
-                                handle_live_pending_timeouts(
-                                    &state,
-                                    &gateway_cfg_tuned,
-                                    executor_mode,
-                                )
-                                .await;
+                                reconcile_live_reports(&state, &exec_cfg_tuned).await;
+                                handle_live_pending_timeouts(&state, &exec_cfg_tuned).await;
                                 let accepted_count = execution_orders
                                     .iter()
                                     .filter(|row| {
@@ -2685,8 +2702,18 @@ async fn live_runtime_loop(
                     }
                 }
             }
+            let pending_after_count = state
+                .list_pending_orders_for_market(market_type)
+                .await
+                .len();
+            if pending_after_count > 0 {
+                market_sleep_ms = market_sleep_ms.min(fast_loop_ms.min(80));
+            }
+            let next_due = Utc::now()
+                .timestamp_millis()
+                .saturating_add(market_sleep_ms as i64);
+            market_next_due_ms.insert(market_type.to_string(), next_due);
         }
-        next_wait_ms = cycle_sleep_ms.clamp(20, cfg.loop_interval_ms.max(20));
     }
 }
 
@@ -2756,15 +2783,11 @@ mod tests {
             token_id_no: "no_token".to_string(),
             end_date: None,
         };
-        let cfg = LiveGatewayConfig {
-            primary_url: "http://127.0.0.1:9001".to_string(),
-            backup_url: None,
-            timeout_ms: 500,
+        let cfg = LiveExecutionConfig {
             min_quote_usdc: 1.0,
             entry_slippage_bps: 18.0,
             exit_slippage_bps: 22.0,
             force_slippage_bps: None,
-            rust_submit_fallback_gateway: true,
         };
         let payload =
             decision_to_live_payload(&decision, &target, &cfg, None, None).expect("payload");

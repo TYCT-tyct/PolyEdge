@@ -383,7 +383,7 @@ pub(super) async fn submit_rust_order(
 
 async fn try_resubmit_after_terminal_reject_rust(
     state: &ApiState,
-    gateway_cfg: &LiveGatewayConfig,
+    exec_cfg: &LiveExecutionConfig,
     ctx: &Arc<RustExecutorContext>,
     row: &LivePendingOrder,
     terminal_status: &str,
@@ -395,6 +395,7 @@ async fn try_resubmit_after_terminal_reject_rust(
     if row.retry_count >= max_retry {
         return false;
     }
+    let now_ms = Utc::now().timestamp_millis();
     let target = match resolve_live_market_target_with_state(state, &row.market_type).await {
         Ok(v) => v,
         Err(err) => {
@@ -441,6 +442,30 @@ async fn try_resubmit_after_terminal_reject_rust(
                 .await;
         return false;
     }
+    if let Err(reason) = validate_entry_target_readiness(&json!({
+        "action": row.action,
+        "side": row.side,
+        "round_id": row.round_id
+    }), &effective_target, now_ms) {
+        state
+            .append_live_event(
+                &row.market_type,
+                json!({
+                    "accepted": false,
+                    "action": row.action,
+                    "side": row.side,
+                    "round_id": row.round_id,
+                    "reason": format!("rust_terminal_rejected_resubmit_{reason}"),
+                    "order_id": row.order_id,
+                    "status": terminal_status,
+                    "target_market_id": effective_target.market_id,
+                    "target_end_date": effective_target.end_date,
+                    "now_ms": now_ms
+                }),
+            )
+            .await;
+        return false;
+    }
     let mut decision = json!({
         "action": row.action,
         "side": row.side,
@@ -452,9 +477,9 @@ async fn try_resubmit_after_terminal_reject_rust(
         "style": "taker",
         "ttl_ms": if emergency_exit { 650 } else { 900 },
         "max_slippage_bps": if exit_like {
-            (gateway_cfg.exit_slippage_bps + if emergency_exit { 22.0 } else { 14.0 }).max(34.0)
+            (exec_cfg.exit_slippage_bps + if emergency_exit { 22.0 } else { 14.0 }).max(34.0)
         } else {
-            (gateway_cfg.entry_slippage_bps + 12.0).max(28.0)
+            (exec_cfg.entry_slippage_bps + 12.0).max(28.0)
         }
     });
     if exit_like {
@@ -484,7 +509,7 @@ async fn try_resubmit_after_terminal_reject_rust(
     let Some(payload) = decision_to_live_payload(
         &decision,
         &effective_target,
-        gateway_cfg,
+        exec_cfg,
         book_snapshot.as_ref(),
         Some(row.quote_size_usdc),
     ) else {
@@ -587,7 +612,7 @@ async fn try_resubmit_after_terminal_reject_rust(
 
 pub(super) async fn execute_live_orders_via_rust_sdk(
     state: &ApiState,
-    gateway_cfg: &LiveGatewayConfig,
+    exec_cfg: &LiveExecutionConfig,
     target: &LiveMarketTarget,
     position_state: &LivePositionState,
     decisions: &[LiveGatedDecision],
@@ -612,10 +637,8 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
     };
 
     let mut out = Vec::<Value>::with_capacity(decisions.len());
-    let fallback_client = state.gateway_http_client.as_ref();
     let token_ids = collect_decision_token_ids(target, decisions);
-    let mut book_cache =
-        prefetch_rust_books_for_tokens(state, &ctx, fallback_client, gateway_cfg, &token_ids).await;
+    let mut book_cache = prefetch_rust_books_for_tokens(state, &ctx, &token_ids).await;
     let exit_quote_override =
         position_state
             .entry_quote_usdc
@@ -627,40 +650,22 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
     };
 
     for gated in decisions {
-        let mut decision = gated.decision.clone();
-        let _side_aligned = align_exit_decision_side_with_position(&mut decision, position_state);
-        let effective_target = build_effective_target_for_decision(target, &decision, position_state);
-        let bypass_round_guard = should_bypass_round_match_for_locked_exit(&decision, position_state);
-        if !decision_round_matches_target(&decision, &effective_target) && !bypass_round_guard {
-            out.push(json!({
-                "ok": false,
-                "accepted": false,
-                "reason": "round_target_mismatch",
-                "decision_key": gated.decision_key,
-                "decision_round_id": decision.get("round_id").and_then(Value::as_str),
-                "target_market_id": effective_target.market_id,
-                "target_end_date": effective_target.end_date,
-                "decision": decision
-            }));
-            continue;
-        }
-        if decision
-            .get("action")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .eq_ignore_ascii_case("exit")
-        {
-            if let Some(obj) = decision.as_object_mut() {
-                if let Some(q) = exit_quote_override {
-                    obj.insert("quote_size_usdc".to_string(), json!(q));
-                }
-                if let Some(sz) = exit_size_override {
-                    obj.insert("position_size_shares".to_string(), json!(sz));
-                }
+        let prepared = match prepare_live_decision_for_submission(
+            gated,
+            target,
+            position_state,
+            exec_cfg,
+            exit_quote_override,
+            exit_size_override,
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                out.push(prepare_live_decision_error_json(gated, err, Some("rust_sdk")));
+                continue;
             }
-        }
-        apply_emergency_exit_overrides(&mut decision, gateway_cfg);
-        let token_id = token_id_for_decision(&decision, &effective_target).map(str::to_string);
+        };
+        let token_id =
+            token_id_for_decision(&prepared.decision, &prepared.effective_target).map(str::to_string);
         let book_snapshot = if let Some(token_id) = token_id.clone() {
             match book_cache.get(&token_id) {
                 Some(cached) => cached.clone(),
@@ -671,13 +676,7 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                         state.put_rust_book_cache(&token_id, v.clone()).await;
                         Some(v)
                     } else {
-                        let fetched =
-                            fetch_gateway_book_snapshot(fallback_client, gateway_cfg, &token_id)
-                                .await;
-                        if let Some(v) = fetched.as_ref() {
-                            state.put_rust_book_cache(&token_id, v.clone()).await;
-                        }
-                        fetched
+                        None
                     };
                     book_cache.insert(token_id.clone(), fetched.clone());
                     fetched
@@ -688,9 +687,9 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
         };
         let Some(payload) =
             decision_to_live_payload(
-                &decision,
-                &effective_target,
-                gateway_cfg,
+                &prepared.decision,
+                &prepared.effective_target,
+                exec_cfg,
                 book_snapshot.as_ref(),
                 None,
             )
@@ -699,7 +698,7 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                 "ok": false,
                 "accepted": false,
                 "decision_key": gated.decision_key,
-                "decision": decision,
+                "decision": prepared.decision,
                 "reason": "decision_to_payload_failed",
                 "executor": "rust_sdk"
             }));
@@ -711,7 +710,7 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
         let mut final_response: Option<Value> = None;
         let mut final_error: Option<String> = None;
         let mut final_reject_reason: Option<String> = None;
-        let mut executed_via = "rust_sdk";
+        let executed_via = "rust_sdk";
         let order_started = Instant::now();
         for attempt in 0..3usize {
             let attempt_started = Instant::now();
@@ -751,55 +750,13 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                     break;
                 }
                 Err(err) => {
-                    let mut fallback_response: Option<Value> = None;
-                    let mut fallback_accept = false;
-                    let mut fallback_used = false;
-                    if gateway_cfg.rust_submit_fallback_gateway {
-                        let fallback_started = Instant::now();
-                        let (fallback_submit, fallback_endpoint) =
-                            submit_gateway_order(fallback_client, gateway_cfg, &attempt_payload)
-                                .await;
-                        if let Ok(resp) = fallback_submit {
-                            fallback_used = true;
-                            fallback_accept = resp
-                                .get("accepted")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false);
-                            executed_via = "gateway_fallback";
-                            fallback_response = Some(json!({
-                                "endpoint": fallback_endpoint,
-                                "latency_ms": fallback_started.elapsed().as_millis() as u64,
-                                "response": resp
-                            }));
-                            if fallback_accept {
-                                accepted = true;
-                                final_response = fallback_response
-                                    .as_ref()
-                                    .and_then(|v| v.get("response"))
-                                    .cloned();
-                                attempts.push(json!({
-                                    "attempt": attempt + 1,
-                                    "executor": "rust_sdk",
-                                    "latency_ms": attempt_started.elapsed().as_millis() as u64,
-                                    "request": attempt_payload.clone(),
-                                    "accepted": false,
-                                    "error": err,
-                                    "fallback": fallback_response
-                                }));
-                                break;
-                            }
-                        }
-                    }
                     attempts.push(json!({
                         "attempt": attempt + 1,
                         "executor": "rust_sdk",
                         "latency_ms": attempt_started.elapsed().as_millis() as u64,
                         "request": attempt_payload.clone(),
                         "accepted": false,
-                        "error": err,
-                        "fallback_used": fallback_used,
-                        "fallback_accepted": fallback_accept,
-                        "fallback": fallback_response
+                        "error": err
                     }));
                     final_error = Some(err.clone());
                     final_reject_reason = Some(err.clone());
@@ -816,7 +773,7 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
             "ok": accepted,
             "accepted": accepted,
             "decision_key": gated.decision_key,
-            "decision": decision,
+            "decision": prepared.decision,
             "request": payload,
             "final_request": attempt_payload,
             "response": final_response,
@@ -826,10 +783,10 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
             "executor": executed_via,
             "order_latency_ms": order_started.elapsed().as_millis() as u64,
             "book_snapshot": book_snapshot,
-            "target_market_id": effective_target.market_id,
-            "round_guard_bypassed": bypass_round_guard,
+            "target_market_id": prepared.effective_target.market_id,
+            "round_guard_bypassed": prepared.bypass_round_guard,
             "price_trace": build_execution_price_trace(
-                &decision,
+                &prepared.decision,
                 &payload,
                 &attempt_payload,
                 final_response.as_ref()
@@ -839,12 +796,11 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
     out
 }
 
-pub(super) async fn reconcile_rust_reports(state: &ApiState, gateway_cfg: &LiveGatewayConfig) {
+pub(super) async fn reconcile_rust_reports(state: &ApiState, exec_cfg: &LiveExecutionConfig) {
     let ctx = match get_or_init_rust_executor(state).await {
         Ok(v) => v,
         Err(err) => {
-            tracing::warn!(error = %err, "rust sdk reconcile unavailable, fallback to gateway reports");
-            reconcile_gateway_reports(state, gateway_cfg).await;
+            tracing::warn!(error = %err, "rust sdk reconcile unavailable");
             return;
         }
     };
@@ -885,7 +841,7 @@ pub(super) async fn reconcile_rust_reports(state: &ApiState, gateway_cfg: &LiveG
             let terminal_status = format!("{}", order.status);
             let retried = try_resubmit_after_terminal_reject_rust(
                 state,
-                gateway_cfg,
+                exec_cfg,
                 &ctx,
                 &row,
                 &terminal_status,
@@ -915,13 +871,12 @@ pub(super) async fn reconcile_rust_reports(state: &ApiState, gateway_cfg: &LiveG
 
 pub(super) async fn handle_pending_timeouts_rust(
     state: &ApiState,
-    gateway_cfg: &LiveGatewayConfig,
+    exec_cfg: &LiveExecutionConfig,
 ) {
     let ctx = match get_or_init_rust_executor(state).await {
         Ok(v) => v,
         Err(err) => {
-            tracing::warn!(error = %err, "rust sdk cancel unavailable, fallback to gateway cancels");
-            handle_pending_timeouts(state, gateway_cfg).await;
+            tracing::warn!(error = %err, "rust sdk cancel unavailable");
             return;
         }
     };
@@ -955,16 +910,16 @@ pub(super) async fn handle_pending_timeouts_rust(
                         900
                     };
                     let fallback_slippage_bps = if emergency_exit {
-                        (gateway_cfg.exit_slippage_bps + 18.0).max(38.0)
+                        (exec_cfg.exit_slippage_bps + 18.0).max(38.0)
                     } else if entry_like {
-                        gateway_cfg
+                        exec_cfg
                             .exit_slippage_bps
-                            .max(gateway_cfg.entry_slippage_bps)
+                            .max(exec_cfg.entry_slippage_bps)
                             + live_entry_fak_slippage_boost_bps()
                     } else {
-                        gateway_cfg
+                        exec_cfg
                             .exit_slippage_bps
-                            .max(gateway_cfg.entry_slippage_bps)
+                            .max(exec_cfg.entry_slippage_bps)
                             + 10.0
                     };
                     let maybe_target =
@@ -993,6 +948,33 @@ pub(super) async fn handle_pending_timeouts_rust(
                                         "order_id": row.order_id,
                                         "target_market_id": effective_target.market_id,
                                         "target_end_date": effective_target.end_date
+                                    }),
+                                )
+                                .await;
+                            apply_pending_revert(state, &row, "rust_local_timeout_cancel").await;
+                            continue;
+                        }
+                        let readiness_check = json!({
+                            "action": row.action,
+                            "side": row.side,
+                            "round_id": row.round_id
+                        });
+                        if let Err(reason) =
+                            validate_entry_target_readiness(&readiness_check, &effective_target, now_ms)
+                        {
+                            state
+                                .append_live_event(
+                                    &row.market_type,
+                                    json!({
+                                        "accepted": false,
+                                        "action": row.action,
+                                        "side": row.side,
+                                        "round_id": row.round_id,
+                                        "reason": format!("rust_timeout_cancelled_{reason}"),
+                                        "order_id": row.order_id,
+                                        "target_market_id": effective_target.market_id,
+                                        "target_end_date": effective_target.end_date,
+                                        "now_ms": now_ms
                                     }),
                                 )
                                 .await;
@@ -1029,7 +1011,7 @@ pub(super) async fn handle_pending_timeouts_rust(
                         if let Some(payload) = decision_to_live_payload(
                             &decision,
                             &effective_target,
-                            gateway_cfg,
+                            exec_cfg,
                             book_snapshot.as_ref(),
                             Some(row.quote_size_usdc),
                         ) {

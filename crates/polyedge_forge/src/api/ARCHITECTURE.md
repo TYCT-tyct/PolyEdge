@@ -26,12 +26,12 @@ This document describes the current API module layout after the large-file split
 
 - `live_execution.rs` + `live_execution/`
   - `live_execution.rs` keeps shared execution types/constants and composes subfiles via `include!`.
-  - `live_execution/config.rs`: gateway/runtime env + cache tuning helpers.
+  - `live_execution/config.rs`: execution/runtime env + cache tuning helpers.
   - `live_execution/targeting.rs`: target resolution, gating and decision selection helpers.
-  - `live_execution/gateway.rs`: payload building, gateway submit/query and retry shaping.
-  - `live_execution/pending.rs`: pending-order lifecycle and gateway reconciliation.
-  - `live_execution/rust_sdk.rs`: Rust SDK submit path and reconciliation.
-  - `live_execution/orchestrator.rs`: executor mode dispatch and top-level orchestration.
+  - `live_execution/planner.rs`: payload building, retry ladder, and fill-meta parsing helpers.
+  - `live_execution/pending.rs`: pending-order lifecycle and shared prepare/validation helpers.
+  - `live_execution/rust_sdk.rs`: Rust SDK submit/cancel/reconcile path (single execution backend).
+  - `live_execution/orchestrator.rs`: top-level execution orchestration (Rust SDK only).
   - `live_execution/tests.rs`: focused execution behavior tests.
 
 - `infra.rs`

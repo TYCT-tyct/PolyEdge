@@ -1,17 +1,23 @@
 fn decision_round_matches_target(decision: &Value, target: &LiveMarketTarget) -> bool {
+    let action = decision
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let is_entry_like = action == "enter" || action == "add";
     let round_id = decision
         .get("round_id")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .trim();
     if round_id.is_empty() {
-        return true;
+        return !is_entry_like;
     }
     let Some(decision_end_ms) = parse_round_end_ts_ms(round_id) else {
-        return true;
+        return !is_entry_like;
     };
     let Some(target_end_ms) = parse_end_date_ms(target.end_date.as_deref()) else {
-        return true;
+        return !is_entry_like;
     };
     decision_end_ms
         .saturating_sub(target_end_ms)
@@ -792,30 +798,14 @@ fn collect_decision_token_ids(
     uniq.into_iter().collect()
 }
 
-async fn prefetch_gateway_books_for_tokens(
-    client: &reqwest::Client,
-    gateway_cfg: &LiveGatewayConfig,
-    token_ids: &[String],
-) -> HashMap<String, Option<GatewayBookSnapshot>> {
-    let futures = token_ids.iter().map(|token_id| async move {
-        let snap = fetch_gateway_book_snapshot(client, gateway_cfg, token_id).await;
-        (token_id.clone(), snap)
-    });
-    let rows = join_all(futures).await;
-    rows.into_iter().collect()
-}
-
 async fn prefetch_rust_books_for_tokens(
     state: &ApiState,
     ctx: &Arc<RustExecutorContext>,
-    fallback_client: &reqwest::Client,
-    gateway_cfg: &LiveGatewayConfig,
     token_ids: &[String],
 ) -> HashMap<String, Option<GatewayBookSnapshot>> {
     let futures = token_ids.iter().map(|token_id| {
         let state = state.clone();
         let ctx = Arc::clone(ctx);
-        let gateway_cfg = gateway_cfg.clone();
         let token_id = token_id.clone();
         async move {
             let snapshot = if let Some(cached) = state.get_rust_book_cache(&token_id).await {
@@ -824,12 +814,7 @@ async fn prefetch_rust_books_for_tokens(
                 state.put_rust_book_cache(&token_id, v.clone()).await;
                 Some(v)
             } else {
-                let fetched =
-                    fetch_gateway_book_snapshot(fallback_client, &gateway_cfg, &token_id).await;
-                if let Some(v) = fetched.as_ref() {
-                    state.put_rust_book_cache(&token_id, v.clone()).await;
-                }
-                fetched
+                None
             };
             (token_id, snapshot)
         }

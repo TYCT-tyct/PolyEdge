@@ -9,16 +9,12 @@
         }
     }
 
-    fn test_gateway_cfg() -> LiveGatewayConfig {
-        LiveGatewayConfig {
-            primary_url: "http://127.0.0.1:9001".to_string(),
-            backup_url: None,
-            timeout_ms: 500,
+    fn test_exec_cfg() -> LiveExecutionConfig {
+        LiveExecutionConfig {
             min_quote_usdc: 1.0,
             entry_slippage_bps: 18.0,
             exit_slippage_bps: 22.0,
             force_slippage_bps: None,
-            rust_submit_fallback_gateway: true,
         }
     }
 
@@ -49,7 +45,7 @@
         let payload = decision_to_live_payload(
             &decision,
             &test_target(),
-            &test_gateway_cfg(),
+            &test_exec_cfg(),
             Some(&test_book(5.0)),
             None,
         )
@@ -95,7 +91,7 @@
         let payload = decision_to_live_payload(
             &decision,
             &test_target(),
-            &test_gateway_cfg(),
+            &test_exec_cfg(),
             Some(&test_book(5.0)),
             None,
         )
@@ -111,6 +107,47 @@
         assert!(
             payload.get("buy_amount_usdc").is_none(),
             "maker path should stay in share-size mode"
+        );
+    }
+
+    #[test]
+    fn taker_buy_quote_amount_is_quantized_to_cents_with_ceiling() {
+        let decision = json!({
+            "action": "enter",
+            "side": "UP",
+            "price_cents": 50.0,
+            "quote_size_usdc": 2.501,
+            "tif": "FAK",
+            "style": "taker"
+        });
+        let payload = decision_to_live_payload(
+            &decision,
+            &test_target(),
+            &test_exec_cfg(),
+            Some(&test_book(5.0)),
+            None,
+        )
+        .expect("payload");
+        let amount = payload
+            .get("buy_amount_usdc")
+            .and_then(Value::as_f64)
+            .unwrap_or_default();
+        let price = payload
+            .get("price")
+            .and_then(Value::as_f64)
+            .unwrap_or_default();
+        let size = payload
+            .get("size")
+            .and_then(Value::as_f64)
+            .unwrap_or_default();
+        let cents_scaled = amount * 100.0;
+        assert!(
+            (cents_scaled - cents_scaled.round()).abs() < 1e-9,
+            "buy amount should keep cent precision, got {amount}"
+        );
+        assert!(
+            amount + 1e-9 >= (size * price),
+            "buy amount should cover notional after rounding, amount={amount}, size={size}, price={price}"
         );
     }
 
@@ -223,6 +260,34 @@
         let bad = json!({"round_id": format!("BTCUSDT_5m_{}", start_ms + 300_000)});
         assert!(decision_round_matches_target(&ok, &target));
         assert!(!decision_round_matches_target(&bad, &target));
+    }
+
+    #[test]
+    fn decision_round_target_match_rejects_entry_without_round_id() {
+        let mut target = test_target();
+        target.end_date = end_date_iso_from_ms(1_700_000_300_000);
+        let enter_missing_round = json!({"action":"enter","side":"UP"});
+        let exit_missing_round = json!({"action":"exit","side":"UP"});
+        assert!(!decision_round_matches_target(&enter_missing_round, &target));
+        assert!(decision_round_matches_target(&exit_missing_round, &target));
+    }
+
+    #[test]
+    fn validate_entry_target_readiness_rejects_expired_entry_target() {
+        let decision = json!({"action":"enter","side":"UP","round_id":"BTCUSDT_5m_1700000000000"});
+        let mut target = test_target();
+        target.end_date = end_date_iso_from_ms(1_700_000_000_000);
+        let err = validate_entry_target_readiness(&decision, &target, 1_700_000_360_000)
+            .expect_err("entry on expired target should be blocked");
+        assert_eq!(err, "entry_target_expired");
+    }
+
+    #[test]
+    fn validate_entry_target_readiness_allows_exit_even_without_target_end_date() {
+        let decision = json!({"action":"exit","side":"UP"});
+        let mut target = test_target();
+        target.end_date = None;
+        assert!(validate_entry_target_readiness(&decision, &target, 1_700_000_360_000).is_ok());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 pub(super) fn decision_to_live_payload(
     decision: &Value,
     target: &LiveMarketTarget,
-    gateway_cfg: &LiveGatewayConfig,
+    exec_cfg: &LiveExecutionConfig,
     book: Option<&GatewayBookSnapshot>,
     quote_size_override: Option<f64>,
 ) -> Option<Value> {
@@ -17,26 +17,18 @@ pub(super) fn decision_to_live_payload(
         .to_ascii_uppercase();
     let is_exit_like = action == "exit" || action == "reduce";
     let (gateway_side, token_id, mut slippage_bps) = match (action.as_str(), side.as_str()) {
-        ("enter", "UP") | ("add", "UP") => (
-            "buy_yes",
-            target.token_id_yes.as_str(),
-            gateway_cfg.entry_slippage_bps,
-        ),
-        ("exit", "UP") | ("reduce", "UP") => (
-            "sell_yes",
-            target.token_id_yes.as_str(),
-            gateway_cfg.exit_slippage_bps,
-        ),
-        ("enter", "DOWN") | ("add", "DOWN") => (
-            "buy_no",
-            target.token_id_no.as_str(),
-            gateway_cfg.entry_slippage_bps,
-        ),
-        ("exit", "DOWN") | ("reduce", "DOWN") => (
-            "sell_no",
-            target.token_id_no.as_str(),
-            gateway_cfg.exit_slippage_bps,
-        ),
+        ("enter", "UP") | ("add", "UP") => {
+            ("buy_yes", target.token_id_yes.as_str(), exec_cfg.entry_slippage_bps)
+        }
+        ("exit", "UP") | ("reduce", "UP") => {
+            ("sell_yes", target.token_id_yes.as_str(), exec_cfg.exit_slippage_bps)
+        }
+        ("enter", "DOWN") | ("add", "DOWN") => {
+            ("buy_no", target.token_id_no.as_str(), exec_cfg.entry_slippage_bps)
+        }
+        ("exit", "DOWN") | ("reduce", "DOWN") => {
+            ("sell_no", target.token_id_no.as_str(), exec_cfg.exit_slippage_bps)
+        }
         _ => return None,
     };
     let mut price_cents = decision
@@ -70,9 +62,9 @@ pub(super) fn decision_to_live_payload(
         decision
             .get("quote_size_usdc")
             .and_then(Value::as_f64)
-            .unwrap_or(gateway_cfg.min_quote_usdc)
+            .unwrap_or(exec_cfg.min_quote_usdc)
     });
-    quote_size = quote_size.max(gateway_cfg.min_quote_usdc);
+    quote_size = quote_size.max(exec_cfg.min_quote_usdc);
     let mut notes: Vec<String> = Vec::with_capacity(3);
     let is_buy = gateway_side.starts_with("buy_");
     let fixed_entry_size_shares = if !is_exit_like {
@@ -147,7 +139,7 @@ pub(super) fn decision_to_live_payload(
         .and_then(Value::as_f64)
         .unwrap_or(slippage_bps)
         .clamp(0.0, 500.0);
-    if let Some(force) = gateway_cfg.force_slippage_bps {
+    if let Some(force) = exec_cfg.force_slippage_bps {
         slippage_bps = force.clamp(0.0, 500.0);
     }
     if let Some(book) = book {
@@ -246,8 +238,7 @@ pub(super) fn decision_to_live_payload(
     }
     let taker_like = style == "taker" || matches!(tif.as_str(), "FAK" | "FOK");
     let floor_notional_usdc = (size * price).max(0.0);
-    let requested_notional_usdc =
-        (quote_size.max(floor_notional_usdc) * 1_000_000.0).round() / 1_000_000.0;
+    let requested_notional_usdc = ceil_quote_amount_usdc(quote_size.max(floor_notional_usdc));
     let buy_amount_usdc = if is_buy && taker_like && fixed_entry_size_shares.is_none() {
         Some(requested_notional_usdc)
     } else {
@@ -303,157 +294,6 @@ pub(super) fn decision_to_live_payload(
         }
     }
     Some(payload)
-}
-
-pub(super) async fn post_gateway(
-    client: &reqwest::Client,
-    timeout_ms: u64,
-    endpoint: &str,
-    path: &str,
-    payload: &Value,
-) -> Result<Value, String> {
-    let url = format!(
-        "{}/{}",
-        endpoint.trim_end_matches('/'),
-        path.trim_start_matches('/')
-    );
-    let resp = client
-        .post(&url)
-        .timeout(Duration::from_millis(timeout_ms.clamp(100, 20_000)))
-        .header("content-type", "application/json")
-        .json(payload)
-        .send()
-        .await
-        .map_err(|e| format!("http_error:{e}"))?;
-    let status = resp.status();
-    let body = resp.text().await.map_err(|e| format!("read_error:{e}"))?;
-    let parsed = serde_json::from_str::<Value>(&body).unwrap_or_else(|_| json!({"raw": body}));
-    if status.is_success() {
-        Ok(parsed)
-    } else {
-        Err(format!("status_{}:{}", status.as_u16(), parsed))
-    }
-}
-
-pub(super) async fn get_gateway(
-    client: &reqwest::Client,
-    timeout_ms: u64,
-    endpoint: &str,
-    path: &str,
-    query: &[(&str, &str)],
-) -> Result<Value, String> {
-    let url = format!(
-        "{}/{}",
-        endpoint.trim_end_matches('/'),
-        path.trim_start_matches('/')
-    );
-    let resp = client
-        .get(&url)
-        .timeout(Duration::from_millis(timeout_ms.clamp(100, 20_000)))
-        .query(query)
-        .send()
-        .await
-        .map_err(|e| format!("http_error:{e}"))?;
-    let status = resp.status();
-    let body = resp.text().await.map_err(|e| format!("read_error:{e}"))?;
-    let parsed = serde_json::from_str::<Value>(&body).unwrap_or_else(|_| json!({"raw": body}));
-    if status.is_success() {
-        Ok(parsed)
-    } else {
-        Err(format!("status_{}:{}", status.as_u16(), parsed))
-    }
-}
-
-pub(super) async fn fetch_gateway_book_snapshot(
-    client: &reqwest::Client,
-    gateway_cfg: &LiveGatewayConfig,
-    token_id: &str,
-) -> Option<GatewayBookSnapshot> {
-    let mut endpoint = gateway_cfg.primary_url.clone();
-    let mut resp = get_gateway(
-        client,
-        gateway_cfg.timeout_ms,
-        &endpoint,
-        "/book",
-        &[("token_id", token_id)],
-    )
-    .await;
-    if resp.is_err() {
-        if let Some(backup) = gateway_cfg.backup_url.as_deref() {
-            endpoint = backup.to_string();
-            resp = get_gateway(
-                client,
-                gateway_cfg.timeout_ms,
-                &endpoint,
-                "/book",
-                &[("token_id", token_id)],
-            )
-            .await;
-        }
-    }
-    match resp {
-        Ok(v) => GatewayBookSnapshot::from_value(&v).or_else(|| {
-            tracing::warn!(
-                token_id = token_id,
-                endpoint = %endpoint,
-                "gateway /book response missing required fields"
-            );
-            None
-        }),
-        Err(err) => {
-            tracing::warn!(token_id = token_id, endpoint = %endpoint, error = %err, "gateway /book fetch failed");
-            None
-        }
-    }
-}
-
-pub(super) async fn submit_gateway_order(
-    client: &reqwest::Client,
-    gateway_cfg: &LiveGatewayConfig,
-    payload: &Value,
-) -> (Result<Value, String>, String) {
-    let mut used_endpoint = gateway_cfg.primary_url.clone();
-    let _ = post_gateway(
-        client,
-        gateway_cfg.timeout_ms,
-        &gateway_cfg.primary_url,
-        "/prebuild_order",
-        payload,
-    )
-    .await;
-    let mut result = post_gateway(
-        client,
-        gateway_cfg.timeout_ms,
-        &gateway_cfg.primary_url,
-        "/orders",
-        payload,
-    )
-    .await;
-    if result.is_err() {
-        if let Some(backup) = gateway_cfg.backup_url.as_deref() {
-            used_endpoint = backup.to_string();
-            let _ = post_gateway(
-                client,
-                gateway_cfg.timeout_ms,
-                backup,
-                "/prebuild_order",
-                payload,
-            )
-            .await;
-            result = post_gateway(client, gateway_cfg.timeout_ms, backup, "/orders", payload).await;
-        }
-    }
-    (result, used_endpoint)
-}
-
-pub(super) fn extract_gateway_reject_reason(payload: &Value) -> String {
-    payload
-        .get("reject_code")
-        .and_then(Value::as_str)
-        .or_else(|| payload.get("error").and_then(Value::as_str))
-        .or_else(|| payload.get("reason").and_then(Value::as_str))
-        .unwrap_or("unknown_reject")
-        .to_string()
 }
 
 pub(super) fn extract_rust_reject_reason(payload: &Value, fallback_error: Option<&str>) -> String {
@@ -535,10 +375,7 @@ pub(super) fn decision_is_emergency_exit(decision: &Value) -> bool {
         .unwrap_or(false)
 }
 
-pub(super) fn apply_emergency_exit_overrides(
-    decision: &mut Value,
-    gateway_cfg: &LiveGatewayConfig,
-) {
+pub(super) fn apply_emergency_exit_overrides(decision: &mut Value, exec_cfg: &LiveExecutionConfig) {
     if !decision_is_emergency_exit(decision) {
         return;
     }
@@ -554,8 +391,8 @@ pub(super) fn apply_emergency_exit_overrides(
         let slippage = obj
             .get("max_slippage_bps")
             .and_then(Value::as_f64)
-            .unwrap_or(gateway_cfg.exit_slippage_bps)
-            .max(gateway_cfg.exit_slippage_bps + 14.0)
+            .unwrap_or(exec_cfg.exit_slippage_bps)
+            .max(exec_cfg.exit_slippage_bps + 14.0)
             .clamp(34.0, 140.0);
         obj.insert("max_slippage_bps".to_string(), json!(slippage));
         obj.insert("emergency_exit".to_string(), Value::Bool(true));
@@ -629,17 +466,14 @@ pub(super) fn build_retry_payload(current: &Value, reason: &str, attempt: usize)
             } else {
                 (12.0, 900_i64, 1_u32)
             }
-        } else {
-            // Final taker step: favor certainty of exit/fill over price.
-            if is_exit_like {
-                if emergency_exit {
-                    (36.0, 420_i64, 3_u32)
-                } else {
-                    (28.0, 520_i64, 2_u32)
-                }
+        } else if is_exit_like {
+            if emergency_exit {
+                (36.0, 420_i64, 3_u32)
             } else {
-                (18.0, 760_i64, 2_u32)
+                (28.0, 520_i64, 2_u32)
             }
+        } else {
+            (18.0, 760_i64, 2_u32)
         };
         let boosted_slippage =
             (current_slippage + slip_boost).min(if is_exit_like { 180.0 } else { 120.0 });
@@ -695,10 +529,7 @@ pub(super) fn build_retry_payload(current: &Value, reason: &str, attempt: usize)
                 None
             };
             if let Some(sz) = lock_retry_size {
-                obj.insert(
-                    "size".to_string(),
-                    json!(round_lot_size(sz)),
-                );
+                obj.insert("size".to_string(), json!(round_lot_size(sz)));
             } else if let Some(q) = obj
                 .get("quote_size_usdc")
                 .and_then(Value::as_f64)
@@ -706,10 +537,7 @@ pub(super) fn build_retry_payload(current: &Value, reason: &str, attempt: usize)
                 .filter(|v| v.is_finite() && *v > 0.0)
             {
                 let resized = (q / shifted_price).max(0.01);
-                obj.insert(
-                    "size".to_string(),
-                    json!(round_lot_size(resized)),
-                );
+                obj.insert("size".to_string(), json!(round_lot_size(resized)));
             }
         }
         return Some(next);
@@ -743,7 +571,7 @@ pub(super) fn build_retry_payload(current: &Value, reason: &str, attempt: usize)
     None
 }
 
-fn build_execution_price_trace(
+pub(super) fn build_execution_price_trace(
     decision: &Value,
     request: &Value,
     final_request: &Value,
@@ -781,80 +609,8 @@ fn build_execution_price_trace(
     })
 }
 
-pub(super) async fn get_gateway_reports(
-    client: &reqwest::Client,
-    timeout_ms: u64,
-    endpoint: &str,
-    since_seq: i64,
-    limit: usize,
-) -> Result<Value, String> {
-    let url = format!(
-        "{}/reports/orders?since_seq={}&limit={}",
-        endpoint.trim_end_matches('/'),
-        since_seq.max(0),
-        limit.clamp(1, 1000)
-    );
-    let resp = client
-        .get(&url)
-        .timeout(Duration::from_millis(timeout_ms.clamp(100, 20_000)))
-        .send()
-        .await
-        .map_err(|e| format!("http_error:{e}"))?;
-    let status = resp.status();
-    let body = resp.text().await.map_err(|e| format!("read_error:{e}"))?;
-    let parsed = serde_json::from_str::<Value>(&body).unwrap_or_else(|_| json!({"raw": body}));
-    if status.is_success() {
-        Ok(parsed)
-    } else {
-        Err(format!("status_{}:{}", status.as_u16(), parsed))
-    }
-}
-
-pub(super) async fn delete_gateway_order(
-    client: &reqwest::Client,
-    timeout_ms: u64,
-    endpoint: &str,
-    order_id: &str,
-) -> Result<Value, String> {
-    let url = format!(
-        "{}/orders/{}",
-        endpoint.trim_end_matches('/'),
-        order_id.trim()
-    );
-    let resp = client
-        .delete(&url)
-        .timeout(Duration::from_millis(timeout_ms.clamp(100, 20_000)))
-        .send()
-        .await
-        .map_err(|e| format!("http_error:{e}"))?;
-    let status = resp.status();
-    let body = resp.text().await.map_err(|e| format!("read_error:{e}"))?;
-    let parsed = serde_json::from_str::<Value>(&body).unwrap_or_else(|_| json!({"raw": body}));
-    if status.is_success() {
-        Ok(parsed)
-    } else {
-        Err(format!("status_{}:{}", status.as_u16(), parsed))
-    }
-}
-
-pub(super) fn extract_order_id_from_gateway_record(row: &Value) -> Option<String> {
-    row.get("response")
-        .and_then(|v| v.get("order_id").and_then(Value::as_str))
-        .map(str::to_string)
-        .or_else(|| {
-            row.get("response")
-                .and_then(|v| v.get("id").and_then(Value::as_str))
-                .map(str::to_string)
-        })
-        .or_else(|| {
-            row.get("order_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-}
-
 #[derive(Debug, Clone, Default)]
-struct PendingFillMeta {
+pub(super) struct PendingFillMeta {
     fill_price_cents: Option<f64>,
     fill_quote_usdc: Option<f64>,
     fill_size_shares: Option<f64>,
@@ -902,14 +658,13 @@ fn normalize_usdc_amount(v: f64) -> f64 {
     if v <= 0.0 || !v.is_finite() {
         0.0
     } else if v > 100_000.0 {
-        // Some gateways return 6-decimal scaled collateral integers.
         (v / 1_000_000.0).max(0.0)
     } else {
         v
     }
 }
 
-fn extract_pending_fill_meta(
+pub(super) fn extract_pending_fill_meta(
     fill_event: Option<&Value>,
     pending: &LivePendingOrder,
 ) -> PendingFillMeta {
@@ -974,10 +729,7 @@ fn extract_pending_fill_meta(
         ],
     );
     let fill_size_shares = size_candidates.into_iter().find(|v| *v > 0.0);
-    let quote_from_size = if let (Some(px_c), Some(sz)) = (
-        fill_price_cents,
-        fill_size_shares,
-    ) {
+    let quote_from_size = if let (Some(px_c), Some(sz)) = (fill_price_cents, fill_size_shares) {
         Some((px_c / 100.0) * sz)
     } else {
         None
@@ -997,20 +749,20 @@ fn extract_pending_fill_meta(
         .map(normalize_usdc_amount)
         .fold(0.0, |acc, v| acc + v);
 
-    let inferred_slippage_usdc =
-        if let (Some(px_c), Some(quote)) = (fill_price_cents, fill_quote_usdc) {
-            let expected_c = pending.price_cents.max(0.01);
-            let shares = quote / (px_c / 100.0).max(0.0001);
-            let action = pending.action.to_ascii_lowercase();
-            let adverse_cents = if action == "enter" || action == "add" {
-                (px_c - expected_c).max(0.0)
-            } else {
-                (expected_c - px_c).max(0.0)
-            };
-            ((adverse_cents / 100.0) * shares).max(0.0)
+    let inferred_slippage_usdc = if let (Some(px_c), Some(quote)) = (fill_price_cents, fill_quote_usdc)
+    {
+        let expected_c = pending.price_cents.max(0.01);
+        let shares = quote / (px_c / 100.0).max(0.0001);
+        let action = pending.action.to_ascii_lowercase();
+        let adverse_cents = if action == "enter" || action == "add" {
+            (px_c - expected_c).max(0.0)
         } else {
-            0.0
+            (expected_c - px_c).max(0.0)
         };
+        ((adverse_cents / 100.0) * shares).max(0.0)
+    } else {
+        0.0
+    };
 
     PendingFillMeta {
         fill_price_cents,
@@ -1020,4 +772,3 @@ fn extract_pending_fill_meta(
         slippage_usdc: explicit_slippage_usdc.max(inferred_slippage_usdc),
     }
 }
-

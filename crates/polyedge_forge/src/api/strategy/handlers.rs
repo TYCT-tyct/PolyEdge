@@ -329,7 +329,6 @@ pub(super) async fn strategy_live_reset(
         let mut exec = state.live_rust_executor.write().await;
         exec.take();
     }
-    state.set_gateway_report_seq(0).await;
     for market in ["5m", "15m"] {
         state
             .put_live_position_state(market, LivePositionState::flat(market, now_ms))
@@ -358,11 +357,6 @@ pub(super) async fn strategy_live_reset(
     if delete_key(&state, &pending_key).await.is_ok() {
         deleted_keys.push(pending_key);
     }
-    let seq_key = live_gateway_seq_key(&state.redis_prefix);
-    if delete_key(&state, &seq_key).await.is_ok() {
-        deleted_keys.push(seq_key);
-    }
-
     Ok(Json(json!({
         "ok": true,
         "reset_at_ms": now_ms,

@@ -195,336 +195,6 @@ pub(super) async fn apply_pending_revert(
         .await;
 }
 
-pub(super) async fn reconcile_gateway_reports(state: &ApiState, gateway_cfg: &LiveGatewayConfig) {
-    let since_seq = state.get_gateway_report_seq().await;
-    let client = state.gateway_http_client.as_ref();
-    let mut endpoint = gateway_cfg.primary_url.clone();
-    let mut response =
-        get_gateway_reports(client, gateway_cfg.timeout_ms, &endpoint, since_seq, 240).await;
-    if response.is_err() {
-        if let Some(backup) = gateway_cfg.backup_url.as_deref() {
-            endpoint = backup.to_string();
-            response =
-                get_gateway_reports(client, gateway_cfg.timeout_ms, &endpoint, since_seq, 240)
-                    .await;
-        }
-    }
-    let Ok(payload) = response else {
-        return;
-    };
-    let latest_seq = payload
-        .get("latest_seq")
-        .and_then(Value::as_i64)
-        .unwrap_or(since_seq);
-    let events = payload
-        .get("events")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    for ev in events {
-        let event_name = ev
-            .get("event")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let order_id = ev
-            .get("order_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        if order_id.is_empty() {
-            continue;
-        }
-        let pending = state.remove_pending_order(&order_id).await;
-        let Some(pending) = pending else {
-            continue;
-        };
-        let state_text = ev
-            .get("state")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let filled_terminal = matches!(state_text.as_str(), "filled" | "executed" | "matched");
-        let canceled_terminal = matches!(
-            state_text.as_str(),
-            "cancelled" | "canceled" | "rejected" | "expired"
-        );
-        if event_name == "order_terminal" && filled_terminal {
-            apply_pending_confirmation(state, &pending, "order_terminal_filled", Some(&ev)).await;
-        } else if event_name == "order_terminal" && canceled_terminal {
-            apply_pending_revert(state, &pending, "order_terminal_canceled").await;
-        } else if event_name == "order_timeout_cancelled" {
-            apply_pending_revert(state, &pending, "timeout_cancelled").await;
-        } else if event_name == "order_timeout_cancel_failed" {
-            handle_cancel_failure_with_escalation(
-                state,
-                &pending,
-                "timeout_cancel_failed",
-                json!({
-                    "gateway_endpoint": endpoint,
-                    "event": ev
-                }),
-            )
-            .await;
-            continue;
-        } else {
-            let retry = pending.clone();
-            state.upsert_pending_order(retry.clone()).await;
-            state
-                .append_live_event(
-                    &retry.market_type,
-                    json!({
-                        "accepted": false,
-                        "action": retry.action,
-                        "side": retry.side,
-                        "round_id": retry.round_id,
-                        "reason": format!("gateway_event_ignored:{event_name}"),
-                        "order_id": retry.order_id,
-                        "gateway_endpoint": endpoint
-                    }),
-                )
-                .await;
-            continue;
-        }
-        state
-            .append_live_event(
-                &pending.market_type,
-                json!({
-                    "accepted": true,
-                    "action": pending.action,
-                    "side": pending.side,
-                    "round_id": pending.round_id,
-                    "reason": format!("gateway_event:{event_name}"),
-                    "order_id": pending.order_id,
-                    "gateway_endpoint": endpoint,
-                    "event": ev
-                }),
-            )
-            .await;
-    }
-    state.set_gateway_report_seq(latest_seq).await;
-}
-
-pub(super) async fn handle_pending_timeouts(state: &ApiState, gateway_cfg: &LiveGatewayConfig) {
-    let now_ms = Utc::now().timestamp_millis();
-    let pending = state.list_pending_orders().await;
-    if pending.is_empty() {
-        return;
-    }
-    let client = state.gateway_http_client.as_ref();
-    for row in pending {
-        let elapsed = now_ms.saturating_sub(row.submitted_ts_ms);
-        if elapsed < pending_cancel_due_ms(&row) {
-            continue;
-        }
-        let mut endpoint = gateway_cfg.primary_url.clone();
-        let mut cancel_res =
-            delete_gateway_order(client, gateway_cfg.timeout_ms, &endpoint, &row.order_id).await;
-        if cancel_res.is_err() {
-            if let Some(backup) = gateway_cfg.backup_url.as_deref() {
-                endpoint = backup.to_string();
-                cancel_res =
-                    delete_gateway_order(client, gateway_cfg.timeout_ms, &endpoint, &row.order_id)
-                        .await;
-            }
-        }
-        match cancel_res {
-            Ok(v) => {
-                let _ = state.remove_pending_order(&row.order_id).await;
-                let maker_tif = matches!(
-                    row.tif.to_ascii_uppercase().as_str(),
-                    "GTD" | "GTC" | "POST_ONLY"
-                );
-                let exit_like = is_live_exit_action(&row.action);
-                let emergency_exit = exit_like && is_emergency_exit_reason(&row.submit_reason);
-                let can_retry = if emergency_exit {
-                    row.retry_count < 2
-                } else {
-                    row.retry_count < 1
-                };
-                if (maker_tif || emergency_exit) && can_retry {
-                    let entry_like = is_entry_action(&row.action);
-                    let fallback_ttl_ms = if emergency_exit {
-                        700
-                    } else if entry_like {
-                        live_entry_fak_ttl_ms()
-                    } else {
-                        900
-                    };
-                    let fallback_slippage_bps = if emergency_exit {
-                        (gateway_cfg.exit_slippage_bps + 18.0).max(38.0)
-                    } else if entry_like {
-                        gateway_cfg
-                            .exit_slippage_bps
-                            .max(gateway_cfg.entry_slippage_bps)
-                            + live_entry_fak_slippage_boost_bps()
-                    } else {
-                        gateway_cfg
-                            .exit_slippage_bps
-                            .max(gateway_cfg.entry_slippage_bps)
-                            + 10.0
-                    };
-                    let maybe_target =
-                        resolve_live_market_target_with_state(state, &row.market_type)
-                            .await
-                            .ok();
-                    if let Some(target) = maybe_target {
-                        let mut effective_target = target.clone();
-                        apply_pending_target_override(&mut effective_target, &row);
-                        let round_check = json!({ "round_id": row.round_id });
-                        let bypass_round_guard = is_live_exit_action(&row.action)
-                            && !row.market_id.trim().is_empty()
-                            && !row.token_id.trim().is_empty();
-                        if !decision_round_matches_target(&round_check, &effective_target)
-                            && !bypass_round_guard
-                        {
-                            state
-                                .append_live_event(
-                                    &row.market_type,
-                                    json!({
-                                        "accepted": false,
-                                        "action": row.action,
-                                        "side": row.side,
-                                        "round_id": row.round_id,
-                                        "reason": "local_timeout_cancelled_round_target_mismatch",
-                                        "order_id": row.order_id,
-                                        "target_market_id": effective_target.market_id,
-                                        "target_end_date": effective_target.end_date
-                                    }),
-                                )
-                                .await;
-                            apply_pending_revert(state, &row, "local_timeout_cancel").await;
-                            continue;
-                        }
-                        let decision = json!({
-                            "action": row.action,
-                            "side": row.side,
-                            "round_id": row.round_id,
-                            "price_cents": row.price_cents,
-                            "quote_size_usdc": row.quote_size_usdc,
-                            "reason": format!("{}_timeout_fallback_fak", row.submit_reason),
-                            "tif": "FAK",
-                            "style": "taker",
-                            "ttl_ms": fallback_ttl_ms,
-                            "max_slippage_bps": fallback_slippage_bps
-                        });
-                        let token_id =
-                            token_id_for_decision(&decision, &effective_target).map(str::to_string);
-                        let book_snapshot = if let Some(token_id) = token_id {
-                            fetch_gateway_book_snapshot(client, gateway_cfg, &token_id).await
-                        } else {
-                            None
-                        };
-                        if let Some(payload) = decision_to_live_payload(
-                            &decision,
-                            &effective_target,
-                            gateway_cfg,
-                            book_snapshot.as_ref(),
-                            Some(row.quote_size_usdc),
-                        ) {
-                            let (submit_res, submit_endpoint) =
-                                submit_gateway_order(client, gateway_cfg, &payload).await;
-                            if let Ok(resp) = submit_res {
-                                let accepted = resp
-                                    .get("accepted")
-                                    .and_then(Value::as_bool)
-                                    .unwrap_or(false);
-                                if accepted {
-                                    let order_id = extract_order_id_from_gateway_record(&resp)
-                                        .or_else(|| {
-                                            extract_order_id_from_gateway_record(
-                                                &json!({ "response": resp.clone() }),
-                                            )
-                                        });
-                                    if let Some(order_id) = order_id {
-                                        let mut pending = row.clone();
-                                        pending.order_id = order_id;
-                                        pending.retry_count = pending.retry_count.saturating_add(1);
-                                        pending.tif = "FAK".to_string();
-                                        pending.style = "taker".to_string();
-                                        pending.submitted_ts_ms = now_ms;
-                                        pending.cancel_after_ms = if emergency_exit {
-                                            700
-                                        } else if entry_like {
-                                            live_entry_fak_cancel_after_ms()
-                                        } else {
-                                            1500
-                                        };
-                                        state.upsert_pending_order(pending).await;
-                                        state
-                                            .append_live_event(
-                                                &row.market_type,
-                                                json!({
-                                                    "accepted": true,
-                                                    "action": row.action,
-                                                    "side": row.side,
-                                                    "round_id": row.round_id,
-                                                    "reason": "local_timeout_cancelled_resubmitted_fak",
-                                                    "order_id": row.order_id,
-                                                    "gateway_endpoint": submit_endpoint,
-                                                    "cancel_response": v.clone(),
-                                                    "submit_response": resp,
-                                                    "book_snapshot": book_snapshot,
-                                                    "emergency_exit": emergency_exit
-                                                }),
-                                            )
-                                            .await;
-                                        continue;
-                                    }
-                                }
-                                state
-                                    .append_live_event(
-                                        &row.market_type,
-                                        json!({
-                                            "accepted": false,
-                                            "action": row.action,
-                                            "side": row.side,
-                                            "round_id": row.round_id,
-                                            "reason": "local_timeout_cancelled_fak_resubmit_rejected",
-                                            "order_id": row.order_id,
-                                            "gateway_endpoint": submit_endpoint,
-                                            "cancel_response": v.clone(),
-                                            "submit_response": resp
-                                        }),
-                                    )
-                                    .await;
-                            }
-                        }
-                    }
-                }
-                apply_pending_revert(state, &row, "local_timeout_cancel").await;
-                state
-                    .append_live_event(
-                        &row.market_type,
-                        json!({
-                            "accepted": false,
-                            "action": row.action,
-                            "side": row.side,
-                            "round_id": row.round_id,
-                            "reason": "local_timeout_cancelled",
-                            "order_id": row.order_id,
-                            "gateway_endpoint": endpoint,
-                            "response": v
-                        }),
-                    )
-                    .await;
-            }
-            Err(err) => {
-                handle_cancel_failure_with_escalation(
-                    state,
-                    &row,
-                    "local_timeout_cancel_failed",
-                    json!({
-                        "gateway_endpoint": endpoint,
-                        "error": err
-                    }),
-                )
-                .await;
-            }
-        }
-    }
-}
-
 pub(super) fn token_id_for_decision<'a>(
     decision: &Value,
     target: &'a LiveMarketTarget,
@@ -690,6 +360,148 @@ fn should_bypass_round_match_for_locked_exit(
             .unwrap_or(false)
 }
 
+fn validate_entry_target_readiness(
+    decision: &Value,
+    target: &LiveMarketTarget,
+    now_ms: i64,
+) -> Result<(), &'static str> {
+    let action = decision
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let is_entry_like = action == "enter" || action == "add";
+    if !is_entry_like {
+        return Ok(());
+    }
+    if target.market_id.trim().is_empty() {
+        return Err("entry_target_market_missing");
+    }
+    if token_id_for_decision(decision, target).is_none() {
+        return Err("entry_target_token_missing");
+    }
+    let Some(end_ms) = parse_end_date_ms(target.end_date.as_deref()) else {
+        return Err("entry_target_end_date_missing");
+    };
+    if now_ms > end_ms.saturating_add(live_round_target_match_tolerance_ms()) {
+        return Err("entry_target_expired");
+    }
+    Ok(())
+}
+
+struct PreparedLiveDecision {
+    decision: Value,
+    effective_target: LiveMarketTarget,
+    bypass_round_guard: bool,
+}
+
+enum PrepareLiveDecisionError {
+    RoundTargetMismatch {
+        decision: Value,
+        effective_target: LiveMarketTarget,
+    },
+    EntryTargetNotReady {
+        decision: Value,
+        effective_target: LiveMarketTarget,
+        reason: &'static str,
+        now_ms: i64,
+    },
+}
+
+fn prepare_live_decision_for_submission(
+    gated: &LiveGatedDecision,
+    target: &LiveMarketTarget,
+    position_state: &LivePositionState,
+    exec_cfg: &LiveExecutionConfig,
+    exit_quote_override: Option<f64>,
+    exit_size_override: Option<f64>,
+) -> Result<PreparedLiveDecision, PrepareLiveDecisionError> {
+    let mut decision = gated.decision.clone();
+    let _side_aligned = align_exit_decision_side_with_position(&mut decision, position_state);
+    let action = decision
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let effective_target = build_effective_target_for_decision(target, &decision, position_state);
+    let bypass_round_guard = should_bypass_round_match_for_locked_exit(&decision, position_state);
+    if !decision_round_matches_target(&decision, &effective_target) && !bypass_round_guard {
+        return Err(PrepareLiveDecisionError::RoundTargetMismatch {
+            decision,
+            effective_target,
+        });
+    }
+    let now_ms = Utc::now().timestamp_millis();
+    if let Err(reason) = validate_entry_target_readiness(&decision, &effective_target, now_ms) {
+        return Err(PrepareLiveDecisionError::EntryTargetNotReady {
+            decision,
+            effective_target,
+            reason,
+            now_ms,
+        });
+    }
+    if action == "exit" {
+        if let Some(obj) = decision.as_object_mut() {
+            if let Some(q) = exit_quote_override {
+                obj.insert("quote_size_usdc".to_string(), json!(q));
+            }
+            if let Some(sz) = exit_size_override {
+                obj.insert("position_size_shares".to_string(), json!(sz));
+            }
+        }
+    }
+    apply_emergency_exit_overrides(&mut decision, exec_cfg);
+    Ok(PreparedLiveDecision {
+        decision,
+        effective_target,
+        bypass_round_guard,
+    })
+}
+
+fn prepare_live_decision_error_json(
+    gated: &LiveGatedDecision,
+    error: PrepareLiveDecisionError,
+    executor: Option<&str>,
+) -> Value {
+    let mut row = match error {
+        PrepareLiveDecisionError::RoundTargetMismatch {
+            decision,
+            effective_target,
+        } => json!({
+            "ok": false,
+            "accepted": false,
+            "reason": "round_target_mismatch",
+            "decision_key": gated.decision_key,
+            "decision_round_id": decision.get("round_id").and_then(Value::as_str),
+            "target_market_id": effective_target.market_id,
+            "target_end_date": effective_target.end_date,
+            "decision": decision
+        }),
+        PrepareLiveDecisionError::EntryTargetNotReady {
+            decision,
+            effective_target,
+            reason,
+            now_ms,
+        } => json!({
+            "ok": false,
+            "accepted": false,
+            "reason": reason,
+            "decision_key": gated.decision_key,
+            "decision_round_id": decision.get("round_id").and_then(Value::as_str),
+            "target_market_id": effective_target.market_id,
+            "target_end_date": effective_target.end_date,
+            "now_ms": now_ms,
+            "decision": decision
+        }),
+    };
+    if let Some(exec) = executor {
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert("executor".to_string(), json!(exec));
+        }
+    }
+    row
+}
+
 pub(super) fn build_position_locked_target(
     market_type: &str,
     position_state: &LivePositionState,
@@ -721,178 +533,4 @@ pub(super) fn build_position_locked_target(
         end_date,
     })
 }
-
-pub(super) async fn execute_live_orders_via_gateway(
-    state: &ApiState,
-    gateway_cfg: &LiveGatewayConfig,
-    target: &LiveMarketTarget,
-    position_state: &LivePositionState,
-    decisions: &[LiveGatedDecision],
-) -> Vec<Value> {
-    let client = state.gateway_http_client.as_ref();
-    let mut out = Vec::<Value>::with_capacity(decisions.len());
-    let token_ids = collect_decision_token_ids(target, decisions);
-    let mut book_cache = prefetch_gateway_books_for_tokens(client, gateway_cfg, &token_ids).await;
-    let exit_quote_override =
-        position_state
-            .entry_quote_usdc
-            .and_then(|v| if v > 0.0 { Some(v) } else { None });
-    let exit_size_override = if position_state.position_size_shares > 0.0 {
-        Some(position_state.position_size_shares)
-    } else {
-        None
-    };
-    for gated in decisions {
-        let mut decision = gated.decision.clone();
-        let _side_aligned = align_exit_decision_side_with_position(&mut decision, position_state);
-        let action = decision
-            .get("action")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let effective_target = build_effective_target_for_decision(target, &decision, position_state);
-        let bypass_round_guard = should_bypass_round_match_for_locked_exit(&decision, position_state);
-        if !decision_round_matches_target(&decision, &effective_target) && !bypass_round_guard {
-            out.push(json!({
-                "ok": false,
-                "reason": "round_target_mismatch",
-                "decision_key": gated.decision_key,
-                "decision_round_id": decision.get("round_id").and_then(Value::as_str),
-                "target_market_id": effective_target.market_id,
-                "target_end_date": effective_target.end_date,
-                "decision": decision
-            }));
-            continue;
-        }
-        if action == "exit" {
-            if let Some(obj) = decision.as_object_mut() {
-                if let Some(q) = exit_quote_override {
-                    obj.insert("quote_size_usdc".to_string(), json!(q));
-                }
-                if let Some(sz) = exit_size_override {
-                    obj.insert("position_size_shares".to_string(), json!(sz));
-                }
-            }
-        }
-        apply_emergency_exit_overrides(&mut decision, gateway_cfg);
-        let token_id = token_id_for_decision(&decision, &effective_target).map(str::to_string);
-        let book_snapshot = if let Some(token_id) = token_id.clone() {
-            match book_cache.get(&token_id) {
-                Some(cached) => cached.clone(),
-                None => {
-                    let fetched = fetch_gateway_book_snapshot(client, gateway_cfg, &token_id).await;
-                    book_cache.insert(token_id.clone(), fetched.clone());
-                    fetched
-                }
-            }
-        } else {
-            None
-        };
-        let Some(payload) =
-            decision_to_live_payload(
-                &decision,
-                &effective_target,
-                gateway_cfg,
-                book_snapshot.as_ref(),
-                None,
-            )
-        else {
-            out.push(json!({
-                "ok": false,
-                "reason": "decision_to_payload_failed",
-                "decision_key": gated.decision_key,
-                "decision": decision,
-                "book_snapshot": book_snapshot
-            }));
-            continue;
-        };
-        let mut attempt_payload = payload.clone();
-        let mut attempts = Vec::<Value>::with_capacity(3);
-        let mut accepted = false;
-        let mut final_endpoint = gateway_cfg.primary_url.clone();
-        let mut final_response: Option<Value> = None;
-        let mut final_error: Option<String> = None;
-
-        let order_started = Instant::now();
-        for attempt in 0..3usize {
-            let attempt_started = Instant::now();
-            let (result, used_endpoint) =
-                submit_gateway_order(client, gateway_cfg, &attempt_payload).await;
-            final_endpoint = used_endpoint.clone();
-            let latency_ms = attempt_started.elapsed().as_millis() as u64;
-            match result {
-                Ok(v) => {
-                    let accept = v.get("accepted").and_then(Value::as_bool).unwrap_or(false);
-                    let reject_reason = if accept {
-                        String::new()
-                    } else {
-                        extract_gateway_reject_reason(&v)
-                    };
-                    attempts.push(json!({
-                        "attempt": attempt + 1,
-                        "endpoint": used_endpoint,
-                        "latency_ms": latency_ms,
-                        "request": attempt_payload.clone(),
-                        "accepted": accept,
-                        "reject_reason": if reject_reason.is_empty() { Value::Null } else { json!(reject_reason.clone()) },
-                        "response": v
-                    }));
-                    final_response = Some(v.clone());
-                    if accept {
-                        accepted = true;
-                        break;
-                    }
-                    if let Some(next_payload) =
-                        build_retry_payload(&attempt_payload, &reject_reason, attempt)
-                    {
-                        attempt_payload = next_payload;
-                        continue;
-                    }
-                    break;
-                }
-                Err(err) => {
-                    attempts.push(json!({
-                        "attempt": attempt + 1,
-                        "endpoint": used_endpoint,
-                        "latency_ms": latency_ms,
-                        "request": attempt_payload.clone(),
-                        "accepted": false,
-                        "error": err
-                    }));
-                    final_error = Some(err.clone());
-                    if let Some(next_payload) = build_retry_payload(&attempt_payload, &err, attempt)
-                    {
-                        attempt_payload = next_payload;
-                        continue;
-                    }
-                    break;
-                }
-            }
-        }
-        out.push(json!({
-            "ok": accepted,
-            "accepted": accepted,
-            "decision_key": gated.decision_key,
-            "decision": decision,
-            "endpoint": final_endpoint,
-            "request": payload,
-            "final_request": attempt_payload.clone(),
-            "response": final_response,
-            "error": final_error,
-            "attempts": attempts,
-            "order_latency_ms": order_started.elapsed().as_millis() as u64,
-            "book_snapshot": book_snapshot,
-            "target_market_id": effective_target.market_id,
-            "round_guard_bypassed": bypass_round_guard,
-            "price_trace": build_execution_price_trace(
-                &decision,
-                &payload,
-                &attempt_payload,
-                final_response.as_ref()
-            )
-        }));
-    }
-    out
-}
-
 
