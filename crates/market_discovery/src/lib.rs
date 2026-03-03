@@ -354,6 +354,7 @@ impl MarketDiscovery {
                     let Some(symbol) = detect_symbol(&text, &self.cfg.symbols) else {
                         continue;
                     };
+                    let end_ms = parse_end_date_ms(market.end_date.as_deref());
 
                     let price_to_beat = market
                         .events
@@ -382,14 +383,18 @@ impl MarketDiscovery {
 
                     if can_early_stop {
                         if let Some(tf) = timeframe {
-                            let discovered_key = format!(
-                                "{}|{}|{}",
-                                symbol,
-                                market_type.to_ascii_lowercase(),
-                                tf.to_ascii_lowercase()
-                            );
-                            if target_template_keys.contains(&discovered_key) {
-                                matched_template_keys.insert(discovered_key);
+                            // Do not early-stop on already-ended rounds. Around boundaries, that
+                            // can pin discovery to stale templates and delay active round pickup.
+                            if end_ms.map(|v| v >= now_ms).unwrap_or(false) {
+                                let discovered_key = format!(
+                                    "{}|{}|{}",
+                                    symbol,
+                                    market_type.to_ascii_lowercase(),
+                                    tf.to_ascii_lowercase()
+                                );
+                                if target_template_keys.contains(&discovered_key) {
+                                    matched_template_keys.insert(discovered_key);
+                                }
                             }
                         }
                         if !target_template_keys.is_empty()

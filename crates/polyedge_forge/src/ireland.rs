@@ -208,13 +208,6 @@ fn round_end_ts_ms_from_round_id(round_id: &str) -> Option<i64> {
     Some(start_ms.saturating_add(tf_ms))
 }
 
-fn market_primary_candidate_is_valid(m: &MarketMeta, now_ms: i64, prestart_allow_ms: i64) -> bool {
-    // Keep the pair primary on currently tradable rounds and near-future rounds inside
-    // prestart window, but still reject long-ended rounds.
-    now_ms.saturating_add(prestart_allow_ms) >= m.start_ts_ms
-        && now_ms <= m.end_ts_ms.saturating_add(MARKET_STALE_GUARD_MS)
-}
-
 fn market_candidate_is_warmable(m: &MarketMeta, now_ms: i64, prewarm_ms: i64) -> bool {
     now_ms.saturating_add(prewarm_ms) >= m.start_ts_ms
         && now_ms <= m.end_ts_ms.saturating_add(MARKET_STALE_GUARD_MS)
@@ -1185,22 +1178,20 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     );
                 }
                 let mut selected_by_pair: HashMap<String, MarketMeta> = HashMap::new();
-                for (pair_key, markets) in &candidates_by_pair {
-                    if let Some(best) = markets
-                        .iter()
-                        .find(|m| {
-                            market_primary_candidate_is_valid(m, now_ms, market_prestart_allow_ms)
-                        })
-                    {
-                        selected_by_pair.insert(pair_key.clone(), best.clone());
-                    } else if let Some(best) = markets.iter().find(|m| {
-                        market_candidate_is_warmable(
-                            m,
-                            now_ms,
-                            market_selection_fallback_prewarm_ms,
-                        )
-                    }) {
-                        selected_by_pair.insert(pair_key.clone(), best.clone());
+                for pair_key in &required_pair_keys {
+                    let Some(markets) = candidates_by_pair.get(pair_key) else {
+                        continue;
+                    };
+                    if let Some(snapshot) = resolve_switch_snapshot(
+                        pair_key,
+                        markets,
+                        now_ms,
+                        market_prestart_allow_ms,
+                        market_selection_fallback_prewarm_ms,
+                        market_sample_end_grace_ms,
+                        MARKET_STALE_GUARD_MS,
+                    ) {
+                        selected_by_pair.insert(pair_key.clone(), snapshot.active_market);
                     }
                 }
                 let mut missing_required_pairs: HashSet<String> = required_pair_keys
@@ -1211,23 +1202,34 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                 if !missing_required_pairs.is_empty() {
                     let mut repaired_pairs = Vec::<String>::new();
                     for pair in missing_required_pairs.clone() {
-                        let fallback = candidates_by_pair
+                        let fallback = prev_candidate_markets_by_pair
                             .get(&pair)
-                            .and_then(|candidates| {
-                                candidates.iter().find(|m| {
-                                    market_candidate_is_warmable(
-                                        m,
-                                        now_ms,
-                                        market_selection_fallback_prewarm_ms,
-                                    )
-                                })
+                            .and_then(|prev_candidates| {
+                                resolve_switch_snapshot(
+                                    &pair,
+                                    prev_candidates,
+                                    now_ms,
+                                    market_prestart_allow_ms,
+                                    market_selection_fallback_prewarm_ms,
+                                    market_sample_end_grace_ms,
+                                    MARKET_STALE_GUARD_MS,
+                                )
                             })
-                            .cloned();
+                            .map(|snapshot| snapshot.active_market);
                         if let Some(best_effort) = fallback {
-                            selected_by_pair.insert(pair.clone(), best_effort);
+                            selected_by_pair.insert(pair.clone(), best_effort.clone());
+                            candidates_by_pair
+                                .entry(pair.clone())
+                                .or_default()
+                                .push(best_effort);
                             repaired_pairs.push(pair);
                         }
                     }
+                    missing_required_pairs = required_pair_keys
+                        .iter()
+                        .filter(|pair| !selected_by_pair.contains_key(*pair))
+                        .cloned()
+                        .collect();
                     // If discovery and cache are both temporarily sparse, keep required pairs alive
                     // with previous still-valid primary markets.
                     if !missing_required_pairs.is_empty() {
@@ -1252,26 +1254,6 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             prev_repaired_pairs.push(pair);
                         }
                         repaired_pairs.extend(prev_repaired_pairs.into_iter().map(|v| format!("{v}:prev")));
-                    }
-                    // Last-resort: keep required pairs non-empty by pinning nearest candidate.
-                    // This avoids full pair drop when discovery is briefly sparse around boundaries.
-                    if !missing_required_pairs.is_empty() {
-                        let mut nearest_repaired_pairs = Vec::<String>::new();
-                        for pair in missing_required_pairs.clone() {
-                            let fallback = candidates_by_pair
-                                .get(&pair)
-                                .and_then(|candidates| candidates.first())
-                                .cloned();
-                            if let Some(nearest) = fallback {
-                                selected_by_pair.insert(pair.clone(), nearest);
-                                nearest_repaired_pairs.push(pair);
-                            }
-                        }
-                        repaired_pairs.extend(
-                            nearest_repaired_pairs
-                                .into_iter()
-                                .map(|v| format!("{v}:nearest")),
-                        );
                     }
                     missing_required_pairs = required_pair_keys
                         .iter()
@@ -3256,45 +3238,6 @@ mod tests {
         assert!(market_in_sampling_window(&market, 1_999, 30_000, 300));
         assert!(market_in_sampling_window(&market, 2_250, 30_000, 300));
         assert!(!market_in_sampling_window(&market, 2_301, 30_000, 300));
-    }
-
-    #[test]
-    fn primary_candidate_rejects_long_ended_round() {
-        let market = MarketMeta {
-            market_id: "m".to_string(),
-            symbol: "BTCUSDT".to_string(),
-            timeframe: "5m".to_string(),
-            title: "BTC".to_string(),
-            target_price: None,
-            start_ts_ms: 1_000,
-            end_ts_ms: 2_000,
-        };
-        assert!(market_primary_candidate_is_valid(&market, 2_001, 30_000));
-        assert!(market_primary_candidate_is_valid(
-            &market,
-            2_000 + MARKET_STALE_GUARD_MS,
-            30_000
-        ));
-        assert!(!market_primary_candidate_is_valid(
-            &market,
-            2_001 + MARKET_STALE_GUARD_MS,
-            30_000
-        ));
-    }
-
-    #[test]
-    fn primary_candidate_allows_prestart_window() {
-        let market = MarketMeta {
-            market_id: "m".to_string(),
-            symbol: "BTCUSDT".to_string(),
-            timeframe: "5m".to_string(),
-            title: "BTC".to_string(),
-            target_price: None,
-            start_ts_ms: 10_000,
-            end_ts_ms: 40_000,
-        };
-        assert!(!market_primary_candidate_is_valid(&market, 8_500, 1_000));
-        assert!(market_primary_candidate_is_valid(&market, 8_500, 2_000));
     }
 
     #[test]
