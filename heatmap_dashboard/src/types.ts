@@ -239,22 +239,34 @@ export interface StrategyLiveExecutionOrder {
   endpoint?: string;
   decision_key?: string;
   request?: Record<string, unknown>;
+  final_request?: Record<string, unknown>;
   response?: Record<string, unknown>;
   error?: string;
   reason?: string;
+  reject_reason?: string;
+  attempts?: Record<string, unknown>[];
+  order_latency_ms?: number;
+  target_market_id?: string;
+  round_guard_bypassed?: boolean;
+  price_trace?: Record<string, unknown>;
   decision?: StrategyLiveDecision;
 }
 
 export interface StrategyLivePositionState {
+  symbol?: string;
   market_type: string;
   state: "flat" | "in_position" | string;
   side?: "UP" | "DOWN" | string | null;
   entry_round_id?: string | null;
+  entry_market_id?: string | null;
+  entry_token_id?: string | null;
   entry_ts_ms?: number | null;
   entry_price_cents?: number | null;
   entry_quote_usdc?: number | null;
   net_quote_usdc?: number;
   vwap_entry_cents?: number | null;
+  position_size_shares?: number;
+  position_cost_usdc?: number;
   last_action?: string | null;
   last_reason?: string | null;
   total_entries?: number;
@@ -286,6 +298,31 @@ export interface StrategyPaperResponse {
     effective_drain_only?: boolean;
     position_side_before_cycle?: "UP" | "DOWN" | null | string;
     pending_orders_before_cycle?: number;
+    fast_loop_enabled?: boolean;
+    fast_loop_ms?: number;
+    base_loop_ms?: number;
+    round_switched?: boolean;
+    target_prewarm_ms?: number;
+    trigger_source?: string;
+    trigger_symbol?: string;
+    trigger_market?: string;
+    trigger_ts_ms?: number;
+    live_arm_required?: boolean;
+    live_armed?: boolean;
+    live_submit_allowed?: boolean;
+    live_hard_kill?: boolean;
+  };
+  execution_aggressiveness?: {
+    entry_slippage_mult?: number;
+    exit_slippage_mult?: number;
+    reject_ema?: number;
+    submit_delta_ema_cents?: number;
+    accepted_delta_ema_cents?: number;
+    latency_ema_ms?: number;
+    attempts_ema?: number;
+    sample_count?: number;
+    updated_ts_ms?: number;
+    last_error?: string | null;
   };
   lookback_minutes: number;
   lookback?: {
@@ -406,6 +443,14 @@ export interface StrategyPaperResponse {
       target?: Record<string, unknown> | null;
       orders?: StrategyLiveExecutionOrder[];
     };
+    execution_target?: {
+      market_id?: string;
+      symbol?: string;
+      timeframe?: string;
+      token_id_yes?: string;
+      token_id_no?: string;
+      end_date?: string | null;
+    } | null;
     state_machine?: StrategyLivePositionState;
     events?: Record<string, unknown>[];
   };

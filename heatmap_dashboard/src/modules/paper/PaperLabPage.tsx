@@ -369,8 +369,54 @@ export function PaperLabPage({
   const liveExecution = strategyPaper?.live_execution;
   const liveParity = liveExecution?.parity_check;
   const liveState = liveExecution?.state_machine;
+  const runtimeControl = strategyPaper?.runtime_control;
+  const executionAggr = strategyPaper?.execution_aggressiveness;
+  const executionTarget = liveExecution?.execution_target;
   const liveEvents = (liveExecution?.events ?? []).slice(-20).reverse();
   const liveOrders = (liveExecution?.execution?.orders ?? []).slice(-20).reverse();
+  const liveOrderLatencies = liveOrders
+    .map((row) => numCell(row.order_latency_ms))
+    .filter((v): v is number => v != null && Number.isFinite(v) && v >= 0);
+  const liveAvgLatencyMs =
+    liveOrderLatencies.length > 0
+      ? liveOrderLatencies.reduce((sum, v) => sum + v, 0) / liveOrderLatencies.length
+      : null;
+  const liveMaxLatencyMs =
+    liveOrderLatencies.length > 0 ? Math.max(...liveOrderLatencies) : null;
+  const liveAttemptCounts = liveOrders
+    .map((row) =>
+      Array.isArray(row.attempts)
+        ? row.attempts.length
+        : null
+    )
+    .filter((v): v is number => v != null && v > 0);
+  const liveAvgAttempts =
+    liveAttemptCounts.length > 0
+      ? liveAttemptCounts.reduce((sum, v) => sum + v, 0) / liveAttemptCounts.length
+      : null;
+  const lastRejectReason =
+    liveEvents.find((row) => row.accepted === false)?.reason ??
+    liveOrders.find((row) => row.accepted === false)?.reject_reason ??
+    liveOrders.find((row) => row.accepted === false)?.error ??
+    executionAggr?.last_error;
+  const topSkipReason = (() => {
+    const skipped = liveExecution?.gated?.skipped_decisions;
+    if (!skipped || skipped.length === 0) {
+      return null;
+    }
+    const freq = new Map<string, number>();
+    for (const row of skipped) {
+      const reason = textCell(row.reason);
+      if (reason === "--") {
+        continue;
+      }
+      freq.set(reason, (freq.get(reason) ?? 0) + 1);
+    }
+    if (freq.size === 0) {
+      return null;
+    }
+    return [...freq.entries()].sort((a, b) => b[1] - a[1])[0][0];
+  })();
   const lookbackMeta = strategyPaper?.lookback;
   const lookbackCoverageMinutes = finite(lookbackMeta?.coverage_minutes_by_samples);
   const lookbackRequestedMinutes =
@@ -525,67 +571,140 @@ export function PaperLabPage({
               </small>
             </article>
             <article className="info-card">
-              <span>基础下单</span>
-              <strong>{`${numCell(liveExecution?.gateway?.base_quote_usdc)?.toFixed(2) ?? "--"} USDC`}</strong>
+              <span>执行延迟</span>
+              <strong>
+                {liveAvgLatencyMs != null ? `${liveAvgLatencyMs.toFixed(0)}ms` : "--"}
+              </strong>
               <small>
-                最小下单 {`${numCell(liveExecution?.gateway?.min_quote_usdc)?.toFixed(2) ?? "--"} USDC`}
+                max {liveMaxLatencyMs != null ? `${liveMaxLatencyMs.toFixed(0)}ms` : "--"} · avg
+                attempts {liveAvgAttempts != null ? liveAvgAttempts.toFixed(2) : "--"}
+              </small>
+            </article>
+            <article className="info-card">
+              <span>门禁阻断</span>
+              <strong>{numCell(liveExecution?.gated?.skipped_count) ?? 0}</strong>
+              <small>top reason: {textCell(topSkipReason)}</small>
+            </article>
+            <article className="info-card">
+              <span>控制模式</span>
+              <strong>{textCell(runtimeControl?.mode)}</strong>
+              <small>
+                execute={runtimeControl?.effective_live_execute ? "on" : "off"} · drain=
+                {runtimeControl?.effective_drain_only ? "on" : "off"}
               </small>
             </article>
           </div>
+
+          <div className="info-cards compact live-matrix">
+            <article className="info-card">
+              <span>实盘安全臂</span>
+              <strong>{runtimeControl?.live_submit_allowed ? "ARMED" : "SAFE"}</strong>
+              <small>
+                required={runtimeControl?.live_arm_required ? "yes" : "no"} · armed=
+                {runtimeControl?.live_armed ? "yes" : "no"} · hard_kill=
+                {runtimeControl?.live_hard_kill ? "yes" : "no"}
+              </small>
+            </article>
+            <article className="info-card">
+              <span>目标市场绑定</span>
+              <strong>{textCell(executionTarget?.market_id)}</strong>
+              <small>
+                {textCell(executionTarget?.symbol)} / {textCell(executionTarget?.timeframe)} · end{" "}
+                {textCell(executionTarget?.end_date)}
+              </small>
+            </article>
+            <article className="info-card">
+              <span>执行自适应</span>
+              <strong>
+                entry x{numCell(executionAggr?.entry_slippage_mult)?.toFixed(2) ?? "--"} · exit x
+                {numCell(executionAggr?.exit_slippage_mult)?.toFixed(2) ?? "--"}
+              </strong>
+              <small>
+                reject_ema {numCell(executionAggr?.reject_ema)?.toFixed(3) ?? "--"} · latency_ema{" "}
+                {numCell(executionAggr?.latency_ema_ms)?.toFixed(0) ?? "--"}ms
+              </small>
+            </article>
+          </div>
+
           <div className="live-block-grid">
             <article className="live-block">
               <header>
                 <h3>状态机</h3>
-                <small>实时持仓状态</small>
+                <small>持仓与在途状态</small>
               </header>
               <ul className="diag-list">
                 <li>
-                  <span>仓位方向</span>
-                  <strong>{textCell(liveState?.side)}</strong>
+                  <span>state / side</span>
+                  <strong>
+                    {textCell(liveState?.state)} / {textCell(liveState?.side)}
+                  </strong>
                 </li>
                 <li>
-                  <span>最近动作</span>
+                  <span>entry round</span>
+                  <strong>{textCell(liveState?.entry_round_id)}</strong>
+                </li>
+                <li>
+                  <span>entry market/token</span>
+                  <strong>
+                    {textCell(liveState?.entry_market_id)} / {textCell(liveState?.entry_token_id)}
+                  </strong>
+                </li>
+                <li>
+                  <span>size / vwap</span>
+                  <strong>
+                    {numCell(liveState?.position_size_shares)?.toFixed(4) ?? "--"} /{" "}
+                    {numCell(liveState?.vwap_entry_cents)?.toFixed(2) ?? "--"}¢
+                  </strong>
+                </li>
+                <li>
+                  <span>net / realized</span>
+                  <strong>
+                    {numCell(liveState?.net_quote_usdc)?.toFixed(4) ?? "--"} /{" "}
+                    {numCell(liveState?.realized_pnl_usdc)?.toFixed(4) ?? "--"} USDC
+                  </strong>
+                </li>
+                <li>
+                  <span>last action</span>
                   <strong>{textCell(liveState?.last_action)}</strong>
                 </li>
                 <li>
-                  <span>未结挂单</span>
-                  <strong>{numCell(liveExecution?.gated?.submitted_count) ?? 0}</strong>
-                </li>
-                <li>
-                  <span>净持仓</span>
-                  <strong>{`${numCell(liveState?.net_quote_usdc)?.toFixed(2) ?? "--"} USDC`}</strong>
-                </li>
-                <li>
-                  <span>累计已实现</span>
-                  <strong>{`${numCell(liveState?.realized_pnl_usdc)?.toFixed(2) ?? "--"} USDC`}</strong>
+                  <span>updated</span>
+                  <strong>{formatClockTime(numCell(liveState?.updated_ts_ms), timeMode)}</strong>
                 </li>
               </ul>
             </article>
             <article className="live-block">
               <header>
                 <h3>链路告警</h3>
-                <small>无法成交与回退原因</small>
+                <small>阻断、错误、节奏</small>
               </header>
               <ul className="diag-list">
                 <li>
-                  <span>no_live_market_target</span>
+                  <span>target missing</span>
                   <strong>{liveParity?.live?.no_live_market_target ? "yes" : "no"}</strong>
                 </li>
                 <li>
-                  <span>gated skipped</span>
-                  <strong>{numCell(liveExecution?.gated?.skipped_count) ?? 0}</strong>
+                  <span>last reject</span>
+                  <strong>{textCell(lastRejectReason)}</strong>
                 </li>
                 <li>
-                  <span>submitted skipped</span>
-                  <strong>{numCell(liveExecution?.gated?.skipped_count) ?? 0}</strong>
+                  <span>pending before</span>
+                  <strong>{numCell(runtimeControl?.pending_orders_before_cycle) ?? 0}</strong>
                 </li>
                 <li>
-                  <span>gateway mode</span>
-                  <strong>{textCell(liveExecution?.execution?.mode)}</strong>
+                  <span>trigger</span>
+                  <strong>{textCell(runtimeControl?.trigger_source)}</strong>
                 </li>
                 <li>
-                  <span>execution error</span>
-                  <strong>{textCell(liveExecution?.execution?.error)}</strong>
+                  <span>loop</span>
+                  <strong>
+                    {numCell(runtimeControl?.base_loop_ms) ?? "--"}ms /{" "}
+                    {numCell(runtimeControl?.fast_loop_ms) ?? "--"}ms
+                  </strong>
+                </li>
+                <li>
+                  <span>round switched</span>
+                  <strong>{runtimeControl?.round_switched ? "yes" : "no"}</strong>
                 </li>
               </ul>
             </article>
@@ -601,6 +720,8 @@ export function PaperLabPage({
                     <th>方向</th>
                     <th>轮次</th>
                     <th>order_id</th>
+                    <th>请求</th>
+                    <th>延迟</th>
                     <th>原因</th>
                   </tr>
                 </thead>
@@ -614,6 +735,18 @@ export function PaperLabPage({
                       textCell(response?.order_id) !== "--"
                         ? textCell(response?.order_id)
                         : textCell(response?.id);
+                    const finalRequest =
+                      row.final_request && typeof row.final_request === "object"
+                        ? (row.final_request as Record<string, unknown>)
+                        : row.request && typeof row.request === "object"
+                        ? (row.request as Record<string, unknown>)
+                        : null;
+                    const reqPrice = numCell(finalRequest?.price_cents);
+                    const reqSize = numCell(finalRequest?.size_shares);
+                    const reqTif = textCell(finalRequest?.tif);
+                    const reqStyle = textCell(finalRequest?.style);
+                    const reqQuote = numCell(finalRequest?.quote_size_usdc);
+                    const attempts = Array.isArray(row.attempts) ? row.attempts.length : 0;
                     return (
                       <tr key={`live-order-${idx}`}>
                         <td className={row.ok && row.accepted !== false ? "up" : "down"}>
@@ -623,13 +756,25 @@ export function PaperLabPage({
                         <td>{textCell(row.decision?.side)}</td>
                         <td>{shortRoundId(textCell(row.decision?.round_id))}</td>
                         <td>{orderId}</td>
-                        <td>{textCell(row.error ?? row.reason)}</td>
+                        <td>
+                          {reqPrice != null ? `${reqPrice.toFixed(2)}¢` : "--"} /{" "}
+                          {reqSize != null ? reqSize.toFixed(4) : "--"} · {reqStyle}/{reqTif}
+                          <div className="muted">
+                            quote {reqQuote != null ? reqQuote.toFixed(4) : "--"} · retry {attempts}
+                          </div>
+                        </td>
+                        <td>
+                          {numCell(row.order_latency_ms) != null
+                            ? `${numCell(row.order_latency_ms)!.toFixed(0)}ms`
+                            : "--"}
+                        </td>
+                        <td>{textCell(row.error ?? row.reject_reason ?? row.reason)}</td>
                       </tr>
                     );
                   })}
                   {liveOrders.length === 0 ? (
                     <tr>
-                      <td colSpan={6}>暂无真实下单记录</td>
+                      <td colSpan={8}>暂无真实下单记录</td>
                     </tr>
                   ) : null}
                 </tbody>
@@ -641,6 +786,7 @@ export function PaperLabPage({
                 <thead>
                   <tr>
                     <th>时间</th>
+                    <th>结果</th>
                     <th>动作</th>
                     <th>方向</th>
                     <th>order_id</th>
@@ -651,6 +797,9 @@ export function PaperLabPage({
                   {liveEvents.map((row, idx) => (
                     <tr key={`live-event-${idx}`}>
                       <td>{formatClockTime(numCell(row.ts_ms), timeMode)}</td>
+                      <td className={row.accepted === false ? "down" : row.accepted === true ? "up" : ""}>
+                        {row.accepted === true ? "ok" : row.accepted === false ? "fail" : "--"}
+                      </td>
                       <td>{textCell(row.action)}</td>
                       <td>{textCell(row.side)}</td>
                       <td>{textCell(row.order_id)}</td>
@@ -659,7 +808,7 @@ export function PaperLabPage({
                   ))}
                   {liveEvents.length === 0 ? (
                     <tr>
-                      <td colSpan={5}>暂无链路事件</td>
+                      <td colSpan={6}>暂无链路事件</td>
                     </tr>
                   ) : null}
                 </tbody>
