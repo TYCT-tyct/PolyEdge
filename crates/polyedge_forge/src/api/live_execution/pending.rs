@@ -5,7 +5,9 @@ pub(super) async fn apply_pending_confirmation(
     fill_event: Option<&Value>,
 ) {
     let now_ms = Utc::now().timestamp_millis();
-    let mut ps = state.get_live_position_state(&pending.market_type).await;
+    let mut ps = state
+        .get_live_position_state(&pending.symbol, &pending.market_type)
+        .await;
     let action = pending.action.to_ascii_lowercase();
     let fill_meta = extract_pending_fill_meta(fill_event, pending);
     let fill_price_cents = fill_meta
@@ -166,7 +168,7 @@ pub(super) async fn apply_pending_confirmation(
     ps.last_reason = Some(reason.to_string());
     ps.updated_ts_ms = now_ms;
     state
-        .put_live_position_state(&pending.market_type, ps)
+        .put_live_position_state(&pending.symbol, &pending.market_type, ps)
         .await;
 }
 
@@ -176,7 +178,9 @@ pub(super) async fn apply_pending_revert(
     reason: &str,
 ) {
     let now_ms = Utc::now().timestamp_millis();
-    let mut ps = state.get_live_position_state(&pending.market_type).await;
+    let mut ps = state
+        .get_live_position_state(&pending.symbol, &pending.market_type)
+        .await;
     let action = pending.action.to_ascii_lowercase();
     if action == "enter" {
         ps.state = "flat".to_string();
@@ -200,7 +204,7 @@ pub(super) async fn apply_pending_revert(
     ps.last_reason = Some(reason.to_string());
     ps.updated_ts_ms = now_ms;
     state
-        .put_live_position_state(&pending.market_type, ps)
+        .put_live_position_state(&pending.symbol, &pending.market_type, ps)
         .await;
 }
 

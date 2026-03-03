@@ -65,7 +65,7 @@ pub(super) async fn handle_cancel_failure_with_escalation(
     state.upsert_pending_order(retry.clone()).await;
     state
         .append_live_event(
-            &retry.market_type,
+            &retry.symbol, &retry.market_type,
             json!({
                 "accepted": false,
                 "action": retry.action,
@@ -84,7 +84,7 @@ pub(super) async fn handle_cancel_failure_with_escalation(
     }
 
     let now_ms = Utc::now().timestamp_millis();
-    let mut control = state.get_live_runtime_control(&retry.market_type).await;
+    let mut control = state.get_live_runtime_control(&retry.symbol, &retry.market_type).await;
     if control.mode != LiveRuntimeControlMode::ForcePause {
         control.mode = LiveRuntimeControlMode::ForcePause;
         control.requested_at_ms = now_ms;
@@ -95,12 +95,12 @@ pub(super) async fn handle_cancel_failure_with_escalation(
             reason, retry.order_id, retry.retry_count
         ));
         state
-            .put_live_runtime_control(&retry.market_type, control.clone())
+            .put_live_runtime_control(&retry.symbol, &retry.market_type, control.clone())
             .await;
     }
     state
         .append_live_event(
-            &retry.market_type,
+            &retry.symbol, &retry.market_type,
             json!({
                 "accepted": false,
                 "action": retry.action,
@@ -430,7 +430,7 @@ async fn try_resubmit_after_terminal_reject_rust(
         Err(err) => {
             state
                 .append_live_event(
-                    &row.market_type,
+                    &row.symbol, &row.market_type,
                     json!({
                         "accepted": false,
                         "action": row.action,
@@ -455,7 +455,7 @@ async fn try_resubmit_after_terminal_reject_rust(
     if !decision_round_matches_target(&round_check, &effective_target) && !bypass_round_guard {
         state
             .append_live_event(
-                &row.market_type,
+                &row.symbol, &row.market_type,
                 json!({
                     "accepted": false,
                     "action": row.action,
@@ -478,7 +478,7 @@ async fn try_resubmit_after_terminal_reject_rust(
     }), &effective_target, now_ms) {
         state
             .append_live_event(
-                &row.market_type,
+                &row.symbol, &row.market_type,
                 json!({
                     "accepted": false,
                     "action": row.action,
@@ -512,7 +512,7 @@ async fn try_resubmit_after_terminal_reject_rust(
         }
     });
     if exit_like {
-        let ps = state.get_live_position_state(&row.market_type).await;
+        let ps = state.get_live_position_state(&row.symbol, &row.market_type).await;
         if ps.position_size_shares > 0.0 {
             if let Some(obj) = decision.as_object_mut() {
                 obj.insert(
@@ -537,7 +537,7 @@ async fn try_resubmit_after_terminal_reject_rust(
     ) else {
         state
             .append_live_event(
-                &row.market_type,
+                &row.symbol, &row.market_type,
                 json!({
                     "accepted": false,
                     "action": row.action,
@@ -575,7 +575,7 @@ async fn try_resubmit_after_terminal_reject_rust(
                     state.upsert_pending_order(pending).await;
                     state
                         .append_live_event(
-                            &row.market_type,
+                            &row.symbol, &row.market_type,
                             json!({
                                 "accepted": true,
                                 "action": row.action,
@@ -596,7 +596,7 @@ async fn try_resubmit_after_terminal_reject_rust(
             }
             state
                 .append_live_event(
-                    &row.market_type,
+                    &row.symbol, &row.market_type,
                     json!({
                         "accepted": false,
                         "action": row.action,
@@ -614,7 +614,7 @@ async fn try_resubmit_after_terminal_reject_rust(
         Err(err) => {
             state
                 .append_live_event(
-                    &row.market_type,
+                    &row.symbol, &row.market_type,
                     json!({
                         "accepted": false,
                         "action": row.action,
@@ -841,7 +841,7 @@ pub(super) async fn reconcile_rust_reports(state: &ApiState, exec_cfg: &LiveExec
             .await;
             state
                 .append_live_event(
-                    &row.market_type,
+                    &row.symbol, &row.market_type,
                     json!({
                         "accepted": true,
                         "action": row.action,
@@ -870,7 +870,7 @@ pub(super) async fn reconcile_rust_reports(state: &ApiState, exec_cfg: &LiveExec
             apply_pending_revert(state, &row, "rust_order_terminal_rejected").await;
             state
                 .append_live_event(
-                    &row.market_type,
+                    &row.symbol, &row.market_type,
                     json!({
                         "accepted": false,
                         "action": row.action,
@@ -971,7 +971,7 @@ pub(super) async fn handle_pending_timeouts_rust(
                         {
                             state
                                 .append_live_event(
-                                    &row.market_type,
+                                    &row.symbol, &row.market_type,
                                     json!({
                                         "accepted": false,
                                         "action": row.action,
@@ -997,7 +997,7 @@ pub(super) async fn handle_pending_timeouts_rust(
                         {
                             state
                                 .append_live_event(
-                                    &row.market_type,
+                                    &row.symbol, &row.market_type,
                                     json!({
                                         "accepted": false,
                                         "action": row.action,
@@ -1074,7 +1074,7 @@ pub(super) async fn handle_pending_timeouts_rust(
                                         state.upsert_pending_order(pending).await;
                                         state
                                             .append_live_event(
-                                                &row.market_type,
+                                                &row.symbol, &row.market_type,
                                                 json!({
                                                     "accepted": true,
                                                     "action": row.action,
@@ -1095,7 +1095,7 @@ pub(super) async fn handle_pending_timeouts_rust(
                                 }
                                 state
                                     .append_live_event(
-                                        &row.market_type,
+                                        &row.symbol, &row.market_type,
                                         json!({
                                             "accepted": false,
                                             "action": row.action,
@@ -1116,7 +1116,7 @@ pub(super) async fn handle_pending_timeouts_rust(
                 apply_pending_revert(state, &row, "rust_timeout_cancelled").await;
                 state
                     .append_live_event(
-                        &row.market_type,
+                        &row.symbol, &row.market_type,
                         json!({
                             "accepted": false,
                             "action": row.action,
@@ -1144,4 +1144,5 @@ pub(super) async fn handle_pending_timeouts_rust(
         }
     }
 }
+
 

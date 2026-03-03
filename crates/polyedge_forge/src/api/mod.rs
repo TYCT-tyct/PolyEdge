@@ -137,12 +137,20 @@ fn normalize_runtime_symbol(raw: &str) -> Option<String> {
     }
 }
 
-fn runtime_event_sample_scope_key(symbol: &str, market_type: &str) -> String {
+fn runtime_scope_key(symbol: &str, market_type: &str) -> String {
     format!(
         "{}|{}",
         symbol.trim().to_ascii_uppercase(),
         market_type.trim().to_ascii_lowercase()
     )
+}
+
+fn runtime_scope_symbol(symbol: &str) -> String {
+    normalize_runtime_symbol(symbol).unwrap_or_else(default_runtime_symbol)
+}
+
+fn runtime_event_sample_scope_key(symbol: &str, market_type: &str) -> String {
+    runtime_scope_key(symbol, market_type)
 }
 
 fn runtime_event_sample_buffer_max() -> usize {
@@ -1237,49 +1245,62 @@ impl ApiState {
         );
     }
 
-    async fn get_live_position_state(&self, market_type: &str) -> LivePositionState {
+    async fn get_live_position_state(&self, symbol: &str, market_type: &str) -> LivePositionState {
         let now_ms = Utc::now().timestamp_millis();
+        let scope_key = runtime_scope_key(symbol, market_type);
         {
             let states = self.live_position_states.read().await;
-            if let Some(v) = states.get(market_type) {
+            if let Some(v) = states.get(&scope_key) {
                 return v.clone();
             }
         }
         let mut states = self.live_position_states.write().await;
-        let runtime_symbol = LiveRuntimeConfig::from_env().symbol;
         let entry = states
-            .entry(market_type.to_string())
-            .or_insert_with(|| LivePositionState::flat(&runtime_symbol, market_type, now_ms));
+            .entry(scope_key)
+            .or_insert_with(|| LivePositionState::flat(symbol, market_type, now_ms));
         entry.clone()
     }
 
-    async fn put_live_position_state(&self, market_type: &str, next: LivePositionState) {
+    async fn put_live_position_state(
+        &self,
+        symbol: &str,
+        market_type: &str,
+        next: LivePositionState,
+    ) {
         let mut states = self.live_position_states.write().await;
         let mut normalized = next;
         if normalized.symbol.trim().is_empty() {
-            normalized.symbol = LiveRuntimeConfig::from_env().symbol;
+            normalized.symbol = runtime_scope_symbol(symbol);
         }
-        states.insert(market_type.to_string(), normalized);
+        let scope_key = runtime_scope_key(&normalized.symbol, market_type);
+        states.insert(scope_key, normalized);
     }
 
-    async fn get_live_runtime_control(&self, market_type: &str) -> LiveRuntimeControl {
+    async fn get_live_runtime_control(&self, symbol: &str, market_type: &str) -> LiveRuntimeControl {
         let now_ms = Utc::now().timestamp_millis();
+        let scope_key = runtime_scope_key(symbol, market_type);
         {
             let controls = self.live_runtime_controls.read().await;
-            if let Some(v) = controls.get(market_type) {
+            if let Some(v) = controls.get(&scope_key) {
                 return v.clone();
             }
         }
         let mut controls = self.live_runtime_controls.write().await;
         let entry = controls
-            .entry(market_type.to_string())
+            .entry(scope_key)
             .or_insert_with(|| LiveRuntimeControl::normal(now_ms));
         entry.clone()
     }
 
-    async fn put_live_runtime_control(&self, market_type: &str, next: LiveRuntimeControl) {
+    async fn put_live_runtime_control(
+        &self,
+        symbol: &str,
+        market_type: &str,
+        next: LiveRuntimeControl,
+    ) {
         let mut controls = self.live_runtime_controls.write().await;
-        controls.insert(market_type.to_string(), next);
+        let scope_key = runtime_scope_key(symbol, market_type);
+        controls.insert(scope_key, next);
     }
 
     #[allow(dead_code)]
@@ -1300,8 +1321,11 @@ impl ApiState {
         false
     }
 
-    async fn append_live_event(&self, market_type: &str, mut event: Value) {
+    async fn append_live_event(&self, symbol: &str, market_type: &str, mut event: Value) {
         let now_ms = Utc::now().timestamp_millis();
+        if event.get("symbol").is_none() {
+            event["symbol"] = Value::String(runtime_scope_symbol(symbol));
+        }
         if event.get("market_type").is_none() {
             event["market_type"] = Value::String(market_type.to_string());
         }
@@ -1339,19 +1363,28 @@ impl ApiState {
             events.pop_front();
         }
         drop(events);
-        self.persist_live_runtime_state_async(market_type).await;
+        self.persist_live_runtime_state_async(symbol, market_type)
+            .await;
     }
 
-    async fn list_live_events(&self, market_type: &str, limit: usize) -> Vec<Value> {
+    async fn list_live_events(&self, symbol: &str, market_type: &str, limit: usize) -> Vec<Value> {
+        let symbol = runtime_scope_symbol(symbol);
         let events = self.live_events.read().await;
         events
             .iter()
             .rev()
             .filter(|v| {
-                v.get("market_type")
+                let symbol_ok = v
+                    .get("symbol")
+                    .and_then(Value::as_str)
+                    .map(|s| s.eq_ignore_ascii_case(&symbol))
+                    .unwrap_or(false);
+                let market_ok = v
+                    .get("market_type")
                     .and_then(Value::as_str)
                     .map(|s| s == market_type)
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+                symbol_ok && market_ok
             })
             .take(limit.max(1))
             .cloned()
@@ -1361,14 +1394,16 @@ impl ApiState {
             .collect()
     }
 
-    async fn get_runtime_snapshot(&self, market_type: &str) -> Option<Value> {
+    async fn get_runtime_snapshot(&self, symbol: &str, market_type: &str) -> Option<Value> {
         let store = self.live_runtime_snapshots.read().await;
-        store.get(market_type).cloned()
+        let scope_key = runtime_scope_key(symbol, market_type);
+        store.get(&scope_key).cloned()
     }
 
-    async fn set_runtime_snapshot(&self, market_type: &str, payload: Value) {
+    async fn set_runtime_snapshot(&self, symbol: &str, market_type: &str, payload: Value) {
         let mut store = self.live_runtime_snapshots.write().await;
-        store.insert(market_type.to_string(), payload);
+        let scope_key = runtime_scope_key(symbol, market_type);
+        store.insert(scope_key, payload);
     }
 
     async fn upsert_runtime_event_sample(
@@ -1494,26 +1529,33 @@ impl ApiState {
         }
     }
 
-    async fn persist_live_runtime_state_async(&self, market_type: &str) {
+    async fn persist_live_runtime_state_async(&self, symbol: &str, market_type: &str) {
+        let scope_key = runtime_scope_key(symbol, market_type);
         {
             let mut inflight = self.live_persist_inflight.write().await;
-            if !inflight.insert(market_type.to_string()) {
+            if !inflight.insert(scope_key.clone()) {
                 return;
             }
         }
         let state = self.clone();
+        let symbol = runtime_scope_symbol(symbol);
         let market = market_type.to_string();
         tokio::spawn(async move {
-            persist_live_runtime_state(&state, &market).await;
+            persist_live_runtime_state(&state, &symbol, &market).await;
             let mut inflight = state.live_persist_inflight.write().await;
-            inflight.remove(&market);
+            inflight.remove(&scope_key);
         });
     }
 
-    async fn get_live_execution_aggr_state(&self, market_type: &str) -> LiveExecutionAggState {
+    async fn get_live_execution_aggr_state(
+        &self,
+        symbol: &str,
+        market_type: &str,
+    ) -> LiveExecutionAggState {
         let mut store = self.live_execution_aggr_states.write().await;
+        let scope_key = runtime_scope_key(symbol, market_type);
         store
-            .entry(market_type.to_string())
+            .entry(scope_key)
             .or_insert_with(|| LiveExecutionAggState::new(market_type))
             .clone()
     }
@@ -1521,10 +1563,11 @@ impl ApiState {
     #[allow(dead_code)]
     async fn apply_aggressiveness_to_execution_cfg(
         &self,
+        symbol: &str,
         market_type: &str,
         cfg: &LiveExecutionConfig,
     ) -> (LiveExecutionConfig, LiveExecutionAggState) {
-        let s = self.get_live_execution_aggr_state(market_type).await;
+        let s = self.get_live_execution_aggr_state(symbol, market_type).await;
         let mut tuned = cfg.clone();
         tuned.entry_slippage_bps =
             (cfg.entry_slippage_bps * s.entry_slippage_mult).clamp(0.0, 500.0);
@@ -1535,12 +1578,14 @@ impl ApiState {
     #[allow(dead_code)]
     async fn update_live_execution_aggr_from_orders(
         &self,
+        symbol: &str,
         market_type: &str,
         orders: &[Value],
     ) -> LiveExecutionAggState {
         let mut store = self.live_execution_aggr_states.write().await;
+        let scope_key = runtime_scope_key(symbol, market_type);
         let st = store
-            .entry(market_type.to_string())
+            .entry(scope_key)
             .or_insert_with(|| LiveExecutionAggState::new(market_type));
         if orders.is_empty() {
             // No recent executions: slowly relax back to baseline to avoid stale high aggressiveness.
@@ -1683,11 +1728,19 @@ impl ApiState {
             .count()
     }
 
-    async fn list_pending_orders_for_market(&self, market_type: &str) -> Vec<LivePendingOrder> {
+    async fn list_pending_orders_for_market(
+        &self,
+        symbol: &str,
+        market_type: &str,
+    ) -> Vec<LivePendingOrder> {
+        let symbol = runtime_scope_symbol(symbol);
         let pending = self.live_pending_orders.read().await;
         pending
             .values()
-            .filter(|p| p.market_type.eq_ignore_ascii_case(market_type))
+            .filter(|p| {
+                p.market_type.eq_ignore_ascii_case(market_type)
+                    && p.symbol.eq_ignore_ascii_case(&symbol)
+            })
             .cloned()
             .collect()
     }
@@ -1707,12 +1760,15 @@ impl ApiState {
     }
 
     #[allow(dead_code)]
-    async fn pending_flags_for_market(&self, market_type: &str) -> (bool, bool) {
+    async fn pending_flags_for_market(&self, symbol: &str, market_type: &str) -> (bool, bool) {
+        let symbol = runtime_scope_symbol(symbol);
         let pending = self.live_pending_orders.read().await;
         let mut has_enter_pending = false;
         let mut has_exit_pending = false;
         for row in pending.values() {
-            if !row.market_type.eq_ignore_ascii_case(market_type) {
+            if !row.market_type.eq_ignore_ascii_case(market_type)
+                || !row.symbol.eq_ignore_ascii_case(&symbol)
+            {
                 continue;
             }
             if row.action.eq_ignore_ascii_case("enter") || row.action.eq_ignore_ascii_case("add") {
@@ -2131,20 +2187,29 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
     Ok(())
 }
 
-fn live_position_state_key(redis_prefix: &str, market_type: &str) -> String {
-    format!("{redis_prefix}:fev1:live:position:{market_type}")
+fn live_position_state_key(redis_prefix: &str, symbol: &str, market_type: &str) -> String {
+    format!(
+        "{redis_prefix}:fev1:live:position:{}:{market_type}",
+        symbol.trim().to_ascii_uppercase()
+    )
 }
 
 fn live_pending_orders_key(redis_prefix: &str) -> String {
     format!("{redis_prefix}:fev1:live:pending")
 }
 
-fn live_events_key(redis_prefix: &str, market_type: &str) -> String {
-    format!("{redis_prefix}:fev1:live:events:{market_type}")
+fn live_events_key(redis_prefix: &str, symbol: &str, market_type: &str) -> String {
+    format!(
+        "{redis_prefix}:fev1:live:events:{}:{market_type}",
+        symbol.trim().to_ascii_uppercase()
+    )
 }
 
-fn live_runtime_control_key(redis_prefix: &str, market_type: &str) -> String {
-    format!("{redis_prefix}:fev1:live:runtime_control:{market_type}")
+fn live_runtime_control_key(redis_prefix: &str, symbol: &str, market_type: &str) -> String {
+    format!(
+        "{redis_prefix}:fev1:live:runtime_control:{}:{market_type}",
+        symbol.trim().to_ascii_uppercase()
+    )
 }
 
 fn start_live_runtime(state: ApiState) {
@@ -2244,11 +2309,13 @@ async fn restore_live_runtime_state(
     let mut restored_events = Vec::<Value>::new();
     let mut max_event_seq: u64 = 0;
     for market in &cfg.markets {
-        let key = live_position_state_key(&state.redis_prefix, market);
+        let key = live_position_state_key(&state.redis_prefix, &cfg.symbol, market);
         if let Some(v) = read_key_value(state, &key).await? {
             if let Ok(parsed) = serde_json::from_value::<LivePositionState>(v) {
                 if parsed.symbol.eq_ignore_ascii_case(&cfg.symbol) {
-                    state.put_live_position_state(market, parsed).await;
+                    state
+                        .put_live_position_state(&cfg.symbol, market, parsed)
+                        .await;
                 } else {
                     tracing::warn!(
                         market_type = market,
@@ -2259,13 +2326,15 @@ async fn restore_live_runtime_state(
                 }
             }
         }
-        let control_key = live_runtime_control_key(&state.redis_prefix, market);
+        let control_key = live_runtime_control_key(&state.redis_prefix, &cfg.symbol, market);
         if let Some(v) = read_key_value(state, &control_key).await? {
             if let Ok(parsed) = serde_json::from_value::<LiveRuntimeControl>(v) {
-                state.put_live_runtime_control(market, parsed).await;
+                state
+                    .put_live_runtime_control(&cfg.symbol, market, parsed)
+                    .await;
             }
         }
-        let events_key = live_events_key(&state.redis_prefix, market);
+        let events_key = live_events_key(&state.redis_prefix, &cfg.symbol, market);
         if let Some(v) = read_key_value(state, &events_key).await? {
             if let Ok(rows) = serde_json::from_value::<Vec<Value>>(v) {
                 for ev in rows {
@@ -2309,12 +2378,12 @@ async fn restore_live_runtime_state(
     Ok(())
 }
 
-async fn persist_live_runtime_state(state: &ApiState, market_type: &str) {
-    let position = state.get_live_position_state(market_type).await;
-    let pos_key = live_position_state_key(&state.redis_prefix, market_type);
+async fn persist_live_runtime_state(state: &ApiState, symbol: &str, market_type: &str) {
+    let position = state.get_live_position_state(symbol, market_type).await;
+    let pos_key = live_position_state_key(&state.redis_prefix, symbol, market_type);
     let _ = write_key_value(state, &pos_key, &json!(position), Some(2 * 24 * 3600)).await;
-    let runtime_control = state.get_live_runtime_control(market_type).await;
-    let control_key = live_runtime_control_key(&state.redis_prefix, market_type);
+    let runtime_control = state.get_live_runtime_control(symbol, market_type).await;
+    let control_key = live_runtime_control_key(&state.redis_prefix, symbol, market_type);
     let _ = write_key_value(
         state,
         &control_key,
@@ -2333,9 +2402,9 @@ async fn persist_live_runtime_state(state: &ApiState, market_type: &str) {
     )
     .await;
 
-    let events_key = live_events_key(&state.redis_prefix, market_type);
+    let events_key = live_events_key(&state.redis_prefix, symbol, market_type);
     let events_rows = state
-        .list_live_events(market_type, live_event_log_max())
+        .list_live_events(symbol, market_type, live_event_log_max())
         .await;
     let _ = write_key_value(
         state,
@@ -2501,11 +2570,19 @@ async fn live_runtime_loop(
                     market_sleep_ms = market_sleep_ms.min(fast_loop_ms);
                 }
             }
-            let position_before_cycle = state.get_live_position_state(market_type).await;
-            let pending_before_cycle = state.list_pending_orders_for_market(market_type).await;
+            let position_before_cycle = state
+                .get_live_position_state(runtime_symbol, market_type)
+                .await;
+            let pending_before_cycle = state
+                .list_pending_orders_for_market(runtime_symbol, market_type)
+                .await;
             let pending_before_count = pending_before_cycle.len();
-            let mut runtime_control = state.get_live_runtime_control(market_type).await;
-            let exec_aggr = state.get_live_execution_aggr_state(market_type).await;
+            let mut runtime_control = state
+                .get_live_runtime_control(runtime_symbol, market_type)
+                .await;
+            let exec_aggr = state
+                .get_live_execution_aggr_state(runtime_symbol, market_type)
+                .await;
             let mut effective_live_execute = cfg.live_execute;
             let mut effective_drain_only = cfg.drain_only;
             let live_arm_required = cached_live_arm_required;
@@ -2526,7 +2603,11 @@ async fn live_runtime_loop(
                             runtime_control.completed_at_ms = Some(now_ms);
                             runtime_control.updated_at_ms = now_ms;
                             state
-                                .put_live_runtime_control(market_type, runtime_control.clone())
+                                .put_live_runtime_control(
+                                    runtime_symbol,
+                                    market_type,
+                                    runtime_control.clone(),
+                                )
                                 .await;
                         }
                     } else {
@@ -2742,7 +2823,11 @@ async fn live_runtime_loop(
                         prefer_action,
                     );
                     let (exec_cfg_tuned, _) = state
-                        .apply_aggressiveness_to_execution_cfg(market_type, &base_exec_cfg)
+                        .apply_aggressiveness_to_execution_cfg(
+                            runtime_symbol,
+                            market_type,
+                            &base_exec_cfg,
+                        )
                         .await;
                     if effective_live_execute || pending_before_count > 0 {
                         reconcile_live_reports(&state, &exec_cfg_tuned).await;
@@ -2758,6 +2843,7 @@ async fn live_runtime_loop(
                         );
                     let (gated, mut state_skipped, position_for_submit) = gate_live_decisions(
                         &state,
+                        runtime_symbol,
                         market_type,
                         &profit_selected,
                         effective_live_execute,
@@ -2810,6 +2896,7 @@ async fn live_runtime_loop(
                                 execution_orders = execute_live_orders(
                                     &state,
                                     &exec_cfg_tuned,
+                                    runtime_symbol,
                                     market_type,
                                     &target,
                                     &position_for_submit,
@@ -2851,10 +2938,18 @@ async fn live_runtime_loop(
                         Vec::new()
                     };
                     let exec_aggr = state
-                        .update_live_execution_aggr_from_orders(market_type, &aggr_orders)
+                        .update_live_execution_aggr_from_orders(
+                            runtime_symbol,
+                            market_type,
+                            &aggr_orders,
+                        )
                         .await;
-                    let state_machine = state.get_live_position_state(market_type).await;
-                    let live_events = state.list_live_events(market_type, 60).await;
+                    let state_machine = state
+                        .get_live_position_state(runtime_symbol, market_type)
+                        .await;
+                    let live_events = state
+                        .list_live_events(runtime_symbol, market_type, 60)
+                        .await;
 
                     let live_submitted_count = execution_orders
                         .iter()
@@ -2936,9 +3031,13 @@ async fn live_runtime_loop(
                         obj.insert("live_execution".to_string(), live_execution_payload);
                         obj.insert("status".to_string(), Value::String(status.clone()));
                     }
-                    state.set_runtime_snapshot(market_type, payload).await;
+                    state
+                        .set_runtime_snapshot(runtime_symbol, market_type, payload)
+                        .await;
                     // Persist runtime state off the hot path to avoid Redis latency coupling.
-                    state.persist_live_runtime_state_async(market_type).await;
+                    state
+                        .persist_live_runtime_state_async(runtime_symbol, market_type)
+                        .await;
 
                     if push_cfg.enabled && effective_live_execute && status != "ok" {
                         let alert_key = format!("live-status:{market_type}:{status}");
@@ -3036,6 +3135,7 @@ async fn live_runtime_loop(
                     let msg = format!("runtime_cycle_error:{}", err.message);
                     state
                         .append_live_event(
+                            runtime_symbol,
                             market_type,
                             json!({
                                 "accepted": false,
@@ -3074,7 +3174,7 @@ async fn live_runtime_loop(
             }
             let pending_after_count = if effective_live_execute || pending_before_count > 0 {
                 state
-                    .list_pending_orders_for_market(market_type)
+                    .list_pending_orders_for_market(runtime_symbol, market_type)
                     .await
                     .len()
             } else {

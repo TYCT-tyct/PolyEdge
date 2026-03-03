@@ -8,10 +8,11 @@ pub(super) async fn handle_live_pending_timeouts(state: &ApiState, exec_cfg: &Li
 
 pub(super) async fn flush_entry_pending_before_exit(
     state: &ApiState,
+    symbol: &str,
     market_type: &str,
 ) -> usize {
     let pending_rows = state
-        .list_pending_orders_for_market(market_type)
+        .list_pending_orders_for_market(symbol, market_type)
         .await
         .into_iter()
         .filter(|row| {
@@ -40,6 +41,7 @@ pub(super) async fn flush_entry_pending_before_exit(
                 cancelled = cancelled.saturating_add(1);
                 state
                     .append_live_event(
+                        &row.symbol,
                         &row.market_type,
                         json!({
                             "accepted": true,
@@ -57,6 +59,7 @@ pub(super) async fn flush_entry_pending_before_exit(
             Err(err) => {
                 state
                     .append_live_event(
+                        &row.symbol,
                         &row.market_type,
                         json!({
                             "accepted": false,
@@ -79,6 +82,7 @@ pub(super) async fn flush_entry_pending_before_exit(
 pub(super) async fn execute_live_orders(
     state: &ApiState,
     exec_cfg: &LiveExecutionConfig,
+    symbol: &str,
     market_type: &str,
     target: &LiveMarketTarget,
     position_state: &LivePositionState,
@@ -134,7 +138,7 @@ pub(super) async fn execute_live_orders(
         });
     }
     if has_exit_like {
-        let _ = flush_entry_pending_before_exit(state, market_type).await;
+        let _ = flush_entry_pending_before_exit(state, symbol, market_type).await;
     }
     let mut out =
         execute_live_orders_via_rust_sdk(state, exec_cfg, target, position_state, &prioritized)

@@ -12,7 +12,7 @@ pub(super) async fn strategy_paper(
         match state.strategy_live_source_slots.clone().try_acquire_owned() {
             Ok(permit) => Some(permit),
             Err(_) => {
-                if let Some(payload) = state.get_runtime_snapshot(market_type).await {
+                if let Some(payload) = state.get_runtime_snapshot(symbol, market_type).await {
                     return Ok(Json(payload));
                 }
                 return Err(ApiError::too_many_requests(
@@ -190,7 +190,7 @@ pub(super) async fn strategy_paper(
                 return Err(ApiError::bad_request(mismatch_msg));
             }
             source_fallback_error = Some(mismatch_msg);
-        } else if let Some(payload) = state.get_runtime_snapshot(market_type).await {
+        } else if let Some(payload) = state.get_runtime_snapshot(symbol, market_type).await {
             return Ok(Json(payload));
         } else {
             let warmup_msg = "live runtime warming up (no snapshot yet)";
@@ -343,26 +343,27 @@ pub(super) async fn strategy_live_reset(
     for market in ["5m", "15m"] {
         state
             .put_live_position_state(
+                &runtime_cfg.symbol,
                 market,
                 LivePositionState::flat(&runtime_cfg.symbol, market, now_ms),
             )
             .await;
         state
-            .put_live_runtime_control(market, LiveRuntimeControl::normal(now_ms))
+            .put_live_runtime_control(&runtime_cfg.symbol, market, LiveRuntimeControl::normal(now_ms))
             .await;
     }
 
     let mut deleted_keys = Vec::<String>::new();
     for market in ["5m", "15m"] {
-        let key = live_position_state_key(&state.redis_prefix, market);
+        let key = live_position_state_key(&state.redis_prefix, &runtime_cfg.symbol, market);
         if delete_key(&state, &key).await.is_ok() {
             deleted_keys.push(key);
         }
-        let events_key = live_events_key(&state.redis_prefix, market);
+        let events_key = live_events_key(&state.redis_prefix, &runtime_cfg.symbol, market);
         if delete_key(&state, &events_key).await.is_ok() {
             deleted_keys.push(events_key);
         }
-        let control_key = live_runtime_control_key(&state.redis_prefix, market);
+        let control_key = live_runtime_control_key(&state.redis_prefix, &runtime_cfg.symbol, market);
         if delete_key(&state, &control_key).await.is_ok() {
             deleted_keys.push(control_key);
         }
@@ -390,12 +391,16 @@ pub(super) async fn strategy_live_control(
     Json(body): Json<StrategyLiveControlRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let market_type = resolve_strategy_market_type(body.market_type.as_deref())?;
+    let runtime_cfg = LiveRuntimeConfig::from_env();
+    let runtime_symbol = runtime_cfg.symbol;
     let action = body.action.trim().to_ascii_lowercase();
     if action.is_empty() {
         return Err(ApiError::bad_request("action is required"));
     }
     let now_ms = Utc::now().timestamp_millis();
-    let mut control = state.get_live_runtime_control(market_type).await;
+    let mut control = state
+        .get_live_runtime_control(&runtime_symbol, market_type)
+        .await;
     let mut updated = false;
     match action.as_str() {
         "status" => {}
@@ -441,13 +446,18 @@ pub(super) async fn strategy_live_control(
 
     if updated {
         state
-            .put_live_runtime_control(market_type, control.clone())
+            .put_live_runtime_control(&runtime_symbol, market_type, control.clone())
             .await;
-        persist_live_runtime_state(&state, market_type).await;
+        persist_live_runtime_state(&state, &runtime_symbol, market_type).await;
     }
 
-    let position = state.get_live_position_state(market_type).await;
-    let pending_count = state.list_pending_orders_for_market(market_type).await.len();
+    let position = state
+        .get_live_position_state(&runtime_symbol, market_type)
+        .await;
+    let pending_count = state
+        .list_pending_orders_for_market(&runtime_symbol, market_type)
+        .await
+        .len();
     let flatten_done = position.side.is_none() && pending_count == 0;
     if matches!(control.mode, LiveRuntimeControlMode::GracefulStop)
         && flatten_done
@@ -456,13 +466,14 @@ pub(super) async fn strategy_live_control(
         control.completed_at_ms = Some(now_ms);
         control.updated_at_ms = now_ms;
         state
-            .put_live_runtime_control(market_type, control.clone())
+            .put_live_runtime_control(&runtime_symbol, market_type, control.clone())
             .await;
-        persist_live_runtime_state(&state, market_type).await;
+        persist_live_runtime_state(&state, &runtime_symbol, market_type).await;
     }
 
     Ok(Json(json!({
         "ok": true,
+        "symbol": runtime_symbol,
         "market_type": market_type,
         "action": action,
         "control": control,
@@ -498,6 +509,7 @@ pub(super) async fn strategy_live_events(
     Query(params): Query<StrategyLiveEventsQueryParams>,
 ) -> Result<Json<Value>, ApiError> {
     let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
+    let runtime_symbol = LiveRuntimeConfig::from_env().symbol;
     let limit = params.limit.unwrap_or(400).clamp(1, 5000) as usize;
     let since_ts_ms = params.since_ts_ms.unwrap_or(0);
     let order_id_filter = params
@@ -518,7 +530,7 @@ pub(super) async fn strategy_live_events(
     let accepted_filter = params.accepted;
 
     let scanned = state
-        .list_live_events(market_type, live_event_log_max())
+        .list_live_events(&runtime_symbol, market_type, live_event_log_max())
         .await;
     let mut filtered = scanned
         .into_iter()
@@ -626,6 +638,7 @@ pub(super) async fn strategy_live_events(
 
     Ok(Json(json!({
         "ok": true,
+        "symbol": runtime_symbol,
         "market_type": market_type,
         "filters": {
             "limit": limit,

@@ -326,6 +326,7 @@ pub(super) fn live_decision_key(market_type: &str, decision: &Value) -> String {
 
 pub(super) async fn gate_live_decisions(
     state: &ApiState,
+    symbol: &str,
     market_type: &str,
     decisions: &[Value],
     mark_attempts: bool,
@@ -336,10 +337,10 @@ pub(super) async fn gate_live_decisions(
     let fixed_entry_size_shares = live_fixed_entry_size_shares();
     let open_positions_total = state.count_open_positions().await;
     let mut enter_pending_total = state.count_entry_pending_orders().await;
-    let mut position_state = state.get_live_position_state(market_type).await;
+    let mut position_state = state.get_live_position_state(symbol, market_type).await;
     let mut virtual_side = position_state.side.clone();
     let (mut has_enter_pending, mut has_exit_pending) =
-        state.pending_flags_for_market(market_type).await;
+        state.pending_flags_for_market(symbol, market_type).await;
     let mut accepted = Vec::<LiveGatedDecision>::new();
     let mut skipped = Vec::<Value>::new();
 

@@ -463,8 +463,8 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                     "mode": "dry_run",
                     "orders": []
                 },
-                "state_machine": state.get_live_position_state(market_type).await,
-                "events": state.list_live_events(market_type, 60).await
+                "state_machine": state.get_live_position_state(symbol, market_type).await,
+                "events": state.list_live_events(symbol, market_type, 60).await
             }
         }));
     }
@@ -562,8 +562,8 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                 "mode": "dry_run",
                 "orders": []
             },
-            "state_machine": state.get_live_position_state(market_type).await,
-            "events": state.list_live_events(market_type, 60).await
+            "state_machine": state.get_live_position_state(symbol, market_type).await,
+            "events": state.list_live_events(symbol, market_type, 60).await
         }
     }))
 }
