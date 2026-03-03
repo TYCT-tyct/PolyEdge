@@ -37,7 +37,7 @@ struct TargetFetchRes {
     target_price: Option<f64>,
 }
 
-const MARKET_FUTURE_GUARD_DEFAULT_MS: i64 = 3 * 60 * 60 * 1000;
+// Removed: MARKET_FUTURE_GUARD_DEFAULT_MS (replaced by market_prestart_allow_ms)
 const MARKET_PRESTART_ALLOW_DEFAULT_MS: i64 = 30_000;
 const MARKET_SAMPLE_END_GRACE_DEFAULT_MS: i64 = 300;
 const MARKET_STALE_GUARD_MS: i64 = 5_000;
@@ -62,6 +62,7 @@ const TARGET_RETRY_RETENTION_MS: i64 = 20 * 60 * 1000;
 const ROUND_META_RETENTION_MS: i64 = 6 * 60 * 60 * 1000;
 const EMITTED_ROUND_RETENTION_MS: i64 = 6 * 60 * 60 * 1000;
 const DISCOVERY_EMPTY_GRACE_DEFAULT_MS: i64 = 8_000;
+const SAMPLE_GAP_WARN_MS: i64 = 1000;
 const ROUND_DROP_ON_QUALITY_FAIL_DEFAULT: bool = true;
 const TOKYO_INPUT_STALE_GUARD_DEFAULT_MS: i64 = 2_500;
 const INPUT_STALE_WARN_THROTTLE_MS: i64 = 15_000;
@@ -719,11 +720,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         .and_then(|v| v.trim().parse::<i64>().ok())
         .unwrap_or(TOKYO_INPUT_STALE_GUARD_DEFAULT_MS)
         .clamp(500, 30_000);
-    let market_future_guard_ms = std::env::var("FORGE_MARKET_FUTURE_GUARD_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .unwrap_or(MARKET_FUTURE_GUARD_DEFAULT_MS)
-        .clamp(0, 24 * 60 * 60 * 1000);
+    // Removed unused market_future_guard_ms - using prestart_allow for boundary control
     let market_prestart_allow_ms = std::env::var("FORGE_MARKET_PRESTART_ALLOW_MS")
         .ok()
         .and_then(|v| v.trim().parse::<i64>().ok())
@@ -771,7 +768,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         round_end_tolerance_ms = quality_policy.end_tolerance_ms,
         settle_stale_tolerance_ms = quality_policy.settle_stale_tolerance_ms,
         tokyo_input_stale_guard_ms = tokyo_input_stale_guard_ms,
-        market_future_guard_ms = market_future_guard_ms,
+        // Removed: market_future_guard_ms (unused)
         market_prestart_allow_ms = market_prestart_allow_ms,
         market_sample_end_grace_ms = market_sample_end_grace_ms,
         market_selection_fallback_prewarm_ms = market_selection_fallback_prewarm_ms,
@@ -1063,6 +1060,8 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
     let mut discovery_empty_since_ms: Option<i64> = None;
 
     let mut ingest_seq: u64 = 0;
+    let mut last_sample_time_ms: i64 = 0;
+    let mut sample_gap_warn_by_pair: HashMap<String, i64> = HashMap::new();
 
     let mut ticker = tokio::time::interval(Duration::from_millis(sample_period_ms as u64));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1421,6 +1420,35 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                 prob_smooth_by_round.retain(|_, v| {
                     now_ms.saturating_sub(v.ts_ms) <= PROB_STATE_RETENTION_MS
                 });
+
+                // Gap detection: warn if sampling interval exceeds threshold
+                if last_sample_time_ms > 0 {
+                    let gap_ms = now_ms.saturating_sub(last_sample_time_ms);
+                    if gap_ms > SAMPLE_GAP_WARN_MS {
+                        let active_pairs: Vec<String> = markets_by_id
+                            .values()
+                            .map(|m| market_pair_key(m))
+                            .collect();
+                        for pair_key in active_pairs.iter() {
+                            let warn_at = sample_gap_warn_by_pair
+                                .entry(pair_key.clone())
+                                .or_insert(0);
+                            if now_ms.saturating_sub(*warn_at) >= INPUT_STALE_WARN_THROTTLE_MS {
+                                log_ingest(
+                                    &persist_tx,
+                                    "warn",
+                                    "sampling_gap",
+                                    &format!(
+                                        "sample_gap_detected pair={} gap_ms={} threshold_ms={}",
+                                        pair_key, gap_ms, SAMPLE_GAP_WARN_MS
+                                    ),
+                                );
+                                *warn_at = now_ms;
+                            }
+                        }
+                    }
+                }
+
                 for primary_market in markets_by_id.values() {
                     let pair_key = market_pair_key(primary_market);
                     let mut market = primary_market.clone();
@@ -1461,9 +1489,8 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             }
                         }
                     }
-                    if now_ms + market_future_guard_ms < market.start_ts_ms {
-                        continue;
-                    }
+                    // Simplified boundary check: only use prestart_allow for early detection
+                    // and end grace for late detection (removed redundant future_guard)
                     if now_ms + market_prestart_allow_ms < market.start_ts_ms {
                         continue;
                     }
@@ -1853,6 +1880,9 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         }
                     }
                     round_buf.push_snapshot(row);
+
+                    // Update last sample time for gap detection
+                    last_sample_time_ms = now_ms;
 
                     let remaining_ms = market.end_ts_ms.saturating_sub(now_ms);
                     if remaining_ms <= 0 && !emitted_rounds.contains_key(&round_id) {
