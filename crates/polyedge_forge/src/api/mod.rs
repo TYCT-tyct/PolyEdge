@@ -406,8 +406,8 @@ impl LiveRuntimeConfig {
         let loop_interval_ms = std::env::var("FORGE_FEV1_RUNTIME_LOOP_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(450)
-            .clamp(200, 10_000);
+            .unwrap_or(180)
+            .clamp(60, 10_000);
         let lookback_minutes = std::env::var("FORGE_FEV1_RUNTIME_LOOKBACK_MINUTES")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
@@ -492,8 +492,8 @@ fn runtime_fast_loop_ms(base_loop_ms: u64) -> u64 {
     std::env::var("FORGE_FEV1_RUNTIME_FAST_LOOP_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(120)
-        .clamp(80, base_loop_ms.max(80))
+        .unwrap_or(40)
+        .clamp(20, base_loop_ms.max(20))
 }
 
 fn runtime_fast_margin_threshold() -> f64 {
