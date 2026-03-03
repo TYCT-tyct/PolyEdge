@@ -168,6 +168,10 @@ const LIVE_FIXED_ENTRY_SIZE_SHARES_MAX: f64 = 1_000.0;
 const LIVE_MAX_OPEN_POSITIONS_DEFAULT: usize = 1;
 const LIVE_MAX_OPEN_POSITIONS_MIN: usize = 1;
 const LIVE_MAX_OPEN_POSITIONS_MAX: usize = 4;
+const LIVE_MAX_COMPLETED_TRADES_DEFAULT: usize = 0;
+const LIVE_MAX_COMPLETED_TRADES_MIN: usize = 0;
+const LIVE_MAX_COMPLETED_TRADES_MAX: usize = 1_000;
+const LIVE_ALLOW_ADDS_DEFAULT: bool = true;
 
 #[derive(Debug, Clone)]
 struct CachedLiveMarketTarget {
@@ -360,6 +364,71 @@ fn live_max_open_positions() -> usize {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(LIVE_MAX_OPEN_POSITIONS_DEFAULT)
         .clamp(LIVE_MAX_OPEN_POSITIONS_MIN, LIVE_MAX_OPEN_POSITIONS_MAX)
+}
+
+fn live_max_completed_trades() -> usize {
+    std::env::var("FORGE_FEV1_LIVE_MAX_COMPLETED_TRADES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(LIVE_MAX_COMPLETED_TRADES_DEFAULT)
+        .clamp(
+            LIVE_MAX_COMPLETED_TRADES_MIN,
+            LIVE_MAX_COMPLETED_TRADES_MAX,
+        )
+}
+
+fn live_max_completed_trades_for_scope(symbol: &str, market_type: &str) -> usize {
+    let default_limit = live_max_completed_trades();
+    let symbol = symbol.trim().to_ascii_uppercase();
+    let market_type = market_type.trim().to_ascii_lowercase();
+    let raw = match std::env::var("FORGE_FEV1_LIVE_MAX_COMPLETED_TRADES_BY_SCOPE") {
+        Ok(v) => v,
+        Err(_) => return default_limit,
+    };
+    for entry in raw.split(',') {
+        let item = entry.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let Some((scope, limit_raw)) = item.split_once('=') else {
+            continue;
+        };
+        let Ok(limit) = limit_raw.trim().parse::<usize>() else {
+            continue;
+        };
+        let limit = limit.clamp(
+            LIVE_MAX_COMPLETED_TRADES_MIN,
+            LIVE_MAX_COMPLETED_TRADES_MAX,
+        );
+        let scope = scope.trim();
+        if scope.is_empty() {
+            continue;
+        }
+        if let Some((scope_symbol, scope_market)) = scope.split_once(':') {
+            if scope_symbol.trim().eq_ignore_ascii_case(&symbol)
+                && scope_market.trim().eq_ignore_ascii_case(&market_type)
+            {
+                return limit;
+            }
+            continue;
+        }
+        if scope.eq_ignore_ascii_case(&symbol) {
+            return limit;
+        }
+    }
+    default_limit
+}
+
+fn live_allow_add_orders() -> bool {
+    std::env::var("FORGE_FEV1_LIVE_ALLOW_ADDS")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(LIVE_ALLOW_ADDS_DEFAULT)
 }
 
 fn live_fixed_entry_size_shares() -> Option<f64> {

@@ -333,6 +333,8 @@ pub(super) async fn gate_live_decisions(
 ) -> (Vec<LiveGatedDecision>, Vec<Value>, LivePositionState) {
     let now_ms = Utc::now().timestamp_millis();
     let max_open_positions = live_max_open_positions();
+    let max_completed_trades = live_max_completed_trades_for_scope(symbol, market_type);
+    let allow_add_orders = live_allow_add_orders();
     let require_fixed_entry_size = live_require_fixed_entry_size();
     let fixed_entry_size_shares = live_fixed_entry_size_shares();
     let open_positions_total = state.count_open_positions().await;
@@ -373,9 +375,29 @@ pub(super) async fn gate_live_decisions(
             }));
             continue;
         }
+        if action == "add" && !allow_add_orders {
+            skipped.push(json!({
+                "reason": "add_disabled_by_env",
+                "required_env": "FORGE_FEV1_LIVE_ALLOW_ADDS=true",
+                "decision": normalized
+            }));
+            continue;
+        }
         if side != "UP" && side != "DOWN" {
             skipped.push(json!({
                 "reason": "invalid_side",
+                "decision": normalized
+            }));
+            continue;
+        }
+        if matches!(action.as_str(), "enter" | "add")
+            && max_completed_trades > 0
+            && (position_state.total_exits as usize) >= max_completed_trades
+        {
+            skipped.push(json!({
+                "reason": "completed_trade_limit_reached",
+                "completed_trades": position_state.total_exits,
+                "max_completed_trades": max_completed_trades,
                 "decision": normalized
             }));
             continue;

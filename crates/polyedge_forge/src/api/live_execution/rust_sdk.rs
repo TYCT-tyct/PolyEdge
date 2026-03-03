@@ -719,6 +719,7 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
         let mut final_error: Option<String> = None;
         let mut final_reject_reason: Option<String> = None;
         let executed_via = "rust_sdk";
+        let submitted_ts_ms = Utc::now().timestamp_millis();
         let order_started = Instant::now();
         for attempt in 0..3usize {
             let attempt_started = Instant::now();
@@ -777,11 +778,28 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                 }
             }
         }
+        let final_order_id = final_response.as_ref().and_then(|resp| {
+            resp.get("order_id")
+                .or_else(|| resp.get("id"))
+                .and_then(Value::as_str)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        });
+        let request_price = payload.get("price").and_then(Value::as_f64);
+        let request_size = payload.get("size").and_then(Value::as_f64);
+        let request_quote = payload.get("quote_size_usdc").and_then(Value::as_f64);
+        let final_price = attempt_payload.get("price").and_then(Value::as_f64);
+        let final_size = attempt_payload.get("size").and_then(Value::as_f64);
+        let final_quote = attempt_payload.get("quote_size_usdc").and_then(Value::as_f64);
         out.push(json!({
             "ok": accepted,
             "accepted": accepted,
+            "submitted_ts_ms": submitted_ts_ms,
+            "symbol": position_state.symbol,
+            "market_type": position_state.market_type,
             "decision_key": gated.decision_key,
             "decision": prepared.decision,
+            "order_id": final_order_id,
             "request": payload,
             "final_request": attempt_payload,
             "response": final_response,
@@ -792,7 +810,14 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
             "order_latency_ms": order_started.elapsed().as_millis() as u64,
             "book_snapshot": book_snapshot,
             "target_market_id": prepared.effective_target.market_id,
+            "target_token_id": token_id,
             "round_guard_bypassed": prepared.bypass_round_guard,
+            "request_price": request_price,
+            "request_size_shares": request_size,
+            "request_quote_usdc": request_quote,
+            "final_price": final_price,
+            "final_size_shares": final_size,
+            "final_quote_usdc": final_quote,
             "price_trace": build_execution_price_trace(
                 &prepared.decision,
                 &payload,
