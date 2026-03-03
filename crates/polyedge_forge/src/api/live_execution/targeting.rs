@@ -613,12 +613,20 @@ pub(super) async fn resolve_live_market_target_with_state(
     state: &ApiState,
     market_type: &str,
 ) -> Result<LiveMarketTarget, ApiError> {
-    resolve_live_market_target_inner(Some(state), market_type).await
+    resolve_live_market_target_inner(Some(state), market_type, true).await
+}
+
+pub(super) async fn resolve_live_market_target_fast_with_state(
+    state: &ApiState,
+    market_type: &str,
+) -> Result<LiveMarketTarget, ApiError> {
+    resolve_live_market_target_inner(Some(state), market_type, false).await
 }
 
 async fn resolve_live_market_target_inner(
     state: Option<&ApiState>,
     market_type: &str,
+    allow_discovery: bool,
 ) -> Result<LiveMarketTarget, ApiError> {
     let now_ms = Utc::now().timestamp_millis();
     let cache_ttl_ms = live_market_target_cache_ttl_ms();
@@ -653,124 +661,123 @@ async fn resolve_live_market_target_inner(
         }
     }
 
-    let discovery = MarketDiscovery::new(DiscoveryConfig {
-        symbols: vec!["BTCUSDT".to_string()],
-        market_types: vec!["updown".to_string()],
-        timeframes: vec![market_type.to_string()],
-        ..DiscoveryConfig::default()
-    });
     let mut last_discovery_error: Option<String> = None;
-    for attempt_idx in 0..resolve_attempts {
-        let discovered = match discovery.discover().await {
-            Ok(v) => v,
-            Err(e) => {
-                last_discovery_error = Some(e.to_string());
+    if allow_discovery {
+        let discovery = MarketDiscovery::new(DiscoveryConfig {
+            symbols: vec!["BTCUSDT".to_string()],
+            market_types: vec!["updown".to_string()],
+            timeframes: vec![market_type.to_string()],
+            ..DiscoveryConfig::default()
+        });
+        for attempt_idx in 0..resolve_attempts {
+            let discovered = match discovery.discover().await {
+                Ok(v) => v,
+                Err(e) => {
+                    last_discovery_error = Some(e.to_string());
+                    if attempt_idx + 1 < resolve_attempts && resolve_retry_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(resolve_retry_ms)).await;
+                    }
+                    continue;
+                }
+            };
+            let mut markets: Vec<MarketDescriptor> = discovered
+                .into_iter()
+                .filter(|m| {
+                    m.symbol.eq_ignore_ascii_case("BTCUSDT")
+                        && m.timeframe
+                            .as_deref()
+                            .map(|tf| tf.eq_ignore_ascii_case(market_type))
+                            .unwrap_or(false)
+                })
+                .collect();
+            if markets.is_empty() {
                 if attempt_idx + 1 < resolve_attempts && resolve_retry_ms > 0 {
                     tokio::time::sleep(Duration::from_millis(resolve_retry_ms)).await;
                 }
                 continue;
             }
-        };
-        let mut markets: Vec<MarketDescriptor> = discovered
-            .into_iter()
-            .filter(|m| {
-                m.symbol.eq_ignore_ascii_case("BTCUSDT")
-                    && m.timeframe
+            {
+                let mut token_cache = live_market_token_cache().write().await;
+                for m in &markets {
+                    let yes = m
+                        .token_id_yes
                         .as_deref()
-                        .map(|tf| tf.eq_ignore_ascii_case(market_type))
-                        .unwrap_or(false)
-            })
-            .collect();
-        if markets.is_empty() {
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    let no = m
+                        .token_id_no
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    if yes.is_empty() || no.is_empty() || yes == no {
+                        continue;
+                    }
+                    token_cache.insert(m.market_id.clone(), (yes.to_string(), no.to_string()));
+                }
+            }
+            markets.sort_by_key(|m| {
+                let end_ms = parse_end_date_ms(m.end_date.as_deref()).unwrap_or(i64::MAX / 4);
+                let bucket = if end_ms >= now_ms.saturating_add(switch_guard_ms) {
+                    0_i64
+                } else if end_ms >= now_ms {
+                    1_i64
+                } else {
+                    2_i64
+                };
+                let distance = if end_ms >= now_ms {
+                    end_ms.saturating_sub(now_ms)
+                } else {
+                    now_ms.saturating_sub(end_ms)
+                };
+                (
+                    bucket,
+                    distance,
+                    std::cmp::Reverse(end_ms),
+                    m.market_id.clone(),
+                )
+            });
+            for candidate in markets {
+                let token_pair = match (
+                    candidate
+                        .token_id_yes
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty()),
+                    candidate
+                        .token_id_no
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty()),
+                ) {
+                    (Some(yes), Some(no)) if yes != no => Some((yes.to_string(), no.to_string())),
+                    _ => resolve_token_ids_from_target_cache(&candidate.market_id, market_type).await,
+                };
+                let Some((token_id_yes, token_id_no)) = token_pair else {
+                    continue;
+                };
+                let target = LiveMarketTarget {
+                    market_id: candidate.market_id,
+                    symbol: candidate.symbol,
+                    timeframe: candidate.timeframe.unwrap_or_else(|| market_type.to_string()),
+                    token_id_yes,
+                    token_id_no,
+                    end_date: candidate.end_date,
+                };
+                {
+                    let mut cache = live_market_target_cache().write().await;
+                    cache.insert(
+                        market_type.to_string(),
+                        CachedLiveMarketTarget {
+                            fetched_at_ms: Utc::now().timestamp_millis(),
+                            target: target.clone(),
+                        },
+                    );
+                }
+                return Ok(target);
+            }
             if attempt_idx + 1 < resolve_attempts && resolve_retry_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(resolve_retry_ms)).await;
             }
-            continue;
-        }
-        {
-            let mut token_cache = live_market_token_cache().write().await;
-            for m in &markets {
-                let yes = m
-                    .token_id_yes
-                    .as_deref()
-                    .map(str::trim)
-                    .unwrap_or_default();
-                let no = m
-                    .token_id_no
-                    .as_deref()
-                    .map(str::trim)
-                    .unwrap_or_default();
-                if yes.is_empty() || no.is_empty() || yes == no {
-                    continue;
-                }
-                token_cache.insert(
-                    m.market_id.clone(),
-                    (yes.to_string(), no.to_string()),
-                );
-            }
-        }
-        markets.sort_by_key(|m| {
-            let end_ms = parse_end_date_ms(m.end_date.as_deref()).unwrap_or(i64::MAX / 4);
-            let bucket = if end_ms >= now_ms.saturating_add(switch_guard_ms) {
-                0_i64
-            } else if end_ms >= now_ms {
-                1_i64
-            } else {
-                2_i64
-            };
-            let distance = if end_ms >= now_ms {
-                end_ms.saturating_sub(now_ms)
-            } else {
-                now_ms.saturating_sub(end_ms)
-            };
-            (
-                bucket,
-                distance,
-                std::cmp::Reverse(end_ms),
-                m.market_id.clone(),
-            )
-        });
-        for candidate in markets {
-            let token_pair = match (
-                candidate
-                    .token_id_yes
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty()),
-                candidate
-                    .token_id_no
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty()),
-            ) {
-                (Some(yes), Some(no)) if yes != no => Some((yes.to_string(), no.to_string())),
-                _ => resolve_token_ids_from_target_cache(&candidate.market_id, market_type).await,
-            };
-            let Some((token_id_yes, token_id_no)) = token_pair else {
-                continue;
-            };
-            let target = LiveMarketTarget {
-                market_id: candidate.market_id,
-                symbol: candidate.symbol,
-                timeframe: candidate.timeframe.unwrap_or_else(|| market_type.to_string()),
-                token_id_yes,
-                token_id_no,
-                end_date: candidate.end_date,
-            };
-            {
-                let mut cache = live_market_target_cache().write().await;
-                cache.insert(
-                    market_type.to_string(),
-                    CachedLiveMarketTarget {
-                        fetched_at_ms: Utc::now().timestamp_millis(),
-                        target: target.clone(),
-                    },
-                );
-            }
-            return Ok(target);
-        }
-        if attempt_idx + 1 < resolve_attempts && resolve_retry_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(resolve_retry_ms)).await;
         }
     }
     if let Some(state) = state {
@@ -804,20 +811,26 @@ async fn resolve_live_market_target_inner(
             return Ok(cached.target);
         }
     }
-    tracing::warn!(
-        market_type = market_type,
-        resolve_attempts = resolve_attempts,
-        last_discovery_error = last_discovery_error.as_deref().unwrap_or("none"),
-        "market target resolve exhausted retries without stale fallback"
-    );
-    Err(ApiError::bad_request(format!(
-        "no active BTC {market_type} market with token ids after {} attempts{}",
-        resolve_attempts,
-        last_discovery_error
-            .as_ref()
-            .map(|e| format!(", last_error={e}"))
-            .unwrap_or_default()
-    )))
+    if allow_discovery {
+        tracing::warn!(
+            market_type = market_type,
+            resolve_attempts = resolve_attempts,
+            last_discovery_error = last_discovery_error.as_deref().unwrap_or("none"),
+            "market target resolve exhausted retries without stale fallback"
+        );
+        Err(ApiError::bad_request(format!(
+            "no active BTC {market_type} market with token ids after {} attempts{}",
+            resolve_attempts,
+            last_discovery_error
+                .as_ref()
+                .map(|e| format!(", last_error={e}"))
+                .unwrap_or_default()
+        )))
+    } else {
+        Err(ApiError::bad_request(format!(
+            "fast market target resolve miss for {market_type} (cache/snapshot only)"
+        )))
+    }
 }
 
 fn collect_decision_token_ids(

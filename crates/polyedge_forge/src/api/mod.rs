@@ -520,6 +520,14 @@ fn runtime_target_keepalive_ms() -> i64 {
         .clamp(500, 30_000)
 }
 
+fn runtime_event_idle_poll_ms() -> i64 {
+    std::env::var("FORGE_FEV1_RUNTIME_EVENT_IDLE_POLL_MS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(1_200)
+        .clamp(200, 20_000)
+}
+
 fn live_submit_arm_required() -> bool {
     std::env::var("FORGE_FEV1_LIVE_ARM_REQUIRED")
         .ok()
@@ -968,6 +976,7 @@ struct LiveRuntimeWakeEvent {
     market_type: String,
     source: String,
     ts_ms: i64,
+    sample_ts_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1005,14 +1014,19 @@ impl LiveExecutionAggState {
     }
 }
 
-fn parse_snapshot_event_market_type(payload: &str) -> Option<String> {
+fn parse_snapshot_event(payload: &str) -> Option<(String, Option<i64>)> {
     let v: Value = serde_json::from_str(payload).ok()?;
     let tf = v
         .get("timeframe")
         .and_then(Value::as_str)
         .map(|s| s.trim().to_ascii_lowercase())?;
+    let sample_ts_ms = v
+        .get("ts_ireland_sample_ms")
+        .and_then(Value::as_i64)
+        .or_else(|| v.get("ts_ms").and_then(Value::as_i64))
+        .filter(|v| *v > 0);
     if tf == "5m" || tf == "15m" {
-        Some(tf)
+        Some((tf, sample_ts_ms))
     } else {
         None
     }
@@ -1986,13 +2000,14 @@ async fn live_runtime_snapshot_event_listener(
                             continue;
                         }
                     };
-                    let Some(market_type) = parse_snapshot_event_market_type(&payload) else {
+                    let Some((market_type, sample_ts_ms)) = parse_snapshot_event(&payload) else {
                         continue;
                     };
                     let _ = wake_tx.send(LiveRuntimeWakeEvent {
                         market_type,
                         source: "redis_snapshot_event".to_string(),
                         ts_ms: Utc::now().timestamp_millis(),
+                        sample_ts_ms,
                     });
                 }
                 tracing::warn!(channel = %channel, "runtime pubsub stream closed, reconnecting");
@@ -2116,6 +2131,9 @@ async fn live_runtime_loop(
     let mut last_round_seen: HashMap<String, String> = HashMap::new();
     let mut target_keepalive_at: HashMap<String, i64> = HashMap::new();
     let mut market_next_due_ms: HashMap<String, i64> = HashMap::new();
+    let mut market_last_strategy_eval_ms: HashMap<String, i64> = HashMap::new();
+    let mut market_last_strategy_sample_ts_ms: HashMap<String, i64> = HashMap::new();
+    let snapshot_event_available = state.redis_client.is_some();
     loop {
         let cfg = LiveRuntimeConfig::from_env();
         let push_cfg = ServerChanConfig::from_env();
@@ -2124,6 +2142,7 @@ async fn live_runtime_loop(
         let fast_margin = runtime_fast_margin_threshold();
         let target_prewarm_ms = runtime_target_prewarm_ms();
         let target_keepalive_ms = runtime_target_keepalive_ms();
+        let idle_force_poll_ms = runtime_event_idle_poll_ms();
         let now_for_wait = Utc::now().timestamp_millis();
         market_next_due_ms.retain(|k, _| cfg.markets.iter().any(|m| m.eq_ignore_ascii_case(k)));
         for market in &cfg.markets {
@@ -2260,6 +2279,33 @@ async fn live_runtime_loop(
             if effective_live_execute && !live_submit_allowed {
                 effective_live_execute = false;
             }
+            let latest_event_sample_ts = trigger_for_market
+                .and_then(|ev| ev.sample_ts_ms)
+                .filter(|v| *v > 0);
+            let last_eval_sample_ts = market_last_strategy_sample_ts_ms
+                .get(market_type)
+                .copied()
+                .unwrap_or(0);
+            let duplicate_wake_sample = latest_event_sample_ts
+                .map(|ts| ts <= last_eval_sample_ts)
+                .unwrap_or(false);
+            let last_eval_ms = market_last_strategy_eval_ms
+                .get(market_type)
+                .copied()
+                .unwrap_or(0);
+            let force_poll_due = now_ms.saturating_sub(last_eval_ms) >= idle_force_poll_ms;
+            let must_run_without_new_sample =
+                effective_drain_only || position_before_cycle.side.is_some() || pending_before_count > 0;
+            let event_idle_skip = snapshot_event_available
+                && !must_run_without_new_sample
+                && !due_keepalive
+                && !force_poll_due
+                && ((!is_wake_hit) || duplicate_wake_sample);
+            if event_idle_skip {
+                let next_due = now_ms.saturating_add(idle_force_poll_ms);
+                market_next_due_ms.insert(market_type.to_string(), next_due);
+                continue;
+            }
             let strategy_cfg = StrategyRuntimeConfig::default();
             let runtime_cfg_source = "live_default";
             match strategy_paper_live(StrategyPaperLiveReq {
@@ -2281,6 +2327,7 @@ async fn live_runtime_loop(
                 Ok(mut payload) => {
                     let now = Utc::now();
                     let now_ms = now.timestamp_millis();
+                    market_last_strategy_eval_ms.insert(market_type.to_string(), now_ms);
                     let current_round = payload
                         .get("current")
                         .and_then(|v| v.get("round_id"))
@@ -2290,6 +2337,15 @@ async fn live_runtime_loop(
                         .get("current")
                         .and_then(|v| v.get("remaining_ms"))
                         .and_then(Value::as_i64);
+                    if let Some(current_sample_ts) = payload
+                        .get("current")
+                        .and_then(|v| v.get("timestamp_ms"))
+                        .and_then(Value::as_i64)
+                        .filter(|v| *v > 0)
+                    {
+                        market_last_strategy_sample_ts_ms
+                            .insert(market_type.to_string(), current_sample_ts);
+                    }
                     let round_switched = if let Some(round_id) = current_round.clone() {
                         if let Some(prev) =
                             last_round_seen.insert(market_type.to_string(), round_id.clone())
@@ -2465,7 +2521,7 @@ async fn live_runtime_loop(
                             {
                                 Some(locked_target)
                             } else {
-                                resolve_live_market_target_with_state(&state, market_type)
+                                resolve_live_market_target_fast_with_state(&state, market_type)
                                     .await
                                     .ok()
                             };
@@ -2703,6 +2759,7 @@ async fn live_runtime_loop(
                 Err(err) => {
                     let now = Utc::now();
                     let now_ms = now.timestamp_millis();
+                    market_last_strategy_eval_ms.insert(market_type.to_string(), now_ms);
                     let msg = format!("runtime_cycle_error:{}", err.message);
                     state
                         .append_live_event(
@@ -2801,6 +2858,31 @@ mod tests {
             "round_id": format!("BTCUSDT_5m_{}", start),
         });
         assert!(is_live_snapshot_fresh(&snap, "5m", start + 100_500));
+    }
+
+    #[test]
+    fn parse_snapshot_event_extracts_timeframe_and_sample_ts() {
+        let payload = json!({
+            "event": "snapshot_updated",
+            "symbol": "BTCUSDT",
+            "timeframe": "5m",
+            "ts_ireland_sample_ms": 123_456_i64
+        })
+        .to_string();
+        let parsed = parse_snapshot_event(&payload).expect("parse snapshot event");
+        assert_eq!(parsed.0, "5m");
+        assert_eq!(parsed.1, Some(123_456_i64));
+    }
+
+    #[test]
+    fn parse_snapshot_event_rejects_unsupported_timeframe() {
+        let payload = json!({
+            "event": "snapshot_updated",
+            "timeframe": "30m",
+            "ts_ireland_sample_ms": 123_456_i64
+        })
+        .to_string();
+        assert!(parse_snapshot_event(&payload).is_none());
     }
 
     #[test]
