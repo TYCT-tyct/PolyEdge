@@ -469,15 +469,20 @@ pub(super) fn strategy_current_default_config_for_scope(
     symbol: &str,
     market_type: &str,
 ) -> StrategyRuntimeConfig {
+    // Normalize inputs like the profile resolver does
+    let symbol = symbol.to_uppercase();
+    let market_type = market_type.to_lowercase();
+    
     // For BTCUSDT 5m, use the optimized profile by default
     if symbol == "BTCUSDT" && market_type == "5m" {
         return strategy_btc5m_optimized_config();
     }
-    match strategy_current_default_profile_name_for_scope(symbol, market_type) {
+    match strategy_current_default_profile_name_for_scope(&symbol, &market_type) {
         STRATEGY_PROFILE_HI_WIN => strategy_hi_win_config(),
         STRATEGY_PROFILE_HI_FREQ => strategy_hi_freq_config(),
         STRATEGY_PROFILE_BALANCED => strategy_balanced_config(),
         STRATEGY_PROFILE_CAND_GROWTH_MIX => strategy_cand_growth_mix_config(),
+        STRATEGY_PROFILE_BTC5M_OPTIMIZED => strategy_btc5m_optimized_config(),
         _ => strategy_profit_max_config(),
     }
 }
