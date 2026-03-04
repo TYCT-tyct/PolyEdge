@@ -608,43 +608,8 @@ pub(super) fn strategy_cfg_json(cfg: &StrategyRuntimeConfig) -> Value {
     })
 }
 
-fn strategy_official_fee_enabled() -> bool {
-    std::env::var("FORGE_STRATEGY_OFFICIAL_FEE_ENABLED")
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(true)
-}
-
-pub(super) async fn strategy_live_fee_context(
-    state: &ApiState,
-    symbol: &str,
-    market_type: &str,
-) -> Option<fev1::FeeModelContext> {
-    if !strategy_official_fee_enabled() {
-        return None;
-    }
-    let target = resolve_live_market_target_fast_with_state(state, symbol, market_type)
-        .await
-        .ok()?;
-    let up_taker_fee_bps = get_official_fee_bps_for_token(state, &target.token_id_yes).await;
-    let down_taker_fee_bps = get_official_fee_bps_for_token(state, &target.token_id_no).await;
-    if up_taker_fee_bps.is_none() && down_taker_fee_bps.is_none() {
-        return None;
-    }
-    Some(fev1::FeeModelContext {
-        up_taker_fee_bps,
-        down_taker_fee_bps,
-    })
-}
-
 pub(super) fn strategy_paper_cost_model_json(
     cfg: &StrategyRuntimeConfig,
-    fee_ctx: Option<&fev1::FeeModelContext>,
 ) -> Value {
     json!({
         "engine": "fev1_simulated_cost_model",
@@ -658,18 +623,9 @@ pub(super) fn strategy_paper_cost_model_json(
             "exit_price_cents": "bid_raw - slippage - fee - impact",
             "slippage_cents_per_side": cfg.slippage_cents_per_side,
             "fee_cents_per_side_base": cfg.fee_cents_per_side,
-            "fee_model": if let Some(ctx) = fee_ctx {
-                json!({
-                    "mode": "official_fee_rate_bps",
-                    "up_taker_fee_bps": ctx.up_taker_fee_bps,
-                    "down_taker_fee_bps": ctx.down_taker_fee_bps,
-                    "fallback": "dynamic_taker_fee_cents(price_cents)"
-                })
-            } else {
-                json!({
-                    "mode": "dynamic_taker_fee_curve",
-                    "formula": "dynamic_taker_fee_cents(price_cents)"
-                })
+            "fee_model": {
+                "mode": "dynamic_taker_fee_curve",
+                "formula": "dynamic_taker_fee_cents(price_cents)"
             },
             "impact_model": "execution_impact_cents(sample, side, cfg, remaining_ms, emergency)"
         },
@@ -762,7 +718,6 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         )
         .await?
     };
-    let fee_ctx = strategy_live_fee_context(state, sample_symbol, market_type).await;
 
     if samples.len() < 20 {
         return Ok(json!({
@@ -794,7 +749,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
             "baseline_profile": baseline_profile,
             "fixed_guard": fixed_guard,
             "config": strategy_cfg_json(cfg),
-            "paper_cost_model": strategy_paper_cost_model_json(cfg, fee_ctx.as_ref()),
+            "paper_cost_model": strategy_paper_cost_model_json(cfg),
             "current": Value::Null,
             "summary": {
                 "trade_count": 0,
@@ -876,7 +831,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         }));
     }
 
-    let run = run_strategy_simulation_with_fee_context(&samples, cfg, max_trades, fee_ctx.as_ref());
+    let run = run_strategy_simulation(&samples, cfg, max_trades);
     Ok(json!({
         "source": "live",
         "execution_target": "live",
@@ -906,7 +861,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         "baseline_profile": baseline_profile,
         "fixed_guard": fixed_guard,
         "config": strategy_cfg_json(cfg),
-        "paper_cost_model": strategy_paper_cost_model_json(cfg, fee_ctx.as_ref()),
+        "paper_cost_model": strategy_paper_cost_model_json(cfg),
         "current": run.current,
         "summary": {
             "trade_count": run.trade_count,
@@ -1104,17 +1059,8 @@ pub(super) fn run_strategy_simulation(
     cfg: &StrategyRuntimeConfig,
     max_trades: usize,
 ) -> StrategySimulationResult {
-    run_strategy_simulation_with_fee_context(samples, cfg, max_trades, None)
-}
-
-pub(super) fn run_strategy_simulation_with_fee_context(
-    samples: &[StrategySample],
-    cfg: &StrategyRuntimeConfig,
-    max_trades: usize,
-    fee_ctx: Option<&fev1::FeeModelContext>,
-) -> StrategySimulationResult {
     let mapped_samples = map_samples_to_fev1(samples);
-    run_strategy_simulation_on_mapped_with_fee_context(&mapped_samples, cfg, max_trades, fee_ctx)
+    run_strategy_simulation_on_mapped(&mapped_samples, cfg, max_trades)
 }
 
 #[allow(dead_code)]
@@ -1123,22 +1069,8 @@ pub(super) fn run_strategy_simulation_on_mapped(
     cfg: &StrategyRuntimeConfig,
     max_trades: usize,
 ) -> StrategySimulationResult {
-    run_strategy_simulation_on_mapped_with_fee_context(mapped_samples, cfg, max_trades, None)
-}
-
-pub(super) fn run_strategy_simulation_on_mapped_with_fee_context(
-    mapped_samples: &[fev1::Sample],
-    cfg: &StrategyRuntimeConfig,
-    max_trades: usize,
-    fee_ctx: Option<&fev1::FeeModelContext>,
-) -> StrategySimulationResult {
     let mapped_cfg = map_cfg_to_fev1(cfg);
-    map_simulation_result(fev1::simulate_with_fee_context(
-        mapped_samples,
-        &mapped_cfg,
-        max_trades,
-        fee_ctx,
-    ))
+    map_simulation_result(fev1::simulate(mapped_samples, &mapped_cfg, max_trades))
 }
 
 pub(super) async fn load_strategy_samples(
