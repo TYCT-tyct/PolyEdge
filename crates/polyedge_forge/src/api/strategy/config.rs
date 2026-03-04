@@ -361,7 +361,8 @@ fn strategy_select_profile_name() -> &'static str {
             return profile;
         }
     }
-    STRATEGY_PROFILE_HI_WIN
+    // Default to BTC 5m optimized profile
+    STRATEGY_PROFILE_BTC5M_OPTIMIZED
 }
 
 fn strategy_profile_name_from_alias(raw: &str) -> Option<&'static str> {
@@ -380,6 +381,9 @@ fn strategy_profile_name_from_alias(raw: &str) -> Option<&'static str> {
         }
         "cand_growth_mix" | "growth_mix" | "growth" | "fev1_cand_growth_mix_2026_02_28" => {
             Some(STRATEGY_PROFILE_CAND_GROWTH_MIX)
+        }
+        "btc5m_optimized" | "btc5m" | "btc5m_opt" | "fev1_btc5m_optimized_2026_03_04" => {
+            Some(STRATEGY_PROFILE_BTC5M_OPTIMIZED)
         }
         _ => None,
     }
@@ -455,6 +459,7 @@ fn strategy_profile_from_alias(raw: &str) -> Option<(&'static str, StrategyRunti
         STRATEGY_PROFILE_HI_FREQ => strategy_hi_freq_config(),
         STRATEGY_PROFILE_BALANCED => strategy_balanced_config(),
         STRATEGY_PROFILE_CAND_GROWTH_MIX => strategy_cand_growth_mix_config(),
+        STRATEGY_PROFILE_BTC5M_OPTIMIZED => strategy_btc5m_optimized_config(),
         _ => strategy_profit_max_config(),
     };
     Some((profile, cfg))
@@ -464,6 +469,10 @@ pub(super) fn strategy_current_default_config_for_scope(
     symbol: &str,
     market_type: &str,
 ) -> StrategyRuntimeConfig {
+    // For BTCUSDT 5m, use the optimized profile by default
+    if symbol == "BTCUSDT" && market_type == "5m" {
+        return strategy_btc5m_optimized_config();
+    }
     match strategy_current_default_profile_name_for_scope(symbol, market_type) {
         STRATEGY_PROFILE_HI_WIN => strategy_hi_win_config(),
         STRATEGY_PROFILE_HI_FREQ => strategy_hi_freq_config(),
@@ -821,6 +830,56 @@ fn strategy_cand_growth_mix_config() -> StrategyRuntimeConfig {
         vic_threshold_relax_max: 0.02,
         vic_edge_relax_max: 0.008,
         vic_spread_relax_max: 0.12,
+        paper_slippage_mult: 1.5,
+        paper_latency_penalty_cents: 0.3,
+        paper_fill_rate_discount: 0.05,
+        paper_simulated_capital: 20.0,
+        paper_max_drawdown_pct: 15.0,
+    }
+}
+
+// BTC 5m optimized profile - designed for high-frequency trading without staleness gate
+fn strategy_btc5m_optimized_config() -> StrategyRuntimeConfig {
+    StrategyRuntimeConfig {
+        entry_threshold_base: 0.30,
+        entry_threshold_cap: 0.85,  // Raised from 0.75 to allow more entries
+        spread_limit_prob: 0.035,   // Slightly wider spread tolerance
+        entry_edge_prob: 0.003,     // Lower edge requirement (was 0.005)
+        entry_min_potential_cents: 8.0,  // Lower from 12.0 to allow more entries
+        entry_max_price_cents: 75.0,     // Raised from 65 to allow higher entry prices
+        min_hold_ms: 2_000,         // Reduced from 3235 for faster exits
+        stop_loss_cents: 8.0,       // Raised from 5.0 to reduce noise-triggered stops
+        reverse_signal_threshold: -0.08,  // Less sensitive to reversals
+        reverse_signal_ticks: 3,    // Reduced from 5 for faster reversal detection
+        trail_activate_profit_cents: 8.0,  // Lower from 10.0 for earlier trail activation
+        trail_drawdown_cents: 4.0,  // Slightly wider trail (was 3.0)
+        take_profit_near_max_cents: 96.0,
+        endgame_take_profit_cents: 92.0,
+        endgame_remaining_ms: 20_000,
+        liquidity_widen_prob: 0.06,
+        cooldown_ms: 2_000,         // Drastically reduced from 5482 for higher frequency
+        max_entries_per_round: 5,   // Increased from 2 to allow more trades
+        max_exec_spread_cents: 6.0, // Slightly wider (was 5.0)
+        slippage_cents_per_side: 0.15,
+        fee_cents_per_side: 0.05,
+        emergency_wide_spread_penalty_ratio: 0.25,
+        stop_loss_grace_ticks: 3,   // Increased from 2 for more tolerance
+        stop_loss_hard_mult: 1.5,
+        stop_loss_reverse_extra_ticks: 1,
+        loss_cluster_limit: 5,      // Increased from 3 to allow more consecutive losses
+        loss_cluster_cooldown_ms: 15_000,  // Reduced from 25000
+        market_quality_enabled: true,
+        market_quality_min: 0.25,   // Lowered from 0.35 to allow more market conditions
+        staleness_entry_threshold: 0.0,  // DISABLED - staleness rarely reaches 1.5 in BTC 5m
+        staleness_exit_threshold: 0.0,   // DISABLED
+        velocity_min_bps: 0.5,      // Drastically lowered from 2.0 to allow more entries
+        accel_reverse_exit_ticks: 3,
+        vic_enabled: true,
+        vic_target_entries_per_hour: 30.0,  // Increased from 14.0 for higher frequency
+        vic_deadband_ratio: 0.10,
+        vic_threshold_relax_max: 0.03,
+        vic_edge_relax_max: 0.012,
+        vic_spread_relax_max: 0.15,
         paper_slippage_mult: 1.5,
         paper_latency_penalty_cents: 0.3,
         paper_fill_rate_discount: 0.05,

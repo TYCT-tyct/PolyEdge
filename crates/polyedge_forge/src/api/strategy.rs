@@ -85,6 +85,7 @@ const STRATEGY_PROFILE_HI_FREQ: &str = "fev1_manual_hi_freq_2026_02_27";
 const STRATEGY_PROFILE_HI_WIN: &str = "fev1_manual_hi_win_2026_02_27";
 const STRATEGY_PROFILE_BALANCED: &str = "fev1_manual_balanced_2026_02_28";
 const STRATEGY_PROFILE_CAND_GROWTH_MIX: &str = "fev1_cand_growth_mix_2026_02_28";
+const STRATEGY_PROFILE_BTC5M_OPTIMIZED: &str = "fev1_btc5m_optimized_2026_03_04";
 
 #[derive(Clone)]
 struct StrategySampleCacheEntry {
