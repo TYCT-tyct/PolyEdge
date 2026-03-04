@@ -317,88 +317,6 @@ async fn get_or_fetch_book_snapshot_cached(
     snapshot
 }
 
-fn parse_fee_bps_from_value(v: &Value) -> Option<u32> {
-    v.get("base_fee")
-        .and_then(Value::as_u64)
-        .map(|v| v as u32)
-        .or_else(|| {
-            v.get("base_fee")
-                .and_then(Value::as_str)
-                .and_then(|raw| raw.trim().parse::<u32>().ok())
-        })
-}
-
-async fn fetch_official_fee_bps_http_fallback(state: &ApiState, token_id: &str) -> Option<u32> {
-    let host = std::env::var("FORGE_FEV1_CLOB_HOST")
-        .ok()
-        .map(|v| v.trim().trim_end_matches('/').to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "https://clob.polymarket.com".to_string());
-    let url = format!("{host}/fee-rate");
-    let resp = state
-        .gateway_http_client
-        .get(url)
-        .query(&[("asset_id", token_id)])
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let body = resp.json::<Value>().await.ok()?;
-    parse_fee_bps_from_value(&body)
-}
-
-pub(super) async fn get_official_fee_bps_for_token(state: &ApiState, token_id: &str) -> Option<u32> {
-    let token_id = token_id.trim();
-    if token_id.is_empty() {
-        return None;
-    }
-    if let Some(cached) = state.get_cached_official_fee_bps(token_id).await {
-        return Some(cached);
-    }
-    let has_private_key = std::env::var("FORGE_FEV1_PRIVATE_KEY")
-        .ok()
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false);
-    if has_private_key {
-        if let (Some(ctx), Ok(token)) = (
-            get_or_init_rust_executor(state).await.ok(),
-            PmU256::from_str(token_id),
-        ) {
-            if let Ok(resp) = ctx.client.fee_rate_bps(token).await {
-                let bps = resp.base_fee;
-                state.put_cached_official_fee_bps(token_id, bps).await;
-                return Some(bps);
-            }
-        }
-    }
-    let bps = fetch_official_fee_bps_http_fallback(state, token_id).await?;
-    state.put_cached_official_fee_bps(token_id, bps).await;
-    Some(bps)
-}
-
-async fn prefetch_official_fee_bps_for_tokens(
-    state: &ApiState,
-    token_ids: &[String],
-) -> HashMap<String, u32> {
-    let futures = token_ids.iter().map(|token_id| {
-        let state = state.clone();
-        let token_id = token_id.clone();
-        async move {
-            let fee_bps = get_official_fee_bps_for_token(&state, &token_id).await;
-            (token_id, fee_bps)
-        }
-    });
-    let mut out = HashMap::<String, u32>::new();
-    for (token_id, fee_bps) in join_all(futures).await {
-        if let Some(fee_bps) = fee_bps {
-            out.insert(token_id, fee_bps);
-        }
-    }
-    out
-}
-
 pub(super) async fn submit_rust_order(
     ctx: &RustExecutorContext,
     payload: &Value,
@@ -859,7 +777,6 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
     let mut out = Vec::<Value>::with_capacity(decisions.len());
     let token_ids = collect_decision_token_ids(target, decisions);
     let mut book_cache = prefetch_rust_books_for_tokens(state, &ctx, &token_ids).await;
-    let mut official_fee_bps_cache = prefetch_official_fee_bps_for_tokens(state, &token_ids).await;
     let exit_quote_override =
         position_state
             .entry_quote_usdc
@@ -947,19 +864,6 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
             .unwrap_or_else(|| gated.decision_key.clone());
         let token_id =
             token_id_for_decision(&prepared.decision, &prepared.effective_target).map(str::to_string);
-        let official_fee_bps = if let Some(token_id) = token_id.as_deref() {
-            if let Some(cached) = official_fee_bps_cache.get(token_id).copied() {
-                Some(cached)
-            } else {
-                let fetched = get_official_fee_bps_for_token(state, token_id).await;
-                if let Some(v) = fetched {
-                    official_fee_bps_cache.insert(token_id.to_string(), v);
-                }
-                fetched
-            }
-        } else {
-            None
-        };
         let book_snapshot = if let Some(token_id) = token_id.clone() {
             get_or_fetch_book_snapshot_cached(state, &ctx, &token_id, &mut book_cache).await
         } else {
@@ -1109,8 +1013,6 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
             "book_snapshot": book_snapshot,
             "target_market_id": prepared.effective_target.market_id,
             "target_token_id": token_id,
-            "official_fee_bps": official_fee_bps,
-            "official_fee_rate": official_fee_bps.map(|bps| (bps as f64) / 10_000.0),
             "round_guard_bypassed": prepared.bypass_round_guard,
             "request_price": request_price,
             "request_size_shares": request_size,
@@ -1171,7 +1073,6 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                     "submit_to_ack_ms": submit_to_ack_ms,
                     "submit_start_ts_ms": submit_start_ts_ms,
                     "ack_ts_ms": ack_ts_ms,
-                    "official_fee_bps": official_fee_bps,
                     "reject_reason": row.get("reject_reason").cloned().unwrap_or(Value::Null),
                     "error": row.get("error").cloned().unwrap_or(Value::Null),
                 }),
@@ -1571,5 +1472,4 @@ pub(super) async fn handle_pending_timeouts_rust(
         }
     }
 }
-
 

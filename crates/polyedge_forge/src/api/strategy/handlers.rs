@@ -211,7 +211,6 @@ pub(super) async fn strategy_paper(
         max_points,
     )
     .await?;
-    let fee_ctx = strategy_live_fee_context(&state, symbol, market_type).await;
     if samples.len() < 20 {
         return Ok(Json(json!({
             "source": "replay",
@@ -231,7 +230,7 @@ pub(super) async fn strategy_paper(
             "lookback_minutes": lookback_minutes,
             "lookback": strategy_lookback_meta_json(&samples, full_history, lookback_minutes, max_points, 1000),
             "samples": samples.len(),
-            "paper_cost_model": strategy_paper_cost_model_json(&cfg, fee_ctx.as_ref()),
+            "paper_cost_model": strategy_paper_cost_model_json(&cfg),
             "current": Value::Null,
             "summary": {
                 "trade_count": 0,
@@ -253,7 +252,7 @@ pub(super) async fn strategy_paper(
         })));
     }
 
-    let run = run_strategy_simulation_with_fee_context(&samples, &cfg, max_trades, fee_ctx.as_ref());
+    let run = run_strategy_simulation_with_fee_context(&samples, &cfg, max_trades, None);
     Ok(Json(json!({
         "source": "replay",
         "execution_target": "paper",
@@ -277,7 +276,7 @@ pub(super) async fn strategy_paper(
         "baseline_profile": baseline_profile,
         "fixed_guard": fixed_guard,
         "config": strategy_cfg_json(&cfg),
-        "paper_cost_model": strategy_paper_cost_model_json(&cfg, fee_ctx.as_ref()),
+        "paper_cost_model": strategy_paper_cost_model_json(&cfg),
         "current": run.current,
         "summary": {
             "trade_count": run.trade_count,
@@ -338,10 +337,6 @@ pub(super) async fn strategy_live_reset(
     }
     {
         let mut cache = state.live_rust_book_cache.write().await;
-        cache.clear();
-    }
-    {
-        let mut cache = state.live_official_fee_cache.write().await;
         cache.clear();
     }
     {

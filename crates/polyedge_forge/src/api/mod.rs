@@ -87,7 +87,6 @@ struct ApiState {
     live_execution_aggr_states: Arc<RwLock<HashMap<String, LiveExecutionAggState>>>,
     live_rust_executor: Arc<RwLock<Option<Arc<RustExecutorContext>>>>,
     live_rust_book_cache: Arc<RwLock<HashMap<String, RustBookCacheEntry>>>,
-    live_official_fee_cache: Arc<RwLock<HashMap<String, RustFeeRateCacheEntry>>>,
     runtime_alert_throttle: Arc<RwLock<HashMap<String, i64>>>,
     runtime_daily_report_sent: Arc<RwLock<HashSet<String>>>,
     strategy_heavy_slots: Arc<Semaphore>,
@@ -119,12 +118,6 @@ const LIVE_EVENT_LOG_TTL_SEC_MIN: u32 = 3600;
 const LIVE_EVENT_LOG_TTL_SEC_MAX: u32 = 30 * 24 * 3600;
 const LIVE_RUST_BOOK_CACHE_TTL_MS: u64 = 260;
 const LIVE_RUST_BOOK_CACHE_MAX: usize = 512;
-const LIVE_OFFICIAL_FEE_CACHE_TTL_MS_DEFAULT: u64 = 30_000;
-const LIVE_OFFICIAL_FEE_CACHE_TTL_MS_MIN: u64 = 1_000;
-const LIVE_OFFICIAL_FEE_CACHE_TTL_MS_MAX: u64 = 300_000;
-const LIVE_OFFICIAL_FEE_CACHE_MAX_DEFAULT: usize = 2_048;
-const LIVE_OFFICIAL_FEE_CACHE_MAX_MIN: usize = 128;
-const LIVE_OFFICIAL_FEE_CACHE_MAX_MAX: usize = 20_000;
 const LIVE_ALERT_THROTTLE_DEFAULT_MS: i64 = 5 * 60_000;
 const RUNTIME_EVENT_SAMPLE_BUFFER_MAX_DEFAULT: usize = 140_000;
 const RUNTIME_EVENT_SAMPLE_BUFFER_MAX_MIN: usize = 10_000;
@@ -330,12 +323,6 @@ struct RustExecutorContext {
 struct RustBookCacheEntry {
     fetched_at: Instant,
     snapshot: GatewayBookSnapshot,
-}
-
-#[derive(Clone)]
-struct RustFeeRateCacheEntry {
-    fetched_at: Instant,
-    fee_bps: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2224,65 +2211,6 @@ impl ApiState {
         );
     }
 
-    #[allow(dead_code)]
-    async fn get_cached_official_fee_bps(&self, token_id: &str) -> Option<u32> {
-        let ttl_ms = std::env::var("FORGE_FEV1_OFFICIAL_FEE_CACHE_TTL_MS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(LIVE_OFFICIAL_FEE_CACHE_TTL_MS_DEFAULT)
-            .clamp(
-                LIVE_OFFICIAL_FEE_CACHE_TTL_MS_MIN,
-                LIVE_OFFICIAL_FEE_CACHE_TTL_MS_MAX,
-            );
-        let cache = self.live_official_fee_cache.read().await;
-        let row = cache.get(token_id)?;
-        if row.fetched_at.elapsed() > Duration::from_millis(ttl_ms) {
-            return None;
-        }
-        Some(row.fee_bps)
-    }
-
-    #[allow(dead_code)]
-    async fn put_cached_official_fee_bps(&self, token_id: &str, fee_bps: u32) {
-        let max_entries = std::env::var("FORGE_FEV1_OFFICIAL_FEE_CACHE_MAX")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(LIVE_OFFICIAL_FEE_CACHE_MAX_DEFAULT)
-            .clamp(
-                LIVE_OFFICIAL_FEE_CACHE_MAX_MIN,
-                LIVE_OFFICIAL_FEE_CACHE_MAX_MAX,
-            );
-        let mut cache = self.live_official_fee_cache.write().await;
-        if cache.len() >= max_entries {
-            let mut stale_keys = Vec::new();
-            for (k, v) in cache.iter() {
-                if v.fetched_at.elapsed()
-                    > Duration::from_millis(LIVE_OFFICIAL_FEE_CACHE_TTL_MS_MAX)
-                {
-                    stale_keys.push(k.clone());
-                }
-                if stale_keys.len() >= 128 {
-                    break;
-                }
-            }
-            for key in stale_keys {
-                cache.remove(&key);
-            }
-            if cache.len() >= max_entries {
-                if let Some(first_key) = cache.keys().next().cloned() {
-                    cache.remove(&first_key);
-                }
-            }
-        }
-        cache.insert(
-            token_id.to_string(),
-            RustFeeRateCacheEntry {
-                fetched_at: Instant::now(),
-                fee_bps,
-            },
-        );
-    }
-
     async fn should_emit_alert(&self, key: &str, now_ms: i64, throttle_ms: i64) -> bool {
         let mut slots = self.runtime_alert_throttle.write().await;
         let last = slots.get(key).copied().unwrap_or(0);
@@ -2586,7 +2514,6 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         live_execution_aggr_states: Arc::new(RwLock::new(HashMap::new())),
         live_rust_executor: Arc::new(RwLock::new(None)),
         live_rust_book_cache: Arc::new(RwLock::new(HashMap::new())),
-        live_official_fee_cache: Arc::new(RwLock::new(HashMap::new())),
         runtime_alert_throttle: Arc::new(RwLock::new(HashMap::new())),
         runtime_daily_report_sent: Arc::new(RwLock::new(HashSet::new())),
         strategy_heavy_slots: Arc::new(Semaphore::new(strategy_heavy_slots)),
