@@ -1,5 +1,151 @@
+/// Compute staleness: how much Binance has moved relative to Polymarket
+/// staleness > 1.5 means Binance moved significantly more than PM = market maker lagging
+/// staleness < 1.2 means PM has caught up = edge gone
+/// 
+/// MAJOR CHANGE (v2.0): Improved boundary handling and anomaly resistance
+fn compute_staleness(
+    binance_now: f64,
+    binance_500ms_ago: f64,
+    pm_mid_now: f64,
+    pm_mid_500ms_ago: f64,
+) -> (f64, f64) {  // Returns (staleness, confidence)
+    const STALENESS_MAX: f64 = 10.0;
+    const BINANCE_MOVE_EPS: f64 = 1e-8;
+    const PM_MOVE_EPS: f64 = 1e-9;
+    const MIN_CONFIDENCE_THRESHOLD: f64 = 0.3;
+
+    // Validate inputs
+    if !binance_now.is_finite()
+        || !binance_500ms_ago.is_finite()
+        || !pm_mid_now.is_finite()
+        || !pm_mid_500ms_ago.is_finite()
+    {
+        return (0.0, 0.0);  // No confidence on invalid data
+    }
+    if binance_now <= 0.0 || binance_500ms_ago <= 0.0 {
+        return (0.0, 0.0);
+    }
+    
+    let delta_binance = (binance_now - binance_500ms_ago).abs() / binance_now.max(1e-9);
+    let delta_pm = (pm_mid_now - pm_mid_500ms_ago).abs() / pm_mid_now.max(0.0001);
+    
+    // Calculate confidence based on data quality
+    let confidence = if delta_binance < BINANCE_MOVE_EPS && delta_pm < PM_MOVE_EPS {
+        // Both barely moved - low confidence in staleness measure
+        0.5
+    } else if delta_pm <= PM_MOVE_EPS {
+        // PM didn't move but Binance did - high confidence on high staleness
+        if delta_binance > BINANCE_MOVE_EPS {
+            (delta_binance / 0.001).min(1.0)  // Scale confidence by Binance movement
+        } else {
+            0.3
+        }
+    } else {
+        // Normal case - confidence based on relative movements
+        (delta_binance.max(delta_pm) / 0.0005).min(1.0)
+    };
+    
+    let staleness = if delta_pm <= PM_MOVE_EPS {
+        if delta_binance <= BINANCE_MOVE_EPS {
+            0.0
+        } else {
+            STALENESS_MAX
+        }
+    } else {
+        (delta_binance / delta_pm).clamp(0.0, STALENESS_MAX)
+    };
+    
+    (staleness, confidence.max(MIN_CONFIDENCE_THRESHOLD))
+}
+
+/// Compute market quality: replaces hard-coded time-of-day filters
+/// Uses spread_zscore (lower is better) and SNR (signal-to-noise ratio)
+/// 
+/// MAJOR CHANGE (v2.0): Uses EMA-smoothed values for more stable quality scores
+fn compute_market_quality(
+    _spread_mid: f64,
+    _velocity: f64,
+    spread_history: &crate::data_quality::RingBuffer<f64>,
+    velocity_history: &crate::data_quality::RingBuffer<f64>,
+    spread_ema: f64,  // EMA-smoothed spread
+    velocity_ema: f64,  // EMA-smoothed velocity
+) -> (f64, f64) {  // Returns (quality, confidence)
+    const MIN_SAMPLES: usize = 10;
+    const MIN_CONFIDENCE: f64 = 0.3;
+    
+    if spread_history.len() < MIN_SAMPLES || velocity_history.len() < MIN_SAMPLES {
+        return (0.5, MIN_CONFIDENCE); // neutral with low confidence
+    }
+    
+    // Use smoothed values for more stable calculations
+    let spread_mean = spread_history.mean();
+    let spread_var: f64 = spread_history.iter()
+        .map(|&s| (s - spread_mean).powi(2))
+        .sum::<f64>() / spread_history.len() as f64;
+    let spread_std = spread_var.sqrt().max(0.0001);
+    let spread_zscore = (spread_ema - spread_mean) / spread_std;
+    let spread_zscore_norm = (-spread_zscore).clamp(-3.0, 3.0) / 3.0;
+    
+    // Compute SNR using EMA-smoothed velocity
+    let velocity_mean = velocity_history.mean();
+    let velocity_var: f64 = velocity_history.iter()
+        .map(|&v| (v - velocity_mean).powi(2))
+        .sum::<f64>() / velocity_history.len() as f64;
+    let local_velocity_vol = velocity_var.sqrt().max(0.1);
+    let snr = velocity_ema.abs() / local_velocity_vol;
+    let snr_norm = (snr / 3.0).clamp(0.0, 1.0);
+    
+    // Combined score: 50% spread quality + 50% SNR
+    let quality = (0.5 * (0.5 + 0.5 * spread_zscore_norm) + 0.5 * snr_norm).clamp(0.0, 1.0);
+    
+    // Confidence based on sample size
+    let confidence = ((spread_history.len() as f64) / 50.0).min(1.0).max(MIN_CONFIDENCE);
+    
+    (quality, confidence)
+}
+
+/// MAJOR CHANGE (v2.0): Integrated data quality monitoring, anomaly detection,
+/// EMA smoothing, and RingBuffer for O(1) performance
 pub(super) fn parse_strategy_rows(rows: Vec<Value>) -> Vec<StrategySample> {
+    use crate::data_quality::{RingBuffer, EmaSmoother, AnomalyDetector};
+    
     let mut out = Vec::<StrategySample>::new();
+
+    const STALENESS_HISTORY_BUFFER_CAPACITY: usize = 128;
+    const STALENESS_FALLBACK_CONFIDENCE: f64 = 0.3;
+    
+    // MAJOR CHANGE: Using RingBuffer for O(1) push performance
+    let mut binance_history: RingBuffer<(i64, f64)> = RingBuffer::new(STALENESS_HISTORY_BUFFER_CAPACITY);
+    let mut pm_mid_history: RingBuffer<(i64, f64)> = RingBuffer::new(STALENESS_HISTORY_BUFFER_CAPACITY);
+    let mut spread_history: RingBuffer<f64> = RingBuffer::new(50);
+    let mut velocity_history: RingBuffer<f64> = RingBuffer::new(50);
+    
+    // MAJOR CHANGE: EMA smoothers for noise reduction
+    let mut spread_smoother = EmaSmoother::new(0.3);  // 30% weight to new value
+    let mut velocity_smoother = EmaSmoother::new(0.3);
+    let mut delta_smoother = EmaSmoother::new(0.2);   // Slower for delta
+    
+    // MAJOR CHANGE: Anomaly detectors for price spike detection
+    let mut spread_anomaly_detector = AnomalyDetector::new(20, 3.5);  // 3.5 sigma threshold
+    let mut velocity_anomaly_detector = AnomalyDetector::new(20, 4.0);
+    
+    // MAJOR CHANGE: Data quality tracking
+    let mut consecutive_anomalies: u32 = 0;
+    let mut data_quality_score: f64 = 1.0;
+    
+    let mut last_valid_binance_price: Option<f64> = None;
+    let mut last_valid_staleness: Option<f64> = None;
+    let mut last_ts_ms: Option<i64> = None;
+    
+    const STALENESS_LOOKBACK_MS: i64 = 500;
+    const STALENESS_LOOKBACK_COARSE_MS: i64 = 1000;
+    const STALENESS_COARSE_STEP_MS: i64 = 800;
+    const STALENESS_HISTORY_RETENTION_MS: i64 = 5_000;
+    const STALENESS_UNAVAILABLE_QUALITY_MULT: f64 = 0.65;
+    const STALENESS_DEGRADED_QUALITY_MULT: f64 = 0.85;
+    const MAX_CONSECUTIVE_ANOMALIES: u32 = 5;
+    const ANOMALY_QUALITY_PENALTY: f64 = 0.15;
+    
     for row in rows {
         let ts_ms = row_i64(&row, "ts_ms").unwrap_or(0);
         if ts_ms <= 0 {
@@ -77,6 +223,122 @@ pub(super) fn parse_strategy_rows(rows: Vec<Value>) -> Vec<StrategySample> {
         let acceleration = row_f64(&row, "acceleration").unwrap_or(0.0);
         let remaining_ms = row_i64(&row, "remaining_ms").unwrap_or(0).max(0);
 
+        // EMA smoothing before downstream quality calculations.
+        let spread_ema = spread_smoother.update(spread_mid);
+        let velocity_ema = velocity_smoother.update(velocity);
+        let _delta_ema = delta_smoother.update(delta_pct);
+
+        // Detect anomalies and penalize data quality state.
+        let (spread_is_anomaly, _) = spread_anomaly_detector.check(spread_mid);
+        let (velocity_is_anomaly, _) = velocity_anomaly_detector.check(velocity);
+        if spread_is_anomaly || velocity_is_anomaly {
+            consecutive_anomalies = consecutive_anomalies
+                .saturating_add(1)
+                .min(MAX_CONSECUTIVE_ANOMALIES);
+            data_quality_score = (data_quality_score - ANOMALY_QUALITY_PENALTY).max(0.0);
+            if consecutive_anomalies >= MAX_CONSECUTIVE_ANOMALIES {
+                data_quality_score = (data_quality_score - ANOMALY_QUALITY_PENALTY).max(0.0);
+            }
+        } else {
+            consecutive_anomalies = 0;
+            data_quality_score = (data_quality_score + ANOMALY_QUALITY_PENALTY * 0.5).min(1.0);
+        }
+        
+        // Extract values for staleness computation.
+        let raw_binance_price = row_f64(&row, "binance_price").unwrap_or(0.0);
+        let raw_binance_valid = raw_binance_price.is_finite() && raw_binance_price > 0.0;
+        let mut staleness_quality_degraded = false;
+        let binance_price = if raw_binance_valid {
+            last_valid_binance_price = Some(raw_binance_price);
+            raw_binance_price
+        } else if let Some(prev) = last_valid_binance_price {
+            staleness_quality_degraded = true;
+            prev
+        } else {
+            staleness_quality_degraded = true;
+            0.0
+        };
+        let pm_mid = p_up; // mid_yes is our PM proxy
+
+        let inferred_step_ms = last_ts_ms
+            .map(|prev| ts_ms.saturating_sub(prev))
+            .unwrap_or(STALENESS_LOOKBACK_MS);
+        let staleness_lookback_ms = if inferred_step_ms >= STALENESS_COARSE_STEP_MS {
+            STALENESS_LOOKBACK_COARSE_MS
+        } else {
+            STALENESS_LOOKBACK_MS
+        };
+
+        // Keep enough temporal context for both 500ms and 1000ms lookbacks.
+        let retention_cutoff =
+            ts_ms - STALENESS_HISTORY_RETENTION_MS.max(staleness_lookback_ms.saturating_mul(3));
+
+        // Find lookback prices using the most recent valid point at/before cutoff.
+        let lookback_cutoff = ts_ms - staleness_lookback_ms;
+        let binance_lookback = binance_history
+            .iter()
+            .rev()
+            .find(|(t, _)| *t <= lookback_cutoff && *t >= retention_cutoff)
+            .map(|(_, p)| *p);
+        let pm_mid_lookback = pm_mid_history
+            .iter()
+            .rev()
+            .find(|(t, _)| *t <= lookback_cutoff && *t >= retention_cutoff)
+            .map(|(_, p)| *p);
+
+        let staleness_unavailable =
+            binance_price <= 0.0 || binance_lookback.is_none() || pm_mid_lookback.is_none();
+        let binance_500ms_ago = binance_lookback.unwrap_or(binance_price);
+        let pm_mid_500ms_ago = pm_mid_lookback.unwrap_or(pm_mid);
+
+        let (staleness, staleness_confidence) = if staleness_unavailable {
+            staleness_quality_degraded = true;
+            (
+                last_valid_staleness.unwrap_or(0.0),
+                STALENESS_FALLBACK_CONFIDENCE,
+            )
+        } else {
+            let (value, confidence) = compute_staleness(
+                binance_price,
+                binance_500ms_ago,
+                pm_mid,
+                pm_mid_500ms_ago,
+            );
+            last_valid_staleness = Some(value);
+            (value, confidence)
+        };
+
+        // Compute market_quality from history that excludes current sample.
+        let (mut market_quality, market_quality_confidence) = compute_market_quality(
+            spread_mid,
+            velocity,
+            &spread_history,
+            &velocity_history,
+            spread_ema,
+            velocity_ema,
+        );
+        if staleness_unavailable {
+            market_quality *= STALENESS_UNAVAILABLE_QUALITY_MULT;
+        } else if staleness_quality_degraded {
+            market_quality *= STALENESS_DEGRADED_QUALITY_MULT;
+        }
+        market_quality = market_quality.clamp(0.0, 1.0);
+        let sample_data_quality_score = (data_quality_score * 0.5
+            + staleness_confidence * 0.25
+            + market_quality_confidence * 0.25)
+            .clamp(0.0, 1.0);
+
+        // Update rolling buffers after computing metrics.
+        if raw_binance_valid {
+            binance_history.push((ts_ms, raw_binance_price));
+        }
+        if pm_mid >= 0.0 && pm_mid <= 1.0 {
+            pm_mid_history.push((ts_ms, pm_mid));
+        }
+        spread_history.push(spread_mid);
+        velocity_history.push(velocity);
+        last_ts_ms = Some(ts_ms);
+
         if let Some(last) = out.last_mut() {
             if last.round_id == round_id && last.ts_ms / 1000 == ts_ms / 1000 {
                 *last = StrategySample {
@@ -94,6 +356,14 @@ pub(super) fn parse_strategy_rows(rows: Vec<Value>) -> Vec<StrategySample> {
                     spread_up,
                     spread_down,
                     spread_mid,
+                    staleness,
+                    market_quality,
+                    data_quality_score: sample_data_quality_score,
+                    staleness_confidence,
+                    spread_ema,
+                    velocity_ema,
+                    pm_mid_500ms_ago,
+                    binance_price_500ms_ago: binance_500ms_ago,
                 };
                 continue;
             }
@@ -114,6 +384,14 @@ pub(super) fn parse_strategy_rows(rows: Vec<Value>) -> Vec<StrategySample> {
             spread_up,
             spread_down,
             spread_mid,
+            staleness,
+            market_quality,
+            data_quality_score: sample_data_quality_score,
+            staleness_confidence,
+            spread_ema,
+            velocity_ema,
+            pm_mid_500ms_ago,
+            binance_price_500ms_ago: binance_500ms_ago,
         });
     }
     out
@@ -199,6 +477,23 @@ pub(super) fn strategy_sample_from_snapshot_event(
         .and_then(Value::as_i64)
         .unwrap_or(0)
         .max(0);
+    
+    // For real-time snapshot events, compute market_quality from current data
+    // Staleness is set to 0.0 (no history available in real-time without external state)
+    let binance_price = event
+        .get("binance_price")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    
+    // Market quality computed from current spread only (simplified for real-time)
+    let snr = velocity.abs() / spread_mid.max(0.001);
+    let snr_norm = (snr / 10.0).clamp(0.0, 1.0);
+    let spread_quality = ((0.02 - spread_mid) / 0.02).clamp(0.0, 1.0); // 2% spread = 0 quality
+    let market_quality = 0.5 * spread_quality + 0.5 * snr_norm;
+    
+    // Staleness: default to 0.0 for real-time (no 500ms history available)
+    // In production, this would be tracked in the runtime state
+    let staleness = 0.0;
 
     Some((
         symbol,
@@ -219,6 +514,14 @@ pub(super) fn strategy_sample_from_snapshot_event(
             spread_up,
             spread_down,
             spread_mid,
+            staleness,
+            market_quality,
+            data_quality_score: 0.5,
+            staleness_confidence: 0.3,
+            spread_ema: spread_mid,
+            velocity_ema: velocity,
+            pm_mid_500ms_ago: p_up, // approximate
+            binance_price_500ms_ago: binance_price, // approximate
         },
     ))
 }
@@ -246,6 +549,9 @@ pub(super) struct StrategySimulationResult {
     total_impact_cents: f64,
     total_cost_cents: f64,
     net_margin_pct: f64,
+    // Fields for Kelly formula and circuit breaker
+    avg_win_loss_ratio: f64,
+    daily_drawdown_cents: f64,
 }
 
 
@@ -278,16 +584,21 @@ pub(super) fn strategy_cfg_json(cfg: &StrategyRuntimeConfig) -> Value {
         "stop_loss_reverse_extra_ticks": cfg.stop_loss_reverse_extra_ticks,
         "loss_cluster_limit": cfg.loss_cluster_limit,
         "loss_cluster_cooldown_ms": cfg.loss_cluster_cooldown_ms,
-        "noise_gate_enabled": cfg.noise_gate_enabled,
-        "noise_gate_threshold_add": cfg.noise_gate_threshold_add,
-        "noise_gate_edge_add": cfg.noise_gate_edge_add,
-        "noise_gate_spread_scale": cfg.noise_gate_spread_scale,
+        "market_quality_enabled": cfg.market_quality_enabled,
+        "market_quality_min": cfg.market_quality_min,
+        "staleness_entry_threshold": cfg.staleness_entry_threshold,
+        "staleness_exit_threshold": cfg.staleness_exit_threshold,
+        "velocity_min_bps": cfg.velocity_min_bps,
+        "accel_reverse_exit_ticks": cfg.accel_reverse_exit_ticks,
         "vic_enabled": cfg.vic_enabled,
         "vic_target_entries_per_hour": cfg.vic_target_entries_per_hour,
         "vic_deadband_ratio": cfg.vic_deadband_ratio,
         "vic_threshold_relax_max": cfg.vic_threshold_relax_max,
         "vic_edge_relax_max": cfg.vic_edge_relax_max,
         "vic_spread_relax_max": cfg.vic_spread_relax_max,
+        "paper_slippage_mult": cfg.paper_slippage_mult,
+        "paper_latency_penalty_cents": cfg.paper_latency_penalty_cents,
+        "paper_fill_rate_discount": cfg.paper_fill_rate_discount,
     })
 }
 
@@ -493,6 +804,11 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
                 "blocked_exits": 0,
                 "emergency_wide_exit_count": 0,
                 "execution_penalty_cents_total": 0.0,
+                // Fields for Kelly formula and circuit breaker
+                "portfolio_value_usdc": 20.0, // Starting capital
+                "avg_win_loss_ratio": 1.0,
+                "current_drawdown_pct": 0.0,
+                "daily_drawdown_pct": 0.0,
             },
             "trades": [],
             "signal_decisions": [],
@@ -600,6 +916,11 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
             "blocked_exits": run.blocked_exits,
             "emergency_wide_exit_count": run.emergency_wide_exit_count,
             "execution_penalty_cents_total": run.execution_penalty_cents_total,
+            // Fields for Kelly formula and circuit breaker
+            "portfolio_value_usdc": (2000.0 + run.total_pnl_cents / 100.0).max(0.0), // Starting capital $20 + PnL
+            "avg_win_loss_ratio": run.avg_win_loss_ratio,
+            "current_drawdown_pct": (run.max_drawdown_cents / 100.0 / 20.0 * 100.0).clamp(0.0, 100.0), // Assuming $20 base
+            "daily_drawdown_pct": (run.daily_drawdown_cents / 100.0 / 20.0 * 100.0).clamp(0.0, 100.0),
         },
         "trades": run.trades,
         "signal_decisions": run.signal_decisions,
@@ -672,6 +993,10 @@ pub(super) fn map_sample_to_fev1(s: &StrategySample) -> fev1::Sample {
         spread_up: s.spread_up,
         spread_down: s.spread_down,
         spread_mid: s.spread_mid,
+        staleness: s.staleness,
+        market_quality: s.market_quality,
+        pm_mid_500ms_ago: s.pm_mid_500ms_ago,
+        binance_price_500ms_ago: s.binance_price_500ms_ago,
     }
 }
 
@@ -710,16 +1035,21 @@ pub(super) fn map_cfg_to_fev1(cfg: &StrategyRuntimeConfig) -> fev1::RuntimeConfi
         stop_loss_reverse_extra_ticks: cfg.stop_loss_reverse_extra_ticks,
         loss_cluster_limit: cfg.loss_cluster_limit,
         loss_cluster_cooldown_ms: cfg.loss_cluster_cooldown_ms,
-        noise_gate_enabled: cfg.noise_gate_enabled,
-        noise_gate_threshold_add: cfg.noise_gate_threshold_add,
-        noise_gate_edge_add: cfg.noise_gate_edge_add,
-        noise_gate_spread_scale: cfg.noise_gate_spread_scale,
+        market_quality_enabled: cfg.market_quality_enabled,
+        market_quality_min: cfg.market_quality_min,
+        staleness_entry_threshold: cfg.staleness_entry_threshold,
+        staleness_exit_threshold: cfg.staleness_exit_threshold,
+        velocity_min_bps: cfg.velocity_min_bps,
+        accel_reverse_exit_ticks: cfg.accel_reverse_exit_ticks,
         vic_enabled: cfg.vic_enabled,
         vic_target_entries_per_hour: cfg.vic_target_entries_per_hour,
         vic_deadband_ratio: cfg.vic_deadband_ratio,
         vic_threshold_relax_max: cfg.vic_threshold_relax_max,
         vic_edge_relax_max: cfg.vic_edge_relax_max,
         vic_spread_relax_max: cfg.vic_spread_relax_max,
+        paper_slippage_mult: cfg.paper_slippage_mult,
+        paper_latency_penalty_cents: cfg.paper_latency_penalty_cents,
+        paper_fill_rate_discount: cfg.paper_fill_rate_discount,
     }
 }
 
@@ -746,6 +1076,8 @@ pub(super) fn map_simulation_result(run: fev1::SimulationResult) -> StrategySimu
         total_impact_cents: run.total_impact_cents,
         total_cost_cents: run.total_cost_cents,
         net_margin_pct: run.net_margin_pct,
+        avg_win_loss_ratio: run.avg_win_loss_ratio,
+        daily_drawdown_cents: run.daily_drawdown_cents,
     }
 }
 
@@ -1049,5 +1381,3 @@ pub(super) async fn load_strategy_samples_runtime_stream(
     );
     Ok(samples)
 }
-
-

@@ -115,17 +115,23 @@ pub(super) async fn strategy_paper(
         if let Some(v) = params.loss_cluster_cooldown_ms {
             cfg.loss_cluster_cooldown_ms = v.clamp(0, 120_000);
         }
-        if let Some(v) = params.noise_gate_enabled {
-            cfg.noise_gate_enabled = v;
+        if let Some(v) = params.market_quality_enabled {
+            cfg.market_quality_enabled = v;
         }
-        if let Some(v) = params.noise_gate_threshold_add {
-            cfg.noise_gate_threshold_add = v.clamp(0.0, 0.20);
+        if let Some(v) = params.market_quality_min {
+            cfg.market_quality_min = v.clamp(0.0, 1.0);
         }
-        if let Some(v) = params.noise_gate_edge_add {
-            cfg.noise_gate_edge_add = v.clamp(0.0, 0.12);
+        if let Some(v) = params.staleness_entry_threshold {
+            cfg.staleness_entry_threshold = v.clamp(0.0, 10.0);
         }
-        if let Some(v) = params.noise_gate_spread_scale {
-            cfg.noise_gate_spread_scale = v.clamp(0.5, 1.2);
+        if let Some(v) = params.staleness_exit_threshold {
+            cfg.staleness_exit_threshold = v.clamp(0.0, 10.0);
+        }
+        if let Some(v) = params.velocity_min_bps {
+            cfg.velocity_min_bps = v.clamp(0.0, 20.0);
+        }
+        if let Some(v) = params.accel_reverse_exit_ticks {
+            cfg.accel_reverse_exit_ticks = v.clamp(0, 8) as usize;
         }
         if let Some(v) = params.vic_enabled {
             cfg.vic_enabled = v;
@@ -144,6 +150,16 @@ pub(super) async fn strategy_paper(
         }
         if let Some(v) = params.vic_spread_relax_max {
             cfg.vic_spread_relax_max = v.clamp(0.0, 0.8);
+        }
+        // Paper cost pessimism factors
+        if let Some(v) = params.paper_slippage_mult {
+            cfg.paper_slippage_mult = v.clamp(0.5, 3.0);
+        }
+        if let Some(v) = params.paper_latency_penalty_cents {
+            cfg.paper_latency_penalty_cents = v.clamp(0.0, 2.0);
+        }
+        if let Some(v) = params.paper_fill_rate_discount {
+            cfg.paper_fill_rate_discount = v.clamp(0.0, 0.5);
         }
         if cfg.entry_threshold_cap < cfg.entry_threshold_base {
             cfg.entry_threshold_cap = cfg.entry_threshold_base;

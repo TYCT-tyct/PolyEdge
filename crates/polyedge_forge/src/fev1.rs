@@ -28,6 +28,9 @@ impl Side {
     }
 }
 
+/// Market data sample for strategy simulation
+/// Note: pm_mid_500ms_ago and binance_price_500ms_ago are passed through for future staleness tracking
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Sample {
     pub ts_ms: i64,
@@ -44,8 +47,16 @@ pub struct Sample {
     pub spread_up: f64,
     pub spread_down: f64,
     pub spread_mid: f64,
+    pub staleness: f64,
+    pub market_quality: f64,
+    pub pm_mid_500ms_ago: f64,
+    pub binance_price_500ms_ago: f64,
 }
 
+/// Runtime configuration for strategy parameters
+/// Note: paper_slippage_mult, paper_latency_penalty_cents, paper_fill_rate_discount
+/// are reserved for future cost model calibration
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeConfig {
     pub entry_threshold_base: f64,
@@ -75,16 +86,26 @@ pub struct RuntimeConfig {
     pub stop_loss_reverse_extra_ticks: usize,
     pub loss_cluster_limit: usize,
     pub loss_cluster_cooldown_ms: i64,
-    pub noise_gate_enabled: bool,
-    pub noise_gate_threshold_add: f64,
-    pub noise_gate_edge_add: f64,
-    pub noise_gate_spread_scale: f64,
+    // Market quality gate (replaces hard-coded noise-hour filter)
+    pub market_quality_enabled: bool,
+    pub market_quality_min: f64,
+    // Staleness-sniping parameters
+    pub staleness_entry_threshold: f64,
+    pub staleness_exit_threshold: f64,
+    pub velocity_min_bps: f64,
+    // Momentum deceleration exit: consecutive ticks of opposing acceleration
+    pub accel_reverse_exit_ticks: usize,
+    // VIC (velocity-indexed cooldown) — kept for optional use
     pub vic_enabled: bool,
     pub vic_target_entries_per_hour: f64,
     pub vic_deadband_ratio: f64,
     pub vic_threshold_relax_max: f64,
     pub vic_edge_relax_max: f64,
     pub vic_spread_relax_max: f64,
+    // Paper cost pessimism factors
+    pub paper_slippage_mult: f64,
+    pub paper_latency_penalty_cents: f64,
+    pub paper_fill_rate_discount: f64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -116,6 +137,9 @@ pub struct SimulationResult {
     pub total_impact_cents: f64,
     pub total_cost_cents: f64,
     pub net_margin_pct: f64,
+    // New fields for Kelly formula and circuit breaker
+    pub avg_win_loss_ratio: f64,
+    pub daily_drawdown_cents: f64,
 }
 
 fn decision_id(action: &str, side: Side, round_id: &str, ts_ms: i64) -> String {
@@ -233,6 +257,7 @@ struct Position {
     reverse_streak: usize,
     blocked_exit_streak: usize,
     soft_stop_pending_ticks: usize,
+    accel_reverse_streak: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -365,30 +390,18 @@ fn confirm_direction(score_hist: &VecDeque<f64>, current_score: f64) -> bool {
         .all(|v| (*v > 0.0 && sgn > 0) || (*v < 0.0 && sgn < 0))
 }
 
-fn hour_cn_from_ts_ms(ts_ms: i64) -> u8 {
-    ((ts_ms.div_euclid(3_600_000) + 8).rem_euclid(24)) as u8
-}
-
-fn is_noise_hour_cn(hour: u8) -> bool {
-    matches!(hour, 5 | 10 | 13 | 18 | 20)
-}
-
 fn entry_adjustments(
-    ts_ms: i64,
     cfg: &RuntimeConfig,
     session_start_ts_ms: i64,
     total_entries: usize,
+    ts_ms: i64,
 ) -> EntryAdjustments {
     let mut out = EntryAdjustments {
         threshold_add: 0.0,
         edge_add: 0.0,
         spread_scale: 1.0,
     };
-    if cfg.noise_gate_enabled && is_noise_hour_cn(hour_cn_from_ts_ms(ts_ms)) {
-        out.threshold_add += cfg.noise_gate_threshold_add.max(0.0);
-        out.edge_add += cfg.noise_gate_edge_add.max(0.0);
-        out.spread_scale *= cfg.noise_gate_spread_scale.clamp(0.5, 1.2);
-    }
+    // VIC: velocity-indexed cooldown — relax thresholds when we are below target entry rate
     if cfg.vic_enabled
         && cfg.vic_target_entries_per_hour > 0.0
         && cfg.vic_deadband_ratio < 1.0
@@ -435,15 +448,22 @@ fn compute_signal(
         0.0
     };
 
+    // Trend component: momentum direction and strength
     let trend_component = 0.55 * tanh_norm(sample.delta_pct, 0.09)
         + 0.30 * tanh_norm(sample.velocity, 4.5)
         + 0.15 * tanh_norm(sample.acceleration, 16.0);
+
+    // Fair-value probability derived from trend (not from mean-reversion)
     let p_fair_up = (0.5 + 0.45 * trend_component).clamp(0.005, 0.995);
     let edge_prob = p_fair_up - sample.p_up.clamp(0.0, 1.0);
     let edge_component = tanh_norm(edge_prob, cfg.entry_edge_prob.max(0.008));
     let spread_penalty = (sample.spread_mid / cfg.spread_limit_prob.max(0.008)).clamp(0.0, 3.0);
+
+    // New weights: 80% trend-momentum, 20% edge.
+    // Old 72%/28% (edge-heavy) was mean-reverting and therefore anti-momentum.
     let score =
-        (0.72 * edge_component + 0.28 * trend_component - 0.08 * spread_penalty).clamp(-1.0, 1.0);
+        (0.20 * edge_component + 0.80 * trend_component - 0.08 * spread_penalty).clamp(-1.0, 1.0);
+
     let entry_threshold = (cfg.entry_threshold_base + local_vol * 1.2 + sample.spread_mid * 0.6)
         .clamp(cfg.entry_threshold_base, cfg.entry_threshold_cap);
     let confirmed = confirm_direction(score_hist, score);
@@ -510,6 +530,8 @@ pub fn simulate_with_fee_context(
     let mut last_delta_pct = 0.0_f64;
     let mut last_spread_up_cents = 0.0_f64;
     let mut last_spread_down_cents = 0.0_f64;
+    let mut last_staleness = 0.0_f64;
+    let mut last_market_quality = 0.0_f64;
     let mut total_entries = 0usize;
     let mut loss_cluster_streak = 0usize;
     let mut loss_cluster_cooldown_until_ts_ms = 0_i64;
@@ -523,6 +545,8 @@ pub fn simulate_with_fee_context(
         last_delta_pct = sample.delta_pct;
         last_spread_up_cents = sample.spread_up * 100.0;
         last_spread_down_cents = sample.spread_down * 100.0;
+        last_staleness = sample.staleness;
+        last_market_quality = sample.market_quality;
 
         let signal = compute_signal(sample, &p_hist, &score_hist, cfg);
         let score = signal.score;
@@ -540,8 +564,13 @@ pub fn simulate_with_fee_context(
             let exit_fee = cfg.fee_cents_per_side + taker_fee_cents(bid_raw, pos.side, fee_ctx);
             let mut exit_impact_cents =
                 execution_impact_cents(sample, pos.side, cfg, sample.remaining_ms, false);
+
+            // Apply paper cost pessimism: slippage multiplier + latency penalty
+            let effective_slippage = cfg.slippage_cents_per_side * cfg.paper_slippage_mult;
+            let latency_penalty = cfg.paper_latency_penalty_cents;
+
             let mut exit_exec =
-                bid_raw - cfg.slippage_cents_per_side - exit_fee - exit_impact_cents;
+                bid_raw - effective_slippage - exit_fee - exit_impact_cents - latency_penalty;
             let pnl = exit_exec - pos.entry_price_cents;
             if pnl > pos.peak_pnl_cents {
                 pos.peak_pnl_cents = pnl;
@@ -554,10 +583,23 @@ pub fn simulate_with_fee_context(
             } else {
                 pos.reverse_streak = 0;
             }
+            // Track consecutive ticks where acceleration opposes position direction
+            let accel_opposes = (sample.acceleration * pos.side.dir()) < 0.0;
+            if accel_opposes {
+                pos.accel_reverse_streak = pos.accel_reverse_streak.saturating_add(1);
+            } else {
+                pos.accel_reverse_streak = 0;
+            }
             let can_exit_now = held_ms >= cfg.min_hold_ms;
             let mut exit_reason: Option<&str> = None;
             if sample.round_id != pos.entry_round_id {
                 exit_reason = Some("round_rollover");
+            } else if cfg.staleness_exit_threshold > 0.0
+                && sample.staleness > 0.0
+                && sample.staleness < cfg.staleness_exit_threshold
+            {
+                // Market maker has caught up — edge is gone
+                exit_reason = Some("staleness_closed");
             } else if bid_raw >= cfg.take_profit_near_max_cents {
                 exit_reason = Some("near_max_take_profit");
             } else if sample.remaining_ms <= cfg.endgame_remaining_ms
@@ -588,6 +630,12 @@ pub fn simulate_with_fee_context(
                 pos.soft_stop_pending_ticks = 0;
                 exit_reason = Some("signal_reverse");
             } else if can_exit_now
+                && cfg.accel_reverse_exit_ticks > 0
+                && pos.accel_reverse_streak >= cfg.accel_reverse_exit_ticks
+            {
+                pos.soft_stop_pending_ticks = 0;
+                exit_reason = Some("accel_deceleration");
+            } else if can_exit_now
                 && pos.peak_pnl_cents >= cfg.trail_activate_profit_cents
                 && drawdown >= cfg.trail_drawdown_cents
             {
@@ -611,6 +659,7 @@ pub fn simulate_with_fee_context(
                         | "stop_loss_wide_grace"
                         | "endgame_take_profit"
                         | "signal_reverse"
+                        | "staleness_closed"
                 );
                 let can_fill = spread_side_cents <= cfg.max_exec_spread_cents;
                 let mut escalated_for_blocked_exit = false;
@@ -633,8 +682,11 @@ pub fn simulate_with_fee_context(
                 if emergency || escalated_for_blocked_exit {
                     exit_impact_cents =
                         execution_impact_cents(sample, pos.side, cfg, sample.remaining_ms, true);
-                    exit_exec =
-                        bid_raw - cfg.slippage_cents_per_side - exit_fee - exit_impact_cents;
+                    exit_exec = bid_raw
+                        - cfg.slippage_cents_per_side * cfg.paper_slippage_mult
+                        - exit_fee
+                        - exit_impact_cents
+                        - cfg.paper_latency_penalty_cents;
                 }
                 exit_exec -= emergency_penalty_cents;
                 execution_penalty_cents_total += emergency_penalty_cents;
@@ -700,6 +752,8 @@ pub fn simulate_with_fee_context(
                         | "trail_drawdown"
                         | "liquidity_widen"
                         | "round_rollover"
+                        | "staleness_closed"
+                        | "accel_deceleration"
                 );
                 let (exit_tif, exit_style, exit_ttl_ms, exit_slippage_bps) =
                     if take_profit_exit && !emergency_exit && sample.remaining_ms > 30_000 {
@@ -730,7 +784,7 @@ pub fn simulate_with_fee_context(
         } else {
             let ask_raw = side_ask(sample, side) * 100.0;
             let spread_side_cents = side_spread(sample, side) * 100.0;
-            let dynamic = entry_adjustments(sample.ts_ms, cfg, session_start_ts_ms, total_entries);
+            let dynamic = entry_adjustments(cfg, session_start_ts_ms, total_entries, sample.ts_ms);
             let dynamic_entry_threshold = (signal.entry_threshold + dynamic.threshold_add).clamp(
                 cfg.entry_threshold_base * 0.65,
                 cfg.entry_threshold_cap + 0.20,
@@ -758,10 +812,32 @@ pub fn simulate_with_fee_context(
             let confidence_ok = fair_conf >= 0.56;
             let spread_ok = sample.spread_mid <= dynamic_spread_limit_prob
                 && spread_side_cents <= dynamic_max_exec_spread;
+
+            // Staleness gate: require market maker to be lagging (if enabled)
+            let staleness_ok = cfg.staleness_entry_threshold <= 0.0
+                || sample.staleness <= 0.0
+                || sample.staleness >= cfg.staleness_entry_threshold;
+
+            // Velocity gate: require meaningful price momentum
+            let velocity_ok =
+                cfg.velocity_min_bps <= 0.0 || sample.velocity.abs() >= cfg.velocity_min_bps;
+
+            // Market quality gate: dynamic replacement for hard-coded noise-hour filter
+            let quality_ok =
+                !cfg.market_quality_enabled || sample.market_quality >= cfg.market_quality_min;
+
+            // Momentum acceleration confirmation: velocity and acceleration must be co-directional
+            let momentum_aligned =
+                cfg.velocity_min_bps <= 0.0 || (sample.velocity * sample.acceleration >= 0.0);
+
             let fee = cfg.fee_cents_per_side + taker_fee_cents(ask_raw, side, fee_ctx);
             let entry_impact_cents =
                 execution_impact_cents(sample, side, cfg, sample.remaining_ms, false);
-            let entry_exec = ask_raw + cfg.slippage_cents_per_side + fee + entry_impact_cents;
+            // Apply paper cost pessimism on entry: slippage_mult + latency_penalty
+            let effective_slippage = cfg.slippage_cents_per_side * cfg.paper_slippage_mult;
+            let latency_penalty = cfg.paper_latency_penalty_cents;
+            let entry_exec =
+                ask_raw + effective_slippage + fee + entry_impact_cents + latency_penalty;
             let expected_potential = (99.0 - entry_exec).max(0.0);
             let potential_ok = expected_potential >= cfg.entry_min_potential_cents;
             let price_ok = entry_exec <= cfg.entry_max_price_cents;
@@ -775,50 +851,70 @@ pub fn simulate_with_fee_context(
                 && cooldown_ok
                 && cluster_cooldown_ok
                 && within_limit
+                && staleness_ok
+                && velocity_ok
+                && quality_ok
+                && momentum_aligned
             {
-                position = Some(Position {
-                    side,
-                    entry_ts_ms: sample.ts_ms,
-                    entry_round_id: sample.round_id.clone(),
-                    entry_price_raw_cents: ask_raw,
-                    entry_price_cents: entry_exec,
-                    entry_fee_cents: fee,
-                    entry_slippage_cents: cfg.slippage_cents_per_side,
-                    entry_impact_cents,
-                    entry_score: score,
-                    entry_remaining_ms: sample.remaining_ms,
-                    peak_pnl_cents: 0.0,
-                    reverse_streak: 0,
-                    blocked_exit_streak: 0,
-                    soft_stop_pending_ticks: 0,
-                });
-                let entry_reason = "fev1_signal_entry";
-                let entry_score = score.abs();
-                let (entry_tif, entry_style, entry_ttl_ms, entry_slippage_bps) =
-                    if sample.remaining_ms <= 120_000 || entry_score >= 0.80 {
-                        ("FAK", "taker", 900_i64, 24.0_f64)
-                    } else {
-                        ("GTD", "maker", 900_i64, 10.0_f64)
-                    };
-                signal_decisions.push(json!({
-                    "decision_id": decision_id("enter", side, &sample.round_id, sample.ts_ms),
-                    "action": "enter",
-                    "side": side.as_str(),
-                    "round_id": sample.round_id,
-                    "ts_ms": sample.ts_ms,
-                    "reason": entry_reason,
-                    "price_cents": ask_raw.clamp(1.0, 99.0),
-                    "entry_score": entry_score,
-                    "edge_score": entry_score,
-                    "entry_remaining_ms": sample.remaining_ms,
-                    "remaining_ms": sample.remaining_ms,
-                    "tif": entry_tif,
-                    "style": entry_style,
-                    "ttl_ms": entry_ttl_ms,
-                    "max_slippage_bps": entry_slippage_bps
-                }));
-                *entries_by_round.entry(sample.round_id.clone()).or_insert(0) += 1;
-                total_entries = total_entries.saturating_add(1);
+                // Paper fill rate: simulate partial fill rejection based on discount factor
+                // fill_rate_discount=0.05 means 5% of entries are rejected (not filled)
+                let fill_rejected = {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut h = DefaultHasher::new();
+                    sample.ts_ms.hash(&mut h);
+                    sample.round_id.hash(&mut h);
+                    let hash_val = h.finish();
+                    (hash_val % 10000) as f64 / 10000.0 < cfg.paper_fill_rate_discount
+                };
+                if fill_rejected {
+                    // Simulate fill rejection: skip this entry
+                } else {
+                    position = Some(Position {
+                        side,
+                        entry_ts_ms: sample.ts_ms,
+                        entry_round_id: sample.round_id.clone(),
+                        entry_price_raw_cents: ask_raw,
+                        entry_price_cents: entry_exec,
+                        entry_fee_cents: fee,
+                        entry_slippage_cents: cfg.slippage_cents_per_side,
+                        entry_impact_cents,
+                        entry_score: score,
+                        entry_remaining_ms: sample.remaining_ms,
+                        peak_pnl_cents: 0.0,
+                        reverse_streak: 0,
+                        blocked_exit_streak: 0,
+                        soft_stop_pending_ticks: 0,
+                        accel_reverse_streak: 0,
+                    });
+                    let entry_reason = "fev1_signal_entry";
+                    let entry_score = score.abs();
+                    let (entry_tif, entry_style, entry_ttl_ms, entry_slippage_bps) =
+                        if sample.remaining_ms <= 120_000 || entry_score >= 0.80 {
+                            ("FAK", "taker", 900_i64, 24.0_f64)
+                        } else {
+                            ("GTD", "maker", 900_i64, 10.0_f64)
+                        };
+                    signal_decisions.push(json!({
+                        "decision_id": decision_id("enter", side, &sample.round_id, sample.ts_ms),
+                        "action": "enter",
+                        "side": side.as_str(),
+                        "round_id": sample.round_id,
+                        "ts_ms": sample.ts_ms,
+                        "reason": entry_reason,
+                        "price_cents": ask_raw.clamp(1.0, 99.0),
+                        "entry_score": entry_score,
+                        "edge_score": entry_score,
+                        "entry_remaining_ms": sample.remaining_ms,
+                        "remaining_ms": sample.remaining_ms,
+                        "tif": entry_tif,
+                        "style": entry_style,
+                        "ttl_ms": entry_ttl_ms,
+                        "max_slippage_bps": entry_slippage_bps
+                    }));
+                    *entries_by_round.entry(sample.round_id.clone()).or_insert(0) += 1;
+                    total_entries = total_entries.saturating_add(1);
+                } // end of fill_rejected else block
             }
         }
 
@@ -837,7 +933,11 @@ pub fn simulate_with_fee_context(
         let exit_fee = cfg.fee_cents_per_side + taker_fee_cents(bid_raw, pos.side, fee_ctx);
         let exit_impact_cents =
             execution_impact_cents(last, pos.side, cfg, last.remaining_ms, false);
-        let exit_exec = bid_raw - cfg.slippage_cents_per_side - exit_fee - exit_impact_cents;
+        // Apply paper cost pessimism on final exit
+        let effective_slippage = cfg.slippage_cents_per_side * cfg.paper_slippage_mult;
+        let latency_penalty = cfg.paper_latency_penalty_cents;
+        let exit_exec =
+            bid_raw - effective_slippage - exit_fee - exit_impact_cents - latency_penalty;
         let net_pnl = exit_exec - pos.entry_price_cents;
         let gross_pnl = bid_raw - pos.entry_price_raw_cents;
         let total_cost = (gross_pnl - net_pnl).max(0.0);
@@ -948,12 +1048,53 @@ pub fn simulate_with_fee_context(
     };
     let max_drawdown_cents = max_drawdown_from_pnls(&all_trade_pnls);
     let max_profit_trade_cents = all_trade_pnls.iter().copied().fold(0.0_f64, f64::max);
+
+    // Calculate avg_win_loss_ratio for Kelly formula
+    let (avg_win_cents, avg_loss_cents) = if trade_count > 0 {
+        let win_pnls: Vec<f64> = all_trade_pnls
+            .iter()
+            .copied()
+            .filter(|v| *v > 0.0)
+            .collect();
+        let loss_pnls: Vec<f64> = all_trade_pnls
+            .iter()
+            .copied()
+            .filter(|v| *v < 0.0)
+            .collect();
+        let avg_win = if !win_pnls.is_empty() {
+            win_pnls.iter().sum::<f64>() / win_pnls.len() as f64
+        } else {
+            0.0
+        };
+        let avg_loss = if !loss_pnls.is_empty() {
+            loss_pnls.iter().sum::<f64>() / loss_pnls.len() as f64
+        } else {
+            0.0
+        };
+        (avg_win, avg_loss.abs())
+    } else {
+        (0.0, 0.0)
+    };
+    let avg_win_loss_ratio = if avg_loss_cents > 1e-9 {
+        avg_win_cents / avg_loss_cents
+    } else {
+        1.0 // default when no losses
+    };
     let net_margin_pct = if gross_pnl_cents.abs() > 1e-9 {
         total_pnl_cents / gross_pnl_cents.abs() * 100.0
     } else {
         0.0
     };
     let net_pnl_cents = total_pnl_cents;
+
+    // Calculate daily drawdown (simplified: max loss from first trade of the day)
+    let daily_drawdown_cents = if !all_trade_pnls.is_empty() {
+        // Use the minimum PnL as a proxy for daily drawdown
+        // In production, this should be calculated based on daily equity curve
+        all_trade_pnls.iter().copied().fold(0.0_f64, f64::min).abs()
+    } else {
+        0.0
+    };
     let confidence = if last_entry_threshold > 1e-9 {
         (last_score.abs() / last_entry_threshold).clamp(0.0, 1.0)
     } else {
@@ -984,6 +1125,8 @@ pub fn simulate_with_fee_context(
         "delta_pct": last_delta_pct,
         "spread_up_cents": last_spread_up_cents,
         "spread_down_cents": last_spread_down_cents,
+        "staleness": last_staleness,
+        "market_quality": last_market_quality,
         "loss_cluster_streak": loss_cluster_streak,
         "loss_cluster_cooldown_until_ts_ms": loss_cluster_cooldown_until_ts_ms,
     });
@@ -1016,6 +1159,8 @@ pub fn simulate_with_fee_context(
         total_impact_cents,
         total_cost_cents,
         net_margin_pct,
+        avg_win_loss_ratio,
+        daily_drawdown_cents,
     }
 }
 
@@ -1053,16 +1198,21 @@ mod tests {
             stop_loss_reverse_extra_ticks: 1,
             loss_cluster_limit: 0,
             loss_cluster_cooldown_ms: 0,
-            noise_gate_enabled: false,
-            noise_gate_threshold_add: 0.0,
-            noise_gate_edge_add: 0.0,
-            noise_gate_spread_scale: 1.0,
+            market_quality_enabled: false,
+            market_quality_min: 0.35,
+            staleness_entry_threshold: 0.0,
+            staleness_exit_threshold: 0.0,
+            velocity_min_bps: 0.0,
+            accel_reverse_exit_ticks: 0,
             vic_enabled: false,
             vic_target_entries_per_hour: 0.0,
             vic_deadband_ratio: 0.08,
             vic_threshold_relax_max: 0.0,
             vic_edge_relax_max: 0.0,
             vic_spread_relax_max: 0.0,
+            paper_slippage_mult: 1.0,
+            paper_latency_penalty_cents: 0.0,
+            paper_fill_rate_discount: 0.0,
         };
         let mut samples = vec![
             // Build confirmation history and open one UP position.
@@ -1081,6 +1231,10 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
+                staleness: 0.0,
+                market_quality: 1.0,
+                pm_mid_500ms_ago: 0.0,
+                binance_price_500ms_ago: 0.0,
             },
             Sample {
                 ts_ms: 2_000,
@@ -1097,6 +1251,10 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
+                staleness: 0.0,
+                market_quality: 1.0,
+                pm_mid_500ms_ago: 0.0,
+                binance_price_500ms_ago: 0.0,
             },
             Sample {
                 ts_ms: 3_000,
@@ -1113,6 +1271,10 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
+                staleness: 0.0,
+                market_quality: 1.0,
+                pm_mid_500ms_ago: 0.0,
+                binance_price_500ms_ago: 0.0,
             },
         ];
         for ts in [4_000_i64, 5_000_i64, 6_000_i64] {
@@ -1131,6 +1293,10 @@ mod tests {
                 spread_up: 0.03,
                 spread_down: 0.03,
                 spread_mid: 0.03,
+                staleness: 0.0,
+                market_quality: 1.0,
+                pm_mid_500ms_ago: 0.0,
+                binance_price_500ms_ago: 0.0,
             });
         }
 
@@ -1209,16 +1375,21 @@ mod tests {
             stop_loss_reverse_extra_ticks: 1,
             loss_cluster_limit: 0,
             loss_cluster_cooldown_ms: 0,
-            noise_gate_enabled: false,
-            noise_gate_threshold_add: 0.0,
-            noise_gate_edge_add: 0.0,
-            noise_gate_spread_scale: 1.0,
+            market_quality_enabled: false,
+            market_quality_min: 0.35,
+            staleness_entry_threshold: 0.0,
+            staleness_exit_threshold: 0.0,
+            velocity_min_bps: 0.0,
+            accel_reverse_exit_ticks: 0,
             vic_enabled: false,
             vic_target_entries_per_hour: 0.0,
             vic_deadband_ratio: 0.08,
             vic_threshold_relax_max: 0.0,
             vic_edge_relax_max: 0.0,
             vic_spread_relax_max: 0.0,
+            paper_slippage_mult: 1.0,
+            paper_latency_penalty_cents: 0.0,
+            paper_fill_rate_discount: 0.0,
         };
 
         let mut samples = vec![
@@ -1237,6 +1408,10 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
+                staleness: 0.0,
+                market_quality: 1.0,
+                pm_mid_500ms_ago: 0.0,
+                binance_price_500ms_ago: 0.0,
             },
             Sample {
                 ts_ms: 2_000,
@@ -1253,6 +1428,10 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
+                staleness: 0.0,
+                market_quality: 1.0,
+                pm_mid_500ms_ago: 0.0,
+                binance_price_500ms_ago: 0.0,
             },
             Sample {
                 ts_ms: 3_000,
@@ -1269,6 +1448,10 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
+                staleness: 0.0,
+                market_quality: 1.0,
+                pm_mid_500ms_ago: 0.0,
+                binance_price_500ms_ago: 0.0,
             },
         ];
         for ts in [4_000_i64, 5_000_i64] {
@@ -1287,6 +1470,10 @@ mod tests {
                 spread_up: 0.03,
                 spread_down: 0.03,
                 spread_mid: 0.03,
+                staleness: 0.0,
+                market_quality: 1.0,
+                pm_mid_500ms_ago: 0.0,
+                binance_price_500ms_ago: 0.0,
             });
         }
 
@@ -1330,16 +1517,21 @@ mod tests {
             stop_loss_reverse_extra_ticks: 1,
             loss_cluster_limit: 1,
             loss_cluster_cooldown_ms: 30_000,
-            noise_gate_enabled: false,
-            noise_gate_threshold_add: 0.0,
-            noise_gate_edge_add: 0.0,
-            noise_gate_spread_scale: 1.0,
+            market_quality_enabled: false,
+            market_quality_min: 0.35,
+            staleness_entry_threshold: 0.0,
+            staleness_exit_threshold: 0.0,
+            velocity_min_bps: 0.0,
+            accel_reverse_exit_ticks: 0,
             vic_enabled: false,
             vic_target_entries_per_hour: 0.0,
             vic_deadband_ratio: 0.08,
             vic_threshold_relax_max: 0.0,
             vic_edge_relax_max: 0.0,
             vic_spread_relax_max: 0.0,
+            paper_slippage_mult: 1.0,
+            paper_latency_penalty_cents: 0.0,
+            paper_fill_rate_discount: 0.0,
         };
 
         let mut samples = vec![
@@ -1358,6 +1550,10 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
+                staleness: 0.0,
+                market_quality: 1.0,
+                pm_mid_500ms_ago: 0.0,
+                binance_price_500ms_ago: 0.0,
             },
             Sample {
                 ts_ms: 2_000,
@@ -1374,6 +1570,10 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
+                staleness: 0.0,
+                market_quality: 1.0,
+                pm_mid_500ms_ago: 0.0,
+                binance_price_500ms_ago: 0.0,
             },
             Sample {
                 ts_ms: 3_000,
@@ -1390,6 +1590,10 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
+                staleness: 0.0,
+                market_quality: 1.0,
+                pm_mid_500ms_ago: 0.0,
+                binance_price_500ms_ago: 0.0,
             },
             Sample {
                 ts_ms: 4_000,
@@ -1406,6 +1610,10 @@ mod tests {
                 spread_up: 0.01,
                 spread_down: 0.01,
                 spread_mid: 0.01,
+                staleness: 0.0,
+                market_quality: 1.0,
+                pm_mid_500ms_ago: 0.0,
+                binance_price_500ms_ago: 0.0,
             },
         ];
         for ts in [5_000_i64, 6_000_i64, 7_000_i64] {
@@ -1424,6 +1632,10 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
+                staleness: 0.0,
+                market_quality: 1.0,
+                pm_mid_500ms_ago: 0.0,
+                binance_price_500ms_ago: 0.0,
             });
         }
 
@@ -1467,16 +1679,21 @@ mod tests {
             stop_loss_reverse_extra_ticks: 1,
             loss_cluster_limit: 0,
             loss_cluster_cooldown_ms: 0,
-            noise_gate_enabled: false,
-            noise_gate_threshold_add: 0.0,
-            noise_gate_edge_add: 0.0,
-            noise_gate_spread_scale: 1.0,
+            market_quality_enabled: false,
+            market_quality_min: 0.35,
+            staleness_entry_threshold: 0.0,
+            staleness_exit_threshold: 0.0,
+            velocity_min_bps: 0.0,
+            accel_reverse_exit_ticks: 0,
             vic_enabled: true,
             vic_target_entries_per_hour: 120.0,
             vic_deadband_ratio: 0.0,
             vic_threshold_relax_max: 0.0,
             vic_edge_relax_max: 0.02,
             vic_spread_relax_max: 0.0,
+            paper_slippage_mult: 1.0,
+            paper_latency_penalty_cents: 0.0,
+            paper_fill_rate_discount: 0.0,
         };
 
         // Keep trend strongly UP, but make p_up slightly above fair value:
@@ -1497,6 +1714,10 @@ mod tests {
                 spread_up: 0.01,
                 spread_down: 0.01,
                 spread_mid: 0.01,
+                staleness: 0.0,
+                market_quality: 1.0,
+                pm_mid_500ms_ago: 0.0,
+                binance_price_500ms_ago: 0.0,
             },
             Sample {
                 ts_ms: 2_000,
@@ -1513,6 +1734,10 @@ mod tests {
                 spread_up: 0.01,
                 spread_down: 0.01,
                 spread_mid: 0.01,
+                staleness: 0.0,
+                market_quality: 1.0,
+                pm_mid_500ms_ago: 0.0,
+                binance_price_500ms_ago: 0.0,
             },
             Sample {
                 ts_ms: 3_000,
@@ -1529,6 +1754,10 @@ mod tests {
                 spread_up: 0.01,
                 spread_down: 0.01,
                 spread_mid: 0.01,
+                staleness: 0.0,
+                market_quality: 1.0,
+                pm_mid_500ms_ago: 0.0,
+                binance_price_500ms_ago: 0.0,
             },
         ];
 

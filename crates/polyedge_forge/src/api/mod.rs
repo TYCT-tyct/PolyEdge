@@ -2431,16 +2431,23 @@ struct StrategyPaperQueryParams {
     stop_loss_reverse_extra_ticks: Option<u32>,
     loss_cluster_limit: Option<u32>,
     loss_cluster_cooldown_ms: Option<i64>,
-    noise_gate_enabled: Option<bool>,
-    noise_gate_threshold_add: Option<f64>,
-    noise_gate_edge_add: Option<f64>,
-    noise_gate_spread_scale: Option<f64>,
     vic_enabled: Option<bool>,
     vic_target_entries_per_hour: Option<f64>,
     vic_deadband_ratio: Option<f64>,
     vic_threshold_relax_max: Option<f64>,
     vic_edge_relax_max: Option<f64>,
     vic_spread_relax_max: Option<f64>,
+    // New staleness/market_quality params (replacing noise_gate)
+    market_quality_enabled: Option<bool>,
+    market_quality_min: Option<f64>,
+    staleness_entry_threshold: Option<f64>,
+    staleness_exit_threshold: Option<f64>,
+    velocity_min_bps: Option<f64>,
+    accel_reverse_exit_ticks: Option<u32>,
+    // Paper cost pessimism factors
+    paper_slippage_mult: Option<f64>,
+    paper_latency_penalty_cents: Option<f64>,
+    paper_fill_rate_discount: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -3,6 +3,7 @@
 mod api;
 mod cli;
 mod common;
+mod data_quality;  // MAJOR CHANGE: Added data quality monitoring module
 mod db_sink;
 mod fev1;
 mod ireland;

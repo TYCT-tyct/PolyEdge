@@ -22,6 +22,14 @@ pub(super) struct StrategySample {
     pub(super) spread_up: f64,
     pub(super) spread_down: f64,
     pub(super) spread_mid: f64,
+    pub(super) staleness: f64,
+    pub(super) market_quality: f64,
+    pub(super) data_quality_score: f64,
+    pub(super) staleness_confidence: f64,
+    pub(super) spread_ema: f64,
+    pub(super) velocity_ema: f64,
+    pub(super) pm_mid_500ms_ago: f64,
+    pub(super) binance_price_500ms_ago: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -53,16 +61,21 @@ pub(super) struct StrategyRuntimeConfig {
     stop_loss_reverse_extra_ticks: usize,
     loss_cluster_limit: usize,
     loss_cluster_cooldown_ms: i64,
-    noise_gate_enabled: bool,
-    noise_gate_threshold_add: f64,
-    noise_gate_edge_add: f64,
-    noise_gate_spread_scale: f64,
+    market_quality_enabled: bool,
+    market_quality_min: f64,
+    staleness_entry_threshold: f64,
+    staleness_exit_threshold: f64,
+    velocity_min_bps: f64,
+    accel_reverse_exit_ticks: usize,
     vic_enabled: bool,
     vic_target_entries_per_hour: f64,
     vic_deadband_ratio: f64,
     vic_threshold_relax_max: f64,
     vic_edge_relax_max: f64,
     vic_spread_relax_max: f64,
+    paper_slippage_mult: f64,
+    paper_latency_penalty_cents: f64,
+    paper_fill_rate_discount: f64,
 }
 
 const STRATEGY_PROFILE_PROFIT_MAX: &str = "fev1_manual_profit_max_2026_02_27";
