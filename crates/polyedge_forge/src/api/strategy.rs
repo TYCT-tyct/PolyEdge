@@ -76,6 +76,8 @@ pub(super) struct StrategyRuntimeConfig {
     paper_slippage_mult: f64,
     paper_latency_penalty_cents: f64,
     paper_fill_rate_discount: f64,
+    paper_simulated_capital: f64,
+    paper_max_drawdown_pct: f64,
 }
 
 const STRATEGY_PROFILE_PROFIT_MAX: &str = "fev1_manual_profit_max_2026_02_27";

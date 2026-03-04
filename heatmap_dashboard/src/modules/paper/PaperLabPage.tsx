@@ -713,6 +713,156 @@ export function PaperLabPage({
         </article>
       </div>
 
+      {/* Paper vs Live Comparison Panel */}
+      <section className="comparison-panel" style={{
+        marginTop: '16px',
+        padding: '12px',
+        background: 'linear-gradient(135deg, #1a1a2e 0%, #16213e 100%)',
+        borderRadius: '8px',
+        border: '1px solid #2a3f5f'
+      }}>
+        <h4 style={{ margin: '0 0 12px 0', color: '#e0e0e0', fontSize: '14px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{ fontSize: '16px' }}>📊</span> 
+          Paper vs 真实交易 对比
+          {summary?.circuit_break_triggered && (
+            <span style={{ 
+              background: '#ff6b6b', 
+              color: 'white', 
+              padding: '2px 8px', 
+              borderRadius: '4px', 
+              fontSize: '11px',
+              marginLeft: 'auto'
+            }}>
+              熔断触发 #{(summary as any)?.circuit_break_at_trade || 0}
+            </span>
+          )}
+        </h4>
+        <div className="info-cards compact" style={{ 
+          display: 'grid', 
+          gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', 
+          gap: '12px' 
+        }}>
+          <div style={{ 
+            background: 'rgba(0,0,0,0.3)', 
+            padding: '10px', 
+            borderRadius: '6px',
+            textAlign: 'center'
+          }}>
+            <div style={{ color: '#888', fontSize: '11px', marginBottom: '4px' }}>交易次数</div>
+            <div style={{ display: 'flex', justifyContent: 'space-around' }}>
+              <div>
+                <div style={{ color: '#4ecdc4', fontSize: '18px', fontWeight: 'bold' }}>{summary?.trade_count ?? 0}</div>
+                <div style={{ color: '#666', fontSize: '10px' }}>Paper</div>
+              </div>
+              <div>
+                <div style={{ color: '#ff6b6b', fontSize: '18px', fontWeight: 'bold' }}>{(liveRealizedNetCents !== null) ? '—' : '—'}</div>
+                <div style={{ color: '#666', fontSize: '10px' }}>Live</div>
+              </div>
+            </div>
+          </div>
+          <div style={{ 
+            background: 'rgba(0,0,0,0.3)', 
+            padding: '10px', 
+            borderRadius: '6px',
+            textAlign: 'center'
+          }}>
+            <div style={{ color: '#888', fontSize: '11px', marginBottom: '4px' }}>胜率</div>
+            <div style={{ display: 'flex', justifyContent: 'space-around' }}>
+              <div>
+                <div style={{ color: '#4ecdc4', fontSize: '18px', fontWeight: 'bold' }}>{summary?.win_rate_pct?.toFixed(1) ?? '—'}%</div>
+                <div style={{ color: '#666', fontSize: '10px' }}>Paper</div>
+              </div>
+              <div>
+                <div style={{ color: '#ff6b6b', fontSize: '18px', fontWeight: 'bold' }}>—</div>
+                <div style={{ color: '#666', fontSize: '10px' }}>Live</div>
+              </div>
+            </div>
+          </div>
+          <div style={{ 
+            background: 'rgba(0,0,0,0.3)', 
+            padding: '10px', 
+            borderRadius: '6px',
+            textAlign: 'center'
+          }}>
+            <div style={{ color: '#888', fontSize: '11px', marginBottom: '4px' }}>净收益</div>
+            <div style={{ display: 'flex', justifyContent: 'space-around' }}>
+              <div>
+                <div style={{ 
+                  color: (summary?.net_pnl_cents ?? 0) >= 0 ? '#4ecdc4' : '#ff6b6b', 
+                  fontSize: '18px', 
+                  fontWeight: 'bold' 
+                }}>
+                  {summary?.net_pnl_cents?.toFixed(2) ?? '—'}¢
+                </div>
+                <div style={{ color: '#666', fontSize: '10px' }}>Paper</div>
+              </div>
+              <div>
+                <div style={{ color: '#ff6b6b', fontSize: '18px', fontWeight: 'bold' }}>
+                  {liveRealizedNetCents !== null ? `${liveRealizedNetCents.toFixed(2)}¢` : '—'}
+                </div>
+                <div style={{ color: '#666', fontSize: '10px' }}>Live</div>
+              </div>
+            </div>
+          </div>
+          <div style={{ 
+            background: 'rgba(0,0,0,0.3)', 
+            padding: '10px', 
+            borderRadius: '6px',
+            textAlign: 'center'
+          }}>
+            <div style={{ color: '#888', fontSize: '11px', marginBottom: '4px' }}>成本总计</div>
+            <div style={{ display: 'flex', justifyContent: 'space-around' }}>
+              <div>
+                <div style={{ color: '#ffd93d', fontSize: '18px', fontWeight: 'bold' }}>
+                  {summary?.total_cost_cents?.toFixed(2) ?? '—'}¢
+                </div>
+                <div style={{ color: '#666', fontSize: '10px' }}>Paper</div>
+              </div>
+              <div>
+                <div style={{ color: '#ff6b6b', fontSize: '18px', fontWeight: 'bold' }}>—</div>
+                <div style={{ color: '#666', fontSize: '10px' }}>Live</div>
+              </div>
+            </div>
+          </div>
+          <div style={{ 
+            background: 'rgba(0,0,0,0.3)', 
+            padding: '10px', 
+            borderRadius: '6px',
+            textAlign: 'center'
+          }}>
+            <div style={{ color: '#888', fontSize: '11px', marginBottom: '4px' }}>最大回撤</div>
+            <div>
+              <div style={{ color: '#ff6b6b', fontSize: '18px', fontWeight: 'bold' }}>
+                {summary?.max_drawdown_cents?.toFixed(2) ?? '—'}¢
+              </div>
+              <div style={{ color: '#666', fontSize: '10px' }}>Paper 模拟</div>
+            </div>
+          </div>
+          <div style={{ 
+            background: 'rgba(0,0,0,0.3)', 
+            padding: '10px', 
+            borderRadius: '6px',
+            textAlign: 'center'
+          }}>
+            <div style={{ color: '#888', fontSize: '11px', marginBottom: '4px' }}>资金曲线</div>
+            <div style={{ display: 'flex', justifyContent: 'space-around' }}>
+              <div>
+                <div style={{ color: '#4ecdc4', fontSize: '14px', fontWeight: 'bold' }}>
+                  {(summary as any)?.peak_capital?.toFixed(2) ?? '20.00'}
+                </div>
+                <div style={{ color: '#666', fontSize: '10px' }}>峰值</div>
+              </div>
+              <div>
+                <div style={{ color: '#ff6b6b', fontSize: '14px', fontWeight: 'bold' }}>
+                  {(summary as any)?.final_capital?.toFixed(2) ?? '20.00'}
+                </div>
+                <div style={{ color: '#666', fontSize: '10px' }}>当前</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
       {strategySource === "live" ? (
         <section className="live-execution-wrap">
           <div className="info-cards compact live-kpi-grid">

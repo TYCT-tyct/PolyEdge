@@ -552,6 +552,10 @@ pub(super) struct StrategySimulationResult {
     // Fields for Kelly formula and circuit breaker
     avg_win_loss_ratio: f64,
     daily_drawdown_cents: f64,
+    circuit_break_triggered: bool,
+    circuit_break_at_trade: usize,
+    final_capital: f64,
+    peak_capital: f64,
 }
 
 
@@ -599,6 +603,8 @@ pub(super) fn strategy_cfg_json(cfg: &StrategyRuntimeConfig) -> Value {
         "paper_slippage_mult": cfg.paper_slippage_mult,
         "paper_latency_penalty_cents": cfg.paper_latency_penalty_cents,
         "paper_fill_rate_discount": cfg.paper_fill_rate_discount,
+        "paper_simulated_capital": cfg.paper_simulated_capital,
+        "paper_max_drawdown_pct": cfg.paper_max_drawdown_pct,
     })
 }
 
@@ -666,6 +672,11 @@ pub(super) fn strategy_paper_cost_model_json(
                 })
             },
             "impact_model": "execution_impact_cents(sample, side, cfg, remaining_ms, emergency)"
+        },
+        "circuit_breaker": {
+            "paper_simulated_capital": cfg.paper_simulated_capital,
+            "paper_max_drawdown_pct": cfg.paper_max_drawdown_pct,
+            "trigger_condition": "drawdown_pct > paper_max_drawdown_pct"
         }
     })
 }
@@ -1050,6 +1061,8 @@ pub(super) fn map_cfg_to_fev1(cfg: &StrategyRuntimeConfig) -> fev1::RuntimeConfi
         paper_slippage_mult: cfg.paper_slippage_mult,
         paper_latency_penalty_cents: cfg.paper_latency_penalty_cents,
         paper_fill_rate_discount: cfg.paper_fill_rate_discount,
+        paper_simulated_capital: cfg.paper_simulated_capital,
+        paper_max_drawdown_pct: cfg.paper_max_drawdown_pct,
     }
 }
 
@@ -1078,6 +1091,10 @@ pub(super) fn map_simulation_result(run: fev1::SimulationResult) -> StrategySimu
         net_margin_pct: run.net_margin_pct,
         avg_win_loss_ratio: run.avg_win_loss_ratio,
         daily_drawdown_cents: run.daily_drawdown_cents,
+        circuit_break_triggered: run.circuit_break_triggered,
+        circuit_break_at_trade: run.circuit_break_at_trade,
+        final_capital: run.final_capital,
+        peak_capital: run.peak_capital,
     }
 }
 

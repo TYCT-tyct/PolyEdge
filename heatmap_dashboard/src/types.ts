@@ -404,6 +404,11 @@ export interface StrategyPaperResponse {
     total_slippage_cents: number;
     net_margin_pct: number;
     max_drawdown_cents: number;
+    // Circuit breaker fields
+    circuit_break_triggered?: boolean;
+    circuit_break_at_trade?: number;
+    final_capital?: number;
+    peak_capital?: number;
   };
   live_execution?: {
     summary?: StrategyLiveExecutionSummary;
@@ -485,4 +490,36 @@ export interface StrategyPaperResponse {
   live_execute?: boolean;
   strategy_alias?: string;
   trades: StrategyPaperTrade[];
+}
+
+// Paper vs Live comparison response
+export interface StrategyComparisonResponse {
+  ok: boolean;
+  lookback_minutes: number;
+  generated_at_ms: number;
+  paper: {
+    trade_count: number;
+    win_rate_pct: number;
+    avg_pnl_cents: number;
+    net_pnl_cents: number;
+    gross_pnl_cents: number;
+    total_cost_cents: number;
+    max_drawdown_cents: number;
+    circuit_break_triggered: boolean;
+    circuit_break_at_trade: number;
+    final_capital: number;
+    peak_capital: number;
+  };
+  live: {
+    trade_count: number;
+    win_rate_pct: number;
+    avg_pnl_cents: number;
+    net_pnl_cents: number;
+    total_cost_cents: number;
+  };
+  comparison: {
+    cost_difference_cents: number;
+    pnl_difference_cents: number;
+    trade_count_ratio: number;
+  };
 }

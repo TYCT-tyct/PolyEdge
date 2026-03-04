@@ -264,6 +264,11 @@ pub(super) async fn strategy_paper(
                 "total_impact_cents": 0.0,
                 "net_margin_pct": 0.0,
                 "max_drawdown_cents": 0.0,
+                // Circuit breaker fields
+                "circuit_break_triggered": false,
+                "circuit_break_at_trade": 0,
+                "final_capital": cfg.paper_simulated_capital,
+                "peak_capital": cfg.paper_simulated_capital,
             },
             "trades": [],
         })));
@@ -314,6 +319,11 @@ pub(super) async fn strategy_paper(
             "blocked_exits": run.blocked_exits,
             "emergency_wide_exit_count": run.emergency_wide_exit_count,
             "execution_penalty_cents_total": run.execution_penalty_cents_total,
+            // Circuit breaker fields
+            "circuit_break_triggered": run.circuit_break_triggered,
+            "circuit_break_at_trade": run.circuit_break_at_trade,
+            "final_capital": run.final_capital,
+            "peak_capital": run.peak_capital,
         },
         "trades": run.trades,
     })))

@@ -106,6 +106,8 @@ pub struct RuntimeConfig {
     pub paper_slippage_mult: f64,
     pub paper_latency_penalty_cents: f64,
     pub paper_fill_rate_discount: f64,
+    pub paper_simulated_capital: f64,
+    pub paper_max_drawdown_pct: f64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -140,6 +142,10 @@ pub struct SimulationResult {
     // New fields for Kelly formula and circuit breaker
     pub avg_win_loss_ratio: f64,
     pub daily_drawdown_cents: f64,
+    pub circuit_break_triggered: bool,
+    pub circuit_break_at_trade: usize,
+    pub final_capital: f64,
+    pub peak_capital: f64,
 }
 
 fn decision_id(action: &str, side: Side, round_id: &str, ts_ms: i64) -> String {
@@ -494,6 +500,33 @@ fn max_drawdown_from_pnls(pnls: &[f64]) -> f64 {
     max_dd.max(0.0)
 }
 
+fn update_paper_circuit_break_state(
+    net_pnl_cents: f64,
+    drawdown_limit_pct: f64,
+    simulated_capital: &mut f64,
+    peak_capital: &mut f64,
+    circuit_break_triggered: &mut bool,
+    circuit_break_at_trade: &mut usize,
+    trade_number: usize,
+) -> bool {
+    *simulated_capital = (*simulated_capital + net_pnl_cents / 100.0).max(0.0);
+    if *simulated_capital > *peak_capital {
+        *peak_capital = *simulated_capital;
+    }
+    if *peak_capital <= 0.0 {
+        return false;
+    }
+    let drawdown_pct = ((*peak_capital - *simulated_capital) / *peak_capital) * 100.0;
+    if drawdown_pct > drawdown_limit_pct {
+        if !*circuit_break_triggered {
+            *circuit_break_triggered = true;
+            *circuit_break_at_trade = trade_number;
+        }
+        return *circuit_break_at_trade == trade_number;
+    }
+    false
+}
+
 #[allow(dead_code)]
 pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> SimulationResult {
     simulate_with_fee_context(samples, cfg, max_trades, None)
@@ -515,6 +548,11 @@ pub fn simulate_with_fee_context(
     let mut blocked_exits = 0usize;
     let mut emergency_wide_exit_count = 0usize;
     let mut execution_penalty_cents_total = 0.0;
+    let mut simulated_capital = cfg.paper_simulated_capital.max(0.0);
+    let mut peak_capital = simulated_capital;
+    let drawdown_limit_pct = cfg.paper_max_drawdown_pct.max(0.0);
+    let mut circuit_break_triggered = false;
+    let mut circuit_break_at_trade = 0usize;
 
     let mut trade_id = 1_i64;
     let mut last_score = 0.0;
@@ -705,6 +743,16 @@ pub fn simulate_with_fee_context(
                 } else {
                     loss_cluster_streak = 0;
                 }
+                let trade_number = trade_id.max(0) as usize;
+                let trade_hit_circuit_break = update_paper_circuit_break_state(
+                    net_pnl,
+                    drawdown_limit_pct,
+                    &mut simulated_capital,
+                    &mut peak_capital,
+                    &mut circuit_break_triggered,
+                    &mut circuit_break_at_trade,
+                    trade_number,
+                );
                 trades.push(json!({
                     "id": trade_id,
                     "side": pos.side.as_str(),
@@ -737,6 +785,7 @@ pub fn simulate_with_fee_context(
                     "exec_fill_ok": can_fill,
                     "exit_spread_cents": spread_side_cents,
                     "loss_cluster_streak_after_exit": loss_cluster_streak,
+                    "circuit_break": trade_hit_circuit_break,
                 }));
                 let final_reason = if escalated_for_blocked_exit {
                     "blocked_exit_escalation"
@@ -780,6 +829,9 @@ pub fn simulate_with_fee_context(
                 trade_id += 1;
                 position = None;
                 last_exit_ts_ms = sample.ts_ms;
+                if trade_hit_circuit_break {
+                    break;
+                }
             }
         } else {
             let ask_raw = side_ask(sample, side) * 100.0;
@@ -941,6 +993,16 @@ pub fn simulate_with_fee_context(
         let net_pnl = exit_exec - pos.entry_price_cents;
         let gross_pnl = bid_raw - pos.entry_price_raw_cents;
         let total_cost = (gross_pnl - net_pnl).max(0.0);
+        let trade_number = trade_id.max(0) as usize;
+        let trade_hit_circuit_break = update_paper_circuit_break_state(
+            net_pnl,
+            drawdown_limit_pct,
+            &mut simulated_capital,
+            &mut peak_capital,
+            &mut circuit_break_triggered,
+            &mut circuit_break_at_trade,
+            trade_number,
+        );
         trades.push(json!({
             "id": trade_id,
             "side": pos.side.as_str(),
@@ -971,7 +1033,8 @@ pub fn simulate_with_fee_context(
             "entry_reason": "fev1_signal_entry",
             "exit_reason": "end_of_samples_force_close",
             "exec_fill_ok": true,
-            "exit_spread_cents": side_spread(last, pos.side) * 100.0
+            "exit_spread_cents": side_spread(last, pos.side) * 100.0,
+            "circuit_break": trade_hit_circuit_break
         }));
     }
 
@@ -1161,6 +1224,10 @@ pub fn simulate_with_fee_context(
         net_margin_pct,
         avg_win_loss_ratio,
         daily_drawdown_cents,
+        circuit_break_triggered,
+        circuit_break_at_trade,
+        final_capital: simulated_capital,
+        peak_capital,
     }
 }
 
@@ -1213,6 +1280,8 @@ mod tests {
             paper_slippage_mult: 1.0,
             paper_latency_penalty_cents: 0.0,
             paper_fill_rate_discount: 0.0,
+            paper_simulated_capital: 20.0,
+            paper_max_drawdown_pct: 15.0,
         };
         let mut samples = vec![
             // Build confirmation history and open one UP position.
@@ -1390,6 +1459,8 @@ mod tests {
             paper_slippage_mult: 1.0,
             paper_latency_penalty_cents: 0.0,
             paper_fill_rate_discount: 0.0,
+            paper_simulated_capital: 20.0,
+            paper_max_drawdown_pct: 15.0,
         };
 
         let mut samples = vec![
@@ -1532,6 +1603,8 @@ mod tests {
             paper_slippage_mult: 1.0,
             paper_latency_penalty_cents: 0.0,
             paper_fill_rate_discount: 0.0,
+            paper_simulated_capital: 20.0,
+            paper_max_drawdown_pct: 15.0,
         };
 
         let mut samples = vec![
@@ -1694,6 +1767,8 @@ mod tests {
             paper_slippage_mult: 1.0,
             paper_latency_penalty_cents: 0.0,
             paper_fill_rate_discount: 0.0,
+            paper_simulated_capital: 20.0,
+            paper_max_drawdown_pct: 15.0,
         };
 
         // Keep trend strongly UP, but make p_up slightly above fair value:

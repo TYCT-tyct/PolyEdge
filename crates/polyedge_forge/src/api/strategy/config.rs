@@ -579,6 +579,8 @@ pub(super) fn strategy_backup_baseline_config() -> StrategyRuntimeConfig {
         paper_slippage_mult: 1.5,
         paper_latency_penalty_cents: 0.3,
         paper_fill_rate_discount: 0.05,
+        paper_simulated_capital: 20.0,
+        paper_max_drawdown_pct: 15.0,
     }
 }
 
@@ -626,6 +628,8 @@ fn strategy_profit_max_config() -> StrategyRuntimeConfig {
         paper_slippage_mult: 1.5,
         paper_latency_penalty_cents: 0.3,
         paper_fill_rate_discount: 0.05,
+        paper_simulated_capital: 20.0,
+        paper_max_drawdown_pct: 15.0,
     }
 }
 
@@ -673,6 +677,8 @@ fn strategy_hi_freq_config() -> StrategyRuntimeConfig {
         paper_slippage_mult: 1.5,
         paper_latency_penalty_cents: 0.3,
         paper_fill_rate_discount: 0.05,
+        paper_simulated_capital: 20.0,
+        paper_max_drawdown_pct: 15.0,
     }
 }
 
@@ -720,6 +726,8 @@ fn strategy_hi_win_config() -> StrategyRuntimeConfig {
         paper_slippage_mult: 1.5,
         paper_latency_penalty_cents: 0.3,
         paper_fill_rate_discount: 0.05,
+        paper_simulated_capital: 20.0,
+        paper_max_drawdown_pct: 15.0,
     }
 }
 
@@ -767,6 +775,8 @@ fn strategy_balanced_config() -> StrategyRuntimeConfig {
         paper_slippage_mult: 1.5,
         paper_latency_penalty_cents: 0.3,
         paper_fill_rate_discount: 0.05,
+        paper_simulated_capital: 20.0,
+        paper_max_drawdown_pct: 15.0,
     }
 }
 
@@ -814,6 +824,8 @@ fn strategy_cand_growth_mix_config() -> StrategyRuntimeConfig {
         paper_slippage_mult: 1.5,
         paper_latency_penalty_cents: 0.3,
         paper_fill_rate_discount: 0.05,
+        paper_simulated_capital: 20.0,
+        paper_max_drawdown_pct: 15.0,
     }
 }
 
