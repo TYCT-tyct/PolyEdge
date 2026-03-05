@@ -227,6 +227,7 @@ pub(super) fn strategy_sample_from_snapshot_event(
 pub(super) struct StrategySimulationResult {
     current: Value,
     trades: Vec<Value>,
+    all_trade_pnls: Vec<f64>,
     signal_decisions: Vec<Value>,
     trade_count: usize,
     win_rate_pct: f64,
@@ -246,6 +247,115 @@ pub(super) struct StrategySimulationResult {
     total_impact_cents: f64,
     total_cost_cents: f64,
     net_margin_pct: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RollingStats {
+    window_trades: usize,
+    windows: usize,
+    latest_win_rate_pct: f64,
+    avg_win_rate_pct: f64,
+    min_win_rate_pct: f64,
+    latest_avg_pnl_cents: f64,
+}
+
+pub(super) fn compute_rolling_stats(pnls: &[f64], window_trades: usize) -> RollingStats {
+    let w = window_trades.max(1);
+    if pnls.len() < w {
+        return RollingStats {
+            window_trades: w,
+            windows: 0,
+            latest_win_rate_pct: 0.0,
+            avg_win_rate_pct: 0.0,
+            min_win_rate_pct: 0.0,
+            latest_avg_pnl_cents: 0.0,
+        };
+    }
+
+    let mut win_sum = 0usize;
+    let mut pnl_sum = 0.0_f64;
+    for v in &pnls[..w] {
+        if *v > 0.0 {
+            win_sum += 1;
+        }
+        pnl_sum += *v;
+    }
+
+    let mut windows = 0usize;
+    let mut acc_win_rate = 0.0_f64;
+    let mut min_win_rate = 100.0_f64;
+    let mut latest_win_rate = 0.0_f64;
+    let mut latest_avg_pnl = 0.0_f64;
+    for end in (w - 1)..pnls.len() {
+        if end >= w {
+            let out = pnls[end - w];
+            if out > 0.0 {
+                win_sum = win_sum.saturating_sub(1);
+            }
+            pnl_sum -= out;
+            let incoming = pnls[end];
+            if incoming > 0.0 {
+                win_sum += 1;
+            }
+            pnl_sum += incoming;
+        }
+        let wr = (win_sum as f64) * 100.0 / w as f64;
+        let ap = pnl_sum / w as f64;
+        windows += 1;
+        acc_win_rate += wr;
+        if wr < min_win_rate {
+            min_win_rate = wr;
+        }
+        latest_win_rate = wr;
+        latest_avg_pnl = ap;
+    }
+
+    RollingStats {
+        window_trades: w,
+        windows,
+        latest_win_rate_pct: latest_win_rate,
+        avg_win_rate_pct: if windows > 0 {
+            acc_win_rate / windows as f64
+        } else {
+            0.0
+        },
+        min_win_rate_pct: if windows > 0 { min_win_rate } else { 0.0 },
+        latest_avg_pnl_cents: latest_avg_pnl,
+    }
+}
+
+pub(super) fn rolling_stats_json(rs: RollingStats) -> Value {
+    json!({
+        "window_trades": rs.window_trades,
+        "windows": rs.windows,
+        "latest_win_rate_pct": rs.latest_win_rate_pct,
+        "avg_win_rate_pct": rs.avg_win_rate_pct,
+        "min_win_rate_pct": rs.min_win_rate_pct,
+        "latest_avg_pnl_cents": rs.latest_avg_pnl_cents,
+    })
+}
+
+pub(super) fn run_summary_json(run: &StrategySimulationResult) -> Value {
+    json!({
+        "trade_count": run.trade_count,
+        "win_rate_pct": run.win_rate_pct,
+        "avg_pnl_cents": run.avg_pnl_cents,
+        "avg_duration_s": run.avg_duration_s,
+        "total_pnl_cents": run.total_pnl_cents,
+        "net_pnl_cents": run.net_pnl_cents,
+        "gross_pnl_cents": run.gross_pnl_cents,
+        "total_cost_cents": run.total_cost_cents,
+        "total_entry_fee_cents": run.total_entry_fee_cents,
+        "total_exit_fee_cents": run.total_exit_fee_cents,
+        "total_slippage_cents": run.total_slippage_cents,
+        "total_impact_cents": run.total_impact_cents,
+        "net_margin_pct": run.net_margin_pct,
+        "max_drawdown_cents": run.max_drawdown_cents,
+        "max_profit_trade_cents": run.max_profit_trade_cents,
+        "blocked_exits": run.blocked_exits,
+        "emergency_wide_exit_count": run.emergency_wide_exit_count,
+        "execution_penalty_cents_total": run.execution_penalty_cents_total,
+    })
 }
 
 
@@ -289,6 +399,273 @@ pub(super) fn strategy_cfg_json(cfg: &StrategyRuntimeConfig) -> Value {
         "vic_edge_relax_max": cfg.vic_edge_relax_max,
         "vic_spread_relax_max": cfg.vic_spread_relax_max,
     })
+}
+
+pub(super) fn strategy_cfg_from_payload(
+    base: StrategyRuntimeConfig,
+    payload: &Value,
+) -> StrategyRuntimeConfig {
+    let mut c = base;
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("entry_threshold_base"))
+        .and_then(Value::as_f64)
+    {
+        c.entry_threshold_base = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("entry_threshold_cap"))
+        .and_then(Value::as_f64)
+    {
+        c.entry_threshold_cap = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("spread_limit_prob"))
+        .and_then(Value::as_f64)
+    {
+        c.spread_limit_prob = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("entry_edge_prob"))
+        .and_then(Value::as_f64)
+    {
+        c.entry_edge_prob = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("entry_min_potential_cents"))
+        .and_then(Value::as_f64)
+    {
+        c.entry_min_potential_cents = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("entry_max_price_cents"))
+        .and_then(Value::as_f64)
+    {
+        c.entry_max_price_cents = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("min_hold_ms"))
+        .and_then(Value::as_i64)
+    {
+        c.min_hold_ms = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("stop_loss_cents"))
+        .and_then(Value::as_f64)
+    {
+        c.stop_loss_cents = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("reverse_signal_threshold"))
+        .and_then(Value::as_f64)
+    {
+        c.reverse_signal_threshold = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("reverse_signal_ticks"))
+        .and_then(Value::as_u64)
+    {
+        c.reverse_signal_ticks = v as usize;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("trail_activate_profit_cents"))
+        .and_then(Value::as_f64)
+    {
+        c.trail_activate_profit_cents = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("trail_drawdown_cents"))
+        .and_then(Value::as_f64)
+    {
+        c.trail_drawdown_cents = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("take_profit_near_max_cents"))
+        .and_then(Value::as_f64)
+    {
+        c.take_profit_near_max_cents = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("endgame_take_profit_cents"))
+        .and_then(Value::as_f64)
+    {
+        c.endgame_take_profit_cents = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("endgame_remaining_ms"))
+        .and_then(Value::as_i64)
+    {
+        c.endgame_remaining_ms = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("liquidity_widen_prob"))
+        .and_then(Value::as_f64)
+    {
+        c.liquidity_widen_prob = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("cooldown_ms"))
+        .and_then(Value::as_i64)
+    {
+        c.cooldown_ms = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("max_entries_per_round"))
+        .and_then(Value::as_u64)
+    {
+        c.max_entries_per_round = v as usize;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("max_exec_spread_cents"))
+        .and_then(Value::as_f64)
+    {
+        c.max_exec_spread_cents = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("slippage_cents_per_side"))
+        .and_then(Value::as_f64)
+    {
+        c.slippage_cents_per_side = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("fee_cents_per_side"))
+        .and_then(Value::as_f64)
+    {
+        c.fee_cents_per_side = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("emergency_wide_spread_penalty_ratio"))
+        .and_then(Value::as_f64)
+    {
+        c.emergency_wide_spread_penalty_ratio = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("stop_loss_grace_ticks"))
+        .and_then(Value::as_u64)
+    {
+        c.stop_loss_grace_ticks = v as usize;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("stop_loss_hard_mult"))
+        .and_then(Value::as_f64)
+    {
+        c.stop_loss_hard_mult = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("stop_loss_reverse_extra_ticks"))
+        .and_then(Value::as_u64)
+    {
+        c.stop_loss_reverse_extra_ticks = v as usize;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("loss_cluster_limit"))
+        .and_then(Value::as_u64)
+    {
+        c.loss_cluster_limit = v as usize;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("loss_cluster_cooldown_ms"))
+        .and_then(Value::as_i64)
+    {
+        c.loss_cluster_cooldown_ms = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("noise_gate_enabled"))
+        .and_then(Value::as_bool)
+    {
+        c.noise_gate_enabled = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("noise_gate_threshold_add"))
+        .and_then(Value::as_f64)
+    {
+        c.noise_gate_threshold_add = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("noise_gate_edge_add"))
+        .and_then(Value::as_f64)
+    {
+        c.noise_gate_edge_add = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("noise_gate_spread_scale"))
+        .and_then(Value::as_f64)
+    {
+        c.noise_gate_spread_scale = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("vic_enabled"))
+        .and_then(Value::as_bool)
+    {
+        c.vic_enabled = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("vic_target_entries_per_hour"))
+        .and_then(Value::as_f64)
+    {
+        c.vic_target_entries_per_hour = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("vic_deadband_ratio"))
+        .and_then(Value::as_f64)
+    {
+        c.vic_deadband_ratio = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("vic_threshold_relax_max"))
+        .and_then(Value::as_f64)
+    {
+        c.vic_threshold_relax_max = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("vic_edge_relax_max"))
+        .and_then(Value::as_f64)
+    {
+        c.vic_edge_relax_max = v;
+    }
+    if let Some(v) = payload
+        .get("config")
+        .and_then(|v| v.get("vic_spread_relax_max"))
+        .and_then(Value::as_f64)
+    {
+        c.vic_spread_relax_max = v;
+    }
+    c
 }
 
 pub(super) fn strategy_paper_cost_model_json(
@@ -610,6 +987,115 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
     }))
 }
 
+pub(super) fn profit_factor(pnls: &[f64]) -> f64 {
+    let mut gross_win = 0.0_f64;
+    let mut gross_loss = 0.0_f64;
+    for v in pnls {
+        if *v > 0.0 {
+            gross_win += *v;
+        } else if *v < 0.0 {
+            gross_loss += v.abs();
+        }
+    }
+    if gross_loss <= 1e-9 {
+        if gross_win > 0.0 {
+            return 9.0;
+        }
+        return 0.0;
+    }
+    gross_win / gross_loss
+}
+
+pub(super) fn loss_tail_penalty(pnls: &[f64]) -> f64 {
+    if pnls.len() < 20 {
+        return 0.0;
+    }
+    let mut sorted = pnls.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let tail_n = (sorted.len() / 10).max(3);
+    let tail = &sorted[..tail_n];
+    let tail_avg = tail.iter().copied().sum::<f64>() / tail_n as f64;
+    tail_avg.abs() * 2.4
+}
+
+pub(super) fn side_loss_penalty(trades: &[Value]) -> f64 {
+    let mut up_n = 0usize;
+    let mut up_w = 0usize;
+    let mut up_p = 0.0_f64;
+    let mut dn_n = 0usize;
+    let mut dn_w = 0usize;
+    for t in trades {
+        let side = t.get("side").and_then(Value::as_str).unwrap_or_default();
+        let pnl = row_f64(t, "pnl_cents").unwrap_or(0.0);
+        if side == "UP" {
+            up_n = up_n.saturating_add(1);
+            up_p += pnl;
+            if pnl > 0.0 {
+                up_w = up_w.saturating_add(1);
+            }
+        } else if side == "DOWN" {
+            dn_n = dn_n.saturating_add(1);
+            if pnl > 0.0 {
+                dn_w = dn_w.saturating_add(1);
+            }
+        }
+    }
+    if up_n < 12 || dn_n < 12 {
+        return 0.0;
+    }
+    let up_wr = up_w as f64 * 100.0 / up_n as f64;
+    let dn_wr = dn_w as f64 * 100.0 / dn_n as f64;
+    let up_avg = up_p / up_n as f64;
+    let mut penalty = 0.0_f64;
+    if dn_wr > up_wr + 8.0 {
+        penalty += (dn_wr - up_wr - 8.0) * 2.1;
+    }
+    if up_wr < 55.0 {
+        penalty += (55.0 - up_wr) * 1.4;
+    }
+    if up_avg < 0.0 {
+        penalty += up_avg.abs() * 22.0;
+    }
+    penalty
+}
+
+pub(super) fn split_samples_by_round(
+    samples: &[StrategySample],
+    valid_ratio: f64,
+) -> (Vec<StrategySample>, Vec<StrategySample>) {
+    if samples.len() < 200 {
+        return (samples.to_vec(), Vec::new());
+    }
+    let mut rounds: Vec<String> = Vec::new();
+    let mut seen = HashSet::<String>::new();
+    for s in samples {
+        if seen.insert(s.round_id.clone()) {
+            rounds.push(s.round_id.clone());
+        }
+    }
+    if rounds.len() < 8 {
+        return (samples.to_vec(), Vec::new());
+    }
+    let valid_rounds = ((rounds.len() as f64) * valid_ratio.clamp(0.1, 0.5)).round() as usize;
+    let valid_rounds = valid_rounds.clamp(2, rounds.len().saturating_sub(2));
+    let split_idx = rounds.len().saturating_sub(valid_rounds);
+    let valid_set: HashSet<String> = rounds[split_idx..].iter().cloned().collect();
+
+    let mut train = Vec::<StrategySample>::with_capacity(samples.len());
+    let mut valid = Vec::<StrategySample>::with_capacity(samples.len() / 3);
+    for s in samples {
+        if valid_set.contains(&s.round_id) {
+            valid.push(s.clone());
+        } else {
+            train.push(s.clone());
+        }
+    }
+    if train.len() < 200 || valid.len() < 120 {
+        return (samples.to_vec(), Vec::new());
+    }
+    (train, valid)
+}
+
 pub(super) fn map_sample_to_fev1(s: &StrategySample) -> fev1::Sample {
     fev1::Sample {
         ts_ms: s.ts_ms,
@@ -681,6 +1167,7 @@ pub(super) fn map_simulation_result(run: fev1::SimulationResult) -> StrategySimu
     StrategySimulationResult {
         current: run.current,
         trades: run.trades,
+        all_trade_pnls: run.all_trade_pnls,
         signal_decisions: run.signal_decisions,
         trade_count: run.trade_count,
         win_rate_pct: run.win_rate_pct,

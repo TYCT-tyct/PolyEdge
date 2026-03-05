@@ -705,3 +705,117 @@ pub(super) async fn strategy_live_events(
         "events": filtered
     })))
 }
+
+pub(super) async fn strategy_autotune_latest(
+    State(state): State<ApiState>,
+    Query(params): Query<StrategyAutotuneLatestQueryParams>,
+) -> Result<Json<Value>, ApiError> {
+    let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
+    let symbol = resolve_strategy_symbol(params.symbol.as_deref())?;
+    let context = normalize_autotune_context(params.context.as_deref(), market_type, symbol);
+    let (payload, key, _) = resolve_autotune_doc(&state, &context, market_type).await?;
+    let (active_payload, active_key) = resolve_autotune_active_doc(&state, market_type, symbol).await?;
+    let (live_payload, live_key) = resolve_autotune_live_doc(&state, market_type, symbol).await?;
+    Ok(Json(json!({
+        "market_type": market_type,
+        "symbol": symbol,
+        "context": context,
+        "key": key,
+        "found": payload.is_some(),
+        "data": payload,
+        "active_key": active_key,
+        "active_found": active_payload.is_some(),
+        "active_data": active_payload,
+        "live_key": live_key,
+        "live_found": live_payload.is_some(),
+        "live_data": live_payload,
+    })))
+}
+
+pub(super) async fn strategy_autotune_history(
+    State(state): State<ApiState>,
+    Query(params): Query<StrategyAutotuneHistoryQueryParams>,
+) -> Result<Json<Value>, ApiError> {
+    let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
+    let symbol = resolve_strategy_symbol(params.symbol.as_deref())?;
+    let context = normalize_autotune_context(params.context.as_deref(), market_type, symbol);
+    let limit = params.limit.unwrap_or(20).clamp(1, 200) as usize;
+    let active_key = strategy_autotune_active_history_key(&state.redis_prefix, market_type, symbol);
+    let mut items = read_key_value(&state, &active_key)
+        .await?
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    let candidate_key = strategy_autotune_history_key(&state.redis_prefix, &context);
+    let (key_used, source_used) = if items.is_empty() {
+        items = read_key_value(&state, &candidate_key)
+            .await?
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        (candidate_key, "candidate_context")
+    } else {
+        (active_key, "active_promotions")
+    };
+    if items.len() > limit {
+        items.truncate(limit);
+    }
+    Ok(Json(json!({
+        "market_type": market_type,
+        "symbol": symbol,
+        "context": context,
+        "key": key_used,
+        "source": source_used,
+        "limit": limit,
+        "count": items.len(),
+        "items": items,
+    })))
+}
+
+pub(super) async fn strategy_autotune_set(
+    State(state): State<ApiState>,
+    Json(body): Json<StrategyAutotuneSetBody>,
+) -> Result<Json<Value>, ApiError> {
+    let market_type = resolve_strategy_market_type(body.market_type.as_deref())?;
+    let symbol = resolve_strategy_symbol(body.symbol.as_deref())?;
+    let context = normalize_autotune_context(body.context.as_deref(), market_type, symbol);
+    let key = strategy_autotune_key(&state.redis_prefix, &context);
+    let history_key = strategy_autotune_history_key(&state.redis_prefix, &context);
+    let (previous, previous_key, _) = resolve_autotune_doc(&state, &context, market_type).await?;
+
+    let wrapped = json!({ "config": body.config });
+    let cfg = strategy_cfg_from_payload(StrategyRuntimeConfig::default(), &wrapped);
+    let saved_doc = json!({
+        "saved_at_ms": Utc::now().timestamp_millis(),
+        "market_type": market_type,
+        "symbol": symbol,
+        "context": context.clone(),
+        "source": body.source.unwrap_or_else(|| "manual".to_string()),
+        "note": body.note.unwrap_or_default(),
+        "config": strategy_cfg_json(&cfg),
+    });
+
+    write_key_value(&state, &key, &saved_doc, body.ttl_sec.filter(|v| *v > 0)).await?;
+
+    let mut history: Vec<Value> = read_key_value(&state, &history_key)
+        .await?
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    if let Some(prev) = previous.clone() {
+        history.insert(0, prev);
+    }
+    if history.len() > 40 {
+        history.truncate(40);
+    }
+    let _ = write_key_value(&state, &history_key, &Value::Array(history), None).await;
+
+    Ok(Json(json!({
+        "ok": true,
+        "market_type": market_type,
+        "symbol": symbol,
+        "context": context,
+        "key": key,
+        "history_key": history_key,
+        "previous_found": previous.is_some(),
+        "previous_key": previous_key,
+        "saved": saved_doc,
+    })))
+}

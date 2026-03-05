@@ -97,6 +97,7 @@ pub struct FeeModelContext {
 pub struct SimulationResult {
     pub current: Value,
     pub trades: Vec<Value>,
+    pub all_trade_pnls: Vec<f64>,
     pub signal_decisions: Vec<Value>,
     pub trade_count: usize,
     pub win_rate_pct: f64,
@@ -997,6 +998,7 @@ pub fn simulate_with_fee_context(
     SimulationResult {
         current,
         trades: trades_view,
+        all_trade_pnls,
         signal_decisions,
         trade_count,
         win_rate_pct,

@@ -2390,6 +2390,56 @@ fn parse_strategy_paper_source(raw: Option<&str>) -> StrategyPaperSource {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct StrategyOptimizeQueryParams {
+    market_type: Option<String>,
+    symbol: Option<String>,
+    autotune_context: Option<String>,
+    lookback_minutes: Option<u32>,
+    max_points: Option<u32>,
+    max_samples: Option<u32>,
+    max_trades: Option<u32>,
+    full_history: Option<bool>,
+    max_arms: Option<u32>,
+    window_trades: Option<u32>,
+    target_win_rate: Option<f64>,
+    iterations: Option<u32>,
+    seed: Option<u64>,
+    recent_lookback_minutes: Option<u32>,
+    recent_weight: Option<f64>,
+    persist_best: Option<bool>,
+    persist_ttl_sec: Option<u32>,
+    promote_min_trades: Option<f64>,
+    promote_min_win_rate: Option<f64>,
+    promote_min_pnl: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StrategyAutotuneLatestQueryParams {
+    market_type: Option<String>,
+    symbol: Option<String>,
+    context: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StrategyAutotuneHistoryQueryParams {
+    market_type: Option<String>,
+    symbol: Option<String>,
+    context: Option<String>,
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StrategyAutotuneSetBody {
+    market_type: Option<String>,
+    symbol: Option<String>,
+    context: Option<String>,
+    config: Value,
+    ttl_sec: Option<u32>,
+    source: Option<String>,
+    note: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct ServiceHealth {
     enabled: bool,
@@ -2543,6 +2593,16 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         .route("/api/heatmap", get(heatmap))
         .route("/api/accuracy_series", get(accuracy_series))
         .route("/api/strategy/paper", get(strategy_paper))
+        .route("/api/strategy/optimize", get(strategy_optimize))
+        .route(
+            "/api/strategy/autotune/latest",
+            get(strategy_autotune_latest),
+        )
+        .route(
+            "/api/strategy/autotune/history",
+            get(strategy_autotune_history),
+        )
+        .route("/api/strategy/autotune/set", post(strategy_autotune_set))
         .route("/api/strategy/live/reset", post(strategy_live_reset))
         .route("/api/strategy/live/control", post(strategy_live_control))
         .route("/api/strategy/live/events", get(strategy_live_events))

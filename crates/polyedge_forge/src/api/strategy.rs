@@ -87,3 +87,5 @@ struct StrategyRuntimeStreamState {
 include!("strategy/config.rs");
 include!("strategy/runtime.rs");
 include!("strategy/handlers.rs");
+include!("strategy/optimize.rs");
+include!("strategy/autotune.rs");
