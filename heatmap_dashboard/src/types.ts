@@ -81,7 +81,7 @@ export interface StatsResponse {
 }
 
 export interface CollectorTimeframeStatus {
-  status: "ok" | "lagging" | "stalled" | "missing";
+  status: "ok" | "lagging" | "stalled" | "missing" | "disabled";
   timestamp_ms: number | null;
   age_ms: number | null;
   remaining_ms: number | null;

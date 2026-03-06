@@ -611,6 +611,72 @@ fn normalize_collector_symbol(raw: Option<&str>) -> String {
     }
 }
 
+fn configured_collector_scopes() -> HashMap<String, HashSet<String>> {
+    let active_symbols = std::env::var("FORGE_ACTIVE_SYMBOLS")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(|s| normalize_collector_symbol(Some(s)))
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            vec![
+                "BTCUSDT".to_string(),
+                "ETHUSDT".to_string(),
+                "SOLUSDT".to_string(),
+                "XRPUSDT".to_string(),
+            ]
+        });
+    let active_tfs = std::env::var("FORGE_ACTIVE_TFS")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .filter_map(normalize_market_type)
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| vec!["5m".to_string(), "15m".to_string()]);
+
+    let mut by_symbol: HashMap<String, HashSet<String>> = HashMap::new();
+    for symbol in &active_symbols {
+        by_symbol.insert(symbol.clone(), active_tfs.iter().cloned().collect());
+    }
+
+    if let Ok(raw) = std::env::var("FORGE_ACTIVE_SYMBOL_TIMEFRAMES") {
+        let mut custom: HashMap<String, HashSet<String>> = HashMap::new();
+        for entry in raw.split(',') {
+            let item = entry.trim();
+            let Some((symbol_raw, tfs_raw)) = item.split_once(':') else {
+                continue;
+            };
+            let symbol = normalize_collector_symbol(Some(symbol_raw));
+            let tfs = tfs_raw
+                .split('|')
+                .filter_map(normalize_market_type)
+                .map(|s| s.to_string())
+                .collect::<HashSet<_>>();
+            if !symbol.is_empty() && !tfs.is_empty() {
+                custom.insert(symbol, tfs);
+            }
+        }
+        if !custom.is_empty() {
+            by_symbol = custom;
+        }
+    }
+
+    by_symbol
+}
+
+fn collector_scope_enabled(symbol: &str, timeframe: &str) -> bool {
+    configured_collector_scopes()
+        .get(&normalize_collector_symbol(Some(symbol)))
+        .map(|set| set.contains(&timeframe.to_ascii_lowercase()))
+        .unwrap_or(false)
+}
+
 fn collector_timeframe_status_row(snapshot: Option<&Value>, now_ms: i64) -> (bool, Value) {
     match snapshot {
         Some(row) => {
@@ -668,6 +734,19 @@ fn collector_timeframe_status_row(snapshot: Option<&Value>, now_ms: i64) -> (boo
             }),
         ),
     }
+}
+
+fn collector_timeframe_disabled_row() -> Value {
+    json!({
+        "status": "disabled",
+        "timestamp_ms": Value::Null,
+        "age_ms": Value::Null,
+        "remaining_ms": Value::Null,
+        "round_id": "",
+        "tokyo_relay_proc_lag_ms": Value::Null,
+        "cross_region_net_lag_ms": Value::Null,
+        "path_lag_ms": Value::Null,
+    })
 }
 
 async fn fetch_collector_window_metrics(
@@ -770,6 +849,10 @@ pub(super) async fn collector_status(
     let mut overall_ok = true;
 
     for tf in ["5m", "15m"] {
+        if !collector_scope_enabled(&symbol, tf) {
+            tf_map.insert(tf.to_string(), collector_timeframe_disabled_row());
+            continue;
+        }
         let snapshot = match fetch_latest_snapshot(&state, &symbol, tf).await? {
             Some(v) => Some(v),
             None => fetch_latest_snapshot_from_clickhouse(&state, &symbol, tf, now_ms).await?,
@@ -799,6 +882,14 @@ pub(super) async fn collector_metrics(
     let mut overall_ok = true;
 
     for tf in ["5m", "15m"] {
+        if !collector_scope_enabled(&symbol, tf) {
+            let mut status_value = collector_timeframe_disabled_row();
+            if let Some(status_obj) = status_value.as_object_mut() {
+                status_obj.insert("window".to_string(), Value::Null);
+            }
+            tf_map.insert(tf.to_string(), status_value);
+            continue;
+        }
         let snapshot = match fetch_latest_snapshot(&state, &symbol, tf).await? {
             Some(v) => Some(v),
             None => fetch_latest_snapshot_from_clickhouse(&state, &symbol, tf, now_ms).await?,
@@ -830,24 +921,33 @@ pub(super) async fn source_health(
 ) -> Result<Json<Value>, ApiError> {
     let now_ms = Utc::now().timestamp_millis();
     let window_ms = i64::from(params.window_sec.unwrap_or(180).clamp(60, 900)) * 1000;
-    const SYMBOLS: [&str; 4] = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"];
-
+    let scopes = configured_collector_scopes();
+    let mut symbols = scopes.keys().cloned().collect::<Vec<_>>();
+    symbols.sort();
     let mut overall_ok = true;
-    let mut rows = Vec::with_capacity(SYMBOLS.len());
-    for symbol in SYMBOLS {
+    let mut rows = Vec::with_capacity(symbols.len());
+    for symbol in symbols {
         let mut tf_map = serde_json::Map::new();
         let mut symbol_ok = true;
         for tf in ["5m", "15m"] {
-            let snapshot = match fetch_latest_snapshot(&state, symbol, tf).await? {
+            if !collector_scope_enabled(&symbol, tf) {
+                let mut status_value = collector_timeframe_disabled_row();
+                if let Some(status_obj) = status_value.as_object_mut() {
+                    status_obj.insert("window".to_string(), Value::Null);
+                }
+                tf_map.insert(tf.to_string(), status_value);
+                continue;
+            }
+            let snapshot = match fetch_latest_snapshot(&state, &symbol, tf).await? {
                 Some(v) => Some(v),
-                None => fetch_latest_snapshot_from_clickhouse(&state, symbol, tf, now_ms).await?,
+                None => fetch_latest_snapshot_from_clickhouse(&state, &symbol, tf, now_ms).await?,
             };
             let (tf_ok, mut status_value) =
                 collector_timeframe_status_row(snapshot.as_ref(), now_ms);
             symbol_ok &= tf_ok;
             if let Some(status_obj) = status_value.as_object_mut() {
                 let window_metrics =
-                    fetch_collector_window_metrics(&state, symbol, tf, now_ms, window_ms).await?;
+                    fetch_collector_window_metrics(&state, &symbol, tf, now_ms, window_ms).await?;
                 status_obj.insert("window".to_string(), window_metrics.unwrap_or(Value::Null));
             }
             tf_map.insert(tf.to_string(), status_value);
