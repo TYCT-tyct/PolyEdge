@@ -146,6 +146,7 @@ Environment=FORGE_BOOK_QUEUE_CAP=32768
 Environment=FORGE_MARKET_DISCOVERY_QUEUE_CAP=1024
 Environment=FORGE_TARGET_REQ_QUEUE_CAP=4096
 Environment=FORGE_TARGET_RES_QUEUE_CAP=4096
+Environment=FORGE_RELAY_TICK_PERSIST_ENABLED=false
 ExecStart=$REPO_DIR/target/release/polyedge_forge ireland-recorder --data-root $DATA_ROOT --udp-bind 0.0.0.0:9801 --sample-ms 100 --supported-symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT --active-symbols $ACTIVE_SYMBOLS --active-timeframes $ACTIVE_TIMEFRAMES --active-symbol-timeframes $ACTIVE_SYMBOL_TIMEFRAMES --discovery-refresh-sec $DISCOVERY_REFRESH_SEC --clickhouse-url http://127.0.0.1:8123 --clickhouse-database polyedge_forge --clickhouse-snapshot-table snapshot_100ms --clickhouse-round-table rounds --clickhouse-snapshot-ttl-days 14 --clickhouse-processed-ttl-days 14 --clickhouse-round-ttl-days 180 --redis-url redis://127.0.0.1:6379/0 --redis-prefix forge --redis-ttl-sec 7200 --sink-batch-size 200 --sink-flush-ms 1000 --sink-queue-cap 20000 --disable-api --dashboard-dist /home/ubuntu/PolyEdge/heatmap_dashboard/dist
 Restart=always
 RestartSec=2

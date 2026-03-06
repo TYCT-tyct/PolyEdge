@@ -50,6 +50,18 @@ fn ingest_queue_cap(key: &str, default: usize, min: usize, max: usize) -> usize 
         .clamp(min, max)
 }
 
+fn relay_tick_persist_enabled() -> bool {
+    std::env::var("FORGE_RELAY_TICK_PERSIST_ENABLED")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 // Removed: MARKET_FUTURE_GUARD_DEFAULT_MS (replaced by market_prestart_allow_ms)
 const MARKET_PRESTART_ALLOW_DEFAULT_MS: i64 = 30_000;
 const MARKET_SAMPLE_END_GRACE_DEFAULT_MS: i64 = 300;
@@ -1165,7 +1177,8 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                 let now = Utc::now().timestamp_millis();
                 let checksum_ok = msg.checksum.is_empty()
                     || msg.checksum == compute_tokyo_wire_checksum(&msg);
-                if let Some(tx) = sink_tx.as_ref() {
+                if relay_tick_persist_enabled() {
+                    if let Some(tx) = sink_tx.as_ref() {
                     if let Err(err) = tx.send(DbEvent::RelayTick(Box::new(RelayTickRow {
                         ts_ireland_recv_ms: now,
                         symbol: msg.symbol.clone(),
@@ -1181,6 +1194,7 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                     }))).await {
                         tracing::warn!(?err, "db sink closed while sending relay tick");
                     }
+                }
                 }
                 let should_update = tokyo_by_symbol
                     .get(&msg.symbol)
@@ -2799,20 +2813,22 @@ fn spawn_tokyo_udp_receiver(
                 );
                 continue;
             }
-            if let Err(err) = persist.send(PersistEvent::RelayTick(Box::new(RelayTickRow {
-                ts_ireland_recv_ms: Utc::now().timestamp_millis(),
-                symbol: msg.symbol.clone(),
-                source: msg.source.clone(),
-                relay_seq: msg.relay_seq,
-                source_seq: msg.source_seq,
-                ts_tokyo_recv_ms: msg.ts_tokyo_recv_ms,
-                ts_tokyo_send_ms: msg.ts_tokyo_send_ms,
-                ts_exchange_ms: msg.ts_exchange_ms,
-                binance_price: msg.binance_price,
-                checksum: msg.checksum.clone(),
-                checksum_ok,
-            }))) {
-                tracing::warn!(?err, "persist relay tick send failed");
+            if relay_tick_persist_enabled() {
+                if let Err(err) = persist.send(PersistEvent::RelayTick(Box::new(RelayTickRow {
+                    ts_ireland_recv_ms: Utc::now().timestamp_millis(),
+                    symbol: msg.symbol.clone(),
+                    source: msg.source.clone(),
+                    relay_seq: msg.relay_seq,
+                    source_seq: msg.source_seq,
+                    ts_tokyo_recv_ms: msg.ts_tokyo_recv_ms,
+                    ts_tokyo_send_ms: msg.ts_tokyo_send_ms,
+                    ts_exchange_ms: msg.ts_exchange_ms,
+                    binance_price: msg.binance_price,
+                    checksum: msg.checksum.clone(),
+                    checksum_ok,
+                }))) {
+                    tracing::warn!(?err, "persist relay tick send failed");
+                }
             }
             if msg.relay_seq > 0 {
                 let symbol = msg.symbol.clone();
