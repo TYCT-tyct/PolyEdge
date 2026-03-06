@@ -1,10 +1,58 @@
-pub(super) fn decision_to_live_payload(
+fn live_profit_recheck_enabled() -> bool {
+    std::env::var("FORGE_FEV1_LIVE_PROFIT_RECHECK_ENABLED")
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(true)
+}
+
+fn live_extreme_spread_cents() -> f64 {
+    std::env::var("FORGE_FEV1_LIVE_EXTREME_SPREAD_CENTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(6.0)
+        .clamp(1.0, 25.0)
+}
+
+fn profit_budget_meta(decision: &Value) -> Option<&serde_json::Map<String, Value>> {
+    decision
+        .get("__profit_budget")
+        .and_then(Value::as_object)
+}
+
+fn decision_signal_price_cents(decision: &Value) -> Option<f64> {
+    decision
+        .get("price_cents")
+        .and_then(Value::as_f64)
+        .filter(|v| v.is_finite() && *v > 0.0)
+}
+
+fn adverse_price_delta_total_cents(signal_price_cents: f64, submit_price_cents: f64, size: f64) -> f64 {
+    if !signal_price_cents.is_finite() || !submit_price_cents.is_finite() || !size.is_finite() {
+        return f64::INFINITY;
+    }
+    ((submit_price_cents - signal_price_cents).max(0.0) * size.max(0.0)).max(0.0)
+}
+
+fn required_profit_floor_cents(meta: Option<&serde_json::Map<String, Value>>) -> f64 {
+    meta.and_then(|m| m.get("required_net_edge_cents"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
+        .max(0.0)
+}
+
+fn estimated_net_edge_cents(meta: Option<&serde_json::Map<String, Value>>) -> Option<f64> {
+    meta.and_then(|m| m.get("estimated_net_edge_cents"))
+        .and_then(Value::as_f64)
+        .filter(|v| v.is_finite())
+}
+
+pub(super) fn try_decision_to_live_payload(
     decision: &Value,
     target: &LiveMarketTarget,
     exec_cfg: &LiveExecutionConfig,
     book: Option<&GatewayBookSnapshot>,
     quote_size_override: Option<f64>,
-) -> Option<Value> {
+) -> Result<Value, String> {
     let action = decision
         .get("action")
         .and_then(Value::as_str)
@@ -29,7 +77,7 @@ pub(super) fn decision_to_live_payload(
         ("exit", "DOWN") | ("reduce", "DOWN") => {
             ("sell_no", target.token_id_no.as_str(), exec_cfg.exit_slippage_bps)
         }
-        _ => return None,
+        _ => return Err("unsupported_action_or_side".to_string()),
     };
     let mut price_cents = decision
         .get("price_cents")
@@ -40,24 +88,8 @@ pub(super) fn decision_to_live_payload(
     }
     price_cents = price_cents.clamp(1.0, 99.0);
     let mut price = (price_cents / 100.0).clamp(0.01, 0.99);
-    let mut tif = decision
-        .get("tif")
-        .and_then(Value::as_str)
-        .map(|v| v.trim().to_ascii_uppercase())
-        .filter(|v| matches!(v.as_str(), "FAK" | "FOK" | "GTC" | "GTD" | "POST_ONLY"))
-        .unwrap_or_else(|| "FAK".to_string());
-    let mut style = decision
-        .get("style")
-        .and_then(Value::as_str)
-        .map(|v| v.trim().to_ascii_lowercase())
-        .filter(|v| matches!(v.as_str(), "maker" | "taker"))
-        .unwrap_or_else(|| {
-            if tif == "GTC" || tif == "GTD" || tif == "POST_ONLY" {
-                "maker".to_string()
-            } else {
-                "taker".to_string()
-            }
-        });
+    let tif = "FAK".to_string();
+    let style = "taker".to_string();
     let mut quote_size = quote_size_override.unwrap_or_else(|| {
         decision
             .get("quote_size_usdc")
@@ -86,53 +118,44 @@ pub(super) fn decision_to_live_payload(
     let mut size = forced_size_shares.unwrap_or_else(|| (quote_size / price).max(size_floor));
     if let Some(book) = book {
         min_order_size = book.min_order_size.max(0.0001);
-        let taker_like = style == "taker" || matches!(tif.as_str(), "FAK" | "FOK");
         size_floor = min_order_size;
         let tick_size = book.tick_size.max(0.0001);
-        price = round_to_tick(price, tick_size, is_buy);
-        size = forced_size_shares.unwrap_or_else(|| (quote_size / price).max(size_floor));
-
-        let depth_top1 = if is_buy {
-            book.best_ask_size.unwrap_or(0.0)
+        let best_px = if is_buy {
+            book.best_ask
         } else {
-            book.best_bid_size.unwrap_or(0.0)
+            book.best_bid
         };
+        if let Some(best_px) = best_px.filter(|v| v.is_finite() && *v > 0.0) {
+            price = round_to_tick(best_px.clamp(0.01, 0.99), tick_size, is_buy);
+            notes.push(if is_buy {
+                "anchor_taker_to_best_ask".to_string()
+            } else {
+                "anchor_taker_to_best_bid".to_string()
+            });
+        }
+        size = forced_size_shares.unwrap_or_else(|| (quote_size / price).max(size_floor));
+        if let (Some(best_bid), Some(best_ask)) = (book.best_bid, book.best_ask) {
+            if best_bid.is_finite() && best_ask.is_finite() && best_bid > 0.0 && best_ask > 0.0 {
+                let spread_cents = ((best_ask - best_bid) * 100.0).max(0.0);
+                if spread_cents > live_extreme_spread_cents() {
+                    return Err("live_book_spread_extreme".to_string());
+                }
+            }
+        }
         let depth_top3 = if is_buy {
             book.ask_depth_top3.unwrap_or(0.0)
         } else {
             book.bid_depth_top3.unwrap_or(0.0)
         };
-        if forced_size_shares.is_none()
-            && !(is_buy && taker_like)
-            && depth_top1.is_finite()
-            && depth_top1 > 0.0
-            && size > depth_top1 * 1.12
-        {
-            let capped = (depth_top1 * 0.95).max(size_floor);
-            if capped < size {
-                size = capped;
-                notes.push("depth_cap_top1".to_string());
-            }
-        }
-        if depth_top3.is_finite() && depth_top3 > 0.0 && size > depth_top3 * 1.25 {
-            if is_exit_like {
-                slippage_bps = (slippage_bps + 12.0).min(500.0);
-                notes.push("depth_thin_exit_force_taker".to_string());
-            } else {
-                slippage_bps = (slippage_bps + 8.0).min(500.0);
-                notes.push("depth_thin_entry_boost_slippage".to_string());
-            }
+        if depth_top3.is_finite() && depth_top3 > 0.0 && size > depth_top3 * 1.5 {
+            return Err("live_book_depth_extreme".to_string());
         }
     }
     size = round_lot_size(size.max(size_floor));
-    if is_exit_like && notes.iter().any(|n| n == "depth_thin_exit_force_taker") {
-        tif = "FAK".to_string();
-        style = "taker".to_string();
-    }
     let ttl_ms = decision
         .get("ttl_ms")
         .and_then(Value::as_i64)
-        .unwrap_or(if is_exit_like { 900 } else { 1400 })
+        .unwrap_or(if is_exit_like { 900 } else { live_entry_fak_ttl_ms() })
         .clamp(300, 30_000);
     slippage_bps = decision
         .get("max_slippage_bps")
@@ -141,88 +164,6 @@ pub(super) fn decision_to_live_payload(
         .clamp(0.0, 500.0);
     if let Some(force) = exec_cfg.force_slippage_bps {
         slippage_bps = force.clamp(0.0, 500.0);
-    }
-    if let Some(book) = book {
-        let taker_like = style == "taker" || matches!(tif.as_str(), "FAK" | "FOK");
-        if taker_like {
-            if is_buy {
-                if let Some(best_ask) = book.best_ask.filter(|v| v.is_finite() && *v > 0.0) {
-                    let anchored = best_ask.clamp(0.01, 0.99);
-                    if anchored > price {
-                        price = anchored;
-                        notes.push("anchor_taker_to_best_ask".to_string());
-                    }
-                }
-            } else if let Some(best_bid) = book.best_bid.filter(|v| v.is_finite() && *v > 0.0) {
-                let anchored = best_bid.clamp(0.01, 0.99);
-                if anchored < price {
-                    price = anchored;
-                    notes.push("anchor_taker_to_best_bid".to_string());
-                }
-            }
-            let depth_top3 = if is_buy {
-                book.ask_depth_top3.unwrap_or(0.0)
-            } else {
-                book.bid_depth_top3.unwrap_or(0.0)
-            };
-            if depth_top3.is_finite() && depth_top3 > 0.0 {
-                let depth_util = (size / depth_top3).max(0.0);
-                let mut extra_bps = if depth_util <= 0.25 {
-                    2.0
-                } else if depth_util <= 0.5 {
-                    4.0
-                } else if depth_util <= 0.85 {
-                    8.0
-                } else if depth_util <= 1.0 {
-                    14.0
-                } else if depth_util <= 1.3 {
-                    22.0
-                } else {
-                    34.0
-                };
-                if let (Some(best_bid), Some(best_ask)) = (book.best_bid, book.best_ask) {
-                    if best_bid.is_finite()
-                        && best_ask.is_finite()
-                        && best_bid > 0.0
-                        && best_ask > 0.0
-                    {
-                        let mid = ((best_bid + best_ask) * 0.5).max(0.0001);
-                        let spread_bps = ((best_ask - best_bid) / mid * 10_000.0).max(0.0);
-                        if spread_bps >= 100.0 {
-                            extra_bps += 4.0;
-                        }
-                    }
-                }
-                if is_exit_like {
-                    extra_bps += 4.0;
-                }
-                if extra_bps > 0.0 {
-                    let adjusted = if is_buy {
-                        (price * (1.0 + extra_bps / 10_000.0)).clamp(0.01, 0.99)
-                    } else {
-                        (price * (1.0 - extra_bps / 10_000.0)).clamp(0.01, 0.99)
-                    };
-                    if (adjusted - price).abs() >= 0.00001 {
-                        price = adjusted;
-                        notes.push(format!("adaptive_taker_price_bps_{extra_bps:.1}"));
-                    }
-                    let min_slippage =
-                        (extra_bps + if is_exit_like { 18.0 } else { 12.0 }).min(500.0);
-                    if min_slippage > slippage_bps {
-                        slippage_bps = min_slippage;
-                        notes.push("adaptive_slippage_floor".to_string());
-                    }
-                }
-            }
-            let tick_size = book.tick_size.max(0.0001);
-            price = round_to_tick(price, tick_size, is_buy);
-            size_floor = min_order_size;
-            size = round_lot_size(
-                forced_size_shares
-                    .unwrap_or_else(|| (quote_size / price).max(size_floor))
-                    .max(0.01),
-            );
-        }
     }
     if let Some(forced) = forced_size_shares {
         size = if is_exit_like {
@@ -237,6 +178,20 @@ pub(super) fn decision_to_live_payload(
         }
     }
     let taker_like = style == "taker" || matches!(tif.as_str(), "FAK" | "FOK");
+    let signal_price_cents = decision_signal_price_cents(decision).unwrap_or(price * 100.0);
+    let submit_price_cents = (price * 100.0).clamp(0.0, 100.0);
+    let profit_meta = profit_budget_meta(decision);
+    let extra_cost_budget_cents = estimated_net_edge_cents(profit_meta)
+        .map(|est| (est - required_profit_floor_cents(profit_meta)).max(0.0));
+    let adverse_extra_cost_cents =
+        adverse_price_delta_total_cents(signal_price_cents, submit_price_cents, size);
+    if !is_exit_like && live_profit_recheck_enabled() {
+        if let Some(budget) = extra_cost_budget_cents {
+            if adverse_extra_cost_cents > budget + 1e-9 {
+                return Err("live_profit_budget_exhausted".to_string());
+            }
+        }
+    }
     let floor_notional_usdc = quantize_usdc_micros((size * price).max(0.0));
     let requested_notional_usdc =
         ceil_quote_amount_usdc(quantize_usdc_micros(quote_size.max(floor_notional_usdc)));
@@ -272,6 +227,14 @@ pub(super) fn decision_to_live_payload(
         "cache_key": cache_key,
         "action": action,
         "signal_side": side,
+        "profit_budget": {
+            "signal_price_cents": signal_price_cents,
+            "submit_price_cents": submit_price_cents,
+            "adverse_extra_cost_cents": adverse_extra_cost_cents,
+            "available_extra_cost_cents": extra_cost_budget_cents,
+            "required_net_edge_cents": required_profit_floor_cents(profit_meta),
+            "estimated_net_edge_cents": estimated_net_edge_cents(profit_meta)
+        },
         "book_meta": if let Some(book) = book {
             json!({
                 "token_id": book.token_id,
@@ -294,7 +257,17 @@ pub(super) fn decision_to_live_payload(
             obj.insert("amount_mode".to_string(), json!("buy_usdc"));
         }
     }
-    Some(payload)
+    Ok(payload)
+}
+
+pub(super) fn decision_to_live_payload(
+    decision: &Value,
+    target: &LiveMarketTarget,
+    exec_cfg: &LiveExecutionConfig,
+    book: Option<&GatewayBookSnapshot>,
+    quote_size_override: Option<f64>,
+) -> Option<Value> {
+    try_decision_to_live_payload(decision, target, exec_cfg, book, quote_size_override).ok()
 }
 
 pub(super) fn extract_rust_reject_reason(payload: &Value, fallback_error: Option<&str>) -> String {
@@ -309,6 +282,7 @@ pub(super) fn extract_rust_reject_reason(payload: &Value, fallback_error: Option
         .to_string()
 }
 
+#[cfg(test)]
 pub(super) fn can_retry_on_liquidity(reason: &str) -> bool {
     let r = reason.to_ascii_lowercase();
     let non_retryable = r.contains("unauthorized")
@@ -400,6 +374,7 @@ pub(super) fn apply_emergency_exit_overrides(decision: &mut Value, exec_cfg: &Li
     }
 }
 
+#[cfg(test)]
 pub(super) fn build_retry_payload(current: &Value, reason: &str, attempt: usize) -> Option<Value> {
     if attempt >= 2 || !can_retry_on_liquidity(reason) {
         return None;
@@ -579,6 +554,10 @@ pub(super) fn build_execution_price_trace(
     response: Option<&Value>,
 ) -> Value {
     let signal_price_cents = decision.get("price_cents").and_then(Value::as_f64);
+    let book_price_cents = request
+        .get("profit_budget")
+        .and_then(|v| v.get("submit_price_cents"))
+        .and_then(Value::as_f64);
     let submit_price_cents = request
         .get("price")
         .and_then(Value::as_f64)
@@ -601,12 +580,14 @@ pub(super) fn build_execution_price_trace(
     };
     json!({
         "signal_price_cents": signal_price_cents,
+        "book_price_cents": book_price_cents,
         "submit_price_cents": submit_price_cents,
         "final_submit_price_cents": final_submit_price_cents,
         "accepted_price_cents": accepted_price_cents,
         "fill_price_cents": Value::Null,
         "signal_vs_submit_cents": signal_vs_submit_cents,
         "signal_vs_accepted_cents": signal_vs_accepted_cents,
+        "profit_budget": request.get("profit_budget").cloned().unwrap_or(Value::Null),
     })
 }
 

@@ -703,10 +703,10 @@ pub fn simulate_with_fee_context(
                         | "round_rollover"
                 );
                 let (exit_tif, exit_style, exit_ttl_ms, exit_slippage_bps) =
-                    if take_profit_exit && !emergency_exit && sample.remaining_ms > 30_000 {
-                        ("GTD", "maker", 1_100_i64, 10.0_f64)
-                    } else if sample.remaining_ms <= 30_000 {
-                        ("FAK", "taker", 900_i64, 30.0_f64)
+                    if sample.remaining_ms <= 30_000 || emergency_exit {
+                        ("FAK", "taker", 700_i64, 30.0_f64)
+                    } else if take_profit_exit {
+                        ("FAK", "taker", 900_i64, 18.0_f64)
                     } else {
                         ("FAK", "taker", 1_000_i64, 22.0_f64)
                     };
@@ -797,9 +797,9 @@ pub fn simulate_with_fee_context(
                 let entry_score = score.abs();
                 let (entry_tif, entry_style, entry_ttl_ms, entry_slippage_bps) =
                     if sample.remaining_ms <= 120_000 || entry_score >= 0.80 {
-                        ("FAK", "taker", 900_i64, 24.0_f64)
+                        ("FAK", "taker", 650_i64, 24.0_f64)
                     } else {
-                        ("GTD", "maker", 900_i64, 10.0_f64)
+                        ("FAK", "taker", 750_i64, 18.0_f64)
                     };
                 signal_decisions.push(json!({
                     "decision_id": decision_id("enter", side, &sample.round_id, sample.ts_ms),

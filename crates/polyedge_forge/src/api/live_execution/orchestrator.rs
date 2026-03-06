@@ -36,27 +36,94 @@ pub(super) async fn flush_entry_pending_before_exit(
     for row in pending_rows {
         match ctx.client.cancel_order(&row.order_id).await {
             Ok(resp) => {
-                let _ = state.remove_pending_order(&row.order_id).await;
-                apply_pending_revert(state, &row, "pre_exit_cancelled").await;
-                cancelled = cancelled.saturating_add(1);
-                state
-                    .append_live_event(
-                        &row.symbol,
-                        &row.market_type,
-                        json!({
-                            "accepted": true,
-                            "action": row.action,
-                            "side": row.side,
-                            "round_id": row.round_id,
-                            "decision_id": row.decision_id,
-                            "decision_key": row.decision_key,
-                            "reason": "pre_exit_cancelled",
-                            "order_id": row.order_id,
-                            "cancelled": resp.canceled,
-                            "not_cancelled": resp.not_canceled
-                        }),
-                    )
-                    .await;
+                match ctx.client.order(&row.order_id).await {
+                    Ok(order) if pm_is_terminal_fill(&order.status) => {
+                        let _ = state.remove_pending_order(&row.order_id).await;
+                        let fill_event = fill_event_from_open_order(&order);
+                        apply_pending_confirmation(
+                            state,
+                            &row,
+                            "pre_exit_cancel_reconciled_fill",
+                            Some(&fill_event),
+                        )
+                        .await;
+                        state
+                            .append_live_event(
+                                &row.symbol,
+                                &row.market_type,
+                                json!({
+                                    "accepted": true,
+                                    "action": row.action,
+                                    "side": row.side,
+                                    "round_id": row.round_id,
+                                    "decision_id": row.decision_id,
+                                    "decision_key": row.decision_key,
+                                    "reason": "pre_exit_cancel_reconciled_fill",
+                                    "order_id": row.order_id,
+                                    "cancelled": resp.canceled,
+                                    "not_cancelled": resp.not_canceled,
+                                    "status": format!("{}", order.status)
+                                }),
+                            )
+                            .await;
+                    }
+                    Ok(order) if pm_is_terminal_reject(&order.status) => {
+                        let _ = state.remove_pending_order(&row.order_id).await;
+                        apply_pending_revert(state, &row, "pre_exit_cancelled").await;
+                        cancelled = cancelled.saturating_add(1);
+                        state
+                            .append_live_event(
+                                &row.symbol,
+                                &row.market_type,
+                                json!({
+                                    "accepted": true,
+                                    "action": row.action,
+                                    "side": row.side,
+                                    "round_id": row.round_id,
+                                    "decision_id": row.decision_id,
+                                    "decision_key": row.decision_key,
+                                    "reason": "pre_exit_cancelled",
+                                    "order_id": row.order_id,
+                                    "cancelled": resp.canceled,
+                                    "not_cancelled": resp.not_canceled,
+                                    "status": format!("{}", order.status)
+                                }),
+                            )
+                            .await;
+                    }
+                    Ok(order) => {
+                        force_pause_for_uncertain_pending(
+                            state,
+                            &row,
+                            "pre_exit_cancel_unresolved",
+                            json!({
+                                "cancelled": resp.canceled,
+                                "not_cancelled": resp.not_canceled,
+                                "status": format!("{}", order.status)
+                            }),
+                        )
+                        .await;
+                    }
+                    Err(err) => {
+                        if resp.canceled.iter().any(|id| id == &row.order_id) {
+                            let _ = state.remove_pending_order(&row.order_id).await;
+                            apply_pending_revert(state, &row, "pre_exit_cancelled").await;
+                            cancelled = cancelled.saturating_add(1);
+                        } else {
+                            force_pause_for_uncertain_pending(
+                                state,
+                                &row,
+                                "pre_exit_cancel_status_error",
+                                json!({
+                                    "cancelled": resp.canceled,
+                                    "not_cancelled": resp.not_canceled,
+                                    "error": err.to_string()
+                                }),
+                            )
+                            .await;
+                        }
+                    }
+                }
             }
             Err(err) => {
                 state

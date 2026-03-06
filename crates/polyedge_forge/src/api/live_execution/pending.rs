@@ -48,7 +48,7 @@ pub(super) async fn apply_pending_confirmation(
         } else {
             Some(pending.token_id.trim().to_string())
         };
-        ps.entry_ts_ms = Some(pending.submitted_ts_ms);
+        ps.entry_ts_ms = Some(pending.ack_ts_ms.max(pending.submitted_ts_ms));
         ps.entry_price_cents = Some(fill_price_cents);
         ps.entry_quote_usdc = Some(fill_quote_usdc);
         ps.net_quote_usdc = fill_quote_usdc;
@@ -96,7 +96,7 @@ pub(super) async fn apply_pending_confirmation(
         {
             ps.entry_token_id = Some(pending.token_id.trim().to_string());
         }
-        ps.entry_ts_ms = Some(pending.submitted_ts_ms);
+        ps.entry_ts_ms = Some(pending.ack_ts_ms.max(pending.submitted_ts_ms));
         ps.entry_price_cents = Some(next_price);
         ps.vwap_entry_cents = Some(next_price);
         ps.entry_quote_usdc = Some(next_quote);
@@ -554,4 +554,3 @@ pub(super) fn build_position_locked_target(
         end_date,
     })
 }
-

@@ -36,10 +36,27 @@ fn pending_cancel_due_ms(row: &LivePendingOrder) -> i64 {
         row.tif.to_ascii_uppercase().as_str(),
         "GTD" | "GTC" | "POST_ONLY"
     );
-    if maker_tif && is_entry_action(&row.action) {
+    let due_delta = if maker_tif && is_entry_action(&row.action) {
         base.min(live_entry_maker_max_wait_ms())
     } else {
         base
+    };
+    if row.cancel_due_at_ms > 0 {
+        row.cancel_due_at_ms
+    } else {
+        row.ack_ts_ms
+            .max(row.submitted_ts_ms)
+            .saturating_add(due_delta)
+    }
+}
+
+fn pending_terminal_due_ms(row: &LivePendingOrder) -> i64 {
+    if row.terminal_due_at_ms > 0 {
+        row.terminal_due_at_ms
+    } else {
+        row.ack_ts_ms
+            .max(row.submitted_ts_ms)
+            .saturating_add(if is_live_exit_action(&row.action) { 5_000 } else { 4_000 })
     }
 }
 
@@ -923,4 +940,3 @@ async fn prefetch_rust_books_for_tokens(
     let rows = join_all(futures).await;
     rows.into_iter().collect()
 }
-

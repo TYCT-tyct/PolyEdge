@@ -79,7 +79,7 @@
     }
 
     #[test]
-    fn maker_buy_still_respects_min_order_size_floor() {
+    fn entry_payload_normalizes_legacy_maker_input_to_fak_taker() {
         let decision = json!({
             "action": "enter",
             "side": "UP",
@@ -100,14 +100,20 @@
             .get("size")
             .and_then(Value::as_f64)
             .unwrap_or_default();
+        let tif = payload
+            .get("tif")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let style = payload
+            .get("style")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         assert!(
             size >= 5.0,
-            "maker buy must keep min_order_size floor, got {size}"
+            "normalized entry must keep min_order_size floor, got {size}"
         );
-        assert!(
-            payload.get("buy_amount_usdc").is_none(),
-            "maker path should stay in share-size mode"
-        );
+        assert_eq!(tif, "FAK");
+        assert_eq!(style, "taker");
     }
 
     #[test]
@@ -252,6 +258,40 @@
     }
 
     #[test]
+    fn profit_budget_recheck_blocks_entry_when_fresh_price_consumes_edge() {
+        let decision = json!({
+            "action": "enter",
+            "side": "UP",
+            "price_cents": 50.0,
+            "quote_size_usdc": 5.0,
+            "__profit_budget": {
+                "estimated_net_edge_cents": 2.0,
+                "required_net_edge_cents": 1.5
+            }
+        });
+        let book = GatewayBookSnapshot {
+            token_id: "yes".to_string(),
+            min_order_size: 0.01,
+            tick_size: 0.01,
+            best_bid: Some(0.59),
+            best_ask: Some(0.60),
+            best_bid_size: Some(100.0),
+            best_ask_size: Some(100.0),
+            bid_depth_top3: Some(300.0),
+            ask_depth_top3: Some(300.0),
+        };
+        let err = try_decision_to_live_payload(
+            &decision,
+            &test_target(),
+            &test_exec_cfg(),
+            Some(&book),
+            None,
+        )
+        .expect_err("fresh repricing should reject exhausted edge");
+        assert_eq!(err, "live_profit_budget_exhausted");
+    }
+
+    #[test]
     fn decision_round_target_match_rejects_cross_round_target() {
         let start_ms = 1_700_000_000_000_i64;
         let mut target = test_target();
@@ -323,7 +363,10 @@
             style: "taker".to_string(),
             submit_reason: "test".to_string(),
             submitted_ts_ms: 0,
+            ack_ts_ms: 0,
             cancel_after_ms: 1000,
+            cancel_due_at_ms: 0,
+            terminal_due_at_ms: 4_000,
             retry_count: 0,
         };
         let fill = json!({

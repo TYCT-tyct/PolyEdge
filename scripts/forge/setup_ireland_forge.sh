@@ -161,7 +161,6 @@ Wants=clickhouse-server.service redis-server.service
 Type=simple
 User=$USER_NAME
 WorkingDirectory=$REPO_DIR
-EnvironmentFile=-$REPO_DIR/.env
 Environment=RUST_LOG=info,polyedge_forge=debug
 Environment=FORGE_FEV1_RUNTIME_MARKETS=$RUNTIME_MARKETS
 Environment=FORGE_FEV1_RUNTIME_LOOKBACK_MINUTES=$RUNTIME_LOOKBACK_MINUTES
@@ -179,6 +178,7 @@ Environment=FORGE_STRATEGY_MAX_POINTS_FULL=220000
 Environment=FORGE_STRATEGY_MAX_POINTS_SHORT=140000
 Environment=FORGE_STRATEGY_MAX_POINTS_HARD_CAP=320000
 Environment=MALLOC_TRIM_THRESHOLD_=131072
+EnvironmentFile=-$REPO_DIR/.env
 ExecStart=$REPO_DIR/target/release/polyedge_forge ireland-api --bind 0.0.0.0:9810 --clickhouse-url http://127.0.0.1:8123 --redis-url redis://127.0.0.1:6379/0 --redis-prefix forge --dashboard-dist /home/ubuntu/PolyEdge/heatmap_dashboard/dist
 Restart=always
 RestartSec=2

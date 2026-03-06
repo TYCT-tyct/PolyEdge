@@ -423,7 +423,13 @@ struct LivePendingOrder {
     #[serde(default)]
     submit_reason: String,
     submitted_ts_ms: i64,
+    #[serde(default)]
+    ack_ts_ms: i64,
     cancel_after_ms: i64,
+    #[serde(default)]
+    cancel_due_at_ms: i64,
+    #[serde(default)]
+    terminal_due_at_ms: i64,
     retry_count: u8,
 }
 
@@ -1254,19 +1260,6 @@ fn gate_live_decisions_by_profitability(
             }),
         );
     }
-    if !enabled {
-        return (
-            decisions.to_vec(),
-            Vec::new(),
-            json!({
-                "enabled": false,
-                "mode": "pass_through",
-                "selected_count": decisions.len(),
-                "skipped_count": 0
-            }),
-        );
-    }
-
     let base_score = live_min_entry_score();
     let base_net_edge = live_min_net_edge_cents();
     let score_edge_scale = live_score_edge_scale_cents();
@@ -1313,8 +1306,16 @@ fn gate_live_decisions_by_profitability(
         !regime_known || (win_rate >= regime_min_win_rate && net_margin >= regime_min_margin);
     let warmup_extra_score = if regime_known { 0.0 } else { 0.04 };
     let warmup_extra_edge = if regime_known { 0.0 } else { 0.35 };
-    let required_score = (effective_score + warmup_extra_score).clamp(0.40, 0.995);
-    let required_edge = (base_net_edge + warmup_extra_edge).max(0.0);
+    let required_score = if enabled {
+        (effective_score + warmup_extra_score).clamp(0.40, 0.995)
+    } else {
+        0.0
+    };
+    let required_edge = if enabled {
+        (base_net_edge + warmup_extra_edge).max(0.0)
+    } else {
+        0.0
+    };
 
     let entry_fee_floor_cents = if trade_count > 0 {
         summary
@@ -1339,7 +1340,8 @@ fn gate_live_decisions_by_profitability(
             selected.push(decision.clone());
             continue;
         }
-        if !regime_ok {
+        let mut annotated = decision.clone();
+        if !regime_ok && enabled {
             skipped.push(json!({
                 "reason": "regime_gate_block",
                 "decision": decision,
@@ -1357,15 +1359,6 @@ fn gate_live_decisions_by_profitability(
             .or_else(|| decision.get("entry_score").and_then(Value::as_f64))
             .unwrap_or(0.0)
             .abs();
-        if score < required_score {
-            skipped.push(json!({
-                "reason": "entry_score_below_profit_gate",
-                "decision": decision,
-                "score": score,
-                "required_score": required_score
-            }));
-            continue;
-        }
         let quote_usdc = decision
             .get("quote_size_usdc")
             .and_then(Value::as_f64)
@@ -1379,10 +1372,36 @@ fn gate_live_decisions_by_profitability(
         let slippage_cost_cents = quote_usdc * (slippage_bps / 10_000.0) * 100.0;
         let model_edge_cents = (score - effective_score).max(0.0) * score_edge_scale;
         let estimated_net_edge = model_edge_cents - slippage_cost_cents - entry_fee_floor_cents;
+        if let Some(obj) = annotated.as_object_mut() {
+            obj.insert(
+                "__profit_budget".to_string(),
+                json!({
+                    "gate_enabled": enabled,
+                    "regime_ok": regime_ok,
+                    "score": score,
+                    "required_score": required_score,
+                    "model_edge_cents": model_edge_cents,
+                    "estimated_net_edge_cents": estimated_net_edge,
+                    "required_net_edge_cents": required_edge,
+                    "signal_slippage_cost_cents": slippage_cost_cents,
+                    "entry_fee_floor_cents": entry_fee_floor_cents,
+                    "quote_size_usdc": quote_usdc
+                }),
+            );
+        }
+        if enabled && score < required_score {
+            skipped.push(json!({
+                "reason": "entry_score_below_profit_gate",
+                "decision": annotated,
+                "score": score,
+                "required_score": required_score
+            }));
+            continue;
+        }
         if estimated_net_edge < required_edge {
             skipped.push(json!({
                 "reason": "net_edge_below_profit_gate",
-                "decision": decision,
+                "decision": annotated,
                 "estimated_net_edge_cents": estimated_net_edge,
                 "required_net_edge_cents": required_edge,
                 "model_edge_cents": model_edge_cents,
@@ -1391,7 +1410,7 @@ fn gate_live_decisions_by_profitability(
             }));
             continue;
         }
-        selected.push(decision.clone());
+        selected.push(annotated);
     }
 
     let selected_count = selected.len();
@@ -3290,6 +3309,8 @@ async fn live_runtime_loop(
                         handle_live_pending_timeouts(&state, &exec_cfg_tuned).await;
                     }
 
+                    let raw_signal_count = paper_decisions.len();
+                    let candidate_count = selected_decisions.len();
                     let (profit_selected, profit_skipped, profit_gate_meta) =
                         gate_live_decisions_by_profitability(
                             &selected_decisions,
@@ -3297,6 +3318,8 @@ async fn live_runtime_loop(
                             &trades,
                             &exec_cfg_tuned,
                         );
+                    let profit_selected_count = profit_selected.len();
+                    let profit_skipped_count = profit_skipped.len();
                     let (gated, mut state_skipped, position_for_submit) = gate_live_decisions(
                         &state,
                         runtime_symbol,
@@ -3305,6 +3328,7 @@ async fn live_runtime_loop(
                         effective_live_execute,
                     )
                     .await;
+                    let state_skipped_count = state_skipped.len();
                     let mut skipped_decisions = profit_skipped;
                     skipped_decisions.append(&mut state_skipped);
                     let submitted_decisions: Vec<Value> =
@@ -3316,73 +3340,89 @@ async fn live_runtime_loop(
                         "dry_run"
                     }
                     .to_string();
-                    let mut execution_status = if effective_live_execute {
-                        "idle"
-                    } else {
-                        "dry_run"
-                    }
-                    .to_string();
+                    let execution_status: String;
                     let mut execution_target = Value::Null;
-                    if effective_live_execute {
-                        if gated.is_empty() {
-                            execution_status = "all_rejected".to_string();
-                        } else {
-                            let resolved_target = if let Some(locked_target) =
-                                build_position_locked_target(market_type, &position_for_submit)
-                            {
-                                Some(locked_target)
-                            } else {
-                                resolve_live_market_target_fast_with_state(
-                                    &state,
-                                    runtime_symbol,
-                                    market_type,
-                                )
-                                .await
-                                .ok()
-                            };
-                            if let Some(target) = resolved_target {
-                                execution_target = json!({
-                                    "market_id": target.market_id.clone(),
-                                    "symbol": target.symbol.clone(),
-                                    "timeframe": target.timeframe.clone(),
-                                    "token_id_yes": target.token_id_yes.clone(),
-                                    "token_id_no": target.token_id_no.clone(),
-                                    "end_date": target.end_date.clone()
-                                });
-                                execution_orders = execute_live_orders(
-                                    &state,
-                                    &exec_cfg_tuned,
-                                    runtime_symbol,
-                                    market_type,
-                                    &target,
-                                    &position_for_submit,
-                                    &gated,
-                                )
-                                .await;
-                                reconcile_live_reports(&state, &exec_cfg_tuned).await;
-                                handle_live_pending_timeouts(&state, &exec_cfg_tuned).await;
-                                let accepted_count = execution_orders
+                    let resolved_target = if gated.is_empty() {
+                        None
+                    } else if let Some(locked_target) =
+                        build_position_locked_target(market_type, &position_for_submit)
+                    {
+                        Some(locked_target)
+                    } else {
+                        resolve_live_market_target_fast_with_state(
+                            &state,
+                            runtime_symbol,
+                            market_type,
+                        )
+                        .await
+                        .ok()
+                    };
+                    if let Some(target) = resolved_target {
+                        execution_target = json!({
+                            "market_id": target.market_id.clone(),
+                            "symbol": target.symbol.clone(),
+                            "timeframe": target.timeframe.clone(),
+                            "token_id_yes": target.token_id_yes.clone(),
+                            "token_id_no": target.token_id_no.clone(),
+                            "end_date": target.end_date.clone()
+                        });
+                        if effective_live_execute {
+                            execution_orders = execute_live_orders(
+                                &state,
+                                &exec_cfg_tuned,
+                                runtime_symbol,
+                                market_type,
+                                &target,
+                                &position_for_submit,
+                                &gated,
+                            )
+                            .await;
+                            reconcile_live_reports(&state, &exec_cfg_tuned).await;
+                            handle_live_pending_timeouts(&state, &exec_cfg_tuned).await;
+                            let accepted_count = execution_orders
+                                .iter()
+                                .filter(|row| {
+                                    row.get("accepted")
+                                        .and_then(Value::as_bool)
+                                        .unwrap_or(false)
+                                })
+                                .count();
+                            execution_status = if accepted_count > 0
+                                || execution_orders
                                     .iter()
-                                    .filter(|row| {
-                                        row.get("accepted")
-                                            .and_then(Value::as_bool)
-                                            .unwrap_or(false)
-                                    })
-                                    .count();
-                                execution_status = if accepted_count > 0
-                                    || execution_orders
-                                        .iter()
-                                        .any(|row| row.get("decision").is_some())
-                                {
-                                    "submitted".to_string()
-                                } else {
-                                    "all_rejected".to_string()
-                                };
+                                    .any(|row| row.get("decision").is_some())
+                            {
+                                "submitted".to_string()
                             } else {
-                                execution_status = "target_missing".to_string();
-                            }
+                                "all_rejected".to_string()
+                            };
+                        } else if candidate_count == 0 {
+                            execution_status = "dry_run_no_candidate".to_string();
+                        } else if profit_selected_count == 0 {
+                            execution_status = "dry_run_profit_blocked".to_string();
+                        } else {
+                            execution_status = "dry_run_ready".to_string();
                         }
+                    } else if effective_live_execute {
+                        execution_status = if gated.is_empty() {
+                            "all_rejected".to_string()
+                        } else {
+                            "target_missing".to_string()
+                        };
+                    } else {
+                        execution_status = if candidate_count == 0 {
+                            "dry_run_no_candidate".to_string()
+                        } else if profit_selected_count == 0 {
+                            "dry_run_profit_blocked".to_string()
+                        } else if submitted_decisions.is_empty() {
+                            "dry_run_state_blocked".to_string()
+                        } else {
+                            "target_missing".to_string()
+                        };
                     }
+                    let shadow_target_ready = !execution_target.is_null();
+                    let shadow_target_missing =
+                        !submitted_decisions.is_empty() && !shadow_target_ready;
 
                     let aggr_orders = if effective_live_execute {
                         execution_orders
@@ -3454,6 +3494,18 @@ async fn live_runtime_loop(
                             "realized_net_pnl_cents": live_realized_net_pnl_cents,
                             "paper_live_fill_count": paper_live_fill_count,
                             "fills": live_fill_summary,
+                            "shadow_eval": {
+                                "enabled": !effective_live_execute,
+                                "status": execution_status.clone(),
+                                "raw_signal_count": raw_signal_count,
+                                "candidate_count": candidate_count,
+                                "profit_selected_count": profit_selected_count,
+                                "profit_skipped_count": profit_skipped_count,
+                                "state_selected_count": submitted_decisions.len(),
+                                "state_skipped_count": state_skipped_count,
+                                "target_ready": shadow_target_ready,
+                                "target_missing": shadow_target_missing
+                            },
                         },
                         "decisions": selected_decisions,
                         "paper_records": paper_records_enriched,
@@ -3478,14 +3530,21 @@ async fn live_runtime_loop(
                                 "accepted_count": live_accepted_count,
                                 "rejected_count": live_rejected_count,
                                 "skipped_count": skipped_decisions.len(),
-                                "no_live_market_target": execution_target.is_null()
+                                "no_live_market_target": shadow_target_missing
                             }
                         },
                         "profit_gate": profit_gate_meta,
                         "gated": {
+                            "raw_signal_count": raw_signal_count,
+                            "candidate_count": candidate_count,
+                            "profit_selected_count": profit_selected_count,
+                            "profit_skipped_count": profit_skipped_count,
                             "selected_count": submitted_decisions.len(),
                             "submitted_count": live_submitted_count,
+                            "state_skipped_count": state_skipped_count,
                             "skipped_count": skipped_decisions.len(),
+                            "target_ready": shadow_target_ready,
+                            "target_missing": shadow_target_missing,
                             "submitted_decisions": submitted_decisions,
                             "skipped_decisions": skipped_decisions
                         },
@@ -3801,8 +3860,8 @@ mod tests {
         };
         let payload =
             decision_to_live_payload(&decision, &target, &cfg, None, None).expect("payload");
-        assert_eq!(payload.get("tif").and_then(Value::as_str), Some("GTD"));
-        assert_eq!(payload.get("style").and_then(Value::as_str), Some("maker"));
+        assert_eq!(payload.get("tif").and_then(Value::as_str), Some("FAK"));
+        assert_eq!(payload.get("style").and_then(Value::as_str), Some("taker"));
         assert_eq!(payload.get("ttl_ms").and_then(Value::as_i64), Some(2300));
         assert_eq!(payload.get("action").and_then(Value::as_str), Some("enter"));
         assert_eq!(

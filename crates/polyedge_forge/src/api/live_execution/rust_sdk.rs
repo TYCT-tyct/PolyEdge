@@ -54,17 +54,39 @@ fn cancel_failure_pause_threshold(action: &str) -> u8 {
     }
 }
 
+fn cancel_response_contains_order(resp: &polymarket_client_sdk::clob::types::response::CancelOrdersResponse, order_id: &str) -> bool {
+    resp.canceled.iter().any(|id| id == order_id)
+}
+
 fn initial_pending_cancel_after_ms(action: &str, tif: &str) -> i64 {
     let maker_tif = matches!(tif.to_ascii_uppercase().as_str(), "GTD" | "GTC" | "POST_ONLY");
     if is_entry_action(action) && maker_tif {
         live_entry_maker_max_wait_ms()
-    } else if is_entry_action(action) {
-        live_entry_fak_cancel_after_ms()
     } else if is_live_exit_action(action) {
         900
     } else {
         1_200
     }
+}
+
+fn initial_pending_terminal_after_ms(action: &str, tif: &str) -> i64 {
+    let maker_tif = matches!(tif.to_ascii_uppercase().as_str(), "GTD" | "GTC" | "POST_ONLY");
+    if maker_tif && is_entry_action(action) {
+        live_entry_maker_max_wait_ms().saturating_add(2_000)
+    } else if is_live_exit_action(action) {
+        5_000
+    } else {
+        4_000
+    }
+}
+
+fn should_retry_submit_error(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains(" 425")
+        || e.contains("status 425")
+        || e.contains("too early")
+        || e.contains("engine")
+        || e.contains("restart")
 }
 
 fn build_pending_from_accepted_submission(
@@ -77,6 +99,7 @@ fn build_pending_from_accepted_submission(
     payload: &Value,
     order_id: &str,
     submitted_ts_ms: i64,
+    ack_ts_ms: i64,
 ) -> LivePendingOrder {
     let action = decision
         .get("action")
@@ -122,6 +145,9 @@ fn build_pending_from_accepted_submission(
         .unwrap_or_default()
         .trim()
         .to_string();
+    let cancel_after_ms = initial_pending_cancel_after_ms(&action, &tif);
+    let terminal_after_ms = initial_pending_terminal_after_ms(&action, &tif);
+    let maker_tif = matches!(tif.as_str(), "GTD" | "GTC" | "POST_ONLY");
     LivePendingOrder {
         symbol: symbol.trim().to_ascii_uppercase(),
         market_type: market_type.to_string(),
@@ -148,7 +174,16 @@ fn build_pending_from_accepted_submission(
             .unwrap_or("live_submit")
             .to_string(),
         submitted_ts_ms,
-        cancel_after_ms: initial_pending_cancel_after_ms(&action, &tif),
+        ack_ts_ms: ack_ts_ms.max(submitted_ts_ms),
+        cancel_after_ms,
+        cancel_due_at_ms: if maker_tif {
+            ack_ts_ms.max(submitted_ts_ms).saturating_add(cancel_after_ms)
+        } else {
+            0
+        },
+        terminal_due_at_ms: ack_ts_ms
+            .max(submitted_ts_ms)
+            .saturating_add(terminal_after_ms),
         retry_count: 0,
     }
 }
@@ -214,6 +249,45 @@ pub(super) async fn handle_cancel_failure_with_escalation(
                 "retry_count": retry.retry_count,
                 "runtime_mode": control.mode,
                 "runtime_note": control.note,
+            }),
+        )
+        .await;
+}
+
+async fn force_pause_for_uncertain_pending(
+    state: &ApiState,
+    row: &LivePendingOrder,
+    reason: &str,
+    detail: Value,
+) {
+    let now_ms = Utc::now().timestamp_millis();
+    let mut control = state.get_live_runtime_control(&row.symbol, &row.market_type).await;
+    if control.mode != LiveRuntimeControlMode::ForcePause {
+        control.mode = LiveRuntimeControlMode::ForcePause;
+        control.requested_at_ms = now_ms;
+        control.updated_at_ms = now_ms;
+        control.completed_at_ms = None;
+        control.note = Some(format!("uncertain_pending:{reason}:order_id={}", row.order_id));
+        state
+            .put_live_runtime_control(&row.symbol, &row.market_type, control.clone())
+            .await;
+    }
+    state
+        .append_live_event(
+            &row.symbol,
+            &row.market_type,
+            json!({
+                "accepted": false,
+                "action": row.action,
+                "side": row.side,
+                "round_id": row.round_id,
+                "decision_id": row.decision_id,
+                "decision_key": row.decision_key,
+                "reason": reason,
+                "order_id": row.order_id,
+                "runtime_mode": control.mode,
+                "runtime_note": control.note,
+                "detail": detail
             }),
         )
         .await;
@@ -522,6 +596,9 @@ async fn try_resubmit_after_terminal_reject_rust(
 ) -> bool {
     let action = row.action.to_ascii_lowercase();
     let exit_like = is_live_exit_action(&action);
+    if !exit_like {
+        return false;
+    }
     let emergency_exit = exit_like && is_emergency_exit_reason(&row.submit_reason);
     let max_retry = if emergency_exit { 2 } else { 1 };
     if row.retry_count >= max_retry {
@@ -681,7 +758,11 @@ async fn try_resubmit_after_terminal_reject_rust(
                     pending.tif = "FAK".to_string();
                     pending.style = "taker".to_string();
                     pending.submitted_ts_ms = now_ms;
+                    pending.ack_ts_ms = now_ms;
                     pending.cancel_after_ms = if emergency_exit { 700 } else { 1500 };
+                    pending.cancel_due_at_ms = 0;
+                    pending.terminal_due_at_ms =
+                        now_ms.saturating_add(initial_pending_terminal_after_ms(&row.action, "FAK"));
                     state.upsert_pending_order(pending).await;
                     state
                         .append_live_event(
@@ -869,27 +950,28 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
         } else {
             None
         };
-        let Some(payload) =
-            decision_to_live_payload(
-                &prepared.decision,
-                &prepared.effective_target,
-                exec_cfg,
-                book_snapshot.as_ref(),
-                None,
-            )
-        else {
-            out.push(json!({
-                "ok": false,
-                "accepted": false,
-                "decision_key": gated.decision_key,
-                "decision": prepared.decision,
-                "reason": "decision_to_payload_failed",
-                "executor": "rust_sdk"
-            }));
-            continue;
+        let payload = match try_decision_to_live_payload(
+            &prepared.decision,
+            &prepared.effective_target,
+            exec_cfg,
+            book_snapshot.as_ref(),
+            None,
+        ) {
+            Ok(payload) => payload,
+            Err(reason) => {
+                out.push(json!({
+                    "ok": false,
+                    "accepted": false,
+                    "decision_key": gated.decision_key,
+                    "decision": prepared.decision,
+                    "reason": reason,
+                    "executor": "rust_sdk"
+                }));
+                continue;
+            }
         };
-        let mut attempt_payload = payload.clone();
-        let mut attempts = Vec::<Value>::with_capacity(3);
+        let attempt_payload = payload.clone();
+        let mut attempts = Vec::<Value>::with_capacity(2);
         let mut accepted = false;
         let mut final_response: Option<Value> = None;
         let mut final_error: Option<String> = None;
@@ -903,7 +985,7 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
         let submit_start_ts_ms = Utc::now().timestamp_millis();
         let mut ack_ts_ms = submit_start_ts_ms;
         let order_started = Instant::now();
-        for attempt in 0..3usize {
+        for attempt in 0..2usize {
             let attempt_started_ts_ms = Utc::now().timestamp_millis();
             let attempt_started = Instant::now();
             let submit = submit_rust_order(&ctx, &attempt_payload).await;
@@ -937,12 +1019,6 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                         break;
                     }
                     final_reject_reason = Some(reject_reason.clone());
-                    if let Some(next_payload) =
-                        build_retry_payload(&attempt_payload, &reject_reason, attempt)
-                    {
-                        attempt_payload = next_payload;
-                        continue;
-                    }
                     break;
                 }
                 Err(err) => {
@@ -960,9 +1036,8 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                     }));
                     final_error = Some(err.clone());
                     final_reject_reason = Some(err.clone());
-                    if let Some(next_payload) = build_retry_payload(&attempt_payload, &err, attempt)
-                    {
-                        attempt_payload = next_payload;
+                    if attempt == 0 && should_retry_submit_error(&err) {
+                        tokio::time::sleep(Duration::from_millis(350)).await;
                         continue;
                     }
                     break;
@@ -1040,6 +1115,7 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                         &attempt_payload,
                         order_id,
                         submit_start_ts_ms,
+                        ack_ts_ms,
                     );
                     state.upsert_pending_order(pending).await;
                 }
@@ -1217,246 +1293,239 @@ pub(super) async fn handle_pending_timeouts_rust(
     let pending = state.list_pending_orders().await;
     let due_rows = pending
         .into_iter()
-        .filter(|row| now_ms.saturating_sub(row.submitted_ts_ms) >= pending_cancel_due_ms(row))
+        .filter(|row| {
+            let maker_tif = matches!(
+                row.tif.to_ascii_uppercase().as_str(),
+                "GTD" | "GTC" | "POST_ONLY"
+            );
+            if maker_tif {
+                now_ms >= pending_cancel_due_ms(row)
+            } else {
+                now_ms >= pending_terminal_due_ms(row)
+            }
+        })
         .collect::<Vec<_>>();
     if due_rows.is_empty() {
         return;
     }
-    let cancel_results = join_all(due_rows.into_iter().map(|row| {
-        let ctx = Arc::clone(&ctx);
-        async move {
-            let result = ctx.client.cancel_order(&row.order_id).await;
-            (row, result)
-        }
-    }))
-    .await;
     let mut timeout_book_cache = HashMap::<String, Option<GatewayBookSnapshot>>::new();
-    for (row, cancel_result) in cancel_results {
-        match cancel_result {
-            Ok(resp) => {
-                let _ = state.remove_pending_order(&row.order_id).await;
-                let maker_tif = matches!(
-                    row.tif.to_ascii_uppercase().as_str(),
-                    "GTD" | "GTC" | "POST_ONLY"
-                );
-                let exit_like = is_live_exit_action(&row.action);
-                let emergency_exit = exit_like && is_emergency_exit_reason(&row.submit_reason);
-                let can_retry = if emergency_exit {
-                    row.retry_count < 2
-                } else {
-                    row.retry_count < 1
-                };
-                if (maker_tif || emergency_exit) && can_retry {
-                    let entry_like = is_entry_action(&row.action);
-                    let fallback_ttl_ms = if emergency_exit {
-                        700
-                    } else if entry_like {
-                        live_entry_fak_ttl_ms()
-                    } else {
-                        900
-                    };
-                    let fallback_slippage_bps = if emergency_exit {
-                        (exec_cfg.exit_slippage_bps + 18.0).max(38.0)
-                    } else if entry_like {
-                        exec_cfg
-                            .exit_slippage_bps
-                            .max(exec_cfg.entry_slippage_bps)
-                            + live_entry_fak_slippage_boost_bps()
-                    } else {
-                        exec_cfg
-                            .exit_slippage_bps
-                            .max(exec_cfg.entry_slippage_bps)
-                            + 10.0
-                    };
-                    let maybe_target = resolve_live_market_target_with_state(
+    for row in due_rows {
+        let maker_tif = matches!(
+            row.tif.to_ascii_uppercase().as_str(),
+            "GTD" | "GTC" | "POST_ONLY"
+        );
+        if !maker_tif {
+            match ctx.client.order(&row.order_id).await {
+                Ok(order) if pm_is_terminal_fill(&order.status) => {
+                    let _ = state.remove_pending_order(&row.order_id).await;
+                    let fill_event = fill_event_from_open_order(&order);
+                    apply_pending_confirmation(
                         state,
-                        &row.symbol,
-                        &row.market_type,
+                        &row,
+                        "rust_terminal_timeout_reconciled_fill",
+                        Some(&fill_event),
                     )
-                    .await
-                    .ok();
-                    if let Some(target) = maybe_target {
-                        let mut effective_target = target.clone();
-                        apply_pending_target_override(&mut effective_target, &row);
-                        let round_check = json!({ "round_id": row.round_id });
-                        let bypass_round_guard = is_live_exit_action(&row.action)
-                            && !row.market_id.trim().is_empty()
-                            && !row.token_id.trim().is_empty();
-                        if !decision_round_matches_target(&round_check, &effective_target)
-                            && !bypass_round_guard
-                        {
-                            state
-                                .append_live_event(
-                                    &row.symbol, &row.market_type,
-                                    json!({
-                                        "accepted": false,
-                                        "action": row.action,
-                                        "side": row.side,
-                                        "round_id": row.round_id,
-                                        "decision_id": row.decision_id,
-                                        "decision_key": row.decision_key,
-                                        "reason": "rust_timeout_cancelled_round_target_mismatch",
-                                        "order_id": row.order_id,
-                                        "target_market_id": effective_target.market_id,
-                                        "target_end_date": effective_target.end_date
-                                    }),
-                                )
-                                .await;
-                            apply_pending_revert(state, &row, "rust_local_timeout_cancel").await;
-                            continue;
-                        }
-                        let readiness_check = json!({
-                            "action": row.action,
-                            "side": row.side,
-                            "round_id": row.round_id
-                        });
-                        if let Err(reason) =
-                            validate_entry_target_readiness(&readiness_check, &effective_target, now_ms)
-                        {
-                            state
-                                .append_live_event(
-                                    &row.symbol, &row.market_type,
-                                    json!({
-                                        "accepted": false,
-                                        "action": row.action,
-                                        "side": row.side,
-                                        "round_id": row.round_id,
-                                        "decision_id": row.decision_id,
-                                        "decision_key": row.decision_key,
-                                        "reason": format!("rust_timeout_cancelled_{reason}"),
-                                        "order_id": row.order_id,
-                                        "target_market_id": effective_target.market_id,
-                                        "target_end_date": effective_target.end_date,
-                                        "now_ms": now_ms
-                                    }),
-                                )
-                                .await;
-                            apply_pending_revert(state, &row, "rust_local_timeout_cancel").await;
-                            continue;
-                        }
-                        let decision = json!({
-                            "decision_id": row.decision_id,
-                            "action": row.action,
-                            "side": row.side,
-                            "round_id": row.round_id,
-                            "price_cents": row.price_cents,
-                            "quote_size_usdc": row.quote_size_usdc,
-                            "reason": format!("{}_timeout_fallback_fak", row.submit_reason),
-                            "tif": "FAK",
-                            "style": "taker",
-                            "ttl_ms": fallback_ttl_ms,
-                            "max_slippage_bps": fallback_slippage_bps
-                        });
-                        let token_id =
-                            token_id_for_decision(&decision, &effective_target).map(str::to_string);
-                        let book_snapshot = if let Some(token_id) = token_id {
-                            get_or_fetch_book_snapshot_cached(
-                                state,
-                                &ctx,
-                                &token_id,
-                                &mut timeout_book_cache,
+                    .await;
+                    state
+                        .append_live_event(
+                            &row.symbol,
+                            &row.market_type,
+                            json!({
+                                "accepted": true,
+                                "action": row.action,
+                                "side": row.side,
+                                "round_id": row.round_id,
+                                "decision_id": row.decision_id,
+                                "decision_key": row.decision_key,
+                                "reason": "rust_terminal_timeout_reconciled_fill",
+                                "order_id": row.order_id,
+                                "status": format!("{}", order.status)
+                            }),
+                        )
+                        .await;
+                }
+                Ok(order) if pm_is_terminal_reject(&order.status) => {
+                    let _ = state.remove_pending_order(&row.order_id).await;
+                    let terminal_status = format!("{}", order.status);
+                    let retried = try_resubmit_after_terminal_reject_rust(
+                        state,
+                        exec_cfg,
+                        &ctx,
+                        &row,
+                        &terminal_status,
+                        &mut timeout_book_cache,
+                    )
+                    .await;
+                    if !retried {
+                        apply_pending_revert(state, &row, "rust_terminal_timeout_rejected").await;
+                        state
+                            .append_live_event(
+                                &row.symbol,
+                                &row.market_type,
+                                json!({
+                                    "accepted": false,
+                                    "action": row.action,
+                                    "side": row.side,
+                                    "round_id": row.round_id,
+                                    "decision_id": row.decision_id,
+                                    "decision_key": row.decision_key,
+                                    "reason": "rust_terminal_timeout_rejected",
+                                    "order_id": row.order_id,
+                                    "status": terminal_status
+                                }),
                             )
-                            .await
-                        } else {
-                            None
-                        };
-                        if let Some(payload) = decision_to_live_payload(
-                            &decision,
-                            &effective_target,
-                            exec_cfg,
-                            book_snapshot.as_ref(),
-                            Some(row.quote_size_usdc),
-                        ) {
-                            let submit = submit_rust_order(&ctx, &payload).await;
-                            if let Ok(submit_resp) = submit {
-                                let accepted = submit_resp
-                                    .get("accepted")
-                                    .and_then(Value::as_bool)
-                                    .unwrap_or(false);
-                                if accepted {
-                                    if let Some(order_id) = submit_resp
-                                        .get("order_id")
-                                        .and_then(Value::as_str)
-                                        .filter(|v| !v.trim().is_empty())
-                                    {
-                                        let mut pending = row.clone();
-                                        pending.order_id = order_id.to_string();
-                                        pending.retry_count = pending.retry_count.saturating_add(1);
-                                        pending.tif = "FAK".to_string();
-                                        pending.style = "taker".to_string();
-                                        pending.submitted_ts_ms = now_ms;
-                                        pending.cancel_after_ms = if emergency_exit {
-                                            700
-                                        } else if entry_like {
-                                            live_entry_fak_cancel_after_ms()
-                                        } else {
-                                            1500
-                                        };
-                                        state.upsert_pending_order(pending).await;
-                                        state
-                                            .append_live_event(
-                                                &row.symbol, &row.market_type,
-                                                json!({
-                                                    "accepted": true,
-                                                    "action": row.action,
-                                                    "side": row.side,
-                                                    "round_id": row.round_id,
-                                                    "decision_id": row.decision_id,
-                                                    "decision_key": row.decision_key,
-                                                    "reason": "rust_timeout_cancelled_resubmitted_fak",
-                                                    "order_id": row.order_id,
-                                                    "new_order_id": order_id,
-                                                    "cancelled": resp.canceled,
-                                                    "not_cancelled": resp.not_canceled,
-                                                    "submit_response": submit_resp,
-                                                    "book_snapshot": book_snapshot,
-                                                    "emergency_exit": emergency_exit
-                                                }),
-                                            )
-                                            .await;
-                                        continue;
-                                    }
-                                }
-                                state
-                                    .append_live_event(
-                                        &row.symbol, &row.market_type,
-                                        json!({
-                                            "accepted": false,
-                                            "action": row.action,
-                                            "side": row.side,
-                                            "round_id": row.round_id,
-                                            "decision_id": row.decision_id,
-                                            "decision_key": row.decision_key,
-                                            "reason": "rust_timeout_cancelled_fak_resubmit_rejected",
-                                            "order_id": row.order_id,
-                                            "cancelled": resp.canceled,
-                                            "not_cancelled": resp.not_canceled,
-                                            "submit_response": submit_resp
-                                        }),
-                                    )
-                                    .await;
-                            }
-                        }
+                            .await;
                     }
                 }
-                apply_pending_revert(state, &row, "rust_timeout_cancelled").await;
-                state
-                    .append_live_event(
-                        &row.symbol, &row.market_type,
+                Ok(order) => {
+                    let mut bumped = row.clone();
+                    bumped.terminal_due_at_ms = now_ms.saturating_add(30_000);
+                    state.upsert_pending_order(bumped).await;
+                    force_pause_for_uncertain_pending(
+                        state,
+                        &row,
+                        "rust_terminal_timeout_unresolved",
                         json!({
-                            "accepted": false,
-                            "action": row.action,
-                            "side": row.side,
-                            "round_id": row.round_id,
-                            "decision_id": row.decision_id,
-                            "decision_key": row.decision_key,
-                            "reason": "rust_timeout_cancelled",
-                            "order_id": row.order_id,
-                            "cancelled": resp.canceled,
-                            "not_cancelled": resp.not_canceled
+                            "status": format!("{}", order.status),
+                            "terminal_due_at_ms": pending_terminal_due_ms(&row)
                         }),
                     )
                     .await;
+                }
+                Err(err) => {
+                    let mut bumped = row.clone();
+                    bumped.terminal_due_at_ms = now_ms.saturating_add(30_000);
+                    state.upsert_pending_order(bumped).await;
+                    force_pause_for_uncertain_pending(
+                        state,
+                        &row,
+                        "rust_terminal_timeout_status_error",
+                        json!({
+                            "error": err.to_string(),
+                            "terminal_due_at_ms": pending_terminal_due_ms(&row)
+                        }),
+                    )
+                    .await;
+                }
+            }
+            continue;
+        }
+
+        match ctx.client.cancel_order(&row.order_id).await {
+            Ok(resp) => {
+                match ctx.client.order(&row.order_id).await {
+                    Ok(order) if pm_is_terminal_fill(&order.status) => {
+                        let _ = state.remove_pending_order(&row.order_id).await;
+                        let fill_event = fill_event_from_open_order(&order);
+                        apply_pending_confirmation(
+                            state,
+                            &row,
+                            "rust_cancel_post_reconcile_filled",
+                            Some(&fill_event),
+                        )
+                        .await;
+                        state
+                            .append_live_event(
+                                &row.symbol,
+                                &row.market_type,
+                                json!({
+                                    "accepted": true,
+                                    "action": row.action,
+                                    "side": row.side,
+                                    "round_id": row.round_id,
+                                    "decision_id": row.decision_id,
+                                    "decision_key": row.decision_key,
+                                    "reason": "rust_cancel_post_reconcile_filled",
+                                    "order_id": row.order_id,
+                                    "cancelled": resp.canceled,
+                                    "not_cancelled": resp.not_canceled,
+                                    "status": format!("{}", order.status)
+                                }),
+                            )
+                            .await;
+                    }
+                    Ok(order) if pm_is_terminal_reject(&order.status) => {
+                        let _ = state.remove_pending_order(&row.order_id).await;
+                        apply_pending_revert(state, &row, "rust_timeout_cancelled").await;
+                        state
+                            .append_live_event(
+                                &row.symbol,
+                                &row.market_type,
+                                json!({
+                                    "accepted": false,
+                                    "action": row.action,
+                                    "side": row.side,
+                                    "round_id": row.round_id,
+                                    "decision_id": row.decision_id,
+                                    "decision_key": row.decision_key,
+                                    "reason": "rust_timeout_cancelled",
+                                    "order_id": row.order_id,
+                                    "cancelled": resp.canceled,
+                                    "not_cancelled": resp.not_canceled,
+                                    "status": format!("{}", order.status)
+                                }),
+                            )
+                            .await;
+                    }
+                    Ok(order) => {
+                        let mut bumped = row.clone();
+                        bumped.cancel_due_at_ms = now_ms.saturating_add(30_000);
+                        bumped.terminal_due_at_ms = now_ms.saturating_add(30_000);
+                        state.upsert_pending_order(bumped).await;
+                        force_pause_for_uncertain_pending(
+                            state,
+                            &row,
+                            "rust_cancel_post_reconcile_unresolved",
+                            json!({
+                                "cancelled": resp.canceled,
+                                "not_cancelled": resp.not_canceled,
+                                "status": format!("{}", order.status)
+                            }),
+                        )
+                        .await;
+                    }
+                    Err(err) => {
+                        if cancel_response_contains_order(&resp, &row.order_id) {
+                            let _ = state.remove_pending_order(&row.order_id).await;
+                            apply_pending_revert(state, &row, "rust_timeout_cancelled").await;
+                            state
+                                .append_live_event(
+                                    &row.symbol,
+                                    &row.market_type,
+                                    json!({
+                                        "accepted": false,
+                                        "action": row.action,
+                                        "side": row.side,
+                                        "round_id": row.round_id,
+                                        "decision_id": row.decision_id,
+                                        "decision_key": row.decision_key,
+                                        "reason": "rust_timeout_cancelled",
+                                        "order_id": row.order_id,
+                                        "cancelled": resp.canceled,
+                                        "not_cancelled": resp.not_canceled,
+                                        "status_error": err.to_string()
+                                    }),
+                                )
+                                .await;
+                        } else {
+                            let mut bumped = row.clone();
+                            bumped.cancel_due_at_ms = now_ms.saturating_add(30_000);
+                            bumped.terminal_due_at_ms = now_ms.saturating_add(30_000);
+                            state.upsert_pending_order(bumped).await;
+                            force_pause_for_uncertain_pending(
+                                state,
+                                &row,
+                                "rust_cancel_post_status_error",
+                                json!({
+                                    "cancelled": resp.canceled,
+                                    "not_cancelled": resp.not_canceled,
+                                    "error": err.to_string()
+                                }),
+                            )
+                            .await;
+                        }
+                    }
+                }
             }
             Err(err) => {
                 handle_cancel_failure_with_escalation(
@@ -1472,4 +1541,3 @@ pub(super) async fn handle_pending_timeouts_rust(
         }
     }
 }
-
