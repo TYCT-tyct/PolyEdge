@@ -94,6 +94,9 @@ pub(super) async fn resolve_autotune_live_doc(
 #[derive(Debug, Clone, Copy, Serialize)]
 pub(super) struct ObjectiveMetrics {
     objective: f64,
+    profit_score: f64,
+    robust_score: f64,
+    balanced_score: f64,
     win_rate_pct: f64,
     avg_pnl_cents: f64,
     max_drawdown_cents: f64,
@@ -163,6 +166,23 @@ pub(super) fn payload_metrics(payload: &Value) -> ObjectiveMetrics {
             .get("objective")
             .and_then(Value::as_f64)
             .unwrap_or(-1_000_000_000.0),
+        profit_score: payload
+            .pointer("/selection_scores/profit")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0),
+        robust_score: payload
+            .pointer("/selection_scores/robust")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0),
+        balanced_score: payload
+            .pointer("/selection_scores/balanced")
+            .and_then(Value::as_f64)
+            .unwrap_or_else(|| {
+                payload
+                    .get("objective")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(-1_000_000_000.0)
+            }),
         win_rate_pct: summary
             .get("win_rate_pct")
             .and_then(Value::as_f64)
@@ -240,15 +260,22 @@ pub(super) fn should_promote_candidate(
     if c.max_drawdown_cents > drawdown_limit {
         return (false, "drawdown_regression".to_string());
     }
-    let objective_improved = c.objective > i.objective + 8.0;
+    let balanced_improved = c.balanced_score > i.balanced_score + 12.0;
+    let robust_improved = c.robust_score > i.robust_score + 12.0;
+    let profit_improved = c.profit_score > i.profit_score + 12.0;
     let pnl_improved = c.avg_pnl_cents > i.avg_pnl_cents + 0.08
-        || c.recent_total_pnl_cents > i.recent_total_pnl_cents + 4.0;
-    let win_rate_guard = c.win_rate_pct + 0.75 >= i.win_rate_pct;
-    if !(objective_improved || pnl_improved) {
+        || c.recent_total_pnl_cents > i.recent_total_pnl_cents + 10.0
+        || c.validation_total_pnl_cents > i.validation_total_pnl_cents + 6.0;
+    let win_rate_guard = c.win_rate_pct + 0.75 >= i.win_rate_pct
+        || c.recent_total_pnl_cents > i.recent_total_pnl_cents + 25.0;
+    if !(balanced_improved || robust_improved || profit_improved || pnl_improved) {
         return (false, "not_meaningfully_better".to_string());
     }
     if !win_rate_guard && c.avg_pnl_cents <= i.avg_pnl_cents + 0.20 {
         return (false, "win_rate_regression_without_pnl_gain".to_string());
     }
-    (true, "promote_positive_robust_candidate".to_string())
+    if c.balanced_score + 1e-9 < i.balanced_score {
+        return (false, "balanced_regression".to_string());
+    }
+    (true, "promote_comprehensive_better_candidate".to_string())
 }

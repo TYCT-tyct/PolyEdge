@@ -1,5 +1,5 @@
-const SEARCH_ENGINE_VERSION: &str = "forge_fev1_search_v2";
-const SEARCH_OBJECTIVE_VERSION: &str = "positive_walkforward_v2";
+const SEARCH_ENGINE_VERSION: &str = "forge_fev1_search_v3";
+const SEARCH_OBJECTIVE_VERSION: &str = "comprehensive_frontier_v3";
 const SEARCH_WALK_FORWARD_MAX_FOLDS: usize = 5;
 const SEARCH_WALK_FORWARD_MIN_ROUNDS_PER_FOLD: usize = 2;
 const SEARCH_WALK_FORWARD_MIN_SAMPLES_PER_FOLD: usize = 120;
@@ -72,6 +72,28 @@ struct PositiveGateSummary {
     emergency_exit_rate_ok: bool,
     blocked_exit_rate_ok: bool,
     positive_fold_ratio: f64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct SelectionScores {
+    profit: f64,
+    robust: f64,
+    balanced: f64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct SelectionImprovement {
+    beats_incumbent: bool,
+    balanced_gain: f64,
+    profit_gain: f64,
+    robust_gain: f64,
+    recent_net_pnl_gain_cents: f64,
+    validation_net_pnl_gain_cents: f64,
+    robust_net_pnl_gain_cents: f64,
+    mean_pnl_gain_cents: f64,
+    win_rate_gain_pct: f64,
+    drawdown_delta_cents: f64,
+    trade_count_ratio: f64,
 }
 
 fn build_strategy_arms(
@@ -859,6 +881,85 @@ fn strategy_samples_hash(samples: &[StrategySample]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn payload_f64(payload: &Value, path: &str) -> f64 {
+    payload
+        .pointer(path)
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
+}
+
+fn payload_selection_score(payload: &Value, score_name: &str) -> f64 {
+    payload
+        .pointer(&format!("/selection_scores/{score_name}"))
+        .and_then(Value::as_f64)
+        .unwrap_or_else(|| payload_objective(payload))
+}
+
+fn selection_improvement(payload: &Value, incumbent: &Value) -> SelectionImprovement {
+    let candidate_trade_count = payload_f64(payload, "/summary_robust/trade_count");
+    let incumbent_trade_count = payload_f64(incumbent, "/summary_robust/trade_count");
+    SelectionImprovement {
+        beats_incumbent: false,
+        balanced_gain: payload_selection_score(payload, "balanced")
+            - payload_selection_score(incumbent, "balanced"),
+        profit_gain: payload_selection_score(payload, "profit")
+            - payload_selection_score(incumbent, "profit"),
+        robust_gain: payload_selection_score(payload, "robust")
+            - payload_selection_score(incumbent, "robust"),
+        recent_net_pnl_gain_cents: payload_f64(payload, "/summary_recent/total_pnl_cents")
+            - payload_f64(incumbent, "/summary_recent/total_pnl_cents"),
+        validation_net_pnl_gain_cents: payload_f64(payload, "/summary_validation/total_pnl_cents")
+            - payload_f64(incumbent, "/summary_validation/total_pnl_cents"),
+        robust_net_pnl_gain_cents: payload_f64(payload, "/summary_robust/total_pnl_cents")
+            - payload_f64(incumbent, "/summary_robust/total_pnl_cents"),
+        mean_pnl_gain_cents: payload_f64(payload, "/summary_robust/avg_pnl_cents")
+            - payload_f64(incumbent, "/summary_robust/avg_pnl_cents"),
+        win_rate_gain_pct: payload_f64(payload, "/summary_robust/win_rate_pct")
+            - payload_f64(incumbent, "/summary_robust/win_rate_pct"),
+        drawdown_delta_cents: payload_f64(payload, "/summary_robust/max_drawdown_cents")
+            - payload_f64(incumbent, "/summary_robust/max_drawdown_cents"),
+        trade_count_ratio: if incumbent_trade_count > 0.0 {
+            candidate_trade_count / incumbent_trade_count
+        } else {
+            1.0
+        },
+    }
+}
+
+fn candidate_beats_incumbent_balanced(payload: &Value, incumbent: &Value) -> bool {
+    if !payload_is_positive_eligible(payload) {
+        return false;
+    }
+    let mut improvement = selection_improvement(payload, incumbent);
+    let incumbent_positive = payload_is_positive_eligible(incumbent);
+    let drawdown_limit = payload_f64(incumbent, "/summary_robust/max_drawdown_cents") * 0.10 + 4.0;
+    let drawdown_ok = improvement.drawdown_delta_cents <= drawdown_limit;
+    let trade_count_ok = improvement.trade_count_ratio >= 0.80 || improvement.trade_count_ratio >= 1.0;
+    let profitability_ok = improvement.recent_net_pnl_gain_cents >= -4.0
+        && improvement.validation_net_pnl_gain_cents >= -4.0
+        && improvement.robust_net_pnl_gain_cents >= -8.0
+        && (improvement.recent_net_pnl_gain_cents > 8.0
+            || improvement.validation_net_pnl_gain_cents > 6.0
+            || improvement.robust_net_pnl_gain_cents > 8.0);
+    let quality_ok = improvement.mean_pnl_gain_cents >= -0.15
+        && (improvement.win_rate_gain_pct >= -1.0
+            || improvement.recent_net_pnl_gain_cents > 25.0
+            || improvement.validation_net_pnl_gain_cents > 18.0);
+    let beats = if !incumbent_positive {
+        improvement.balanced_gain > 16.0
+            && improvement.recent_net_pnl_gain_cents > 0.0
+            && improvement.validation_net_pnl_gain_cents > 0.0
+    } else {
+        improvement.balanced_gain > 12.0
+            && profitability_ok
+            && quality_ok
+            && drawdown_ok
+            && trade_count_ok
+    };
+    improvement.beats_incumbent = beats;
+    improvement.beats_incumbent
+}
+
 fn payload_is_positive_eligible(payload: &Value) -> bool {
     payload
         .pointer("/robustness/gates/eligible_positive")
@@ -873,14 +974,19 @@ fn payload_objective(payload: &Value) -> f64 {
         .unwrap_or(f64::NEG_INFINITY)
 }
 
-fn sort_leaderboard(leaderboard: &mut Vec<Value>, limit: usize) {
+fn sort_leaderboard(leaderboard: &mut Vec<Value>, limit: usize, incumbent: &Value) {
     leaderboard.sort_by(|a, b| {
+        let ai = candidate_beats_incumbent_balanced(a, incumbent);
+        let bi = candidate_beats_incumbent_balanced(b, incumbent);
         let ae = payload_is_positive_eligible(a);
         let be = payload_is_positive_eligible(b);
-        match be.cmp(&ae) {
-            std::cmp::Ordering::Equal => payload_objective(b)
-                .partial_cmp(&payload_objective(a))
-                .unwrap_or(std::cmp::Ordering::Equal),
+        match bi.cmp(&ai) {
+            std::cmp::Ordering::Equal => match be.cmp(&ae) {
+                std::cmp::Ordering::Equal => payload_selection_score(b, "balanced")
+                    .partial_cmp(&payload_selection_score(a, "balanced"))
+                    .unwrap_or(std::cmp::Ordering::Equal),
+                other => other,
+            },
             other => other,
         }
     });
@@ -990,7 +1096,6 @@ pub(super) async fn strategy_optimize(
     let mapped_recent_samples = map_samples_to_fev1(recent_samples);
     let recent_target_win_rate = (target_win_rate - 2.0).clamp(40.0, 99.9);
     let recent_max_trades = std::cmp::max(valid_max_trades, window_trades * 4);
-    let valid_weight = (1.0_f64 - recent_weight).max(0.1);
     let walk_forward_folds = build_walk_forward_folds(train_samples);
     let dataset_hash = strategy_samples_hash(&samples);
     let study_id = format!(
@@ -1017,10 +1122,6 @@ pub(super) async fn strategy_optimize(
     let seed_pool = build_strategy_arms(base_cfg, incumbent_cfg, budget.seed_trials);
     let mut seed = params.seed.unwrap_or(0xC0DEC0DE1234ABCDu64);
     let mut leaderboard: Vec<Value> = Vec::new();
-    let mut best_overall_objective = f64::NEG_INFINITY;
-    let mut best_overall_payload = Value::Null;
-    let mut best_positive_objective = f64::NEG_INFINITY;
-    let mut best_positive_payload = Value::Null;
     let mut reached_target = false;
     let mut seen_configs = HashSet::<String>::new();
     let mut evaluated_candidates = 0usize;
@@ -1112,13 +1213,57 @@ pub(super) async fn strategy_optimize(
                 + fold_penalty
         };
 
-        let objective =
-            train_obj * 0.08 + valid_obj * valid_weight + recent_obj * recent_weight * 1.20
-                + walk_score
-                - consistency_penalty
-                - fill_risk_penalty
-                - coverage_gate_penalty
-                - positive_gate_penalty;
+        let trade_support = recent_run.trade_count.min(160) as f64 * 0.8
+            + valid_run.trade_count.min(120) as f64 * 0.9
+            + walk.median_trade_count.min(90.0) * 1.8;
+        let profit_score = recent_run.total_pnl_cents.max(0.0) * 0.42
+            + valid_run.total_pnl_cents.max(0.0) * 0.30
+            + walk.median_total_pnl_cents.max(0.0) * 0.24
+            + recent_run.avg_pnl_cents.max(0.0) * 92.0
+            + valid_run.avg_pnl_cents.max(0.0) * 74.0
+            + walk.median_avg_pnl_cents.max(0.0) * 68.0
+            + recent_run.win_rate_pct * 5.5
+            + valid_run.win_rate_pct * 4.0
+            + ((pf_recent.min(8.0) - 1.0).max(0.0)) * 140.0
+            + ((pf_valid.min(6.0) - 1.0).max(0.0)) * 100.0
+            + trade_support
+            - recent_run.max_drawdown_cents * 1.25
+            - valid_run.max_drawdown_cents * 0.95
+            - walk.worst_drawdown_cents * 1.10
+            - consistency_penalty * 2.0
+            - fill_risk_penalty * 1.15
+            - coverage_gate_penalty * 0.08
+            - if gates.eligible_positive { 0.0 } else { 2200.0 };
+        let robust_score = walk.median_total_pnl_cents.max(0.0) * 0.28
+            + valid_run.total_pnl_cents.max(0.0) * 0.22
+            + recent_run.total_pnl_cents.max(0.0) * 0.18
+            + walk.median_avg_pnl_cents.max(0.0) * 88.0
+            + valid_run.avg_pnl_cents.max(0.0) * 70.0
+            + recent_run.avg_pnl_cents.max(0.0) * 60.0
+            + walk.median_win_rate_pct * 7.0
+            + valid_run.win_rate_pct * 5.0
+            + recent_run.win_rate_pct * 4.5
+            + walk.positive_total_pnl_ratio * 280.0
+            + ((walk.median_profit_factor.min(8.0) - 1.0).max(0.0)) * 160.0
+            + ((walk.min_profit_factor.min(4.0) - 1.0).max(0.0)) * 110.0
+            + trade_support * 0.8
+            - walk.worst_drawdown_cents * 2.9
+            - valid_run.max_drawdown_cents * 1.8
+            - recent_run.max_drawdown_cents * 1.4
+            - walk.max_blocked_exit_rate * 320.0
+            - walk.max_emergency_exit_rate * 360.0
+            - consistency_penalty * 2.3
+            - fill_risk_penalty
+            - coverage_gate_penalty * 0.10
+            - if gates.eligible_positive { 0.0 } else { 2600.0 };
+        let balanced_score = profit_score * 0.52
+            + robust_score * 0.68
+            + train_obj * 0.04
+            + valid_obj * 0.18
+            + recent_obj * 0.24
+            + walk_score * 0.55
+            - (recent_rs.latest_win_rate_pct - valid_rs.latest_win_rate_pct).abs() * 3.5;
+        let objective = balanced_score;
 
         let hit = gates.eligible_positive
             && (valid_hit || valid_rs.latest_win_rate_pct >= (target_win_rate - 3.0))
@@ -1176,25 +1321,54 @@ pub(super) async fn strategy_optimize(
                 "validation_objective": valid_obj,
                 "recent_objective": recent_obj,
                 "walk_forward_score": walk_score,
+                "profit_score": profit_score,
+                "robust_score": robust_score,
+                "balanced_score": balanced_score,
                 "consistency_penalty": consistency_penalty,
                 "fill_risk_penalty": fill_risk_penalty,
                 "coverage_penalty": coverage_gate_penalty,
                 "positive_gate_penalty": positive_gate_penalty,
+            },
+            "selection_scores": SelectionScores {
+                profit: profit_score,
+                robust: robust_score,
+                balanced: balanced_score,
             },
             "config": strategy_cfg_json(cfg),
         });
         (payload, objective, hit, gates.eligible_positive)
     };
 
+    let incumbent_payload = if let Some(cfg) = incumbent_cfg {
+        let (payload, _, _, _) = evaluate_candidate("incumbent_active".to_string(), &cfg);
+        payload
+    } else {
+        let (payload, _, _, _) = evaluate_candidate("incumbent_default".to_string(), &base_cfg);
+        payload
+    };
+
+    let mut best_profit_score = f64::NEG_INFINITY;
+    let mut best_profit_payload = Value::Null;
+    let mut best_robust_score = f64::NEG_INFINITY;
+    let mut best_robust_payload = Value::Null;
+    let mut best_balanced_score = f64::NEG_INFINITY;
+    let mut best_balanced_payload = Value::Null;
+    let mut best_improved_score = f64::NEG_INFINITY;
+    let mut best_improved_payload = Value::Null;
+
     let register_candidate =
         |name: String,
          mut cfg: StrategyRuntimeConfig,
          leaderboard: &mut Vec<Value>,
          seen_configs: &mut HashSet<String>,
-         best_overall_objective: &mut f64,
-         best_overall_payload: &mut Value,
-         best_positive_objective: &mut f64,
-         best_positive_payload: &mut Value,
+         best_profit_score: &mut f64,
+         best_profit_payload: &mut Value,
+         best_robust_score: &mut f64,
+         best_robust_payload: &mut Value,
+         best_balanced_score: &mut f64,
+         best_balanced_payload: &mut Value,
+         best_improved_score: &mut f64,
+         best_improved_payload: &mut Value,
          reached_target: &mut bool,
          evaluated_candidates: &mut usize,
          positive_candidates: &mut usize| {
@@ -1203,24 +1377,37 @@ pub(super) async fn strategy_optimize(
             if !seen_configs.insert(key) {
                 return;
             }
-            let (payload, objective, hit, eligible_positive) = evaluate_candidate(name, &cfg);
+            let (payload, _objective, hit, eligible_positive) = evaluate_candidate(name, &cfg);
             *evaluated_candidates = evaluated_candidates.saturating_add(1);
             if eligible_positive {
                 *positive_candidates = positive_candidates.saturating_add(1);
-                if objective > *best_positive_objective {
-                    *best_positive_objective = objective;
-                    *best_positive_payload = payload.clone();
+                let profit_score = payload_selection_score(&payload, "profit");
+                let robust_score = payload_selection_score(&payload, "robust");
+                let balanced_score = payload_selection_score(&payload, "balanced");
+                if profit_score > *best_profit_score {
+                    *best_profit_score = profit_score;
+                    *best_profit_payload = payload.clone();
                 }
-            }
-            if objective > *best_overall_objective {
-                *best_overall_objective = objective;
-                *best_overall_payload = payload.clone();
+                if robust_score > *best_robust_score {
+                    *best_robust_score = robust_score;
+                    *best_robust_payload = payload.clone();
+                }
+                if balanced_score > *best_balanced_score {
+                    *best_balanced_score = balanced_score;
+                    *best_balanced_payload = payload.clone();
+                }
+                if candidate_beats_incumbent_balanced(&payload, &incumbent_payload)
+                    && balanced_score > *best_improved_score
+                {
+                    *best_improved_score = balanced_score;
+                    *best_improved_payload = payload.clone();
+                }
             }
             if hit {
                 *reached_target = true;
             }
             leaderboard.push(payload);
-            sort_leaderboard(leaderboard, budget.leaderboard_size);
+            sort_leaderboard(leaderboard, budget.leaderboard_size, &incumbent_payload);
         };
 
     for (name, cfg) in seed_pool {
@@ -1229,10 +1416,14 @@ pub(super) async fn strategy_optimize(
             cfg,
             &mut leaderboard,
             &mut seen_configs,
-            &mut best_overall_objective,
-            &mut best_overall_payload,
-            &mut best_positive_objective,
-            &mut best_positive_payload,
+            &mut best_profit_score,
+            &mut best_profit_payload,
+            &mut best_robust_score,
+            &mut best_robust_payload,
+            &mut best_balanced_score,
+            &mut best_balanced_payload,
+            &mut best_improved_score,
+            &mut best_improved_payload,
             &mut reached_target,
             &mut evaluated_candidates,
             &mut positive_candidates,
@@ -1246,10 +1437,14 @@ pub(super) async fn strategy_optimize(
             cfg,
             &mut leaderboard,
             &mut seen_configs,
-            &mut best_overall_objective,
-            &mut best_overall_payload,
-            &mut best_positive_objective,
-            &mut best_positive_payload,
+            &mut best_profit_score,
+            &mut best_profit_payload,
+            &mut best_robust_score,
+            &mut best_robust_payload,
+            &mut best_balanced_score,
+            &mut best_balanced_payload,
+            &mut best_improved_score,
+            &mut best_improved_payload,
             &mut reached_target,
             &mut evaluated_candidates,
             &mut positive_candidates,
@@ -1287,10 +1482,14 @@ pub(super) async fn strategy_optimize(
             cfg,
             &mut leaderboard,
             &mut seen_configs,
-            &mut best_overall_objective,
-            &mut best_overall_payload,
-            &mut best_positive_objective,
-            &mut best_positive_payload,
+            &mut best_profit_score,
+            &mut best_profit_payload,
+            &mut best_robust_score,
+            &mut best_robust_payload,
+            &mut best_balanced_score,
+            &mut best_balanced_payload,
+            &mut best_improved_score,
+            &mut best_improved_payload,
             &mut reached_target,
             &mut evaluated_candidates,
             &mut positive_candidates,
@@ -1312,10 +1511,14 @@ pub(super) async fn strategy_optimize(
                 cfg,
                 &mut leaderboard,
                 &mut seen_configs,
-                &mut best_overall_objective,
-                &mut best_overall_payload,
-                &mut best_positive_objective,
-                &mut best_positive_payload,
+                &mut best_profit_score,
+                &mut best_profit_payload,
+                &mut best_robust_score,
+                &mut best_robust_payload,
+                &mut best_balanced_score,
+                &mut best_balanced_payload,
+                &mut best_improved_score,
+                &mut best_improved_payload,
                 &mut reached_target,
                 &mut evaluated_candidates,
                 &mut positive_candidates,
@@ -1335,30 +1538,33 @@ pub(super) async fn strategy_optimize(
             cfg,
             &mut leaderboard,
             &mut seen_configs,
-            &mut best_overall_objective,
-            &mut best_overall_payload,
-            &mut best_positive_objective,
-            &mut best_positive_payload,
+            &mut best_profit_score,
+            &mut best_profit_payload,
+            &mut best_robust_score,
+            &mut best_robust_payload,
+            &mut best_balanced_score,
+            &mut best_balanced_payload,
+            &mut best_improved_score,
+            &mut best_improved_payload,
             &mut reached_target,
             &mut evaluated_candidates,
             &mut positive_candidates,
         );
     }
 
-    let best_payload = if !best_positive_payload.is_null() {
-        best_positive_payload.clone()
+    let best_discovered_payload = if !best_balanced_payload.is_null() {
+        best_balanced_payload.clone()
     } else {
-        best_overall_payload.clone()
+        incumbent_payload.clone()
     };
-    let positive_candidate_found = !best_positive_payload.is_null();
-
-    let incumbent_payload = if let Some(cfg) = incumbent_cfg {
-        let (payload, _, _, _) = evaluate_candidate("incumbent_active".to_string(), &cfg);
-        payload
+    let best_payload = if !best_improved_payload.is_null() {
+        best_improved_payload.clone()
     } else {
-        let (payload, _, _, _) = evaluate_candidate("incumbent_default".to_string(), &base_cfg);
-        payload
+        incumbent_payload.clone()
     };
+    let positive_candidate_found = !best_balanced_payload.is_null();
+    let selected_beats_incumbent = candidate_beats_incumbent_balanced(&best_payload, &incumbent_payload);
+    let selected_improvement = selection_improvement(&best_payload, &incumbent_payload);
 
     let persist_requested = params.persist_best.unwrap_or(true);
     let persist_ttl_sec = params.persist_ttl_sec.filter(|v| *v > 0);
@@ -1376,7 +1582,7 @@ pub(super) async fn strategy_optimize(
     let (should_promote, promotion_reason) = should_promote_candidate(
         &best_payload,
         &incumbent_payload,
-        active_before_opt.is_some(),
+        true,
         promote_min_trades,
         promote_min_win_rate,
         promote_min_pnl,
@@ -1406,8 +1612,13 @@ pub(super) async fn strategy_optimize(
                 "seed": seed,
                 "budget": budget,
                 "positive_candidate_found": positive_candidate_found,
+                "selected_beats_incumbent": selected_beats_incumbent,
                 "config": best_payload.get("config").cloned().unwrap_or(Value::Null),
                 "best": best_payload.clone(),
+                "best_discovered": best_discovered_payload.clone(),
+                "best_profit": best_profit_payload.clone(),
+                "best_robust": best_robust_payload.clone(),
+                "best_balanced": best_balanced_payload.clone(),
                 "leaderboard_top": leaderboard.iter().take(5).cloned().collect::<Vec<Value>>(),
             });
             if let Err(e) = write_key_value(&state, &persist_key, &save_doc, persist_ttl_sec).await
@@ -1430,8 +1641,10 @@ pub(super) async fn strategy_optimize(
                         "baseline_profile": baseline_profile,
                         "target_win_rate_pct": target_win_rate,
                         "window_trades": window_trades,
+                        "selected_beats_incumbent": selected_beats_incumbent,
                         "config": best_payload.get("config").cloned().unwrap_or(Value::Null),
                         "best": best_payload.clone(),
+                        "best_discovered": best_discovered_payload.clone(),
                         "incumbent": incumbent_payload.clone(),
                     });
                     if let Err(e) =
@@ -1507,6 +1720,11 @@ pub(super) async fn strategy_optimize(
         "positive_candidate_found": positive_candidate_found,
         "target_reached": reached_target,
         "leaderboard_names": candidate_names(&leaderboard),
+        "selection": {
+            "selected_beats_incumbent": selected_beats_incumbent,
+            "selected_improvement": selected_improvement,
+            "selected_source": if selected_beats_incumbent { "best_improved_balanced" } else { "hold_current_reference" },
+        },
         "walk_forward": {
             "fold_count": walk_forward_folds.len(),
             "fold_names": walk_forward_folds.iter().map(|fold| fold.name.clone()).collect::<Vec<String>>(),
@@ -1533,6 +1751,10 @@ pub(super) async fn strategy_optimize(
             "incumbent_metrics": payload_metrics(&incumbent_payload),
         },
         "best": best_payload,
+        "best_discovered": best_discovered_payload,
+        "best_profit": best_profit_payload,
+        "best_robust": best_robust_payload,
+        "best_balanced": best_balanced_payload,
         "incumbent": incumbent_payload,
         "leaderboard": leaderboard,
     })))
@@ -1605,5 +1827,50 @@ mod tests {
         let folds = build_walk_forward_folds(&samples);
         assert!(folds.len() >= 3);
         assert!(folds.iter().all(|fold| fold.mapped_samples.len() >= 120));
+    }
+
+    #[test]
+    fn candidate_beats_incumbent_requires_real_comprehensive_improvement() {
+        let incumbent = json!({
+            "selection_scores": { "profit": 100.0, "robust": 120.0, "balanced": 150.0 },
+            "summary_recent": { "total_pnl_cents": 120.0 },
+            "summary_validation": { "total_pnl_cents": 80.0 },
+            "summary_robust": {
+                "total_pnl_cents": 90.0,
+                "avg_pnl_cents": 4.0,
+                "win_rate_pct": 70.0,
+                "max_drawdown_cents": 30.0,
+                "trade_count": 40.0
+            },
+            "robustness": { "gates": { "eligible_positive": true } }
+        });
+        let better = json!({
+            "selection_scores": { "profit": 145.0, "robust": 154.0, "balanced": 176.0 },
+            "summary_recent": { "total_pnl_cents": 168.0 },
+            "summary_validation": { "total_pnl_cents": 108.0 },
+            "summary_robust": {
+                "total_pnl_cents": 112.0,
+                "avg_pnl_cents": 4.2,
+                "win_rate_pct": 70.4,
+                "max_drawdown_cents": 31.0,
+                "trade_count": 38.0
+            },
+            "robustness": { "gates": { "eligible_positive": true } }
+        });
+        let worse = json!({
+            "selection_scores": { "profit": 146.0, "robust": 158.0, "balanced": 170.0 },
+            "summary_recent": { "total_pnl_cents": 115.0 },
+            "summary_validation": { "total_pnl_cents": 75.0 },
+            "summary_robust": {
+                "total_pnl_cents": 88.0,
+                "avg_pnl_cents": 3.7,
+                "win_rate_pct": 68.5,
+                "max_drawdown_cents": 38.0,
+                "trade_count": 32.0
+            },
+            "robustness": { "gates": { "eligible_positive": true } }
+        });
+        assert!(candidate_beats_incumbent_balanced(&better, &incumbent));
+        assert!(!candidate_beats_incumbent_balanced(&worse, &incumbent));
     }
 }
