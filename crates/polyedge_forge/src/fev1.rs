@@ -1085,6 +1085,7 @@ impl SimulationCoreState {
             0.0
         };
         let current_live_entry_decision = self.current_live_entry_decision();
+        let current_live_entry_available = current_live_entry_decision.is_some();
         let suggested_side = if self.last_confirmed {
             self.last_side
         } else {
@@ -1092,9 +1093,9 @@ impl SimulationCoreState {
         };
 
         let current = json!({
-            "suggested_action": if self.last_confirmed && self.last_score.abs() >= self.last_entry_threshold {
+            "suggested_action": if current_live_entry_available {
                 if self.last_side == "UP" { "ENTER_UP" } else { "ENTER_DOWN" }
-            } else if trade_count > 0 {
+            } else if self.position.is_some() || trade_count > 0 {
                 "HOLD"
             } else {
                 "WAIT"
@@ -1121,7 +1122,7 @@ impl SimulationCoreState {
             "spread_down_cents": self.last_spread_down_cents,
             "loss_cluster_streak": self.loss_cluster_streak,
             "loss_cluster_cooldown_until_ts_ms": self.loss_cluster_cooldown_until_ts_ms,
-            "live_entry_available": current_live_entry_decision.is_some(),
+            "live_entry_available": current_live_entry_available,
             "live_entry_decision": current_live_entry_decision,
         });
 
