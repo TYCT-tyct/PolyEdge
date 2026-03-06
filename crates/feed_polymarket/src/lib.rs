@@ -316,6 +316,13 @@ impl PolymarketFeed {
             .clamp(2, 60);
         let mut rediscover_tick = tokio::time::interval(Duration::from_secs(rediscover_every));
         rediscover_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let market_set_confirm_polls = std::env::var("POLYEDGE_MARKET_SET_CONFIRM_POLLS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(3)
+            .clamp(1, 12);
+        let mut pending_market_ids: Option<HashSet<String>> = None;
+        let mut pending_market_confirmations: usize = 0;
         let mut last_update_at = Instant::now();
         // Many Polymarket markets (especially 5m/15m contracts) expire quickly. If the WS
         // connection stays up, we would otherwise keep subscribing to stale/closed assets and
@@ -402,6 +409,17 @@ impl PolymarketFeed {
                             let current_ids = markets.keys().cloned().collect::<HashSet<_>>();
                             let latest_ids = latest_markets.keys().cloned().collect::<HashSet<_>>();
                             if current_ids != latest_ids {
+                                if pending_market_ids
+                                    .as_ref()
+                                    .map(|pending| pending == &latest_ids)
+                                    .unwrap_or(false)
+                                {
+                                    pending_market_confirmations =
+                                        pending_market_confirmations.saturating_add(1);
+                                } else {
+                                    pending_market_ids = Some(latest_ids.clone());
+                                    pending_market_confirmations = 1;
+                                }
                                 let added = latest_ids.difference(&current_ids).count();
                                 let removed = current_ids.difference(&latest_ids).count();
                                 tracing::info!(
@@ -410,9 +428,25 @@ impl PolymarketFeed {
                                     added,
                                     removed,
                                     rediscover_sec = rediscover_every,
-                                    "polymarket market set changed, reconnecting"
+                                    confirmations = pending_market_confirmations,
+                                    confirm_required = market_set_confirm_polls,
+                                    "polymarket market set drift observed"
                                 );
-                                break;
+                                if pending_market_confirmations >= market_set_confirm_polls {
+                                    tracing::info!(
+                                        current_market_count = markets.len(),
+                                        discovered_market_count = latest_markets.len(),
+                                        added,
+                                        removed,
+                                        rediscover_sec = rediscover_every,
+                                        confirmations = pending_market_confirmations,
+                                        "polymarket market set change confirmed, reconnecting"
+                                    );
+                                    break;
+                                }
+                            } else {
+                                pending_market_ids = None;
+                                pending_market_confirmations = 0;
                             }
                         }
                         Err(err) => {
