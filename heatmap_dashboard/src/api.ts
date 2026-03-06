@@ -10,7 +10,6 @@ import type {
     MarketType,
     RoundChartResponse,
     RoundsResponse,
-    SourceHealthResponse,
     StatsResponse,
     StrategyPaperResponse,
     WindowType,
@@ -27,7 +26,6 @@ const apiSupport: {
   stats: boolean | null;
   collectorStatus: boolean | null;
   collectorMetrics: boolean | null;
-  sourceHealth: boolean | null;
   chart: boolean | null;
   rounds: boolean | null;
   roundsAvailable: boolean | null;
@@ -38,7 +36,6 @@ const apiSupport: {
   stats: null,
   collectorStatus: null,
   collectorMetrics: null,
-  sourceHealth: null,
   chart: null,
   rounds: null,
   roundsAvailable: null,
@@ -61,9 +58,6 @@ function responseCacheTtlMs(path: string): number {
     return 1_500;
   }
   if (path.startsWith("/api/collector/metrics")) {
-    return 1_500;
-  }
-  if (path.startsWith("/api/source_health")) {
     return 1_500;
   }
   return 0;
@@ -508,10 +502,9 @@ async function getHistoryRaw(
 }
 
 export async function getStats(symbol: MarketSymbol = "BTCUSDT"): Promise<StatsResponse> {
-  const qs = new URLSearchParams({ symbol });
-  if (apiSupport.stats !== false) {
+  if (symbol === "BTCUSDT" && apiSupport.stats !== false) {
     try {
-      const data = await requestJson<StatsResponse>(`/api/stats?${qs.toString()}`);
+      const data = await requestJson<StatsResponse>("/api/stats");
       apiSupport.stats = true;
       return data;
     } catch (err) {
@@ -622,39 +615,6 @@ export async function getCollectorMetrics(
   };
 }
 
-export async function getSourceHealth(windowSec = 180): Promise<SourceHealthResponse> {
-  const qs = new URLSearchParams({ window_sec: String(windowSec) });
-  if (apiSupport.sourceHealth !== false) {
-    try {
-      const data = await requestJson<SourceHealthResponse>(`/api/source_health?${qs.toString()}`);
-      apiSupport.sourceHealth = true;
-      return data;
-    } catch (err) {
-      if (!(err instanceof HttpError) || err.status !== 404) {
-        throw err;
-      }
-      apiSupport.sourceHealth = false;
-    }
-  }
-  const symbols: MarketSymbol[] = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"];
-  const rows = await Promise.all(
-    symbols.map(async (symbol) => {
-      const status = await getCollectorMetrics(symbol);
-      return {
-        symbol,
-        ok: status.ok,
-        timeframes: status.timeframes
-      };
-    })
-  );
-  return {
-    ok: rows.every((row) => row.ok),
-    ts_ms: Date.now(),
-    window_ms: windowSec * 1000,
-    symbols: rows
-  };
-}
-
 export interface LatestRawRow {
   ts_ireland_sample_ms: number;
   symbol: string;
@@ -695,10 +655,9 @@ export async function getChart(
   const qs = new URLSearchParams({
     market_type: marketType,
     minutes: String(minutes),
-    max_points: String(maxPoints),
-    symbol
+    max_points: String(maxPoints)
   });
-  if (apiSupport.chart !== false) {
+  if (symbol === "BTCUSDT" && apiSupport.chart !== false) {
     try {
       const data = await requestJson<ChartResponse>(`/api/chart?${qs.toString()}`);
       apiSupport.chart = true;
@@ -762,10 +721,9 @@ export async function getRoundHistory(
 ): Promise<RoundsResponse> {
   const qs = new URLSearchParams({
     market_type: marketType,
-    limit: String(limit),
-    symbol
+    limit: String(limit)
   });
-  if (apiSupport.rounds !== false) {
+  if (symbol === "BTCUSDT" && apiSupport.rounds !== false) {
     try {
       const data = await requestJson<RoundsResponse>(`/api/rounds?${qs.toString()}`);
       apiSupport.rounds = true;
@@ -814,10 +772,9 @@ export async function getAvailableRounds(
   symbol: MarketSymbol = "BTCUSDT"
 ): Promise<AvailableRoundsResponse> {
   const qs = new URLSearchParams({
-    market_type: marketType,
-    symbol
+    market_type: marketType
   });
-  if (apiSupport.roundsAvailable !== false) {
+  if (symbol === "BTCUSDT" && apiSupport.roundsAvailable !== false) {
     try {
       const data = await requestJson<AvailableRoundsResponse>(`/api/rounds/available?${qs.toString()}`);
       apiSupport.roundsAvailable = true;
@@ -866,10 +823,9 @@ export async function getRoundChart(
   const qs = new URLSearchParams({
     round_id: roundId,
     market_type: marketType,
-    max_points: "6000",
-    symbol
+    max_points: "6000"
   });
-  if (apiSupport.roundChart !== false) {
+  if (symbol === "BTCUSDT" && apiSupport.roundChart !== false) {
     try {
       const data = await requestJson<RoundChartResponse>(`/api/chart/round?${qs.toString()}`);
       apiSupport.roundChart = true;
@@ -933,10 +889,9 @@ export async function getHeatmap(
 ): Promise<HeatmapResponse> {
   const qs = new URLSearchParams({
     market_type: marketType,
-    lookback_hours: String(lookbackHours),
-    symbol
+    lookback_hours: String(lookbackHours)
   });
-  if (apiSupport.heatmap !== false) {
+  if (symbol === "BTCUSDT") {
     const data = await requestJson<HeatmapResponse>(`/api/heatmap?${qs.toString()}`);
     apiSupport.heatmap = true;
     return data;
@@ -993,9 +948,8 @@ export async function getAccuracySeries(
   const qs = new URLSearchParams({
     market_type: marketType,
     lookback_hours: String(lookbackHours),
-    symbol,
   });
-  if (apiSupport.accuracy !== false) {
+  if (symbol === "BTCUSDT") {
     const data = await requestJson<AccuracySeriesResponse>(`/api/accuracy_series?${qs.toString()}`);
     apiSupport.accuracy = true;
     return data;

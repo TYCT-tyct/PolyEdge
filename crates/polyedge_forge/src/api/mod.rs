@@ -1965,7 +1965,6 @@ struct HistoryQueryParams {
 #[derive(Debug, Deserialize)]
 struct ChartQueryParams {
     market_type: String,
-    symbol: Option<String>,
     minutes: Option<u32>,
     max_points: Option<u32>,
 }
@@ -1984,20 +1983,17 @@ struct WsLiveQueryParams {
 #[derive(Debug, Deserialize)]
 struct RoundQueryParams {
     market_type: String,
-    symbol: Option<String>,
     limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AvailableRoundsQueryParams {
     market_type: String,
-    symbol: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RoundChartQueryParams {
     round_id: String,
-    symbol: Option<String>,
     market_type: Option<String>,
     max_points: Option<u32>,
 }
@@ -2005,14 +2001,12 @@ struct RoundChartQueryParams {
 #[derive(Debug, Deserialize)]
 struct HeatmapQueryParams {
     market_type: String,
-    symbol: Option<String>,
     lookback_hours: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AccuracyQueryParams {
     market_type: String,
-    symbol: Option<String>,
     window: Option<u32>,
     lookback_hours: Option<u32>,
     limit: Option<u32>,
@@ -2283,7 +2277,6 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         .route("/api/stats", get(stats))
         .route("/api/collector/status", get(collector_status))
         .route("/api/collector/metrics", get(collector_metrics))
-        .route("/api/source_health", get(source_health))
         .route("/api/chart", get(chart))
         .route("/api/chart/round", get(chart_round))
         .route("/api/rounds", get(rounds))

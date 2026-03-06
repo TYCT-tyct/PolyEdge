@@ -81,7 +81,7 @@ export interface StatsResponse {
 }
 
 export interface CollectorTimeframeStatus {
-  status: "ok" | "lagging" | "stalled" | "missing" | "disabled";
+  status: "ok" | "lagging" | "stalled" | "missing";
   timestamp_ms: number | null;
   age_ms: number | null;
   remaining_ms: number | null;
@@ -115,22 +115,6 @@ export interface CollectorStatusResponse {
 export interface CollectorMetricsResponse extends CollectorStatusResponse {
   symbol: string;
   window_ms: number;
-}
-
-export interface SourceHealthSymbolRow {
-  symbol: string;
-  ok: boolean;
-  timeframes: {
-    "5m": CollectorTimeframeStatus;
-    "15m": CollectorTimeframeStatus;
-  };
-}
-
-export interface SourceHealthResponse {
-  ok: boolean;
-  ts_ms: number;
-  window_ms: number;
-  symbols: SourceHealthSymbolRow[];
 }
 
 export interface RoundHistoryRow {

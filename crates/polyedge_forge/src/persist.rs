@@ -8,7 +8,7 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::common::ts_to_date_hour;
-use crate::models::{BronzePersistEvent, IngestLogRow, PersistEvent};
+use crate::models::{IngestLogRow, PersistEvent};
 
 pub fn persist_event(root: &Path, ev: PersistEvent) -> Result<()> {
     match ev {
@@ -49,42 +49,6 @@ pub fn persist_event(root: &Path, ev: PersistEvent) -> Result<()> {
                 .join("app=ireland-recorder");
             let path = dir.join(format!("hour={hour:02}.jsonl"));
             append_jsonl(&path, &row)?;
-        }
-    }
-    Ok(())
-}
-
-pub fn persist_bronze_event(root: &Path, ev: BronzePersistEvent) -> Result<()> {
-    match ev {
-        BronzePersistEvent::BookTop(row) => {
-            let (date, hour) = ts_to_date_hour(row.ts_recorded_ms)?;
-            let dir = root
-                .join("book_top")
-                .join(format!("dt={date}"))
-                .join(format!("symbol={}", row.symbol))
-                .join(format!("tf={}", row.timeframe));
-            let path = dir.join(format!("hour={hour:02}.jsonl"));
-            append_jsonl(&path, row.as_ref())?;
-        }
-        BronzePersistEvent::BookEvent(row) => {
-            let (date, hour) = ts_to_date_hour(row.ts_recorded_ms)?;
-            let dir = root
-                .join("book_event")
-                .join(format!("dt={date}"))
-                .join(format!("symbol={}", row.symbol))
-                .join(format!("tf={}", row.timeframe));
-            let path = dir.join(format!("hour={hour:02}.jsonl"));
-            append_jsonl(&path, row.as_ref())?;
-        }
-        BronzePersistEvent::Discovery(row) => {
-            let (date, hour) = ts_to_date_hour(row.ts_recorded_ms)?;
-            let dir = root
-                .join("market_discovery")
-                .join(format!("dt={date}"))
-                .join(format!("symbol={}", row.symbol))
-                .join(format!("tf={}", row.timeframe));
-            let path = dir.join(format!("hour={hour:02}.jsonl"));
-            append_jsonl(&path, row.as_ref())?;
         }
     }
     Ok(())

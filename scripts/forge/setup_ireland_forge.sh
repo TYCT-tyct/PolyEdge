@@ -17,7 +17,7 @@ RUNTIME_MAX_TRADES="${RUNTIME_MAX_TRADES:-0}"
 RUNTIME_LIVE_EXECUTE="${RUNTIME_LIVE_EXECUTE:-false}"
 DISCOVERY_REFRESH_SEC="${DISCOVERY_REFRESH_SEC:-5}"
 DISCOVERY_MARKETS_PER_TEMPLATE="${DISCOVERY_MARKETS_PER_TEMPLATE:-3}"
-MARKET_WS_REFRESH_SEC="${MARKET_WS_REFRESH_SEC:-0}"
+MARKET_WS_REFRESH_SEC="${MARKET_WS_REFRESH_SEC:-30}"
 TOKYO_INPUT_STALE_GUARD_MS="${TOKYO_INPUT_STALE_GUARD_MS:-2500}"
 MARKET_SAMPLE_END_GRACE_MS="${MARKET_SAMPLE_END_GRACE_MS:-300}"
 MARKET_SELECTION_FALLBACK_PREWARM_MS="${MARKET_SELECTION_FALLBACK_PREWARM_MS:-300000}"
@@ -58,11 +58,6 @@ sudo chown -R "$USER_NAME:$USER_NAME" "$DATA_ROOT"
 
 cd "$REPO_DIR"
 ~/.cargo/bin/cargo build -p polyedge_forge --release
-chmod +x "$REPO_DIR/scripts/forge/verify_ireland_deploy.sh"
-
-echo "[forge-ireland] active_symbols=$ACTIVE_SYMBOLS active_timeframes=$ACTIVE_TIMEFRAMES active_symbol_timeframes=$ACTIVE_SYMBOL_TIMEFRAMES"
-echo "[forge-ireland] discovery_refresh_sec=$DISCOVERY_REFRESH_SEC market_ws_refresh_sec=$MARKET_WS_REFRESH_SEC candidate_pool=$MARKET_CANDIDATE_POOL_SIZE"
-echo "[forge-ireland] runtime_markets=$RUNTIME_MARKETS strategy_markets=$STRATEGY_MARKETS base_profile=$STRATEGY_BASE_PROFILE"
 
 # Keep service-level defaults in sync even when .env overrides are present.
 ENV_FILE="$REPO_DIR/.env"
@@ -118,7 +113,6 @@ User=$USER_NAME
 WorkingDirectory=$REPO_DIR
 Environment=RUST_LOG=info,polyedge_forge=debug
 Environment=POLYEDGE_MARKET_REFRESH_SEC=$MARKET_WS_REFRESH_SEC
-Environment=POLYEDGE_MARKET_SET_CONFIRM_POLLS=3
 Environment=POLYEDGE_TARGET_MARKET_CACHE_FILE=/data/polyedge-forge/cache/target_market_cache.json
 Environment=POLYEDGE_DISCOVERY_NEAR_EXPIRY_ONLY=true
 Environment=POLYEDGE_DISCOVERY_MARKETS_PER_TEMPLATE=$DISCOVERY_MARKETS_PER_TEMPLATE
@@ -153,8 +147,6 @@ Environment=FORGE_MARKET_DISCOVERY_QUEUE_CAP=1024
 Environment=FORGE_TARGET_REQ_QUEUE_CAP=4096
 Environment=FORGE_TARGET_RES_QUEUE_CAP=4096
 Environment=FORGE_RELAY_TICK_PERSIST_ENABLED=false
-Environment=FORGE_BRONZE_SIDECAR_ENABLED=true
-Environment=FORGE_BRONZE_QUEUE_CAP=32768
 ExecStart=$REPO_DIR/target/release/polyedge_forge ireland-recorder --data-root $DATA_ROOT --udp-bind 0.0.0.0:9801 --sample-ms 100 --supported-symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT --active-symbols $ACTIVE_SYMBOLS --active-timeframes $ACTIVE_TIMEFRAMES --active-symbol-timeframes $ACTIVE_SYMBOL_TIMEFRAMES --discovery-refresh-sec $DISCOVERY_REFRESH_SEC --clickhouse-url http://127.0.0.1:8123 --clickhouse-database polyedge_forge --clickhouse-snapshot-table snapshot_100ms --clickhouse-round-table rounds --clickhouse-snapshot-ttl-days 14 --clickhouse-processed-ttl-days 14 --clickhouse-round-ttl-days 180 --redis-url redis://127.0.0.1:6379/0 --redis-prefix forge --redis-ttl-sec 7200 --sink-batch-size 200 --sink-flush-ms 1000 --sink-queue-cap 20000 --disable-api --dashboard-dist /home/ubuntu/PolyEdge/heatmap_dashboard/dist
 Restart=always
 RestartSec=2
@@ -185,9 +177,6 @@ Environment=FORGE_FEV1_RUNTIME_MAX_TRADES=$RUNTIME_MAX_TRADES
 Environment=FORGE_STRATEGY_MARKETS=$STRATEGY_MARKETS
 Environment=FORGE_STRATEGY_BASE_PROFILE=$STRATEGY_BASE_PROFILE
 Environment=FORGE_STRATEGY_BASE_PROFILE_BY_SCOPE=$STRATEGY_BASE_PROFILE_BY_SCOPE
-Environment=FORGE_ACTIVE_SYMBOLS=$ACTIVE_SYMBOLS
-Environment=FORGE_ACTIVE_TFS=$ACTIVE_TIMEFRAMES
-Environment=FORGE_ACTIVE_SYMBOL_TIMEFRAMES=$ACTIVE_SYMBOL_TIMEFRAMES
 Environment=FORGE_FEV1_EXECUTOR=rust_sdk
 Environment=FORGE_FEV1_MIN_QUOTE_USDC=0.01
 Environment=FORGE_FEV1_RUNTIME_QUOTE_USDC=0.01
@@ -350,6 +339,5 @@ sudo systemctl enable --now polyedge-forge-healthcheck.timer
 sudo systemctl --no-pager --full status polyedge-forge-ireland-recorder.service | sed -n '1,25p'
 sudo systemctl --no-pager --full status polyedge-forge-ireland-api.service | sed -n '1,25p'
 sudo systemctl --no-pager --full status polyedge-forge-healthcheck.timer | sed -n '1,20p'
-"$REPO_DIR/scripts/forge/verify_ireland_deploy.sh"
 
 echo "[forge-ireland] done"

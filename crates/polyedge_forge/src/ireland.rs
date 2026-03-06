@@ -1,13 +1,11 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
 use chrono::Utc;
-use core_types::{BookSide, BookTop, BookUpdate, MarketFeed, PolymarketBookWsFeed, RefPriceWsFeed};
+use core_types::{BookTop, MarketFeed, RefPriceWsFeed};
 use feed_polymarket::PolymarketFeed;
 use feed_reference::MultiSourceRefFeed;
 use futures::StreamExt;
@@ -25,11 +23,11 @@ use crate::market_data_exchange::{
 };
 use crate::market_switch::resolve_switch_snapshot;
 use crate::models::{
-    compute_tokyo_wire_checksum, BronzeBookEventRow, BronzeBookTopRow, BronzeDiscoveryRow,
-    BronzePersistEvent, ChainlinkLocal, MarketMeta, MotionState, PersistEvent, RelayTickRow,
-    RoundRow, SnapshotRow, TokyoBinanceLocal, TokyoBinanceWire, TokyoReplayRequestWire,
+    compute_tokyo_wire_checksum, ChainlinkLocal, MarketMeta, MotionState, PersistEvent,
+    RelayTickRow, RoundRow, SnapshotRow, TokyoBinanceLocal, TokyoBinanceWire,
+    TokyoReplayRequestWire,
 };
-use crate::persist::{log_ingest, persist_bronze_event, persist_event};
+use crate::persist::{log_ingest, persist_event};
 
 // --- 后台 Target Fetch 请求/响应定义 ---
 struct TargetFetchReq {
@@ -42,13 +40,6 @@ struct TargetFetchReq {
 struct TargetFetchRes {
     cache_key: String,
     target_price: Option<f64>,
-}
-
-#[derive(Debug, Clone)]
-struct BronzeBookSidecarState {
-    by_market: HashMap<String, MarketMeta>,
-    token_to_market: HashMap<String, MarketMeta>,
-    token_ids: Vec<String>,
 }
 
 fn ingest_queue_cap(key: &str, default: usize, min: usize, max: usize) -> usize {
@@ -69,177 +60,6 @@ fn relay_tick_persist_enabled() -> bool {
             )
         })
         .unwrap_or(false)
-}
-
-fn bronze_sidecar_enabled() -> bool {
-    std::env::var("FORGE_BRONZE_SIDECAR_ENABLED")
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(true)
-}
-
-fn bronze_try_send(
-    tx: &mpsc::Sender<BronzePersistEvent>,
-    event: BronzePersistEvent,
-    source: &'static str,
-) {
-    static DROP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    match tx.try_send(event) {
-        Ok(()) => {}
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            let dropped = DROP_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-            if dropped.is_multiple_of(1024) {
-                tracing::warn!(
-                    source,
-                    dropped,
-                    "bronze sidecar queue full, dropping sidecar events"
-                );
-            }
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
-            tracing::warn!(source, "bronze sidecar channel closed");
-        }
-    }
-}
-
-fn build_bronze_book_sidecar_state(
-    markets: &HashMap<String, MarketMeta>,
-) -> BronzeBookSidecarState {
-    let mut token_to_market = HashMap::new();
-    let mut token_ids = Vec::new();
-    for market in markets.values() {
-        if let Some(token) = market.token_id_yes.as_ref() {
-            token_ids.push(token.clone());
-            token_to_market.insert(token.clone(), market.clone());
-        }
-        if let Some(token) = market.token_id_no.as_ref() {
-            token_ids.push(token.clone());
-            token_to_market.insert(token.clone(), market.clone());
-        }
-    }
-    token_ids.sort();
-    token_ids.dedup();
-    BronzeBookSidecarState {
-        by_market: markets.clone(),
-        token_to_market,
-        token_ids,
-    }
-}
-
-fn bronze_book_event_row(
-    event: &BookUpdate,
-    state: &BronzeBookSidecarState,
-    now_ms: i64,
-) -> Option<BronzeBookEventRow> {
-    match event {
-        BookUpdate::Snapshot(snapshot) => {
-            let market = state
-                .by_market
-                .get(&snapshot.market_id)
-                .or_else(|| state.token_to_market.get(&snapshot.asset_id))?;
-            Some(BronzeBookEventRow {
-                ts_recorded_ms: now_ms,
-                event_type: "snapshot".to_string(),
-                market_id: snapshot.market_id.clone(),
-                asset_id: snapshot.asset_id.clone(),
-                symbol: market.symbol.clone(),
-                timeframe: market.timeframe.clone(),
-                title: market.title.clone(),
-                side: None,
-                price: None,
-                size: None,
-                best_bid: snapshot.bids.first().map(|l| l.price),
-                best_ask: snapshot.asks.first().map(|l| l.price),
-                spread: match (snapshot.bids.first(), snapshot.asks.first()) {
-                    (Some(b), Some(a)) => Some((a.price - b.price).max(0.0)),
-                    _ => None,
-                },
-                bid_levels: Some(
-                    snapshot
-                        .bids
-                        .iter()
-                        .take(5)
-                        .map(|l| (l.price, l.size))
-                        .collect(),
-                ),
-                ask_levels: Some(
-                    snapshot
-                        .asks
-                        .iter()
-                        .take(5)
-                        .map(|l| (l.price, l.size))
-                        .collect(),
-                ),
-                ts_exchange_ms: snapshot.ts_exchange_ms,
-                recv_ts_local_ns: snapshot.recv_ts_local_ns,
-                hash: snapshot.hash.clone(),
-            })
-        }
-        BookUpdate::Delta(delta) => {
-            let market = state
-                .by_market
-                .get(&delta.market_id)
-                .or_else(|| state.token_to_market.get(&delta.asset_id))?;
-            Some(BronzeBookEventRow {
-                ts_recorded_ms: now_ms,
-                event_type: "delta".to_string(),
-                market_id: delta.market_id.clone(),
-                asset_id: delta.asset_id.clone(),
-                symbol: market.symbol.clone(),
-                timeframe: market.timeframe.clone(),
-                title: market.title.clone(),
-                side: Some(match delta.side {
-                    BookSide::Bid => "bid".to_string(),
-                    BookSide::Ask => "ask".to_string(),
-                }),
-                price: Some(delta.price),
-                size: Some(delta.size),
-                best_bid: delta.best_bid,
-                best_ask: delta.best_ask,
-                spread: match (delta.best_bid, delta.best_ask) {
-                    (Some(b), Some(a)) => Some((a - b).max(0.0)),
-                    _ => None,
-                },
-                bid_levels: None,
-                ask_levels: None,
-                ts_exchange_ms: delta.ts_exchange_ms,
-                recv_ts_local_ns: delta.recv_ts_local_ns,
-                hash: delta.hash.clone(),
-            })
-        }
-        BookUpdate::Digest(digest) => {
-            let market = state
-                .by_market
-                .get(&digest.market_id)
-                .or_else(|| state.token_to_market.get(&digest.asset_id))?;
-            Some(BronzeBookEventRow {
-                ts_recorded_ms: now_ms,
-                event_type: "digest".to_string(),
-                market_id: digest.market_id.clone(),
-                asset_id: digest.asset_id.clone(),
-                symbol: market.symbol.clone(),
-                timeframe: market.timeframe.clone(),
-                title: market.title.clone(),
-                side: None,
-                price: None,
-                size: None,
-                best_bid: Some(digest.best_bid),
-                best_ask: Some(digest.best_ask),
-                spread: Some(digest.spread),
-                bid_levels: None,
-                ask_levels: None,
-                ts_exchange_ms: digest.ts_exchange_ms,
-                recv_ts_local_ns: digest.recv_ts_local_ns,
-                hash: None,
-            })
-        }
-    }
 }
 
 // Removed: MARKET_FUTURE_GUARD_DEFAULT_MS (replaced by market_prestart_allow_ms)
@@ -264,7 +84,6 @@ const CHAINLINK_QUEUE_CAP_DEFAULT: usize = 8_192;
 const BOOK_QUEUE_CAP_DEFAULT: usize = 16_384;
 const MARKET_QUEUE_CAP_DEFAULT: usize = 512;
 const TARGET_QUEUE_CAP_DEFAULT: usize = 2_048;
-const BRONZE_QUEUE_CAP_DEFAULT: usize = 16_384;
 const TOKYO_REPLAY_REQ_THROTTLE_MS: i64 = 250;
 const TARGET_RETRY_BACKOFF_MS: i64 = 1_200;
 const RECORDER_HOUSEKEEPING_INTERVAL_MS: i64 = 10_000;
@@ -1041,45 +860,6 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         }
     });
 
-    let bronze_tx = if bronze_sidecar_enabled() {
-        let bronze_root = root.join("bronze");
-        fs::create_dir_all(&bronze_root).ok();
-        let (tx, mut rx) = mpsc::channel::<BronzePersistEvent>(ingest_queue_cap(
-            "FORGE_BRONZE_QUEUE_CAP",
-            BRONZE_QUEUE_CAP_DEFAULT,
-            512,
-            131_072,
-        ));
-        thread::spawn(move || {
-            while let Some(ev) = rx.blocking_recv() {
-                if let Err(err) = persist_bronze_event(&bronze_root, ev) {
-                    tracing::error!(?err, "bronze persist failed");
-                }
-            }
-        });
-        Some(tx)
-    } else {
-        None
-    };
-    let (bronze_book_state_tx, mut bronze_book_state_sig) =
-        if let Some(bronze_tx_ref) = bronze_tx.as_ref() {
-            let (tx, rx) = mpsc::channel::<BronzeBookSidecarState>(ingest_queue_cap(
-                "FORGE_BRONZE_BOOK_STATE_QUEUE_CAP",
-                32,
-                4,
-                1024,
-            ));
-            spawn_bronze_book_raw_sidecar(
-                subscribe_tfs.clone(),
-                rx,
-                bronze_tx_ref.clone(),
-                persist_tx.clone(),
-            );
-            (Some(tx), Vec::<String>::new())
-        } else {
-            (None, Vec::<String>::new())
-        };
-
     let sink_cfg = DbSinkConfig {
         clickhouse_url: normalize_opt_url(&args.clickhouse_url),
         clickhouse_database: args.clickhouse_database.clone(),
@@ -1441,31 +1221,6 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                 chainlink_by_symbol.insert(msg.symbol.clone(), msg);
             }
             Some(book) = book_rx.recv() => {
-                if let Some(bronze_tx) = bronze_tx.as_ref() {
-                    if let Some(market_meta) = markets_by_id.get(&book.market_id) {
-                        bronze_try_send(
-                            bronze_tx,
-                            BronzePersistEvent::BookTop(Box::new(BronzeBookTopRow {
-                                ts_recorded_ms: Utc::now().timestamp_millis(),
-                                market_id: book.market_id.clone(),
-                                symbol: market_meta.symbol.clone(),
-                                timeframe: market_meta.timeframe.clone(),
-                                title: market_meta.title.clone(),
-                                bid_yes: book.bid_yes,
-                                ask_yes: book.ask_yes,
-                                bid_no: book.bid_no,
-                                ask_no: book.ask_no,
-                                bid_size_yes: book.bid_size_yes,
-                                ask_size_yes: book.ask_size_yes,
-                                bid_size_no: book.bid_size_no,
-                                ask_size_no: book.ask_size_no,
-                                ts_exchange_ms: book.ts_ms,
-                                recv_ts_local_ns: book.recv_ts_local_ns,
-                            })),
-                            "bronze_book_top",
-                        );
-                    }
-                }
                 book_by_market.insert(book.market_id.clone(), book);
             }
             Some(markets) = market_rx.recv() => {
@@ -1481,34 +1236,6 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                 for m in markets {
                     if market_filter.allows(&m.symbol, &m.timeframe) {
                         markets_by_id.insert(m.market_id.clone(), m);
-                    }
-                }
-                if let Some(bronze_tx) = bronze_tx.as_ref() {
-                    for market in markets_by_id.values() {
-                        bronze_try_send(
-                            bronze_tx,
-                            BronzePersistEvent::Discovery(Box::new(BronzeDiscoveryRow {
-                                ts_recorded_ms: now_ms,
-                                market_id: market.market_id.clone(),
-                                symbol: market.symbol.clone(),
-                                timeframe: market.timeframe.clone(),
-                                title: market.title.clone(),
-                                target_price: market.target_price,
-                                start_ts_ms: market.start_ts_ms,
-                                end_ts_ms: market.end_ts_ms,
-                                source: "market_discovery".to_string(),
-                            })),
-                            "bronze_discovery",
-                        );
-                    }
-                }
-                if let Some(sidecar_tx) = bronze_book_state_tx.as_ref() {
-                    let state = build_bronze_book_sidecar_state(&markets_by_id);
-                    if state.token_ids != bronze_book_state_sig {
-                        bronze_book_state_sig = state.token_ids.clone();
-                        if let Err(err) = sidecar_tx.try_send(state) {
-                            tracing::warn!(?err, "bronze book sidecar state send failed");
-                        }
                     }
                 }
                 let mut pair_seen: HashSet<String> = markets_by_id
@@ -3420,87 +3147,6 @@ fn spawn_market_discovery_reader(
     });
 }
 
-fn spawn_bronze_book_raw_sidecar(
-    timeframes: Vec<String>,
-    mut state_rx: mpsc::Receiver<BronzeBookSidecarState>,
-    bronze_tx: mpsc::Sender<BronzePersistEvent>,
-    persist: mpsc::UnboundedSender<PersistEvent>,
-) {
-    tokio::spawn(async move {
-        let mut pending_state: Option<BronzeBookSidecarState> = None;
-        loop {
-            let current_state = match pending_state.take() {
-                Some(v) => v,
-                None => match state_rx.recv().await {
-                    Some(v) => v,
-                    None => return,
-                },
-            };
-            if current_state.token_ids.is_empty() {
-                continue;
-            }
-
-            let feed = PolymarketFeed::new_with_universe(
-                Duration::from_millis(50),
-                Vec::new(),
-                vec!["updown".to_string()],
-                timeframes.clone(),
-            );
-            let stream = feed.stream_book(current_state.token_ids.clone()).await;
-            let mut stream = match stream {
-                Ok(v) => v,
-                Err(err) => {
-                    log_ingest(
-                        &persist,
-                        "warn",
-                        "bronze_book_raw",
-                        &format!("stream start failed: {err}"),
-                    );
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    pending_state = Some(current_state);
-                    continue;
-                }
-            };
-
-            loop {
-                tokio::select! {
-                    maybe_state = state_rx.recv() => {
-                        match maybe_state {
-                            Some(next_state) => {
-                                pending_state = Some(next_state);
-                                break;
-                            }
-                            None => return,
-                        }
-                    }
-                    next = stream.next() => {
-                        let Some(next) = next else {
-                            log_ingest(&persist, "warn", "bronze_book_raw", "stream ended, restarting");
-                            pending_state = Some(current_state.clone());
-                            break;
-                        };
-                        let update = match next {
-                            Ok(v) => v,
-                            Err(err) => {
-                                log_ingest(&persist, "warn", "bronze_book_raw", &format!("stream item error: {err}"));
-                                pending_state = Some(current_state.clone());
-                                break;
-                            }
-                        };
-                        if let Some(row) = bronze_book_event_row(&update, &current_state, Utc::now().timestamp_millis()) {
-                            bronze_try_send(
-                                &bronze_tx,
-                                BronzePersistEvent::BookEvent(Box::new(row)),
-                                "bronze_book_raw",
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    });
-}
-
 fn target_market_cache_file_path() -> PathBuf {
     if let Ok(raw) = std::env::var("POLYEDGE_TARGET_MARKET_CACHE_FILE") {
         let trimmed = raw.trim();
@@ -3647,18 +3293,6 @@ async fn discover_markets_from_target_cache(
             symbol,
             timeframe: timeframe.to_string(),
             title: question,
-            token_id_yes: detail_json
-                .get("clobTokenIds")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|arr| arr.first())
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            token_id_no: detail_json
-                .get("clobTokenIds")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|arr| arr.get(1))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
             target_price: None,
             end_ts_ms,
             start_ts_ms,
@@ -3709,8 +3343,6 @@ fn to_market_meta(m: MarketDescriptor, tf: String, start_ts_ms: i64, end_ts_ms: 
         symbol,
         timeframe: tf,
         title: m.question.clone(),
-        token_id_yes: m.token_id_yes,
-        token_id_no: m.token_id_no,
         target_price,
         end_ts_ms,
         start_ts_ms,
@@ -4045,8 +3677,6 @@ mod tests {
             symbol: "BTCUSDT".to_string(),
             timeframe: "5m".to_string(),
             title: "BTC".to_string(),
-            token_id_yes: None,
-            token_id_no: None,
             target_price: None,
             start_ts_ms: 1_000,
             end_ts_ms: 2_000,
@@ -4063,8 +3693,6 @@ mod tests {
             symbol: "BTCUSDT".to_string(),
             timeframe: "5m".to_string(),
             title: "BTC".to_string(),
-            token_id_yes: None,
-            token_id_no: None,
             target_price: None,
             start_ts_ms: 100_000,
             end_ts_ms: 400_000,
@@ -4090,8 +3718,6 @@ mod tests {
             symbol: "BTCUSDT".to_string(),
             timeframe: "5m".to_string(),
             title: "BTC".to_string(),
-            token_id_yes: None,
-            token_id_no: None,
             target_price: None,
             start_ts_ms: 1_000,
             end_ts_ms: 2_000,
@@ -4118,8 +3744,6 @@ mod tests {
             symbol: "BTCUSDT".to_string(),
             timeframe: "5m".to_string(),
             title: "BTC".to_string(),
-            token_id_yes: None,
-            token_id_no: None,
             target_price: None,
             start_ts_ms: start,
             end_ts_ms: end,
@@ -4190,8 +3814,6 @@ mod tests {
             symbol: "BTCUSDT".to_string(),
             timeframe: "5m".to_string(),
             title: "BTC".to_string(),
-            token_id_yes: None,
-            token_id_no: None,
             target_price: Some(100_000.0),
             start_ts_ms: 0,
             end_ts_ms: 300_000,
@@ -4227,8 +3849,6 @@ mod tests {
             symbol: "BTCUSDT".to_string(),
             timeframe: "5m".to_string(),
             title: "BTC".to_string(),
-            token_id_yes: None,
-            token_id_no: None,
             target_price: Some(100_000.0),
             start_ts_ms: 0,
             end_ts_ms: 300_000,

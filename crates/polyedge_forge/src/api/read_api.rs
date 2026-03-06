@@ -512,34 +512,26 @@ pub(super) async fn history_symbol_timeframe(
     })))
 }
 
-pub(super) async fn stats(
-    State(state): State<ApiState>,
-    Query(params): Query<CollectorMetricsQueryParams>,
-) -> Result<Json<Value>, ApiError> {
+pub(super) async fn stats(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
     let Some(ch_url) = state.ch_url.as_deref() else {
         return Err(ApiError::internal("clickhouse not configured"));
     };
-    let symbol = normalize_collector_symbol(params.symbol.as_deref());
 
-    let sample_query = format!(
-        "SELECT
+    let sample_query = "SELECT
             count() AS total_samples,
             min(ts_ireland_sample_ms) AS first_sample_ms,
             max(ts_ireland_sample_ms) AS last_sample_ms
         FROM polyedge_forge.snapshot_100ms
-        WHERE symbol='{symbol}' AND timeframe IN ('5m','15m')
-        FORMAT JSON"
-    );
-    let round_query = format!(
-        "SELECT
+        WHERE symbol='BTCUSDT' AND timeframe IN ('5m','15m')
+        FORMAT JSON";
+    let round_query = "SELECT
             count() AS total_rounds,
             sum(toUInt8(settle_price > target_price)) AS up_count,
             count() - sum(toUInt8(settle_price > target_price)) AS down_count
         FROM polyedge_forge.rounds
-        WHERE symbol='{symbol}' AND timeframe IN ('5m','15m')
-        FORMAT JSON"
-    );
-    let accuracy_query = format!("SELECT
+        WHERE symbol='BTCUSDT' AND timeframe IN ('5m','15m')
+        FORMAT JSON";
+    let accuracy_query = "SELECT
             countIf(isNotNull(s.eval_mid_up)) AS market_accuracy_n,
             avgIf(
                 toFloat64((s.eval_mid_up >= 0.5) = (r.settle_price > r.target_price)),
@@ -551,21 +543,21 @@ pub(super) async fn stats(
                 round_id,
                 argMinIf(coalesce(mid_yes, mid_yes_smooth), abs(remaining_ms - if(timeframe='5m', 60000, 180000)), remaining_ms >= 0) AS eval_mid_up
             FROM polyedge_forge.snapshot_100ms
-            WHERE symbol='{symbol}' AND timeframe IN ('5m','15m')
+            WHERE symbol='BTCUSDT' AND timeframe IN ('5m','15m')
             GROUP BY round_id
         ) s ON r.round_id = s.round_id
-        WHERE r.symbol='{symbol}' AND r.timeframe IN ('5m','15m')
-        FORMAT JSON");
+        WHERE r.symbol='BTCUSDT' AND r.timeframe IN ('5m','15m')
+        FORMAT JSON";
 
-    let sample_row = rows_from_json(query_clickhouse_json(ch_url, &sample_query).await?)
+    let sample_row = rows_from_json(query_clickhouse_json(ch_url, sample_query).await?)
         .into_iter()
         .next()
         .unwrap_or_else(|| json!({}));
-    let round_row = rows_from_json(query_clickhouse_json(ch_url, &round_query).await?)
+    let round_row = rows_from_json(query_clickhouse_json(ch_url, round_query).await?)
         .into_iter()
         .next()
         .unwrap_or_else(|| json!({}));
-    let accuracy_row = rows_from_json(query_clickhouse_json(ch_url, &accuracy_query).await?)
+    let accuracy_row = rows_from_json(query_clickhouse_json(ch_url, accuracy_query).await?)
         .into_iter()
         .next()
         .unwrap_or_else(|| json!({}));
@@ -581,7 +573,6 @@ pub(super) async fn stats(
     };
 
     Ok(Json(json!({
-        "symbol": symbol,
         "total_rounds": row_i64(&round_row, "total_rounds").unwrap_or(0).max(0),
         "total_samples": total_samples,
         "up_count": row_i64(&round_row, "up_count").unwrap_or(0).max(0),
@@ -609,72 +600,6 @@ fn normalize_collector_symbol(raw: Option<&str>) -> String {
     } else {
         symbol
     }
-}
-
-fn configured_collector_scopes() -> HashMap<String, HashSet<String>> {
-    let active_symbols = std::env::var("FORGE_ACTIVE_SYMBOLS")
-        .ok()
-        .map(|v| {
-            v.split(',')
-                .map(|s| normalize_collector_symbol(Some(s)))
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>()
-        })
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| {
-            vec![
-                "BTCUSDT".to_string(),
-                "ETHUSDT".to_string(),
-                "SOLUSDT".to_string(),
-                "XRPUSDT".to_string(),
-            ]
-        });
-    let active_tfs = std::env::var("FORGE_ACTIVE_TFS")
-        .ok()
-        .map(|v| {
-            v.split(',')
-                .filter_map(normalize_market_type)
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>()
-        })
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| vec!["5m".to_string(), "15m".to_string()]);
-
-    let mut by_symbol: HashMap<String, HashSet<String>> = HashMap::new();
-    for symbol in &active_symbols {
-        by_symbol.insert(symbol.clone(), active_tfs.iter().cloned().collect());
-    }
-
-    if let Ok(raw) = std::env::var("FORGE_ACTIVE_SYMBOL_TIMEFRAMES") {
-        let mut custom: HashMap<String, HashSet<String>> = HashMap::new();
-        for entry in raw.split(',') {
-            let item = entry.trim();
-            let Some((symbol_raw, tfs_raw)) = item.split_once(':') else {
-                continue;
-            };
-            let symbol = normalize_collector_symbol(Some(symbol_raw));
-            let tfs = tfs_raw
-                .split('|')
-                .filter_map(normalize_market_type)
-                .map(|s| s.to_string())
-                .collect::<HashSet<_>>();
-            if !symbol.is_empty() && !tfs.is_empty() {
-                custom.insert(symbol, tfs);
-            }
-        }
-        if !custom.is_empty() {
-            by_symbol = custom;
-        }
-    }
-
-    by_symbol
-}
-
-fn collector_scope_enabled(symbol: &str, timeframe: &str) -> bool {
-    configured_collector_scopes()
-        .get(&normalize_collector_symbol(Some(symbol)))
-        .map(|set| set.contains(&timeframe.to_ascii_lowercase()))
-        .unwrap_or(false)
 }
 
 fn collector_timeframe_status_row(snapshot: Option<&Value>, now_ms: i64) -> (bool, Value) {
@@ -734,19 +659,6 @@ fn collector_timeframe_status_row(snapshot: Option<&Value>, now_ms: i64) -> (boo
             }),
         ),
     }
-}
-
-fn collector_timeframe_disabled_row() -> Value {
-    json!({
-        "status": "disabled",
-        "timestamp_ms": Value::Null,
-        "age_ms": Value::Null,
-        "remaining_ms": Value::Null,
-        "round_id": "",
-        "tokyo_relay_proc_lag_ms": Value::Null,
-        "cross_region_net_lag_ms": Value::Null,
-        "path_lag_ms": Value::Null,
-    })
 }
 
 async fn fetch_collector_window_metrics(
@@ -849,10 +761,6 @@ pub(super) async fn collector_status(
     let mut overall_ok = true;
 
     for tf in ["5m", "15m"] {
-        if !collector_scope_enabled(&symbol, tf) {
-            tf_map.insert(tf.to_string(), collector_timeframe_disabled_row());
-            continue;
-        }
         let snapshot = match fetch_latest_snapshot(&state, &symbol, tf).await? {
             Some(v) => Some(v),
             None => fetch_latest_snapshot_from_clickhouse(&state, &symbol, tf, now_ms).await?,
@@ -882,14 +790,6 @@ pub(super) async fn collector_metrics(
     let mut overall_ok = true;
 
     for tf in ["5m", "15m"] {
-        if !collector_scope_enabled(&symbol, tf) {
-            let mut status_value = collector_timeframe_disabled_row();
-            if let Some(status_obj) = status_value.as_object_mut() {
-                status_obj.insert("window".to_string(), Value::Null);
-            }
-            tf_map.insert(tf.to_string(), status_value);
-            continue;
-        }
         let snapshot = match fetch_latest_snapshot(&state, &symbol, tf).await? {
             Some(v) => Some(v),
             None => fetch_latest_snapshot_from_clickhouse(&state, &symbol, tf, now_ms).await?,
@@ -915,69 +815,15 @@ pub(super) async fn collector_metrics(
     })))
 }
 
-pub(super) async fn source_health(
-    State(state): State<ApiState>,
-    Query(params): Query<CollectorMetricsQueryParams>,
-) -> Result<Json<Value>, ApiError> {
-    let now_ms = Utc::now().timestamp_millis();
-    let window_ms = i64::from(params.window_sec.unwrap_or(180).clamp(60, 900)) * 1000;
-    let scopes = configured_collector_scopes();
-    let mut symbols = scopes.keys().cloned().collect::<Vec<_>>();
-    symbols.sort();
-    let mut overall_ok = true;
-    let mut rows = Vec::with_capacity(symbols.len());
-    for symbol in symbols {
-        let mut tf_map = serde_json::Map::new();
-        let mut symbol_ok = true;
-        for tf in ["5m", "15m"] {
-            if !collector_scope_enabled(&symbol, tf) {
-                let mut status_value = collector_timeframe_disabled_row();
-                if let Some(status_obj) = status_value.as_object_mut() {
-                    status_obj.insert("window".to_string(), Value::Null);
-                }
-                tf_map.insert(tf.to_string(), status_value);
-                continue;
-            }
-            let snapshot = match fetch_latest_snapshot(&state, &symbol, tf).await? {
-                Some(v) => Some(v),
-                None => fetch_latest_snapshot_from_clickhouse(&state, &symbol, tf, now_ms).await?,
-            };
-            let (tf_ok, mut status_value) =
-                collector_timeframe_status_row(snapshot.as_ref(), now_ms);
-            symbol_ok &= tf_ok;
-            if let Some(status_obj) = status_value.as_object_mut() {
-                let window_metrics =
-                    fetch_collector_window_metrics(&state, &symbol, tf, now_ms, window_ms).await?;
-                status_obj.insert("window".to_string(), window_metrics.unwrap_or(Value::Null));
-            }
-            tf_map.insert(tf.to_string(), status_value);
-        }
-        overall_ok &= symbol_ok;
-        rows.push(json!({
-            "symbol": symbol,
-            "ok": symbol_ok,
-            "timeframes": Value::Object(tf_map),
-        }));
-    }
-
-    Ok(Json(json!({
-        "ok": overall_ok,
-        "ts_ms": now_ms,
-        "window_ms": window_ms,
-        "symbols": rows,
-    })))
-}
-
 pub(super) async fn chart(
     State(state): State<ApiState>,
     Query(params): Query<ChartQueryParams>,
 ) -> Result<Json<Value>, ApiError> {
     let market_type = normalize_market_type(&params.market_type)
         .ok_or_else(|| ApiError::bad_request("invalid market_type"))?;
-    let symbol = normalize_collector_symbol(params.symbol.as_deref());
     let minutes = params.minutes.unwrap_or(30).min(7 * 24 * 60);
     let max_points = params.max_points.unwrap_or(1500).clamp(200, 20_000) as usize;
-    let cache_key = format!("{}:{}:{}:{}", symbol, market_type, minutes, max_points);
+    let cache_key = format!("{}:{}:{}", market_type, minutes, max_points);
     if let Some(cached) = state.chart_cache_get(&cache_key).await {
         return Ok(Json(cached));
     }
@@ -1024,7 +870,7 @@ pub(super) async fn chart(
             binance_price AS btc_price,
             target_price
         FROM polyedge_forge.snapshot_100ms
-        WHERE symbol='{symbol}'
+        WHERE symbol='BTCUSDT'
           AND timeframe='{market_type}'
           {from_clause}
         ORDER BY ts_ireland_sample_ms DESC
@@ -1044,7 +890,7 @@ pub(super) async fn chart(
             target_price,
             toInt8(settle_price > target_price) AS outcome
         FROM polyedge_forge.rounds
-        WHERE symbol='{symbol}'
+        WHERE symbol='BTCUSDT'
           AND timeframe='{market_type}'
           {}
         ORDER BY end_ts_ms DESC
@@ -1077,7 +923,6 @@ pub(super) async fn chart(
     }
 
     let payload = json!({
-        "symbol": symbol,
         "points": points,
         "rounds": rounds,
         "total_samples": total_samples,
@@ -1102,7 +947,6 @@ pub(super) async fn chart_round(
         infer_market_type_from_round_id(&params.round_id)
             .ok_or_else(|| ApiError::bad_request("market_type required"))?
     };
-    let symbol = normalize_collector_symbol(params.symbol.as_deref());
 
     let max_points = params.max_points.unwrap_or(100_000).clamp(200, 300_000) as usize;
     let Some(ch_url) = state.ch_url.as_deref() else {
@@ -1127,7 +971,7 @@ pub(super) async fn chart_round(
             binance_price AS btc_price,
             target_price
         FROM polyedge_forge.snapshot_100ms
-        WHERE symbol='{symbol}'
+        WHERE symbol='BTCUSDT'
           AND timeframe='{market_type}'
           AND round_id='{}'
         ORDER BY ts_ireland_sample_ms ASC
@@ -1146,7 +990,7 @@ pub(super) async fn chart_round(
             target_price,
             toInt8(settle_price > target_price) AS outcome
         FROM polyedge_forge.rounds
-        WHERE symbol='{symbol}'
+        WHERE symbol='BTCUSDT'
           AND timeframe='{market_type}'
           AND round_id='{}'
         ORDER BY end_ts_ms DESC
@@ -1209,7 +1053,6 @@ pub(super) async fn chart_round(
     };
 
     Ok(Json(json!({
-        "symbol": symbol,
         "points": points,
         "round": round_obj,
         "total_samples": total_samples,
@@ -1223,7 +1066,6 @@ pub(super) async fn rounds(
 ) -> Result<Json<Value>, ApiError> {
     let market_type = normalize_market_type(&params.market_type)
         .ok_or_else(|| ApiError::bad_request("invalid market_type"))?;
-    let symbol = normalize_collector_symbol(params.symbol.as_deref());
     let limit = min(params.limit.unwrap_or(500), 5_000).max(1);
 
     let Some(ch_url) = state.ch_url.as_deref() else {
@@ -1243,7 +1085,7 @@ pub(super) async fn rounds(
             if(r.target_price > 0, (r.settle_price - r.target_price) / r.target_price * 100.0, NULL) AS delta_pct,
             if(toInt8(r.settle_price > r.target_price) = 1, {resolved_up_cents}, {resolved_down_cents}) AS mkt_price_cents
         FROM polyedge_forge.rounds r
-        WHERE r.symbol='{symbol}'
+        WHERE r.symbol='BTCUSDT'
           AND r.timeframe='{market_type}'
         ORDER BY end_ts_ms DESC
         LIMIT {limit}
@@ -1254,7 +1096,6 @@ pub(super) async fn rounds(
 
     let rows = rows_from_json(query_clickhouse_json(ch_url, &query).await?);
     Ok(Json(json!({
-        "symbol": symbol,
         "market_type": market_type,
         "count": rows.len(),
         "rounds": rows,
@@ -1267,7 +1108,6 @@ pub(super) async fn rounds_available(
 ) -> Result<Json<Value>, ApiError> {
     let market_type = normalize_market_type(&params.market_type)
         .ok_or_else(|| ApiError::bad_request("invalid market_type"))?;
-    let symbol = normalize_collector_symbol(params.symbol.as_deref());
 
     let Some(ch_url) = state.ch_url.as_deref() else {
         return Err(ApiError::internal("clickhouse not configured"));
@@ -1280,7 +1120,7 @@ pub(super) async fn rounds_available(
             start_ts_ms AS start_time_ms,
             end_ts_ms AS end_time_ms
         FROM polyedge_forge.rounds
-        WHERE symbol='{symbol}'
+        WHERE symbol='BTCUSDT'
           AND timeframe='{market_type}'
         ORDER BY start_ts_ms DESC
         LIMIT 5000
@@ -1318,7 +1158,6 @@ pub(super) async fn rounds_available(
     });
 
     Ok(Json(json!({
-        "symbol": symbol,
         "market_type": market_type,
         "days": days,
         "rounds": rows,
@@ -1331,7 +1170,6 @@ pub(super) async fn heatmap(
 ) -> Result<Json<Value>, ApiError> {
     let market_type = normalize_market_type(&params.market_type)
         .ok_or_else(|| ApiError::bad_request("invalid market_type"))?;
-    let symbol = normalize_collector_symbol(params.symbol.as_deref());
     let lookback_hours = params.lookback_hours.unwrap_or(72).clamp(1, 24 * 30);
     let duration_ms = market_type_to_ms(market_type);
     let from_ms = Utc::now()
@@ -1355,7 +1193,7 @@ pub(super) async fn heatmap(
                 coalesce(mid_yes, mid_yes_smooth) * 100.0 AS avg_up_price_cents_raw,
                 1 AS sample_count_raw
             FROM polyedge_forge.snapshot_100ms
-            WHERE symbol='{symbol}'
+            WHERE symbol='BTCUSDT'
               AND timeframe='{market_type}'
               AND ts_ireland_sample_ms >= {from_ms}
               AND delta_pct IS NOT NULL
@@ -1388,7 +1226,6 @@ pub(super) async fn heatmap(
     }
 
     Ok(Json(json!({
-        "symbol": symbol,
         "market_type": market_type,
         "lookback_hours": lookback_hours,
         "max_sample_count": max_count,
@@ -1402,7 +1239,6 @@ pub(super) async fn accuracy_series(
 ) -> Result<Json<Value>, ApiError> {
     let market_type = normalize_market_type(&params.market_type)
         .ok_or_else(|| ApiError::bad_request("invalid market_type"))?;
-    let symbol = normalize_collector_symbol(params.symbol.as_deref());
     let rolling_window = if market_type == "5m" {
         40usize
     } else {
@@ -1434,13 +1270,13 @@ pub(super) async fn accuracy_series(
                 round_id,
                 argMinIf(coalesce(mid_yes, mid_yes_smooth), abs(remaining_ms - {eval_remaining_ms}), remaining_ms >= 0) AS eval_mid_up
             FROM polyedge_forge.snapshot_100ms
-            WHERE symbol='{symbol}'
+            WHERE symbol='BTCUSDT'
               AND timeframe='{market_type}'
               AND remaining_ms >= 0
               AND remaining_ms <= {duration_ms}
             GROUP BY round_id
         ) s ON r.round_id = s.round_id
-        WHERE r.symbol='{symbol}'
+        WHERE r.symbol='BTCUSDT'
           AND r.timeframe='{market_type}'
           AND isFinite(s.eval_mid_up)
           AND r.end_ts_ms >= ({from_ms} - {duration_ms} * 4)
@@ -1528,7 +1364,6 @@ pub(super) async fn accuracy_series(
         .and_then(Value::as_f64);
 
     Ok(Json(json!({
-        "symbol": symbol,
         "market_type": market_type,
         "window": rolling_window,
         "lookback_hours": lookback_hours,

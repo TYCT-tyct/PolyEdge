@@ -10,7 +10,6 @@ import {
     getLatestAllRaw,
     getRoundChart,
     getRoundHistory,
-    getSourceHealth,
     getStats
 } from "./api";
 import { AccuracyChart } from "./components/AccuracyChart";
@@ -33,7 +32,6 @@ import type {
     RoundChartResponse,
     RoundHistoryRow,
     RoundsResponse,
-    SourceHealthResponse,
     StatsResponse,
     WindowType
 } from "./types";
@@ -436,7 +434,7 @@ function parseRoundStartMs(roundId: string | null | undefined): number | null {
   return tail;
 }
 
-function summarizeGaps(points: ChartPoint[], step = 1): { count: number; maxGapMs: number } {
+function summarizeGaps(points: ChartPoint[]): { count: number; maxGapMs: number } {
   if (points.length < 2) {
     return { count: 0, maxGapMs: 0 };
   }
@@ -455,9 +453,9 @@ function summarizeGaps(points: ChartPoint[], step = 1): { count: number; maxGapM
   if (diffs.length === 0) {
     return { count: 0, maxGapMs: 0 };
   }
-  const effectiveStep = Math.max(1, step);
-  const expectedMs = effectiveStep * 100;
-  const threshold = Math.max(2_500, Math.min(120_000, expectedMs * 12));
+  const sorted = [...diffs].sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)] ?? 100;
+  const threshold = Math.max(3000, Math.min(120_000, median * 8));
   let count = 0;
   let maxGapMs = 0;
   for (const d of diffs) {
@@ -530,10 +528,7 @@ function MarketSection({
   chart,
   loading
 }: MarketSectionProps) {
-  const gapInfo = useMemo(
-    () => summarizeGaps(chart?.points ?? [], chart?.step ?? 1),
-    [chart?.points, chart?.step]
-  );
+  const gapInfo = useMemo(() => summarizeGaps(chart?.points ?? []), [chart?.points]);
   const up = displayUpProb(live);
   const down = displayDownProb(live);
 
@@ -764,7 +759,6 @@ export default function App() {
   const [stats, setStats] = useState<StatsResponse | null>(null);
   const [collectorStatus, setCollectorStatus] = useState<CollectorStatusResponse | null>(null);
   const [collectorMetrics, setCollectorMetrics] = useState<CollectorMetricsResponse | null>(null);
-  const [sourceHealth, setSourceHealth] = useState<SourceHealthResponse | null>(null);
   const [chartWindow, setChartWindow] = useState<Record<MarketType, WindowType>>({
     "5m": "30m",
     "15m": "30m"
@@ -1338,29 +1332,6 @@ export default function App() {
     }
     let alive = true;
     const load = async () => {
-      try {
-        const value = await getSourceHealth(180);
-        if (alive) {
-          setSourceHealth(value);
-        }
-      } catch {
-        // advisory panel only
-      }
-    };
-    void load();
-    const id = window.setInterval(load, 15_000);
-    return () => {
-      alive = false;
-      window.clearInterval(id);
-    };
-  }, [isMarketView]);
-
-  useEffect(() => {
-    if (!isMarketView) {
-      return;
-    }
-    let alive = true;
-    const load = async () => {
       if (document.visibilityState !== "visible") {
         return;
       }
@@ -1616,20 +1587,20 @@ export default function App() {
                   15m采集: {collector15m?.status ?? "--"} · {formatAgeMs(collector15m?.age_ms ?? null)}
                 </span>
                 <span>
-                  5m窗口覆盖:{" "}
+                  5m覆盖:{" "}
                   {collector5mWindow != null
                     ? `${(collector5mWindow.sample_ratio * 100).toFixed(0)}%`
                     : "--"}
                   {" · "}
-                  窗口p95链路: {formatAgeMs(collector5mWindow?.path_lag_p95_ms ?? null)}
+                  p95链路延迟: {formatAgeMs(collector5mWindow?.path_lag_p95_ms ?? null)}
                 </span>
                 <span>
-                  15m窗口覆盖:{" "}
+                  15m覆盖:{" "}
                   {collector15mWindow != null
                     ? `${(collector15mWindow.sample_ratio * 100).toFixed(0)}%`
                     : "--"}
                   {" · "}
-                  窗口p95链路: {formatAgeMs(collector15mWindow?.path_lag_p95_ms ?? null)}
+                  p95链路延迟: {formatAgeMs(collector15mWindow?.path_lag_p95_ms ?? null)}
                 </span>
               </>
             ) : (
@@ -1803,55 +1774,6 @@ export default function App() {
         points={accuracyPoints}
         timeMode={timeMode}
       />
-
-      {sourceHealth ? (
-        <details className="panel" style={{ marginTop: 18 }}>
-          <summary className="panel-head" style={{ cursor: "pointer", listStyle: "none" }}>
-            <div>
-              <h2>全局采集质量</h2>
-              <p className="muted">默认折叠，避免抢占主视野；展开后查看 BTC / ETH / SOL / XRP 的 5m / 15m 质量矩阵。</p>
-            </div>
-          </summary>
-          <div className="table-wrap">
-            <table className="history-table">
-              <thead>
-                <tr>
-                  <th>Symbol</th>
-                  <th>5m状态</th>
-                  <th>5m延迟</th>
-                  <th>5m覆盖</th>
-                  <th>5m p95</th>
-                  <th>15m状态</th>
-                  <th>15m延迟</th>
-                  <th>15m覆盖</th>
-                  <th>15m p95</th>
-                </tr>
-              </thead>
-              <tbody>
-                {sourceHealth.symbols.map((row) => {
-                  const tf5 = row.timeframes["5m"];
-                  const tf15 = row.timeframes["15m"];
-                  const w5 = tf5.window;
-                  const w15 = tf15.window;
-                  return (
-                    <tr key={row.symbol}>
-                      <td>{row.symbol}</td>
-                      <td className={tf5.status === "ok" ? "up" : tf5.status === "disabled" ? "" : "down"}>{tf5.status}</td>
-                      <td>{formatAgeMs(tf5.age_ms ?? null)}</td>
-                      <td>{w5 ? `${(w5.sample_ratio * 100).toFixed(0)}%` : "--"}</td>
-                      <td>{formatAgeMs(w5?.path_lag_p95_ms ?? null)}</td>
-                      <td className={tf15.status === "ok" ? "up" : tf15.status === "disabled" ? "" : "down"}>{tf15.status}</td>
-                      <td>{formatAgeMs(tf15.age_ms ?? null)}</td>
-                      <td>{w15 ? `${(w15.sample_ratio * 100).toFixed(0)}%` : "--"}</td>
-                      <td>{formatAgeMs(w15?.path_lag_p95_ms ?? null)}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        </details>
-      ) : null}
       </>
       ) : (
         <PaperLabPage selectedSymbol={selectedSymbol} timeMode={timeMode} />
@@ -1875,18 +1797,18 @@ export default function App() {
             {collector15m?.round_id || "--"}
           </span>
           <span>
-            5m窗口覆盖:{" "}
+            5m覆盖率:{" "}
             {collector5mWindow != null
               ? `${(collector5mWindow.sample_ratio * 100).toFixed(0)}%`
               : "--"}
-            {" · "}窗口p95链路: {formatAgeMs(collector5mWindow?.path_lag_p95_ms ?? null)}
+            {" · "}p95链路: {formatAgeMs(collector5mWindow?.path_lag_p95_ms ?? null)}
           </span>
           <span>
-            15m窗口覆盖:{" "}
+            15m覆盖率:{" "}
             {collector15mWindow != null
               ? `${(collector15mWindow.sample_ratio * 100).toFixed(0)}%`
               : "--"}
-            {" · "}窗口p95链路: {formatAgeMs(collector15mWindow?.path_lag_p95_ms ?? null)}
+            {" · "}p95链路: {formatAgeMs(collector15mWindow?.path_lag_p95_ms ?? null)}
           </span>
           {errorText ? <span className="down">{errorText}</span> : null}
         </footer>
