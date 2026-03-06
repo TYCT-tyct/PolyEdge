@@ -323,14 +323,15 @@ impl PolymarketFeed {
         let refresh_every = std::env::var("POLYEDGE_MARKET_REFRESH_SEC")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(180));
+            .filter(|v| *v > 0)
+            .map(Duration::from_secs);
         let stale_reconnect_ratio = std::env::var("POLYEDGE_MARKET_STALE_RECONNECT_RATIO")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(1.0)
             .clamp(0.25, 1.0);
-        let refresh_deadline = tokio::time::sleep(refresh_every);
+        let refresh_deadline =
+            tokio::time::sleep(refresh_every.unwrap_or(Duration::from_secs(365 * 24 * 60 * 60)));
         tokio::pin!(refresh_deadline);
         let mut parse_failures = 0_u64;
         let mut no_update_msgs = 0_u64;
@@ -424,11 +425,13 @@ impl PolymarketFeed {
                     }
                 }
                 _ = &mut refresh_deadline => {
-                    tracing::info!(
-                        refresh_sec = refresh_every.as_secs(),
-                        "polymarket market ws refresh triggered; resubscribing"
-                    );
-                    break;
+                    if let Some(refresh_every) = refresh_every {
+                        tracing::info!(
+                            refresh_sec = refresh_every.as_secs(),
+                            "polymarket market ws refresh triggered; resubscribing"
+                        );
+                        break;
+                    }
                 }
                 _ = ping.tick() => {
                     // The Polymarket WS docs recommend an application-level "PING".
