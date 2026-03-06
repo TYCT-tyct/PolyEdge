@@ -169,10 +169,13 @@ def main() -> int:
             "error_count": 0,
             "status_counter": collections.Counter(),
             "suggested_action_counter": collections.Counter(),
+            "no_candidate_reason_counter": collections.Counter(),
             "trade_count_series": [],
             "win_rate_series": [],
             "net_pnl_series": [],
             "raw_signal_series": [],
+            "decision_pool_series": [],
+            "fresh_signal_series": [],
             "candidate_series": [],
             "parity_ready_series": [],
             "state_selected_series": [],
@@ -275,6 +278,16 @@ def main() -> int:
                     or gated.get("raw_signal_count")
                     or safe_len(payload.get("signal_decisions"))
                 )
+                decision_pool_count = int(
+                    shadow_eval.get("decision_pool_count")
+                    or gated.get("decision_pool_count")
+                    or raw_signal_count
+                )
+                fresh_signal_count = int(
+                    shadow_eval.get("fresh_signal_count")
+                    or gated.get("fresh_signal_count")
+                    or 0
+                )
                 candidate_count = int(
                     shadow_eval.get("candidate_count")
                     or gated.get("candidate_count")
@@ -305,16 +318,25 @@ def main() -> int:
                     if "target_missing" in shadow_eval
                     else gated.get("target_missing")
                 )
+                no_candidate_reason = str(
+                    shadow_eval.get("no_candidate_reason")
+                    or gated.get("no_candidate_reason")
+                    or ""
+                ).strip()
 
                 st["last_status"] = status
                 st["last_shadow_eval"] = shadow_eval
                 st["last_current"] = current
                 st["status_counter"][str(status)] += 1
                 st["suggested_action_counter"][suggested_action] += 1
+                if no_candidate_reason:
+                    st["no_candidate_reason_counter"][no_candidate_reason] += 1
                 st["trade_count_series"].append(int(summary.get("trade_count") or 0))
                 st["win_rate_series"].append(float(summary.get("win_rate_pct") or 0.0))
                 st["net_pnl_series"].append(float(summary.get("net_pnl_cents") or 0.0))
                 st["raw_signal_series"].append(raw_signal_count)
+                st["decision_pool_series"].append(decision_pool_count)
+                st["fresh_signal_series"].append(fresh_signal_count)
                 st["candidate_series"].append(candidate_count)
                 st["parity_ready_series"].append(parity_ready_count)
                 st["state_selected_series"].append(state_selected_count)
@@ -350,12 +372,15 @@ def main() -> int:
                                 "win_rate_pct": summary.get("win_rate_pct"),
                                 "net_pnl_cents": summary.get("net_pnl_cents"),
                                 "raw_signal_count": raw_signal_count,
+                                "decision_pool_count": decision_pool_count,
+                                "fresh_signal_count": fresh_signal_count,
                                 "candidate_count": candidate_count,
                                 "parity_ready_count": parity_ready_count,
                                 "state_selected_count": state_selected_count,
                                 "target_ready": target_ready,
                                 "state_skipped_count": state_skipped_count,
                                 "target_missing": target_missing,
+                                "no_candidate_reason": no_candidate_reason or None,
                                 "current": current,
                                 "gap_rows": gap_rows[:8],
                             },
@@ -380,6 +405,8 @@ def main() -> int:
 
     for symbol, st in symbol_state.items():
         candidate_total = sum(st["candidate_series"])
+        decision_pool_total = sum(st["decision_pool_series"])
+        fresh_signal_total = sum(st["fresh_signal_series"])
         parity_ready_total = sum(st["parity_ready_series"])
         state_selected_total = sum(st["state_selected_series"])
         target_ready_total = sum(st["target_ready_series"])
@@ -401,11 +428,14 @@ def main() -> int:
             },
             "shadow_coverage": {
                 "raw_signal_sum": raw_signal_total,
+                "decision_pool_sum": decision_pool_total,
+                "fresh_signal_sum": fresh_signal_total,
                 "candidate_sum": candidate_total,
                 "parity_ready_sum": parity_ready_total,
                 "state_selected_sum": state_selected_total,
                 "target_ready_sum": target_ready_total,
                 "candidate_vs_signal": round(candidate_total / raw_signal_total, 4) if raw_signal_total else None,
+                "candidate_vs_fresh_signal": round(candidate_total / fresh_signal_total, 4) if fresh_signal_total else None,
                 "parity_vs_candidate": round(parity_ready_total / candidate_total, 4) if candidate_total else None,
                 "state_vs_parity": round(state_selected_total / parity_ready_total, 4) if parity_ready_total else None,
                 "target_vs_state": round(target_ready_total / state_selected_total, 4) if state_selected_total else None,
@@ -424,6 +454,7 @@ def main() -> int:
             },
             "status_counter": counter_to_dict(st["status_counter"]),
             "suggested_action_counter": counter_to_dict(st["suggested_action_counter"]),
+            "no_candidate_reason_counter": counter_to_dict(st["no_candidate_reason_counter"]),
             "skip_reason_counter": counter_to_dict(st["skip_reason_counter"]),
         }
 

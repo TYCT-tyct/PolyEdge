@@ -554,6 +554,54 @@ pub(super) async fn gate_live_decisions(
     (accepted, skipped, position_state)
 }
 
+fn is_replay_only_reason(decision: &Value) -> bool {
+    decision
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(|reason| {
+            reason
+                .trim()
+                .eq_ignore_ascii_case("end_of_samples_force_close")
+        })
+        .unwrap_or(false)
+}
+
+fn is_live_fresh_decision(decision: &Value, latest_ts_ms: i64, drain_only: bool) -> bool {
+    let action = decision
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let freshness_ms = if action == "enter" || action == "add" {
+        live_signal_entry_freshness_ms()
+    } else {
+        live_signal_exit_freshness_ms()
+    };
+    let ts_ok = decision
+        .get("ts_ms")
+        .and_then(Value::as_i64)
+        .map(|ts| ts >= latest_ts_ms.saturating_sub(freshness_ms))
+        .unwrap_or(false);
+    let action_ok = if drain_only {
+        action == "exit" || action == "reduce"
+    } else {
+        true
+    };
+    let reason_ok = !is_replay_only_reason(decision);
+    ts_ok && action_ok && reason_ok
+}
+
+pub(super) fn count_fresh_live_decisions(
+    decisions: &[Value],
+    latest_ts_ms: i64,
+    drain_only: bool,
+) -> usize {
+    decisions
+        .iter()
+        .filter(|decision| is_live_fresh_decision(decision, latest_ts_ms, drain_only))
+        .count()
+}
+
 pub(super) fn select_live_decisions(
     decisions: &[Value],
     latest_ts_ms: i64,
@@ -561,17 +609,6 @@ pub(super) fn select_live_decisions(
     drain_only: bool,
     prefer_action: Option<&str>,
 ) -> Vec<Value> {
-    fn is_replay_only_reason(decision: &Value) -> bool {
-        decision
-            .get("reason")
-            .and_then(Value::as_str)
-            .map(|reason| {
-                reason
-                    .trim()
-                    .eq_ignore_ascii_case("end_of_samples_force_close")
-            })
-            .unwrap_or(false)
-    }
 
     if decisions.is_empty() {
         return Vec::new();
@@ -585,34 +622,13 @@ pub(super) fn select_live_decisions(
     let mut selected: Vec<Value> = decisions
         .iter()
         .filter(|d| {
-            let action = d
-                .get("action")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            let freshness_ms = if action == "enter" || action == "add" {
-                live_signal_entry_freshness_ms()
-            } else {
-                live_signal_exit_freshness_ms()
-            };
             let round_ok = d
                 .get("round_id")
                 .and_then(Value::as_str)
                 .map(|r| r == latest_round)
                 .unwrap_or(false);
-            let ts_ok = d
-                .get("ts_ms")
-                .and_then(Value::as_i64)
-                .map(|ts| ts >= latest_ts_ms.saturating_sub(freshness_ms))
-                .unwrap_or(false);
-            let scope_ok = if drain_only { round_ok || ts_ok } else { ts_ok };
-            let action_ok = if drain_only {
-                action == "exit" || action == "reduce"
-            } else {
-                true
-            };
-            let reason_ok = !is_replay_only_reason(d);
-            scope_ok && action_ok && reason_ok
+            let fresh_ok = is_live_fresh_decision(d, latest_ts_ms, drain_only);
+            if drain_only { round_ok || fresh_ok } else { fresh_ok }
         })
         .cloned()
         .collect();

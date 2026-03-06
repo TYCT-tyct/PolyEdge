@@ -67,6 +67,8 @@ def main() -> int:
     last_runtime_control = None
     last_event_seq = None
     signal_decision_count_series: list[int] = []
+    decision_pool_count_series: list[int] = []
+    fresh_signal_count_series: list[int] = []
     candidate_count_series: list[int] = []
     parity_ready_count_series: list[int] = []
     state_selected_count_series: list[int] = []
@@ -80,6 +82,7 @@ def main() -> int:
     submit_reason_counter: collections.Counter[str] = collections.Counter()
     event_type_counter: collections.Counter[str] = collections.Counter()
     status_counter: collections.Counter[str] = collections.Counter()
+    no_candidate_reason_counter: collections.Counter[str] = collections.Counter()
     mode_counter: collections.Counter[str] = collections.Counter()
     accepted_submit_count = 0
     rejected_submit_count = 0
@@ -134,6 +137,16 @@ def main() -> int:
                 or gated.get("raw_signal_count")
                 or safe_len(payload.get("signal_decisions"))
             )
+            decision_pool_count = int(
+                shadow_eval.get("decision_pool_count")
+                or gated.get("decision_pool_count")
+                or signal_decision_count
+            )
+            fresh_signal_count = int(
+                shadow_eval.get("fresh_signal_count")
+                or gated.get("fresh_signal_count")
+                or 0
+            )
             candidate_count = int(
                 shadow_eval.get("candidate_count")
                 or gated.get("candidate_count")
@@ -162,10 +175,17 @@ def main() -> int:
                 if "target_missing" in shadow_eval
                 else (((parity_check.get("live") or {}).get("no_live_market_target")))
             )
+            no_candidate_reason = str(
+                shadow_eval.get("no_candidate_reason")
+                or gated.get("no_candidate_reason")
+                or ""
+            ).strip()
             paper_trade_count = safe_len(payload.get("trades"))
             fill_count = int((((summary.get("fills") or {}).get("fill_decision_count")) or 0))
 
             signal_decision_count_series.append(int(signal_decision_count))
+            decision_pool_count_series.append(int(decision_pool_count))
+            fresh_signal_count_series.append(int(fresh_signal_count))
             candidate_count_series.append(int(candidate_count))
             parity_ready_count_series.append(parity_ready_count)
             state_selected_count_series.append(gated_selected_count)
@@ -176,6 +196,8 @@ def main() -> int:
             live_fill_count_series.append(fill_count)
             if no_live_target:
                 no_live_target_count += 1
+            if no_candidate_reason:
+                no_candidate_reason_counter[no_candidate_reason] += 1
 
             for row in gated.get("skipped_decisions") or []:
                 reason = row.get("reason") or "unknown"
@@ -225,6 +247,8 @@ def main() -> int:
                 "status": status,
                 "mode": mode,
                 "signal_decision_count": signal_decision_count,
+                "decision_pool_count": decision_pool_count,
+                "fresh_signal_count": fresh_signal_count,
                 "candidate_count": candidate_count,
                 "gated_selected_count": gated_selected_count,
                 "parity_ready_count": parity_ready_count,
@@ -234,8 +258,13 @@ def main() -> int:
                 "paper_trade_count": paper_trade_count,
                 "fill_decision_count": fill_count,
                 "no_live_market_target": no_live_target,
+                "no_candidate_reason": no_candidate_reason or None,
                 "target_ready": target_ready,
                 "runtime_control": runtime_control,
+                "current_suggested_action": shadow_eval.get("current_suggested_action"),
+                "current_confirmed": shadow_eval.get("current_confirmed"),
+                "current_score": shadow_eval.get("current_score"),
+                "current_entry_threshold": shadow_eval.get("current_entry_threshold"),
             }
             if jsonl_fp is not None:
                 jsonl_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -254,6 +283,8 @@ def main() -> int:
         return round(num / den, 4)
 
     signal_decision_total = sum(signal_decision_count_series)
+    decision_pool_total = sum(decision_pool_count_series)
+    fresh_signal_total = sum(fresh_signal_count_series)
     candidate_total = sum(candidate_count_series)
     parity_ready_total = sum(parity_ready_count_series)
     state_selected_total = sum(state_selected_count_series)
@@ -277,9 +308,18 @@ def main() -> int:
             "avg": avg(signal_decision_count_series),
             "sum": signal_decision_total,
         },
+        "decision_pool_count": {
+            "avg": avg(decision_pool_count_series),
+            "sum": decision_pool_total,
+        },
+        "fresh_signal_count": {
+            "avg": avg(fresh_signal_count_series),
+            "sum": fresh_signal_total,
+        },
         "candidate_count": {
             "avg": avg(candidate_count_series),
             "sum": candidate_total,
+            "coverage_vs_fresh_signal": ratio(candidate_total, fresh_signal_total),
         },
         "parity_ready_count": {
             "avg": avg(parity_ready_count_series),
@@ -320,6 +360,7 @@ def main() -> int:
         },
         "no_live_market_target_polls": no_live_target_count,
         "status_counter": dict(status_counter),
+        "no_candidate_reason_counter": dict(no_candidate_reason_counter),
         "mode_counter": dict(mode_counter),
         "skip_reason_counter": dict(skip_reason_counter.most_common()),
         "event_type_counter": dict(event_type_counter),

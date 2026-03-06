@@ -3052,6 +3052,25 @@ async fn live_runtime_loop(
                         .and_then(|v| v.get("timestamp_ms"))
                         .and_then(Value::as_i64)
                         .unwrap_or(now_ms);
+                    let current_suggested_action = payload
+                        .get("current")
+                        .and_then(|v| v.get("suggested_action"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("UNKNOWN")
+                        .to_string();
+                    let current_confirmed = payload
+                        .get("current")
+                        .and_then(|v| v.get("confirmed"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let current_score = payload
+                        .get("current")
+                        .and_then(|v| v.get("score"))
+                        .and_then(Value::as_f64);
+                    let current_entry_threshold = payload
+                        .get("current")
+                        .and_then(|v| v.get("entry_threshold"))
+                        .and_then(Value::as_f64);
                     let prefer_action =
                         if effective_drain_only || position_before_cycle.side.is_some() {
                             Some("exit")
@@ -3065,6 +3084,11 @@ async fn live_runtime_loop(
                         effective_drain_only,
                         prefer_action,
                     );
+                    let fresh_signal_count = count_fresh_live_decisions(
+                        &paper_decisions,
+                        latest_ts_ms,
+                        effective_drain_only,
+                    );
                     let (exec_cfg_tuned, _) = state
                         .apply_aggressiveness_to_execution_cfg(
                             runtime_symbol,
@@ -3077,7 +3101,7 @@ async fn live_runtime_loop(
                         handle_live_pending_timeouts(&state, &exec_cfg_tuned).await;
                     }
 
-                    let raw_signal_count = paper_decisions.len();
+                    let decision_pool_count = paper_decisions.len();
                     let candidate_count = selected_decisions.len();
                     let (gated, mut state_skipped, position_for_submit) = gate_live_decisions(
                         &state,
@@ -3177,6 +3201,28 @@ async fn live_runtime_loop(
                     let shadow_target_ready = !execution_target.is_null();
                     let shadow_target_missing =
                         !submitted_decisions.is_empty() && !shadow_target_ready;
+                    let no_candidate_reason = if candidate_count > 0 {
+                        Value::Null
+                    } else if fresh_signal_count == 0 {
+                        let reason = if current_suggested_action.eq_ignore_ascii_case("hold")
+                            || current_suggested_action.eq_ignore_ascii_case("wait")
+                        {
+                            match (current_confirmed, current_score, current_entry_threshold) {
+                                (false, _, _) => "signal_not_confirmed",
+                                (true, Some(score), Some(threshold))
+                                    if score.abs() < threshold =>
+                                {
+                                    "score_below_threshold"
+                                }
+                                _ => "current_hold",
+                            }
+                        } else {
+                            "no_fresh_signal"
+                        };
+                        Value::String(reason.to_string())
+                    } else {
+                        Value::String("selection_empty".to_string())
+                    };
 
                     let aggr_orders = if effective_live_execute {
                         execution_orders
@@ -3251,12 +3297,19 @@ async fn live_runtime_loop(
                             "shadow_eval": {
                                 "enabled": !effective_live_execute,
                                 "status": execution_status.clone(),
-                                "raw_signal_count": raw_signal_count,
+                                "decision_pool_count": decision_pool_count,
+                                "raw_signal_count": decision_pool_count,
+                                "fresh_signal_count": fresh_signal_count,
                                 "candidate_count": candidate_count,
                                 "state_selected_count": submitted_decisions.len(),
                                 "state_skipped_count": state_skipped_count,
                                 "target_ready": shadow_target_ready,
-                                "target_missing": shadow_target_missing
+                                "target_missing": shadow_target_missing,
+                                "no_candidate_reason": no_candidate_reason.clone(),
+                                "current_suggested_action": current_suggested_action,
+                                "current_confirmed": current_confirmed,
+                                "current_score": current_score,
+                                "current_entry_threshold": current_entry_threshold
                             },
                         },
                         "decisions": selected_decisions,
@@ -3287,7 +3340,9 @@ async fn live_runtime_loop(
                         },
                         "execution_policy": live_execution_policy_meta(),
                         "gated": {
-                            "raw_signal_count": raw_signal_count,
+                            "decision_pool_count": decision_pool_count,
+                            "raw_signal_count": decision_pool_count,
+                            "fresh_signal_count": fresh_signal_count,
                             "candidate_count": candidate_count,
                             "selected_count": submitted_decisions.len(),
                             "submitted_count": live_submitted_count,
@@ -3295,6 +3350,7 @@ async fn live_runtime_loop(
                             "skipped_count": skipped_decisions.len(),
                             "target_ready": shadow_target_ready,
                             "target_missing": shadow_target_missing,
+                            "no_candidate_reason": no_candidate_reason,
                             "submitted_decisions": submitted_decisions,
                             "skipped_decisions": skipped_decisions
                         },
