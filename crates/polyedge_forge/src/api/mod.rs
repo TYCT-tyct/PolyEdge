@@ -551,6 +551,82 @@ impl LiveRuntimeConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+struct LiveRuntimeStrategyEngineState {
+    symbol: String,
+    cfg: StrategyRuntimeConfig,
+    max_trades: usize,
+    samples: Arc<Vec<StrategySample>>,
+    engine: fev1::IncrementalSimulationEngine,
+}
+
+impl LiveRuntimeStrategyEngineState {
+    fn bootstrap(
+        symbol: &str,
+        cfg: StrategyRuntimeConfig,
+        max_trades: usize,
+        samples: Arc<Vec<StrategySample>>,
+    ) -> Self {
+        let mapped = map_samples_to_fev1(&samples);
+        let engine = fev1::IncrementalSimulationEngine::from_samples(
+            &mapped,
+            map_cfg_to_fev1(&cfg),
+            max_trades,
+            None,
+        );
+        Self {
+            symbol: symbol.to_ascii_uppercase(),
+            cfg,
+            max_trades,
+            samples,
+            engine,
+        }
+    }
+
+    fn can_reuse(
+        &self,
+        symbol: &str,
+        cfg: &StrategyRuntimeConfig,
+        max_trades: usize,
+        samples: &[StrategySample],
+    ) -> bool {
+        if !self.symbol.eq_ignore_ascii_case(symbol)
+            || self.cfg != *cfg
+            || self.max_trades != max_trades
+        {
+            return false;
+        }
+        if samples.is_empty() || self.samples.is_empty() {
+            return false;
+        }
+        if self.samples[0].ts_ms != samples[0].ts_ms {
+            return false;
+        }
+        if samples.len() < self.samples.len() {
+            return false;
+        }
+        match (self.samples.last(), samples.last()) {
+            (Some(prev_last), Some(last)) if samples.len() == self.samples.len() => {
+                prev_last == last
+            }
+            (Some(prev_last), Some(_)) if self.samples.len() <= samples.len() => {
+                samples.get(self.samples.len().saturating_sub(1)) == Some(prev_last)
+            }
+            _ => false,
+        }
+    }
+
+    fn update(&mut self, samples: Arc<Vec<StrategySample>>) {
+        if samples.len() > self.samples.len() {
+            let new_mapped = map_samples_to_fev1(&samples[self.samples.len()..]);
+            for sample in &new_mapped {
+                self.engine.apply_sample(sample);
+            }
+        }
+        self.samples = samples;
+    }
+}
+
 fn runtime_fast_loop_enabled() -> bool {
     std::env::var("FORGE_FEV1_RUNTIME_FAST_ENABLED")
         .ok()
@@ -2267,6 +2343,72 @@ fn live_runtime_control_key(redis_prefix: &str, symbol: &str, market_type: &str)
     )
 }
 
+async fn load_live_runtime_samples(
+    state: &ApiState,
+    symbol: &str,
+    market_type: &str,
+    lookback_minutes: u32,
+    max_points: u32,
+) -> Result<Arc<Vec<StrategySample>>, ApiError> {
+    if let Some(samples) = state
+        .get_runtime_event_samples(symbol, market_type, lookback_minutes, max_points)
+        .await
+    {
+        return Ok(samples);
+    }
+    load_strategy_samples_runtime_stream(state, symbol, market_type, lookback_minutes, max_points)
+        .await
+}
+
+async fn prewarm_live_runtime_target_and_books(state: &ApiState, symbol: &str, market_type: &str) {
+    let Ok(target) = resolve_live_market_target_with_state(state, symbol, market_type).await else {
+        return;
+    };
+    let _ = prewarm_rust_books_for_target(state, &target).await;
+}
+
+async fn live_runtime_background_maintenance(state: ApiState, bootstrap: LiveRuntimeConfig) {
+    let mut cfg = bootstrap;
+    let mut target_keepalive_at = HashMap::<String, i64>::new();
+    let mut book_prewarm_at = HashMap::<String, i64>::new();
+    let mut last_env_refresh_ms = 0_i64;
+    loop {
+        let now_ms = Utc::now().timestamp_millis();
+        if now_ms.saturating_sub(last_env_refresh_ms) >= 1_000 {
+            cfg = LiveRuntimeConfig::from_env();
+            target_keepalive_at
+                .retain(|k, _| cfg.markets.iter().any(|m| m.eq_ignore_ascii_case(k)));
+            book_prewarm_at.retain(|k, _| cfg.markets.iter().any(|m| m.eq_ignore_ascii_case(k)));
+            last_env_refresh_ms = now_ms;
+        }
+        if !cfg.enabled {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        }
+        let target_keepalive_ms = runtime_target_keepalive_ms().max(400);
+        let book_prewarm_ms = (LIVE_RUST_BOOK_CACHE_TTL_MS as i64)
+            .saturating_sub(60)
+            .max(120);
+        for market in &cfg.markets {
+            let last_target = target_keepalive_at.get(market).copied().unwrap_or(0);
+            let last_book = book_prewarm_at.get(market).copied().unwrap_or(0);
+            let due_target = now_ms.saturating_sub(last_target) >= target_keepalive_ms;
+            let due_book = now_ms.saturating_sub(last_book) >= book_prewarm_ms;
+            if !(due_target || due_book) {
+                continue;
+            }
+            prewarm_live_runtime_target_and_books(&state, &cfg.symbol, market).await;
+            if due_target {
+                target_keepalive_at.insert(market.clone(), now_ms);
+            }
+            if due_book {
+                book_prewarm_at.insert(market.clone(), now_ms);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+}
+
 fn start_live_runtime(state: ApiState) {
     let cfg = LiveRuntimeConfig::from_env();
     if !cfg.enabled {
@@ -2286,11 +2428,18 @@ fn start_live_runtime(state: ApiState) {
             "redis unavailable: runtime event-driven wakeup disabled, fallback to polling"
         );
     }
+    let runtime_state = state.clone();
+    let runtime_cfg = cfg.clone();
     tokio::spawn(async move {
-        if let Err(err) = restore_live_runtime_state(&state, &cfg).await {
+        if let Err(err) = restore_live_runtime_state(&runtime_state, &runtime_cfg).await {
             tracing::warn!(?err, "restore live runtime state failed");
         }
-        live_runtime_loop(state, cfg, wake_rx).await;
+        live_runtime_loop(runtime_state, runtime_cfg, wake_rx).await;
+    });
+    let maintenance_state = state.clone();
+    let maintenance_cfg = cfg.clone();
+    tokio::spawn(async move {
+        live_runtime_background_maintenance(maintenance_state, maintenance_cfg).await;
     });
 }
 
@@ -2483,7 +2632,7 @@ async fn live_runtime_loop(
         "fev1 live runtime started"
     );
     let mut last_round_seen: HashMap<String, String> = HashMap::new();
-    let mut target_keepalive_at: HashMap<String, i64> = HashMap::new();
+    let mut strategy_engines: HashMap<String, LiveRuntimeStrategyEngineState> = HashMap::new();
     let mut market_next_due_ms: HashMap<String, i64> = HashMap::new();
     let mut market_last_strategy_eval_ms: HashMap<String, i64> = HashMap::new();
     let mut market_last_strategy_sample_ts_ms: HashMap<String, i64> = HashMap::new();
@@ -2494,7 +2643,6 @@ async fn live_runtime_loop(
     let mut cached_fast_enabled = runtime_fast_loop_enabled();
     let mut cached_fast_margin = runtime_fast_margin_threshold();
     let mut cached_target_prewarm_ms = runtime_target_prewarm_ms();
-    let mut cached_target_keepalive_ms = runtime_target_keepalive_ms();
     let mut cached_idle_force_poll_ms = runtime_event_idle_poll_ms();
     let mut cached_live_arm_required = live_submit_arm_required();
     let mut cached_live_armed = live_submit_armed();
@@ -2511,7 +2659,6 @@ async fn live_runtime_loop(
             cached_fast_enabled = runtime_fast_loop_enabled();
             cached_fast_margin = runtime_fast_margin_threshold();
             cached_target_prewarm_ms = runtime_target_prewarm_ms();
-            cached_target_keepalive_ms = runtime_target_keepalive_ms();
             cached_idle_force_poll_ms = runtime_event_idle_poll_ms();
             cached_live_arm_required = live_submit_arm_required();
             cached_live_armed = live_submit_armed();
@@ -2527,9 +2674,9 @@ async fn live_runtime_loop(
         let fast_loop_ms = runtime_fast_loop_ms(cfg.loop_interval_ms);
         let fast_margin = cached_fast_margin;
         let target_prewarm_ms = cached_target_prewarm_ms;
-        let target_keepalive_ms = cached_target_keepalive_ms;
         let idle_force_poll_ms = cached_idle_force_poll_ms;
         market_next_due_ms.retain(|k, _| cfg.markets.iter().any(|m| m.eq_ignore_ascii_case(k)));
+        strategy_engines.retain(|k, _| cfg.markets.iter().any(|m| m.eq_ignore_ascii_case(k)));
         for market in &cfg.markets {
             market_next_due_ms
                 .entry(market.to_string())
@@ -2609,22 +2756,6 @@ async fn live_runtime_loop(
                 continue;
             }
             let mut market_sleep_ms = cfg.loop_interval_ms;
-            let last_keepalive = target_keepalive_at.get(market_type).copied().unwrap_or(0);
-            let due_keepalive = now_ms.saturating_sub(last_keepalive) >= target_keepalive_ms;
-            if due_keepalive {
-                // Keep target discovery warm during steady-state to reduce market target misses.
-                if matches!(
-                    tokio::time::timeout(
-                        Duration::from_millis(360),
-                        resolve_live_market_target_with_state(&state, runtime_symbol, market_type),
-                    )
-                    .await,
-                    Ok(Ok(_))
-                ) {
-                    target_keepalive_at.insert(market_type.to_string(), now_ms);
-                    market_sleep_ms = market_sleep_ms.min(fast_loop_ms);
-                }
-            }
             let position_before_cycle = state
                 .get_live_position_state(runtime_symbol, market_type)
                 .await;
@@ -2698,7 +2829,6 @@ async fn live_runtime_loop(
                 || pending_before_count > 0;
             let event_idle_skip = snapshot_event_available
                 && !must_run_without_new_sample
-                && !due_keepalive
                 && !force_poll_due
                 && ((!is_wake_hit) || duplicate_wake_sample);
             if event_idle_skip {
@@ -2710,7 +2840,7 @@ async fn live_runtime_loop(
                 strategy_current_default_profile_name_for_scope(runtime_symbol, market_type);
             let strategy_cfg =
                 strategy_current_default_config_for_scope(runtime_symbol, market_type);
-            match strategy_paper_live(StrategyPaperLiveReq {
+            let runtime_req = StrategyPaperLiveReq {
                 state: &state,
                 symbol: runtime_symbol,
                 market_type,
@@ -2725,9 +2855,58 @@ async fn live_runtime_loop(
                 live_quote_usdc: cfg.quote_usdc,
                 live_max_orders: cfg.max_orders,
                 live_drain_only: effective_drain_only,
-            })
+            };
+            let payload_result = match load_live_runtime_samples(
+                &state,
+                runtime_symbol,
+                market_type,
+                cfg.lookback_minutes,
+                cfg.max_points,
+            )
             .await
             {
+                Ok(samples) => {
+                    let run = if samples.len() >= 20 {
+                        let rebuild = match strategy_engines.get(market_type) {
+                            Some(engine_state) => !engine_state.can_reuse(
+                                runtime_symbol,
+                                &strategy_cfg,
+                                cfg.max_trades,
+                                &samples,
+                            ),
+                            None => true,
+                        };
+                        if rebuild {
+                            strategy_engines.insert(
+                                market_type.to_string(),
+                                LiveRuntimeStrategyEngineState::bootstrap(
+                                    runtime_symbol,
+                                    strategy_cfg,
+                                    cfg.max_trades,
+                                    samples.clone(),
+                                ),
+                            );
+                        } else if let Some(engine_state) = strategy_engines.get_mut(market_type) {
+                            engine_state.update(samples.clone());
+                        }
+                        strategy_engines.get(market_type).map(|engine_state| {
+                            map_simulation_result(engine_state.engine.snapshot())
+                        })
+                    } else {
+                        None
+                    };
+                    strategy_paper_live_from_samples(
+                        runtime_req,
+                        "runtime_stream_100ms",
+                        100,
+                        samples,
+                        run,
+                    )
+                    .await
+                }
+                Err(err) => Err(err),
+            };
+            match payload_result {
                 Ok(mut payload) => {
                     let now = Utc::now();
                     let now_ms = now.timestamp_millis();
@@ -2837,16 +3016,19 @@ async fn live_runtime_loop(
                         .map(|v| v >= 0 && v <= target_prewarm_ms)
                         .unwrap_or(false)
                     {
-                        // Round-switch prewarm is always on, even in paused mode, to eliminate no_live_market_target gaps.
-                        let _ = tokio::time::timeout(
-                            Duration::from_millis(420),
-                            resolve_live_market_target_with_state(
-                                &state,
-                                runtime_symbol,
-                                market_type,
-                            ),
-                        )
-                        .await;
+                        // Keep round-switch prewarm off the hot path. Background maintenance handles
+                        // the actual target/book refresh without stalling submit latency.
+                        let prewarm_state = state.clone();
+                        let prewarm_symbol = runtime_symbol.to_string();
+                        let prewarm_market = market_type.to_string();
+                        tokio::spawn(async move {
+                            prewarm_live_runtime_target_and_books(
+                                &prewarm_state,
+                                &prewarm_symbol,
+                                &prewarm_market,
+                            )
+                            .await;
+                        });
                         market_sleep_ms = market_sleep_ms.min(fast_loop_ms);
                     }
 
@@ -2953,8 +3135,6 @@ async fn live_runtime_loop(
                                 &gated,
                             )
                             .await;
-                            reconcile_live_reports(&state, &exec_cfg_tuned).await;
-                            handle_live_pending_timeouts(&state, &exec_cfg_tuned).await;
                             let accepted_count = execution_orders
                                 .iter()
                                 .filter(|row| {

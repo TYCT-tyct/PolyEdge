@@ -391,6 +391,16 @@ async fn get_or_fetch_book_snapshot_cached(
     snapshot
 }
 
+pub(super) async fn prewarm_rust_books_for_target(
+    state: &ApiState,
+    target: &LiveMarketTarget,
+) -> Result<(), String> {
+    let ctx = get_or_init_rust_executor(state).await?;
+    let token_ids = vec![target.token_id_yes.clone(), target.token_id_no.clone()];
+    let _ = prefetch_rust_books_for_tokens(state, &ctx, &token_ids).await;
+    Ok(())
+}
+
 pub(super) async fn submit_rust_order(
     ctx: &RustExecutorContext,
     payload: &Value,

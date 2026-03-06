@@ -700,6 +700,7 @@ pub(super) struct StrategyPaperLiveReq<'a> {
     pub(super) full_history: bool,
     pub(super) lookback_minutes: u32,
     pub(super) max_points: u32,
+    #[allow(dead_code)]
     pub(super) max_trades: usize,
     pub(super) cfg: &'a StrategyRuntimeConfig,
     pub(super) config_source: &'a str,
@@ -709,7 +710,53 @@ pub(super) struct StrategyPaperLiveReq<'a> {
     pub(super) live_drain_only: bool,
 }
 
+#[allow(dead_code)]
 pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result<Value, ApiError> {
+    let sample_resolution_ms = if req.full_history { 1000 } else { 100 };
+    let sample_source_mode = if req.full_history {
+        "replay_bucket_1s"
+    } else {
+        "runtime_stream_100ms"
+    };
+    let samples = if req.full_history {
+        load_strategy_samples(
+            req.state,
+            req.symbol,
+            req.market_type,
+            true,
+            req.lookback_minutes,
+            req.max_points,
+        )
+        .await?
+    } else {
+        load_strategy_samples_runtime_stream(
+            req.state,
+            req.symbol,
+            req.market_type,
+            req.lookback_minutes,
+            req.max_points,
+        )
+        .await?
+    };
+    let run = (samples.len() >= 20)
+        .then(|| run_strategy_simulation_with_fee_context(&samples, req.cfg, req.max_trades, None));
+    strategy_paper_live_from_samples(
+        req,
+        sample_source_mode,
+        sample_resolution_ms,
+        samples,
+        run,
+    )
+    .await
+}
+
+pub(super) async fn strategy_paper_live_from_samples(
+    req: StrategyPaperLiveReq<'_>,
+    sample_source_mode: &'static str,
+    sample_resolution_ms: u32,
+    samples: Arc<Vec<StrategySample>>,
+    run: Option<StrategySimulationResult>,
+) -> Result<Value, ApiError> {
     let StrategyPaperLiveReq {
         state,
         symbol,
@@ -718,7 +765,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         full_history,
         lookback_minutes,
         max_points,
-        max_trades,
+        max_trades: _,
         cfg,
         config_source,
         live_execute,
@@ -745,35 +792,9 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
     } else {
         None
     };
-
     let sample_symbol = symbol;
-    let sample_resolution_ms = if full_history { 1000 } else { 100 };
-    let sample_source_mode = if full_history {
-        "replay_bucket_1s"
-    } else {
-        "runtime_stream_100ms"
-    };
-    let samples = if full_history {
-        load_strategy_samples(
-            state,
-            sample_symbol,
-            market_type,
-            true,
-            lookback_minutes,
-            max_points,
-        )
-        .await?
-    } else {
-        load_strategy_samples_runtime_stream(
-            state,
-            sample_symbol,
-            market_type,
-            lookback_minutes,
-            max_points,
-        )
-        .await?
-    };
-    if samples.len() < 20 {
+
+    if samples.len() < 20 || run.is_none() {
         return Ok(json!({
             "source": "live",
             "execution_target": "live",
@@ -787,7 +808,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
             "lookback_minutes": lookback_minutes,
             "sample_source_mode": sample_source_mode,
             "sample_resolution_ms": sample_resolution_ms,
-            "lookback": strategy_lookback_meta_json(&samples, full_history, lookback_minutes, max_points, sample_resolution_ms as u32),
+            "lookback": strategy_lookback_meta_json(&samples, full_history, lookback_minutes, max_points, sample_resolution_ms),
             "runtime_defaults": {
                 "lookback_minutes": runtime_defaults.lookback_minutes,
                 "max_points": runtime_defaults.max_points,
@@ -880,7 +901,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         }));
     }
 
-    let run = run_strategy_simulation_with_fee_context(&samples, cfg, max_trades, None);
+    let run = run.expect("run exists when samples >= 20");
     Ok(json!({
         "source": "live",
         "execution_target": "live",
@@ -894,7 +915,7 @@ pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result
         "lookback_minutes": lookback_minutes,
         "sample_source_mode": sample_source_mode,
         "sample_resolution_ms": sample_resolution_ms,
-        "lookback": strategy_lookback_meta_json(&samples, full_history, lookback_minutes, max_points, sample_resolution_ms as u32),
+        "lookback": strategy_lookback_meta_json(&samples, full_history, lookback_minutes, max_points, sample_resolution_ms),
         "runtime_defaults": {
             "lookback_minutes": runtime_defaults.lookback_minutes,
             "max_points": runtime_defaults.max_points,

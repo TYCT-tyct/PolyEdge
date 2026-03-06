@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::OwnedSemaphorePermit;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct StrategySample {
     pub(super) ts_ms: i64,
     pub(super) round_id: String,
@@ -24,7 +24,7 @@ pub(super) struct StrategySample {
     pub(super) spread_mid: f64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct StrategyRuntimeConfig {
     entry_threshold_base: f64,
     entry_threshold_cap: f64,

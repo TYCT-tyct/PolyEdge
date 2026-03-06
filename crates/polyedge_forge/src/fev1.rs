@@ -458,84 +458,101 @@ fn compute_signal(
     }
 }
 
-fn max_drawdown_from_pnls(pnls: &[f64]) -> f64 {
-    let mut equity = 0.0;
-    let mut peak = 0.0;
-    let mut max_dd = 0.0;
-    for p in pnls {
-        equity += *p;
-        if equity > peak {
-            peak = equity;
-        }
-        let dd = peak - equity;
-        if dd > max_dd {
-            max_dd = dd;
+#[derive(Debug, Clone)]
+struct SimulationCoreState {
+    p_hist: VecDeque<f64>,
+    score_hist: VecDeque<f64>,
+    position: Option<Position>,
+    trades: Vec<Value>,
+    signal_decisions: Vec<Value>,
+    entries_by_round: HashMap<String, usize>,
+    last_exit_ts_ms: i64,
+    blocked_exits: usize,
+    emergency_wide_exit_count: usize,
+    execution_penalty_cents_total: f64,
+    trade_id: i64,
+    last_score: f64,
+    last_entry_threshold: f64,
+    last_confirmed: bool,
+    last_side: &'static str,
+    last_p_fair_up: f64,
+    last_edge_prob: f64,
+    last_ts_ms: i64,
+    last_round_id: String,
+    last_remaining_s: f64,
+    last_p_up: f64,
+    last_delta_pct: f64,
+    last_spread_up_cents: f64,
+    last_spread_down_cents: f64,
+    total_entries: usize,
+    loss_cluster_streak: usize,
+    loss_cluster_cooldown_until_ts_ms: i64,
+    session_start_ts_ms: i64,
+    last_sample: Option<Sample>,
+    sample_count: usize,
+}
+
+impl SimulationCoreState {
+    fn new(session_start_ts_ms: i64, entry_threshold_base: f64) -> Self {
+        Self {
+            p_hist: VecDeque::with_capacity(24),
+            score_hist: VecDeque::with_capacity(24),
+            position: None,
+            trades: Vec::new(),
+            signal_decisions: Vec::new(),
+            entries_by_round: HashMap::new(),
+            last_exit_ts_ms: 0,
+            blocked_exits: 0,
+            emergency_wide_exit_count: 0,
+            execution_penalty_cents_total: 0.0,
+            trade_id: 1,
+            last_score: 0.0,
+            last_entry_threshold: entry_threshold_base,
+            last_confirmed: false,
+            last_side: "WAIT",
+            last_p_fair_up: 0.5,
+            last_edge_prob: 0.0,
+            last_ts_ms: 0,
+            last_round_id: String::new(),
+            last_remaining_s: 0.0,
+            last_p_up: 0.5,
+            last_delta_pct: 0.0,
+            last_spread_up_cents: 0.0,
+            last_spread_down_cents: 0.0,
+            total_entries: 0,
+            loss_cluster_streak: 0,
+            loss_cluster_cooldown_until_ts_ms: 0,
+            session_start_ts_ms,
+            last_sample: None,
+            sample_count: 0,
         }
     }
-    max_dd.max(0.0)
-}
 
-#[allow(dead_code)]
-pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> SimulationResult {
-    simulate_with_fee_context(samples, cfg, max_trades, None)
-}
+    fn apply_sample(
+        &mut self,
+        sample: &Sample,
+        cfg: &RuntimeConfig,
+        fee_ctx: Option<&FeeModelContext>,
+    ) {
+        self.last_ts_ms = sample.ts_ms;
+        self.last_round_id = sample.round_id.clone();
+        self.last_remaining_s = (sample.remaining_ms.max(0) as f64) / 1000.0;
+        self.last_p_up = sample.p_up.clamp(0.0, 1.0);
+        self.last_delta_pct = sample.delta_pct;
+        self.last_spread_up_cents = sample.spread_up * 100.0;
+        self.last_spread_down_cents = sample.spread_down * 100.0;
 
-pub fn simulate_with_fee_context(
-    samples: &[Sample],
-    cfg: &RuntimeConfig,
-    max_trades: usize,
-    fee_ctx: Option<&FeeModelContext>,
-) -> SimulationResult {
-    let mut p_hist = VecDeque::<f64>::with_capacity(24);
-    let mut score_hist = VecDeque::<f64>::with_capacity(24);
-    let mut position: Option<Position> = None;
-    let mut trades = Vec::<Value>::new();
-    let mut signal_decisions = Vec::<Value>::new();
-    let mut entries_by_round: HashMap<String, usize> = HashMap::new();
-    let mut last_exit_ts_ms = 0_i64;
-    let mut blocked_exits = 0usize;
-    let mut emergency_wide_exit_count = 0usize;
-    let mut execution_penalty_cents_total = 0.0;
-
-    let mut trade_id = 1_i64;
-    let mut last_score = 0.0;
-    let mut last_entry_threshold = cfg.entry_threshold_base;
-    let mut last_confirmed = false;
-    let mut last_side = "WAIT";
-    let mut last_p_fair_up = 0.5;
-    let mut last_edge_prob = 0.0;
-    let mut last_ts_ms = 0_i64;
-    let mut last_round_id = String::new();
-    let mut last_remaining_s = 0.0_f64;
-    let mut last_p_up = 0.5_f64;
-    let mut last_delta_pct = 0.0_f64;
-    let mut last_spread_up_cents = 0.0_f64;
-    let mut last_spread_down_cents = 0.0_f64;
-    let mut total_entries = 0usize;
-    let mut loss_cluster_streak = 0usize;
-    let mut loss_cluster_cooldown_until_ts_ms = 0_i64;
-    let session_start_ts_ms = samples.first().map(|v| v.ts_ms).unwrap_or(0);
-
-    for sample in samples {
-        last_ts_ms = sample.ts_ms;
-        last_round_id = sample.round_id.clone();
-        last_remaining_s = (sample.remaining_ms.max(0) as f64) / 1000.0;
-        last_p_up = sample.p_up.clamp(0.0, 1.0);
-        last_delta_pct = sample.delta_pct;
-        last_spread_up_cents = sample.spread_up * 100.0;
-        last_spread_down_cents = sample.spread_down * 100.0;
-
-        let signal = compute_signal(sample, &p_hist, &score_hist, cfg);
+        let signal = compute_signal(sample, &self.p_hist, &self.score_hist, cfg);
         let score = signal.score;
         let side = if score >= 0.0 { Side::Up } else { Side::Down };
-        last_score = score;
-        last_entry_threshold = signal.entry_threshold;
-        last_confirmed = signal.confirmed;
-        last_p_fair_up = signal.p_fair_up;
-        last_edge_prob = signal.edge_prob;
-        last_side = side.as_str();
+        self.last_score = score;
+        self.last_entry_threshold = signal.entry_threshold;
+        self.last_confirmed = signal.confirmed;
+        self.last_p_fair_up = signal.p_fair_up;
+        self.last_edge_prob = signal.edge_prob;
+        self.last_side = side.as_str();
 
-        if let Some(pos) = position.as_mut() {
+        if let Some(pos) = self.position.as_mut() {
             let bid_raw = side_bid(sample, pos.side) * 100.0;
             let spread_side_cents = side_spread(sample, pos.side) * 100.0;
             let exit_fee = cfg.fee_cents_per_side + taker_fee_cents(bid_raw, pos.side, fee_ctx);
@@ -616,16 +633,20 @@ pub fn simulate_with_fee_context(
                 let can_fill = spread_side_cents <= cfg.max_exec_spread_cents;
                 let mut escalated_for_blocked_exit = false;
                 if !can_fill && !emergency {
-                    blocked_exits = blocked_exits.saturating_add(1);
+                    self.blocked_exits = self.blocked_exits.saturating_add(1);
                     pos.blocked_exit_streak = pos.blocked_exit_streak.saturating_add(1);
                     if pos.blocked_exit_streak < MAX_BLOCKED_EXIT_STREAK {
-                        continue;
+                        self.push_signal_history(sample.p_up, score);
+                        self.last_sample = Some(sample.clone());
+                        self.sample_count = self.sample_count.saturating_add(1);
+                        return;
                     }
                     escalated_for_blocked_exit = true;
                 }
                 pos.blocked_exit_streak = 0;
                 let emergency_penalty_cents = if !can_fill {
-                    emergency_wide_exit_count = emergency_wide_exit_count.saturating_add(1);
+                    self.emergency_wide_exit_count =
+                        self.emergency_wide_exit_count.saturating_add(1);
                     (spread_side_cents - cfg.max_exec_spread_cents).max(0.0)
                         * cfg.emergency_wide_spread_penalty_ratio
                 } else {
@@ -638,24 +659,26 @@ pub fn simulate_with_fee_context(
                         bid_raw - cfg.slippage_cents_per_side - exit_fee - exit_impact_cents;
                 }
                 exit_exec -= emergency_penalty_cents;
-                execution_penalty_cents_total += emergency_penalty_cents;
+                self.execution_penalty_cents_total += emergency_penalty_cents;
 
                 let net_pnl = exit_exec - pos.entry_price_cents;
                 let gross_pnl = bid_raw - pos.entry_price_raw_cents;
                 let total_cost = (gross_pnl - net_pnl).max(0.0);
                 let duration_s = ((sample.ts_ms - pos.entry_ts_ms).max(0) as f64) / 1000.0;
                 if net_pnl < 0.0 {
-                    loss_cluster_streak = loss_cluster_streak.saturating_add(1);
-                    if cfg.loss_cluster_limit > 0 && loss_cluster_streak >= cfg.loss_cluster_limit {
-                        loss_cluster_cooldown_until_ts_ms = sample
+                    self.loss_cluster_streak = self.loss_cluster_streak.saturating_add(1);
+                    if cfg.loss_cluster_limit > 0
+                        && self.loss_cluster_streak >= cfg.loss_cluster_limit
+                    {
+                        self.loss_cluster_cooldown_until_ts_ms = sample
                             .ts_ms
                             .saturating_add(cfg.loss_cluster_cooldown_ms.max(0));
                     }
                 } else {
-                    loss_cluster_streak = 0;
+                    self.loss_cluster_streak = 0;
                 }
-                trades.push(json!({
-                    "id": trade_id,
+                self.trades.push(json!({
+                    "id": self.trade_id,
                     "side": pos.side.as_str(),
                     "entry_round_id": pos.entry_round_id,
                     "entry_ts_ms": pos.entry_ts_ms,
@@ -685,7 +708,7 @@ pub fn simulate_with_fee_context(
                     "exit_reason": if escalated_for_blocked_exit { "blocked_exit_escalation" } else { reason },
                     "exec_fill_ok": can_fill,
                     "exit_spread_cents": spread_side_cents,
-                    "loss_cluster_streak_after_exit": loss_cluster_streak,
+                    "loss_cluster_streak_after_exit": self.loss_cluster_streak,
                 }));
                 let final_reason = if escalated_for_blocked_exit {
                     "blocked_exit_escalation"
@@ -710,7 +733,7 @@ pub fn simulate_with_fee_context(
                     } else {
                         ("FAK", "taker", 1_000_i64, 22.0_f64)
                     };
-                signal_decisions.push(json!({
+                self.signal_decisions.push(json!({
                     "decision_id": decision_id("exit", pos.side, &sample.round_id, sample.ts_ms),
                     "action": "exit",
                     "side": pos.side.as_str(),
@@ -724,29 +747,38 @@ pub fn simulate_with_fee_context(
                     "ttl_ms": exit_ttl_ms,
                     "max_slippage_bps": exit_slippage_bps
                 }));
-                trade_id += 1;
-                position = None;
-                last_exit_ts_ms = sample.ts_ms;
+                self.trade_id += 1;
+                self.position = None;
+                self.last_exit_ts_ms = sample.ts_ms;
             }
         } else {
             let ask_raw = side_ask(sample, side) * 100.0;
             let spread_side_cents = side_spread(sample, side) * 100.0;
-            let dynamic = entry_adjustments(sample.ts_ms, cfg, session_start_ts_ms, total_entries);
+            let dynamic = entry_adjustments(
+                sample.ts_ms,
+                cfg,
+                self.session_start_ts_ms,
+                self.total_entries,
+            );
             let dynamic_entry_threshold = (signal.entry_threshold + dynamic.threshold_add).clamp(
                 cfg.entry_threshold_base * 0.65,
                 cfg.entry_threshold_cap + 0.20,
             );
-            last_entry_threshold = dynamic_entry_threshold;
+            self.last_entry_threshold = dynamic_entry_threshold;
             let dynamic_edge_req =
                 (cfg.entry_edge_prob + dynamic.edge_add).clamp(0.001, cfg.entry_edge_prob + 0.2);
             let dynamic_spread_limit_prob =
                 (cfg.spread_limit_prob * dynamic.spread_scale).clamp(0.003, 0.25);
             let dynamic_max_exec_spread =
                 (cfg.max_exec_spread_cents * dynamic.spread_scale).clamp(0.5, 12.0);
-            let cooldown_ok = last_exit_ts_ms <= 0
-                || sample.ts_ms.saturating_sub(last_exit_ts_ms) >= cfg.cooldown_ms;
-            let cluster_cooldown_ok = sample.ts_ms >= loss_cluster_cooldown_until_ts_ms;
-            let round_entries = entries_by_round.get(&sample.round_id).copied().unwrap_or(0);
+            let cooldown_ok = self.last_exit_ts_ms <= 0
+                || sample.ts_ms.saturating_sub(self.last_exit_ts_ms) >= cfg.cooldown_ms;
+            let cluster_cooldown_ok = sample.ts_ms >= self.loss_cluster_cooldown_until_ts_ms;
+            let round_entries = self
+                .entries_by_round
+                .get(&sample.round_id)
+                .copied()
+                .unwrap_or(0);
             let within_limit = round_entries < cfg.max_entries_per_round;
             let directional_edge = signal.edge_prob * side.dir();
             let edge_ok = directional_edge >= dynamic_edge_req;
@@ -777,7 +809,7 @@ pub fn simulate_with_fee_context(
                 && cluster_cooldown_ok
                 && within_limit
             {
-                position = Some(Position {
+                self.position = Some(Position {
                     side,
                     entry_ts_ms: sample.ts_ms,
                     entry_round_id: sample.round_id.clone(),
@@ -793,7 +825,6 @@ pub fn simulate_with_fee_context(
                     blocked_exit_streak: 0,
                     soft_stop_pending_ticks: 0,
                 });
-                let entry_reason = "fev1_signal_entry";
                 let entry_score = score.abs();
                 let (entry_tif, entry_style, entry_ttl_ms, entry_slippage_bps) =
                     if sample.remaining_ms <= 120_000 || entry_score >= 0.80 {
@@ -801,13 +832,13 @@ pub fn simulate_with_fee_context(
                     } else {
                         ("FAK", "taker", 750_i64, 18.0_f64)
                     };
-                signal_decisions.push(json!({
+                self.signal_decisions.push(json!({
                     "decision_id": decision_id("enter", side, &sample.round_id, sample.ts_ms),
                     "action": "enter",
                     "side": side.as_str(),
                     "round_id": sample.round_id,
                     "ts_ms": sample.ts_ms,
-                    "reason": entry_reason,
+                    "reason": "fev1_signal_entry",
                     "price_cents": ask_raw.clamp(1.0, 99.0),
                     "entry_score": entry_score,
                     "edge_score": entry_score,
@@ -818,212 +849,484 @@ pub fn simulate_with_fee_context(
                     "ttl_ms": entry_ttl_ms,
                     "max_slippage_bps": entry_slippage_bps
                 }));
-                *entries_by_round.entry(sample.round_id.clone()).or_insert(0) += 1;
-                total_entries = total_entries.saturating_add(1);
+                *self
+                    .entries_by_round
+                    .entry(sample.round_id.clone())
+                    .or_insert(0) += 1;
+                self.total_entries = self.total_entries.saturating_add(1);
             }
         }
 
-        if p_hist.len() >= 24 {
-            p_hist.pop_front();
-        }
-        if score_hist.len() >= 24 {
-            score_hist.pop_front();
-        }
-        p_hist.push_back(sample.p_up);
-        score_hist.push_back(score);
+        self.push_signal_history(sample.p_up, score);
+        self.last_sample = Some(sample.clone());
+        self.sample_count = self.sample_count.saturating_add(1);
     }
 
-    if let (Some(pos), Some(last)) = (position.take(), samples.last()) {
-        let bid_raw = side_bid(last, pos.side) * 100.0;
-        let exit_fee = cfg.fee_cents_per_side + taker_fee_cents(bid_raw, pos.side, fee_ctx);
-        let exit_impact_cents =
-            execution_impact_cents(last, pos.side, cfg, last.remaining_ms, false);
-        let exit_exec = bid_raw - cfg.slippage_cents_per_side - exit_fee - exit_impact_cents;
-        let net_pnl = exit_exec - pos.entry_price_cents;
-        let gross_pnl = bid_raw - pos.entry_price_raw_cents;
-        let total_cost = (gross_pnl - net_pnl).max(0.0);
-        trades.push(json!({
-            "id": trade_id,
-            "side": pos.side.as_str(),
-            "entry_round_id": pos.entry_round_id,
-            "entry_ts_ms": pos.entry_ts_ms,
-            "exit_ts_ms": last.ts_ms,
-            "entry_remaining_ms": pos.entry_remaining_ms,
-            "exit_remaining_ms": last.remaining_ms,
-            "entry_price_cents": pos.entry_price_cents,
-            "entry_price_raw_cents": pos.entry_price_raw_cents,
-            "entry_fee_cents": pos.entry_fee_cents,
-            "entry_slippage_cents": pos.entry_slippage_cents,
-            "entry_impact_cents": pos.entry_impact_cents,
-            "exit_price_cents": exit_exec,
-            "exit_price_raw_cents": bid_raw,
-            "exit_slippage_cents": cfg.slippage_cents_per_side,
-            "exit_impact_cents": exit_impact_cents,
-            "exit_emergency_penalty_cents": 0.0,
-            "exit_fee_cents": exit_fee,
-            "pnl_gross_cents": gross_pnl,
-            "total_cost_cents": total_cost,
-            "pnl_net_cents": net_pnl,
-            "pnl_cents": net_pnl,
-            "peak_pnl_cents": pos.peak_pnl_cents.max(net_pnl),
-            "duration_s": ((last.ts_ms - pos.entry_ts_ms).max(0) as f64) / 1000.0,
-            "entry_score": pos.entry_score,
-            "exit_score": last_score,
-            "entry_reason": "fev1_signal_entry",
-            "exit_reason": "end_of_samples_force_close",
-            "exec_fill_ok": true,
-            "exit_spread_cents": side_spread(last, pos.side) * 100.0
-        }));
+    fn push_signal_history(&mut self, p_up: f64, score: f64) {
+        if self.p_hist.len() >= 24 {
+            self.p_hist.pop_front();
+        }
+        if self.score_hist.len() >= 24 {
+            self.score_hist.pop_front();
+        }
+        self.p_hist.push_back(p_up);
+        self.score_hist.push_back(score);
     }
 
-    let trade_count = trades.len();
-    let all_trade_pnls: Vec<f64> = trades
-        .iter()
-        .filter_map(|t| t.get("pnl_cents").and_then(Value::as_f64))
-        .collect();
-    let wins = all_trade_pnls.iter().filter(|v| **v > 0.0).count();
-    let win_rate_pct = if trade_count > 0 {
-        wins as f64 * 100.0 / trade_count as f64
-    } else {
-        0.0
-    };
-    let total_pnl_cents: f64 = all_trade_pnls.iter().sum();
-    let gross_pnl_cents: f64 = trades
-        .iter()
-        .filter_map(|t| t.get("pnl_gross_cents").and_then(Value::as_f64))
-        .sum();
-    let total_entry_fee_cents: f64 = trades
-        .iter()
-        .filter_map(|t| t.get("entry_fee_cents").and_then(Value::as_f64))
-        .sum();
-    let total_exit_fee_cents: f64 = trades
-        .iter()
-        .filter_map(|t| t.get("exit_fee_cents").and_then(Value::as_f64))
-        .sum();
-    let total_slippage_cents: f64 = trades
-        .iter()
-        .map(|t| {
-            let a = t
-                .get("entry_slippage_cents")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            let b = t
-                .get("exit_slippage_cents")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            a + b
-        })
-        .sum();
-    let total_impact_cents: f64 = trades
-        .iter()
-        .map(|t| {
-            let a = t
-                .get("entry_impact_cents")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            let b = t
-                .get("exit_impact_cents")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            a + b
-        })
-        .sum();
-    let total_cost_cents = total_entry_fee_cents
-        + total_exit_fee_cents
-        + total_slippage_cents
-        + total_impact_cents
-        + execution_penalty_cents_total;
-    let avg_pnl_cents = if trade_count > 0 {
-        total_pnl_cents / trade_count as f64
-    } else {
-        0.0
-    };
-    let avg_duration_s = if trade_count > 0 {
-        trades
+    fn force_close_open_position(
+        &mut self,
+        last: &Sample,
+        cfg: &RuntimeConfig,
+        fee_ctx: Option<&FeeModelContext>,
+    ) {
+        if let Some(pos) = self.position.take() {
+            let bid_raw = side_bid(last, pos.side) * 100.0;
+            let exit_fee = cfg.fee_cents_per_side + taker_fee_cents(bid_raw, pos.side, fee_ctx);
+            let exit_impact_cents =
+                execution_impact_cents(last, pos.side, cfg, last.remaining_ms, false);
+            let exit_exec = bid_raw - cfg.slippage_cents_per_side - exit_fee - exit_impact_cents;
+            let net_pnl = exit_exec - pos.entry_price_cents;
+            let gross_pnl = bid_raw - pos.entry_price_raw_cents;
+            let total_cost = (gross_pnl - net_pnl).max(0.0);
+            self.trades.push(json!({
+                "id": self.trade_id,
+                "side": pos.side.as_str(),
+                "entry_round_id": pos.entry_round_id,
+                "entry_ts_ms": pos.entry_ts_ms,
+                "exit_ts_ms": last.ts_ms,
+                "entry_remaining_ms": pos.entry_remaining_ms,
+                "exit_remaining_ms": last.remaining_ms,
+                "entry_price_cents": pos.entry_price_cents,
+                "entry_price_raw_cents": pos.entry_price_raw_cents,
+                "entry_fee_cents": pos.entry_fee_cents,
+                "entry_slippage_cents": pos.entry_slippage_cents,
+                "entry_impact_cents": pos.entry_impact_cents,
+                "exit_price_cents": exit_exec,
+                "exit_price_raw_cents": bid_raw,
+                "exit_slippage_cents": cfg.slippage_cents_per_side,
+                "exit_impact_cents": exit_impact_cents,
+                "exit_emergency_penalty_cents": 0.0,
+                "exit_fee_cents": exit_fee,
+                "pnl_gross_cents": gross_pnl,
+                "total_cost_cents": total_cost,
+                "pnl_net_cents": net_pnl,
+                "pnl_cents": net_pnl,
+                "peak_pnl_cents": pos.peak_pnl_cents.max(net_pnl),
+                "duration_s": ((last.ts_ms - pos.entry_ts_ms).max(0) as f64) / 1000.0,
+                "entry_score": pos.entry_score,
+                "exit_score": self.last_score,
+                "entry_reason": "fev1_signal_entry",
+                "exit_reason": "end_of_samples_force_close",
+                "exec_fill_ok": true,
+                "exit_spread_cents": side_spread(last, pos.side) * 100.0
+            }));
+        }
+    }
+
+    fn into_result(
+        mut self,
+        cfg: &RuntimeConfig,
+        max_trades: usize,
+        fee_ctx: Option<&FeeModelContext>,
+    ) -> SimulationResult {
+        if let Some(last) = self.last_sample.clone() {
+            self.force_close_open_position(&last, cfg, fee_ctx);
+        }
+
+        let trade_count = self.trades.len();
+        let all_trade_pnls: Vec<f64> = self
+            .trades
             .iter()
-            .filter_map(|t| t.get("duration_s").and_then(Value::as_f64))
-            .sum::<f64>()
-            / trade_count as f64
-    } else {
-        0.0
-    };
-    let max_drawdown_cents = max_drawdown_from_pnls(&all_trade_pnls);
-    let max_profit_trade_cents = all_trade_pnls.iter().copied().fold(0.0_f64, f64::max);
-    let net_margin_pct = if gross_pnl_cents.abs() > 1e-9 {
-        total_pnl_cents / gross_pnl_cents.abs() * 100.0
-    } else {
-        0.0
-    };
-    let net_pnl_cents = total_pnl_cents;
-    let confidence = if last_entry_threshold > 1e-9 {
-        (last_score.abs() / last_entry_threshold).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let suggested_side = if last_confirmed { last_side } else { "WAIT" };
-
-    let current = json!({
-        "suggested_action": if last_confirmed && last_score.abs() >= last_entry_threshold {
-            if last_side == "UP" { "ENTER_UP" } else { "ENTER_DOWN" }
-        } else if trade_count > 0 {
-            "HOLD"
+            .filter_map(|t| t.get("pnl_cents").and_then(Value::as_f64))
+            .collect();
+        let wins = all_trade_pnls.iter().filter(|v| **v > 0.0).count();
+        let win_rate_pct = if trade_count > 0 {
+            wins as f64 * 100.0 / trade_count as f64
+        } else {
+            0.0
+        };
+        let total_pnl_cents: f64 = all_trade_pnls.iter().sum();
+        let gross_pnl_cents: f64 = self
+            .trades
+            .iter()
+            .filter_map(|t| t.get("pnl_gross_cents").and_then(Value::as_f64))
+            .sum();
+        let total_entry_fee_cents: f64 = self
+            .trades
+            .iter()
+            .filter_map(|t| t.get("entry_fee_cents").and_then(Value::as_f64))
+            .sum();
+        let total_exit_fee_cents: f64 = self
+            .trades
+            .iter()
+            .filter_map(|t| t.get("exit_fee_cents").and_then(Value::as_f64))
+            .sum();
+        let total_slippage_cents: f64 = self
+            .trades
+            .iter()
+            .map(|t| {
+                let a = t
+                    .get("entry_slippage_cents")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                let b = t
+                    .get("exit_slippage_cents")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                a + b
+            })
+            .sum();
+        let total_impact_cents: f64 = self
+            .trades
+            .iter()
+            .map(|t| {
+                let a = t
+                    .get("entry_impact_cents")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                let b = t
+                    .get("exit_impact_cents")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                a + b
+            })
+            .sum();
+        let total_cost_cents = total_entry_fee_cents
+            + total_exit_fee_cents
+            + total_slippage_cents
+            + total_impact_cents
+            + self.execution_penalty_cents_total;
+        let avg_pnl_cents = if trade_count > 0 {
+            total_pnl_cents / trade_count as f64
+        } else {
+            0.0
+        };
+        let avg_duration_s = if trade_count > 0 {
+            self.trades
+                .iter()
+                .filter_map(|t| t.get("duration_s").and_then(Value::as_f64))
+                .sum::<f64>()
+                / trade_count as f64
+        } else {
+            0.0
+        };
+        let max_drawdown_cents = max_drawdown_from_pnls(&all_trade_pnls);
+        let max_profit_trade_cents = all_trade_pnls.iter().copied().fold(0.0_f64, f64::max);
+        let net_margin_pct = if gross_pnl_cents.abs() > 1e-9 {
+            total_pnl_cents / gross_pnl_cents.abs() * 100.0
+        } else {
+            0.0
+        };
+        let net_pnl_cents = total_pnl_cents;
+        let confidence = if self.last_entry_threshold > 1e-9 {
+            (self.last_score.abs() / self.last_entry_threshold).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let suggested_side = if self.last_confirmed {
+            self.last_side
         } else {
             "WAIT"
-        },
-        "suggested_side": suggested_side,
-        "score": last_score,
-        "entry_threshold": last_entry_threshold,
-        "side": last_side,
-        "confirmed": last_confirmed,
-        "confidence": confidence,
-        "p_fair_up": last_p_fair_up,
-        "edge_prob": last_edge_prob,
-        "timestamp_ms": last_ts_ms,
-        "round_id": last_round_id,
-        "remaining_s": last_remaining_s,
-        "p_up_pct": last_p_up,
-        "delta_pct": last_delta_pct,
-        "spread_up_cents": last_spread_up_cents,
-        "spread_down_cents": last_spread_down_cents,
-        "loss_cluster_streak": loss_cluster_streak,
-        "loss_cluster_cooldown_until_ts_ms": loss_cluster_cooldown_until_ts_ms,
-    });
+        };
 
-    let trades_view = if trades.len() > max_trades {
-        trades[trades.len() - max_trades..].to_vec()
-    } else {
-        trades
-    };
+        let current = json!({
+            "suggested_action": if self.last_confirmed && self.last_score.abs() >= self.last_entry_threshold {
+                if self.last_side == "UP" { "ENTER_UP" } else { "ENTER_DOWN" }
+            } else if trade_count > 0 {
+                "HOLD"
+            } else {
+                "WAIT"
+            },
+            "suggested_side": suggested_side,
+            "score": self.last_score,
+            "entry_threshold": self.last_entry_threshold,
+            "side": self.last_side,
+            "confirmed": self.last_confirmed,
+            "confidence": confidence,
+            "p_fair_up": self.last_p_fair_up,
+            "edge_prob": self.last_edge_prob,
+            "timestamp_ms": self.last_ts_ms,
+            "round_id": self.last_round_id,
+            "remaining_s": self.last_remaining_s,
+            "p_up_pct": self.last_p_up,
+            "delta_pct": self.last_delta_pct,
+            "spread_up_cents": self.last_spread_up_cents,
+            "spread_down_cents": self.last_spread_down_cents,
+            "loss_cluster_streak": self.loss_cluster_streak,
+            "loss_cluster_cooldown_until_ts_ms": self.loss_cluster_cooldown_until_ts_ms,
+        });
 
-    SimulationResult {
-        current,
-        trades: trades_view,
-        all_trade_pnls,
-        signal_decisions,
-        trade_count,
-        win_rate_pct,
-        avg_pnl_cents,
-        avg_duration_s,
-        total_pnl_cents,
-        max_drawdown_cents,
-        max_profit_trade_cents,
-        blocked_exits,
-        emergency_wide_exit_count,
-        execution_penalty_cents_total,
-        gross_pnl_cents,
-        net_pnl_cents,
-        total_entry_fee_cents,
-        total_exit_fee_cents,
-        total_slippage_cents,
-        total_impact_cents,
-        total_cost_cents,
-        net_margin_pct,
+        let trades = if self.trades.len() > max_trades {
+            self.trades[self.trades.len() - max_trades..].to_vec()
+        } else {
+            self.trades
+        };
+
+        SimulationResult {
+            current,
+            trades,
+            all_trade_pnls,
+            signal_decisions: self.signal_decisions,
+            trade_count,
+            win_rate_pct,
+            avg_pnl_cents,
+            avg_duration_s,
+            total_pnl_cents,
+            max_drawdown_cents,
+            max_profit_trade_cents,
+            blocked_exits: self.blocked_exits,
+            emergency_wide_exit_count: self.emergency_wide_exit_count,
+            execution_penalty_cents_total: self.execution_penalty_cents_total,
+            gross_pnl_cents,
+            net_pnl_cents,
+            total_entry_fee_cents,
+            total_exit_fee_cents,
+            total_slippage_cents,
+            total_impact_cents,
+            total_cost_cents,
+            net_margin_pct,
+        }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct IncrementalSimulationEngine {
+    cfg: RuntimeConfig,
+    max_trades: usize,
+    fee_ctx: Option<FeeModelContext>,
+    state: SimulationCoreState,
+}
+
+impl IncrementalSimulationEngine {
+    pub fn new(
+        cfg: RuntimeConfig,
+        max_trades: usize,
+        fee_ctx: Option<FeeModelContext>,
+        session_start_ts_ms: i64,
+    ) -> Self {
+        Self {
+            cfg,
+            max_trades,
+            fee_ctx,
+            state: SimulationCoreState::new(session_start_ts_ms, cfg.entry_threshold_base),
+        }
+    }
+
+    pub fn from_samples(
+        samples: &[Sample],
+        cfg: RuntimeConfig,
+        max_trades: usize,
+        fee_ctx: Option<FeeModelContext>,
+    ) -> Self {
+        let session_start_ts_ms = samples.first().map(|v| v.ts_ms).unwrap_or(0);
+        let mut engine = Self::new(cfg, max_trades, fee_ctx, session_start_ts_ms);
+        for sample in samples {
+            engine.apply_sample(sample);
+        }
+        engine
+    }
+
+    pub fn apply_sample(&mut self, sample: &Sample) {
+        self.state
+            .apply_sample(sample, &self.cfg, self.fee_ctx.as_ref());
+    }
+
+    pub fn snapshot(&self) -> SimulationResult {
+        self.state
+            .clone()
+            .into_result(&self.cfg, self.max_trades, self.fee_ctx.as_ref())
+    }
+}
+
+fn max_drawdown_from_pnls(pnls: &[f64]) -> f64 {
+    let mut equity = 0.0;
+    let mut peak = 0.0;
+    let mut max_dd = 0.0;
+    for p in pnls {
+        equity += *p;
+        if equity > peak {
+            peak = equity;
+        }
+        let dd = peak - equity;
+        if dd > max_dd {
+            max_dd = dd;
+        }
+    }
+    max_dd.max(0.0)
+}
+
+#[allow(dead_code)]
+pub fn simulate(samples: &[Sample], cfg: &RuntimeConfig, max_trades: usize) -> SimulationResult {
+    simulate_with_fee_context(samples, cfg, max_trades, None)
+}
+
+pub fn simulate_with_fee_context(
+    samples: &[Sample],
+    cfg: &RuntimeConfig,
+    max_trades: usize,
+    fee_ctx: Option<&FeeModelContext>,
+) -> SimulationResult {
+    IncrementalSimulationEngine::from_samples(samples, *cfg, max_trades, fee_ctx.copied())
+        .snapshot()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{simulate, RuntimeConfig, Sample};
+    use super::{simulate, IncrementalSimulationEngine, RuntimeConfig, Sample};
+
+    #[test]
+    fn incremental_engine_matches_bulk_simulation() {
+        let cfg = RuntimeConfig {
+            entry_threshold_base: 0.40,
+            entry_threshold_cap: 0.55,
+            spread_limit_prob: 0.02,
+            entry_edge_prob: 0.01,
+            entry_min_potential_cents: 1.0,
+            entry_max_price_cents: 95.0,
+            min_hold_ms: 0,
+            stop_loss_cents: 99.0,
+            reverse_signal_threshold: -0.95,
+            reverse_signal_ticks: 12,
+            trail_activate_profit_cents: 99.0,
+            trail_drawdown_cents: 99.0,
+            take_profit_near_max_cents: 99.9,
+            endgame_take_profit_cents: 99.9,
+            endgame_remaining_ms: 1_000,
+            liquidity_widen_prob: 0.02,
+            cooldown_ms: 0,
+            max_entries_per_round: 1,
+            max_exec_spread_cents: 2.0,
+            slippage_cents_per_side: 0.2,
+            fee_cents_per_side: 0.1,
+            emergency_wide_spread_penalty_ratio: 0.5,
+            stop_loss_grace_ticks: 1,
+            stop_loss_hard_mult: 1.4,
+            stop_loss_reverse_extra_ticks: 1,
+            loss_cluster_limit: 0,
+            loss_cluster_cooldown_ms: 0,
+            noise_gate_enabled: false,
+            noise_gate_threshold_add: 0.0,
+            noise_gate_edge_add: 0.0,
+            noise_gate_spread_scale: 1.0,
+            vic_enabled: false,
+            vic_target_entries_per_hour: 0.0,
+            vic_deadband_ratio: 0.08,
+            vic_threshold_relax_max: 0.0,
+            vic_edge_relax_max: 0.0,
+            vic_spread_relax_max: 0.0,
+        };
+        let samples = vec![
+            Sample {
+                ts_ms: 1_000,
+                round_id: "r-1".to_string(),
+                remaining_ms: 200_000,
+                p_up: 0.18,
+                delta_pct: 0.8,
+                velocity: 6.0,
+                acceleration: 2.0,
+                bid_yes: 0.49,
+                ask_yes: 0.50,
+                bid_no: 0.50,
+                ask_no: 0.51,
+                spread_up: 0.005,
+                spread_down: 0.005,
+                spread_mid: 0.005,
+            },
+            Sample {
+                ts_ms: 2_000,
+                round_id: "r-1".to_string(),
+                remaining_ms: 199_000,
+                p_up: 0.18,
+                delta_pct: 0.8,
+                velocity: 6.0,
+                acceleration: 2.0,
+                bid_yes: 0.49,
+                ask_yes: 0.50,
+                bid_no: 0.50,
+                ask_no: 0.51,
+                spread_up: 0.005,
+                spread_down: 0.005,
+                spread_mid: 0.005,
+            },
+            Sample {
+                ts_ms: 3_000,
+                round_id: "r-1".to_string(),
+                remaining_ms: 198_000,
+                p_up: 0.18,
+                delta_pct: 0.8,
+                velocity: 6.0,
+                acceleration: 2.0,
+                bid_yes: 0.50,
+                ask_yes: 0.51,
+                bid_no: 0.49,
+                ask_no: 0.50,
+                spread_up: 0.005,
+                spread_down: 0.005,
+                spread_mid: 0.005,
+            },
+            Sample {
+                ts_ms: 4_000,
+                round_id: "r-1".to_string(),
+                remaining_ms: 197_000,
+                p_up: 0.35,
+                delta_pct: 0.4,
+                velocity: 2.0,
+                acceleration: 0.5,
+                bid_yes: 0.53,
+                ask_yes: 0.56,
+                bid_no: 0.44,
+                ask_no: 0.47,
+                spread_up: 0.03,
+                spread_down: 0.03,
+                spread_mid: 0.03,
+            },
+            Sample {
+                ts_ms: 5_000,
+                round_id: "r-1".to_string(),
+                remaining_ms: 196_000,
+                p_up: 0.31,
+                delta_pct: 0.1,
+                velocity: 1.2,
+                acceleration: 0.1,
+                bid_yes: 0.55,
+                ask_yes: 0.57,
+                bid_no: 0.43,
+                ask_no: 0.45,
+                spread_up: 0.02,
+                spread_down: 0.02,
+                spread_mid: 0.02,
+            },
+            Sample {
+                ts_ms: 6_000,
+                round_id: "r-2".to_string(),
+                remaining_ms: 200_000,
+                p_up: 0.52,
+                delta_pct: -0.6,
+                velocity: -4.5,
+                acceleration: -1.8,
+                bid_yes: 0.46,
+                ask_yes: 0.48,
+                bid_no: 0.52,
+                ask_no: 0.54,
+                spread_up: 0.02,
+                spread_down: 0.02,
+                spread_mid: 0.02,
+            },
+        ];
+
+        let bulk = simulate(&samples, &cfg, 32);
+        let mut incremental = IncrementalSimulationEngine::new(cfg, 32, None, samples[0].ts_ms);
+        for sample in &samples {
+            incremental.apply_sample(sample);
+        }
+        let live = incremental.snapshot();
+
+        assert_eq!(bulk.trade_count, live.trade_count);
+        assert_eq!(bulk.blocked_exits, live.blocked_exits);
+        assert_eq!(bulk.signal_decisions, live.signal_decisions);
+        assert_eq!(bulk.current, live.current);
+        assert_eq!(bulk.trades, live.trades);
+    }
 
     #[test]
     fn blocked_non_emergency_exits_are_escalated() {
