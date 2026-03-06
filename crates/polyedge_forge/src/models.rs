@@ -59,6 +59,38 @@ pub struct RelayTickRow {
     pub checksum_ok: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BronzeBookTopRow {
+    pub ts_recorded_ms: i64,
+    pub market_id: String,
+    pub symbol: String,
+    pub timeframe: String,
+    pub title: String,
+    pub bid_yes: f64,
+    pub ask_yes: f64,
+    pub bid_no: f64,
+    pub ask_no: f64,
+    pub bid_size_yes: f64,
+    pub ask_size_yes: f64,
+    pub bid_size_no: f64,
+    pub ask_size_no: f64,
+    pub ts_exchange_ms: i64,
+    pub recv_ts_local_ns: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BronzeDiscoveryRow {
+    pub ts_recorded_ms: i64,
+    pub market_id: String,
+    pub symbol: String,
+    pub timeframe: String,
+    pub title: String,
+    pub target_price: Option<f64>,
+    pub start_ts_ms: i64,
+    pub end_ts_ms: i64,
+    pub source: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChainlinkLocal {
     pub symbol: String,
@@ -161,6 +193,12 @@ pub enum PersistEvent {
     RelayTick(Box<RelayTickRow>),
     Round(RoundRow),
     Log(IngestLogRow),
+}
+
+#[derive(Debug)]
+pub enum BronzePersistEvent {
+    BookTop(Box<BronzeBookTopRow>),
+    Discovery(Box<BronzeDiscoveryRow>),
 }
 
 #[derive(Debug, Clone, Copy)]

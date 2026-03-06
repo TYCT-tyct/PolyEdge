@@ -1,6 +1,8 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -23,11 +25,11 @@ use crate::market_data_exchange::{
 };
 use crate::market_switch::resolve_switch_snapshot;
 use crate::models::{
-    compute_tokyo_wire_checksum, ChainlinkLocal, MarketMeta, MotionState, PersistEvent,
-    RelayTickRow, RoundRow, SnapshotRow, TokyoBinanceLocal, TokyoBinanceWire,
-    TokyoReplayRequestWire,
+    compute_tokyo_wire_checksum, BronzeBookTopRow, BronzeDiscoveryRow, BronzePersistEvent,
+    ChainlinkLocal, MarketMeta, MotionState, PersistEvent, RelayTickRow, RoundRow, SnapshotRow,
+    TokyoBinanceLocal, TokyoBinanceWire, TokyoReplayRequestWire,
 };
-use crate::persist::{log_ingest, persist_event};
+use crate::persist::{log_ingest, persist_bronze_event, persist_event};
 
 // --- 后台 Target Fetch 请求/响应定义 ---
 struct TargetFetchReq {
@@ -62,6 +64,43 @@ fn relay_tick_persist_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn bronze_sidecar_enabled() -> bool {
+    std::env::var("FORGE_BRONZE_SIDECAR_ENABLED")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(true)
+}
+
+fn bronze_try_send(
+    tx: &mpsc::Sender<BronzePersistEvent>,
+    event: BronzePersistEvent,
+    source: &'static str,
+) {
+    static DROP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    match tx.try_send(event) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            let dropped = DROP_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped.is_multiple_of(1024) {
+                tracing::warn!(
+                    source,
+                    dropped,
+                    "bronze sidecar queue full, dropping sidecar events"
+                );
+            }
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            tracing::warn!(source, "bronze sidecar channel closed");
+        }
+    }
+}
+
 // Removed: MARKET_FUTURE_GUARD_DEFAULT_MS (replaced by market_prestart_allow_ms)
 const MARKET_PRESTART_ALLOW_DEFAULT_MS: i64 = 30_000;
 const MARKET_SAMPLE_END_GRACE_DEFAULT_MS: i64 = 300;
@@ -84,6 +123,7 @@ const CHAINLINK_QUEUE_CAP_DEFAULT: usize = 8_192;
 const BOOK_QUEUE_CAP_DEFAULT: usize = 16_384;
 const MARKET_QUEUE_CAP_DEFAULT: usize = 512;
 const TARGET_QUEUE_CAP_DEFAULT: usize = 2_048;
+const BRONZE_QUEUE_CAP_DEFAULT: usize = 16_384;
 const TOKYO_REPLAY_REQ_THROTTLE_MS: i64 = 250;
 const TARGET_RETRY_BACKOFF_MS: i64 = 1_200;
 const RECORDER_HOUSEKEEPING_INTERVAL_MS: i64 = 10_000;
@@ -860,6 +900,27 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         }
     });
 
+    let bronze_tx = if bronze_sidecar_enabled() {
+        let bronze_root = root.join("bronze");
+        fs::create_dir_all(&bronze_root).ok();
+        let (tx, mut rx) = mpsc::channel::<BronzePersistEvent>(ingest_queue_cap(
+            "FORGE_BRONZE_QUEUE_CAP",
+            BRONZE_QUEUE_CAP_DEFAULT,
+            512,
+            131_072,
+        ));
+        thread::spawn(move || {
+            while let Some(ev) = rx.blocking_recv() {
+                if let Err(err) = persist_bronze_event(&bronze_root, ev) {
+                    tracing::error!(?err, "bronze persist failed");
+                }
+            }
+        });
+        Some(tx)
+    } else {
+        None
+    };
+
     let sink_cfg = DbSinkConfig {
         clickhouse_url: normalize_opt_url(&args.clickhouse_url),
         clickhouse_database: args.clickhouse_database.clone(),
@@ -1221,6 +1282,30 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                 chainlink_by_symbol.insert(msg.symbol.clone(), msg);
             }
             Some(book) = book_rx.recv() => {
+                if let Some(bronze_tx) = bronze_tx.as_ref() {
+                    let market_meta = markets_by_id.get(&book.market_id);
+                    bronze_try_send(
+                        bronze_tx,
+                        BronzePersistEvent::BookTop(Box::new(BronzeBookTopRow {
+                            ts_recorded_ms: Utc::now().timestamp_millis(),
+                            market_id: book.market_id.clone(),
+                            symbol: market_meta.map(|m| m.symbol.clone()).unwrap_or_default(),
+                            timeframe: market_meta.map(|m| m.timeframe.clone()).unwrap_or_default(),
+                            title: market_meta.map(|m| m.title.clone()).unwrap_or_default(),
+                            bid_yes: book.bid_yes,
+                            ask_yes: book.ask_yes,
+                            bid_no: book.bid_no,
+                            ask_no: book.ask_no,
+                            bid_size_yes: book.bid_size_yes,
+                            ask_size_yes: book.ask_size_yes,
+                            bid_size_no: book.bid_size_no,
+                            ask_size_no: book.ask_size_no,
+                            ts_exchange_ms: book.ts_ms,
+                            recv_ts_local_ns: book.recv_ts_local_ns,
+                        })),
+                        "bronze_book_top",
+                    );
+                }
                 book_by_market.insert(book.market_id.clone(), book);
             }
             Some(markets) = market_rx.recv() => {
@@ -1236,6 +1321,25 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                 for m in markets {
                     if market_filter.allows(&m.symbol, &m.timeframe) {
                         markets_by_id.insert(m.market_id.clone(), m);
+                    }
+                }
+                if let Some(bronze_tx) = bronze_tx.as_ref() {
+                    for market in markets_by_id.values() {
+                        bronze_try_send(
+                            bronze_tx,
+                            BronzePersistEvent::Discovery(Box::new(BronzeDiscoveryRow {
+                                ts_recorded_ms: now_ms,
+                                market_id: market.market_id.clone(),
+                                symbol: market.symbol.clone(),
+                                timeframe: market.timeframe.clone(),
+                                title: market.title.clone(),
+                                target_price: market.target_price,
+                                start_ts_ms: market.start_ts_ms,
+                                end_ts_ms: market.end_ts_ms,
+                                source: "market_discovery".to_string(),
+                            })),
+                            "bronze_discovery",
+                        );
                     }
                 }
                 let mut pair_seen: HashSet<String> = markets_by_id
