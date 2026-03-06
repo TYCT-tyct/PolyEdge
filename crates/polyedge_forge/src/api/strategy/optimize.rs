@@ -932,25 +932,21 @@ fn candidate_beats_incumbent_balanced(payload: &Value, incumbent: &Value) -> boo
     }
     let mut improvement = selection_improvement(payload, incumbent);
     let incumbent_positive = payload_is_positive_eligible(incumbent);
-    let drawdown_limit = payload_f64(incumbent, "/summary_robust/max_drawdown_cents") * 0.10 + 4.0;
-    let drawdown_ok = improvement.drawdown_delta_cents <= drawdown_limit;
-    let trade_count_ok = improvement.trade_count_ratio >= 0.80 || improvement.trade_count_ratio >= 1.0;
-    let profitability_ok = improvement.recent_net_pnl_gain_cents >= -4.0
-        && improvement.validation_net_pnl_gain_cents >= -4.0
-        && improvement.robust_net_pnl_gain_cents >= -8.0
-        && (improvement.recent_net_pnl_gain_cents > 8.0
-            || improvement.validation_net_pnl_gain_cents > 6.0
-            || improvement.robust_net_pnl_gain_cents > 8.0);
-    let quality_ok = improvement.mean_pnl_gain_cents >= -0.15
-        && (improvement.win_rate_gain_pct >= -1.0
-            || improvement.recent_net_pnl_gain_cents > 25.0
-            || improvement.validation_net_pnl_gain_cents > 18.0);
+    let drawdown_ok = improvement.drawdown_delta_cents <= 1.5;
+    let trade_count_ok = improvement.trade_count_ratio >= 0.85;
+    let profitability_ok = improvement.recent_net_pnl_gain_cents > 8.0
+        && improvement.validation_net_pnl_gain_cents > 6.0
+        && improvement.robust_net_pnl_gain_cents > 8.0;
+    let quality_ok =
+        improvement.mean_pnl_gain_cents >= 0.05 && improvement.win_rate_gain_pct >= 0.25;
     let beats = if !incumbent_positive {
-        improvement.balanced_gain > 16.0
-            && improvement.recent_net_pnl_gain_cents > 0.0
-            && improvement.validation_net_pnl_gain_cents > 0.0
+        improvement.balanced_gain > 24.0
+            && profitability_ok
+            && quality_ok
+            && drawdown_ok
+            && trade_count_ok
     } else {
-        improvement.balanced_gain > 12.0
+        improvement.balanced_gain > 16.0
             && profitability_ok
             && quality_ok
             && drawdown_ok
@@ -1216,20 +1212,20 @@ pub(super) async fn strategy_optimize(
         let trade_support = recent_run.trade_count.min(160) as f64 * 0.8
             + valid_run.trade_count.min(120) as f64 * 0.9
             + walk.median_trade_count.min(90.0) * 1.8;
-        let profit_score = recent_run.total_pnl_cents.max(0.0) * 0.42
-            + valid_run.total_pnl_cents.max(0.0) * 0.30
-            + walk.median_total_pnl_cents.max(0.0) * 0.24
-            + recent_run.avg_pnl_cents.max(0.0) * 92.0
-            + valid_run.avg_pnl_cents.max(0.0) * 74.0
-            + walk.median_avg_pnl_cents.max(0.0) * 68.0
-            + recent_run.win_rate_pct * 5.5
-            + valid_run.win_rate_pct * 4.0
+        let profit_score = recent_run.total_pnl_cents.max(0.0) * 0.38
+            + valid_run.total_pnl_cents.max(0.0) * 0.28
+            + walk.median_total_pnl_cents.max(0.0) * 0.22
+            + recent_run.avg_pnl_cents.max(0.0) * 120.0
+            + valid_run.avg_pnl_cents.max(0.0) * 100.0
+            + walk.median_avg_pnl_cents.max(0.0) * 92.0
+            + recent_run.win_rate_pct * 8.0
+            + valid_run.win_rate_pct * 6.0
             + ((pf_recent.min(8.0) - 1.0).max(0.0)) * 140.0
             + ((pf_valid.min(6.0) - 1.0).max(0.0)) * 100.0
             + trade_support
-            - recent_run.max_drawdown_cents * 1.25
-            - valid_run.max_drawdown_cents * 0.95
-            - walk.worst_drawdown_cents * 1.10
+            - recent_run.max_drawdown_cents * 2.00
+            - valid_run.max_drawdown_cents * 1.60
+            - walk.worst_drawdown_cents * 1.85
             - consistency_penalty * 2.0
             - fill_risk_penalty * 1.15
             - coverage_gate_penalty * 0.08
@@ -1237,27 +1233,27 @@ pub(super) async fn strategy_optimize(
         let robust_score = walk.median_total_pnl_cents.max(0.0) * 0.28
             + valid_run.total_pnl_cents.max(0.0) * 0.22
             + recent_run.total_pnl_cents.max(0.0) * 0.18
-            + walk.median_avg_pnl_cents.max(0.0) * 88.0
-            + valid_run.avg_pnl_cents.max(0.0) * 70.0
-            + recent_run.avg_pnl_cents.max(0.0) * 60.0
-            + walk.median_win_rate_pct * 7.0
-            + valid_run.win_rate_pct * 5.0
-            + recent_run.win_rate_pct * 4.5
+            + walk.median_avg_pnl_cents.max(0.0) * 108.0
+            + valid_run.avg_pnl_cents.max(0.0) * 92.0
+            + recent_run.avg_pnl_cents.max(0.0) * 84.0
+            + walk.median_win_rate_pct * 11.0
+            + valid_run.win_rate_pct * 8.0
+            + recent_run.win_rate_pct * 7.0
             + walk.positive_total_pnl_ratio * 280.0
             + ((walk.median_profit_factor.min(8.0) - 1.0).max(0.0)) * 160.0
             + ((walk.min_profit_factor.min(4.0) - 1.0).max(0.0)) * 110.0
             + trade_support * 0.8
-            - walk.worst_drawdown_cents * 2.9
-            - valid_run.max_drawdown_cents * 1.8
-            - recent_run.max_drawdown_cents * 1.4
+            - walk.worst_drawdown_cents * 4.60
+            - valid_run.max_drawdown_cents * 2.80
+            - recent_run.max_drawdown_cents * 2.20
             - walk.max_blocked_exit_rate * 320.0
             - walk.max_emergency_exit_rate * 360.0
             - consistency_penalty * 2.3
             - fill_risk_penalty
             - coverage_gate_penalty * 0.10
             - if gates.eligible_positive { 0.0 } else { 2600.0 };
-        let balanced_score = profit_score * 0.52
-            + robust_score * 0.68
+        let balanced_score = profit_score * 0.46
+            + robust_score * 0.82
             + train_obj * 0.04
             + valid_obj * 0.18
             + recent_obj * 0.24
