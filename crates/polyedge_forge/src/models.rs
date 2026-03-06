@@ -79,6 +79,28 @@ pub struct BronzeBookTopRow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BronzeBookEventRow {
+    pub ts_recorded_ms: i64,
+    pub event_type: String,
+    pub market_id: String,
+    pub asset_id: String,
+    pub symbol: String,
+    pub timeframe: String,
+    pub title: String,
+    pub side: Option<String>,
+    pub price: Option<f64>,
+    pub size: Option<f64>,
+    pub best_bid: Option<f64>,
+    pub best_ask: Option<f64>,
+    pub spread: Option<f64>,
+    pub bid_levels: Option<Vec<(f64, f64)>>,
+    pub ask_levels: Option<Vec<(f64, f64)>>,
+    pub ts_exchange_ms: i64,
+    pub recv_ts_local_ns: i64,
+    pub hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BronzeDiscoveryRow {
     pub ts_recorded_ms: i64,
     pub market_id: String,
@@ -105,6 +127,8 @@ pub struct MarketMeta {
     pub symbol: String,
     pub timeframe: String,
     pub title: String,
+    pub token_id_yes: Option<String>,
+    pub token_id_no: Option<String>,
     pub target_price: Option<f64>,
     pub end_ts_ms: i64,
     pub start_ts_ms: i64,
@@ -198,6 +222,7 @@ pub enum PersistEvent {
 #[derive(Debug)]
 pub enum BronzePersistEvent {
     BookTop(Box<BronzeBookTopRow>),
+    BookEvent(Box<BronzeBookEventRow>),
     Discovery(Box<BronzeDiscoveryRow>),
 }
 

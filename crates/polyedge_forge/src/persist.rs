@@ -66,6 +66,16 @@ pub fn persist_bronze_event(root: &Path, ev: BronzePersistEvent) -> Result<()> {
             let path = dir.join(format!("hour={hour:02}.jsonl"));
             append_jsonl(&path, row.as_ref())?;
         }
+        BronzePersistEvent::BookEvent(row) => {
+            let (date, hour) = ts_to_date_hour(row.ts_recorded_ms)?;
+            let dir = root
+                .join("book_event")
+                .join(format!("dt={date}"))
+                .join(format!("symbol={}", row.symbol))
+                .join(format!("tf={}", row.timeframe));
+            let path = dir.join(format!("hour={hour:02}.jsonl"));
+            append_jsonl(&path, row.as_ref())?;
+        }
         BronzePersistEvent::Discovery(row) => {
             let (date, hour) = ts_to_date_hour(row.ts_recorded_ms)?;
             let dir = root

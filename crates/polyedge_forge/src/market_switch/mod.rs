@@ -154,6 +154,8 @@ mod tests {
             symbol: "BTCUSDT".to_string(),
             timeframe: "5m".to_string(),
             title: "BTC".to_string(),
+            token_id_yes: None,
+            token_id_no: None,
             target_price: None,
             start_ts_ms: start,
             end_ts_ms: end,
