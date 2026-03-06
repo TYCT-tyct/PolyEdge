@@ -29,18 +29,20 @@ pub(super) async fn health_db(State(state): State<ApiState>) -> Json<HealthRespo
 pub(super) async fn ws_live(
     ws: WebSocketUpgrade,
     State(state): State<ApiState>,
+    Query(params): Query<WsLiveQueryParams>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| ws_live_loop(socket, state))
+    let symbol = normalize_collector_symbol(params.symbol.as_deref());
+    ws.on_upgrade(move |socket| ws_live_loop(socket, state, symbol))
 }
 
-pub(super) async fn ws_live_loop(mut socket: WebSocket, state: ApiState) {
+pub(super) async fn ws_live_loop(mut socket: WebSocket, state: ApiState, symbol: String) {
     let mut interval = tokio::time::interval(Duration::from_millis(350));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_payload = String::new();
 
     loop {
         interval.tick().await;
-        let payload = match build_ws_live_payload(&state).await {
+        let payload = match build_ws_live_payload(&state, &symbol).await {
             Ok(v) => v,
             Err(err) => {
                 tracing::warn!(?err, "ws live payload build failed");
@@ -69,10 +71,14 @@ pub(super) async fn ws_live_loop(mut socket: WebSocket, state: ApiState) {
     }
 }
 
-pub(super) async fn build_ws_live_payload(state: &ApiState) -> Result<Value, ApiError> {
-    let five = fetch_latest_snapshot(state, "BTCUSDT", "5m").await?;
-    let fifteen = fetch_latest_snapshot(state, "BTCUSDT", "15m").await?;
+pub(super) async fn build_ws_live_payload(
+    state: &ApiState,
+    symbol: &str,
+) -> Result<Value, ApiError> {
+    let five = fetch_latest_snapshot(state, symbol, "5m").await?;
+    let fifteen = fetch_latest_snapshot(state, symbol, "15m").await?;
     Ok(json!({
+        "symbol": symbol,
         "5m": five.as_ref().map(|v| compact_live_snapshot(v, "5m")),
         "15m": fifteen.as_ref().map(|v| compact_live_snapshot(v, "15m")),
     }))
@@ -747,15 +753,17 @@ async fn fetch_collector_window_metrics(
 
 pub(super) async fn collector_status(
     State(state): State<ApiState>,
+    Query(params): Query<CollectorMetricsQueryParams>,
 ) -> Result<Json<Value>, ApiError> {
     let now_ms = Utc::now().timestamp_millis();
+    let symbol = normalize_collector_symbol(params.symbol.as_deref());
     let mut tf_map = serde_json::Map::new();
     let mut overall_ok = true;
 
     for tf in ["5m", "15m"] {
-        let snapshot = match fetch_latest_snapshot(&state, "BTCUSDT", tf).await? {
+        let snapshot = match fetch_latest_snapshot(&state, &symbol, tf).await? {
             Some(v) => Some(v),
-            None => fetch_latest_snapshot_from_clickhouse(&state, "BTCUSDT", tf, now_ms).await?,
+            None => fetch_latest_snapshot_from_clickhouse(&state, &symbol, tf, now_ms).await?,
         };
 
         let (tf_ok, status_value) = collector_timeframe_status_row(snapshot.as_ref(), now_ms);
@@ -765,6 +773,7 @@ pub(super) async fn collector_status(
 
     Ok(Json(json!({
         "ok": overall_ok,
+        "symbol": symbol,
         "ts_ms": now_ms,
         "timeframes": Value::Object(tf_map),
     })))

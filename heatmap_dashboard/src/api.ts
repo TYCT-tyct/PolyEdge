@@ -54,7 +54,7 @@ function responseCacheTtlMs(path: string): number {
   if (path === "/api/stats") {
     return 2_000;
   }
-  if (path === "/api/collector/status") {
+  if (path.startsWith("/api/collector/status")) {
     return 1_500;
   }
   if (path.startsWith("/api/collector/metrics")) {
@@ -542,9 +542,10 @@ export async function getStats(symbol: MarketSymbol = "BTCUSDT"): Promise<StatsR
 }
 
 export async function getCollectorStatus(symbol: MarketSymbol = "BTCUSDT"): Promise<CollectorStatusResponse> {
-  if (symbol === "BTCUSDT" && apiSupport.collectorStatus !== false) {
+  const qs = new URLSearchParams({ symbol });
+  if (apiSupport.collectorStatus !== false) {
     try {
-      const data = await requestJson<CollectorStatusResponse>("/api/collector/status");
+      const data = await requestJson<CollectorStatusResponse>(`/api/collector/status?${qs.toString()}`);
       apiSupport.collectorStatus = true;
       return data;
     } catch (err) {
@@ -1099,6 +1100,7 @@ export async function getStrategyPaper(
 }
 
 export function connectLiveWs(
+  symbol: MarketSymbol,
   onData: (payload: WsLivePayload) => void,
   onStatus?: (status: "connecting" | "open" | "closed" | "error") => void
 ): () => void {
@@ -1112,7 +1114,7 @@ export function connectLiveWs(
       return;
     }
     onStatus?.("connecting");
-    ws = new WebSocket(buildWsUrl("/ws/live"));
+    ws = new WebSocket(buildWsUrl(`/ws/live?symbol=${encodeURIComponent(symbol)}`));
     ws.onopen = () => {
       retryMs = 1200;
       onStatus?.("open");

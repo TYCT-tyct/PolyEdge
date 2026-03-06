@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -23,8 +23,9 @@ use crate::market_data_exchange::{
 };
 use crate::market_switch::resolve_switch_snapshot;
 use crate::models::{
-    ChainlinkLocal, MarketMeta, MotionState, PersistEvent, RoundRow, SnapshotRow,
-    TokyoBinanceLocal, TokyoBinanceWire,
+    compute_tokyo_wire_checksum, ChainlinkLocal, MarketMeta, MotionState, PersistEvent,
+    RelayTickRow, RoundRow, SnapshotRow, TokyoBinanceLocal, TokyoBinanceWire,
+    TokyoReplayRequestWire,
 };
 use crate::persist::{log_ingest, persist_event};
 
@@ -39,6 +40,14 @@ struct TargetFetchReq {
 struct TargetFetchRes {
     cache_key: String,
     target_price: Option<f64>,
+}
+
+fn ingest_queue_cap(key: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
 }
 
 // Removed: MARKET_FUTURE_GUARD_DEFAULT_MS (replaced by market_prestart_allow_ms)
@@ -58,6 +67,12 @@ const PROB_RAW_MAX_STEP_PER_SEC: f64 = 0.45;
 const PROB_RAW_MAX_STEP_MID_CLOSE_PER_SEC: f64 = 0.80;
 const PROB_RAW_MAX_STEP_NEAR_CLOSE_PER_SEC: f64 = 1.20;
 const PROB_STATE_RETENTION_MS: i64 = 2 * 60 * 60 * 1000;
+const TOKYO_RELAY_QUEUE_CAP_DEFAULT: usize = 32_768;
+const CHAINLINK_QUEUE_CAP_DEFAULT: usize = 8_192;
+const BOOK_QUEUE_CAP_DEFAULT: usize = 16_384;
+const MARKET_QUEUE_CAP_DEFAULT: usize = 512;
+const TARGET_QUEUE_CAP_DEFAULT: usize = 2_048;
+const TOKYO_REPLAY_REQ_THROTTLE_MS: i64 = 250;
 const TARGET_RETRY_BACKOFF_MS: i64 = 1_200;
 const RECORDER_HOUSEKEEPING_INTERVAL_MS: i64 = 10_000;
 const RECORDER_STALE_STATE_RETENTION_MS: i64 = 20 * 60 * 1000;
@@ -495,6 +510,10 @@ struct StableQuote {
     ask_yes: f64,
     bid_no: f64,
     ask_no: f64,
+    bid_size_yes: f64,
+    ask_size_yes: f64,
+    bid_size_no: f64,
+    ask_size_no: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -658,6 +677,10 @@ fn stabilize_book_quotes(
         ask_yes,
         bid_no,
         ask_no,
+        bid_size_yes: book.bid_size_yes.max(0.0),
+        ask_size_yes: book.ask_size_yes.max(0.0),
+        bid_size_no: book.bid_size_no.max(0.0),
+        ask_size_no: book.ask_size_no.max(0.0),
     })
 }
 
@@ -875,14 +898,44 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
 
     log_ingest(&persist_tx, "info", "recorder", "startup complete");
 
-    let (tokyo_tx, mut tokyo_rx) = mpsc::unbounded_channel::<TokyoBinanceWire>();
-    let (chainlink_tx, mut chainlink_rx) = mpsc::unbounded_channel::<ChainlinkLocal>();
-    let (book_tx, mut book_rx) = mpsc::unbounded_channel::<BookTop>();
-    let (market_tx, mut market_rx) = mpsc::unbounded_channel::<Vec<MarketMeta>>();
+    let (tokyo_tx, mut tokyo_rx) = mpsc::channel::<TokyoBinanceWire>(ingest_queue_cap(
+        "FORGE_TOKYO_RELAY_QUEUE_CAP",
+        TOKYO_RELAY_QUEUE_CAP_DEFAULT,
+        1_024,
+        262_144,
+    ));
+    let (chainlink_tx, mut chainlink_rx) = mpsc::channel::<ChainlinkLocal>(ingest_queue_cap(
+        "FORGE_CHAINLINK_QUEUE_CAP",
+        CHAINLINK_QUEUE_CAP_DEFAULT,
+        512,
+        65_536,
+    ));
+    let (book_tx, mut book_rx) = mpsc::channel::<BookTop>(ingest_queue_cap(
+        "FORGE_BOOK_QUEUE_CAP",
+        BOOK_QUEUE_CAP_DEFAULT,
+        1_024,
+        131_072,
+    ));
+    let (market_tx, mut market_rx) = mpsc::channel::<Vec<MarketMeta>>(ingest_queue_cap(
+        "FORGE_MARKET_DISCOVERY_QUEUE_CAP",
+        MARKET_QUEUE_CAP_DEFAULT,
+        32,
+        8_192,
+    ));
 
     // target price 异步获取通道
-    let (target_req_tx, mut target_req_rx) = mpsc::unbounded_channel::<TargetFetchReq>();
-    let (target_res_tx, mut target_res_rx) = mpsc::unbounded_channel::<TargetFetchRes>();
+    let (target_req_tx, mut target_req_rx) = mpsc::channel::<TargetFetchReq>(ingest_queue_cap(
+        "FORGE_TARGET_REQ_QUEUE_CAP",
+        TARGET_QUEUE_CAP_DEFAULT,
+        64,
+        32_768,
+    ));
+    let (target_res_tx, mut target_res_rx) = mpsc::channel::<TargetFetchRes>(ingest_queue_cap(
+        "FORGE_TARGET_RES_QUEUE_CAP",
+        TARGET_QUEUE_CAP_DEFAULT,
+        64,
+        32_768,
+    ));
     let chainlink_enabled = chainlink_runtime_enabled();
 
     // 提取的后台任务，接收请求并串行执行 fallback
@@ -986,10 +1039,12 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                 }
             }
 
-            let _ = target_res_tx.send(TargetFetchRes {
-                cache_key: req.cache_key,
-                target_price: resolved_price,
-            });
+            let _ = target_res_tx
+                .send(TargetFetchRes {
+                    cache_key: req.cache_key,
+                    target_price: resolved_price,
+                })
+                .await;
         }
     });
 
@@ -1108,13 +1163,45 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         tokio::select! {
             Some(msg) = tokyo_rx.recv() => {
                 let now = Utc::now().timestamp_millis();
-                tokyo_by_symbol.insert(msg.symbol.clone(), TokyoBinanceLocal {
-                    ts_tokyo_recv_ms: msg.ts_tokyo_recv_ms,
-                    ts_tokyo_send_ms: msg.ts_tokyo_send_ms,
-                    ts_exchange_ms: msg.ts_exchange_ms,
-                    ts_ireland_recv_ms: now,
-                    binance_price: msg.binance_price,
-                });
+                let checksum_ok = msg.checksum.is_empty()
+                    || msg.checksum == compute_tokyo_wire_checksum(&msg);
+                if let Some(tx) = sink_tx.as_ref() {
+                    if let Err(err) = tx.send(DbEvent::RelayTick(Box::new(RelayTickRow {
+                        ts_ireland_recv_ms: now,
+                        symbol: msg.symbol.clone(),
+                        source: msg.source.clone(),
+                        relay_seq: msg.relay_seq,
+                        source_seq: msg.source_seq,
+                        ts_tokyo_recv_ms: msg.ts_tokyo_recv_ms,
+                        ts_tokyo_send_ms: msg.ts_tokyo_send_ms,
+                        ts_exchange_ms: msg.ts_exchange_ms,
+                        binance_price: msg.binance_price,
+                        checksum: msg.checksum.clone(),
+                        checksum_ok,
+                    }))).await {
+                        tracing::warn!(?err, "db sink closed while sending relay tick");
+                    }
+                }
+                let should_update = tokyo_by_symbol
+                    .get(&msg.symbol)
+                    .map(|prev| {
+                        msg.relay_seq >= prev.relay_seq
+                            || msg.ts_exchange_ms >= prev.ts_exchange_ms
+                    })
+                    .unwrap_or(true);
+                if should_update {
+                    tokyo_by_symbol.insert(msg.symbol.clone(), TokyoBinanceLocal {
+                        relay_seq: msg.relay_seq,
+                        source_seq: msg.source_seq,
+                        source: msg.source.clone(),
+                        ts_tokyo_recv_ms: msg.ts_tokyo_recv_ms,
+                        ts_tokyo_send_ms: msg.ts_tokyo_send_ms,
+                        ts_exchange_ms: msg.ts_exchange_ms,
+                        ts_ireland_recv_ms: now,
+                        binance_price: msg.binance_price,
+                        checksum_ok,
+                    });
+                }
             }
             Some(msg) = chainlink_rx.recv() => {
                 chainlink_by_symbol.insert(msg.symbol.clone(), msg);
@@ -1790,12 +1877,14 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                     );
                                 } else {
                                     // Offload target fetch to background worker to keep ticker non-blocking.
-                                    let _ = target_req_tx.send(TargetFetchReq {
-                                        cache_key: cache_key.clone(),
-                                        symbol: market.symbol.clone(),
-                                        timeframe: market.timeframe.clone(),
-                                        start_ts_ms: market.start_ts_ms,
-                                    });
+                                    let _ = target_req_tx
+                                        .send(TargetFetchReq {
+                                            cache_key: cache_key.clone(),
+                                            symbol: market.symbol.clone(),
+                                            timeframe: market.timeframe.clone(),
+                                            start_ts_ms: market.start_ts_ms,
+                                        })
+                                        .await;
                                     // Rate-limit follow-up fetches for the same key.
                                     target_retry_after_ms.insert(
                                         cache_key,
@@ -1804,12 +1893,14 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                                 }
                             } else {
                                 // Offload target fetch to background worker to keep ticker non-blocking.
-                                let _ = target_req_tx.send(TargetFetchReq {
-                                    cache_key: cache_key.clone(),
-                                    symbol: market.symbol.clone(),
-                                    timeframe: market.timeframe.clone(),
-                                    start_ts_ms: market.start_ts_ms,
-                                });
+                                let _ = target_req_tx
+                                    .send(TargetFetchReq {
+                                        cache_key: cache_key.clone(),
+                                        symbol: market.symbol.clone(),
+                                        timeframe: market.timeframe.clone(),
+                                        start_ts_ms: market.start_ts_ms,
+                                    })
+                                    .await;
                                 // Rate-limit follow-up fetches for the same key.
                                 target_retry_after_ms.insert(
                                     cache_key,
@@ -2026,6 +2117,10 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         ask_yes: stable_quote.ask_yes,
                         bid_no: stable_quote.bid_no,
                         ask_no: stable_quote.ask_no,
+                        bid_size_yes: stable_quote.bid_size_yes,
+                        ask_size_yes: stable_quote.ask_size_yes,
+                        bid_size_no: stable_quote.bid_size_no,
+                        ask_size_no: stable_quote.ask_size_no,
                         binance_price,
                         pm_live_btc_price: chainlink.map(|v| v.price),
                         ts_pm_live_exchange_ms: chainlink.map(|v| v.ts_exchange_ms),
@@ -2635,7 +2730,7 @@ pub async fn run_ireland_api(args: IrelandApiArgs) -> Result<()> {
 
 fn spawn_tokyo_udp_receiver(
     bind: String,
-    tx: mpsc::UnboundedSender<TokyoBinanceWire>,
+    tx: mpsc::Sender<TokyoBinanceWire>,
     persist: mpsc::UnboundedSender<PersistEvent>,
 ) {
     tokio::spawn(async move {
@@ -2659,8 +2754,11 @@ fn spawn_tokyo_udp_receiver(
         );
 
         let mut buf = vec![0_u8; 2048];
+        let mut contiguous_seq_by_symbol: HashMap<String, u64> = HashMap::new();
+        let mut buffered_seq_by_symbol: HashMap<String, BTreeSet<u64>> = HashMap::new();
+        let mut replay_request_at_ms: HashMap<String, i64> = HashMap::new();
         loop {
-            let (n, _peer) = match socket.recv_from(&mut buf).await {
+            let (n, peer) = match socket.recv_from(&mut buf).await {
                 Ok(v) => v,
                 Err(err) => {
                     log_ingest(
@@ -2684,7 +2782,80 @@ fn spawn_tokyo_udp_receiver(
                     continue;
                 }
             };
-            if tx.send(msg).is_err() {
+            if msg.packet_type != "tick" {
+                continue;
+            }
+            let checksum_ok =
+                msg.checksum.is_empty() || msg.checksum == compute_tokyo_wire_checksum(&msg);
+            if !checksum_ok {
+                log_ingest(
+                    &persist,
+                    "warn",
+                    "udp_receiver",
+                    &format!(
+                        "checksum mismatch symbol={} relay_seq={} source_seq={}",
+                        msg.symbol, msg.relay_seq, msg.source_seq
+                    ),
+                );
+                continue;
+            }
+            if let Err(err) = persist.send(PersistEvent::RelayTick(Box::new(RelayTickRow {
+                ts_ireland_recv_ms: Utc::now().timestamp_millis(),
+                symbol: msg.symbol.clone(),
+                source: msg.source.clone(),
+                relay_seq: msg.relay_seq,
+                source_seq: msg.source_seq,
+                ts_tokyo_recv_ms: msg.ts_tokyo_recv_ms,
+                ts_tokyo_send_ms: msg.ts_tokyo_send_ms,
+                ts_exchange_ms: msg.ts_exchange_ms,
+                binance_price: msg.binance_price,
+                checksum: msg.checksum.clone(),
+                checksum_ok,
+            }))) {
+                tracing::warn!(?err, "persist relay tick send failed");
+            }
+            if msg.relay_seq > 0 {
+                let symbol = msg.symbol.clone();
+                let contiguous = contiguous_seq_by_symbol.entry(symbol.clone()).or_insert(0);
+                let buffered = buffered_seq_by_symbol.entry(symbol.clone()).or_default();
+                if msg.relay_seq == contiguous.saturating_add(1) {
+                    *contiguous = msg.relay_seq;
+                    while buffered.remove(&contiguous.saturating_add(1)) {
+                        *contiguous = contiguous.saturating_add(1);
+                    }
+                } else if msg.relay_seq > contiguous.saturating_add(1) {
+                    buffered.insert(msg.relay_seq);
+                    let now_ms = Utc::now().timestamp_millis();
+                    let last_req_at = replay_request_at_ms.entry(symbol.clone()).or_insert(0);
+                    if now_ms.saturating_sub(*last_req_at) >= TOKYO_REPLAY_REQ_THROTTLE_MS {
+                        let req = TokyoReplayRequestWire {
+                            packet_type: "replay_request".to_string(),
+                            symbol: symbol.clone(),
+                            from_relay_seq: contiguous.saturating_add(1),
+                            to_relay_seq: msg.relay_seq.saturating_sub(1),
+                            requested_at_ms: now_ms,
+                        };
+                        if let Ok(payload) = serde_json::to_vec(&req) {
+                            if let Err(err) = socket.send_to(&payload, peer).await {
+                                log_ingest(
+                                    &persist,
+                                    "warn",
+                                    "udp_receiver",
+                                    &format!(
+                                        "replay request send failed symbol={} err={err}",
+                                        symbol
+                                    ),
+                                );
+                            } else {
+                                *last_req_at = now_ms;
+                            }
+                        }
+                    }
+                } else {
+                    continue;
+                }
+            }
+            if tx.send(msg).await.is_err() {
                 break;
             }
         }
@@ -2693,7 +2864,7 @@ fn spawn_tokyo_udp_receiver(
 
 fn spawn_chainlink_reader(
     symbols: Vec<String>,
-    tx: mpsc::UnboundedSender<ChainlinkLocal>,
+    tx: mpsc::Sender<ChainlinkLocal>,
     persist: mpsc::UnboundedSender<PersistEvent>,
 ) {
     tokio::spawn(async move {
@@ -2735,7 +2906,7 @@ fn spawn_chainlink_reader(
                     ts_ireland_recv_ms: Utc::now().timestamp_millis(),
                     price: tick.price,
                 };
-                if tx.send(msg).is_err() {
+                if tx.send(msg).await.is_err() {
                     return;
                 }
             }
@@ -2747,7 +2918,7 @@ fn spawn_chainlink_reader(
 fn spawn_book_reader(
     symbols: Vec<String>,
     timeframes: Vec<String>,
-    tx: mpsc::UnboundedSender<BookTop>,
+    tx: mpsc::Sender<BookTop>,
     persist: mpsc::UnboundedSender<PersistEvent>,
 ) {
     tokio::spawn(async move {
@@ -2793,7 +2964,7 @@ fn spawn_book_reader(
                     saw_book = true;
                     retry_wait = Duration::from_secs(1);
                 }
-                if tx.send(book).is_err() {
+                if tx.send(book).await.is_err() {
                     return;
                 }
             }
@@ -2818,7 +2989,7 @@ fn spawn_market_discovery_reader(
     symbols: Vec<String>,
     timeframes: Vec<String>,
     refresh_sec: u64,
-    tx: mpsc::UnboundedSender<Vec<MarketMeta>>,
+    tx: mpsc::Sender<Vec<MarketMeta>>,
     persist: mpsc::UnboundedSender<PersistEvent>,
 ) {
     fn has_near_upcoming_markets(
@@ -2871,7 +3042,7 @@ fn spawn_market_discovery_reader(
                         "discovery",
                         &format!("discovered {} active markets", markets.len()),
                     );
-                    if tx.send(markets.clone()).is_err() {
+                    if tx.send(markets.clone()).await.is_err() {
                         return;
                     }
                     last_markets = markets;
@@ -2904,7 +3075,7 @@ fn spawn_market_discovery_reader(
                                 fallback.len()
                             ),
                         );
-                        if tx.send(fallback.clone()).is_err() {
+                        if tx.send(fallback.clone()).await.is_err() {
                             return;
                         }
                         last_markets = fallback;
@@ -2939,7 +3110,7 @@ fn spawn_market_discovery_reader(
                                 last_markets.len()
                             ),
                         );
-                        if tx.send(last_markets.clone()).is_err() {
+                        if tx.send(last_markets.clone()).await.is_err() {
                             return;
                         }
                         tokio::time::sleep(Duration::from_secs(current_wait.max(1))).await;
@@ -3599,6 +3770,10 @@ mod tests {
             ask_yes: 0.51,
             bid_no: 0.49,
             ask_no: 0.51,
+            bid_size_yes: 10.0,
+            ask_size_yes: 10.0,
+            bid_size_no: 10.0,
+            ask_size_no: 10.0,
             binance_price: Some(100_100.0),
             pm_live_btc_price: None,
             ts_pm_live_exchange_ms: None,

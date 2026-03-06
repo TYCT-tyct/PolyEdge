@@ -30,6 +30,7 @@ Type=simple
 User=$USER_NAME
 WorkingDirectory=$REPO_DIR
 Environment=RUST_LOG=info,polyedge_forge=debug
+Environment=FORGE_TOKYO_REPLAY_CACHE_SIZE=65536
 ExecStart=$REPO_DIR/target/release/polyedge_forge tokyo-relay --symbols $TOKYO_SYMBOLS --bind 0.0.0.0:0 --ireland-udp $IRELAND_PRIVATE_UDP --redundancy 2
 Restart=always
 RestartSec=2

@@ -1976,6 +1976,11 @@ struct CollectorMetricsQueryParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct WsLiveQueryParams {
+    symbol: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RoundQueryParams {
     market_type: String,
     limit: Option<u32>,

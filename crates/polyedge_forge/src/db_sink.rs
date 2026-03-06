@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use crate::models::{RoundRow, SnapshotRow};
+use crate::models::{RelayTickRow, RoundRow, SnapshotRow};
 
 #[derive(Debug, Clone)]
 pub struct DbSinkConfig {
@@ -30,6 +30,7 @@ pub struct DbSinkConfig {
 #[derive(Debug, Clone)]
 pub enum DbEvent {
     Snapshot(Box<SnapshotRow>),
+    RelayTick(Box<RelayTickRow>),
     Round(RoundRow),
 }
 
@@ -182,6 +183,7 @@ pub async fn run_db_sink(cfg: DbSinkConfig, mut rx: mpsc::Receiver<DbEvent>) {
 
     let mut flush_tick = tokio::time::interval(Duration::from_millis(cfg.flush_ms.max(100)));
     let mut snapshot_batch = Vec::<SnapshotRow>::with_capacity(cfg.batch_size.saturating_mul(2));
+    let mut relay_tick_batch = Vec::<RelayTickRow>::with_capacity(cfg.batch_size.saturating_mul(2));
     let mut round_batch = Vec::<RoundRow>::with_capacity(cfg.batch_size.saturating_mul(2));
     let mut redis_state = RedisLatestState::default();
     let mut conn = redis_conn;
@@ -195,26 +197,30 @@ pub async fn run_db_sink(cfg: DbSinkConfig, mut rx: mpsc::Receiver<DbEvent>) {
                             snapshot_batch.push(clean);
                         }
                     }
+                    Some(DbEvent::RelayTick(row)) => {
+                        relay_tick_batch.push(*row);
+                    }
                     Some(DbEvent::Round(row)) => {
                         if sanitize_round_row(&row) {
                             round_batch.push(row);
                         }
                     }
                     None => {
-                        flush_batches(&cfg, &mut snapshot_batch, &mut round_batch, &mut redis_state, &mut conn).await;
+                        flush_batches(&cfg, &mut snapshot_batch, &mut relay_tick_batch, &mut round_batch, &mut redis_state, &mut conn).await;
                         break;
                     }
                 }
 
                 if snapshot_batch.len() >= cfg.batch_size.max(10)
+                    || relay_tick_batch.len() >= cfg.batch_size.max(10)
                     || round_batch.len() >= cfg.batch_size.max(10)
                 {
-                    flush_batches(&cfg, &mut snapshot_batch, &mut round_batch, &mut redis_state, &mut conn).await;
+                    flush_batches(&cfg, &mut snapshot_batch, &mut relay_tick_batch, &mut round_batch, &mut redis_state, &mut conn).await;
                 }
             }
             _ = flush_tick.tick() => {
-                if !snapshot_batch.is_empty() || !round_batch.is_empty() {
-                    flush_batches(&cfg, &mut snapshot_batch, &mut round_batch, &mut redis_state, &mut conn).await;
+                if !snapshot_batch.is_empty() || !relay_tick_batch.is_empty() || !round_batch.is_empty() {
+                    flush_batches(&cfg, &mut snapshot_batch, &mut relay_tick_batch, &mut round_batch, &mut redis_state, &mut conn).await;
                 }
             }
         }
@@ -232,21 +238,34 @@ fn redis_snapshot_ring_max() -> i64 {
 async fn flush_batches(
     cfg: &DbSinkConfig,
     snapshot_batch: &mut Vec<SnapshotRow>,
+    relay_tick_batch: &mut Vec<RelayTickRow>,
     round_batch: &mut Vec<RoundRow>,
     redis_state: &mut RedisLatestState,
     redis_conn: &mut Option<redis::aio::MultiplexedConnection>,
 ) {
-    if snapshot_batch.is_empty() && round_batch.is_empty() {
+    if snapshot_batch.is_empty() && relay_tick_batch.is_empty() && round_batch.is_empty() {
         return;
     }
 
     let mut snapshots = Vec::new();
     std::mem::swap(&mut snapshots, snapshot_batch);
 
+    let mut relay_ticks = Vec::new();
+    std::mem::swap(&mut relay_ticks, relay_tick_batch);
+
     let mut rounds = Vec::new();
     std::mem::swap(&mut rounds, round_batch);
 
     if let Some(ch_url) = cfg.clickhouse_url.as_deref() {
+        if !relay_ticks.is_empty() {
+            if let Err(err) = flush_clickhouse_relay_ticks(ch_url, cfg, &relay_ticks).await {
+                tracing::warn!(
+                    ?err,
+                    rows = relay_ticks.len(),
+                    "clickhouse relay tick flush failed"
+                );
+            }
+        }
         if !snapshots.is_empty() {
             if let Err(err) = flush_clickhouse_snapshots(ch_url, cfg, &snapshots).await {
                 tracing::warn!(
@@ -284,7 +303,11 @@ fn sanitize_snapshot_row(mut row: SnapshotRow) -> Option<SnapshotRow> {
         && row.bid_yes.is_finite()
         && row.ask_yes.is_finite()
         && row.bid_no.is_finite()
-        && row.ask_no.is_finite())
+        && row.ask_no.is_finite()
+        && row.bid_size_yes.is_finite()
+        && row.ask_size_yes.is_finite()
+        && row.bid_size_no.is_finite()
+        && row.ask_size_no.is_finite())
     {
         return None;
     }
@@ -334,6 +357,7 @@ async fn init_clickhouse(ch_url: &str, cfg: &DbSinkConfig) -> Result<()> {
     let snapshot_tbl = &cfg.clickhouse_snapshot_table;
     let processed_tbl = &cfg.clickhouse_processed_table;
     let round_tbl = &cfg.clickhouse_round_table;
+    let relay_tick_tbl = "relay_tick_raw";
     let snapshot_ttl_days = cfg.clickhouse_snapshot_ttl_days.max(1);
     let processed_ttl_days = cfg.clickhouse_processed_ttl_days.max(1);
     let round_ttl_days = cfg.clickhouse_round_ttl_days.max(1);
@@ -348,6 +372,10 @@ async fn init_clickhouse(ch_url: &str, cfg: &DbSinkConfig) -> Result<()> {
     let round_ttl_expr = format!(
         "fromUnixTimestamp64Milli(ts_recorded_ms) + INTERVAL {} DAY",
         round_ttl_days
+    );
+    let relay_tick_ttl_expr = format!(
+        "fromUnixTimestamp64Milli(ts_ireland_recv_ms) + INTERVAL {} DAY",
+        snapshot_ttl_days
     );
 
     execute_clickhouse_query(ch_url, &format!("CREATE DATABASE IF NOT EXISTS {}", db)).await?;
@@ -378,6 +406,10 @@ async fn init_clickhouse(ch_url: &str, cfg: &DbSinkConfig) -> Result<()> {
             ask_yes Float64,
             bid_no Float64,
             ask_no Float64,
+            bid_size_yes Float64,
+            ask_size_yes Float64,
+            bid_size_no Float64,
+            ask_size_no Float64,
             binance_price Nullable(Float64),
             pm_live_btc_price Nullable(Float64),
             ts_pm_live_exchange_ms Nullable(Int64),
@@ -438,6 +470,22 @@ async fn init_clickhouse(ch_url: &str, cfg: &DbSinkConfig) -> Result<()> {
         ),
         format!(
             "ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS delta_pct_smooth Nullable(Float64) AFTER delta_pct",
+            db, snapshot_tbl
+        ),
+        format!(
+            "ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS bid_size_yes Float64 DEFAULT 0.0 AFTER ask_no",
+            db, snapshot_tbl
+        ),
+        format!(
+            "ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS ask_size_yes Float64 DEFAULT 0.0 AFTER bid_size_yes",
+            db, snapshot_tbl
+        ),
+        format!(
+            "ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS bid_size_no Float64 DEFAULT 0.0 AFTER ask_size_yes",
+            db, snapshot_tbl
+        ),
+        format!(
+            "ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS ask_size_no Float64 DEFAULT 0.0 AFTER bid_size_no",
             db, snapshot_tbl
         ),
         format!(
@@ -527,6 +575,38 @@ async fn init_clickhouse(ch_url: &str, cfg: &DbSinkConfig) -> Result<()> {
     );
     execute_clickhouse_query(ch_url, &create_processed_mv).await?;
 
+    let create_relay_tick_tbl = format!(
+        "CREATE TABLE IF NOT EXISTS {}.{} (
+            ts_ireland_recv_ms Int64,
+            symbol LowCardinality(String),
+            source LowCardinality(String),
+            relay_seq UInt64,
+            source_seq UInt64,
+            ts_tokyo_recv_ms Int64,
+            ts_tokyo_send_ms Int64,
+            ts_exchange_ms Int64,
+            binance_price Float64,
+            checksum String,
+            checksum_ok UInt8,
+            ingested_at DateTime64(3, 'UTC') DEFAULT now64(3)
+        )
+        ENGINE = MergeTree
+        PARTITION BY toDate(fromUnixTimestamp64Milli(ts_ireland_recv_ms))
+        ORDER BY (symbol, relay_seq, ts_ireland_recv_ms)
+        TTL {} DELETE
+        SETTINGS index_granularity = 8192",
+        db, relay_tick_tbl, relay_tick_ttl_expr
+    );
+    execute_clickhouse_query(ch_url, &create_relay_tick_tbl).await?;
+    execute_clickhouse_query(
+        ch_url,
+        &format!(
+            "ALTER TABLE {}.{} MODIFY TTL {}",
+            db, relay_tick_tbl, relay_tick_ttl_expr
+        ),
+    )
+    .await?;
+
     let create_round_tbl = format!(
         "CREATE TABLE IF NOT EXISTS {}.{} (
             round_id String,
@@ -580,7 +660,11 @@ async fn flush_clickhouse_snapshots(
 
     let resp = reqwest::Client::new()
         .post(ch_url)
-        .query(&[("query", query.as_str())])
+        .query(&[
+            ("query", query.as_str()),
+            ("async_insert", "1"),
+            ("wait_for_async_insert", "1"),
+        ])
         .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
         .body(body.clone())
         .send()
@@ -599,7 +683,11 @@ async fn flush_clickhouse_snapshots(
         init_clickhouse(ch_url, cfg).await?;
         let resp2 = reqwest::Client::new()
             .post(ch_url)
-            .query(&[("query", query.as_str())])
+            .query(&[
+                ("query", query.as_str()),
+                ("async_insert", "1"),
+                ("wait_for_async_insert", "1"),
+            ])
             .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
             .body(body)
             .send()
@@ -713,7 +801,11 @@ async fn flush_clickhouse_rounds(
 
     let resp = reqwest::Client::new()
         .post(ch_url)
-        .query(&[("query", query.as_str())])
+        .query(&[
+            ("query", query.as_str()),
+            ("async_insert", "1"),
+            ("wait_for_async_insert", "1"),
+        ])
         .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
         .body(body.clone())
         .send()
@@ -732,7 +824,11 @@ async fn flush_clickhouse_rounds(
         init_clickhouse(ch_url, cfg).await?;
         let resp2 = reqwest::Client::new()
             .post(ch_url)
-            .query(&[("query", query.as_str())])
+            .query(&[
+                ("query", query.as_str()),
+                ("async_insert", "1"),
+                ("wait_for_async_insert", "1"),
+            ])
             .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
             .body(body)
             .send()
@@ -751,6 +847,49 @@ async fn flush_clickhouse_rounds(
 
     Err(anyhow!(
         "clickhouse insert failed status={} body={}",
+        status,
+        body_err
+    ))
+}
+
+async fn flush_clickhouse_relay_ticks(
+    ch_url: &str,
+    cfg: &DbSinkConfig,
+    rows: &[RelayTickRow],
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let db = &cfg.clickhouse_database;
+    let query = format!("INSERT INTO {}.relay_tick_raw FORMAT JSONEachRow", db);
+
+    let mut body = String::with_capacity(rows.len().saturating_mul(256));
+    for row in rows {
+        let line = serde_json::to_string(row)?;
+        body.push_str(&line);
+        body.push('\n');
+    }
+
+    let resp = reqwest::Client::new()
+        .post(ch_url)
+        .query(&[
+            ("query", query.as_str()),
+            ("async_insert", "1"),
+            ("wait_for_async_insert", "1"),
+        ])
+        .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
+        .body(body)
+        .send()
+        .await?;
+
+    if resp.status().is_success() {
+        return Ok(());
+    }
+
+    let status = resp.status();
+    let body_err = resp.text().await.unwrap_or_default();
+    Err(anyhow!(
+        "clickhouse relay tick insert failed status={} body={}",
         status,
         body_err
     ))

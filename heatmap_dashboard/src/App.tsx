@@ -1117,11 +1117,9 @@ export default function App() {
       return;
     }
     const disconnect = connectLiveWs(
+      selectedSymbol,
       (payload) => {
         if (document.visibilityState !== "visible") {
-          return;
-        }
-        if (selectedSymbolRef.current !== "BTCUSDT") {
           return;
         }
         lastWsTickMsRef.current = Date.now();
@@ -1131,7 +1129,7 @@ export default function App() {
       setWsStatus
     );
     return disconnect;
-  }, [isMarketView]);
+  }, [isMarketView, selectedSymbol]);
 
   useEffect(() => {
     if (!isMarketView) {

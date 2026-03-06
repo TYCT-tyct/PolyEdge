@@ -27,6 +27,7 @@ export interface LiveSnapshot {
 }
 
 export interface WsLivePayload {
+  symbol?: string;
   "5m": LiveSnapshot | null;
   "15m": LiveSnapshot | null;
 }
@@ -103,6 +104,7 @@ export interface CollectorWindowMetrics {
 
 export interface CollectorStatusResponse {
   ok: boolean;
+  symbol?: string;
   ts_ms: number;
   timeframes: {
     "5m": CollectorTimeframeStatus;

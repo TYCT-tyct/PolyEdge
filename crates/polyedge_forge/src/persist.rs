@@ -22,6 +22,15 @@ pub fn persist_event(root: &Path, ev: PersistEvent) -> Result<()> {
             let path = dir.join(format!("hour={hour:02}.jsonl"));
             append_jsonl(&path, row.as_ref())?;
         }
+        PersistEvent::RelayTick(row) => {
+            let (date, hour) = ts_to_date_hour(row.ts_ireland_recv_ms)?;
+            let dir = root
+                .join("relay_tick_raw")
+                .join(format!("dt={date}"))
+                .join(format!("symbol={}", row.symbol));
+            let path = dir.join(format!("hour={hour:02}.jsonl"));
+            append_jsonl(&path, row.as_ref())?;
+        }
         PersistEvent::Round(row) => {
             let (date, _hour) = ts_to_date_hour(row.ts_recorded_ms)?;
             let dir = root
