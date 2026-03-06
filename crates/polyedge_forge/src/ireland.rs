@@ -1283,28 +1283,29 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
             }
             Some(book) = book_rx.recv() => {
                 if let Some(bronze_tx) = bronze_tx.as_ref() {
-                    let market_meta = markets_by_id.get(&book.market_id);
-                    bronze_try_send(
-                        bronze_tx,
-                        BronzePersistEvent::BookTop(Box::new(BronzeBookTopRow {
-                            ts_recorded_ms: Utc::now().timestamp_millis(),
-                            market_id: book.market_id.clone(),
-                            symbol: market_meta.map(|m| m.symbol.clone()).unwrap_or_default(),
-                            timeframe: market_meta.map(|m| m.timeframe.clone()).unwrap_or_default(),
-                            title: market_meta.map(|m| m.title.clone()).unwrap_or_default(),
-                            bid_yes: book.bid_yes,
-                            ask_yes: book.ask_yes,
-                            bid_no: book.bid_no,
-                            ask_no: book.ask_no,
-                            bid_size_yes: book.bid_size_yes,
-                            ask_size_yes: book.ask_size_yes,
-                            bid_size_no: book.bid_size_no,
-                            ask_size_no: book.ask_size_no,
-                            ts_exchange_ms: book.ts_ms,
-                            recv_ts_local_ns: book.recv_ts_local_ns,
-                        })),
-                        "bronze_book_top",
-                    );
+                    if let Some(market_meta) = markets_by_id.get(&book.market_id) {
+                        bronze_try_send(
+                            bronze_tx,
+                            BronzePersistEvent::BookTop(Box::new(BronzeBookTopRow {
+                                ts_recorded_ms: Utc::now().timestamp_millis(),
+                                market_id: book.market_id.clone(),
+                                symbol: market_meta.symbol.clone(),
+                                timeframe: market_meta.timeframe.clone(),
+                                title: market_meta.title.clone(),
+                                bid_yes: book.bid_yes,
+                                ask_yes: book.ask_yes,
+                                bid_no: book.bid_no,
+                                ask_no: book.ask_no,
+                                bid_size_yes: book.bid_size_yes,
+                                ask_size_yes: book.ask_size_yes,
+                                bid_size_no: book.bid_size_no,
+                                ask_size_no: book.ask_size_no,
+                                ts_exchange_ms: book.ts_ms,
+                                recv_ts_local_ns: book.recv_ts_local_ns,
+                            })),
+                            "bronze_book_top",
+                        );
+                    }
                 }
                 book_by_market.insert(book.market_id.clone(), book);
             }
