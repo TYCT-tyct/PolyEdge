@@ -174,10 +174,9 @@ def main() -> int:
             "net_pnl_series": [],
             "raw_signal_series": [],
             "candidate_series": [],
-            "profit_selected_series": [],
+            "parity_ready_series": [],
             "state_selected_series": [],
             "target_ready_series": [],
-            "profit_skipped_series": [],
             "state_skipped_series": [],
             "skip_reason_counter": collections.Counter(),
             "gap_abs_values": [],
@@ -281,9 +280,9 @@ def main() -> int:
                     or gated.get("candidate_count")
                     or safe_len(decisions)
                 )
-                profit_selected_count = int(
-                    shadow_eval.get("profit_selected_count")
-                    or gated.get("profit_selected_count")
+                parity_ready_count = int(
+                    shadow_eval.get("state_selected_count")
+                    or gated.get("selected_count")
                     or 0
                 )
                 state_selected_count = int(
@@ -295,11 +294,6 @@ def main() -> int:
                     shadow_eval.get("target_ready")
                     if "target_ready" in shadow_eval
                     else gated.get("target_ready")
-                )
-                profit_skipped_count = int(
-                    shadow_eval.get("profit_skipped_count")
-                    or gated.get("profit_skipped_count")
-                    or 0
                 )
                 state_skipped_count = int(
                     shadow_eval.get("state_skipped_count")
@@ -322,10 +316,9 @@ def main() -> int:
                 st["net_pnl_series"].append(float(summary.get("net_pnl_cents") or 0.0))
                 st["raw_signal_series"].append(raw_signal_count)
                 st["candidate_series"].append(candidate_count)
-                st["profit_selected_series"].append(profit_selected_count)
+                st["parity_ready_series"].append(parity_ready_count)
                 st["state_selected_series"].append(state_selected_count)
                 st["target_ready_series"].append(state_selected_count if target_ready else 0)
-                st["profit_skipped_series"].append(profit_skipped_count)
                 st["state_skipped_series"].append(state_skipped_count)
                 if target_missing:
                     st["target_missing_count"] += 1
@@ -358,10 +351,9 @@ def main() -> int:
                                 "net_pnl_cents": summary.get("net_pnl_cents"),
                                 "raw_signal_count": raw_signal_count,
                                 "candidate_count": candidate_count,
-                                "profit_selected_count": profit_selected_count,
+                                "parity_ready_count": parity_ready_count,
                                 "state_selected_count": state_selected_count,
                                 "target_ready": target_ready,
-                                "profit_skipped_count": profit_skipped_count,
                                 "state_skipped_count": state_skipped_count,
                                 "target_missing": target_missing,
                                 "current": current,
@@ -388,7 +380,7 @@ def main() -> int:
 
     for symbol, st in symbol_state.items():
         candidate_total = sum(st["candidate_series"])
-        profit_selected_total = sum(st["profit_selected_series"])
+        parity_ready_total = sum(st["parity_ready_series"])
         state_selected_total = sum(st["state_selected_series"])
         target_ready_total = sum(st["target_ready_series"])
         raw_signal_total = sum(st["raw_signal_series"])
@@ -410,14 +402,13 @@ def main() -> int:
             "shadow_coverage": {
                 "raw_signal_sum": raw_signal_total,
                 "candidate_sum": candidate_total,
-                "profit_selected_sum": profit_selected_total,
+                "parity_ready_sum": parity_ready_total,
                 "state_selected_sum": state_selected_total,
                 "target_ready_sum": target_ready_total,
                 "candidate_vs_signal": round(candidate_total / raw_signal_total, 4) if raw_signal_total else None,
-                "profit_vs_candidate": round(profit_selected_total / candidate_total, 4) if candidate_total else None,
-                "state_vs_profit": round(state_selected_total / profit_selected_total, 4) if profit_selected_total else None,
+                "parity_vs_candidate": round(parity_ready_total / candidate_total, 4) if candidate_total else None,
+                "state_vs_parity": round(state_selected_total / parity_ready_total, 4) if parity_ready_total else None,
                 "target_vs_state": round(target_ready_total / state_selected_total, 4) if state_selected_total else None,
-                "profit_skipped_sum": sum(st["profit_skipped_series"]),
                 "state_skipped_sum": sum(st["state_skipped_series"]),
                 "target_missing_count": st["target_missing_count"],
             },

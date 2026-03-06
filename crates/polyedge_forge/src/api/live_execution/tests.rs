@@ -258,16 +258,13 @@
     }
 
     #[test]
-    fn profit_budget_recheck_blocks_entry_when_fresh_price_consumes_edge() {
+    fn price_parity_band_blocks_entry_when_fresh_price_exceeds_paper_band() {
         let decision = json!({
             "action": "enter",
             "side": "UP",
             "price_cents": 50.0,
             "quote_size_usdc": 5.0,
-            "__profit_budget": {
-                "estimated_net_edge_cents": 2.0,
-                "required_net_edge_cents": 1.5
-            }
+            "max_slippage_bps": 20.0
         });
         let book = GatewayBookSnapshot {
             token_id: "yes".to_string(),
@@ -287,8 +284,8 @@
             Some(&book),
             None,
         )
-        .expect_err("fresh repricing should reject exhausted edge");
-        assert_eq!(err, "live_profit_budget_exhausted");
+        .expect_err("fresh repricing should reject parity exhaustion");
+        assert_eq!(err, "live_price_parity_band_exhausted");
     }
 
     #[test]

@@ -1,24 +1,3 @@
-fn live_profit_recheck_enabled() -> bool {
-    std::env::var("FORGE_FEV1_LIVE_PROFIT_RECHECK_ENABLED")
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(true)
-}
-
-fn live_extreme_spread_cents() -> f64 {
-    std::env::var("FORGE_FEV1_LIVE_EXTREME_SPREAD_CENTS")
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .unwrap_or(6.0)
-        .clamp(1.0, 25.0)
-}
-
-fn profit_budget_meta(decision: &Value) -> Option<&serde_json::Map<String, Value>> {
-    decision
-        .get("__profit_budget")
-        .and_then(Value::as_object)
-}
-
 fn decision_signal_price_cents(decision: &Value) -> Option<f64> {
     decision
         .get("price_cents")
@@ -26,24 +5,19 @@ fn decision_signal_price_cents(decision: &Value) -> Option<f64> {
         .filter(|v| v.is_finite() && *v > 0.0)
 }
 
-fn adverse_price_delta_total_cents(signal_price_cents: f64, submit_price_cents: f64, size: f64) -> f64 {
-    if !signal_price_cents.is_finite() || !submit_price_cents.is_finite() || !size.is_finite() {
-        return f64::INFINITY;
+fn allowed_price_band_cents(signal_price_cents: f64, slippage_bps: f64, tick_size: f64) -> f64 {
+    let signal = signal_price_cents.max(0.0);
+    let bps_band = signal * slippage_bps.max(0.0) / 10_000.0;
+    let tick_band = (tick_size.max(0.0001) * 100.0).max(0.01);
+    (bps_band + tick_band).max(tick_band)
+}
+
+fn price_parity_delta_cents(signal_price_cents: f64, submit_price_cents: f64, is_buy: bool) -> f64 {
+    if is_buy {
+        (submit_price_cents - signal_price_cents).max(0.0)
+    } else {
+        (signal_price_cents - submit_price_cents).max(0.0)
     }
-    ((submit_price_cents - signal_price_cents).max(0.0) * size.max(0.0)).max(0.0)
-}
-
-fn required_profit_floor_cents(meta: Option<&serde_json::Map<String, Value>>) -> f64 {
-    meta.and_then(|m| m.get("required_net_edge_cents"))
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0)
-        .max(0.0)
-}
-
-fn estimated_net_edge_cents(meta: Option<&serde_json::Map<String, Value>>) -> Option<f64> {
-    meta.and_then(|m| m.get("estimated_net_edge_cents"))
-        .and_then(Value::as_f64)
-        .filter(|v| v.is_finite())
 }
 
 pub(super) fn try_decision_to_live_payload(
@@ -134,22 +108,6 @@ pub(super) fn try_decision_to_live_payload(
             });
         }
         size = forced_size_shares.unwrap_or_else(|| (quote_size / price).max(size_floor));
-        if let (Some(best_bid), Some(best_ask)) = (book.best_bid, book.best_ask) {
-            if best_bid.is_finite() && best_ask.is_finite() && best_bid > 0.0 && best_ask > 0.0 {
-                let spread_cents = ((best_ask - best_bid) * 100.0).max(0.0);
-                if spread_cents > live_extreme_spread_cents() {
-                    return Err("live_book_spread_extreme".to_string());
-                }
-            }
-        }
-        let depth_top3 = if is_buy {
-            book.ask_depth_top3.unwrap_or(0.0)
-        } else {
-            book.bid_depth_top3.unwrap_or(0.0)
-        };
-        if depth_top3.is_finite() && depth_top3 > 0.0 && size > depth_top3 * 1.5 {
-            return Err("live_book_depth_extreme".to_string());
-        }
     }
     size = round_lot_size(size.max(size_floor));
     let ttl_ms = decision
@@ -180,17 +138,11 @@ pub(super) fn try_decision_to_live_payload(
     let taker_like = style == "taker" || matches!(tif.as_str(), "FAK" | "FOK");
     let signal_price_cents = decision_signal_price_cents(decision).unwrap_or(price * 100.0);
     let submit_price_cents = (price * 100.0).clamp(0.0, 100.0);
-    let profit_meta = profit_budget_meta(decision);
-    let extra_cost_budget_cents = estimated_net_edge_cents(profit_meta)
-        .map(|est| (est - required_profit_floor_cents(profit_meta)).max(0.0));
-    let adverse_extra_cost_cents =
-        adverse_price_delta_total_cents(signal_price_cents, submit_price_cents, size);
-    if !is_exit_like && live_profit_recheck_enabled() {
-        if let Some(budget) = extra_cost_budget_cents {
-            if adverse_extra_cost_cents > budget + 1e-9 {
-                return Err("live_profit_budget_exhausted".to_string());
-            }
-        }
+    let tick_size = book.map(|b| b.tick_size).unwrap_or(0.01);
+    let parity_band_cents = allowed_price_band_cents(signal_price_cents, slippage_bps, tick_size);
+    let parity_delta_cents = price_parity_delta_cents(signal_price_cents, submit_price_cents, is_buy);
+    if parity_delta_cents > parity_band_cents + 1e-9 {
+        return Err("live_price_parity_band_exhausted".to_string());
     }
     let floor_notional_usdc = quantize_usdc_micros((size * price).max(0.0));
     let requested_notional_usdc =
@@ -227,13 +179,14 @@ pub(super) fn try_decision_to_live_payload(
         "cache_key": cache_key,
         "action": action,
         "signal_side": side,
-        "profit_budget": {
+        "price_parity": {
             "signal_price_cents": signal_price_cents,
             "submit_price_cents": submit_price_cents,
-            "adverse_extra_cost_cents": adverse_extra_cost_cents,
-            "available_extra_cost_cents": extra_cost_budget_cents,
-            "required_net_edge_cents": required_profit_floor_cents(profit_meta),
-            "estimated_net_edge_cents": estimated_net_edge_cents(profit_meta)
+            "max_slippage_bps": slippage_bps,
+            "tick_size": tick_size,
+            "allowed_band_cents": parity_band_cents,
+            "parity_delta_cents": parity_delta_cents,
+            "within_band": true
         },
         "book_meta": if let Some(book) = book {
             json!({
@@ -555,7 +508,7 @@ pub(super) fn build_execution_price_trace(
 ) -> Value {
     let signal_price_cents = decision.get("price_cents").and_then(Value::as_f64);
     let book_price_cents = request
-        .get("profit_budget")
+        .get("price_parity")
         .and_then(|v| v.get("submit_price_cents"))
         .and_then(Value::as_f64);
     let submit_price_cents = request
@@ -587,7 +540,7 @@ pub(super) fn build_execution_price_trace(
         "fill_price_cents": Value::Null,
         "signal_vs_submit_cents": signal_vs_submit_cents,
         "signal_vs_accepted_cents": signal_vs_accepted_cents,
-        "profit_budget": request.get("profit_budget").cloned().unwrap_or(Value::Null),
+        "price_parity": request.get("price_parity").cloned().unwrap_or(Value::Null),
     })
 }
 

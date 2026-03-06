@@ -68,7 +68,7 @@ def main() -> int:
     last_event_seq = None
     signal_decision_count_series: list[int] = []
     candidate_count_series: list[int] = []
-    profit_selected_count_series: list[int] = []
+    parity_ready_count_series: list[int] = []
     state_selected_count_series: list[int] = []
     submitted_count_series: list[int] = []
     skipped_count_series: list[int] = []
@@ -139,16 +139,6 @@ def main() -> int:
                 or gated.get("candidate_count")
                 or (((parity_check.get("paper") or {}).get("decision_count")) or 0)
             )
-            profit_selected_count = int(
-                shadow_eval.get("profit_selected_count")
-                or gated.get("profit_selected_count")
-                or 0
-            )
-            profit_skipped_count = int(
-                shadow_eval.get("profit_skipped_count")
-                or gated.get("profit_skipped_count")
-                or 0
-            )
             state_skipped_count = int(
                 shadow_eval.get("state_skipped_count")
                 or gated.get("state_skipped_count")
@@ -159,6 +149,7 @@ def main() -> int:
                 or gated.get("selected_count")
                 or 0
             )
+            parity_ready_count = gated_selected_count
             submitted_count = int(gated.get("submitted_count") or 0)
             skipped_count = int(gated.get("skipped_count") or 0)
             target_ready = bool(
@@ -176,7 +167,7 @@ def main() -> int:
 
             signal_decision_count_series.append(int(signal_decision_count))
             candidate_count_series.append(int(candidate_count))
-            profit_selected_count_series.append(profit_selected_count)
+            parity_ready_count_series.append(parity_ready_count)
             state_selected_count_series.append(gated_selected_count)
             submitted_count_series.append(submitted_count)
             skipped_count_series.append(skipped_count)
@@ -236,8 +227,7 @@ def main() -> int:
                 "signal_decision_count": signal_decision_count,
                 "candidate_count": candidate_count,
                 "gated_selected_count": gated_selected_count,
-                "profit_selected_count": profit_selected_count,
-                "profit_skipped_count": profit_skipped_count,
+                "parity_ready_count": parity_ready_count,
                 "state_skipped_count": state_skipped_count,
                 "submitted_count": submitted_count,
                 "skipped_count": skipped_count,
@@ -265,7 +255,7 @@ def main() -> int:
 
     signal_decision_total = sum(signal_decision_count_series)
     candidate_total = sum(candidate_count_series)
-    profit_selected_total = sum(profit_selected_count_series)
+    parity_ready_total = sum(parity_ready_count_series)
     state_selected_total = sum(state_selected_count_series)
     submitted_total = sum(submitted_count_series)
     skipped_total = sum(skipped_count_series)
@@ -291,17 +281,17 @@ def main() -> int:
             "avg": avg(candidate_count_series),
             "sum": candidate_total,
         },
-        "profit_selected_count": {
-            "avg": avg(profit_selected_count_series),
-            "sum": profit_selected_total,
-            "coverage_vs_candidate": ratio(profit_selected_total, candidate_total),
-            "coverage_vs_signal": ratio(profit_selected_total, signal_decision_total),
+        "parity_ready_count": {
+            "avg": avg(parity_ready_count_series),
+            "sum": parity_ready_total,
+            "coverage_vs_candidate": ratio(parity_ready_total, candidate_total),
+            "coverage_vs_signal": ratio(parity_ready_total, signal_decision_total),
         },
         "gated_selected_count": {
             "avg": avg(state_selected_count_series),
             "sum": state_selected_total,
             "coverage_vs_candidate": ratio(state_selected_total, candidate_total),
-            "coverage_vs_profit_selected": ratio(state_selected_total, profit_selected_total),
+            "coverage_vs_parity_ready": ratio(state_selected_total, parity_ready_total),
             "coverage_vs_signal": ratio(state_selected_total, signal_decision_total),
         },
         "target_ready_count": {
