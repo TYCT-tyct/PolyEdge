@@ -436,7 +436,7 @@ function parseRoundStartMs(roundId: string | null | undefined): number | null {
   return tail;
 }
 
-function summarizeGaps(points: ChartPoint[]): { count: number; maxGapMs: number } {
+function summarizeGaps(points: ChartPoint[], step = 1): { count: number; maxGapMs: number } {
   if (points.length < 2) {
     return { count: 0, maxGapMs: 0 };
   }
@@ -455,9 +455,9 @@ function summarizeGaps(points: ChartPoint[]): { count: number; maxGapMs: number 
   if (diffs.length === 0) {
     return { count: 0, maxGapMs: 0 };
   }
-  const sorted = [...diffs].sort((a, b) => a - b);
-  const median = sorted[Math.floor(sorted.length / 2)] ?? 100;
-  const threshold = Math.max(3000, Math.min(120_000, median * 8));
+  const effectiveStep = Math.max(1, step);
+  const expectedMs = effectiveStep * 100;
+  const threshold = Math.max(2_500, Math.min(120_000, expectedMs * 12));
   let count = 0;
   let maxGapMs = 0;
   for (const d of diffs) {
@@ -530,7 +530,10 @@ function MarketSection({
   chart,
   loading
 }: MarketSectionProps) {
-  const gapInfo = useMemo(() => summarizeGaps(chart?.points ?? []), [chart?.points]);
+  const gapInfo = useMemo(
+    () => summarizeGaps(chart?.points ?? [], chart?.step ?? 1),
+    [chart?.points, chart?.step]
+  );
   const up = displayUpProb(live);
   const down = displayDownProb(live);
 
