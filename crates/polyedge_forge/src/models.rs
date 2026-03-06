@@ -200,9 +200,7 @@ pub fn compute_tokyo_wire_checksum(wire: &TokyoBinanceWire) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        compute_tokyo_wire_checksum, tokyo_packet_type_tick, TokyoBinanceWire,
-    };
+    use super::{compute_tokyo_wire_checksum, tokyo_packet_type_tick, TokyoBinanceWire};
 
     fn sample_wire() -> TokyoBinanceWire {
         TokyoBinanceWire {
