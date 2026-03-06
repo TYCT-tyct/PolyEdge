@@ -1,5 +1,5 @@
-const SEARCH_ENGINE_VERSION: &str = "forge_fev1_search_v3";
-const SEARCH_OBJECTIVE_VERSION: &str = "comprehensive_frontier_v3";
+const SEARCH_ENGINE_VERSION: &str = "forge_fev1_search_v4";
+const SEARCH_OBJECTIVE_VERSION: &str = "profit_discovery_review_v4";
 const SEARCH_WALK_FORWARD_MAX_FOLDS: usize = 5;
 const SEARCH_WALK_FORWARD_MIN_ROUNDS_PER_FOLD: usize = 2;
 const SEARCH_WALK_FORWARD_MIN_SAMPLES_PER_FOLD: usize = 120;
@@ -1019,19 +1019,14 @@ fn payload_objective(payload: &Value) -> f64 {
         .unwrap_or(f64::NEG_INFINITY)
 }
 
-fn sort_leaderboard(leaderboard: &mut Vec<Value>, limit: usize, incumbent: &Value) {
+fn sort_leaderboard(leaderboard: &mut Vec<Value>, limit: usize) {
     leaderboard.sort_by(|a, b| {
-        let ai = candidate_beats_incumbent_balanced(a, incumbent);
-        let bi = candidate_beats_incumbent_balanced(b, incumbent);
         let ae = payload_is_positive_eligible(a);
         let be = payload_is_positive_eligible(b);
-        match bi.cmp(&ai) {
-            std::cmp::Ordering::Equal => match be.cmp(&ae) {
-                std::cmp::Ordering::Equal => payload_selection_score(b, "balanced")
-                    .partial_cmp(&payload_selection_score(a, "balanced"))
-                    .unwrap_or(std::cmp::Ordering::Equal),
-                other => other,
-            },
+        match be.cmp(&ae) {
+            std::cmp::Ordering::Equal => payload_selection_score(b, "profit")
+                .partial_cmp(&payload_selection_score(a, "profit"))
+                .unwrap_or(std::cmp::Ordering::Equal),
             other => other,
         }
     });
@@ -1452,7 +1447,7 @@ pub(super) async fn strategy_optimize(
                 *reached_target = true;
             }
             leaderboard.push(payload);
-            sort_leaderboard(leaderboard, budget.leaderboard_size, &incumbent_payload);
+            sort_leaderboard(leaderboard, budget.leaderboard_size);
         };
 
     for (name, cfg) in seed_pool {
@@ -1574,7 +1569,7 @@ pub(super) async fn strategy_optimize(
         if leaderboard.is_empty() {
             break;
         }
-        let parent = if best_improved_payload.is_null() {
+        let parent = if best_profit_payload.is_null() {
             incumbent_cfg.unwrap_or(base_cfg)
         } else {
             let idx = ((lcg_next(&mut seed) * leaderboard.len() as f64).floor() as usize)
@@ -1601,19 +1596,21 @@ pub(super) async fn strategy_optimize(
         );
     }
 
-    let best_discovered_payload = if !best_balanced_payload.is_null() {
-        best_balanced_payload.clone()
+    let best_discovered_payload = if !best_profit_payload.is_null() {
+        best_profit_payload.clone()
     } else {
         incumbent_payload.clone()
     };
-    let best_payload = if !best_improved_payload.is_null() {
+    let reviewed_payload = if !best_improved_payload.is_null() {
         best_improved_payload.clone()
     } else {
         incumbent_payload.clone()
     };
-    let positive_candidate_found = !best_balanced_payload.is_null();
-    let selected_beats_incumbent = candidate_beats_incumbent_balanced(&best_payload, &incumbent_payload);
-    let selected_improvement = selection_improvement(&best_payload, &incumbent_payload);
+    let best_payload = best_discovered_payload.clone();
+    let positive_candidate_found = !best_profit_payload.is_null();
+    let reviewed_beats_incumbent =
+        candidate_beats_incumbent_balanced(&reviewed_payload, &incumbent_payload);
+    let reviewed_improvement = selection_improvement(&reviewed_payload, &incumbent_payload);
 
     let persist_requested = params.persist_best.unwrap_or(true);
     let persist_ttl_sec = params.persist_ttl_sec.filter(|v| *v > 0);
@@ -1629,7 +1626,7 @@ pub(super) async fn strategy_optimize(
     let promote_min_pnl = params.promote_min_pnl.unwrap_or(0.0);
 
     let (should_promote, promotion_reason) = should_promote_candidate(
-        &best_payload,
+        &reviewed_payload,
         &incumbent_payload,
         true,
         promote_min_trades,
@@ -1661,13 +1658,14 @@ pub(super) async fn strategy_optimize(
                 "seed": seed,
                 "budget": budget,
                 "positive_candidate_found": positive_candidate_found,
-                "selected_beats_incumbent": selected_beats_incumbent,
+                "reviewed_beats_incumbent": reviewed_beats_incumbent,
                 "config": best_payload.get("config").cloned().unwrap_or(Value::Null),
                 "best": best_payload.clone(),
                 "best_discovered": best_discovered_payload.clone(),
                 "best_profit": best_profit_payload.clone(),
                 "best_robust": best_robust_payload.clone(),
                 "best_balanced": best_balanced_payload.clone(),
+                "best_reviewed": reviewed_payload.clone(),
                 "leaderboard_top": leaderboard.iter().take(5).cloned().collect::<Vec<Value>>(),
             });
             if let Err(e) = write_key_value(&state, &persist_key, &save_doc, persist_ttl_sec).await
@@ -1690,10 +1688,11 @@ pub(super) async fn strategy_optimize(
                         "baseline_profile": baseline_profile,
                         "target_win_rate_pct": target_win_rate,
                         "window_trades": window_trades,
-                        "selected_beats_incumbent": selected_beats_incumbent,
-                        "config": best_payload.get("config").cloned().unwrap_or(Value::Null),
-                        "best": best_payload.clone(),
+                        "reviewed_beats_incumbent": reviewed_beats_incumbent,
+                        "config": reviewed_payload.get("config").cloned().unwrap_or(Value::Null),
+                        "best": reviewed_payload.clone(),
                         "best_discovered": best_discovered_payload.clone(),
+                        "best_reviewed": reviewed_payload.clone(),
                         "incumbent": incumbent_payload.clone(),
                     });
                     if let Err(e) =
@@ -1770,9 +1769,10 @@ pub(super) async fn strategy_optimize(
         "target_reached": reached_target,
         "leaderboard_names": candidate_names(&leaderboard),
         "selection": {
-            "selected_beats_incumbent": selected_beats_incumbent,
-            "selected_improvement": selected_improvement,
-            "selected_source": if selected_beats_incumbent { "best_improved_balanced" } else { "hold_current_reference" },
+            "discovery_source": "best_profit",
+            "reviewed_beats_incumbent": reviewed_beats_incumbent,
+            "reviewed_improvement": reviewed_improvement,
+            "reviewed_source": if reviewed_beats_incumbent { "best_reviewed_upgrade" } else { "hold_current_reference" },
         },
         "walk_forward": {
             "fold_count": walk_forward_folds.len(),
@@ -1796,7 +1796,7 @@ pub(super) async fn strategy_optimize(
             "active_history_key": active_history_key,
             "active_before_found": active_before_opt.is_some(),
             "active_saved": active_saved_doc,
-            "candidate_metrics": payload_metrics(&best_payload),
+            "candidate_metrics": payload_metrics(&reviewed_payload),
             "incumbent_metrics": payload_metrics(&incumbent_payload),
         },
         "best": best_payload,
@@ -1804,6 +1804,7 @@ pub(super) async fn strategy_optimize(
         "best_profit": best_profit_payload,
         "best_robust": best_robust_payload,
         "best_balanced": best_balanced_payload,
+        "best_reviewed": reviewed_payload,
         "incumbent": incumbent_payload,
         "leaderboard": leaderboard,
     })))
