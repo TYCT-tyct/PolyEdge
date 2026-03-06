@@ -188,6 +188,7 @@ impl PolymarketFeed {
                 market.market_id.clone(),
                 MarketState {
                     market_id: market.market_id,
+                    symbol: market.symbol.to_ascii_uppercase(),
                     timeframe: market.timeframe,
                     yes_token: yes,
                     no_token: no,
@@ -611,12 +612,15 @@ fn market_state_recency_ms(state: &MarketState) -> i64 {
 }
 
 fn market_state_timeframe_key(state: &MarketState) -> String {
-    state
-        .timeframe
-        .as_deref()
-        .unwrap_or("unknown")
-        .trim()
-        .to_ascii_lowercase()
+    format!(
+        "{}|{}",
+        state.symbol.trim().to_ascii_uppercase(),
+        state.timeframe
+            .as_deref()
+            .unwrap_or("unknown")
+            .trim()
+            .to_ascii_lowercase()
+    )
 }
 
 fn target_market_cache_max_per_timeframe() -> usize {
@@ -1436,6 +1440,7 @@ struct AssetTop {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MarketState {
     market_id: String,
+    symbol: String,
     #[serde(default)]
     timeframe: Option<String>,
     yes_token: String,
@@ -1545,6 +1550,7 @@ mod tests {
     fn mk_state(market_id: &str, timeframe: &str, ts_ms: i64) -> MarketState {
         MarketState {
             market_id: market_id.to_string(),
+            symbol: "BTCUSDT".to_string(),
             timeframe: Some(timeframe.to_string()),
             yes_token: format!("{market_id}-yes"),
             no_token: format!("{market_id}-no"),
