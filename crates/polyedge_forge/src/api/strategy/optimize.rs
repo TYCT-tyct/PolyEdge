@@ -106,6 +106,7 @@ fn build_strategy_arms(
     if let Some(cfg) = incumbent {
         pool.push(("active_incumbent".to_string(), cfg));
     }
+    let anchor = incumbent.unwrap_or(base);
     pool.push(("profile_profit_max".to_string(), strategy_profit_max_config()));
     pool.push(("profile_hi_freq".to_string(), strategy_hi_freq_config()));
     pool.push(("profile_hi_win".to_string(), strategy_hi_win_config()));
@@ -140,6 +141,54 @@ fn build_strategy_arms(
     both_off.vic_edge_relax_max = 0.0;
     both_off.vic_spread_relax_max = 0.0;
     pool.push(("baseline_noise_vic_off".to_string(), both_off));
+
+    let mut anchor_net_plus = anchor;
+    anchor_net_plus.entry_threshold_base -= 0.020;
+    anchor_net_plus.entry_threshold_cap -= 0.018;
+    anchor_net_plus.entry_edge_prob -= 0.004;
+    anchor_net_plus.entry_min_potential_cents += 1.2;
+    anchor_net_plus.cooldown_ms -= 1200;
+    anchor_net_plus.max_entries_per_round += 1;
+    anchor_net_plus.max_exec_spread_cents += 0.18;
+    anchor_net_plus.trail_activate_profit_cents += 1.0;
+    pool.push(("anchor_net_plus".to_string(), anchor_net_plus));
+
+    let mut anchor_mean_plus = anchor;
+    anchor_mean_plus.entry_threshold_base += 0.010;
+    anchor_mean_plus.entry_edge_prob += 0.003;
+    anchor_mean_plus.entry_min_potential_cents += 2.0;
+    anchor_mean_plus.max_exec_spread_cents -= 0.10;
+    anchor_mean_plus.take_profit_near_max_cents += 0.8;
+    anchor_mean_plus.endgame_take_profit_cents += 0.8;
+    pool.push(("anchor_mean_plus".to_string(), anchor_mean_plus));
+
+    let mut anchor_win_plus = anchor;
+    anchor_win_plus.entry_threshold_base += 0.018;
+    anchor_win_plus.entry_threshold_cap += 0.015;
+    anchor_win_plus.entry_edge_prob += 0.005;
+    anchor_win_plus.entry_min_potential_cents += 1.6;
+    anchor_win_plus.cooldown_ms += 1800;
+    anchor_win_plus.max_entries_per_round = anchor_win_plus.max_entries_per_round.saturating_sub(1).max(1);
+    anchor_win_plus.max_exec_spread_cents -= 0.12;
+    pool.push(("anchor_win_plus".to_string(), anchor_win_plus));
+
+    let mut anchor_drawdown_plus = anchor;
+    anchor_drawdown_plus.stop_loss_cents -= 1.8;
+    anchor_drawdown_plus.stop_loss_grace_ticks = anchor_drawdown_plus.stop_loss_grace_ticks.saturating_sub(1).max(1);
+    anchor_drawdown_plus.trail_activate_profit_cents -= 1.2;
+    anchor_drawdown_plus.trail_drawdown_cents -= 1.0;
+    anchor_drawdown_plus.cooldown_ms += 2200;
+    anchor_drawdown_plus.max_exec_spread_cents -= 0.10;
+    pool.push(("anchor_drawdown_plus".to_string(), anchor_drawdown_plus));
+
+    let mut anchor_balanced_plus = anchor;
+    anchor_balanced_plus.entry_threshold_base -= 0.008;
+    anchor_balanced_plus.entry_edge_prob -= 0.001;
+    anchor_balanced_plus.entry_min_potential_cents += 1.4;
+    anchor_balanced_plus.stop_loss_cents -= 1.0;
+    anchor_balanced_plus.take_profit_near_max_cents += 0.6;
+    anchor_balanced_plus.cooldown_ms += 800;
+    pool.push(("anchor_balanced_plus".to_string(), anchor_balanced_plus));
 
     let mut dedup = Vec::<(String, StrategyRuntimeConfig)>::new();
     let mut seen = HashSet::<String>::new();
@@ -1525,9 +1574,13 @@ pub(super) async fn strategy_optimize(
         if leaderboard.is_empty() {
             break;
         }
-        let idx = ((lcg_next(&mut seed) * leaderboard.len() as f64).floor() as usize)
-            .min(leaderboard.len().saturating_sub(1));
-        let parent = strategy_cfg_from_payload(base_cfg, &leaderboard[idx]);
+        let parent = if best_improved_payload.is_null() {
+            incumbent_cfg.unwrap_or(base_cfg)
+        } else {
+            let idx = ((lcg_next(&mut seed) * leaderboard.len() as f64).floor() as usize)
+                .min(leaderboard.len().saturating_sub(1));
+            strategy_cfg_from_payload(base_cfg, &leaderboard[idx])
+        };
         let cfg = mutate_cfg(&parent, &base_cfg, &mut seed, iter, budget.local_trials);
         register_candidate(
             format!("local_{iter:03}"),
