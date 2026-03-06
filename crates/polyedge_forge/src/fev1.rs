@@ -144,7 +144,11 @@ fn build_entry_decision(
     round_id: &str,
     ts_ms: i64,
     remaining_ms: i64,
-    price_cents: f64,
+    signal_price_cents: f64,
+    paper_entry_exec_price_cents: f64,
+    paper_entry_fee_cents: f64,
+    paper_entry_slippage_cents: f64,
+    paper_entry_impact_cents: f64,
     entry_score: f64,
     reason: &str,
     source_tag: Option<&str>,
@@ -164,7 +168,18 @@ fn build_entry_decision(
         "ts_ms": ts_ms,
         "reason": reason,
         "signal_source": source_tag.unwrap_or("signal_decision"),
-        "price_cents": price_cents.clamp(1.0, 99.0),
+        "price_cents": signal_price_cents.clamp(1.0, 99.0),
+        "signal_price_cents": signal_price_cents.clamp(1.0, 99.0),
+        "paper_entry_raw_price_cents": signal_price_cents.clamp(1.0, 99.0),
+        "paper_entry_exec_price_cents": paper_entry_exec_price_cents.clamp(1.0, 99.0),
+        "paper_entry_fee_cents": paper_entry_fee_cents.max(0.0),
+        "paper_entry_slippage_cents": paper_entry_slippage_cents.max(0.0),
+        "paper_entry_impact_cents": paper_entry_impact_cents.max(0.0),
+        "paper_entry_total_cost_cents": (
+            paper_entry_fee_cents.max(0.0)
+                + paper_entry_slippage_cents.max(0.0)
+                + paper_entry_impact_cents.max(0.0)
+        ),
         "entry_score": entry_score,
         "edge_score": entry_score,
         "entry_remaining_ms": remaining_ms,
@@ -879,6 +894,10 @@ impl SimulationCoreState {
                     sample.ts_ms,
                     sample.remaining_ms,
                     ask_raw,
+                    entry_exec,
+                    fee,
+                    cfg.slippage_cents_per_side,
+                    entry_impact_cents,
                     entry_score,
                     "fev1_signal_entry",
                     None,
@@ -896,7 +915,11 @@ impl SimulationCoreState {
         self.sample_count = self.sample_count.saturating_add(1);
     }
 
-    fn current_live_entry_decision(&self) -> Option<Value> {
+    fn current_live_entry_decision(
+        &self,
+        cfg: &RuntimeConfig,
+        fee_ctx: Option<&FeeModelContext>,
+    ) -> Option<Value> {
         let sample = self.last_sample.as_ref()?;
         if self.position.is_some()
             || !self.last_confirmed
@@ -910,6 +933,10 @@ impl SimulationCoreState {
             Side::Down
         };
         let ask_raw = side_ask(sample, side) * 100.0;
+        let entry_fee = taker_fee_cents(ask_raw, side, fee_ctx);
+        let entry_impact_cents =
+            execution_impact_cents(sample, side, cfg, sample.remaining_ms, false);
+        let entry_exec = ask_raw + cfg.slippage_cents_per_side + entry_fee + entry_impact_cents;
         let entry_score = self.last_score.abs();
         Some(build_entry_decision(
             side,
@@ -917,6 +944,10 @@ impl SimulationCoreState {
             sample.ts_ms,
             sample.remaining_ms,
             ask_raw,
+            entry_exec,
+            entry_fee,
+            cfg.slippage_cents_per_side,
+            entry_impact_cents,
             entry_score,
             "fev1_current_summary_entry",
             Some("current_summary"),
@@ -1084,8 +1115,33 @@ impl SimulationCoreState {
         } else {
             0.0
         };
-        let current_live_entry_decision = self.current_live_entry_decision();
+        let current_live_entry_decision = self.current_live_entry_decision(cfg, fee_ctx);
         let current_live_entry_available = current_live_entry_decision.is_some();
+        let (
+            current_signal_price_cents,
+            current_paper_entry_exec_price_cents,
+            current_paper_entry_fee_cents,
+            current_paper_entry_slippage_cents,
+            current_paper_entry_impact_cents,
+        ) = if let Some(decision) = current_live_entry_decision.as_ref() {
+            (
+                decision.get("signal_price_cents").and_then(Value::as_f64),
+                decision
+                    .get("paper_entry_exec_price_cents")
+                    .and_then(Value::as_f64),
+                decision
+                    .get("paper_entry_fee_cents")
+                    .and_then(Value::as_f64),
+                decision
+                    .get("paper_entry_slippage_cents")
+                    .and_then(Value::as_f64),
+                decision
+                    .get("paper_entry_impact_cents")
+                    .and_then(Value::as_f64),
+            )
+        } else {
+            (None, None, None, None, None)
+        };
         let suggested_side = if self.last_confirmed {
             self.last_side
         } else {
@@ -1124,6 +1180,11 @@ impl SimulationCoreState {
             "loss_cluster_cooldown_until_ts_ms": self.loss_cluster_cooldown_until_ts_ms,
             "live_entry_available": current_live_entry_available,
             "live_entry_decision": current_live_entry_decision,
+            "signal_price_cents": current_signal_price_cents,
+            "paper_entry_exec_price_cents": current_paper_entry_exec_price_cents,
+            "paper_entry_fee_cents": current_paper_entry_fee_cents,
+            "paper_entry_slippage_cents": current_paper_entry_slippage_cents,
+            "paper_entry_impact_cents": current_paper_entry_impact_cents,
         });
 
         let trades = if self.trades.len() > max_trades {
@@ -1526,6 +1587,27 @@ mod tests {
                 .get("signal_source")
                 .and_then(Value::as_str),
             Some("current_summary")
+        );
+        assert_eq!(
+            live_entry_decision
+                .get("signal_price_cents")
+                .and_then(Value::as_f64),
+            Some(50.0)
+        );
+        assert_eq!(
+            run.current
+                .get("paper_entry_exec_price_cents")
+                .and_then(Value::as_f64),
+            live_entry_decision
+                .get("paper_entry_exec_price_cents")
+                .and_then(Value::as_f64)
+        );
+        assert!(
+            live_entry_decision
+                .get("paper_entry_exec_price_cents")
+                .and_then(Value::as_f64)
+                .unwrap_or_default()
+                > 50.0
         );
     }
 

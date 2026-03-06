@@ -3355,6 +3355,7 @@ async fn live_runtime_loop(
                             "shadow_eval": {
                                 "enabled": !effective_live_execute,
                                 "status": execution_status.clone(),
+                                "trigger_ts_ms": trigger_for_market.map(|v| v.ts_ms),
                                 "decision_pool_count": decision_pool_count,
                                 "raw_signal_count": decision_pool_count,
                                 "fresh_signal_count": fresh_signal_count,
