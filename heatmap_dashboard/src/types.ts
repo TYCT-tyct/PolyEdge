@@ -117,6 +117,22 @@ export interface CollectorMetricsResponse extends CollectorStatusResponse {
   window_ms: number;
 }
 
+export interface SourceHealthSymbolRow {
+  symbol: string;
+  ok: boolean;
+  timeframes: {
+    "5m": CollectorTimeframeStatus;
+    "15m": CollectorTimeframeStatus;
+  };
+}
+
+export interface SourceHealthResponse {
+  ok: boolean;
+  ts_ms: number;
+  window_ms: number;
+  symbols: SourceHealthSymbolRow[];
+}
+
 export interface RoundHistoryRow {
   round_id: string;
   market_id: string;

@@ -10,6 +10,7 @@ import {
     getLatestAllRaw,
     getRoundChart,
     getRoundHistory,
+    getSourceHealth,
     getStats
 } from "./api";
 import { AccuracyChart } from "./components/AccuracyChart";
@@ -32,6 +33,7 @@ import type {
     RoundChartResponse,
     RoundHistoryRow,
     RoundsResponse,
+    SourceHealthResponse,
     StatsResponse,
     WindowType
 } from "./types";
@@ -759,6 +761,7 @@ export default function App() {
   const [stats, setStats] = useState<StatsResponse | null>(null);
   const [collectorStatus, setCollectorStatus] = useState<CollectorStatusResponse | null>(null);
   const [collectorMetrics, setCollectorMetrics] = useState<CollectorMetricsResponse | null>(null);
+  const [sourceHealth, setSourceHealth] = useState<SourceHealthResponse | null>(null);
   const [chartWindow, setChartWindow] = useState<Record<MarketType, WindowType>>({
     "5m": "30m",
     "15m": "30m"
@@ -1332,6 +1335,29 @@ export default function App() {
     }
     let alive = true;
     const load = async () => {
+      try {
+        const value = await getSourceHealth(180);
+        if (alive) {
+          setSourceHealth(value);
+        }
+      } catch {
+        // advisory panel only
+      }
+    };
+    void load();
+    const id = window.setInterval(load, 15_000);
+    return () => {
+      alive = false;
+      window.clearInterval(id);
+    };
+  }, [isMarketView]);
+
+  useEffect(() => {
+    if (!isMarketView) {
+      return;
+    }
+    let alive = true;
+    const load = async () => {
       if (document.visibilityState !== "visible") {
         return;
       }
@@ -1621,6 +1647,55 @@ export default function App() {
         {roundCard(`${selectedSymbol.replace("USDT", "")} 5分钟轮次`, live["5m"])}
         {roundCard(`${selectedSymbol.replace("USDT", "")} 15分钟轮次`, live["15m"])}
       </section>
+
+      {sourceHealth ? (
+        <section className="panel">
+          <header className="panel-head">
+            <div>
+              <h2>全局采集质量</h2>
+              <p className="muted">统一查看 BTC / ETH / SOL / XRP 在 5m / 15m 上的最新状态与滚动窗口质量。</p>
+            </div>
+          </header>
+          <div className="table-wrap">
+            <table className="history-table">
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>5m状态</th>
+                  <th>5m延迟</th>
+                  <th>5m覆盖</th>
+                  <th>5m p95</th>
+                  <th>15m状态</th>
+                  <th>15m延迟</th>
+                  <th>15m覆盖</th>
+                  <th>15m p95</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sourceHealth.symbols.map((row) => {
+                  const tf5 = row.timeframes["5m"];
+                  const tf15 = row.timeframes["15m"];
+                  const w5 = tf5.window;
+                  const w15 = tf15.window;
+                  return (
+                    <tr key={row.symbol}>
+                      <td>{row.symbol}</td>
+                      <td className={tf5.status === "ok" ? "up" : tf5.status === "missing" ? "" : "down"}>{tf5.status}</td>
+                      <td>{formatAgeMs(tf5.age_ms ?? null)}</td>
+                      <td>{w5 ? `${(w5.sample_ratio * 100).toFixed(0)}%` : "--"}</td>
+                      <td>{formatAgeMs(w5?.path_lag_p95_ms ?? null)}</td>
+                      <td className={tf15.status === "ok" ? "up" : tf15.status === "missing" ? "" : "down"}>{tf15.status}</td>
+                      <td>{formatAgeMs(tf15.age_ms ?? null)}</td>
+                      <td>{w15 ? `${(w15.sample_ratio * 100).toFixed(0)}%` : "--"}</td>
+                      <td>{formatAgeMs(w15?.path_lag_p95_ms ?? null)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      ) : null}
 
       <MemoMarketSection
         title={`${selectedSymbol.replace("USDT", "")} 5分钟市场`}

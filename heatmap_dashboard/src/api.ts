@@ -10,6 +10,7 @@ import type {
     MarketType,
     RoundChartResponse,
     RoundsResponse,
+    SourceHealthResponse,
     StatsResponse,
     StrategyPaperResponse,
     WindowType,
@@ -26,6 +27,7 @@ const apiSupport: {
   stats: boolean | null;
   collectorStatus: boolean | null;
   collectorMetrics: boolean | null;
+  sourceHealth: boolean | null;
   chart: boolean | null;
   rounds: boolean | null;
   roundsAvailable: boolean | null;
@@ -36,6 +38,7 @@ const apiSupport: {
   stats: null,
   collectorStatus: null,
   collectorMetrics: null,
+  sourceHealth: null,
   chart: null,
   rounds: null,
   roundsAvailable: null,
@@ -58,6 +61,9 @@ function responseCacheTtlMs(path: string): number {
     return 1_500;
   }
   if (path.startsWith("/api/collector/metrics")) {
+    return 1_500;
+  }
+  if (path.startsWith("/api/source_health")) {
     return 1_500;
   }
   return 0;
@@ -613,6 +619,39 @@ export async function getCollectorMetrics(
     ...status,
     symbol,
     window_ms: 180_000
+  };
+}
+
+export async function getSourceHealth(windowSec = 180): Promise<SourceHealthResponse> {
+  const qs = new URLSearchParams({ window_sec: String(windowSec) });
+  if (apiSupport.sourceHealth !== false) {
+    try {
+      const data = await requestJson<SourceHealthResponse>(`/api/source_health?${qs.toString()}`);
+      apiSupport.sourceHealth = true;
+      return data;
+    } catch (err) {
+      if (!(err instanceof HttpError) || err.status !== 404) {
+        throw err;
+      }
+      apiSupport.sourceHealth = false;
+    }
+  }
+  const symbols: MarketSymbol[] = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"];
+  const rows = await Promise.all(
+    symbols.map(async (symbol) => {
+      const status = await getCollectorMetrics(symbol);
+      return {
+        symbol,
+        ok: status.ok,
+        timeframes: status.timeframes
+      };
+    })
+  );
+  return {
+    ok: rows.every((row) => row.ok),
+    ts_ms: Date.now(),
+    window_ms: windowSec * 1000,
+    symbols: rows
   };
 }
 

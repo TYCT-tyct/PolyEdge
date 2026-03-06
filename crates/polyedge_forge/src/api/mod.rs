@@ -2283,6 +2283,7 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         .route("/api/stats", get(stats))
         .route("/api/collector/status", get(collector_status))
         .route("/api/collector/metrics", get(collector_metrics))
+        .route("/api/source_health", get(source_health))
         .route("/api/chart", get(chart))
         .route("/api/chart/round", get(chart_round))
         .route("/api/rounds", get(rounds))

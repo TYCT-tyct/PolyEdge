@@ -824,6 +824,50 @@ pub(super) async fn collector_metrics(
     })))
 }
 
+pub(super) async fn source_health(
+    State(state): State<ApiState>,
+    Query(params): Query<CollectorMetricsQueryParams>,
+) -> Result<Json<Value>, ApiError> {
+    let now_ms = Utc::now().timestamp_millis();
+    let window_ms = i64::from(params.window_sec.unwrap_or(180).clamp(60, 900)) * 1000;
+    const SYMBOLS: [&str; 4] = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"];
+
+    let mut overall_ok = true;
+    let mut rows = Vec::with_capacity(SYMBOLS.len());
+    for symbol in SYMBOLS {
+        let mut tf_map = serde_json::Map::new();
+        let mut symbol_ok = true;
+        for tf in ["5m", "15m"] {
+            let snapshot = match fetch_latest_snapshot(&state, symbol, tf).await? {
+                Some(v) => Some(v),
+                None => fetch_latest_snapshot_from_clickhouse(&state, symbol, tf, now_ms).await?,
+            };
+            let (tf_ok, mut status_value) =
+                collector_timeframe_status_row(snapshot.as_ref(), now_ms);
+            symbol_ok &= tf_ok;
+            if let Some(status_obj) = status_value.as_object_mut() {
+                let window_metrics =
+                    fetch_collector_window_metrics(&state, symbol, tf, now_ms, window_ms).await?;
+                status_obj.insert("window".to_string(), window_metrics.unwrap_or(Value::Null));
+            }
+            tf_map.insert(tf.to_string(), status_value);
+        }
+        overall_ok &= symbol_ok;
+        rows.push(json!({
+            "symbol": symbol,
+            "ok": symbol_ok,
+            "timeframes": Value::Object(tf_map),
+        }));
+    }
+
+    Ok(Json(json!({
+        "ok": overall_ok,
+        "ts_ms": now_ms,
+        "window_ms": window_ms,
+        "symbols": rows,
+    })))
+}
+
 pub(super) async fn chart(
     State(state): State<ApiState>,
     Query(params): Query<ChartQueryParams>,
