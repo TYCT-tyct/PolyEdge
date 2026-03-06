@@ -95,8 +95,9 @@ pub(super) async fn strategy_paper(
             cfg.slippage_cents_per_side = v.clamp(0.0, 10.0);
         }
         if let Some(v) = params.fee_cents_per_side {
-            cfg.fee_cents_per_side = v.clamp(0.0, 12.0);
+            let _ = v;
         }
+        cfg.fee_cents_per_side = 0.0;
         if let Some(v) = params.emergency_wide_spread_penalty_ratio {
             cfg.emergency_wide_spread_penalty_ratio = v.clamp(0.2, 3.0);
         }

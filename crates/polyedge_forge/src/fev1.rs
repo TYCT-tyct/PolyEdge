@@ -68,7 +68,6 @@ pub struct RuntimeConfig {
     pub max_entries_per_round: usize,
     pub max_exec_spread_cents: f64,
     pub slippage_cents_per_side: f64,
-    pub fee_cents_per_side: f64,
     pub emergency_wide_spread_penalty_ratio: f64,
     pub stop_loss_grace_ticks: usize,
     pub stop_loss_hard_mult: f64,
@@ -555,7 +554,7 @@ impl SimulationCoreState {
         if let Some(pos) = self.position.as_mut() {
             let bid_raw = side_bid(sample, pos.side) * 100.0;
             let spread_side_cents = side_spread(sample, pos.side) * 100.0;
-            let exit_fee = cfg.fee_cents_per_side + taker_fee_cents(bid_raw, pos.side, fee_ctx);
+            let exit_fee = taker_fee_cents(bid_raw, pos.side, fee_ctx);
             let mut exit_impact_cents =
                 execution_impact_cents(sample, pos.side, cfg, sample.remaining_ms, false);
             let mut exit_exec =
@@ -791,7 +790,7 @@ impl SimulationCoreState {
             let confidence_ok = fair_conf >= 0.56;
             let spread_ok = sample.spread_mid <= dynamic_spread_limit_prob
                 && spread_side_cents <= dynamic_max_exec_spread;
-            let fee = cfg.fee_cents_per_side + taker_fee_cents(ask_raw, side, fee_ctx);
+            let fee = taker_fee_cents(ask_raw, side, fee_ctx);
             let entry_impact_cents =
                 execution_impact_cents(sample, side, cfg, sample.remaining_ms, false);
             let entry_exec = ask_raw + cfg.slippage_cents_per_side + fee + entry_impact_cents;
@@ -881,7 +880,7 @@ impl SimulationCoreState {
     ) {
         if let Some(pos) = self.position.take() {
             let bid_raw = side_bid(last, pos.side) * 100.0;
-            let exit_fee = cfg.fee_cents_per_side + taker_fee_cents(bid_raw, pos.side, fee_ctx);
+            let exit_fee = taker_fee_cents(bid_raw, pos.side, fee_ctx);
             let exit_impact_cents =
                 execution_impact_cents(last, pos.side, cfg, last.remaining_ms, false);
             let exit_exec = bid_raw - cfg.slippage_cents_per_side - exit_fee - exit_impact_cents;
@@ -1172,7 +1171,9 @@ pub fn simulate_with_fee_context(
 
 #[cfg(test)]
 mod tests {
-    use super::{simulate, IncrementalSimulationEngine, RuntimeConfig, Sample};
+    use super::{
+        dynamic_taker_fee_cents, simulate, IncrementalSimulationEngine, RuntimeConfig, Sample,
+    };
 
     #[test]
     fn incremental_engine_matches_bulk_simulation() {
@@ -1197,7 +1198,6 @@ mod tests {
             max_entries_per_round: 1,
             max_exec_spread_cents: 2.0,
             slippage_cents_per_side: 0.2,
-            fee_cents_per_side: 0.1,
             emergency_wide_spread_penalty_ratio: 0.5,
             stop_loss_grace_ticks: 1,
             stop_loss_hard_mult: 1.4,
@@ -1329,6 +1329,12 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_fee_matches_official_crypto_curve() {
+        let fee_cents = dynamic_taker_fee_cents(55.71);
+        assert!((fee_cents - 0.85).abs() < 0.02, "fee_cents={fee_cents}");
+    }
+
+    #[test]
     fn blocked_non_emergency_exits_are_escalated() {
         let cfg = RuntimeConfig {
             entry_threshold_base: 0.40,
@@ -1351,7 +1357,6 @@ mod tests {
             max_entries_per_round: 1,
             max_exec_spread_cents: 1.0,
             slippage_cents_per_side: 0.0,
-            fee_cents_per_side: 0.0,
             emergency_wide_spread_penalty_ratio: 0.5,
             stop_loss_grace_ticks: 0,
             stop_loss_hard_mult: 1.4,
@@ -1507,7 +1512,6 @@ mod tests {
             max_entries_per_round: 2,
             max_exec_spread_cents: 1.0,
             slippage_cents_per_side: 0.0,
-            fee_cents_per_side: 0.0,
             emergency_wide_spread_penalty_ratio: 0.1,
             stop_loss_grace_ticks: 2,
             stop_loss_hard_mult: 1.8,
@@ -1628,7 +1632,6 @@ mod tests {
             max_entries_per_round: 10,
             max_exec_spread_cents: 2.0,
             slippage_cents_per_side: 0.0,
-            fee_cents_per_side: 0.0,
             emergency_wide_spread_penalty_ratio: 0.1,
             stop_loss_grace_ticks: 0,
             stop_loss_hard_mult: 1.4,
@@ -1765,7 +1768,6 @@ mod tests {
             max_entries_per_round: 10,
             max_exec_spread_cents: 3.0,
             slippage_cents_per_side: 0.0,
-            fee_cents_per_side: 0.0,
             emergency_wide_spread_penalty_ratio: 1.0,
             stop_loss_grace_ticks: 0,
             stop_loss_hard_mult: 1.5,

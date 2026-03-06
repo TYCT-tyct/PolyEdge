@@ -381,7 +381,7 @@ pub(super) fn strategy_cfg_json(cfg: &StrategyRuntimeConfig) -> Value {
         "max_entries_per_round": cfg.max_entries_per_round,
         "max_exec_spread_cents": cfg.max_exec_spread_cents,
         "slippage_cents_per_side": cfg.slippage_cents_per_side,
-        "fee_cents_per_side": cfg.fee_cents_per_side,
+        "fee_cents_per_side": 0.0,
         "emergency_wide_spread_penalty_ratio": cfg.emergency_wide_spread_penalty_ratio,
         "stop_loss_grace_ticks": cfg.stop_loss_grace_ticks,
         "stop_loss_hard_mult": cfg.stop_loss_hard_mult,
@@ -551,8 +551,9 @@ pub(super) fn strategy_cfg_from_payload(
         .and_then(|v| v.get("fee_cents_per_side"))
         .and_then(Value::as_f64)
     {
-        c.fee_cents_per_side = v;
+        let _ = v;
     }
+    c.fee_cents_per_side = 0.0;
     if let Some(v) = payload
         .get("config")
         .and_then(|v| v.get("emergency_wide_spread_penalty_ratio"))
@@ -676,16 +677,19 @@ pub(super) fn strategy_paper_cost_model_json(
         "official_exchange_fill_model": false,
         "notes": [
             "paper cost is heuristic simulation, not official exchange fill replay",
-            "calibrate with live price_parity and latency metrics before widening size"
+            "calibrate with live price_parity and latency metrics before widening size",
+            "legacy fixed fee_cents_per_side is disabled; fee uses official polymarket crypto formula only"
         ],
         "components": {
             "entry_price_cents": "ask_raw + slippage + fee + impact",
             "exit_price_cents": "bid_raw - slippage - fee - impact",
             "slippage_cents_per_side": cfg.slippage_cents_per_side,
-            "fee_cents_per_side_base": cfg.fee_cents_per_side,
+            "fee_cents_per_side_base": 0.0,
             "fee_model": {
-                "mode": "dynamic_taker_fee_curve",
-                "formula": "dynamic_taker_fee_cents(price_cents)"
+                "mode": "official_polymarket_crypto_curve",
+                "formula": "fee = C × p × 0.25 × (p × (1 - p))^2",
+                "unit": "cents_per_share",
+                "rounding": "round fee_usdc to 4dp, then convert to cents"
             },
             "impact_model": "execution_impact_cents(sample, side, cfg, remaining_ms, emergency)"
         }
@@ -1164,7 +1168,6 @@ pub(super) fn map_cfg_to_fev1(cfg: &StrategyRuntimeConfig) -> fev1::RuntimeConfi
         max_entries_per_round: cfg.max_entries_per_round,
         max_exec_spread_cents: cfg.max_exec_spread_cents,
         slippage_cents_per_side: cfg.slippage_cents_per_side,
-        fee_cents_per_side: cfg.fee_cents_per_side,
         emergency_wide_spread_penalty_ratio: cfg.emergency_wide_spread_penalty_ratio,
         stop_loss_grace_ticks: cfg.stop_loss_grace_ticks,
         stop_loss_hard_mult: cfg.stop_loss_hard_mult,

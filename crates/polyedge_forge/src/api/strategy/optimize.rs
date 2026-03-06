@@ -228,7 +228,7 @@ pub(super) fn clamp_runtime_cfg(cfg: &mut StrategyRuntimeConfig) {
     cfg.max_entries_per_round = cfg.max_entries_per_round.clamp(1, 16);
     cfg.max_exec_spread_cents = cfg.max_exec_spread_cents.clamp(0.8, 12.0);
     cfg.slippage_cents_per_side = cfg.slippage_cents_per_side.clamp(0.03, 4.0);
-    cfg.fee_cents_per_side = cfg.fee_cents_per_side.clamp(0.03, 4.0);
+    cfg.fee_cents_per_side = 0.0;
     cfg.emergency_wide_spread_penalty_ratio =
         cfg.emergency_wide_spread_penalty_ratio.clamp(0.0, 2.0);
     cfg.stop_loss_grace_ticks = cfg.stop_loss_grace_ticks.clamp(0, 8);
@@ -286,7 +286,7 @@ fn lerp_usize(min_v: usize, max_v: usize, t: f64) -> usize {
 
 fn freeze_cost_model_fields(cfg: &mut StrategyRuntimeConfig, reference: &StrategyRuntimeConfig) {
     cfg.slippage_cents_per_side = reference.slippage_cents_per_side;
-    cfg.fee_cents_per_side = reference.fee_cents_per_side;
+    cfg.fee_cents_per_side = 0.0;
     cfg.emergency_wide_spread_penalty_ratio = reference.emergency_wide_spread_penalty_ratio;
 }
 

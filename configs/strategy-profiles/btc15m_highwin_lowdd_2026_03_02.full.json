@@ -20,6 +20,6 @@
   "max_entries_per_round": 2,
   "max_exec_spread_cents": 2.036509456881631,
   "slippage_cents_per_side": 0.07030273871496183,
-  "fee_cents_per_side": 0.05756236147802781,
+  "fee_cents_per_side": 0.0,
   "emergency_wide_spread_penalty_ratio": 0.0960558103033064
 }
