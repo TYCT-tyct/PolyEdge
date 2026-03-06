@@ -170,6 +170,7 @@ def main() -> int:
             "status_counter": collections.Counter(),
             "suggested_action_counter": collections.Counter(),
             "no_candidate_reason_counter": collections.Counter(),
+            "candidate_source_counter": collections.Counter(),
             "trade_count_series": [],
             "win_rate_series": [],
             "net_pnl_series": [],
@@ -323,6 +324,8 @@ def main() -> int:
                     or gated.get("no_candidate_reason")
                     or ""
                 ).strip()
+                candidate_source = str(shadow_eval.get("candidate_source") or "").strip()
+                current_entry_available = bool(shadow_eval.get("current_entry_available"))
 
                 st["last_status"] = status
                 st["last_shadow_eval"] = shadow_eval
@@ -331,6 +334,8 @@ def main() -> int:
                 st["suggested_action_counter"][suggested_action] += 1
                 if no_candidate_reason:
                     st["no_candidate_reason_counter"][no_candidate_reason] += 1
+                if candidate_source:
+                    st["candidate_source_counter"][candidate_source] += 1
                 st["trade_count_series"].append(int(summary.get("trade_count") or 0))
                 st["win_rate_series"].append(float(summary.get("win_rate_pct") or 0.0))
                 st["net_pnl_series"].append(float(summary.get("net_pnl_cents") or 0.0))
@@ -381,6 +386,8 @@ def main() -> int:
                                 "state_skipped_count": state_skipped_count,
                                 "target_missing": target_missing,
                                 "no_candidate_reason": no_candidate_reason or None,
+                                "candidate_source": candidate_source or None,
+                                "current_entry_available": current_entry_available,
                                 "current": current,
                                 "gap_rows": gap_rows[:8],
                             },
@@ -455,6 +462,7 @@ def main() -> int:
             "status_counter": counter_to_dict(st["status_counter"]),
             "suggested_action_counter": counter_to_dict(st["suggested_action_counter"]),
             "no_candidate_reason_counter": counter_to_dict(st["no_candidate_reason_counter"]),
+            "candidate_source_counter": counter_to_dict(st["candidate_source_counter"]),
             "skip_reason_counter": counter_to_dict(st["skip_reason_counter"]),
         }
 

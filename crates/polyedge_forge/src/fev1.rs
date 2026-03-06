@@ -128,6 +128,54 @@ fn decision_id(action: &str, side: Side, round_id: &str, ts_ms: i64) -> String {
     )
 }
 
+fn entry_execution_policy(
+    remaining_ms: i64,
+    entry_score: f64,
+) -> (&'static str, &'static str, i64, f64) {
+    if remaining_ms <= 120_000 || entry_score >= 0.80 {
+        ("FAK", "taker", 650_i64, 24.0_f64)
+    } else {
+        ("FAK", "taker", 750_i64, 18.0_f64)
+    }
+}
+
+fn build_entry_decision(
+    side: Side,
+    round_id: &str,
+    ts_ms: i64,
+    remaining_ms: i64,
+    price_cents: f64,
+    entry_score: f64,
+    reason: &str,
+    source_tag: Option<&str>,
+) -> Value {
+    let (entry_tif, entry_style, entry_ttl_ms, entry_slippage_bps) =
+        entry_execution_policy(remaining_ms, entry_score);
+    let mut id = decision_id("enter", side, round_id, ts_ms);
+    if let Some(tag) = source_tag.filter(|v| !v.trim().is_empty()) {
+        id.push(':');
+        id.push_str(tag.trim());
+    }
+    json!({
+        "decision_id": id,
+        "action": "enter",
+        "side": side.as_str(),
+        "round_id": round_id,
+        "ts_ms": ts_ms,
+        "reason": reason,
+        "signal_source": source_tag.unwrap_or("signal_decision"),
+        "price_cents": price_cents.clamp(1.0, 99.0),
+        "entry_score": entry_score,
+        "edge_score": entry_score,
+        "entry_remaining_ms": remaining_ms,
+        "remaining_ms": remaining_ms,
+        "tif": entry_tif,
+        "style": entry_style,
+        "ttl_ms": entry_ttl_ms,
+        "max_slippage_bps": entry_slippage_bps
+    })
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionTarget {
@@ -825,29 +873,16 @@ impl SimulationCoreState {
                     soft_stop_pending_ticks: 0,
                 });
                 let entry_score = score.abs();
-                let (entry_tif, entry_style, entry_ttl_ms, entry_slippage_bps) =
-                    if sample.remaining_ms <= 120_000 || entry_score >= 0.80 {
-                        ("FAK", "taker", 650_i64, 24.0_f64)
-                    } else {
-                        ("FAK", "taker", 750_i64, 18.0_f64)
-                    };
-                self.signal_decisions.push(json!({
-                    "decision_id": decision_id("enter", side, &sample.round_id, sample.ts_ms),
-                    "action": "enter",
-                    "side": side.as_str(),
-                    "round_id": sample.round_id,
-                    "ts_ms": sample.ts_ms,
-                    "reason": "fev1_signal_entry",
-                    "price_cents": ask_raw.clamp(1.0, 99.0),
-                    "entry_score": entry_score,
-                    "edge_score": entry_score,
-                    "entry_remaining_ms": sample.remaining_ms,
-                    "remaining_ms": sample.remaining_ms,
-                    "tif": entry_tif,
-                    "style": entry_style,
-                    "ttl_ms": entry_ttl_ms,
-                    "max_slippage_bps": entry_slippage_bps
-                }));
+                self.signal_decisions.push(build_entry_decision(
+                    side,
+                    &sample.round_id,
+                    sample.ts_ms,
+                    sample.remaining_ms,
+                    ask_raw,
+                    entry_score,
+                    "fev1_signal_entry",
+                    None,
+                ));
                 *self
                     .entries_by_round
                     .entry(sample.round_id.clone())
@@ -859,6 +894,33 @@ impl SimulationCoreState {
         self.push_signal_history(sample.p_up, score);
         self.last_sample = Some(sample.clone());
         self.sample_count = self.sample_count.saturating_add(1);
+    }
+
+    fn current_live_entry_decision(&self) -> Option<Value> {
+        let sample = self.last_sample.as_ref()?;
+        if self.position.is_some()
+            || !self.last_confirmed
+            || self.last_score.abs() < self.last_entry_threshold
+        {
+            return None;
+        }
+        let side = if self.last_score >= 0.0 {
+            Side::Up
+        } else {
+            Side::Down
+        };
+        let ask_raw = side_ask(sample, side) * 100.0;
+        let entry_score = self.last_score.abs();
+        Some(build_entry_decision(
+            side,
+            &sample.round_id,
+            sample.ts_ms,
+            sample.remaining_ms,
+            ask_raw,
+            entry_score,
+            "fev1_current_summary_entry",
+            Some("current_summary"),
+        ))
     }
 
     fn push_signal_history(&mut self, p_up: f64, score: f64) {
@@ -1022,6 +1084,7 @@ impl SimulationCoreState {
         } else {
             0.0
         };
+        let current_live_entry_decision = self.current_live_entry_decision();
         let suggested_side = if self.last_confirmed {
             self.last_side
         } else {
@@ -1047,12 +1110,19 @@ impl SimulationCoreState {
             "timestamp_ms": self.last_ts_ms,
             "round_id": self.last_round_id,
             "remaining_s": self.last_remaining_s,
+            "remaining_ms": self
+                .last_sample
+                .as_ref()
+                .map(|sample| sample.remaining_ms.max(0))
+                .unwrap_or_else(|| (self.last_remaining_s.max(0.0) * 1000.0).round() as i64),
             "p_up_pct": self.last_p_up,
             "delta_pct": self.last_delta_pct,
             "spread_up_cents": self.last_spread_up_cents,
             "spread_down_cents": self.last_spread_down_cents,
             "loss_cluster_streak": self.loss_cluster_streak,
             "loss_cluster_cooldown_until_ts_ms": self.loss_cluster_cooldown_until_ts_ms,
+            "live_entry_available": current_live_entry_decision.is_some(),
+            "live_entry_decision": current_live_entry_decision,
         });
 
         let trades = if self.trades.len() > max_trades {
@@ -1174,6 +1244,7 @@ mod tests {
     use super::{
         dynamic_taker_fee_cents, simulate, IncrementalSimulationEngine, RuntimeConfig, Sample,
     };
+    use serde_json::Value;
 
     #[test]
     fn incremental_engine_matches_bulk_simulation() {
@@ -1332,6 +1403,129 @@ mod tests {
     fn dynamic_fee_matches_official_crypto_curve() {
         let fee_cents = dynamic_taker_fee_cents(55.71);
         assert!((fee_cents - 0.85).abs() < 0.02, "fee_cents={fee_cents}");
+    }
+
+    #[test]
+    fn current_summary_exposes_live_entry_decision_when_entry_is_active() {
+        let cfg = RuntimeConfig {
+            entry_threshold_base: 0.40,
+            entry_threshold_cap: 0.55,
+            spread_limit_prob: 0.02,
+            entry_edge_prob: 0.01,
+            entry_min_potential_cents: 1.0,
+            entry_max_price_cents: 95.0,
+            min_hold_ms: 0,
+            stop_loss_cents: 99.0,
+            reverse_signal_threshold: -0.95,
+            reverse_signal_ticks: 12,
+            trail_activate_profit_cents: 99.0,
+            trail_drawdown_cents: 99.0,
+            take_profit_near_max_cents: 99.9,
+            endgame_take_profit_cents: 99.9,
+            endgame_remaining_ms: 1_000,
+            liquidity_widen_prob: 0.02,
+            cooldown_ms: 0,
+            max_entries_per_round: 1,
+            max_exec_spread_cents: 2.0,
+            slippage_cents_per_side: 0.2,
+            emergency_wide_spread_penalty_ratio: 0.5,
+            stop_loss_grace_ticks: 1,
+            stop_loss_hard_mult: 1.4,
+            stop_loss_reverse_extra_ticks: 1,
+            loss_cluster_limit: 0,
+            loss_cluster_cooldown_ms: 0,
+            noise_gate_enabled: false,
+            noise_gate_threshold_add: 0.0,
+            noise_gate_edge_add: 0.0,
+            noise_gate_spread_scale: 1.0,
+            vic_enabled: false,
+            vic_target_entries_per_hour: 0.0,
+            vic_deadband_ratio: 0.08,
+            vic_threshold_relax_max: 0.0,
+            vic_edge_relax_max: 0.0,
+            vic_spread_relax_max: 0.0,
+        };
+        let samples = vec![
+            Sample {
+                ts_ms: 1_000,
+                round_id: "r-1".to_string(),
+                remaining_ms: 200_000,
+                p_up: 0.18,
+                delta_pct: -0.8,
+                velocity: -6.0,
+                acceleration: -2.0,
+                bid_yes: 0.49,
+                ask_yes: 0.50,
+                bid_no: 0.50,
+                ask_no: 0.51,
+                spread_up: 0.005,
+                spread_down: 0.005,
+                spread_mid: 0.005,
+            },
+            Sample {
+                ts_ms: 2_000,
+                round_id: "r-1".to_string(),
+                remaining_ms: 199_000,
+                p_up: 0.18,
+                delta_pct: -0.8,
+                velocity: -6.0,
+                acceleration: -2.0,
+                bid_yes: 0.49,
+                ask_yes: 0.50,
+                bid_no: 0.50,
+                ask_no: 0.51,
+                spread_up: 0.005,
+                spread_down: 0.005,
+                spread_mid: 0.005,
+            },
+            Sample {
+                ts_ms: 3_000,
+                round_id: "r-1".to_string(),
+                remaining_ms: 198_000,
+                p_up: 0.18,
+                delta_pct: -0.8,
+                velocity: -6.0,
+                acceleration: -2.0,
+                bid_yes: 0.50,
+                ask_yes: 0.51,
+                bid_no: 0.49,
+                ask_no: 0.50,
+                spread_up: 0.005,
+                spread_down: 0.005,
+                spread_mid: 0.005,
+            },
+        ];
+
+        let run = simulate(&samples, &cfg, 32);
+        assert_eq!(
+            run.current.get("suggested_action").and_then(Value::as_str),
+            Some("ENTER_DOWN")
+        );
+        assert_eq!(
+            run.current
+                .get("live_entry_available")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let live_entry_decision = run
+            .current
+            .get("live_entry_decision")
+            .and_then(Value::as_object)
+            .expect("expected current live entry decision");
+        assert_eq!(
+            live_entry_decision.get("action").and_then(Value::as_str),
+            Some("enter")
+        );
+        assert_eq!(
+            live_entry_decision.get("side").and_then(Value::as_str),
+            Some("DOWN")
+        );
+        assert_eq!(
+            live_entry_decision
+                .get("signal_source")
+                .and_then(Value::as_str),
+            Some("current_summary")
+        );
     }
 
     #[test]

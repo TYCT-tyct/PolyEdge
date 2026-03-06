@@ -83,6 +83,7 @@ def main() -> int:
     event_type_counter: collections.Counter[str] = collections.Counter()
     status_counter: collections.Counter[str] = collections.Counter()
     no_candidate_reason_counter: collections.Counter[str] = collections.Counter()
+    candidate_source_counter: collections.Counter[str] = collections.Counter()
     mode_counter: collections.Counter[str] = collections.Counter()
     accepted_submit_count = 0
     rejected_submit_count = 0
@@ -180,6 +181,8 @@ def main() -> int:
                 or gated.get("no_candidate_reason")
                 or ""
             ).strip()
+            candidate_source = str(shadow_eval.get("candidate_source") or "").strip()
+            current_entry_available = bool(shadow_eval.get("current_entry_available"))
             paper_trade_count = safe_len(payload.get("trades"))
             fill_count = int((((summary.get("fills") or {}).get("fill_decision_count")) or 0))
 
@@ -198,6 +201,8 @@ def main() -> int:
                 no_live_target_count += 1
             if no_candidate_reason:
                 no_candidate_reason_counter[no_candidate_reason] += 1
+            if candidate_source:
+                candidate_source_counter[candidate_source] += 1
 
             for row in gated.get("skipped_decisions") or []:
                 reason = row.get("reason") or "unknown"
@@ -259,6 +264,8 @@ def main() -> int:
                 "fill_decision_count": fill_count,
                 "no_live_market_target": no_live_target,
                 "no_candidate_reason": no_candidate_reason or None,
+                "candidate_source": candidate_source or None,
+                "current_entry_available": current_entry_available,
                 "target_ready": target_ready,
                 "runtime_control": runtime_control,
                 "current_suggested_action": shadow_eval.get("current_suggested_action"),
@@ -361,6 +368,7 @@ def main() -> int:
         "no_live_market_target_polls": no_live_target_count,
         "status_counter": dict(status_counter),
         "no_candidate_reason_counter": dict(no_candidate_reason_counter),
+        "candidate_source_counter": dict(candidate_source_counter),
         "mode_counter": dict(mode_counter),
         "skip_reason_counter": dict(skip_reason_counter.most_common()),
         "event_type_counter": dict(event_type_counter),

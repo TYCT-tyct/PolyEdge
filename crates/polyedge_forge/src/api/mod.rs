@@ -777,6 +777,60 @@ fn normalize_runtime_signal_decisions(
         .collect()
 }
 
+fn normalize_current_live_entry_decision(
+    payload: &Value,
+    market_type: &str,
+    quote_usdc: f64,
+) -> Option<Value> {
+    let decision = payload
+        .get("current")
+        .and_then(|v| v.get("live_entry_decision"))
+        .cloned()?;
+    normalize_runtime_signal_decisions(market_type, vec![decision], quote_usdc)
+        .into_iter()
+        .next()
+}
+
+fn select_live_execution_candidates(
+    paper_decisions: &[Value],
+    current_live_entry_decision: Option<Value>,
+    latest_ts_ms: i64,
+    max_orders: usize,
+    drain_only: bool,
+    prefer_action: Option<&str>,
+) -> (Vec<Value>, usize, &'static str, bool) {
+    let selected_from_pool = select_live_decisions(
+        paper_decisions,
+        latest_ts_ms,
+        max_orders,
+        drain_only,
+        prefer_action,
+    );
+    let fresh_signal_count = count_fresh_live_decisions(paper_decisions, latest_ts_ms, drain_only);
+    let current_entry_available = current_live_entry_decision.is_some();
+    if selected_from_pool.is_empty() && !drain_only && prefer_action.is_none() {
+        if let Some(current_decision) = current_live_entry_decision {
+            return (
+                vec![current_decision],
+                fresh_signal_count.max(1),
+                "current_summary",
+                true,
+            );
+        }
+    }
+    let effective_fresh_count = if current_entry_available {
+        fresh_signal_count.max(1)
+    } else {
+        fresh_signal_count
+    };
+    (
+        selected_from_pool,
+        effective_fresh_count,
+        "decision_pool",
+        current_entry_available,
+    )
+}
+
 fn decision_action_count(decisions: &[Value], action: &str) -> usize {
     decisions
         .iter()
@@ -3077,17 +3131,23 @@ async fn live_runtime_loop(
                         } else {
                             None
                         };
-                    let selected_decisions = select_live_decisions(
+                    let current_live_entry_decision = normalize_current_live_entry_decision(
+                        &payload,
+                        market_type,
+                        cfg.quote_usdc,
+                    );
+                    let (
+                        selected_decisions,
+                        fresh_signal_count,
+                        candidate_source,
+                        current_entry_available,
+                    ) = select_live_execution_candidates(
                         &paper_decisions,
+                        current_live_entry_decision,
                         latest_ts_ms,
                         cfg.max_orders.max(1),
                         effective_drain_only,
                         prefer_action,
-                    );
-                    let fresh_signal_count = count_fresh_live_decisions(
-                        &paper_decisions,
-                        latest_ts_ms,
-                        effective_drain_only,
                     );
                     let (exec_cfg_tuned, _) = state
                         .apply_aggressiveness_to_execution_cfg(
@@ -3209,9 +3269,7 @@ async fn live_runtime_loop(
                         {
                             match (current_confirmed, current_score, current_entry_threshold) {
                                 (false, _, _) => "signal_not_confirmed",
-                                (true, Some(score), Some(threshold))
-                                    if score.abs() < threshold =>
-                                {
+                                (true, Some(score), Some(threshold)) if score.abs() < threshold => {
                                     "score_below_threshold"
                                 }
                                 _ => "current_hold",
@@ -3301,6 +3359,8 @@ async fn live_runtime_loop(
                                 "raw_signal_count": decision_pool_count,
                                 "fresh_signal_count": fresh_signal_count,
                                 "candidate_count": candidate_count,
+                                "candidate_source": candidate_source,
+                                "current_entry_available": current_entry_available,
                                 "state_selected_count": submitted_decisions.len(),
                                 "state_skipped_count": state_skipped_count,
                                 "target_ready": shadow_target_ready,
@@ -3734,6 +3794,46 @@ mod tests {
         let latest_ts_ms = 250_000_i64;
         let selected = select_live_decisions(&decisions, latest_ts_ms, 1, false, Some("enter"));
         assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn select_live_execution_candidates_falls_back_to_current_summary_entry() {
+        let paper_decisions = vec![json!({
+            "action": "enter",
+            "side": "DOWN",
+            "round_id": "old-round",
+            "ts_ms": 1_000_i64,
+            "reason": "fev1_signal_entry",
+            "decision_id": "old-decision",
+            "quote_size_usdc": 1.0
+        })];
+        let current_live_entry_decision = Some(json!({
+            "action": "enter",
+            "side": "DOWN",
+            "round_id": "r-1",
+            "ts_ms": 250_000_i64,
+            "reason": "fev1_current_summary_entry",
+            "decision_id": "summary-decision",
+            "quote_size_usdc": 1.0,
+            "price_cents": 51.2
+        }));
+        let (selected, fresh_count, candidate_source, current_entry_available) =
+            select_live_execution_candidates(
+                &paper_decisions,
+                current_live_entry_decision,
+                250_000_i64,
+                1,
+                false,
+                None,
+            );
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0].get("decision_id").and_then(Value::as_str),
+            Some("summary-decision")
+        );
+        assert_eq!(fresh_count, 1);
+        assert_eq!(candidate_source, "current_summary");
+        assert!(current_entry_available);
     }
 
     #[test]
