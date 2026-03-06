@@ -1613,20 +1613,20 @@ export default function App() {
                   15m采集: {collector15m?.status ?? "--"} · {formatAgeMs(collector15m?.age_ms ?? null)}
                 </span>
                 <span>
-                  5m覆盖:{" "}
+                  5m窗口覆盖:{" "}
                   {collector5mWindow != null
                     ? `${(collector5mWindow.sample_ratio * 100).toFixed(0)}%`
                     : "--"}
                   {" · "}
-                  p95链路延迟: {formatAgeMs(collector5mWindow?.path_lag_p95_ms ?? null)}
+                  窗口p95链路: {formatAgeMs(collector5mWindow?.path_lag_p95_ms ?? null)}
                 </span>
                 <span>
-                  15m覆盖:{" "}
+                  15m窗口覆盖:{" "}
                   {collector15mWindow != null
                     ? `${(collector15mWindow.sample_ratio * 100).toFixed(0)}%`
                     : "--"}
                   {" · "}
-                  p95链路延迟: {formatAgeMs(collector15mWindow?.path_lag_p95_ms ?? null)}
+                  窗口p95链路: {formatAgeMs(collector15mWindow?.path_lag_p95_ms ?? null)}
                 </span>
               </>
             ) : (
@@ -1872,18 +1872,18 @@ export default function App() {
             {collector15m?.round_id || "--"}
           </span>
           <span>
-            5m覆盖率:{" "}
+            5m窗口覆盖:{" "}
             {collector5mWindow != null
               ? `${(collector5mWindow.sample_ratio * 100).toFixed(0)}%`
               : "--"}
-            {" · "}p95链路: {formatAgeMs(collector5mWindow?.path_lag_p95_ms ?? null)}
+            {" · "}窗口p95链路: {formatAgeMs(collector5mWindow?.path_lag_p95_ms ?? null)}
           </span>
           <span>
-            15m覆盖率:{" "}
+            15m窗口覆盖:{" "}
             {collector15mWindow != null
               ? `${(collector15mWindow.sample_ratio * 100).toFixed(0)}%`
               : "--"}
-            {" · "}p95链路: {formatAgeMs(collector15mWindow?.path_lag_p95_ms ?? null)}
+            {" · "}窗口p95链路: {formatAgeMs(collector15mWindow?.path_lag_p95_ms ?? null)}
           </span>
           {errorText ? <span className="down">{errorText}</span> : null}
         </footer>

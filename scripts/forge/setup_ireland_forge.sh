@@ -58,6 +58,11 @@ sudo chown -R "$USER_NAME:$USER_NAME" "$DATA_ROOT"
 
 cd "$REPO_DIR"
 ~/.cargo/bin/cargo build -p polyedge_forge --release
+chmod +x "$REPO_DIR/scripts/forge/verify_ireland_deploy.sh"
+
+echo "[forge-ireland] active_symbols=$ACTIVE_SYMBOLS active_timeframes=$ACTIVE_TIMEFRAMES active_symbol_timeframes=$ACTIVE_SYMBOL_TIMEFRAMES"
+echo "[forge-ireland] discovery_refresh_sec=$DISCOVERY_REFRESH_SEC market_ws_refresh_sec=$MARKET_WS_REFRESH_SEC candidate_pool=$MARKET_CANDIDATE_POOL_SIZE"
+echo "[forge-ireland] runtime_markets=$RUNTIME_MARKETS strategy_markets=$STRATEGY_MARKETS base_profile=$STRATEGY_BASE_PROFILE"
 
 # Keep service-level defaults in sync even when .env overrides are present.
 ENV_FILE="$REPO_DIR/.env"
@@ -344,5 +349,6 @@ sudo systemctl enable --now polyedge-forge-healthcheck.timer
 sudo systemctl --no-pager --full status polyedge-forge-ireland-recorder.service | sed -n '1,25p'
 sudo systemctl --no-pager --full status polyedge-forge-ireland-api.service | sed -n '1,25p'
 sudo systemctl --no-pager --full status polyedge-forge-healthcheck.timer | sed -n '1,20p'
+"$REPO_DIR/scripts/forge/verify_ireland_deploy.sh"
 
 echo "[forge-ireland] done"
