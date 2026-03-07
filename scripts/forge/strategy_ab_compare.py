@@ -5,6 +5,45 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+PARAM_KEYS = [
+    "entry_threshold_base",
+    "entry_threshold_cap",
+    "spread_limit_prob",
+    "entry_edge_prob",
+    "entry_min_potential_cents",
+    "entry_max_price_cents",
+    "min_hold_ms",
+    "stop_loss_cents",
+    "reverse_signal_threshold",
+    "reverse_signal_ticks",
+    "trail_activate_profit_cents",
+    "trail_drawdown_cents",
+    "take_profit_near_max_cents",
+    "endgame_take_profit_cents",
+    "endgame_remaining_ms",
+    "liquidity_widen_prob",
+    "cooldown_ms",
+    "max_entries_per_round",
+    "max_exec_spread_cents",
+    "slippage_cents_per_side",
+    "emergency_wide_spread_penalty_ratio",
+    "stop_loss_grace_ticks",
+    "stop_loss_hard_mult",
+    "stop_loss_reverse_extra_ticks",
+    "loss_cluster_limit",
+    "loss_cluster_cooldown_ms",
+    "noise_gate_enabled",
+    "noise_gate_threshold_add",
+    "noise_gate_edge_add",
+    "noise_gate_spread_scale",
+    "vic_enabled",
+    "vic_target_entries_per_hour",
+    "vic_deadband_ratio",
+    "vic_threshold_relax_max",
+    "vic_edge_relax_max",
+    "vic_spread_relax_max",
+]
+
 
 def fetch_payload(
     base_url: str,
@@ -14,7 +53,6 @@ def fetch_payload(
     lookback_minutes: int,
     max_trades: int,
     max_samples: int,
-    use_autotune: bool,
     cfg: dict | None,
 ) -> dict:
     q: dict[str, str] = {
@@ -24,7 +62,6 @@ def fetch_payload(
         "lookback_minutes": str(lookback_minutes),
         "max_trades": str(max_trades),
         "max_samples": str(max_samples),
-        "use_autotune": "true" if use_autotune else "false",
     }
     if cfg:
         for k, v in cfg.items():
@@ -92,7 +129,10 @@ def load_cfg(path: str | None) -> dict | None:
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(path)
-    return json.loads(p.read_text(encoding="utf-8"))
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    out = {k: raw[k] for k in PARAM_KEYS if k in raw}
+    out["fee_cents_per_side"] = 0.0
+    return out
 
 
 def main() -> None:
@@ -114,8 +154,6 @@ def main() -> None:
         default=260000,
         help="Upper bound for /api/strategy/paper max_samples; lower value reduces API memory pressure.",
     )
-    ap.add_argument("--use-autotune-a", action="store_true")
-    ap.add_argument("--use-autotune-b", action="store_true")
     ap.add_argument("--config-a", help="JSON file for query A override params")
     ap.add_argument("--config-b", help="JSON file for query B override params")
     ap.add_argument("--out", help="Optional output json path")
@@ -132,7 +170,6 @@ def main() -> None:
         args.lookback_minutes,
         args.max_trades,
         args.max_samples,
-        args.use_autotune_a,
         cfg_a,
     )
     payload_b = fetch_payload(
@@ -143,7 +180,6 @@ def main() -> None:
         args.lookback_minutes,
         args.max_trades,
         args.max_samples,
-        args.use_autotune_b,
         cfg_b,
     )
     metrics_a = summarize(payload_a)

@@ -28,14 +28,30 @@ PARAM_KEYS = [
     "max_entries_per_round",
     "max_exec_spread_cents",
     "slippage_cents_per_side",
-    "fee_cents_per_side",
     "emergency_wide_spread_penalty_ratio",
+    "stop_loss_grace_ticks",
+    "stop_loss_hard_mult",
+    "stop_loss_reverse_extra_ticks",
+    "loss_cluster_limit",
+    "loss_cluster_cooldown_ms",
+    "noise_gate_enabled",
+    "noise_gate_threshold_add",
+    "noise_gate_edge_add",
+    "noise_gate_spread_scale",
+    "vic_enabled",
+    "vic_target_entries_per_hour",
+    "vic_deadband_ratio",
+    "vic_threshold_relax_max",
+    "vic_edge_relax_max",
+    "vic_spread_relax_max",
 ]
 
 
 def load_cfg(path: str) -> dict:
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
-    return {k: raw[k] for k in PARAM_KEYS if k in raw}
+    out = {k: raw[k] for k in PARAM_KEYS if k in raw}
+    out["fee_cents_per_side"] = 0.0
+    return out
 
 
 def fetch_payload(

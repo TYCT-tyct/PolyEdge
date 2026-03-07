@@ -6,7 +6,7 @@ OUT_ROOT="${OUT_ROOT:-/tmp/polyedge_bg}"
 ARCHIVE_ROOT="${ARCHIVE_ROOT:-$OUT_ROOT/archive}"
 
 MODE="${MODE:-overall}" # overall|highwin
-SYMBOL="${SYMBOL:-BTCUSDT}" # BTCUSDT|ETHUSDT|SOLUSDT|XRPUSDT
+SYMBOL="${SYMBOL:-BTCUSDT}"
 MARKET_TYPE="${MARKET_TYPE:-5m}"
 SEED_CONFIG="${SEED_CONFIG:-configs/strategy-profiles/manual_balanced_2026_02_28.full.json}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:9810}"
@@ -31,7 +31,7 @@ JOB_TAG="${JOB_TAG:-${MODE}_${MARKET_TYPE}}"
 
 usage() {
   cat <<'USAGE'
-Usage: run_lowprio_optimize.sh [--mode overall|highwin] [--symbol SYMBOL] [--market-type 5m]
+Usage: run_lowprio_optimize.sh [--mode overall|highwin] [--symbol SYMBOL] [--market-type 5m|15m]
                                [--seed-config PATH] [--job-tag TAG] [--max-samples N] [--workers N]
 
 Environment overrides:
@@ -56,14 +56,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$MARKET_TYPE" != "5m" && "$MARKET_TYPE" != "15m" ]]; then
-  echo "[lowprio-opt] unsupported MARKET_TYPE=$MARKET_TYPE" >&2
-  exit 2
-fi
 if [[ "$MODE" != "overall" && "$MODE" != "highwin" ]]; then
   echo "[lowprio-opt] invalid MODE=$MODE" >&2
   exit 2
 fi
+
 if [[ "$MODE" == "highwin" ]]; then
   WIN_TARGET="${WIN_TARGET:-84}"
   DD_TARGET="${DD_TARGET:-55}"

@@ -68,7 +68,7 @@ def sanitize_cfg(cfg: dict) -> dict:
     for k in PARAM_SPECS:
         if k in cfg:
             out[k] = clamp_value(k, cfg[k])
-    # Forge paper ignores fee_cents_per_side and forces its internal fee model.
+    # Forge paper currently ignores request fee_cents_per_side and forces its own fee model.
     out["fee_cents_per_side"] = 0.0
     if "entry_threshold_base" in out and "entry_threshold_cap" in out:
         min_cap = float(out["entry_threshold_base"]) + 0.01
