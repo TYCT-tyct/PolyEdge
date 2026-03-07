@@ -17,7 +17,6 @@ fi
 
 cd "$REPO_DIR"
 ~/.cargo/bin/cargo build -p polyedge_forge --release
-chmod +x "$REPO_DIR/scripts/forge/tokyo_disk_guard.sh"
 
 sudo tee /etc/systemd/system/polyedge-forge-tokyo.service >/dev/null <<UNIT
 [Unit]
