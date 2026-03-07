@@ -71,7 +71,6 @@ const STRATEGY_PROFILE_HI_WIN: &str = "fev1_manual_hi_win_2026_02_27";
 const STRATEGY_PROFILE_BALANCED: &str = "fev1_manual_balanced_2026_02_28";
 const STRATEGY_PROFILE_CAND_GROWTH_MIX: &str = "fev1_cand_growth_mix_2026_02_28";
 const STRATEGY_PROFILE_BTC_5M_BALANCE: &str = "btc5m_balance_2026_03_06";
-const STRATEGY_PROFILE_SOL_5M_BALANCE: &str = "sol5m_balance_2026_03_07";
 const STRATEGY_PROFILE_SOL_5M_SHARP: &str = "sol5m_sharp_2026_03_07";
 
 #[derive(Clone)]

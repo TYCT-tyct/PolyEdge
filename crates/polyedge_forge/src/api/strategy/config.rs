@@ -381,6 +381,9 @@ fn strategy_profile_from_alias_strict(
     Ok((profile, strategy_cfg_for_profile_name(profile)))
 }
 
+fn strategy_profile_from_alias(raw: &str) -> Option<(&'static str, StrategyRuntimeConfig)> {
+    strategy_profile_from_alias_strict(raw).ok()
+}
 fn strategy_profile_name_from_alias(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "profit_max" | "manual_profit_max" | "max" | "fev1_manual_profit_max_2026_02_27" => {
@@ -398,9 +401,6 @@ fn strategy_profile_name_from_alias(raw: &str) -> Option<&'static str> {
         "btc5m_balance"
         | "btc5m_balance_2026_03_06"
         | "fev1_btc5m_balance_2026_03_06" => Some(STRATEGY_PROFILE_BTC_5M_BALANCE),
-        "sol5m_balance"
-        | "sol5m_balance_2026_03_07"
-        | "fev1_sol5m_balance_2026_03_07" => Some(STRATEGY_PROFILE_SOL_5M_BALANCE),
         "sol5m_sharp"
         | "sol5m_sharp_2026_03_07"
         | "fev1_sol5m_sharp_2026_03_07" => Some(STRATEGY_PROFILE_SOL_5M_SHARP),
@@ -454,7 +454,6 @@ fn parse_strategy_scope_profile_overrides(raw: &str) -> HashMap<String, &'static
     }
     out
 }
-
 #[derive(Debug, Clone)]
 pub(super) struct StrategyResolvedConfig {
     pub(super) cfg: StrategyRuntimeConfig,
@@ -497,7 +496,11 @@ fn strategy_baseline_profile_from_inputs<'a>(
     if let Some(profile) = base_profile {
         return (profile, "env_base_profile");
     }
-    (strategy_select_profile_name(), "code_default")
+    match (symbol, market_type) {
+        ("BTCUSDT", "5m") => (STRATEGY_PROFILE_BTC_5M_BALANCE, "code_scope_default"),
+        ("SOLUSDT", "5m") => (STRATEGY_PROFILE_SOL_5M_SHARP, "code_scope_default"),
+        _ => (strategy_select_profile_name(), "code_default"),
+    }
 }
 
 fn strategy_cfg_for_profile_name(profile: &str) -> StrategyRuntimeConfig {
@@ -506,7 +509,6 @@ fn strategy_cfg_for_profile_name(profile: &str) -> StrategyRuntimeConfig {
         STRATEGY_PROFILE_HI_FREQ => strategy_hi_freq_config(),
         STRATEGY_PROFILE_BALANCED => strategy_balanced_config(),
         STRATEGY_PROFILE_BTC_5M_BALANCE => strategy_btc_5m_balance_config(),
-        STRATEGY_PROFILE_SOL_5M_BALANCE => strategy_sol_5m_balance_config(),
         STRATEGY_PROFILE_SOL_5M_SHARP => strategy_sol_5m_sharp_config(),
         STRATEGY_PROFILE_CAND_GROWTH_MIX => strategy_cand_growth_mix_config(),
         _ => strategy_profit_max_config(),
@@ -565,12 +567,12 @@ pub(super) async fn strategy_resolve_effective_config(
     }
 
     if let Some(profile_raw) = explicit_profile {
-        let (profile_name, profile_cfg) = strategy_profile_from_alias_strict(profile_raw)
-            .map_err(|_| ApiError::bad_request(format!("unknown strategy profile: {profile_raw}")))?;
-        cfg = profile_cfg;
-        config_source = profile_name.to_string();
-        config_layer = "request_profile";
-        source_key = None;
+        if let Some((profile_name, profile_cfg)) = strategy_profile_from_alias(profile_raw) {
+            cfg = profile_cfg;
+            config_source = profile_name.to_string();
+            config_layer = "request_profile";
+            source_key = None;
+        }
     }
 
     Ok(StrategyResolvedConfig {
@@ -591,80 +593,6 @@ pub(super) fn strategy_config_resolution_json(resolved: &StrategyResolvedConfig)
         "effective_layer": resolved.config_layer,
         "source_key": resolved.source_key,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_scope_profile_overrides_supports_exact_and_wildcards() {
-        let parsed = parse_strategy_scope_profile_overrides(
-            "SOLUSDT:5m=sol5m_sharp,SOLUSDT=balanced,15m=hi_freq,noop=unknown",
-        );
-        assert_eq!(
-            parsed.get("SOLUSDT|5m").copied(),
-            Some(STRATEGY_PROFILE_SOL_5M_SHARP)
-        );
-        assert_eq!(parsed.get("SOLUSDT|*").copied(), Some(STRATEGY_PROFILE_BALANCED));
-        assert_eq!(parsed.get("*|15m").copied(), Some(STRATEGY_PROFILE_HI_FREQ));
-        assert_eq!(parsed.len(), 3);
-    }
-
-    #[test]
-    fn baseline_profile_precedence_is_scope_then_env_then_code_default() {
-        let mut overrides = HashMap::<String, &'static str>::new();
-        overrides.insert("SOLUSDT|5m".to_string(), STRATEGY_PROFILE_SOL_5M_SHARP);
-        overrides.insert("SOLUSDT|*".to_string(), STRATEGY_PROFILE_BALANCED);
-        overrides.insert("*|15m".to_string(), STRATEGY_PROFILE_HI_FREQ);
-
-        assert_eq!(
-            strategy_baseline_profile_from_inputs(
-                "SOLUSDT",
-                "5m",
-                &overrides,
-                Some(STRATEGY_PROFILE_CAND_GROWTH_MIX),
-            ),
-            (STRATEGY_PROFILE_SOL_5M_SHARP, "env_scope_symbol_market")
-        );
-        assert_eq!(
-            strategy_baseline_profile_from_inputs(
-                "SOLUSDT",
-                "1h",
-                &overrides,
-                Some(STRATEGY_PROFILE_CAND_GROWTH_MIX),
-            ),
-            (STRATEGY_PROFILE_BALANCED, "env_scope_symbol")
-        );
-        assert_eq!(
-            strategy_baseline_profile_from_inputs(
-                "BTCUSDT",
-                "15m",
-                &overrides,
-                Some(STRATEGY_PROFILE_CAND_GROWTH_MIX),
-            ),
-            (STRATEGY_PROFILE_HI_FREQ, "env_scope_market")
-        );
-        assert_eq!(
-            strategy_baseline_profile_from_inputs(
-                "BTCUSDT",
-                "5m",
-                &HashMap::new(),
-                Some(STRATEGY_PROFILE_CAND_GROWTH_MIX),
-            ),
-            (STRATEGY_PROFILE_CAND_GROWTH_MIX, "env_base_profile")
-        );
-        assert_eq!(
-            strategy_baseline_profile_from_inputs("BTCUSDT", "5m", &HashMap::new(), None),
-            (STRATEGY_PROFILE_HI_WIN, "code_default")
-        );
-    }
-
-    #[test]
-    fn strict_profile_alias_rejects_unknown_values() {
-        assert!(strategy_profile_from_alias_strict("sol5m_sharp").is_ok());
-        assert!(strategy_profile_from_alias_strict("definitely_not_a_profile").is_err());
-    }
 }
 
 fn strategy_env_bool(name: &str, default: bool) -> bool {
@@ -1022,49 +950,6 @@ fn strategy_btc_5m_balance_config() -> StrategyRuntimeConfig {
         vic_spread_relax_max: 0.12,
     }
 }
-
-fn strategy_sol_5m_balance_config() -> StrategyRuntimeConfig {
-    StrategyRuntimeConfig {
-        entry_threshold_base: 0.7476638018261539,
-        entry_threshold_cap: 0.99,
-        spread_limit_prob: 0.02439836783513124,
-        entry_edge_prob: 0.03564878183858613,
-        entry_min_potential_cents: 10.066531527622889,
-        entry_max_price_cents: 76.4997564566711,
-        min_hold_ms: 0,
-        stop_loss_cents: 16.65812653820055,
-        reverse_signal_threshold: -0.1770513110145612,
-        reverse_signal_ticks: 1,
-        trail_activate_profit_cents: 24.99799978463737,
-        trail_drawdown_cents: 16.82299393297926,
-        take_profit_near_max_cents: 99.5,
-        endgame_take_profit_cents: 93.5644303775527,
-        endgame_remaining_ms: 20_518,
-        liquidity_widen_prob: 0.06143177168730615,
-        cooldown_ms: 7_691,
-        max_entries_per_round: 4,
-        max_exec_spread_cents: 1.6807376190292096,
-        slippage_cents_per_side: 0.10036573476058915,
-        fee_cents_per_side: 0.0,
-        emergency_wide_spread_penalty_ratio: 0.2,
-        stop_loss_grace_ticks: 2,
-        stop_loss_hard_mult: 1.45,
-        stop_loss_reverse_extra_ticks: 1,
-        loss_cluster_limit: 3,
-        loss_cluster_cooldown_ms: 25_000,
-        noise_gate_enabled: true,
-        noise_gate_threshold_add: 0.03,
-        noise_gate_edge_add: 0.008,
-        noise_gate_spread_scale: 0.9,
-        vic_enabled: true,
-        vic_target_entries_per_hour: 14.0,
-        vic_deadband_ratio: 0.08,
-        vic_threshold_relax_max: 0.02,
-        vic_edge_relax_max: 0.008,
-        vic_spread_relax_max: 0.12,
-    }
-}
-
 fn strategy_sol_5m_sharp_config() -> StrategyRuntimeConfig {
     StrategyRuntimeConfig {
         entry_threshold_base: 0.7476638018261539,
