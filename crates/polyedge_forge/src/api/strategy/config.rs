@@ -567,12 +567,12 @@ pub(super) async fn strategy_resolve_effective_config(
     }
 
     if let Some(profile_raw) = explicit_profile {
-        if let Some((profile_name, profile_cfg)) = strategy_profile_from_alias(profile_raw) {
-            cfg = profile_cfg;
-            config_source = profile_name.to_string();
-            config_layer = "request_profile";
-            source_key = None;
-        }
+        let (profile_name, profile_cfg) = strategy_profile_from_alias_strict(profile_raw)
+            .map_err(|_| ApiError::bad_request(format!("unknown strategy profile: {profile_raw}")))?;
+        cfg = profile_cfg;
+        config_source = profile_name.to_string();
+        config_layer = "request_profile";
+        source_key = None;
     }
 
     Ok(StrategyResolvedConfig {
@@ -593,6 +593,80 @@ pub(super) fn strategy_config_resolution_json(resolved: &StrategyResolvedConfig)
         "effective_layer": resolved.config_layer,
         "source_key": resolved.source_key,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_scope_profile_overrides_supports_exact_and_wildcards() {
+        let parsed = parse_strategy_scope_profile_overrides(
+            "SOLUSDT:5m=sol5m_sharp,SOLUSDT=balanced,15m=hi_freq,noop=unknown",
+        );
+        assert_eq!(
+            parsed.get("SOLUSDT|5m").copied(),
+            Some(STRATEGY_PROFILE_SOL_5M_SHARP)
+        );
+        assert_eq!(parsed.get("SOLUSDT|*").copied(), Some(STRATEGY_PROFILE_BALANCED));
+        assert_eq!(parsed.get("*|15m").copied(), Some(STRATEGY_PROFILE_HI_FREQ));
+        assert_eq!(parsed.len(), 3);
+    }
+
+    #[test]
+    fn baseline_profile_precedence_is_scope_then_env_then_code_default() {
+        let mut overrides = HashMap::<String, &'static str>::new();
+        overrides.insert("SOLUSDT|5m".to_string(), STRATEGY_PROFILE_SOL_5M_SHARP);
+        overrides.insert("SOLUSDT|*".to_string(), STRATEGY_PROFILE_BALANCED);
+        overrides.insert("*|15m".to_string(), STRATEGY_PROFILE_HI_FREQ);
+
+        assert_eq!(
+            strategy_baseline_profile_from_inputs(
+                "SOLUSDT",
+                "5m",
+                &overrides,
+                Some(STRATEGY_PROFILE_CAND_GROWTH_MIX),
+            ),
+            (STRATEGY_PROFILE_SOL_5M_SHARP, "env_scope_symbol_market")
+        );
+        assert_eq!(
+            strategy_baseline_profile_from_inputs(
+                "SOLUSDT",
+                "1h",
+                &overrides,
+                Some(STRATEGY_PROFILE_CAND_GROWTH_MIX),
+            ),
+            (STRATEGY_PROFILE_BALANCED, "env_scope_symbol")
+        );
+        assert_eq!(
+            strategy_baseline_profile_from_inputs(
+                "BTCUSDT",
+                "15m",
+                &overrides,
+                Some(STRATEGY_PROFILE_CAND_GROWTH_MIX),
+            ),
+            (STRATEGY_PROFILE_HI_FREQ, "env_scope_market")
+        );
+        assert_eq!(
+            strategy_baseline_profile_from_inputs(
+                "BTCUSDT",
+                "5m",
+                &HashMap::new(),
+                Some(STRATEGY_PROFILE_CAND_GROWTH_MIX),
+            ),
+            (STRATEGY_PROFILE_CAND_GROWTH_MIX, "env_base_profile")
+        );
+        assert_eq!(
+            strategy_baseline_profile_from_inputs("BTCUSDT", "5m", &HashMap::new(), None),
+            (STRATEGY_PROFILE_HI_WIN, "code_default")
+        );
+    }
+
+    #[test]
+    fn strict_profile_alias_rejects_unknown_values() {
+        assert!(strategy_profile_from_alias_strict("sol5m_sharp").is_ok());
+        assert!(strategy_profile_from_alias_strict("definitely_not_a_profile").is_err());
+    }
 }
 
 fn strategy_env_bool(name: &str, default: bool) -> bool {
