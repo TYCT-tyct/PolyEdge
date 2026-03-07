@@ -506,7 +506,13 @@ pub(super) fn build_execution_price_trace(
     final_request: &Value,
     response: Option<&Value>,
 ) -> Value {
-    let signal_price_cents = decision.get("price_cents").and_then(Value::as_f64);
+    let signal_price_cents = decision
+        .get("signal_price_cents")
+        .and_then(Value::as_f64)
+        .or_else(|| decision.get("price_cents").and_then(Value::as_f64));
+    let paper_exec_price_cents = decision
+        .get("paper_entry_exec_price_cents")
+        .and_then(Value::as_f64);
     let book_price_cents = request
         .get("price_parity")
         .and_then(|v| v.get("submit_price_cents"))
@@ -531,8 +537,17 @@ pub(super) fn build_execution_price_trace(
         (Some(signal), Some(accepted)) => Some(accepted - signal),
         _ => None,
     };
+    let paper_exec_vs_submit_cents = match (paper_exec_price_cents, submit_price_cents) {
+        (Some(exec), Some(submit)) => Some(submit - exec),
+        _ => None,
+    };
+    let paper_exec_vs_accepted_cents = match (paper_exec_price_cents, accepted_price_cents) {
+        (Some(exec), Some(accepted)) => Some(accepted - exec),
+        _ => None,
+    };
     json!({
         "signal_price_cents": signal_price_cents,
+        "paper_entry_exec_price_cents": paper_exec_price_cents,
         "book_price_cents": book_price_cents,
         "submit_price_cents": submit_price_cents,
         "final_submit_price_cents": final_submit_price_cents,
@@ -540,6 +555,8 @@ pub(super) fn build_execution_price_trace(
         "fill_price_cents": Value::Null,
         "signal_vs_submit_cents": signal_vs_submit_cents,
         "signal_vs_accepted_cents": signal_vs_accepted_cents,
+        "paper_exec_vs_submit_cents": paper_exec_vs_submit_cents,
+        "paper_exec_vs_accepted_cents": paper_exec_vs_accepted_cents,
         "price_parity": request.get("price_parity").cloned().unwrap_or(Value::Null),
     })
 }

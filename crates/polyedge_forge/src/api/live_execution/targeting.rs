@@ -956,3 +956,19 @@ async fn prefetch_rust_books_for_tokens(
     let rows = join_all(futures).await;
     rows.into_iter().collect()
 }
+
+pub(super) async fn load_cached_rust_books_for_tokens(
+    state: &ApiState,
+    token_ids: &[String],
+) -> HashMap<String, Option<GatewayBookSnapshot>> {
+    let futures = token_ids.iter().map(|token_id| {
+        let state = state.clone();
+        let token_id = token_id.clone();
+        async move {
+            let snapshot = state.get_rust_book_cache(&token_id).await;
+            (token_id, snapshot)
+        }
+    });
+    let rows = join_all(futures).await;
+    rows.into_iter().collect()
+}

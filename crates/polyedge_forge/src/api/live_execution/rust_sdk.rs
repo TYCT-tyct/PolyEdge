@@ -867,7 +867,7 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
 
     let mut out = Vec::<Value>::with_capacity(decisions.len());
     let token_ids = collect_decision_token_ids(target, decisions);
-    let mut book_cache = prefetch_rust_books_for_tokens(state, &ctx, &token_ids).await;
+    let mut book_cache = load_cached_rust_books_for_tokens(state, &token_ids).await;
     let exit_quote_override =
         position_state
             .entry_quote_usdc
@@ -992,6 +992,11 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
             .get("ts_ms")
             .and_then(Value::as_i64)
             .filter(|v| *v > 0);
+        let trigger_ts_ms = prepared
+            .decision
+            .get("trigger_ts_ms")
+            .and_then(Value::as_i64)
+            .filter(|v| *v > 0);
         let submit_start_ts_ms = Utc::now().timestamp_millis();
         let mut ack_ts_ms = submit_start_ts_ms;
         let order_started = Instant::now();
@@ -1067,6 +1072,11 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
         let final_price = attempt_payload.get("price").and_then(Value::as_f64);
         let final_size = attempt_payload.get("size").and_then(Value::as_f64);
         let final_quote = attempt_payload.get("quote_size_usdc").and_then(Value::as_f64);
+        let signal_to_trigger_ms = match (decision_ts_ms, trigger_ts_ms) {
+            (Some(signal_ts), Some(trigger_ts)) => Some(trigger_ts.saturating_sub(signal_ts)),
+            _ => None,
+        };
+        let trigger_to_submit_ms = trigger_ts_ms.map(|ts| submit_start_ts_ms.saturating_sub(ts));
         let signal_to_submit_ms = decision_ts_ms.map(|ts| submit_start_ts_ms.saturating_sub(ts));
         let signal_to_ack_ms = decision_ts_ms.map(|ts| ack_ts_ms.saturating_sub(ts));
         let submit_to_ack_ms = ack_ts_ms.saturating_sub(submit_start_ts_ms);
@@ -1078,6 +1088,9 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
             "submit_start_ts_ms": submit_start_ts_ms,
             "ack_ts_ms": ack_ts_ms,
             "decision_ts_ms": decision_ts_ms,
+            "trigger_ts_ms": trigger_ts_ms,
+            "signal_to_trigger_ms": signal_to_trigger_ms,
+            "trigger_to_submit_ms": trigger_to_submit_ms,
             "signal_to_submit_ms": signal_to_submit_ms,
             "signal_to_ack_ms": signal_to_ack_ms,
             "submit_to_ack_ms": submit_to_ack_ms,

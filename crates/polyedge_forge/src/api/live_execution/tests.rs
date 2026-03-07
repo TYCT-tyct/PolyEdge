@@ -289,6 +289,46 @@
     }
 
     #[test]
+    fn execution_price_trace_includes_paper_exec_deltas() {
+        let decision = json!({
+            "action": "enter",
+            "side": "DOWN",
+            "price_cents": 56.0,
+            "signal_price_cents": 56.0,
+            "paper_entry_exec_price_cents": 57.45
+        });
+        let request = json!({
+            "price": 0.58,
+            "price_parity": {
+                "submit_price_cents": 58.0
+            }
+        });
+        let final_request = request.clone();
+        let response = json!({"price": 0.59});
+        let trace = build_execution_price_trace(&decision, &request, &final_request, Some(&response));
+        assert_eq!(
+            trace
+                .get("paper_entry_exec_price_cents")
+                .and_then(Value::as_f64),
+            Some(57.45)
+        );
+        assert_eq!(
+            trace
+                .get("paper_exec_vs_submit_cents")
+                .and_then(Value::as_f64)
+                .map(|v| (v * 100.0).round() / 100.0),
+            Some(0.55)
+        );
+        assert_eq!(
+            trace
+                .get("paper_exec_vs_accepted_cents")
+                .and_then(Value::as_f64)
+                .map(|v| (v * 100.0).round() / 100.0),
+            Some(1.55)
+        );
+    }
+
+    #[test]
     fn decision_round_target_match_rejects_cross_round_target() {
         let start_ms = 1_700_000_000_000_i64;
         let mut target = test_target();

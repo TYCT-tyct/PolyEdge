@@ -895,11 +895,15 @@ fn latency_stats_json(samples: &[f64]) -> Value {
 }
 
 fn summarize_live_order_latency(orders: &[Value]) -> Value {
+    let signal_to_trigger = collect_latency_values_ms(orders, "signal_to_trigger_ms");
+    let trigger_to_submit = collect_latency_values_ms(orders, "trigger_to_submit_ms");
     let signal_to_submit = collect_latency_values_ms(orders, "signal_to_submit_ms");
     let signal_to_ack = collect_latency_values_ms(orders, "signal_to_ack_ms");
     let submit_to_ack = collect_latency_values_ms(orders, "submit_to_ack_ms");
     let order_latency = collect_latency_values_ms(orders, "order_latency_ms");
     json!({
+        "signal_to_trigger_ms": latency_stats_json(&signal_to_trigger),
+        "trigger_to_submit_ms": latency_stats_json(&trigger_to_submit),
         "signal_to_submit_ms": latency_stats_json(&signal_to_submit),
         "signal_to_ack_ms": latency_stats_json(&signal_to_ack),
         "submit_to_ack_ms": latency_stats_json(&submit_to_ack),
@@ -3137,7 +3141,7 @@ async fn live_runtime_loop(
                         cfg.quote_usdc,
                     );
                     let (
-                        selected_decisions,
+                        mut selected_decisions,
                         fresh_signal_count,
                         candidate_source,
                         current_entry_available,
@@ -3149,6 +3153,14 @@ async fn live_runtime_loop(
                         effective_drain_only,
                         prefer_action,
                     );
+                    let trigger_ts_ms = trigger_for_market.map(|v| v.ts_ms);
+                    if let Some(trigger_ts_ms) = trigger_ts_ms {
+                        for decision in &mut selected_decisions {
+                            if let Some(obj) = decision.as_object_mut() {
+                                obj.insert("trigger_ts_ms".to_string(), json!(trigger_ts_ms));
+                            }
+                        }
+                    }
                     let (exec_cfg_tuned, _) = state
                         .apply_aggressiveness_to_execution_cfg(
                             runtime_symbol,
@@ -3883,18 +3895,24 @@ mod tests {
     fn summarize_live_order_latency_reports_percentiles() {
         let orders = vec![
             json!({
+                "signal_to_trigger_ms": 3.0,
+                "trigger_to_submit_ms": 5.0,
                 "signal_to_submit_ms": 8.0,
                 "signal_to_ack_ms": 74.0,
                 "submit_to_ack_ms": 66.0,
                 "order_latency_ms": 68.0
             }),
             json!({
+                "signal_to_trigger_ms": 4.0,
+                "trigger_to_submit_ms": 10.0,
                 "signal_to_submit_ms": 14.0,
                 "signal_to_ack_ms": 88.0,
                 "submit_to_ack_ms": 74.0,
                 "order_latency_ms": 75.0
             }),
             json!({
+                "signal_to_trigger_ms": 6.0,
+                "trigger_to_submit_ms": 16.0,
                 "signal_to_submit_ms": 22.0,
                 "signal_to_ack_ms": 130.0,
                 "submit_to_ack_ms": 108.0,
@@ -3902,6 +3920,20 @@ mod tests {
             }),
         ];
         let summary = summarize_live_order_latency(&orders);
+        assert_eq!(
+            summary
+                .get("signal_to_trigger_ms")
+                .and_then(|v| v.get("p50_ms"))
+                .and_then(Value::as_f64),
+            Some(4.0)
+        );
+        assert_eq!(
+            summary
+                .get("trigger_to_submit_ms")
+                .and_then(|v| v.get("p95_ms"))
+                .and_then(Value::as_f64),
+            Some(16.0)
+        );
         assert_eq!(
             summary
                 .get("signal_to_submit_ms")
