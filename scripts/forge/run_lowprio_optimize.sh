@@ -1,55 +1,44 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Low-priority optimizer launcher for Ireland API.
-# - runs search in background with nice/ionice
-# - enforces bounded max-samples + bounded workers
-# - auto archives outputs after completion
-
 REPO_DIR="${REPO_DIR:-/home/ubuntu/PolyEdge}"
 OUT_ROOT="${OUT_ROOT:-/tmp/polyedge_bg}"
 ARCHIVE_ROOT="${ARCHIVE_ROOT:-$OUT_ROOT/archive}"
 
-MODE="${MODE:-parallel}" # parallel|refine
+MODE="${MODE:-overall}" # overall|highwin
 SYMBOL="${SYMBOL:-BTCUSDT}" # BTCUSDT|ETHUSDT|SOLUSDT|XRPUSDT
-MARKET_TYPE="${MARKET_TYPE:-5m}" # 5m only in current production phase
-SEED_CONFIG="${SEED_CONFIG:-configs/strategy-profiles/manual_hi_freq_2026_02_27.full.json}"
+MARKET_TYPE="${MARKET_TYPE:-5m}"
+SEED_CONFIG="${SEED_CONFIG:-configs/strategy-profiles/manual_balanced_2026_02_28.full.json}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:9810}"
 
-LOOKBACKS="${LOOKBACKS:-720,1440,2880}"
-MAX_TRADES="${MAX_TRADES:-900}"
+LOOKBACKS="${LOOKBACKS:-720,1440,2880,4320}"
+MAX_TRADES="${MAX_TRADES:-1100}"
 MAX_SAMPLES="${MAX_SAMPLES:-260000}"
-
+GENERATIONS="${GENERATIONS:-24}"
+POPULATION="${POPULATION:-14}"
+ELITISM="${ELITISM:-5}"
+PHASE2_ITERS="${PHASE2_ITERS:-120}"
 WORKERS="${WORKERS:-2}"
-GENERATIONS="${GENERATIONS:-14}"
-POPULATION="${POPULATION:-10}"
-MIN_TRADES="${MIN_TRADES:-220}"
-TRADE_TARGET="${TRADE_TARGET:-450}"
-WIN_FLOOR="${WIN_FLOOR:-88}"
-SEED="${SEED:-20260227}"
-
-REFINE_ITERS="${REFINE_ITERS:-120}"
-REFINE_LOOKBACK_MINUTES="${REFINE_LOOKBACK_MINUTES:-1440}"
-REFINE_MAX_TRADES="${REFINE_MAX_TRADES:-900}"
-REFINE_MIN_TRADES="${REFINE_MIN_TRADES:-120}"
-REFINE_WIN_FLOOR="${REFINE_WIN_FLOOR:-84}"
+MIN_TRADES="${MIN_TRADES:-180}"
+TRADE_TARGET="${TRADE_TARGET:-360}"
+WIN_TARGET="${WIN_TARGET:-76}"
+DD_TARGET="${DD_TARGET:-120}"
+SEED="${SEED:-20260307}"
+TIMEOUT="${TIMEOUT:-220}"
 RETRIES="${RETRIES:-2}"
-TIMEOUT="${TIMEOUT:-180}"
-
 NICE_LEVEL="${NICE_LEVEL:-10}"
 JOB_TAG="${JOB_TAG:-${MODE}_${MARKET_TYPE}}"
 
 usage() {
   cat <<'USAGE'
-Usage: run_lowprio_optimize.sh [--mode parallel|refine] [--symbol SYMBOL] [--market-type 5m] [--seed-config PATH]
-                               [--job-tag TAG] [--max-samples N] [--workers N]
+Usage: run_lowprio_optimize.sh [--mode overall|highwin] [--symbol SYMBOL] [--market-type 5m]
+                               [--seed-config PATH] [--job-tag TAG] [--max-samples N] [--workers N]
 
 Environment overrides:
   REPO_DIR OUT_ROOT ARCHIVE_ROOT BASE_URL
   MODE SYMBOL MARKET_TYPE SEED_CONFIG LOOKBACKS MAX_TRADES MAX_SAMPLES
-  WORKERS GENERATIONS POPULATION MIN_TRADES TRADE_TARGET WIN_FLOOR SEED
-  REFINE_ITERS RETRIES TIMEOUT NICE_LEVEL JOB_TAG
-  REFINE_LOOKBACK_MINUTES REFINE_MAX_TRADES REFINE_MIN_TRADES REFINE_WIN_FLOOR
+  GENERATIONS POPULATION ELITISM PHASE2_ITERS WORKERS
+  MIN_TRADES TRADE_TARGET WIN_TARGET DD_TARGET SEED TIMEOUT RETRIES NICE_LEVEL JOB_TAG
 USAGE
 }
 
@@ -67,13 +56,18 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$MARKET_TYPE" != "5m" ]]; then
-  echo "[lowprio-opt] only 5m is enabled now (got: $MARKET_TYPE)" >&2
+if [[ "$MARKET_TYPE" != "5m" && "$MARKET_TYPE" != "15m" ]]; then
+  echo "[lowprio-opt] unsupported MARKET_TYPE=$MARKET_TYPE" >&2
   exit 2
 fi
-if [[ "$MODE" != "parallel" && "$MODE" != "refine" ]]; then
+if [[ "$MODE" != "overall" && "$MODE" != "highwin" ]]; then
   echo "[lowprio-opt] invalid MODE=$MODE" >&2
   exit 2
+fi
+if [[ "$MODE" == "highwin" ]]; then
+  WIN_TARGET="${WIN_TARGET:-84}"
+  DD_TARGET="${DD_TARGET:-55}"
+  TRADE_TARGET="${TRADE_TARGET:-220}"
 fi
 
 mkdir -p "$OUT_ROOT" "$ARCHIVE_ROOT"
@@ -82,6 +76,7 @@ job_id="${JOB_TAG}_${SYMBOL}_${ts}"
 log_file="$OUT_ROOT/${job_id}.log"
 checkpoint_file="$OUT_ROOT/${job_id}.checkpoint.json"
 result_file="$OUT_ROOT/${job_id}.result.json"
+profile_file="$OUT_ROOT/${job_id}.profile.json"
 meta_file="$OUT_ROOT/${job_id}.meta.json"
 pid_file="$OUT_ROOT/${job_id}.pid"
 
@@ -96,46 +91,32 @@ if command -v ionice >/dev/null 2>&1; then
   ionice_prefix=(ionice -c3)
 fi
 
-cmd=()
-if [[ "$MODE" == "parallel" ]]; then
-  cmd=(
-    python3 -u scripts/forge/strategy_parallel_search.py
-    --base-url "$BASE_URL"
-    --symbol "$SYMBOL"
-    --market-type "$MARKET_TYPE"
-    --seed-config "$SEED_CONFIG"
-    --lookbacks "$LOOKBACKS"
-    --max-trades "$MAX_TRADES"
-    --max-samples "$MAX_SAMPLES"
-    --generations "$GENERATIONS"
-    --population "$POPULATION"
-    --workers "$WORKERS"
-    --min-trades "$MIN_TRADES"
-    --trade-target "$TRADE_TARGET"
-    --win-floor "$WIN_FLOOR"
-    --timeout "$TIMEOUT"
-    --retries "$RETRIES"
-    --checkpoint "$checkpoint_file"
-    --out "$result_file"
-    --seed "$SEED"
-  )
-else
-  cmd=(
-    python3 -u scripts/forge/strategy_refine_search.py
-    --base-url "$BASE_URL"
-    --symbol "$SYMBOL"
-    --market-type "$MARKET_TYPE"
-    --input "$SEED_CONFIG"
-    --iters "$REFINE_ITERS"
-    --lookback-minutes "$REFINE_LOOKBACK_MINUTES"
-    --max-trades "$REFINE_MAX_TRADES"
-    --min-trades "$REFINE_MIN_TRADES"
-    --win-floor "$REFINE_WIN_FLOOR"
-    --max-samples "$MAX_SAMPLES"
-    --retries "$RETRIES"
-    --out "$result_file"
-  )
-fi
+cmd=(
+  python3 -u scripts/forge/strategy_search_paper_full.py
+  --base-url "$BASE_URL"
+  --symbol "$SYMBOL"
+  --market-type "$MARKET_TYPE"
+  --seed-glob "configs/strategy-profiles/*.full.json"
+  --extra-seed "$SEED_CONFIG"
+  --lookbacks "$LOOKBACKS"
+  --max-trades "$MAX_TRADES"
+  --max-samples "$MAX_SAMPLES"
+  --generations "$GENERATIONS"
+  --population "$POPULATION"
+  --elitism "$ELITISM"
+  --phase2-iters "$PHASE2_ITERS"
+  --workers "$WORKERS"
+  --min-trades "$MIN_TRADES"
+  --trade-target "$TRADE_TARGET"
+  --win-target "$WIN_TARGET"
+  --dd-target "$DD_TARGET"
+  --timeout "$TIMEOUT"
+  --retries "$RETRIES"
+  --seed "$SEED"
+  --checkpoint "$checkpoint_file"
+  --out "$result_file"
+  --save-profile "$profile_file"
+)
 
 {
   printf '{\n'
@@ -155,7 +136,6 @@ nohup "${ionice_prefix[@]}" nice -n "$NICE_LEVEL" "${cmd[@]}" >"$log_file" 2>&1 
 pid=$!
 echo "$pid" > "$pid_file"
 
-# Async archiver (non-blocking): waits process exit, snapshots outputs into archive dir.
 (
   while kill -0 "$pid" >/dev/null 2>&1; do
     sleep 5
@@ -167,18 +147,17 @@ echo "$pid" > "$pid_file"
   cp -f "$log_file" "${archive_prefix}.log" 2>/dev/null || true
   cp -f "$checkpoint_file" "${archive_prefix}.checkpoint.json" 2>/dev/null || true
   cp -f "$result_file" "${archive_prefix}.result.json" 2>/dev/null || true
+  cp -f "$profile_file" "${archive_prefix}.profile.json" 2>/dev/null || true
 
   python3 - <<PY >/dev/null 2>&1
 import json
 from pathlib import Path
 meta = Path(r"$meta_file")
-if meta.exists():
-    data = json.loads(meta.read_text(encoding="utf-8"))
-else:
-    data = {}
+data = json.loads(meta.read_text(encoding="utf-8")) if meta.exists() else {}
 data["ended_at_utc"] = r"$end_utc"
 data["result_exists"] = Path(r"$result_file").exists()
 data["checkpoint_exists"] = Path(r"$checkpoint_file").exists()
+data["profile_exists"] = Path(r"$profile_file").exists()
 meta.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 Path(r"${archive_prefix}.meta.json").write_text(
     json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -194,5 +173,6 @@ mode: $MODE
 log: $log_file
 checkpoint: $checkpoint_file
 result: $result_file
+profile: $profile_file
 archive_dir: $ARCHIVE_ROOT
 EOF

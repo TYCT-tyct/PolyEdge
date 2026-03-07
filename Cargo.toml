@@ -6,7 +6,6 @@ members = [
   "crates/feed_reference",
   "crates/market_discovery",
   "crates/polyedge_forge",
-  "crates/polyedge_hpo",
 ]
 
 [workspace.package]

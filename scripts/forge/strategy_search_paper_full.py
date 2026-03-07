@@ -33,7 +33,6 @@ PARAM_SPECS: dict[str, dict] = {
     "max_entries_per_round": {"type": "int", "lo": 1, "hi": 16, "step": 1},
     "max_exec_spread_cents": {"type": "float", "lo": 0.2, "hi": 30.0, "step": 0.9},
     "slippage_cents_per_side": {"type": "float", "lo": 0.0, "hi": 10.0, "step": 0.15},
-    "fee_cents_per_side": {"type": "float", "lo": 0.0, "hi": 12.0, "step": 0.18},
     "emergency_wide_spread_penalty_ratio": {"type": "float", "lo": 0.2, "hi": 3.0, "step": 0.15},
     "stop_loss_grace_ticks": {"type": "int", "lo": 0, "hi": 8, "step": 1},
     "stop_loss_hard_mult": {"type": "float", "lo": 1.0, "hi": 3.0, "step": 0.1},
@@ -69,6 +68,8 @@ def sanitize_cfg(cfg: dict) -> dict:
     for k in PARAM_SPECS:
         if k in cfg:
             out[k] = clamp_value(k, cfg[k])
+    # Forge paper ignores fee_cents_per_side and forces its internal fee model.
+    out["fee_cents_per_side"] = 0.0
     if "entry_threshold_base" in out and "entry_threshold_cap" in out:
         min_cap = float(out["entry_threshold_base"]) + 0.01
         out["entry_threshold_cap"] = max(float(out["entry_threshold_cap"]), min_cap)
@@ -290,7 +291,7 @@ def mutate_cfg(base: dict, scale: float) -> dict:
         if k not in c:
             continue
         # Keep fee/slippage relatively stable to reduce fake alpha.
-        if k in {"fee_cents_per_side", "slippage_cents_per_side"} and random.random() < 0.75:
+        if k == "slippage_cents_per_side" and random.random() < 0.75:
             continue
         if random.random() < (0.55 if PARAM_SPECS[k]["type"] != "bool" else 0.20):
             c[k] = mutate_value(k, c[k], scale)

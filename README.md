@@ -5,7 +5,6 @@ PolyEdge is now a Forge-first repository. Legacy latency-arbitrage stacks and si
 ## Kept Components
 
 - `crates/polyedge_forge` - recorder, API, paper/live strategy runtime
-- `crates/polyedge_hpo` - dedicated hyperparameter optimization service (independent from Forge runtime)
 - `crates/core_types` - shared domain types
 - `crates/feed_polymarket` - Polymarket feed adapter
 - `crates/feed_reference` - reference feed adapter
@@ -35,24 +34,14 @@ npm --prefix heatmap_dashboard ci
 npm --prefix heatmap_dashboard run build
 ```
 
-## Run HPO Service
+## Search Params
+
+Use the Forge `paper` endpoint and the scripts under `scripts/forge`.
+
+The supported search path is the paper-only toolchain:
 
 ```bash
-cargo run -p polyedge_hpo
-```
-
-Submit one search job:
-
-```bash
-curl -X POST http://127.0.0.1:9820/api/hpo/jobs \
-  -H "content-type: application/json" \
-  -d '{"symbol":"BTCUSDT","market_type":"5m","lookbacks":[720,1440,2880]}'
-```
-
-Read job result:
-
-```bash
-curl http://127.0.0.1:9820/api/hpo/jobs/<job_id>
+python scripts/forge/strategy_search_paper_full.py --base-url http://127.0.0.1:9810 --symbol BTCUSDT --market-type 5m
 ```
 
 ## Live Execution Profiles
