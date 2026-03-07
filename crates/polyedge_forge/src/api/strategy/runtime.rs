@@ -162,30 +162,24 @@ pub(super) fn strategy_sample_from_snapshot_event(
         .and_then(Value::as_f64)
         .or_else(|| event.get("mid_no").and_then(Value::as_f64))
         .unwrap_or((1.0 - p_up).clamp(0.0, 1.0));
-    let raw_bid_yes = event.get("bid_yes").and_then(Value::as_f64);
-    let raw_ask_yes = event.get("ask_yes").and_then(Value::as_f64);
-    let raw_bid_no = event.get("bid_no").and_then(Value::as_f64);
-    let raw_ask_no = event.get("ask_no").and_then(Value::as_f64);
-    let raw_spread_up = match (raw_bid_yes, raw_ask_yes) {
-        (Some(b), Some(a)) if a.is_finite() && b.is_finite() => (a - b).abs(),
-        _ => 0.012,
-    };
-    let raw_spread_down = match (raw_bid_no, raw_ask_no) {
-        (Some(b), Some(a)) if a.is_finite() && b.is_finite() => (a - b).abs(),
-        _ => 0.012,
-    };
-    let spread_up = raw_spread_up.clamp(0.003, 0.04);
-    let spread_down = raw_spread_down.clamp(0.003, 0.04);
-    let mut bid_yes = (p_up - spread_up * 0.5).clamp(0.0, 1.0);
-    let mut ask_yes = (p_up + spread_up * 0.5).clamp(0.0, 1.0);
-    if bid_yes > ask_yes {
-        std::mem::swap(&mut bid_yes, &mut ask_yes);
-    }
-    let mut bid_no = (p_no_mid - spread_down * 0.5).clamp(0.0, 1.0);
-    let mut ask_no = (p_no_mid + spread_down * 0.5).clamp(0.0, 1.0);
-    if bid_no > ask_no {
-        std::mem::swap(&mut bid_no, &mut ask_no);
-    }
+    let bid_yes = event
+        .get("bid_yes")
+        .and_then(Value::as_f64)
+        .unwrap_or((p_up - 0.006).clamp(0.0, 1.0));
+    let ask_yes = event
+        .get("ask_yes")
+        .and_then(Value::as_f64)
+        .unwrap_or((p_up + 0.006).clamp(0.0, 1.0));
+    let bid_no = event
+        .get("bid_no")
+        .and_then(Value::as_f64)
+        .unwrap_or((p_no_mid - 0.006).clamp(0.0, 1.0));
+    let ask_no = event
+        .get("ask_no")
+        .and_then(Value::as_f64)
+        .unwrap_or((p_no_mid + 0.006).clamp(0.0, 1.0));
+    let spread_up = (ask_yes - bid_yes).abs().clamp(0.003, 0.04);
+    let spread_down = (ask_no - bid_no).abs().clamp(0.003, 0.04);
     let spread_mid = ((spread_up + spread_down) * 0.5).clamp(0.001, 0.08);
     let delta_pct = event
         .get("delta_pct_smooth")
@@ -714,6 +708,7 @@ pub(super) struct StrategyPaperLiveReq<'a> {
     pub(super) max_trades: usize,
     pub(super) cfg: &'a StrategyRuntimeConfig,
     pub(super) config_source: &'a str,
+    pub(super) config_resolution: Value,
     pub(super) live_execute: bool,
     pub(super) live_quote_usdc: f64,
     pub(super) live_max_orders: usize,
@@ -778,6 +773,7 @@ pub(super) async fn strategy_paper_live_from_samples(
         max_trades: _,
         cfg,
         config_source,
+        config_resolution,
         live_execute,
         live_quote_usdc,
         live_max_orders,
@@ -832,6 +828,7 @@ pub(super) async fn strategy_paper_live_from_samples(
             "samples": samples.len(),
             "config_source": config_source,
             "baseline_profile": baseline_profile,
+            "config_resolution": config_resolution,
             "fixed_guard": fixed_guard,
             "config": strategy_cfg_json(cfg),
             "paper_cost_model": strategy_paper_cost_model_json(cfg),
@@ -939,6 +936,7 @@ pub(super) async fn strategy_paper_live_from_samples(
         "samples": samples.len(),
         "config_source": config_source,
         "baseline_profile": baseline_profile,
+        "config_resolution": config_resolution,
         "fixed_guard": fixed_guard,
         "config": strategy_cfg_json(cfg),
         "paper_cost_model": strategy_paper_cost_model_json(cfg),

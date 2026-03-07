@@ -1563,7 +1563,15 @@ impl ApiState {
             });
         for sample in samples {
             entry.updated_at_ms = sample.ts_ms;
-            entry.samples.push_back(sample);
+            if let Some(last) = entry.samples.back_mut() {
+                if last.round_id == sample.round_id && last.ts_ms / 1000 == sample.ts_ms / 1000 {
+                    *last = sample;
+                } else {
+                    entry.samples.push_back(sample);
+                }
+            } else {
+                entry.samples.push_back(sample);
+            }
         }
         let max_points = runtime_event_sample_buffer_max();
         while entry.samples.len() > max_points {
@@ -2017,6 +2025,7 @@ struct ChartQueryParams {
     market_type: String,
     minutes: Option<u32>,
     max_points: Option<u32>,
+    symbol: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2029,11 +2038,17 @@ struct CollectorMetricsQueryParams {
 struct RoundQueryParams {
     market_type: String,
     limit: Option<u32>,
+    symbol: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AvailableRoundsQueryParams {
     market_type: String,
+    symbol: Option<String>,
+    date: Option<String>,
+    limit: Option<u32>,
+    days_limit: Option<u32>,
+    include_rounds: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2041,20 +2056,33 @@ struct RoundChartQueryParams {
     round_id: String,
     market_type: Option<String>,
     max_points: Option<u32>,
+    symbol: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct HeatmapQueryParams {
     market_type: String,
     lookback_hours: Option<u32>,
+    symbol: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AccuracyQueryParams {
     market_type: String,
+    symbol: Option<String>,
     window: Option<u32>,
     lookback_hours: Option<u32>,
     limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StatsQueryParams {
+    symbol: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WsLiveQueryParams {
+    symbol: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2886,10 +2914,38 @@ async fn live_runtime_loop(
                 market_next_due_ms.insert(market_type.to_string(), next_due);
                 continue;
             }
-            let runtime_cfg_source =
-                strategy_current_default_profile_name_for_scope(runtime_symbol, market_type);
-            let strategy_cfg =
-                strategy_current_default_config_for_scope(runtime_symbol, market_type);
+            let resolved_cfg = match strategy_resolve_effective_config(
+                &state,
+                runtime_symbol,
+                market_type,
+                None,
+                true,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::warn!(error = %err.message, symbol = runtime_symbol, market_type = market_type, "strategy config resolve failed, fallback to baseline");
+                    StrategyResolvedConfig {
+                        cfg: strategy_current_default_config_for_scope(runtime_symbol, market_type),
+                        baseline_profile: strategy_current_default_profile_name_for_scope(
+                            runtime_symbol,
+                            market_type,
+                        ),
+                        baseline_layer: "fallback",
+                        config_source: strategy_current_default_profile_name_for_scope(
+                            runtime_symbol,
+                            market_type,
+                        )
+                        .to_string(),
+                        config_layer: "fallback",
+                        source_key: None,
+                    }
+                }
+            };
+            let runtime_cfg_source = resolved_cfg.baseline_profile;
+            let runtime_config_resolution = strategy_config_resolution_json(&resolved_cfg);
+            let strategy_cfg = resolved_cfg.cfg;
             let runtime_req = StrategyPaperLiveReq {
                 state: &state,
                 symbol: runtime_symbol,
@@ -2900,7 +2956,8 @@ async fn live_runtime_loop(
                 max_points: cfg.max_points,
                 max_trades: cfg.max_trades,
                 cfg: &strategy_cfg,
-                config_source: runtime_cfg_source,
+                config_source: resolved_cfg.config_source.as_str(),
+                config_resolution: runtime_config_resolution,
                 live_execute: effective_live_execute,
                 live_quote_usdc: cfg.quote_usdc,
                 live_max_orders: cfg.max_orders,
@@ -3611,35 +3668,6 @@ async fn live_runtime_loop(
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::sync::Arc;
-    use tokio::sync::{RwLock, Semaphore};
-
-    fn test_api_state() -> ApiState {
-        ApiState {
-            ch_url: None,
-            redis_prefix: "test".to_string(),
-            redis_client: None,
-            redis_manager: None,
-            chart_cache: Arc::new(RwLock::new(HashMap::new())),
-            live_position_states: Arc::new(RwLock::new(HashMap::new())),
-            live_decision_guard: Arc::new(RwLock::new(HashMap::new())),
-            live_events: Arc::new(RwLock::new(VecDeque::new())),
-            live_event_seq: Arc::new(RwLock::new(0)),
-            live_pending_orders: Arc::new(RwLock::new(HashMap::new())),
-            live_runtime_snapshots: Arc::new(RwLock::new(HashMap::new())),
-            live_runtime_controls: Arc::new(RwLock::new(HashMap::new())),
-            live_persist_inflight: Arc::new(RwLock::new(HashSet::new())),
-            live_execution_aggr_states: Arc::new(RwLock::new(HashMap::new())),
-            live_rust_executor: Arc::new(RwLock::new(None)),
-            live_rust_book_cache: Arc::new(RwLock::new(HashMap::new())),
-            runtime_alert_throttle: Arc::new(RwLock::new(HashMap::new())),
-            runtime_daily_report_sent: Arc::new(RwLock::new(HashSet::new())),
-            strategy_heavy_slots: Arc::new(Semaphore::new(1)),
-            strategy_live_source_slots: Arc::new(Semaphore::new(8)),
-            runtime_event_samples: Arc::new(RwLock::new(HashMap::new())),
-            gateway_http_client: Arc::new(reqwest::Client::new()),
-        }
-    }
 
     #[test]
     fn live_snapshot_rejects_old_timestamp() {
@@ -3730,85 +3758,6 @@ mod tests {
         assert_eq!(parsed.0, "BTCUSDT");
         assert_eq!(parsed.1, "5m");
         assert_eq!(parsed.2, 123_456_i64);
-    }
-
-    #[test]
-    fn strategy_sample_from_snapshot_event_uses_synthetic_band_from_smoothed_mid() {
-        let payload = json!({
-            "symbol": "BTCUSDT",
-            "timeframe": "5m",
-            "round_id": "BTCUSDT_5m_123000",
-            "ts_ireland_sample_ms": 123_456_i64,
-            "remaining_ms": 40_000_i64,
-            "mid_yes_smooth": 0.62,
-            "mid_no_smooth": 0.38,
-            "bid_yes": 0.01,
-            "ask_yes": 0.99,
-            "bid_no": 0.01,
-            "ask_no": 0.99,
-            "delta_pct_smooth": 0.12,
-            "velocity_bps_per_sec": 8.0,
-            "acceleration": 0.6
-        });
-        let (_, _, _, sample) =
-            strategy_sample_from_snapshot_event(&payload).expect("runtime sample");
-        assert!((sample.bid_yes - 0.60).abs() < 1e-9);
-        assert!((sample.ask_yes - 0.64).abs() < 1e-9);
-        assert!((sample.bid_no - 0.36).abs() < 1e-9);
-        assert!((sample.ask_no - 0.40).abs() < 1e-9);
-        assert!((sample.spread_up - 0.04).abs() < 1e-9);
-        assert!((sample.spread_down - 0.04).abs() < 1e-9);
-    }
-
-    #[tokio::test]
-    async fn runtime_event_buffer_preserves_multiple_samples_within_same_second() {
-        let state = test_api_state();
-        let now_ms = Utc::now().timestamp_millis();
-        let base_ts = now_ms.saturating_sub(1_000);
-        let samples = vec![
-            StrategySample {
-                ts_ms: base_ts,
-                round_id: "BTCUSDT_5m_0".to_string(),
-                remaining_ms: 10_000,
-                p_up: 0.5,
-                delta_pct: 0.0,
-                velocity: 0.0,
-                acceleration: 0.0,
-                bid_yes: 0.49,
-                ask_yes: 0.51,
-                bid_no: 0.49,
-                ask_no: 0.51,
-                spread_up: 0.02,
-                spread_down: 0.02,
-                spread_mid: 0.02,
-            },
-            StrategySample {
-                ts_ms: base_ts + 100,
-                round_id: "BTCUSDT_5m_0".to_string(),
-                remaining_ms: 9_900,
-                p_up: 0.51,
-                delta_pct: 0.1,
-                velocity: 1.0,
-                acceleration: 0.2,
-                bid_yes: 0.50,
-                ask_yes: 0.52,
-                bid_no: 0.48,
-                ask_no: 0.50,
-                spread_up: 0.02,
-                spread_down: 0.02,
-                spread_mid: 0.02,
-            },
-        ];
-        state
-            .upsert_runtime_event_samples_batch("BTCUSDT", "5m", samples)
-            .await;
-        let loaded = state
-            .get_runtime_event_samples("BTCUSDT", "5m", 10, 100)
-            .await
-            .expect("samples");
-        assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].ts_ms, base_ts);
-        assert_eq!(loaded[1].ts_ms, base_ts + 100);
     }
 
     #[test]

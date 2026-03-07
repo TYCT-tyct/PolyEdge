@@ -5,7 +5,19 @@ pub(super) async fn strategy_paper(
     let source_mode = parse_strategy_paper_source(params.source.as_deref());
     let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
     let symbol = resolve_strategy_symbol(params.symbol.as_deref())?;
-    let baseline_profile = strategy_current_default_profile_name_for_scope(symbol, market_type);
+    let prefer_live_doc = matches!(
+        source_mode,
+        StrategyPaperSource::Live | StrategyPaperSource::Auto
+    );
+    let resolved_cfg = strategy_resolve_effective_config(
+        &state,
+        symbol,
+        market_type,
+        params.profile.as_deref(),
+        prefer_live_doc,
+    )
+    .await?;
+    let baseline_profile = resolved_cfg.baseline_profile;
     let _live_source_permit = if matches!(
         source_mode,
         StrategyPaperSource::Live | StrategyPaperSource::Auto
@@ -25,74 +37,89 @@ pub(super) async fn strategy_paper(
         None
     };
 
-    let mut cfg = strategy_current_default_config_for_scope(symbol, market_type);
-    let mut config_source = baseline_profile;
-    if let Some(profile_raw) = params.profile.as_deref() {
-        if let Some((profile_name, profile_cfg)) = strategy_profile_from_alias(profile_raw) {
-            cfg = profile_cfg;
-            config_source = profile_name;
-        }
-    }
+    let mut cfg = resolved_cfg.cfg;
+    let mut config_source = resolved_cfg.config_source.clone();
     if !matches!(source_mode, StrategyPaperSource::Live) {
+        let mut request_overrides_applied = false;
         if let Some(v) = params.entry_threshold_base {
             cfg.entry_threshold_base = v.clamp(0.40, 0.95);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.entry_threshold_cap {
             cfg.entry_threshold_cap = v.clamp(cfg.entry_threshold_base, 0.99);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.spread_limit_prob {
             cfg.spread_limit_prob = v.clamp(0.005, 0.12);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.entry_edge_prob {
             cfg.entry_edge_prob = v.clamp(0.002, 0.25);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.entry_min_potential_cents {
             cfg.entry_min_potential_cents = v.clamp(1.0, 70.0);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.entry_max_price_cents {
             cfg.entry_max_price_cents = v.clamp(45.0, 98.5);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.min_hold_ms {
             cfg.min_hold_ms = v.clamp(0, 240_000);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.stop_loss_cents {
             cfg.stop_loss_cents = v.clamp(2.0, 60.0);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.reverse_signal_threshold {
             cfg.reverse_signal_threshold = v.clamp(-0.95, -0.02);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.reverse_signal_ticks {
             cfg.reverse_signal_ticks = v.clamp(1, 12) as usize;
+            request_overrides_applied = true;
         }
         if let Some(v) = params.trail_activate_profit_cents {
             cfg.trail_activate_profit_cents = v.clamp(2.0, 80.0);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.trail_drawdown_cents {
             cfg.trail_drawdown_cents = v.clamp(1.0, 50.0);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.take_profit_near_max_cents {
             cfg.take_profit_near_max_cents = v.clamp(70.0, 99.5);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.endgame_take_profit_cents {
             cfg.endgame_take_profit_cents = v.clamp(50.0, 99.0);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.endgame_remaining_ms {
             cfg.endgame_remaining_ms = v.clamp(1_000, 180_000);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.liquidity_widen_prob {
             cfg.liquidity_widen_prob = v.clamp(0.01, 0.2);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.cooldown_ms {
             cfg.cooldown_ms = v.clamp(0, 120_000);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.max_entries_per_round {
             cfg.max_entries_per_round = v.clamp(1, 16) as usize;
+            request_overrides_applied = true;
         }
         if let Some(v) = params.max_exec_spread_cents {
             cfg.max_exec_spread_cents = v.clamp(0.2, 30.0);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.slippage_cents_per_side {
             cfg.slippage_cents_per_side = v.clamp(0.0, 10.0);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.fee_cents_per_side {
             let _ = v;
@@ -100,58 +127,78 @@ pub(super) async fn strategy_paper(
         cfg.fee_cents_per_side = 0.0;
         if let Some(v) = params.emergency_wide_spread_penalty_ratio {
             cfg.emergency_wide_spread_penalty_ratio = v.clamp(0.2, 3.0);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.stop_loss_grace_ticks {
             cfg.stop_loss_grace_ticks = v.clamp(0, 8) as usize;
+            request_overrides_applied = true;
         }
         if let Some(v) = params.stop_loss_hard_mult {
             cfg.stop_loss_hard_mult = v.clamp(1.0, 3.0);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.stop_loss_reverse_extra_ticks {
             cfg.stop_loss_reverse_extra_ticks = v.clamp(0, 6) as usize;
+            request_overrides_applied = true;
         }
         if let Some(v) = params.loss_cluster_limit {
             cfg.loss_cluster_limit = v.clamp(0, 8) as usize;
+            request_overrides_applied = true;
         }
         if let Some(v) = params.loss_cluster_cooldown_ms {
             cfg.loss_cluster_cooldown_ms = v.clamp(0, 120_000);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.noise_gate_enabled {
             cfg.noise_gate_enabled = v;
+            request_overrides_applied = true;
         }
         if let Some(v) = params.noise_gate_threshold_add {
             cfg.noise_gate_threshold_add = v.clamp(0.0, 0.20);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.noise_gate_edge_add {
             cfg.noise_gate_edge_add = v.clamp(0.0, 0.12);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.noise_gate_spread_scale {
             cfg.noise_gate_spread_scale = v.clamp(0.5, 1.2);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.vic_enabled {
             cfg.vic_enabled = v;
+            request_overrides_applied = true;
         }
         if let Some(v) = params.vic_target_entries_per_hour {
             cfg.vic_target_entries_per_hour = v.clamp(0.0, 120.0);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.vic_deadband_ratio {
             cfg.vic_deadband_ratio = v.clamp(0.0, 0.8);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.vic_threshold_relax_max {
             cfg.vic_threshold_relax_max = v.clamp(0.0, 0.2);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.vic_edge_relax_max {
             cfg.vic_edge_relax_max = v.clamp(0.0, 0.1);
+            request_overrides_applied = true;
         }
         if let Some(v) = params.vic_spread_relax_max {
             cfg.vic_spread_relax_max = v.clamp(0.0, 0.8);
+            request_overrides_applied = true;
         }
         if cfg.entry_threshold_cap < cfg.entry_threshold_base {
             cfg.entry_threshold_cap = cfg.entry_threshold_base;
         }
+        if request_overrides_applied {
+            config_source = format!("{config_source}+request_overrides");
+        }
     }
 
-    let fixed_guard = strategy_fixed_guard_payload(&cfg, config_source);
+    let fixed_guard = strategy_fixed_guard_payload(&cfg, &config_source);
+    let config_resolution = strategy_config_resolution_json(&resolved_cfg);
     let runtime_defaults = LiveRuntimeConfig::from_env();
     let full_history = params.full_history.unwrap_or(false);
     let lookback_minutes = params
@@ -223,6 +270,7 @@ pub(super) async fn strategy_paper(
             "market_type": market_type,
             "symbol": symbol,
             "fixed_guard": fixed_guard,
+            "config_resolution": config_resolution,
             "runtime_defaults": {
                 "lookback_minutes": runtime_defaults.lookback_minutes,
                 "max_points": runtime_defaults.max_points,
@@ -276,6 +324,7 @@ pub(super) async fn strategy_paper(
         "config_source": config_source,
         "baseline_profile": baseline_profile,
         "fixed_guard": fixed_guard,
+        "config_resolution": config_resolution,
         "config": strategy_cfg_json(&cfg),
         "paper_cost_model": strategy_paper_cost_model_json(&cfg),
         "current": run.current,

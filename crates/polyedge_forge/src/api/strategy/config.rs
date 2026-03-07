@@ -365,12 +365,20 @@ impl Drop for StrategyHeavyScope {
 }
 
 fn strategy_select_profile_name() -> &'static str {
-    if let Ok(raw) = std::env::var("FORGE_STRATEGY_BASE_PROFILE") {
-        if let Some(profile) = strategy_profile_name_from_alias(raw.trim()) {
-            return profile;
-        }
-    }
     STRATEGY_PROFILE_HI_WIN
+}
+
+fn strategy_base_profile_from_env() -> Option<&'static str> {
+    std::env::var("FORGE_STRATEGY_BASE_PROFILE")
+        .ok()
+        .and_then(|raw| strategy_profile_name_from_alias(raw.trim()))
+}
+
+fn strategy_profile_from_alias_strict(
+    raw: &str,
+) -> Result<(&'static str, StrategyRuntimeConfig), &'static str> {
+    let profile = strategy_profile_name_from_alias(raw).ok_or("unknown profile alias")?;
+    Ok((profile, strategy_cfg_for_profile_name(profile)))
 }
 
 fn strategy_profile_name_from_alias(raw: &str) -> Option<&'static str> {
@@ -393,6 +401,9 @@ fn strategy_profile_name_from_alias(raw: &str) -> Option<&'static str> {
         "sol5m_balance"
         | "sol5m_balance_2026_03_07"
         | "fev1_sol5m_balance_2026_03_07" => Some(STRATEGY_PROFILE_SOL_5M_BALANCE),
+        "sol5m_sharp"
+        | "sol5m_sharp_2026_03_07"
+        | "fev1_sol5m_sharp_2026_03_07" => Some(STRATEGY_PROFILE_SOL_5M_SHARP),
         "cand_growth_mix" | "growth_mix" | "growth" | "fev1_cand_growth_mix_2026_02_28" => {
             Some(STRATEGY_PROFILE_CAND_GROWTH_MIX)
         }
@@ -403,97 +414,256 @@ fn strategy_profile_name_from_alias(raw: &str) -> Option<&'static str> {
 fn strategy_scope_profile_overrides() -> &'static HashMap<String, &'static str> {
     static OVERRIDES: OnceLock<HashMap<String, &'static str>> = OnceLock::new();
     OVERRIDES.get_or_init(|| {
-        let mut out = HashMap::<String, &'static str>::new();
-        let Ok(raw) = std::env::var("FORGE_STRATEGY_BASE_PROFILE_BY_SCOPE") else {
-            return out;
-        };
-        for entry in raw.split(',').map(str::trim).filter(|v| !v.is_empty()) {
-            let Some((scope_raw, profile_raw)) = entry.split_once('=') else {
-                continue;
-            };
-            let scope = scope_raw.trim();
-            let Some(profile) = strategy_profile_name_from_alias(profile_raw.trim()) else {
-                continue;
-            };
-            if let Some((symbol_raw, market_raw)) = scope.split_once(':') {
-                let symbol = normalize_strategy_symbol(symbol_raw);
-                let market = normalize_market_type(market_raw);
-                match (symbol, market) {
-                    (Some(sym), Some(mt)) => {
-                        out.insert(format!("{sym}|{mt}"), profile);
-                    }
-                    (Some(sym), None) => {
-                        out.insert(format!("{sym}|*"), profile);
-                    }
-                    (None, Some(mt)) => {
-                        out.insert(format!("*|{mt}"), profile);
-                    }
-                    (None, None) => {}
-                }
-            } else if let Some(sym) = normalize_strategy_symbol(scope) {
-                out.insert(format!("{sym}|*"), profile);
-            } else if let Some(mt) = normalize_market_type(scope) {
-                out.insert(format!("*|{mt}"), profile);
-            }
-        }
-        out
+        std::env::var("FORGE_STRATEGY_BASE_PROFILE_BY_SCOPE")
+            .ok()
+            .map(|raw| parse_strategy_scope_profile_overrides(&raw))
+            .unwrap_or_default()
     })
 }
 
-fn strategy_profile_name_for_scope(symbol: &str, market_type: &str) -> &'static str {
+fn parse_strategy_scope_profile_overrides(raw: &str) -> HashMap<String, &'static str> {
+    let mut out = HashMap::<String, &'static str>::new();
+    for entry in raw.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+        let Some((scope_raw, profile_raw)) = entry.split_once('=') else {
+            continue;
+        };
+        let scope = scope_raw.trim();
+        let Some(profile) = strategy_profile_name_from_alias(profile_raw.trim()) else {
+            continue;
+        };
+        if let Some((symbol_raw, market_raw)) = scope.split_once(':') {
+            let symbol = normalize_strategy_symbol(symbol_raw);
+            let market = normalize_market_type(market_raw);
+            match (symbol, market) {
+                (Some(sym), Some(mt)) => {
+                    out.insert(format!("{sym}|{mt}"), profile);
+                }
+                (Some(sym), None) => {
+                    out.insert(format!("{sym}|*"), profile);
+                }
+                (None, Some(mt)) => {
+                    out.insert(format!("*|{mt}"), profile);
+                }
+                (None, None) => {}
+            }
+        } else if let Some(sym) = normalize_strategy_symbol(scope) {
+            out.insert(format!("{sym}|*"), profile);
+        } else if let Some(mt) = normalize_market_type(scope) {
+            out.insert(format!("*|{mt}"), profile);
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct StrategyResolvedConfig {
+    pub(super) cfg: StrategyRuntimeConfig,
+    pub(super) baseline_profile: &'static str,
+    pub(super) baseline_layer: &'static str,
+    pub(super) config_source: String,
+    pub(super) config_layer: &'static str,
+    pub(super) source_key: Option<String>,
+}
+
+fn strategy_baseline_profile_for_scope(
+    symbol: &str,
+    market_type: &str,
+) -> (&'static str, &'static str) {
+    strategy_baseline_profile_from_inputs(
+        symbol,
+        market_type,
+        strategy_scope_profile_overrides(),
+        strategy_base_profile_from_env(),
+    )
+}
+
+fn strategy_baseline_profile_from_inputs<'a>(
+    symbol: &str,
+    market_type: &str,
+    overrides: &'a HashMap<String, &'static str>,
+    base_profile: Option<&'static str>,
+) -> (&'static str, &'static str) {
     let symbol = normalize_strategy_symbol(symbol).unwrap_or("BTCUSDT");
     let market_type = normalize_market_type(market_type).unwrap_or("5m");
-    let overrides = strategy_scope_profile_overrides();
     if let Some(profile) = overrides.get(&format!("{symbol}|{market_type}")) {
-        return profile;
+        return (profile, "env_scope_symbol_market");
     }
     if let Some(profile) = overrides.get(&format!("{symbol}|*")) {
-        return profile;
+        return (profile, "env_scope_symbol");
     }
     if let Some(profile) = overrides.get(&format!("*|{market_type}")) {
-        return profile;
+        return (profile, "env_scope_market");
     }
-    match (symbol, market_type) {
-        ("BTCUSDT", "5m") => return STRATEGY_PROFILE_BTC_5M_BALANCE,
-        ("SOLUSDT", "5m") => return STRATEGY_PROFILE_SOL_5M_BALANCE,
-        _ => {}
+    if let Some(profile) = base_profile {
+        return (profile, "env_base_profile");
     }
-    strategy_select_profile_name()
+    (strategy_select_profile_name(), "code_default")
+}
+
+fn strategy_cfg_for_profile_name(profile: &str) -> StrategyRuntimeConfig {
+    match profile {
+        STRATEGY_PROFILE_HI_WIN => strategy_hi_win_config(),
+        STRATEGY_PROFILE_HI_FREQ => strategy_hi_freq_config(),
+        STRATEGY_PROFILE_BALANCED => strategy_balanced_config(),
+        STRATEGY_PROFILE_BTC_5M_BALANCE => strategy_btc_5m_balance_config(),
+        STRATEGY_PROFILE_SOL_5M_BALANCE => strategy_sol_5m_balance_config(),
+        STRATEGY_PROFILE_SOL_5M_SHARP => strategy_sol_5m_sharp_config(),
+        STRATEGY_PROFILE_CAND_GROWTH_MIX => strategy_cand_growth_mix_config(),
+        _ => strategy_profit_max_config(),
+    }
 }
 
 pub(super) fn strategy_current_default_profile_name_for_scope(
     symbol: &str,
     market_type: &str,
 ) -> &'static str {
-    strategy_profile_name_for_scope(symbol, market_type)
-}
-
-fn strategy_profile_from_alias(raw: &str) -> Option<(&'static str, StrategyRuntimeConfig)> {
-    let profile = strategy_profile_name_from_alias(raw)?;
-    let cfg = match profile {
-        STRATEGY_PROFILE_HI_WIN => strategy_hi_win_config(),
-        STRATEGY_PROFILE_HI_FREQ => strategy_hi_freq_config(),
-        STRATEGY_PROFILE_BALANCED => strategy_balanced_config(),
-        STRATEGY_PROFILE_BTC_5M_BALANCE => strategy_btc_5m_balance_config(),
-        STRATEGY_PROFILE_SOL_5M_BALANCE => strategy_sol_5m_balance_config(),
-        STRATEGY_PROFILE_CAND_GROWTH_MIX => strategy_cand_growth_mix_config(),
-        _ => strategy_profit_max_config(),
-    };
-    Some((profile, cfg))
+    strategy_baseline_profile_for_scope(symbol, market_type).0
 }
 
 pub(super) fn strategy_current_default_config_for_scope(
     symbol: &str,
     market_type: &str,
 ) -> StrategyRuntimeConfig {
-    match strategy_current_default_profile_name_for_scope(symbol, market_type) {
-        STRATEGY_PROFILE_HI_WIN => strategy_hi_win_config(),
-        STRATEGY_PROFILE_HI_FREQ => strategy_hi_freq_config(),
-        STRATEGY_PROFILE_BALANCED => strategy_balanced_config(),
-        STRATEGY_PROFILE_BTC_5M_BALANCE => strategy_btc_5m_balance_config(),
-        STRATEGY_PROFILE_SOL_5M_BALANCE => strategy_sol_5m_balance_config(),
-        STRATEGY_PROFILE_CAND_GROWTH_MIX => strategy_cand_growth_mix_config(),
-        _ => strategy_profit_max_config(),
+    strategy_cfg_for_profile_name(strategy_current_default_profile_name_for_scope(
+        symbol,
+        market_type,
+    ))
+}
+
+pub(super) async fn strategy_resolve_effective_config(
+    state: &ApiState,
+    symbol: &str,
+    market_type: &str,
+    explicit_profile: Option<&str>,
+    prefer_live_doc: bool,
+) -> Result<StrategyResolvedConfig, ApiError> {
+    let (baseline_profile, baseline_layer) = strategy_baseline_profile_for_scope(symbol, market_type);
+    let mut cfg = strategy_cfg_for_profile_name(baseline_profile);
+    let mut config_source = baseline_profile.to_string();
+    let mut config_layer = baseline_layer;
+    let mut source_key = None::<String>;
+
+    if explicit_profile.is_none() {
+        if prefer_live_doc {
+            let (payload, key) = resolve_autotune_live_doc(state, market_type, symbol).await?;
+            if let Some(doc) = payload {
+                cfg = strategy_cfg_from_payload(cfg, &doc);
+                config_source = format!("autotune_live:{market_type}:{}", symbol.to_ascii_lowercase());
+                config_layer = "autotune_live";
+                source_key = Some(key);
+            }
+        }
+        if source_key.is_none() {
+            let (payload, key) = resolve_autotune_active_doc(state, market_type, symbol).await?;
+            if let Some(doc) = payload {
+                cfg = strategy_cfg_from_payload(cfg, &doc);
+                config_source = format!("autotune_active:{market_type}:{}", symbol.to_ascii_lowercase());
+                config_layer = "autotune_active";
+                source_key = Some(key);
+            }
+        }
+    }
+
+    if let Some(profile_raw) = explicit_profile {
+        let (profile_name, profile_cfg) = strategy_profile_from_alias_strict(profile_raw)
+            .map_err(|_| ApiError::bad_request(format!("unknown strategy profile: {profile_raw}")))?;
+        cfg = profile_cfg;
+        config_source = profile_name.to_string();
+        config_layer = "request_profile";
+        source_key = None;
+    }
+
+    Ok(StrategyResolvedConfig {
+        cfg,
+        baseline_profile,
+        baseline_layer,
+        config_source,
+        config_layer,
+        source_key,
+    })
+}
+
+pub(super) fn strategy_config_resolution_json(resolved: &StrategyResolvedConfig) -> Value {
+    json!({
+        "baseline_profile": resolved.baseline_profile,
+        "baseline_layer": resolved.baseline_layer,
+        "effective_source": resolved.config_source,
+        "effective_layer": resolved.config_layer,
+        "source_key": resolved.source_key,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_scope_profile_overrides_supports_exact_and_wildcards() {
+        let parsed = parse_strategy_scope_profile_overrides(
+            "SOLUSDT:5m=sol5m_sharp,SOLUSDT=balanced,15m=hi_freq,noop=unknown",
+        );
+        assert_eq!(
+            parsed.get("SOLUSDT|5m").copied(),
+            Some(STRATEGY_PROFILE_SOL_5M_SHARP)
+        );
+        assert_eq!(parsed.get("SOLUSDT|*").copied(), Some(STRATEGY_PROFILE_BALANCED));
+        assert_eq!(parsed.get("*|15m").copied(), Some(STRATEGY_PROFILE_HI_FREQ));
+        assert_eq!(parsed.len(), 3);
+    }
+
+    #[test]
+    fn baseline_profile_precedence_is_scope_then_env_then_code_default() {
+        let mut overrides = HashMap::<String, &'static str>::new();
+        overrides.insert("SOLUSDT|5m".to_string(), STRATEGY_PROFILE_SOL_5M_SHARP);
+        overrides.insert("SOLUSDT|*".to_string(), STRATEGY_PROFILE_BALANCED);
+        overrides.insert("*|15m".to_string(), STRATEGY_PROFILE_HI_FREQ);
+
+        assert_eq!(
+            strategy_baseline_profile_from_inputs(
+                "SOLUSDT",
+                "5m",
+                &overrides,
+                Some(STRATEGY_PROFILE_CAND_GROWTH_MIX),
+            ),
+            (STRATEGY_PROFILE_SOL_5M_SHARP, "env_scope_symbol_market")
+        );
+        assert_eq!(
+            strategy_baseline_profile_from_inputs(
+                "SOLUSDT",
+                "1h",
+                &overrides,
+                Some(STRATEGY_PROFILE_CAND_GROWTH_MIX),
+            ),
+            (STRATEGY_PROFILE_BALANCED, "env_scope_symbol")
+        );
+        assert_eq!(
+            strategy_baseline_profile_from_inputs(
+                "BTCUSDT",
+                "15m",
+                &overrides,
+                Some(STRATEGY_PROFILE_CAND_GROWTH_MIX),
+            ),
+            (STRATEGY_PROFILE_HI_FREQ, "env_scope_market")
+        );
+        assert_eq!(
+            strategy_baseline_profile_from_inputs(
+                "BTCUSDT",
+                "5m",
+                &HashMap::new(),
+                Some(STRATEGY_PROFILE_CAND_GROWTH_MIX),
+            ),
+            (STRATEGY_PROFILE_CAND_GROWTH_MIX, "env_base_profile")
+        );
+        assert_eq!(
+            strategy_baseline_profile_from_inputs("BTCUSDT", "5m", &HashMap::new(), None),
+            (STRATEGY_PROFILE_HI_WIN, "code_default")
+        );
+    }
+
+    #[test]
+    fn strict_profile_alias_rejects_unknown_values() {
+        assert!(strategy_profile_from_alias_strict("sol5m_sharp").is_ok());
+        assert!(strategy_profile_from_alias_strict("definitely_not_a_profile").is_err());
     }
 }
 
@@ -877,6 +1047,48 @@ fn strategy_sol_5m_balance_config() -> StrategyRuntimeConfig {
         slippage_cents_per_side: 0.10036573476058915,
         fee_cents_per_side: 0.0,
         emergency_wide_spread_penalty_ratio: 0.2,
+        stop_loss_grace_ticks: 2,
+        stop_loss_hard_mult: 1.45,
+        stop_loss_reverse_extra_ticks: 1,
+        loss_cluster_limit: 3,
+        loss_cluster_cooldown_ms: 25_000,
+        noise_gate_enabled: true,
+        noise_gate_threshold_add: 0.03,
+        noise_gate_edge_add: 0.008,
+        noise_gate_spread_scale: 0.9,
+        vic_enabled: true,
+        vic_target_entries_per_hour: 14.0,
+        vic_deadband_ratio: 0.08,
+        vic_threshold_relax_max: 0.02,
+        vic_edge_relax_max: 0.008,
+        vic_spread_relax_max: 0.12,
+    }
+}
+
+fn strategy_sol_5m_sharp_config() -> StrategyRuntimeConfig {
+    StrategyRuntimeConfig {
+        entry_threshold_base: 0.7476638018261539,
+        entry_threshold_cap: 0.99,
+        spread_limit_prob: 0.034650575054196706,
+        entry_edge_prob: 0.03377344663392838,
+        entry_min_potential_cents: 10.066531527622889,
+        entry_max_price_cents: 76.4997564566711,
+        min_hold_ms: 0,
+        stop_loss_cents: 20.2357558174703,
+        reverse_signal_threshold: -0.12642467385409162,
+        reverse_signal_ticks: 1,
+        trail_activate_profit_cents: 29.073439116395964,
+        trail_drawdown_cents: 16.82299393297926,
+        take_profit_near_max_cents: 99.5,
+        endgame_take_profit_cents: 93.5644303775527,
+        endgame_remaining_ms: 20_518,
+        liquidity_widen_prob: 0.06143177168730615,
+        cooldown_ms: 2_147,
+        max_entries_per_round: 3,
+        max_exec_spread_cents: 1.6807376190292096,
+        slippage_cents_per_side: 0.10036573476058915,
+        fee_cents_per_side: 0.0,
+        emergency_wide_spread_penalty_ratio: 0.24004592137073613,
         stop_loss_grace_ticks: 2,
         stop_loss_hard_mult: 1.45,
         stop_loss_reverse_extra_ticks: 1,
