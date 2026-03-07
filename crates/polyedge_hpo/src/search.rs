@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,9 +46,16 @@ pub async fn run_search(
     let seed = request.search.seed.unwrap_or(0xA5A5_2026_0303);
     let mut rng = StdRng::seed_from_u64(seed);
 
-    let mut population = (0..request.search.population)
-        .map(|_| random_params(&mut rng))
+    let mut population = request
+        .seed_params
+        .iter()
+        .cloned()
+        .map(normalize_params)
         .collect::<Vec<_>>();
+    while population.len() < request.search.population {
+        population.push(random_params(&mut rng));
+    }
+    population.truncate(request.search.population);
     let mut elite_bank = Vec::<CandidateResult>::new();
     let mut iteration_summaries = Vec::<IterationSummary>::new();
     let total_iterations = request.search.iterations;
@@ -174,18 +182,10 @@ fn next_generation(
 }
 
 fn dedup_params(params: &mut Vec<StrategyParams>) {
-    params.sort_by(|a, b| {
-        a.entry_threshold_base
-            .total_cmp(&b.entry_threshold_base)
-            .then(a.entry_threshold_cap.total_cmp(&b.entry_threshold_cap))
-            .then(a.stop_loss_cents.total_cmp(&b.stop_loss_cents))
-            .then(a.cooldown_ms.cmp(&b.cooldown_ms))
-    });
-    params.dedup_by(|a, b| {
-        (a.entry_threshold_base - b.entry_threshold_base).abs() < 0.0001
-            && (a.entry_threshold_cap - b.entry_threshold_cap).abs() < 0.0001
-            && (a.stop_loss_cents - b.stop_loss_cents).abs() < 0.01
-            && a.cooldown_ms == b.cooldown_ms
+    let mut seen = HashSet::new();
+    params.retain(|p| {
+        let key = serde_json::to_string(p).unwrap_or_default();
+        seen.insert(key)
     });
 }
 
@@ -341,6 +341,63 @@ async fn fetch_window_metrics(
         (
             "emergency_wide_spread_penalty_ratio".to_string(),
             fmtf(params.emergency_wide_spread_penalty_ratio),
+        ),
+        (
+            "stop_loss_grace_ticks".to_string(),
+            params.stop_loss_grace_ticks.to_string(),
+        ),
+        (
+            "stop_loss_hard_mult".to_string(),
+            fmtf(params.stop_loss_hard_mult),
+        ),
+        (
+            "stop_loss_reverse_extra_ticks".to_string(),
+            params.stop_loss_reverse_extra_ticks.to_string(),
+        ),
+        (
+            "loss_cluster_limit".to_string(),
+            params.loss_cluster_limit.to_string(),
+        ),
+        (
+            "loss_cluster_cooldown_ms".to_string(),
+            params.loss_cluster_cooldown_ms.to_string(),
+        ),
+        (
+            "noise_gate_enabled".to_string(),
+            params.noise_gate_enabled.to_string(),
+        ),
+        (
+            "noise_gate_threshold_add".to_string(),
+            fmtf(params.noise_gate_threshold_add),
+        ),
+        (
+            "noise_gate_edge_add".to_string(),
+            fmtf(params.noise_gate_edge_add),
+        ),
+        (
+            "noise_gate_spread_scale".to_string(),
+            fmtf(params.noise_gate_spread_scale),
+        ),
+        ("vic_enabled".to_string(), params.vic_enabled.to_string()),
+        (
+            "vic_target_entries_per_hour".to_string(),
+            fmtf(params.vic_target_entries_per_hour),
+        ),
+        (
+            "vic_deadband_ratio".to_string(),
+            fmtf(params.vic_deadband_ratio),
+        ),
+        (
+            "vic_threshold_relax_max".to_string(),
+            fmtf(params.vic_threshold_relax_max),
+        ),
+        (
+            "vic_edge_relax_max".to_string(),
+            fmtf(params.vic_edge_relax_max),
+        ),
+        (
+            "vic_spread_relax_max".to_string(),
+            fmtf(params.vic_spread_relax_max),
         ),
     ];
     let value = client
@@ -531,30 +588,46 @@ fn window_score(window: &WindowMetrics, constraints: &Constraints) -> f64 {
 }
 
 pub fn random_params(rng: &mut StdRng) -> StrategyParams {
-    StrategyParams {
-        entry_threshold_base: sample(rng, b(0.001, 0.06)),
-        entry_threshold_cap: sample(rng, b(0.02, 0.22)),
-        spread_limit_prob: sample(rng, b(0.01, 0.24)),
-        entry_edge_prob: sample(rng, b(0.001, 0.08)),
-        entry_min_potential_cents: sample(rng, b(0.2, 4.5)),
-        entry_max_price_cents: sample(rng, b(45.0, 98.0)),
-        min_hold_ms: sample(rng, b(0.0, 25_000.0)).round() as i64,
-        stop_loss_cents: sample(rng, b(1.0, 18.0)),
-        reverse_signal_threshold: sample(rng, b(0.002, 0.08)),
-        reverse_signal_ticks: sample(rng, b(1.0, 8.0)).round() as i64,
-        trail_activate_profit_cents: sample(rng, b(0.4, 24.0)),
-        trail_drawdown_cents: sample(rng, b(0.2, 14.0)),
-        take_profit_near_max_cents: sample(rng, b(0.5, 26.0)),
-        endgame_take_profit_cents: sample(rng, b(0.2, 16.0)),
-        endgame_remaining_ms: sample(rng, b(4_000.0, 120_000.0)).round() as i64,
-        liquidity_widen_prob: sample(rng, b(0.01, 0.4)),
-        cooldown_ms: sample(rng, b(0.0, 80_000.0)).round() as i64,
-        max_entries_per_round: sample(rng, b(1.0, 5.0)).round() as i64,
-        max_exec_spread_cents: sample(rng, b(0.1, 9.0)),
-        slippage_cents_per_side: sample(rng, b(0.0, 3.0)),
-        fee_cents_per_side: sample(rng, b(0.0, 3.0)),
-        emergency_wide_spread_penalty_ratio: sample(rng, b(0.0, 0.95)),
-    }
+    normalize_params(StrategyParams {
+        entry_threshold_base: sample(rng, b(0.40, 0.95)),
+        entry_threshold_cap: sample(rng, b(0.45, 0.99)),
+        spread_limit_prob: sample(rng, b(0.005, 0.12)),
+        entry_edge_prob: sample(rng, b(0.002, 0.25)),
+        entry_min_potential_cents: sample(rng, b(1.0, 70.0)),
+        entry_max_price_cents: sample(rng, b(45.0, 98.5)),
+        min_hold_ms: sample(rng, b(0.0, 240_000.0)).round() as i64,
+        stop_loss_cents: sample(rng, b(2.0, 60.0)),
+        reverse_signal_threshold: sample(rng, b(-0.95, -0.02)),
+        reverse_signal_ticks: sample(rng, b(1.0, 12.0)).round() as i64,
+        trail_activate_profit_cents: sample(rng, b(2.0, 80.0)),
+        trail_drawdown_cents: sample(rng, b(1.0, 50.0)),
+        take_profit_near_max_cents: sample(rng, b(70.0, 99.5)),
+        endgame_take_profit_cents: sample(rng, b(50.0, 99.0)),
+        endgame_remaining_ms: sample(rng, b(1_000.0, 180_000.0)).round() as i64,
+        liquidity_widen_prob: sample(rng, b(0.01, 0.2)),
+        cooldown_ms: sample(rng, b(0.0, 120_000.0)).round() as i64,
+        max_entries_per_round: sample(rng, b(1.0, 16.0)).round() as i64,
+        max_exec_spread_cents: sample(rng, b(0.2, 30.0)),
+        slippage_cents_per_side: sample(rng, b(0.0, 10.0)),
+        // Forge paper currently forces fee_cents_per_side to 0.0, so do not waste search budget on it.
+        fee_cents_per_side: 0.0,
+        emergency_wide_spread_penalty_ratio: sample(rng, b(0.2, 3.0)),
+        stop_loss_grace_ticks: sample(rng, b(0.0, 8.0)).round() as i64,
+        stop_loss_hard_mult: sample(rng, b(1.0, 3.0)),
+        stop_loss_reverse_extra_ticks: sample(rng, b(0.0, 6.0)).round() as i64,
+        loss_cluster_limit: sample(rng, b(0.0, 8.0)).round() as i64,
+        loss_cluster_cooldown_ms: sample(rng, b(0.0, 120_000.0)).round() as i64,
+        noise_gate_enabled: rng.random::<f64>() < 0.8,
+        noise_gate_threshold_add: sample(rng, b(0.0, 0.20)),
+        noise_gate_edge_add: sample(rng, b(0.0, 0.12)),
+        noise_gate_spread_scale: sample(rng, b(0.5, 1.2)),
+        vic_enabled: rng.random::<f64>() < 0.8,
+        vic_target_entries_per_hour: sample(rng, b(0.0, 120.0)),
+        vic_deadband_ratio: sample(rng, b(0.0, 0.8)),
+        vic_threshold_relax_max: sample(rng, b(0.0, 0.2)),
+        vic_edge_relax_max: sample(rng, b(0.0, 0.1)),
+        vic_spread_relax_max: sample(rng, b(0.0, 0.8)),
+    })
 }
 
 pub fn mutate_params(rng: &mut StdRng, parent: &StrategyParams, ratio: f64) -> StrategyParams {
@@ -563,41 +636,79 @@ pub fn mutate_params(rng: &mut StdRng, parent: &StrategyParams, ratio: f64) -> S
         let delta = (rng.random::<f64>() * 2.0 - 1.0) * span * ratio;
         (v + delta).clamp(bound.min, bound.max)
     };
-    StrategyParams {
-        entry_threshold_base: jitter(rng, parent.entry_threshold_base, b(0.001, 0.06)),
-        entry_threshold_cap: jitter(rng, parent.entry_threshold_cap, b(0.02, 0.22)),
-        spread_limit_prob: jitter(rng, parent.spread_limit_prob, b(0.01, 0.24)),
-        entry_edge_prob: jitter(rng, parent.entry_edge_prob, b(0.001, 0.08)),
-        entry_min_potential_cents: jitter(rng, parent.entry_min_potential_cents, b(0.2, 4.5)),
-        entry_max_price_cents: jitter(rng, parent.entry_max_price_cents, b(45.0, 98.0)),
-        min_hold_ms: jitter(rng, parent.min_hold_ms as f64, b(0.0, 25_000.0)).round() as i64,
-        stop_loss_cents: jitter(rng, parent.stop_loss_cents, b(1.0, 18.0)),
-        reverse_signal_threshold: jitter(rng, parent.reverse_signal_threshold, b(0.002, 0.08)),
-        reverse_signal_ticks: jitter(rng, parent.reverse_signal_ticks as f64, b(1.0, 8.0)).round()
-            as i64,
-        trail_activate_profit_cents: jitter(rng, parent.trail_activate_profit_cents, b(0.4, 24.0)),
-        trail_drawdown_cents: jitter(rng, parent.trail_drawdown_cents, b(0.2, 14.0)),
-        take_profit_near_max_cents: jitter(rng, parent.take_profit_near_max_cents, b(0.5, 26.0)),
-        endgame_take_profit_cents: jitter(rng, parent.endgame_take_profit_cents, b(0.2, 16.0)),
+    let flip_bool = |rng: &mut StdRng, v: bool| -> bool {
+        if rng.random::<f64>() < ratio * 0.8 {
+            !v
+        } else {
+            v
+        }
+    };
+    normalize_params(StrategyParams {
+        entry_threshold_base: jitter(rng, parent.entry_threshold_base, b(0.40, 0.95)),
+        entry_threshold_cap: jitter(rng, parent.entry_threshold_cap, b(0.45, 0.99)),
+        spread_limit_prob: jitter(rng, parent.spread_limit_prob, b(0.005, 0.12)),
+        entry_edge_prob: jitter(rng, parent.entry_edge_prob, b(0.002, 0.25)),
+        entry_min_potential_cents: jitter(rng, parent.entry_min_potential_cents, b(1.0, 70.0)),
+        entry_max_price_cents: jitter(rng, parent.entry_max_price_cents, b(45.0, 98.5)),
+        min_hold_ms: jitter(rng, parent.min_hold_ms as f64, b(0.0, 240_000.0)).round() as i64,
+        stop_loss_cents: jitter(rng, parent.stop_loss_cents, b(2.0, 60.0)),
+        reverse_signal_threshold: jitter(rng, parent.reverse_signal_threshold, b(-0.95, -0.02)),
+        reverse_signal_ticks: jitter(rng, parent.reverse_signal_ticks as f64, b(1.0, 12.0))
+            .round() as i64,
+        trail_activate_profit_cents: jitter(rng, parent.trail_activate_profit_cents, b(2.0, 80.0)),
+        trail_drawdown_cents: jitter(rng, parent.trail_drawdown_cents, b(1.0, 50.0)),
+        take_profit_near_max_cents: jitter(rng, parent.take_profit_near_max_cents, b(70.0, 99.5)),
+        endgame_take_profit_cents: jitter(rng, parent.endgame_take_profit_cents, b(50.0, 99.0)),
         endgame_remaining_ms: jitter(
             rng,
             parent.endgame_remaining_ms as f64,
-            b(4_000.0, 120_000.0),
+            b(1_000.0, 180_000.0),
         )
         .round() as i64,
-        liquidity_widen_prob: jitter(rng, parent.liquidity_widen_prob, b(0.01, 0.4)),
-        cooldown_ms: jitter(rng, parent.cooldown_ms as f64, b(0.0, 80_000.0)).round() as i64,
-        max_entries_per_round: jitter(rng, parent.max_entries_per_round as f64, b(1.0, 5.0)).round()
-            as i64,
-        max_exec_spread_cents: jitter(rng, parent.max_exec_spread_cents, b(0.1, 9.0)),
-        slippage_cents_per_side: jitter(rng, parent.slippage_cents_per_side, b(0.0, 3.0)),
-        fee_cents_per_side: jitter(rng, parent.fee_cents_per_side, b(0.0, 3.0)),
+        liquidity_widen_prob: jitter(rng, parent.liquidity_widen_prob, b(0.01, 0.2)),
+        cooldown_ms: jitter(rng, parent.cooldown_ms as f64, b(0.0, 120_000.0)).round() as i64,
+        max_entries_per_round: jitter(rng, parent.max_entries_per_round as f64, b(1.0, 16.0))
+            .round() as i64,
+        max_exec_spread_cents: jitter(rng, parent.max_exec_spread_cents, b(0.2, 30.0)),
+        slippage_cents_per_side: jitter(rng, parent.slippage_cents_per_side, b(0.0, 10.0)),
+        fee_cents_per_side: 0.0,
         emergency_wide_spread_penalty_ratio: jitter(
             rng,
             parent.emergency_wide_spread_penalty_ratio,
-            b(0.0, 0.95),
+            b(0.2, 3.0),
         ),
-    }
+        stop_loss_grace_ticks: jitter(rng, parent.stop_loss_grace_ticks as f64, b(0.0, 8.0))
+            .round() as i64,
+        stop_loss_hard_mult: jitter(rng, parent.stop_loss_hard_mult, b(1.0, 3.0)),
+        stop_loss_reverse_extra_ticks: jitter(
+            rng,
+            parent.stop_loss_reverse_extra_ticks as f64,
+            b(0.0, 6.0),
+        )
+        .round() as i64,
+        loss_cluster_limit: jitter(rng, parent.loss_cluster_limit as f64, b(0.0, 8.0)).round()
+            as i64,
+        loss_cluster_cooldown_ms: jitter(
+            rng,
+            parent.loss_cluster_cooldown_ms as f64,
+            b(0.0, 120_000.0),
+        )
+        .round() as i64,
+        noise_gate_enabled: flip_bool(rng, parent.noise_gate_enabled),
+        noise_gate_threshold_add: jitter(rng, parent.noise_gate_threshold_add, b(0.0, 0.20)),
+        noise_gate_edge_add: jitter(rng, parent.noise_gate_edge_add, b(0.0, 0.12)),
+        noise_gate_spread_scale: jitter(rng, parent.noise_gate_spread_scale, b(0.5, 1.2)),
+        vic_enabled: flip_bool(rng, parent.vic_enabled),
+        vic_target_entries_per_hour: jitter(
+            rng,
+            parent.vic_target_entries_per_hour,
+            b(0.0, 120.0),
+        ),
+        vic_deadband_ratio: jitter(rng, parent.vic_deadband_ratio, b(0.0, 0.8)),
+        vic_threshold_relax_max: jitter(rng, parent.vic_threshold_relax_max, b(0.0, 0.2)),
+        vic_edge_relax_max: jitter(rng, parent.vic_edge_relax_max, b(0.0, 0.1)),
+        vic_spread_relax_max: jitter(rng, parent.vic_spread_relax_max, b(0.0, 0.8)),
+    })
 }
 
 #[inline]
@@ -613,4 +724,45 @@ fn b(min: f64, max: f64) -> ParamBounds {
 #[inline]
 fn fmtf(v: f64) -> String {
     format!("{v:.8}")
+}
+
+fn normalize_params(mut p: StrategyParams) -> StrategyParams {
+    p.entry_threshold_base = p.entry_threshold_base.clamp(0.40, 0.95);
+    p.entry_threshold_cap = p
+        .entry_threshold_cap
+        .clamp((p.entry_threshold_base + 0.01).min(0.99), 0.99);
+    p.spread_limit_prob = p.spread_limit_prob.clamp(0.005, 0.12);
+    p.entry_edge_prob = p.entry_edge_prob.clamp(0.002, 0.25);
+    p.entry_min_potential_cents = p.entry_min_potential_cents.clamp(1.0, 70.0);
+    p.entry_max_price_cents = p.entry_max_price_cents.clamp(45.0, 98.5);
+    p.min_hold_ms = p.min_hold_ms.clamp(0, 240_000);
+    p.stop_loss_cents = p.stop_loss_cents.clamp(2.0, 60.0);
+    p.reverse_signal_threshold = p.reverse_signal_threshold.clamp(-0.95, -0.02);
+    p.reverse_signal_ticks = p.reverse_signal_ticks.clamp(1, 12);
+    p.trail_activate_profit_cents = p.trail_activate_profit_cents.clamp(2.0, 80.0);
+    p.trail_drawdown_cents = p.trail_drawdown_cents.clamp(1.0, 50.0);
+    p.take_profit_near_max_cents = p.take_profit_near_max_cents.clamp(70.0, 99.5);
+    p.endgame_take_profit_cents = p.endgame_take_profit_cents.clamp(50.0, 99.0);
+    p.endgame_remaining_ms = p.endgame_remaining_ms.clamp(1_000, 180_000);
+    p.liquidity_widen_prob = p.liquidity_widen_prob.clamp(0.01, 0.2);
+    p.cooldown_ms = p.cooldown_ms.clamp(0, 120_000);
+    p.max_entries_per_round = p.max_entries_per_round.clamp(1, 16);
+    p.max_exec_spread_cents = p.max_exec_spread_cents.clamp(0.2, 30.0);
+    p.slippage_cents_per_side = p.slippage_cents_per_side.clamp(0.0, 10.0);
+    p.fee_cents_per_side = 0.0;
+    p.emergency_wide_spread_penalty_ratio = p.emergency_wide_spread_penalty_ratio.clamp(0.2, 3.0);
+    p.stop_loss_grace_ticks = p.stop_loss_grace_ticks.clamp(0, 8);
+    p.stop_loss_hard_mult = p.stop_loss_hard_mult.clamp(1.0, 3.0);
+    p.stop_loss_reverse_extra_ticks = p.stop_loss_reverse_extra_ticks.clamp(0, 6);
+    p.loss_cluster_limit = p.loss_cluster_limit.clamp(0, 8);
+    p.loss_cluster_cooldown_ms = p.loss_cluster_cooldown_ms.clamp(0, 120_000);
+    p.noise_gate_threshold_add = p.noise_gate_threshold_add.clamp(0.0, 0.20);
+    p.noise_gate_edge_add = p.noise_gate_edge_add.clamp(0.0, 0.12);
+    p.noise_gate_spread_scale = p.noise_gate_spread_scale.clamp(0.5, 1.2);
+    p.vic_target_entries_per_hour = p.vic_target_entries_per_hour.clamp(0.0, 120.0);
+    p.vic_deadband_ratio = p.vic_deadband_ratio.clamp(0.0, 0.8);
+    p.vic_threshold_relax_max = p.vic_threshold_relax_max.clamp(0.0, 0.2);
+    p.vic_edge_relax_max = p.vic_edge_relax_max.clamp(0.0, 0.1);
+    p.vic_spread_relax_max = p.vic_spread_relax_max.clamp(0.0, 0.8);
+    p
 }

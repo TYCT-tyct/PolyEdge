@@ -25,6 +25,21 @@ pub struct StrategyParams {
     pub slippage_cents_per_side: f64,
     pub fee_cents_per_side: f64,
     pub emergency_wide_spread_penalty_ratio: f64,
+    pub stop_loss_grace_ticks: i64,
+    pub stop_loss_hard_mult: f64,
+    pub stop_loss_reverse_extra_ticks: i64,
+    pub loss_cluster_limit: i64,
+    pub loss_cluster_cooldown_ms: i64,
+    pub noise_gate_enabled: bool,
+    pub noise_gate_threshold_add: f64,
+    pub noise_gate_edge_add: f64,
+    pub noise_gate_spread_scale: f64,
+    pub vic_enabled: bool,
+    pub vic_target_entries_per_hour: f64,
+    pub vic_deadband_ratio: f64,
+    pub vic_threshold_relax_max: f64,
+    pub vic_edge_relax_max: f64,
+    pub vic_spread_relax_max: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +98,7 @@ pub struct SearchRequest {
     pub max_trades: Option<u32>,
     pub max_samples: Option<u32>,
     pub timeout_secs: Option<u64>,
+    pub seed_params: Option<Vec<StrategyParams>>,
     pub search: Option<SearchConfig>,
     pub constraints: Option<Constraints>,
 }
@@ -97,6 +113,7 @@ pub struct ResolvedSearchRequest {
     pub max_trades: u32,
     pub max_samples: u32,
     pub timeout_secs: u64,
+    pub seed_params: Vec<StrategyParams>,
     pub search: SearchConfig,
     pub constraints: Constraints,
 }
@@ -118,6 +135,7 @@ impl SearchRequest {
         if lookbacks.is_empty() {
             anyhow::bail!("lookbacks must not be empty");
         }
+        let seed_params = self.seed_params.unwrap_or_default();
         Ok(ResolvedSearchRequest {
             forge_base_url: self
                 .forge_base_url
@@ -129,6 +147,7 @@ impl SearchRequest {
             max_trades: self.max_trades.unwrap_or(1500),
             max_samples: self.max_samples.unwrap_or(260_000),
             timeout_secs: self.timeout_secs.unwrap_or(180),
+            seed_params,
             search,
             constraints,
         })
