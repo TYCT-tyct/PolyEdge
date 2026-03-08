@@ -353,7 +353,80 @@ impl MarketDiscovery {
             });
         }
 
+        let events_limit = env_i64("POLYEDGE_DISCOVERY_EVENTS_LIMIT", 100, 20, 500);
+        let events_pages = env_usize("POLYEDGE_DISCOVERY_EVENTS_MAX_PAGES", 20, 1, 64);
+        let events_endpoint = self
+            .cfg
+            .endpoint
+            .strip_suffix("/markets")
+            .map(|prefix| format!("{prefix}/events"))
+            .unwrap_or_else(|| self.cfg.endpoint.replace("/markets", "/events"));
+
         let mut last_err: Option<anyhow::Error> = None;
+        'events_scan: for page_idx in 0..events_pages {
+            let offset = (page_idx as i64) * events_limit;
+            let limit_s = events_limit.to_string();
+            let offset_s = offset.to_string();
+            let request_kind = format!("events limit={} offset={}", events_limit, offset);
+            let events: Vec<GammaEventItem> = match self
+                .get_json_with_retry(
+                    &events_endpoint,
+                    &[
+                        ("active", "true"),
+                        ("closed", "false"),
+                        ("limit", limit_s.as_str()),
+                        ("offset", offset_s.as_str()),
+                    ],
+                    &request_kind,
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(err) => {
+                    last_err = Some(err);
+                    break 'events_scan;
+                }
+            };
+
+            if events.is_empty() {
+                break;
+            }
+
+            for event in events {
+                if event.closed {
+                    continue;
+                }
+                for market in event.markets {
+                    absorb_discovered_market(
+                        market,
+                        &self.cfg,
+                        now_ms,
+                        &mut seen,
+                        &mut out,
+                        &mut matched_template_keys,
+                        &target_template_keys,
+                        can_early_stop,
+                    );
+                    if can_early_stop
+                        && !target_template_keys.is_empty()
+                        && matched_template_keys.len() >= target_template_keys.len()
+                    {
+                        break 'events_scan;
+                    }
+                }
+            }
+        }
+
+        if can_early_stop
+            && !target_template_keys.is_empty()
+            && matched_template_keys.len() >= target_template_keys.len()
+        {
+            if self.cfg.one_market_per_template {
+                out = collapse_to_markets_per_template(out, now_ms, self.cfg.markets_per_template);
+            }
+            return Ok(out);
+        }
+
         'scan_plans: for plan in plans {
             for page_idx in 0..plan.max_pages {
                 let offset = (page_idx as i64) * plan.limit;
@@ -392,111 +465,21 @@ impl MarketDiscovery {
                 }
 
                 for market in markets {
-                    // Do not hard-reject `acceptingOrders=false` here.
-                    // Around round boundaries, Gamma can temporarily report the next window
-                    // with `acceptingOrders=false`, and filtering it out causes 60-90s switch gaps.
-                    // We keep discovery broad and let recorder-side window guards decide sampling.
-                    if market.closed {
-                        continue;
-                    }
-                    if !seen.insert(market.id.clone()) {
-                        continue;
-                    }
-
-                    let text = format!(
-                        "{} {}",
-                        market.question.to_ascii_uppercase(),
-                        market.slug.clone().unwrap_or_default().to_ascii_uppercase()
+                    absorb_discovered_market(
+                        market,
+                        &self.cfg,
+                        now_ms,
+                        &mut seen,
+                        &mut out,
+                        &mut matched_template_keys,
+                        &target_template_keys,
+                        can_early_stop,
                     );
-                    let market_type = classify_market_type(&text);
-                    if !self.cfg.market_types.is_empty()
-                        && !self
-                            .cfg
-                            .market_types
-                            .iter()
-                            .any(|t| t.eq_ignore_ascii_case(market_type))
+                    if can_early_stop
+                        && !target_template_keys.is_empty()
+                        && matched_template_keys.len() >= target_template_keys.len()
                     {
-                        continue;
-                    }
-                    let timeframe = classify_timeframe_with_bounds(
-                        &text,
-                        market.event_start_time.as_deref(),
-                        market.end_date.as_deref(),
-                    );
-                    if !self.cfg.timeframes.is_empty() {
-                        let Some(tf) = timeframe else {
-                            continue;
-                        };
-                        if !self
-                            .cfg
-                            .timeframes
-                            .iter()
-                            .any(|t| t.eq_ignore_ascii_case(tf))
-                        {
-                            continue;
-                        }
-                    }
-                    if self.cfg.near_expiry_only
-                        && !is_within_discovery_window(
-                            market.end_date.as_deref(),
-                            timeframe,
-                            now_ms,
-                            &self.cfg,
-                        )
-                    {
-                        continue;
-                    }
-                    let Some(symbol) = detect_symbol(&text, &self.cfg.symbols) else {
-                        continue;
-                    };
-                    let end_ms = parse_end_date_ms(market.end_date.as_deref());
-
-                    let price_to_beat = market
-                        .events
-                        .as_ref()
-                        .and_then(|evs| evs.first())
-                        .and_then(|ev| ev.event_metadata.as_ref())
-                        .and_then(|m| m.price_to_beat);
-                    out.push(MarketDescriptor {
-                        market_id: market.id.clone(),
-                        question: market.question.clone(),
-                        symbol: symbol.clone(),
-                        market_slug: market.slug.clone(),
-                        token_id_yes: parse_token_pair(market.clob_token_ids.as_deref())
-                            .map(|x| x.0),
-                        token_id_no: parse_token_pair(market.clob_token_ids.as_deref())
-                            .map(|x| x.1),
-                        event_slug: market.event_slug.clone(),
-                        end_date: market.end_date.clone(),
-                        event_start_time: market.event_start_time.clone(),
-                        timeframe: timeframe.map(|v| v.to_string()),
-                        market_type: Some(market_type.to_string()),
-                        best_bid: market.best_bid,
-                        best_ask: market.best_ask,
-                        price_to_beat,
-                    });
-
-                    if can_early_stop {
-                        if let Some(tf) = timeframe {
-                            // Do not early-stop on already-ended rounds. Around boundaries, that
-                            // can pin discovery to stale templates and delay active round pickup.
-                            if end_ms.map(|v| v >= now_ms).unwrap_or(false) {
-                                let discovered_key = format!(
-                                    "{}|{}|{}",
-                                    symbol,
-                                    market_type.to_ascii_lowercase(),
-                                    tf.to_ascii_lowercase()
-                                );
-                                if target_template_keys.contains(&discovered_key) {
-                                    matched_template_keys.insert(discovered_key);
-                                }
-                            }
-                        }
-                        if !target_template_keys.is_empty()
-                            && matched_template_keys.len() >= target_template_keys.len()
-                        {
-                            break 'scan_plans;
-                        }
+                        break 'scan_plans;
                     }
                 }
             }
@@ -514,6 +497,99 @@ impl MarketDiscovery {
         }
 
         Ok(out)
+    }
+}
+
+fn absorb_discovered_market(
+    market: GammaMarket,
+    cfg: &DiscoveryConfig,
+    now_ms: i64,
+    seen: &mut std::collections::HashSet<String>,
+    out: &mut Vec<MarketDescriptor>,
+    matched_template_keys: &mut std::collections::HashSet<String>,
+    target_template_keys: &std::collections::HashSet<String>,
+    can_early_stop: bool,
+) {
+    if market.closed {
+        return;
+    }
+    if !seen.insert(market.id.clone()) {
+        return;
+    }
+
+    let text = format!(
+        "{} {}",
+        market.question.to_ascii_uppercase(),
+        market.slug.clone().unwrap_or_default().to_ascii_uppercase()
+    );
+    let market_type = classify_market_type(&text);
+    if !cfg.market_types.is_empty()
+        && !cfg
+            .market_types
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(market_type))
+    {
+        return;
+    }
+    let timeframe = classify_timeframe_with_bounds(
+        &text,
+        market.event_start_time.as_deref(),
+        market.end_date.as_deref(),
+    );
+    if !cfg.timeframes.is_empty() {
+        let Some(tf) = timeframe else {
+            return;
+        };
+        if !cfg.timeframes.iter().any(|t| t.eq_ignore_ascii_case(tf)) {
+            return;
+        }
+    }
+    if cfg.near_expiry_only
+        && !is_within_discovery_window(market.end_date.as_deref(), timeframe, now_ms, cfg)
+    {
+        return;
+    }
+    let Some(symbol) = detect_symbol(&text, &cfg.symbols) else {
+        return;
+    };
+    let end_ms = parse_end_date_ms(market.end_date.as_deref());
+    let price_to_beat = market
+        .events
+        .as_ref()
+        .and_then(|evs| evs.first())
+        .and_then(|ev| ev.event_metadata.as_ref())
+        .and_then(|m| m.price_to_beat);
+    out.push(MarketDescriptor {
+        market_id: market.id.clone(),
+        question: market.question.clone(),
+        symbol: symbol.clone(),
+        market_slug: market.slug.clone(),
+        token_id_yes: parse_token_pair(market.clob_token_ids.as_deref()).map(|x| x.0),
+        token_id_no: parse_token_pair(market.clob_token_ids.as_deref()).map(|x| x.1),
+        event_slug: market.event_slug.clone(),
+        end_date: market.end_date.clone(),
+        event_start_time: market.event_start_time.clone(),
+        timeframe: timeframe.map(|v| v.to_string()),
+        market_type: Some(market_type.to_string()),
+        best_bid: market.best_bid,
+        best_ask: market.best_ask,
+        price_to_beat,
+    });
+
+    if can_early_stop {
+        if let Some(tf) = timeframe {
+            if end_ms.map(|v| v >= now_ms).unwrap_or(false) {
+                let discovered_key = format!(
+                    "{}|{}|{}",
+                    symbol,
+                    market_type.to_ascii_lowercase(),
+                    tf.to_ascii_lowercase()
+                );
+                if target_template_keys.contains(&discovered_key) {
+                    matched_template_keys.insert(discovered_key);
+                }
+            }
+        }
     }
 }
 
@@ -742,6 +818,15 @@ struct GammaEvent {
 struct GammaEventMetadata {
     #[serde(default)]
     price_to_beat: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GammaEventItem {
+    #[serde(default)]
+    closed: bool,
+    #[serde(default)]
+    markets: Vec<GammaMarket>,
 }
 
 fn parse_token_pair(input: Option<&str>) -> Option<(String, String)> {
