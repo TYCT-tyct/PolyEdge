@@ -1,6 +1,7 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -150,6 +151,40 @@ struct ScanPlan {
     max_pages: usize,
 }
 
+fn discovery_retry_limit() -> usize {
+    std::env::var("POLYEDGE_DISCOVERY_REQUEST_RETRIES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(2)
+        .clamp(0, 6)
+}
+
+fn discovery_retry_base_ms() -> u64 {
+    std::env::var("POLYEDGE_DISCOVERY_RETRY_BASE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(400)
+        .clamp(100, 5_000)
+}
+
+fn discovery_retry_max_ms() -> u64 {
+    std::env::var("POLYEDGE_DISCOVERY_RETRY_MAX_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(5_000)
+        .clamp(250, 30_000)
+}
+
+fn retry_after_delay_ms(headers: &reqwest::header::HeaderMap, fallback_ms: u64) -> u64 {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|secs| secs.saturating_mul(1_000))
+        .filter(|delay_ms| *delay_ms > 0)
+        .unwrap_or(fallback_ms)
+}
+
 impl MarketDiscovery {
     pub fn new(cfg: DiscoveryConfig) -> Self {
         let user_agent = std::env::var("POLYEDGE_DISCOVERY_USER_AGENT")
@@ -167,6 +202,75 @@ impl MarketDiscovery {
             .build()
             .unwrap_or_else(|_| Client::new());
         Self { http, cfg }
+    }
+
+    async fn get_json_with_retry<T: DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        query: &[(&str, &str)],
+        request_kind: &str,
+    ) -> Result<T> {
+        let max_retries = discovery_retry_limit();
+        let max_backoff_ms = discovery_retry_max_ms();
+        let mut backoff_ms = discovery_retry_base_ms();
+
+        for attempt in 0..=max_retries {
+            let response = self.http.get(endpoint).query(query).send().await;
+            match response {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        return resp.json::<T>().await.with_context(|| {
+                            format!("discovery json parse failed ({request_kind})")
+                        });
+                    }
+
+                    let wait_ms =
+                        retry_after_delay_ms(resp.headers(), backoff_ms).min(max_backoff_ms);
+                    let body = resp.text().await.unwrap_or_default();
+                    let retriable = status == StatusCode::TOO_MANY_REQUESTS
+                        || status == StatusCode::REQUEST_TIMEOUT
+                        || status.is_server_error();
+                    if retriable && attempt < max_retries {
+                        tracing::warn!(
+                            request_kind,
+                            status = %status,
+                            attempt,
+                            retry_in_ms = wait_ms,
+                            "gamma discovery request throttled; backing off"
+                        );
+                        tokio::time::sleep(Duration::from_millis(wait_ms.max(1))).await;
+                        backoff_ms = backoff_ms.saturating_mul(2).min(max_backoff_ms);
+                        continue;
+                    }
+                    return Err(anyhow!(
+                        "discovery status failed ({request_kind}, status={}): {body}",
+                        status
+                    ));
+                }
+                Err(err) => {
+                    let retriable = err.is_timeout() || err.is_connect() || err.is_request();
+                    if retriable && attempt < max_retries {
+                        let wait_ms = backoff_ms.min(max_backoff_ms);
+                        tracing::warn!(
+                            request_kind,
+                            ?err,
+                            attempt,
+                            retry_in_ms = wait_ms,
+                            "gamma discovery request failed; retrying"
+                        );
+                        tokio::time::sleep(Duration::from_millis(wait_ms.max(1))).await;
+                        backoff_ms = backoff_ms.saturating_mul(2).min(max_backoff_ms);
+                        continue;
+                    }
+                    return Err(anyhow!("discovery request failed ({request_kind}): {err}"));
+                }
+            }
+        }
+
+        Err(anyhow!(
+            "discovery request exhausted retries ({request_kind})"
+        ))
     }
 
     pub async fn discover(&self) -> Result<Vec<MarketDescriptor>> {
@@ -257,37 +361,28 @@ impl MarketDiscovery {
                 let offset_s = offset.to_string();
                 // Do not set `active=true` query param here: Gamma may omit near-expiry
                 // markets under that server-side filter. We filter by `market.active` below.
-                let response = self
-                    .http
-                    .get(&self.cfg.endpoint)
-                    .query(&[
-                        ("closed", "false"),
-                        ("archived", "false"),
-                        ("limit", limit_s.as_str()),
-                        ("offset", offset_s.as_str()),
-                        ("order", plan.order),
-                        ("ascending", plan.ascending),
-                    ])
-                    .send()
-                    .await;
-                let response = match response {
+                let request_kind = format!(
+                    "markets order={} asc={} limit={} offset={}",
+                    plan.order, plan.ascending, plan.limit, offset
+                );
+                let markets: Vec<GammaMarket> = match self
+                    .get_json_with_retry(
+                        &self.cfg.endpoint,
+                        &[
+                            ("closed", "false"),
+                            ("archived", "false"),
+                            ("limit", limit_s.as_str()),
+                            ("offset", offset_s.as_str()),
+                            ("order", plan.order),
+                            ("ascending", plan.ascending),
+                        ],
+                        &request_kind,
+                    )
+                    .await
+                {
                     Ok(v) => v,
                     Err(err) => {
-                        last_err = Some(anyhow!("discovery request failed: {err}"));
-                        break;
-                    }
-                };
-                let response = match response.error_for_status() {
-                    Ok(v) => v,
-                    Err(err) => {
-                        last_err = Some(anyhow!("discovery status failed: {err}"));
-                        break;
-                    }
-                };
-                let markets: Vec<GammaMarket> = match response.json().await {
-                    Ok(v) => v,
-                    Err(err) => {
-                        last_err = Some(anyhow!("discovery json parse failed: {err}"));
+                        last_err = Some(err);
                         break;
                     }
                 };

@@ -48,8 +48,8 @@ fn strategy_runtime_stream_delta_limit() -> u32 {
     )
 }
 
-fn strategy_runtime_stream_cache(
-) -> &'static tokio::sync::RwLock<HashMap<String, StrategyRuntimeStreamState>> {
+fn strategy_runtime_stream_cache()
+-> &'static tokio::sync::RwLock<HashMap<String, StrategyRuntimeStreamState>> {
     static CACHE: OnceLock<tokio::sync::RwLock<HashMap<String, StrategyRuntimeStreamState>>> =
         OnceLock::new();
     CACHE.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
@@ -151,7 +151,10 @@ fn resolve_strategy_symbol(raw: Option<&str>) -> Result<&'static str, ApiError> 
     } else {
         "BTCUSDT"
     };
-    if strategy_enabled_symbols().iter().any(|v| v.as_str() == symbol) {
+    if strategy_enabled_symbols()
+        .iter()
+        .any(|v| v.as_str() == symbol)
+    {
         return Ok(symbol);
     }
     Err(ApiError::bad_request(format!(
@@ -398,12 +401,12 @@ fn strategy_profile_name_from_alias(raw: &str) -> Option<&'static str> {
         "balanced" | "manual_balanced" | "fev1_manual_balanced_2026_02_28" => {
             Some(STRATEGY_PROFILE_BALANCED)
         }
-        "btc5m_balance"
-        | "btc5m_balance_2026_03_06"
-        | "fev1_btc5m_balance_2026_03_06" => Some(STRATEGY_PROFILE_BTC_5M_BALANCE),
-        "sol5m_sharp"
-        | "sol5m_sharp_2026_03_07"
-        | "fev1_sol5m_sharp_2026_03_07" => Some(STRATEGY_PROFILE_SOL_5M_SHARP),
+        "btc5m_balance" | "btc5m_balance_2026_03_06" | "fev1_btc5m_balance_2026_03_06" => {
+            Some(STRATEGY_PROFILE_BTC_5M_BALANCE)
+        }
+        "sol5m_sharp" | "sol5m_sharp_2026_03_07" | "fev1_sol5m_sharp_2026_03_07" => {
+            Some(STRATEGY_PROFILE_SOL_5M_SHARP)
+        }
         "cand_growth_mix" | "growth_mix" | "growth" | "fev1_cand_growth_mix_2026_02_28" => {
             Some(STRATEGY_PROFILE_CAND_GROWTH_MIX)
         }
@@ -539,7 +542,8 @@ pub(super) async fn strategy_resolve_effective_config(
     explicit_profile: Option<&str>,
     prefer_live_doc: bool,
 ) -> Result<StrategyResolvedConfig, ApiError> {
-    let (baseline_profile, baseline_layer) = strategy_baseline_profile_for_scope(symbol, market_type);
+    let (baseline_profile, baseline_layer) =
+        strategy_baseline_profile_for_scope(symbol, market_type);
     let mut cfg = strategy_cfg_for_profile_name(baseline_profile);
     let mut config_source = baseline_profile.to_string();
     let mut config_layer = baseline_layer;
@@ -550,7 +554,10 @@ pub(super) async fn strategy_resolve_effective_config(
             let (payload, key) = resolve_autotune_live_doc(state, market_type, symbol).await?;
             if let Some(doc) = payload {
                 cfg = strategy_cfg_from_payload(cfg, &doc);
-                config_source = format!("autotune_live:{market_type}:{}", symbol.to_ascii_lowercase());
+                config_source = format!(
+                    "autotune_live:{market_type}:{}",
+                    symbol.to_ascii_lowercase()
+                );
                 config_layer = "autotune_live";
                 source_key = Some(key);
             }
@@ -559,7 +566,10 @@ pub(super) async fn strategy_resolve_effective_config(
             let (payload, key) = resolve_autotune_active_doc(state, market_type, symbol).await?;
             if let Some(doc) = payload {
                 cfg = strategy_cfg_from_payload(cfg, &doc);
-                config_source = format!("autotune_active:{market_type}:{}", symbol.to_ascii_lowercase());
+                config_source = format!(
+                    "autotune_active:{market_type}:{}",
+                    symbol.to_ascii_lowercase()
+                );
                 config_layer = "autotune_active";
                 source_key = Some(key);
             }
@@ -567,8 +577,10 @@ pub(super) async fn strategy_resolve_effective_config(
     }
 
     if let Some(profile_raw) = explicit_profile {
-        let (profile_name, profile_cfg) = strategy_profile_from_alias_strict(profile_raw)
-            .map_err(|_| ApiError::bad_request(format!("unknown strategy profile: {profile_raw}")))?;
+        let (profile_name, profile_cfg) =
+            strategy_profile_from_alias_strict(profile_raw).map_err(|_| {
+                ApiError::bad_request(format!("unknown strategy profile: {profile_raw}"))
+            })?;
         cfg = profile_cfg;
         config_source = profile_name.to_string();
         config_layer = "request_profile";
@@ -608,7 +620,10 @@ mod tests {
             parsed.get("SOLUSDT|5m").copied(),
             Some(STRATEGY_PROFILE_SOL_5M_SHARP)
         );
-        assert_eq!(parsed.get("SOLUSDT|*").copied(), Some(STRATEGY_PROFILE_BALANCED));
+        assert_eq!(
+            parsed.get("SOLUSDT|*").copied(),
+            Some(STRATEGY_PROFILE_BALANCED)
+        );
         assert_eq!(parsed.get("*|15m").copied(), Some(STRATEGY_PROFILE_HI_FREQ));
         assert_eq!(parsed.len(), 3);
     }
@@ -658,7 +673,7 @@ mod tests {
         );
         assert_eq!(
             strategy_baseline_profile_from_inputs("BTCUSDT", "5m", &HashMap::new(), None),
-            (STRATEGY_PROFILE_HI_WIN, "code_default")
+            (STRATEGY_PROFILE_BTC_5M_BALANCE, "code_scope_default")
         );
     }
 

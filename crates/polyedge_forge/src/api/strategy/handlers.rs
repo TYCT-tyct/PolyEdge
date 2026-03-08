@@ -262,6 +262,10 @@ pub(super) async fn strategy_paper(
     if samples.len() < 20 {
         return Ok(Json(json!({
             "source": "replay",
+            "sample_source_mode": "replay_bucket_1s_from_snapshot_100ms",
+            "sample_resolution_ms": 1000,
+            "storage_source_mode": "snapshot_100ms",
+            "storage_resolution_ms": 100,
             "execution_target": "paper",
             "live_enabled": fev1::ExecutionGate::from_env().live_enabled,
             "strategy_engine": "forge_fev1",
@@ -304,6 +308,10 @@ pub(super) async fn strategy_paper(
     let run = run_strategy_simulation_with_fee_context(&samples, &cfg, max_trades, None);
     Ok(Json(json!({
         "source": "replay",
+            "sample_source_mode": "replay_bucket_1s_from_snapshot_100ms",
+            "sample_resolution_ms": 1000,
+            "storage_source_mode": "snapshot_100ms",
+            "storage_resolution_ms": 100,
         "execution_target": "paper",
         "live_enabled": fev1::ExecutionGate::from_env().live_enabled,
         "strategy_engine": "forge_fev1",
@@ -402,7 +410,11 @@ pub(super) async fn strategy_live_reset(
             )
             .await;
         state
-            .put_live_runtime_control(&runtime_cfg.symbol, market, LiveRuntimeControl::normal(now_ms))
+            .put_live_runtime_control(
+                &runtime_cfg.symbol,
+                market,
+                LiveRuntimeControl::normal(now_ms),
+            )
             .await;
     }
 
@@ -416,7 +428,8 @@ pub(super) async fn strategy_live_reset(
         if delete_key(&state, &events_key).await.is_ok() {
             deleted_keys.push(events_key);
         }
-        let control_key = live_runtime_control_key(&state.redis_prefix, &runtime_cfg.symbol, market);
+        let control_key =
+            live_runtime_control_key(&state.redis_prefix, &runtime_cfg.symbol, market);
         if delete_key(&state, &control_key).await.is_ok() {
             deleted_keys.push(control_key);
         }
@@ -709,22 +722,16 @@ pub(super) async fn strategy_live_events(
     let mut reason_top = by_reason.into_iter().collect::<Vec<_>>();
     reason_top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     reason_top.truncate(20);
-    let order_latency = latency_stats_from_samples(&collect_event_latency_values(
-        &filtered,
-        "order_latency_ms",
-    ));
+    let order_latency =
+        latency_stats_from_samples(&collect_event_latency_values(&filtered, "order_latency_ms"));
     let signal_to_submit_latency = latency_stats_from_samples(&collect_event_latency_values(
         &filtered,
         "signal_to_submit_ms",
     ));
-    let signal_to_ack_latency = latency_stats_from_samples(&collect_event_latency_values(
-        &filtered,
-        "signal_to_ack_ms",
-    ));
-    let submit_to_ack_latency = latency_stats_from_samples(&collect_event_latency_values(
-        &filtered,
-        "submit_to_ack_ms",
-    ));
+    let signal_to_ack_latency =
+        latency_stats_from_samples(&collect_event_latency_values(&filtered, "signal_to_ack_ms"));
+    let submit_to_ack_latency =
+        latency_stats_from_samples(&collect_event_latency_values(&filtered, "submit_to_ack_ms"));
 
     Ok(Json(json!({
         "ok": true,
@@ -764,7 +771,8 @@ pub(super) async fn strategy_autotune_latest(
     let symbol = resolve_strategy_symbol(params.symbol.as_deref())?;
     let context = normalize_autotune_context(params.context.as_deref(), market_type, symbol);
     let (payload, key, _) = resolve_autotune_doc(&state, &context, market_type).await?;
-    let (active_payload, active_key) = resolve_autotune_active_doc(&state, market_type, symbol).await?;
+    let (active_payload, active_key) =
+        resolve_autotune_active_doc(&state, market_type, symbol).await?;
     let (live_payload, live_key) = resolve_autotune_live_doc(&state, market_type, symbol).await?;
     Ok(Json(json!({
         "market_type": market_type,

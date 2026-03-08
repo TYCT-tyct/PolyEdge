@@ -14,10 +14,10 @@ use reqwest::Client;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
-use crate::api::{run_api_server, ApiConfig};
+use crate::api::{ApiConfig, run_api_server};
 use crate::cli::{IrelandApiArgs, IrelandRecorderArgs};
 use crate::common::{parse_lower_csv, parse_timestamp_ms, parse_upper_csv, timeframe_to_ms};
-use crate::db_sink::{normalize_opt_url, run_db_sink, DbEvent, DbSinkConfig};
+use crate::db_sink::{DbEvent, DbSinkConfig, normalize_opt_url, run_db_sink};
 use crate::market_data_exchange::{
     market_in_sampling_window, market_pair_key, trim_candidate_pool,
 };
@@ -2992,6 +2992,175 @@ fn target_market_cache_key(symbols: &[String], timeframes: &[String]) -> String 
     )
 }
 
+fn serde_value_as_i64(v: Option<&serde_json::Value>) -> Option<i64> {
+    v.and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_u64().and_then(|raw| i64::try_from(raw).ok()))
+            .or_else(|| {
+                value
+                    .as_str()
+                    .and_then(|raw| raw.trim().parse::<i64>().ok())
+            })
+    })
+}
+
+fn serde_value_as_f64(v: Option<&serde_json::Value>) -> Option<f64> {
+    v.and_then(|value| {
+        value.as_f64().or_else(|| {
+            value
+                .as_str()
+                .and_then(|raw| raw.trim().parse::<f64>().ok())
+        })
+    })
+}
+
+fn serde_value_as_string(v: Option<&serde_json::Value>) -> Option<String> {
+    v.and_then(|value| value.as_str().map(str::to_string))
+}
+
+fn discovery_history_clickhouse_url() -> String {
+    std::env::var("POLYEDGE_DISCOVERY_HISTORY_CLICKHOUSE_URL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:8123".to_string())
+}
+
+fn clickhouse_escape_literal(raw: &str) -> String {
+    raw.to_string()
+}
+
+fn market_meta_from_history_row(
+    market_id: &str,
+    row: &serde_json::Map<String, serde_json::Value>,
+    allowed_symbols: &[String],
+) -> Option<MarketMeta> {
+    let symbol = serde_value_as_string(row.get("symbol"))?
+        .trim()
+        .to_ascii_uppercase();
+    if !allowed_symbols
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(&symbol))
+    {
+        return None;
+    }
+    let timeframe = serde_value_as_string(row.get("timeframe"))?
+        .trim()
+        .to_ascii_lowercase();
+    let title = serde_value_as_string(row.get("title")).unwrap_or_else(|| market_id.to_string());
+    let start_ts_ms = serde_value_as_i64(row.get("start_ts_ms"))?;
+    let end_ts_ms = serde_value_as_i64(row.get("end_ts_ms"))?;
+    if end_ts_ms <= start_ts_ms {
+        return None;
+    }
+    let target_price =
+        serde_value_as_f64(row.get("target_price")).filter(|v| v.is_finite() && *v > 0.0);
+    Some(MarketMeta {
+        market_id: market_id.to_string(),
+        symbol,
+        timeframe,
+        title,
+        target_price,
+        start_ts_ms,
+        end_ts_ms,
+    })
+}
+
+async fn recover_market_meta_from_history(
+    http: &Client,
+    market_id: &str,
+    timeframe: &str,
+    allowed_symbols: &[String],
+) -> Option<MarketMeta> {
+    let ch_url = discovery_history_clickhouse_url();
+    let market_id_esc = clickhouse_escape_literal(market_id);
+    let timeframe_esc = clickhouse_escape_literal(timeframe);
+    let queries = [
+        format!(
+            "SELECT                 argMax(symbol, ts_recorded_ms) AS symbol,                 argMax(timeframe, ts_recorded_ms) AS timeframe,                 argMax(title, ts_recorded_ms) AS title,                 argMax(start_ts_ms, ts_recorded_ms) AS start_ts_ms,                 argMax(end_ts_ms, ts_recorded_ms) AS end_ts_ms,                 argMax(target_price, ts_recorded_ms) AS target_price              FROM polyedge_forge.rounds              WHERE market_id='{}' AND timeframe='{}'              FORMAT JSON",
+            market_id_esc, timeframe_esc
+        ),
+        format!(
+            "SELECT                 argMax(symbol, ts_ireland_sample_ms) AS symbol,                 argMax(timeframe, ts_ireland_sample_ms) AS timeframe,                 argMax(title, ts_ireland_sample_ms) AS title,                 min(ts_ireland_sample_ms) AS start_ts_ms,                 max(ts_ireland_sample_ms) AS end_ts_ms,                 argMax(target_price, ts_ireland_sample_ms) AS target_price              FROM polyedge_forge.snapshot_100ms              WHERE market_id='{}' AND timeframe='{}'              FORMAT JSON",
+            market_id_esc, timeframe_esc
+        ),
+    ];
+
+    for query in queries {
+        let resp = http
+            .post(&ch_url)
+            .header("Content-Type", "text/plain")
+            .body(query)
+            .send()
+            .await
+            .ok()?;
+        let resp = resp.error_for_status().ok()?;
+        let value: serde_json::Value = resp.json().await.ok()?;
+        let row = value
+            .get("data")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(serde_json::Value::as_object);
+        if let Some(row) = row {
+            if let Some(meta) = market_meta_from_history_row(market_id, row, allowed_symbols) {
+                return Some(meta);
+            }
+        }
+    }
+    None
+}
+
+fn market_meta_from_cache_value(
+    market_id: &str,
+    market_v: &serde_json::Value,
+    allowed_symbols: &[String],
+) -> Option<MarketMeta> {
+    let timeframe = market_v
+        .get("timeframe")
+        .and_then(serde_json::Value::as_str)?
+        .trim()
+        .to_ascii_lowercase();
+    let title = market_v
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let symbol = market_v
+        .get("symbol")
+        .and_then(serde_json::Value::as_str)
+        .map(|v| v.trim().to_ascii_uppercase())
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            title
+                .as_deref()
+                .and_then(|question| detect_symbol_from_question(question, allowed_symbols))
+        })?;
+    if !allowed_symbols
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(&symbol))
+    {
+        return None;
+    }
+    let start_ts_ms = serde_value_as_i64(market_v.get("start_ts_ms"))?;
+    let end_ts_ms = serde_value_as_i64(market_v.get("end_ts_ms"))?;
+    if end_ts_ms <= start_ts_ms {
+        return None;
+    }
+    let target_price = market_v
+        .get("target_price")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|v| v.is_finite() && *v > 0.0);
+    Some(MarketMeta {
+        market_id: market_id.to_string(),
+        symbol,
+        timeframe,
+        title: title.unwrap_or_else(|| market_id.to_string()),
+        target_price,
+        end_ts_ms,
+        start_ts_ms,
+    })
+}
+
 fn detect_symbol_from_question(question: &str, allowed_symbols: &[String]) -> Option<String> {
     let text = question.to_ascii_uppercase();
     let aliases: [(&str, [&str; 3]); 15] = [
@@ -3041,6 +3210,32 @@ async fn discover_markets_from_target_cache(
         anyhow::bail!("cache key not found: {cache_key}");
     };
 
+    let mut out = Vec::<MarketMeta>::new();
+    let mut unresolved = Vec::<(String, String)>::new();
+    for (market_id, market_v) in markets_obj {
+        let Some(timeframe) = market_v
+            .get("timeframe")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if !timeframes
+            .iter()
+            .any(|tf| tf.eq_ignore_ascii_case(timeframe))
+        {
+            continue;
+        }
+        if let Some(meta) = market_meta_from_cache_value(market_id, market_v, symbols) {
+            out.push(meta);
+            continue;
+        }
+        unresolved.push((market_id.clone(), timeframe.to_string()));
+    }
+
+    if unresolved.is_empty() {
+        return Ok(out);
+    }
+
     let user_agent = std::env::var("POLYEDGE_DISCOVERY_USER_AGENT")
         .ok()
         .map(|v| v.trim().to_string())
@@ -3056,18 +3251,11 @@ async fn discover_markets_from_target_cache(
         .build()
         .unwrap_or_else(|_| Client::new());
 
-    let mut out = Vec::<MarketMeta>::new();
-    for (market_id, market_v) in markets_obj {
-        let Some(timeframe) = market_v
-            .get("timeframe")
-            .and_then(serde_json::Value::as_str)
-        else {
-            continue;
-        };
-        if !timeframes
-            .iter()
-            .any(|tf| tf.eq_ignore_ascii_case(timeframe))
+    for (market_id, timeframe) in unresolved {
+        if let Some(meta) =
+            recover_market_meta_from_history(&http, &market_id, &timeframe, symbols).await
         {
+            out.push(meta);
             continue;
         }
         let detail_url = format!("https://gamma-api.polymarket.com/markets/{market_id}");
@@ -3099,12 +3287,12 @@ async fn discover_markets_from_target_cache(
         ) else {
             continue;
         };
-        let tf_ms = timeframe_to_ms(timeframe).unwrap_or(300_000);
+        let tf_ms = timeframe_to_ms(&timeframe).unwrap_or(300_000);
         let start_ts_ms = end_ts_ms.saturating_sub(tf_ms);
         out.push(MarketMeta {
-            market_id: market_id.clone(),
+            market_id,
             symbol,
-            timeframe: timeframe.to_string(),
+            timeframe,
             title: question,
             target_price: None,
             end_ts_ms,
@@ -3571,6 +3759,30 @@ mod tests {
         trim_candidate_pool(&mut markets, now_ms, 30_000, 300, 3);
         let ids = markets.into_iter().map(|m| m.market_id).collect::<Vec<_>>();
         assert_eq!(ids, vec!["current", "next", "next2"]);
+    }
+
+    #[test]
+    fn cache_value_with_embedded_meta_recovers_market_meta() {
+        let cache_value = json!({
+            "timeframe": "5m",
+            "symbol": "BTCUSDT",
+            "title": "Bitcoin Up or Down - 5 Minutes",
+            "target_price": 101234.5,
+            "start_ts_ms": 1_700_000_000_000_i64,
+            "end_ts_ms": 1_700_000_300_000_i64
+        });
+        let meta = market_meta_from_cache_value(
+            "market-1",
+            &cache_value,
+            &["BTCUSDT".to_string(), "SOLUSDT".to_string()],
+        )
+        .expect("embedded cache market meta");
+        assert_eq!(meta.market_id, "market-1");
+        assert_eq!(meta.symbol, "BTCUSDT");
+        assert_eq!(meta.timeframe, "5m");
+        assert_eq!(meta.target_price, Some(101234.5));
+        assert_eq!(meta.start_ts_ms, 1_700_000_000_000_i64);
+        assert_eq!(meta.end_ts_ms, 1_700_000_300_000_i64);
     }
 
     fn dummy_snapshot(round_id: &str, ts_ms: i64) -> SnapshotRow {

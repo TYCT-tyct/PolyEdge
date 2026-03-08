@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use core_types::{
     BookDelta, BookLevel, BookSide, BookSnapshot, BookTop, BookUpdate, DynStream, MarketFeed,
     OrderbookStateDigest, PolymarketBookWsFeed,
@@ -183,12 +183,25 @@ impl PolymarketFeed {
             let ask_yes = market.best_ask.unwrap_or(1.0).clamp(0.0, 1.0);
             let bid_no = (1.0 - ask_yes).max(0.0);
             let ask_no = (1.0 - bid_yes).min(1.0);
+            let timeframe = market.timeframe.clone();
+            let end_ts_ms = parse_rfc3339_timestamp_ms(market.end_date.as_deref());
+            let start_ts_ms = end_ts_ms.and_then(|end_ts_ms| {
+                timeframe
+                    .as_deref()
+                    .and_then(timeframe_to_ms)
+                    .map(|tf_ms| end_ts_ms.saturating_sub(tf_ms))
+            });
 
             out.insert(
                 market.market_id.clone(),
                 MarketState {
                     market_id: market.market_id,
-                    timeframe: market.timeframe,
+                    timeframe,
+                    symbol: Some(market.symbol.to_ascii_uppercase()),
+                    title: Some(market.question),
+                    target_price: market.price_to_beat,
+                    start_ts_ms,
+                    end_ts_ms,
                     yes_token: yes,
                     no_token: no,
                     yes: AssetTop {
@@ -562,8 +575,31 @@ impl PolymarketFeed {
     }
 }
 
-fn target_market_cache(
-) -> &'static tokio::sync::RwLock<HashMap<String, HashMap<String, MarketState>>> {
+fn parse_rfc3339_timestamp_ms(raw: Option<&str>) -> Option<i64> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
+fn timeframe_to_ms(timeframe: &str) -> Option<i64> {
+    match timeframe.trim().to_ascii_lowercase().as_str() {
+        "5m" => Some(5 * 60 * 1_000),
+        "15m" => Some(15 * 60 * 1_000),
+        "30m" => Some(30 * 60 * 1_000),
+        "1h" => Some(60 * 60 * 1_000),
+        "2h" => Some(2 * 60 * 60 * 1_000),
+        "4h" => Some(4 * 60 * 60 * 1_000),
+        "1d" => Some(24 * 60 * 60 * 1_000),
+        _ => None,
+    }
+}
+
+fn target_market_cache()
+-> &'static tokio::sync::RwLock<HashMap<String, HashMap<String, MarketState>>> {
     static CACHE: OnceLock<tokio::sync::RwLock<HashMap<String, HashMap<String, MarketState>>>> =
         OnceLock::new();
     CACHE.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
@@ -1401,6 +1437,16 @@ struct MarketState {
     market_id: String,
     #[serde(default)]
     timeframe: Option<String>,
+    #[serde(default)]
+    symbol: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    target_price: Option<f64>,
+    #[serde(default)]
+    start_ts_ms: Option<i64>,
+    #[serde(default)]
+    end_ts_ms: Option<i64>,
     yes_token: String,
     no_token: String,
     yes: AssetTop,
@@ -1509,6 +1555,11 @@ mod tests {
         MarketState {
             market_id: market_id.to_string(),
             timeframe: Some(timeframe.to_string()),
+            symbol: None,
+            title: None,
+            target_price: None,
+            start_ts_ms: None,
+            end_ts_ms: None,
             yes_token: format!("{market_id}-yes"),
             no_token: format!("{market_id}-no"),
             yes: AssetTop {
