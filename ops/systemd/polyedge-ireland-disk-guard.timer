@@ -1,0 +1,11 @@
+[Unit]
+Description=Run PolyEdge Ireland disk guard every 6 hours
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+Unit=polyedge-ireland-disk-guard.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

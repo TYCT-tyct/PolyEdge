@@ -320,14 +320,20 @@ Unit=polyedge-forge-healthcheck.service
 WantedBy=timers.target
 UNIT
 
+sudo install -m 0755 "$REPO_DIR/scripts/forge/ireland_disk_guard.sh" /usr/local/bin/polyedge-ireland-disk-guard.sh
+sudo cp "$REPO_DIR/ops/systemd/polyedge-ireland-disk-guard.service" /etc/systemd/system/
+sudo cp "$REPO_DIR/ops/systemd/polyedge-ireland-disk-guard.timer" /etc/systemd/system/
+
 sudo systemctl daemon-reload
 sudo systemctl enable polyedge-forge-ireland-recorder.service
 sudo systemctl enable polyedge-forge-ireland-api.service
 sudo systemctl restart polyedge-forge-ireland-recorder.service
 sudo systemctl restart polyedge-forge-ireland-api.service
 sudo systemctl enable --now polyedge-forge-healthcheck.timer
+sudo systemctl enable --now polyedge-ireland-disk-guard.timer
 sudo systemctl --no-pager --full status polyedge-forge-ireland-recorder.service | sed -n '1,25p'
 sudo systemctl --no-pager --full status polyedge-forge-ireland-api.service | sed -n '1,25p'
 sudo systemctl --no-pager --full status polyedge-forge-healthcheck.timer | sed -n '1,20p'
+sudo systemctl --no-pager --full status polyedge-ireland-disk-guard.timer | sed -n '1,15p'
 
 echo "[forge-ireland] done"

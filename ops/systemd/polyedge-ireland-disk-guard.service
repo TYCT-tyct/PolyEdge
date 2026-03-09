@@ -1,0 +1,14 @@
+[Unit]
+Description=PolyEdge Ireland disk guard
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+Environment=ROOT_USAGE_PCT=85
+Environment=JOURNAL_KEEP=300M
+Environment=HOME_DIR=/home/ubuntu
+Environment=REPO_DIR=/home/ubuntu/PolyEdge
+Environment=DATA_RELEASE_ROOT=/data/polyedge-releases
+Environment=HOME_RELEASE_ROOT=/home/ubuntu/polyedge-releases
+ExecStart=/usr/bin/env bash /usr/local/bin/polyedge-ireland-disk-guard.sh

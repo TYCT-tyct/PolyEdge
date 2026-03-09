@@ -43,6 +43,7 @@ sudo systemctl enable polyedge-forge-tokyo.service
 sudo systemctl restart polyedge-forge-tokyo.service
 sudo systemctl --no-pager --full status polyedge-forge-tokyo.service | sed -n '1,25p'
 
+sudo install -m 0755 "$REPO_DIR/scripts/forge/tokyo_disk_guard.sh" /usr/local/bin/polyedge-tokyo-disk-guard.sh
 sudo cp "$REPO_DIR/ops/systemd/polyedge-tokyo-disk-guard.service" /etc/systemd/system/
 sudo cp "$REPO_DIR/ops/systemd/polyedge-tokyo-disk-guard.timer" /etc/systemd/system/
 sudo systemctl daemon-reload

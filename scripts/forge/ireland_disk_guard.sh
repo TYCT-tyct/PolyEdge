@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Forge-only disk guard for Tokyo relay hosts.
-# This is intentionally conservative: keep runtime binaries, prune build/cache artifacts.
+# Disk guard for Ireland API/recorder hosts.
+# Keep live data under /data intact, prune only reproducible build and deploy artifacts.
 
 ROOT_USAGE_PCT="${ROOT_USAGE_PCT:-85}"
-JOURNAL_KEEP="${JOURNAL_KEEP:-200M}"
-REPO_DIR="${REPO_DIR:-/home/ubuntu/PolyEdge}"
+JOURNAL_KEEP="${JOURNAL_KEEP:-300M}"
 HOME_DIR="${HOME_DIR:-/home/ubuntu}"
-RELEASE_ROOT="${RELEASE_ROOT:-$HOME_DIR/polyedge-releases}"
-RUSTUP_HOME_DIR="${RUSTUP_HOME_DIR:-/home/ubuntu/.rustup}"
-CARGO_HOME_DIR="${CARGO_HOME_DIR:-/home/ubuntu/.cargo}"
+REPO_DIR="${REPO_DIR:-$HOME_DIR/PolyEdge}"
+DATA_RELEASE_ROOT="${DATA_RELEASE_ROOT:-/data/polyedge-releases}"
+HOME_RELEASE_ROOT="${HOME_RELEASE_ROOT:-$HOME_DIR/polyedge-releases}"
+CARGO_HOME_DIR="${CARGO_HOME_DIR:-$HOME_DIR/.cargo}"
+RUSTUP_HOME_DIR="${RUSTUP_HOME_DIR:-$HOME_DIR/.rustup}"
 
 log() {
-  printf '[tokyo-disk-guard] %s\n' "$*"
+  printf '[ireland-disk-guard] %s\n' "$*"
 }
 
 usage_pct() {
@@ -22,11 +23,29 @@ usage_pct() {
 
 active_release_short() {
   local env_line commit
-  env_line="$(systemctl show polyedge-forge-tokyo.service -p Environment --value 2>/dev/null || true)"
+  env_line="$(systemctl show polyedge-forge-ireland-api.service -p Environment --value 2>/dev/null || true)"
   commit="$(printf '%s\n' "$env_line" | tr ' ' '\n' | sed -n 's/^POLYEDGE_RELEASE_COMMIT=//p' | head -n1)"
   if [[ -n "$commit" ]]; then
     printf '%s' "${commit:0:7}"
   fi
+}
+
+prune_release_root() {
+  local root="$1"
+  local keep="$2"
+  [[ -d "$root" ]] || return
+  while IFS= read -r dir; do
+    [[ -d "$dir" ]] || continue
+    local base
+    base="$(basename "$dir")"
+    if [[ -n "$keep" && "$base" == "$keep" ]]; then
+      log "trim active release source tree: $dir"
+      rm -rf "$dir/src"
+      continue
+    fi
+    log "remove stale release: $dir"
+    rm -rf "$dir"
+  done < <(find "$root" -mindepth 1 -maxdepth 1 -type d | sort)
 }
 
 prune_glob() {
@@ -40,35 +59,15 @@ prune_glob() {
   done
 }
 
-prune_releases() {
-  local keep="$1"
-  [[ -d "$RELEASE_ROOT" ]] || return
-  while IFS= read -r dir; do
-    [[ -d "$dir" ]] || continue
-    local base
-    base="$(basename "$dir")"
-    if [[ -n "$keep" && "$base" == "$keep" ]]; then
-      log "trim active release source tree: $dir"
-      rm -rf "$dir/src"
-      continue
-    fi
-    log "remove stale release: $dir"
-    rm -rf "$dir"
-  done < <(find "$RELEASE_ROOT" -mindepth 1 -maxdepth 1 -type d | sort)
-}
-
-prune_target_release() {
-  local rel="$REPO_DIR/target/release"
-  if [[ ! -d "$rel" ]]; then
-    return
+prune_build_artifacts() {
+  if [[ -d "$REPO_DIR/target" ]]; then
+    log "prune repo target dir"
+    rm -rf "$REPO_DIR/target"
   fi
-  log "prune target/release build artifacts"
-  rm -rf \
-    "$rel/deps" \
-    "$rel/build" \
-    "$rel/.fingerprint" \
-    "$rel/incremental" \
-    "$rel/examples"
+  if [[ -d "$HOME_DIR/.npm" ]]; then
+    log "prune home npm cache"
+    rm -rf "$HOME_DIR/.npm/_cacache" "$HOME_DIR/.npm/_logs" 2>/dev/null || true
+  fi
 }
 
 prune_cargo_cache() {
@@ -88,11 +87,6 @@ prune_misc() {
   log "apt clean"
   apt-get clean >/dev/null 2>&1 || true
   rm -rf /var/tmp/* /tmp/* 2>/dev/null || true
-  rm -rf "$HOME_DIR/polyedge_dirty_backup" 2>/dev/null || true
-  prune_glob \
-    "$HOME_DIR/PolyEdge_dirty_*" \
-    "$HOME_DIR/"'polyedge_*.bundle' \
-    "$HOME_DIR/"'*.tgz'
 }
 
 main() {
@@ -107,11 +101,18 @@ main() {
   fi
 
   prune_misc
-  prune_target_release
+  prune_build_artifacts
   prune_cargo_cache
-  prune_releases "$active"
+  prune_release_root "$DATA_RELEASE_ROOT" "$active"
+  prune_release_root "$HOME_RELEASE_ROOT" "$active"
+  prune_glob \
+    "$HOME_DIR/PolyEdge_dirty_*" \
+    "$HOME_DIR/PolyEdge_deploy*" \
+    "$HOME_DIR/PolyEdge-[0-9a-f]*" \
+    "$HOME_DIR/releases" \
+    "$HOME_DIR/"'polyedge_*.bundle' \
+    "$HOME_DIR/"'*.tgz'
 
-  # Emergency branch: rustup toolchains can dominate small root volumes.
   after="$(usage_pct)"
   if (( after >= ROOT_USAGE_PCT )) && [[ -d "$RUSTUP_HOME_DIR/toolchains" ]]; then
     log "usage still high (${after}%), prune old rustup toolchains except stable"
