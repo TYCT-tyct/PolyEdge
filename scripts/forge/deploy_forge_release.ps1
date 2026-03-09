@@ -58,6 +58,14 @@ function Assert-FileExists {
     }
 }
 
+function Quote-ProcessArgument {
+    param([string]$Value)
+    if ($Value -match '[\s"]') {
+        return '"' + ($Value -replace '"', '\"') + '"'
+    }
+    return $Value
+}
+
 function Assert-CleanWorktree {
     param([string]$RepoRoot)
     $status = & git -C $RepoRoot status --porcelain=v1 --untracked-files=all
@@ -207,14 +215,13 @@ function Invoke-RemoteScript {
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     $startInfo.UseShellExecute = $false
-    $null = $startInfo.ArgumentList.Add("-i")
-    $null = $startInfo.ArgumentList.Add($KeyPath)
-    $null = $startInfo.ArgumentList.Add("-o")
-    $null = $startInfo.ArgumentList.Add("BatchMode=yes")
-    $null = $startInfo.ArgumentList.Add("-o")
-    $null = $startInfo.ArgumentList.Add("StrictHostKeyChecking=accept-new")
-    $null = $startInfo.ArgumentList.Add("$User@$RemoteHost")
-    $null = $startInfo.ArgumentList.Add("bash -s")
+    $startInfo.Arguments = @(
+        "-i", (Quote-ProcessArgument $KeyPath),
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+        (Quote-ProcessArgument "$User@$RemoteHost"),
+        (Quote-ProcessArgument "bash -s")
+    ) -join " "
 
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
