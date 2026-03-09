@@ -812,13 +812,26 @@ pub(super) async fn chart(
 ) -> Result<Json<Value>, ApiError> {
     let market_type = normalize_market_type(&params.market_type)
         .ok_or_else(|| ApiError::bad_request("invalid market_type"))?;
+    let symbol = normalize_collector_symbol(params.symbol.as_deref());
     let minutes = params.minutes.unwrap_or(30).min(7 * 24 * 60);
     let max_points = params.max_points.unwrap_or(1500).clamp(200, 20_000) as usize;
-    let cache_key = format!("{}:{}:{}", market_type, minutes, max_points);
+    let cache_key = format!("{}:{}:{}:{}", symbol, market_type, minutes, max_points);
     if let Some(cached) = state.chart_cache_get(&cache_key).await {
         return Ok(Json(cached));
     }
-    let raw_limit = (max_points.saturating_mul(12)).clamp(6_000, 120_000);
+    let sample_period_ms = std::env::var("FORGE_SAMPLE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(100)
+        .clamp(20, 1_000);
+    let lookback_minutes = if minutes == 0 { 180 } else { minutes as usize };
+    let estimated_points = lookback_minutes
+        .saturating_mul(60_000)
+        .div_ceil(sample_period_ms);
+    let raw_limit = estimated_points
+        .saturating_mul(12)
+        .max(max_points.saturating_mul(4))
+        .clamp(6_000, 240_000);
     let round_limit = {
         let tf_minutes = if market_type == "5m" { 5usize } else { 15usize };
         let round_span_minutes = if minutes == 0 {
@@ -861,7 +874,7 @@ pub(super) async fn chart(
             binance_price AS btc_price,
             target_price
         FROM polyedge_forge.snapshot_100ms
-        WHERE symbol='BTCUSDT'
+        WHERE symbol='{symbol}'
           AND timeframe='{market_type}'
           {from_clause}
         ORDER BY ts_ireland_sample_ms DESC
@@ -881,7 +894,7 @@ pub(super) async fn chart(
             target_price,
             toInt8(settle_price > target_price) AS outcome
         FROM polyedge_forge.rounds
-        WHERE symbol='BTCUSDT'
+        WHERE symbol='{symbol}'
           AND timeframe='{market_type}'
           {}
         ORDER BY end_ts_ms DESC
@@ -914,6 +927,7 @@ pub(super) async fn chart(
     }
 
     let payload = json!({
+        "symbol": symbol,
         "points": points,
         "rounds": rounds,
         "total_samples": total_samples,
