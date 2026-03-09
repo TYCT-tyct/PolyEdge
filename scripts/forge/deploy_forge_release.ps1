@@ -195,7 +195,7 @@ echo "[deploy] release_dir=$RELEASE_DIR"
 
 function Invoke-RemoteScript {
     param(
-        [string]$Host,
+        [string]$RemoteHost,
         [string]$User,
         [string]$KeyPath,
         [string]$ScriptBody
@@ -205,13 +205,13 @@ function Invoke-RemoteScript {
         "-i", $KeyPath,
         "-o", "BatchMode=yes",
         "-o", "StrictHostKeyChecking=accept-new",
-        "$User@$Host",
+        "$User@$RemoteHost",
         "bash -s"
     )
 
     $ScriptBody | & ssh @sshArgs
     if ($LASTEXITCODE -ne 0) {
-        throw "Remote deploy failed on $Host."
+        throw "Remote deploy failed on $RemoteHost."
     }
 }
 
@@ -277,7 +277,7 @@ foreach ($targetName in $deployQueue) {
                 -SetupScriptRelativePath "scripts/forge/setup_ireland_forge.sh" `
                 -TargetName "ireland" `
                 -PostChecks $irelandPostChecks
-            Invoke-RemoteScript -Host $IrelandHost -User $IrelandUser -KeyPath $IrelandKeyPath -ScriptBody $script
+            Invoke-RemoteScript -RemoteHost $IrelandHost -User $IrelandUser -KeyPath $IrelandKeyPath -ScriptBody $script
         }
         "tokyo" {
             Assert-FileExists -PathToCheck $TokyoKeyPath
@@ -291,7 +291,7 @@ foreach ($targetName in $deployQueue) {
                 -SetupScriptRelativePath "scripts/forge/setup_tokyo_forge.sh" `
                 -TargetName "tokyo" `
                 -PostChecks $tokyoPostChecks
-            Invoke-RemoteScript -Host $TokyoHost -User $TokyoUser -KeyPath $TokyoKeyPath -ScriptBody $script
+            Invoke-RemoteScript -RemoteHost $TokyoHost -User $TokyoUser -KeyPath $TokyoKeyPath -ScriptBody $script
         }
         default {
             throw "Unexpected target in deploy queue: $targetName"
