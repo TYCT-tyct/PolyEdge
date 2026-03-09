@@ -32,7 +32,8 @@ pub(super) async fn apply_pending_confirmation(
     } else {
         (fill_quote_usdc / (fill_price_cents / 100.0).max(0.0001)).max(0.0)
     };
-    let fill_cost_usdc = quantize_usdc_micros((fill_meta.fee_usdc + fill_meta.slippage_usdc).max(0.0));
+    let fill_cost_usdc =
+        quantize_usdc_micros((fill_meta.fee_usdc + fill_meta.slippage_usdc).max(0.0));
     if action == "enter" {
         ps.state = "in_position".to_string();
         ps.symbol = pending.symbol.trim().to_ascii_uppercase();
@@ -132,7 +133,8 @@ pub(super) async fn apply_pending_confirmation(
             let realized_micro = gross_micro - alloc_micro - fill_cost_micro;
             let next_cost_micro = (usdc_to_micros(ps.position_cost_usdc) - alloc_micro).max(0);
             ps.position_cost_usdc = micros_to_usdc(next_cost_micro);
-            ps.realized_pnl_usdc = micros_to_usdc(usdc_to_micros(ps.realized_pnl_usdc) + realized_micro);
+            ps.realized_pnl_usdc =
+                micros_to_usdc(usdc_to_micros(ps.realized_pnl_usdc) + realized_micro);
             ps.last_fill_pnl_usdc = micros_to_usdc(realized_micro);
         } else {
             ps.last_fill_pnl_usdc = 0.0;
@@ -170,6 +172,53 @@ pub(super) async fn apply_pending_confirmation(
     state
         .put_live_position_state(&pending.symbol, &pending.market_type, ps)
         .await;
+    if fill_meta.size_guard_triggered {
+        let now_ms = Utc::now().timestamp_millis();
+        let mut control = state
+            .get_live_runtime_control(&pending.symbol, &pending.market_type)
+            .await;
+        if control.mode != LiveRuntimeControlMode::ForcePause {
+            control.mode = LiveRuntimeControlMode::ForcePause;
+            control.requested_at_ms = now_ms;
+            control.updated_at_ms = now_ms;
+            control.completed_at_ms = None;
+            control.note = Some(format!(
+                "fill_size_guard:{}:order_id={}",
+                reason, pending.order_id
+            ));
+            state
+                .put_live_runtime_control(&pending.symbol, &pending.market_type, control.clone())
+                .await;
+        }
+        state
+            .append_live_event(
+                &pending.symbol,
+                &pending.market_type,
+                json!({
+                    "accepted": true,
+                    "event_type": "guard",
+                    "action": pending.action,
+                    "side": pending.side,
+                    "round_id": pending.round_id,
+                    "decision_id": pending.decision_id,
+                    "decision_key": pending.decision_key,
+                    "reason": "fill_size_guard_force_pause",
+                    "order_id": pending.order_id,
+                    "runtime_mode": control.mode,
+                    "runtime_note": control.note,
+                    "detail": {
+                        "requested_size_shares": pending.order_size_shares,
+                        "reported_fill_size_shares": fill_meta.reported_fill_size_shares,
+                        "effective_fill_size_shares": fill_meta.fill_size_shares,
+                        "requested_quote_usdc": pending.quote_size_usdc,
+                        "reported_fill_quote_usdc": fill_meta.reported_fill_quote_usdc,
+                        "effective_fill_quote_usdc": fill_meta.fill_quote_usdc,
+                        "fill_price_cents": fill_price_cents
+                    }
+                }),
+            )
+            .await;
+    }
 }
 
 pub(super) async fn apply_pending_revert(
@@ -519,26 +568,27 @@ pub(super) fn build_position_locked_target(
     market_type: &str,
     position_state: &LivePositionState,
 ) -> Option<LiveMarketTarget> {
-    let market_id = position_state.entry_market_id.as_deref()?.trim().to_string();
+    let market_id = position_state
+        .entry_market_id
+        .as_deref()?
+        .trim()
+        .to_string();
     let token_id = position_state.entry_token_id.as_deref()?.trim().to_string();
     if market_id.is_empty() || token_id.is_empty() {
         return None;
     }
     let (token_id_yes, token_id_no) = (token_id.clone(), token_id.clone());
-    let symbol = position_state
-        .symbol
-        .trim()
-        .to_ascii_uppercase();
+    let symbol = position_state.symbol.trim().to_ascii_uppercase();
     let symbol = if !symbol.is_empty() {
         symbol
     } else {
         position_state
-        .entry_round_id
-        .as_deref()
-        .and_then(|rid| rid.split('_').next())
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.to_ascii_uppercase())
-        .unwrap_or_else(default_runtime_symbol)
+            .entry_round_id
+            .as_deref()
+            .and_then(|rid| rid.split('_').next())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_ascii_uppercase())
+            .unwrap_or_else(default_runtime_symbol)
     };
     let end_date = position_state
         .entry_round_id

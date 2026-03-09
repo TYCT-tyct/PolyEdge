@@ -6,7 +6,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
@@ -16,8 +16,9 @@ use axum::{Json, Router};
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use futures::StreamExt;
 use market_discovery::{DiscoveryConfig, MarketDescriptor, MarketDiscovery};
-use polymarket_client_sdk::auth::state::Authenticated as PmAuthenticated;
+use polymarket_client_sdk::POLYGON;
 use polymarket_client_sdk::auth::Credentials as PmCredentials;
+use polymarket_client_sdk::auth::state::Authenticated as PmAuthenticated;
 use polymarket_client_sdk::auth::{
     LocalSigner as PmLocalSigner, Normal as PmNormal, Signer as PmSigner,
 };
@@ -30,11 +31,10 @@ use polymarket_client_sdk::clob::types::{
 };
 use polymarket_client_sdk::clob::{Client as PmClient, Config as PmConfig};
 use polymarket_client_sdk::types::{Address as PmAddress, Decimal as PmDecimal, U256 as PmU256};
-use polymarket_client_sdk::POLYGON;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use serde_json::{Value, json};
+use tokio::sync::{RwLock, Semaphore, mpsc};
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
@@ -431,6 +431,8 @@ struct LivePendingOrder {
     #[serde(default)]
     terminal_due_at_ms: i64,
     retry_count: u8,
+    #[serde(default)]
+    size_locked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1078,6 +1080,49 @@ fn enrich_paper_records_with_live_fills(
         out.push(next);
     }
     (out, matched)
+}
+
+fn merge_current_summary_paper_records(
+    paper_records: &[Value],
+    selected_decisions: &[Value],
+) -> Vec<Value> {
+    let mut seen = HashSet::<String>::new();
+    let mut out = Vec::<Value>::with_capacity(paper_records.len() + 1);
+    for record in paper_records {
+        if let Some(decision_id) = extract_decision_id(record) {
+            seen.insert(decision_id);
+        }
+        out.push(record.clone());
+    }
+    for decision in selected_decisions {
+        let signal_source = decision
+            .get("signal_source")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let reason = decision
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let is_current_summary = signal_source.eq_ignore_ascii_case("current_summary")
+            || reason.eq_ignore_ascii_case("fev1_current_summary_entry");
+        if !is_current_summary {
+            continue;
+        }
+        let Some(decision_id) = extract_decision_id(decision) else {
+            continue;
+        };
+        if !seen.insert(decision_id) {
+            continue;
+        }
+        let mut row = decision.clone();
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert("paper_record_source".to_string(), json!("current_summary"));
+            obj.insert("paper_record_virtual".to_string(), Value::Bool(true));
+        }
+        out.push(row);
+    }
+    out.sort_by_key(|row| row.get("ts_ms").and_then(Value::as_i64).unwrap_or(0));
+    out
 }
 
 fn build_live_order_lineage(events: &[Value], pending_rows: &[LivePendingOrder]) -> Vec<Value> {
@@ -3370,9 +3415,11 @@ async fn live_runtime_loop(
                         .await;
                     let (live_fill_by_decision, live_fill_summary) =
                         build_live_fill_decision_map(&live_events_all);
+                    let paper_records =
+                        merge_current_summary_paper_records(&paper_decisions, &selected_decisions);
                     let (paper_records_enriched, paper_live_fill_count) =
                         enrich_paper_records_with_live_fills(
-                            &paper_decisions,
+                            &paper_records,
                             &live_fill_by_decision,
                         );
                     let live_order_lineage =
@@ -3937,6 +3984,52 @@ mod tests {
         assert_eq!(
             normalized[0].get("quote_size_usdc").and_then(Value::as_f64),
             Some(1.2)
+        );
+    }
+
+    #[test]
+    fn merge_current_summary_paper_records_appends_virtual_record() {
+        let paper_records = vec![json!({
+            "decision_id": "paper-1",
+            "action": "enter",
+            "side": "UP",
+            "round_id": "r-1",
+            "ts_ms": 100_i64
+        })];
+        let selected_decisions = vec![
+            json!({
+                "decision_id": "paper-1",
+                "action": "enter",
+                "side": "UP",
+                "signal_source": "signal_decision",
+                "round_id": "r-1",
+                "ts_ms": 100_i64
+            }),
+            json!({
+                "decision_id": "summary-1",
+                "action": "enter",
+                "side": "DOWN",
+                "signal_source": "current_summary",
+                "round_id": "r-2",
+                "ts_ms": 200_i64
+            }),
+        ];
+
+        let merged = merge_current_summary_paper_records(&paper_records, &selected_decisions);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged[1].get("decision_id").and_then(Value::as_str),
+            Some("summary-1")
+        );
+        assert_eq!(
+            merged[1].get("paper_record_source").and_then(Value::as_str),
+            Some("current_summary")
+        );
+        assert_eq!(
+            merged[1]
+                .get("paper_record_virtual")
+                .and_then(Value::as_bool),
+            Some(true)
         );
     }
 

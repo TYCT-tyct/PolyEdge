@@ -28,6 +28,7 @@ pub(super) fn fill_event_from_open_order(
     let fill_price = pm_dec_to_f64(&order.price).max(0.0001);
     let fill_size = pm_dec_to_f64(&order.size_matched).max(0.0);
     let fill_quote = (fill_price * fill_size).max(0.0);
+    let original_size = pm_dec_to_f64(&order.original_size).max(0.0);
     json!({
         "event": "order_terminal",
         "state": "filled",
@@ -35,6 +36,7 @@ pub(super) fn fill_event_from_open_order(
         "fill_price_cents": fill_price * 100.0,
         "fill_quote_usdc": fill_quote,
         "fill_size_shares": fill_size,
+        "original_size_shares": original_size,
         "size_matched": fill_size,
         "matched_size": fill_size,
         "associate_trades": order.associate_trades,
@@ -54,12 +56,18 @@ fn cancel_failure_pause_threshold(action: &str) -> u8 {
     }
 }
 
-fn cancel_response_contains_order(resp: &polymarket_client_sdk::clob::types::response::CancelOrdersResponse, order_id: &str) -> bool {
+fn cancel_response_contains_order(
+    resp: &polymarket_client_sdk::clob::types::response::CancelOrdersResponse,
+    order_id: &str,
+) -> bool {
     resp.canceled.iter().any(|id| id == order_id)
 }
 
 fn initial_pending_cancel_after_ms(action: &str, tif: &str) -> i64 {
-    let maker_tif = matches!(tif.to_ascii_uppercase().as_str(), "GTD" | "GTC" | "POST_ONLY");
+    let maker_tif = matches!(
+        tif.to_ascii_uppercase().as_str(),
+        "GTD" | "GTC" | "POST_ONLY"
+    );
     if is_entry_action(action) && maker_tif {
         live_entry_maker_max_wait_ms()
     } else if is_live_exit_action(action) {
@@ -70,7 +78,10 @@ fn initial_pending_cancel_after_ms(action: &str, tif: &str) -> i64 {
 }
 
 fn initial_pending_terminal_after_ms(action: &str, tif: &str) -> i64 {
-    let maker_tif = matches!(tif.to_ascii_uppercase().as_str(), "GTD" | "GTC" | "POST_ONLY");
+    let maker_tif = matches!(
+        tif.to_ascii_uppercase().as_str(),
+        "GTD" | "GTC" | "POST_ONLY"
+    );
     if maker_tif && is_entry_action(action) {
         live_entry_maker_max_wait_ms().saturating_add(2_000)
     } else if is_live_exit_action(action) {
@@ -87,6 +98,65 @@ fn should_retry_submit_error(err: &str) -> bool {
         || e.contains("too early")
         || e.contains("engine")
         || e.contains("restart")
+}
+
+fn is_locked_market_missing_submit_error(reason: &str) -> bool {
+    let e = reason.to_ascii_lowercase();
+    e.contains("orderbook") && e.contains("does not exist")
+}
+
+async fn force_pause_for_locked_market_submit_error(
+    state: &ApiState,
+    position_state: &LivePositionState,
+    decision: &Value,
+    decision_key: &str,
+    target: &LiveMarketTarget,
+    detail: Value,
+) {
+    let now_ms = Utc::now().timestamp_millis();
+    let mut control = state
+        .get_live_runtime_control(&position_state.symbol, &position_state.market_type)
+        .await;
+    if control.mode != LiveRuntimeControlMode::ForcePause {
+        control.mode = LiveRuntimeControlMode::ForcePause;
+        control.requested_at_ms = now_ms;
+        control.updated_at_ms = now_ms;
+        control.completed_at_ms = None;
+        control.note = Some(format!(
+            "locked_market_missing:{}:{}",
+            target.market_id,
+            decision
+                .get("decision_id")
+                .and_then(Value::as_str)
+                .unwrap_or(decision_key)
+        ));
+        state
+            .put_live_runtime_control(
+                &position_state.symbol,
+                &position_state.market_type,
+                control.clone(),
+            )
+            .await;
+    }
+    state
+        .append_live_event(
+            &position_state.symbol,
+            &position_state.market_type,
+            json!({
+                "accepted": false,
+                "event_type": "guard",
+                "action": decision.get("action").and_then(Value::as_str).unwrap_or("unknown"),
+                "side": decision.get("side").and_then(Value::as_str).unwrap_or("unknown"),
+                "round_id": decision.get("round_id").and_then(Value::as_str),
+                "decision_id": decision.get("decision_id").and_then(Value::as_str),
+                "decision_key": decision_key,
+                "reason": "locked_market_orderbook_missing_force_pause",
+                "runtime_mode": control.mode,
+                "runtime_note": control.note,
+                "detail": detail
+            }),
+        )
+        .await;
 }
 
 fn build_pending_from_accepted_submission(
@@ -148,6 +218,17 @@ fn build_pending_from_accepted_submission(
     let cancel_after_ms = initial_pending_cancel_after_ms(&action, &tif);
     let terminal_after_ms = initial_pending_terminal_after_ms(&action, &tif);
     let maker_tif = matches!(tif.as_str(), "GTD" | "GTC" | "POST_ONLY");
+    let size_locked = payload
+        .get("execution_notes")
+        .and_then(Value::as_array)
+        .map(|notes| {
+            notes.iter().any(|note| {
+                note.as_str()
+                    .map(|s| s == "force_entry_fixed_size" || s == "force_exit_full_size")
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
     LivePendingOrder {
         symbol: symbol.trim().to_ascii_uppercase(),
         market_type: market_type.to_string(),
@@ -177,7 +258,9 @@ fn build_pending_from_accepted_submission(
         ack_ts_ms: ack_ts_ms.max(submitted_ts_ms),
         cancel_after_ms,
         cancel_due_at_ms: if maker_tif {
-            ack_ts_ms.max(submitted_ts_ms).saturating_add(cancel_after_ms)
+            ack_ts_ms
+                .max(submitted_ts_ms)
+                .saturating_add(cancel_after_ms)
         } else {
             0
         },
@@ -185,6 +268,7 @@ fn build_pending_from_accepted_submission(
             .max(submitted_ts_ms)
             .saturating_add(terminal_after_ms),
         retry_count: 0,
+        size_locked,
     }
 }
 
@@ -199,7 +283,8 @@ pub(super) async fn handle_cancel_failure_with_escalation(
     state.upsert_pending_order(retry.clone()).await;
     state
         .append_live_event(
-            &retry.symbol, &retry.market_type,
+            &retry.symbol,
+            &retry.market_type,
             json!({
                 "accepted": false,
                 "action": retry.action,
@@ -220,7 +305,9 @@ pub(super) async fn handle_cancel_failure_with_escalation(
     }
 
     let now_ms = Utc::now().timestamp_millis();
-    let mut control = state.get_live_runtime_control(&retry.symbol, &retry.market_type).await;
+    let mut control = state
+        .get_live_runtime_control(&retry.symbol, &retry.market_type)
+        .await;
     if control.mode != LiveRuntimeControlMode::ForcePause {
         control.mode = LiveRuntimeControlMode::ForcePause;
         control.requested_at_ms = now_ms;
@@ -236,7 +323,8 @@ pub(super) async fn handle_cancel_failure_with_escalation(
     }
     state
         .append_live_event(
-            &retry.symbol, &retry.market_type,
+            &retry.symbol,
+            &retry.market_type,
             json!({
                 "accepted": false,
                 "action": retry.action,
@@ -261,13 +349,18 @@ async fn force_pause_for_uncertain_pending(
     detail: Value,
 ) {
     let now_ms = Utc::now().timestamp_millis();
-    let mut control = state.get_live_runtime_control(&row.symbol, &row.market_type).await;
+    let mut control = state
+        .get_live_runtime_control(&row.symbol, &row.market_type)
+        .await;
     if control.mode != LiveRuntimeControlMode::ForcePause {
         control.mode = LiveRuntimeControlMode::ForcePause;
         control.requested_at_ms = now_ms;
         control.updated_at_ms = now_ms;
         control.completed_at_ms = None;
-        control.note = Some(format!("uncertain_pending:{reason}:order_id={}", row.order_id));
+        control.note = Some(format!(
+            "uncertain_pending:{reason}:order_id={}",
+            row.order_id
+        ));
         state
             .put_live_runtime_control(&row.symbol, &row.market_type, control.clone())
             .await;
@@ -535,9 +628,7 @@ pub(super) async fn submit_rust_order(
             let ttl_sec = ((ttl_ms + 999) / 1000).max(1);
             let expiration = Utc::now()
                 + chrono::Duration::seconds(
-                    live_gtd_min_future_guard_sec()
-                        + live_gtd_expiration_safety_sec()
-                        + ttl_sec,
+                    live_gtd_min_future_guard_sec() + live_gtd_expiration_safety_sec() + ttl_sec,
                 );
             builder = builder.expiration(expiration);
         }
@@ -615,29 +706,31 @@ async fn try_resubmit_after_terminal_reject_rust(
         return false;
     }
     let now_ms = Utc::now().timestamp_millis();
-    let target = match resolve_live_market_target_with_state(state, &row.symbol, &row.market_type).await {
-        Ok(v) => v,
-        Err(err) => {
-            state
-                .append_live_event(
-                    &row.symbol, &row.market_type,
-                    json!({
-                        "accepted": false,
-                        "action": row.action,
-                        "side": row.side,
-                        "round_id": row.round_id,
-                        "decision_id": row.decision_id,
-                        "decision_key": row.decision_key,
-                        "reason": "rust_terminal_rejected_resubmit_no_target",
-                        "order_id": row.order_id,
-                        "status": terminal_status,
-                        "error": err.message
-                    }),
-                )
-                .await;
-            return false;
-        }
-    };
+    let target =
+        match resolve_live_market_target_with_state(state, &row.symbol, &row.market_type).await {
+            Ok(v) => v,
+            Err(err) => {
+                state
+                    .append_live_event(
+                        &row.symbol,
+                        &row.market_type,
+                        json!({
+                            "accepted": false,
+                            "action": row.action,
+                            "side": row.side,
+                            "round_id": row.round_id,
+                            "decision_id": row.decision_id,
+                            "decision_key": row.decision_key,
+                            "reason": "rust_terminal_rejected_resubmit_no_target",
+                            "order_id": row.order_id,
+                            "status": terminal_status,
+                            "error": err.message
+                        }),
+                    )
+                    .await;
+                return false;
+            }
+        };
     let mut effective_target = target.clone();
     apply_pending_target_override(&mut effective_target, row);
     let round_check = json!({ "round_id": row.round_id });
@@ -647,32 +740,38 @@ async fn try_resubmit_after_terminal_reject_rust(
     if !decision_round_matches_target(&round_check, &effective_target) && !bypass_round_guard {
         state
             .append_live_event(
-                &row.symbol, &row.market_type,
+                &row.symbol,
+                &row.market_type,
                 json!({
-                    "accepted": false,
-                    "action": row.action,
-                        "side": row.side,
-                        "round_id": row.round_id,
-                        "decision_id": row.decision_id,
-                        "decision_key": row.decision_key,
-                        "reason": "rust_terminal_rejected_resubmit_round_target_mismatch",
-                        "order_id": row.order_id,
-                        "status": terminal_status,
-                        "target_market_id": effective_target.market_id,
-                        "target_end_date": effective_target.end_date
-                    }),
-                )
-                .await;
+                "accepted": false,
+                "action": row.action,
+                    "side": row.side,
+                    "round_id": row.round_id,
+                    "decision_id": row.decision_id,
+                    "decision_key": row.decision_key,
+                    "reason": "rust_terminal_rejected_resubmit_round_target_mismatch",
+                    "order_id": row.order_id,
+                    "status": terminal_status,
+                    "target_market_id": effective_target.market_id,
+                    "target_end_date": effective_target.end_date
+                }),
+            )
+            .await;
         return false;
     }
-    if let Err(reason) = validate_entry_target_readiness(&json!({
-        "action": row.action,
-        "side": row.side,
-        "round_id": row.round_id
-    }), &effective_target, now_ms) {
+    if let Err(reason) = validate_entry_target_readiness(
+        &json!({
+            "action": row.action,
+            "side": row.side,
+            "round_id": row.round_id
+        }),
+        &effective_target,
+        now_ms,
+    ) {
         state
             .append_live_event(
-                &row.symbol, &row.market_type,
+                &row.symbol,
+                &row.market_type,
                 json!({
                     "accepted": false,
                     "action": row.action,
@@ -709,7 +808,9 @@ async fn try_resubmit_after_terminal_reject_rust(
         }
     });
     if exit_like {
-        let ps = state.get_live_position_state(&row.symbol, &row.market_type).await;
+        let ps = state
+            .get_live_position_state(&row.symbol, &row.market_type)
+            .await;
         if ps.position_size_shares > 0.0 {
             if let Some(obj) = decision.as_object_mut() {
                 obj.insert(
@@ -734,7 +835,8 @@ async fn try_resubmit_after_terminal_reject_rust(
     ) else {
         state
             .append_live_event(
-                &row.symbol, &row.market_type,
+                &row.symbol,
+                &row.market_type,
                 json!({
                     "accepted": false,
                     "action": row.action,
@@ -771,12 +873,13 @@ async fn try_resubmit_after_terminal_reject_rust(
                     pending.ack_ts_ms = now_ms;
                     pending.cancel_after_ms = if emergency_exit { 700 } else { 1500 };
                     pending.cancel_due_at_ms = 0;
-                    pending.terminal_due_at_ms =
-                        now_ms.saturating_add(initial_pending_terminal_after_ms(&row.action, "FAK"));
+                    pending.terminal_due_at_ms = now_ms
+                        .saturating_add(initial_pending_terminal_after_ms(&row.action, "FAK"));
                     state.upsert_pending_order(pending).await;
                     state
                         .append_live_event(
-                            &row.symbol, &row.market_type,
+                            &row.symbol,
+                            &row.market_type,
                             json!({
                                 "accepted": true,
                                 "action": row.action,
@@ -799,7 +902,8 @@ async fn try_resubmit_after_terminal_reject_rust(
             }
             state
                 .append_live_event(
-                    &row.symbol, &row.market_type,
+                    &row.symbol,
+                    &row.market_type,
                     json!({
                         "accepted": false,
                         "action": row.action,
@@ -819,7 +923,8 @@ async fn try_resubmit_after_terminal_reject_rust(
         Err(err) => {
             state
                 .append_live_event(
-                    &row.symbol, &row.market_type,
+                    &row.symbol,
+                    &row.market_type,
                     json!({
                         "accepted": false,
                         "action": row.action,
@@ -868,10 +973,9 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
     let mut out = Vec::<Value>::with_capacity(decisions.len());
     let token_ids = collect_decision_token_ids(target, decisions);
     let mut book_cache = load_cached_rust_books_for_tokens(state, &token_ids).await;
-    let exit_quote_override =
-        position_state
-            .entry_quote_usdc
-            .and_then(|v| if v > 0.0 { Some(v) } else { None });
+    let exit_quote_override = position_state
+        .entry_quote_usdc
+        .and_then(|v| if v > 0.0 { Some(v) } else { None });
     let exit_size_override = if position_state.position_size_shares > 0.0 {
         Some(position_state.position_size_shares)
     } else {
@@ -942,7 +1046,11 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
         ) {
             Ok(v) => v,
             Err(err) => {
-                out.push(prepare_live_decision_error_json(gated, err, Some("rust_sdk")));
+                out.push(prepare_live_decision_error_json(
+                    gated,
+                    err,
+                    Some("rust_sdk"),
+                ));
                 continue;
             }
         };
@@ -953,8 +1061,8 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| gated.decision_key.clone());
-        let token_id =
-            token_id_for_decision(&prepared.decision, &prepared.effective_target).map(str::to_string);
+        let token_id = token_id_for_decision(&prepared.decision, &prepared.effective_target)
+            .map(str::to_string);
         let book_snapshot = if let Some(token_id) = token_id.clone() {
             get_or_fetch_book_snapshot_cached(state, &ctx, &token_id, &mut book_cache).await
         } else {
@@ -1071,7 +1179,9 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
         let request_quote = payload.get("quote_size_usdc").and_then(Value::as_f64);
         let final_price = attempt_payload.get("price").and_then(Value::as_f64);
         let final_size = attempt_payload.get("size").and_then(Value::as_f64);
-        let final_quote = attempt_payload.get("quote_size_usdc").and_then(Value::as_f64);
+        let final_quote = attempt_payload
+            .get("quote_size_usdc")
+            .and_then(Value::as_f64);
         let signal_to_trigger_ms = match (decision_ts_ms, trigger_ts_ms) {
             (Some(signal_ts), Some(trigger_ts)) => Some(trigger_ts.saturating_sub(signal_ts)),
             _ => None,
@@ -1167,6 +1277,13 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                     "executor": executed_via,
                     "attempt_count": row.get("attempts").and_then(Value::as_array).map(|v| v.len()).unwrap_or(0),
                     "order_latency_ms": order_latency_ms,
+                    "request_size_shares": request_size,
+                    "request_quote_usdc": request_quote,
+                    "final_size_shares": final_size,
+                    "final_quote_usdc": final_quote,
+                    "accepted_size_shares": final_response.as_ref().and_then(|resp| resp.get("accepted_size")).cloned().unwrap_or(Value::Null),
+                    "making_amount": final_response.as_ref().and_then(|resp| resp.get("making_amount")).cloned().unwrap_or(Value::Null),
+                    "taking_amount": final_response.as_ref().and_then(|resp| resp.get("taking_amount")).cloned().unwrap_or(Value::Null),
                     "signal_to_submit_ms": signal_to_submit_ms,
                     "signal_to_ack_ms": signal_to_ack_ms,
                     "submit_to_ack_ms": submit_to_ack_ms,
@@ -1177,6 +1294,38 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                 }),
             )
             .await;
+        if !accepted {
+            let reject_text = final_reject_reason
+                .as_deref()
+                .or(final_error.as_deref())
+                .unwrap_or_default();
+            let action_lc = prepared
+                .decision
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if is_exit_like_action(&action_lc) && is_locked_market_missing_submit_error(reject_text)
+            {
+                force_pause_for_locked_market_submit_error(
+                    state,
+                    position_state,
+                    &prepared.decision,
+                    &gated.decision_key,
+                    &prepared.effective_target,
+                    json!({
+                        "reject_reason": final_reject_reason,
+                        "error": final_error,
+                        "target_market_id": prepared.effective_target.market_id,
+                        "target_token_id": token_id,
+                        "request_price": request_price,
+                        "request_size_shares": request_size,
+                        "request_quote_usdc": request_quote
+                    }),
+                )
+                .await;
+            }
+        }
         out.push(row);
     }
     out
@@ -1244,7 +1393,8 @@ pub(super) async fn reconcile_rust_reports(state: &ApiState, exec_cfg: &LiveExec
             let fill_cost_cents = fill_fee_cents + fill_slippage_cents;
             state
                 .append_live_event(
-                    &row.symbol, &row.market_type,
+                    &row.symbol,
+                    &row.market_type,
                     json!({
                         "accepted": true,
                         "action": row.action,
@@ -1257,6 +1407,10 @@ pub(super) async fn reconcile_rust_reports(state: &ApiState, exec_cfg: &LiveExec
                         "fill_price_cents": fill_price_cents,
                         "fill_quote_usdc": fill_quote_usdc,
                         "fill_size_shares": fill_size_shares,
+                        "reported_fill_quote_usdc": fill_meta.reported_fill_quote_usdc,
+                        "reported_fill_size_shares": fill_meta.reported_fill_size_shares,
+                        "size_guard_triggered": fill_meta.size_guard_triggered,
+                        "expected_order_size_shares": row.order_size_shares,
                         "fill_fee_cents": fill_fee_cents,
                         "fill_slippage_cents": fill_slippage_cents,
                         "fill_cost_cents": fill_cost_cents,
@@ -1283,7 +1437,8 @@ pub(super) async fn reconcile_rust_reports(state: &ApiState, exec_cfg: &LiveExec
             apply_pending_revert(state, &row, "rust_order_terminal_rejected").await;
             state
                 .append_live_event(
-                    &row.symbol, &row.market_type,
+                    &row.symbol,
+                    &row.market_type,
                     json!({
                         "accepted": false,
                         "action": row.action,
@@ -1301,10 +1456,7 @@ pub(super) async fn reconcile_rust_reports(state: &ApiState, exec_cfg: &LiveExec
     }
 }
 
-pub(super) async fn handle_pending_timeouts_rust(
-    state: &ApiState,
-    exec_cfg: &LiveExecutionConfig,
-) {
+pub(super) async fn handle_pending_timeouts_rust(state: &ApiState, exec_cfg: &LiveExecutionConfig) {
     let ctx = match get_or_init_rust_executor(state).await {
         Ok(v) => v,
         Err(err) => {
@@ -1435,39 +1587,79 @@ pub(super) async fn handle_pending_timeouts_rust(
         }
 
         match ctx.client.cancel_order(&row.order_id).await {
-            Ok(resp) => {
-                match ctx.client.order(&row.order_id).await {
-                    Ok(order) if pm_is_terminal_fill(&order.status) => {
-                        let _ = state.remove_pending_order(&row.order_id).await;
-                        let fill_event = fill_event_from_open_order(&order);
-                        apply_pending_confirmation(
-                            state,
-                            &row,
-                            "rust_cancel_post_reconcile_filled",
-                            Some(&fill_event),
+            Ok(resp) => match ctx.client.order(&row.order_id).await {
+                Ok(order) if pm_is_terminal_fill(&order.status) => {
+                    let _ = state.remove_pending_order(&row.order_id).await;
+                    let fill_event = fill_event_from_open_order(&order);
+                    apply_pending_confirmation(
+                        state,
+                        &row,
+                        "rust_cancel_post_reconcile_filled",
+                        Some(&fill_event),
+                    )
+                    .await;
+                    state
+                        .append_live_event(
+                            &row.symbol,
+                            &row.market_type,
+                            json!({
+                                "accepted": true,
+                                "action": row.action,
+                                "side": row.side,
+                                "round_id": row.round_id,
+                                "decision_id": row.decision_id,
+                                "decision_key": row.decision_key,
+                                "reason": "rust_cancel_post_reconcile_filled",
+                                "order_id": row.order_id,
+                                "cancelled": resp.canceled,
+                                "not_cancelled": resp.not_canceled,
+                                "status": format!("{}", order.status)
+                            }),
                         )
                         .await;
-                        state
-                            .append_live_event(
-                                &row.symbol,
-                                &row.market_type,
-                                json!({
-                                    "accepted": true,
-                                    "action": row.action,
-                                    "side": row.side,
-                                    "round_id": row.round_id,
-                                    "decision_id": row.decision_id,
-                                    "decision_key": row.decision_key,
-                                    "reason": "rust_cancel_post_reconcile_filled",
-                                    "order_id": row.order_id,
-                                    "cancelled": resp.canceled,
-                                    "not_cancelled": resp.not_canceled,
-                                    "status": format!("{}", order.status)
-                                }),
-                            )
-                            .await;
-                    }
-                    Ok(order) if pm_is_terminal_reject(&order.status) => {
+                }
+                Ok(order) if pm_is_terminal_reject(&order.status) => {
+                    let _ = state.remove_pending_order(&row.order_id).await;
+                    apply_pending_revert(state, &row, "rust_timeout_cancelled").await;
+                    state
+                        .append_live_event(
+                            &row.symbol,
+                            &row.market_type,
+                            json!({
+                                "accepted": false,
+                                "action": row.action,
+                                "side": row.side,
+                                "round_id": row.round_id,
+                                "decision_id": row.decision_id,
+                                "decision_key": row.decision_key,
+                                "reason": "rust_timeout_cancelled",
+                                "order_id": row.order_id,
+                                "cancelled": resp.canceled,
+                                "not_cancelled": resp.not_canceled,
+                                "status": format!("{}", order.status)
+                            }),
+                        )
+                        .await;
+                }
+                Ok(order) => {
+                    let mut bumped = row.clone();
+                    bumped.cancel_due_at_ms = now_ms.saturating_add(30_000);
+                    bumped.terminal_due_at_ms = now_ms.saturating_add(30_000);
+                    state.upsert_pending_order(bumped).await;
+                    force_pause_for_uncertain_pending(
+                        state,
+                        &row,
+                        "rust_cancel_post_reconcile_unresolved",
+                        json!({
+                            "cancelled": resp.canceled,
+                            "not_cancelled": resp.not_canceled,
+                            "status": format!("{}", order.status)
+                        }),
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    if cancel_response_contains_order(&resp, &row.order_id) {
                         let _ = state.remove_pending_order(&row.order_id).await;
                         apply_pending_revert(state, &row, "rust_timeout_cancelled").await;
                         state
@@ -1485,12 +1677,11 @@ pub(super) async fn handle_pending_timeouts_rust(
                                     "order_id": row.order_id,
                                     "cancelled": resp.canceled,
                                     "not_cancelled": resp.not_canceled,
-                                    "status": format!("{}", order.status)
+                                    "status_error": err.to_string()
                                 }),
                             )
                             .await;
-                    }
-                    Ok(order) => {
+                    } else {
                         let mut bumped = row.clone();
                         bumped.cancel_due_at_ms = now_ms.saturating_add(30_000);
                         bumped.terminal_due_at_ms = now_ms.saturating_add(30_000);
@@ -1498,58 +1689,17 @@ pub(super) async fn handle_pending_timeouts_rust(
                         force_pause_for_uncertain_pending(
                             state,
                             &row,
-                            "rust_cancel_post_reconcile_unresolved",
+                            "rust_cancel_post_status_error",
                             json!({
                                 "cancelled": resp.canceled,
                                 "not_cancelled": resp.not_canceled,
-                                "status": format!("{}", order.status)
+                                "error": err.to_string()
                             }),
                         )
                         .await;
                     }
-                    Err(err) => {
-                        if cancel_response_contains_order(&resp, &row.order_id) {
-                            let _ = state.remove_pending_order(&row.order_id).await;
-                            apply_pending_revert(state, &row, "rust_timeout_cancelled").await;
-                            state
-                                .append_live_event(
-                                    &row.symbol,
-                                    &row.market_type,
-                                    json!({
-                                        "accepted": false,
-                                        "action": row.action,
-                                        "side": row.side,
-                                        "round_id": row.round_id,
-                                        "decision_id": row.decision_id,
-                                        "decision_key": row.decision_key,
-                                        "reason": "rust_timeout_cancelled",
-                                        "order_id": row.order_id,
-                                        "cancelled": resp.canceled,
-                                        "not_cancelled": resp.not_canceled,
-                                        "status_error": err.to_string()
-                                    }),
-                                )
-                                .await;
-                        } else {
-                            let mut bumped = row.clone();
-                            bumped.cancel_due_at_ms = now_ms.saturating_add(30_000);
-                            bumped.terminal_due_at_ms = now_ms.saturating_add(30_000);
-                            state.upsert_pending_order(bumped).await;
-                            force_pause_for_uncertain_pending(
-                                state,
-                                &row,
-                                "rust_cancel_post_status_error",
-                                json!({
-                                    "cancelled": resp.canceled,
-                                    "not_cancelled": resp.not_canceled,
-                                    "error": err.to_string()
-                                }),
-                            )
-                            .await;
-                        }
-                    }
                 }
-            }
+            },
             Err(err) => {
                 handle_cancel_failure_with_escalation(
                     state,

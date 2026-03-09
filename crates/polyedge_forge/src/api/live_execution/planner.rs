@@ -39,18 +39,26 @@ pub(super) fn try_decision_to_live_payload(
         .to_ascii_uppercase();
     let is_exit_like = action == "exit" || action == "reduce";
     let (gateway_side, token_id, mut slippage_bps) = match (action.as_str(), side.as_str()) {
-        ("enter", "UP") | ("add", "UP") => {
-            ("buy_yes", target.token_id_yes.as_str(), exec_cfg.entry_slippage_bps)
-        }
-        ("exit", "UP") | ("reduce", "UP") => {
-            ("sell_yes", target.token_id_yes.as_str(), exec_cfg.exit_slippage_bps)
-        }
-        ("enter", "DOWN") | ("add", "DOWN") => {
-            ("buy_no", target.token_id_no.as_str(), exec_cfg.entry_slippage_bps)
-        }
-        ("exit", "DOWN") | ("reduce", "DOWN") => {
-            ("sell_no", target.token_id_no.as_str(), exec_cfg.exit_slippage_bps)
-        }
+        ("enter", "UP") | ("add", "UP") => (
+            "buy_yes",
+            target.token_id_yes.as_str(),
+            exec_cfg.entry_slippage_bps,
+        ),
+        ("exit", "UP") | ("reduce", "UP") => (
+            "sell_yes",
+            target.token_id_yes.as_str(),
+            exec_cfg.exit_slippage_bps,
+        ),
+        ("enter", "DOWN") | ("add", "DOWN") => (
+            "buy_no",
+            target.token_id_no.as_str(),
+            exec_cfg.entry_slippage_bps,
+        ),
+        ("exit", "DOWN") | ("reduce", "DOWN") => (
+            "sell_no",
+            target.token_id_no.as_str(),
+            exec_cfg.exit_slippage_bps,
+        ),
         _ => return Err("unsupported_action_or_side".to_string()),
     };
     let mut price_cents = decision
@@ -94,11 +102,7 @@ pub(super) fn try_decision_to_live_payload(
         min_order_size = book.min_order_size.max(0.0001);
         size_floor = min_order_size;
         let tick_size = book.tick_size.max(0.0001);
-        let best_px = if is_buy {
-            book.best_ask
-        } else {
-            book.best_bid
-        };
+        let best_px = if is_buy { book.best_ask } else { book.best_bid };
         if let Some(best_px) = best_px.filter(|v| v.is_finite() && *v > 0.0) {
             price = round_to_tick(best_px.clamp(0.01, 0.99), tick_size, is_buy);
             notes.push(if is_buy {
@@ -113,7 +117,11 @@ pub(super) fn try_decision_to_live_payload(
     let ttl_ms = decision
         .get("ttl_ms")
         .and_then(Value::as_i64)
-        .unwrap_or(if is_exit_like { 900 } else { live_entry_fak_ttl_ms() })
+        .unwrap_or(if is_exit_like {
+            900
+        } else {
+            live_entry_fak_ttl_ms()
+        })
         .clamp(300, 30_000);
     slippage_bps = decision
         .get("max_slippage_bps")
@@ -140,7 +148,8 @@ pub(super) fn try_decision_to_live_payload(
     let submit_price_cents = (price * 100.0).clamp(0.0, 100.0);
     let tick_size = book.map(|b| b.tick_size).unwrap_or(0.01);
     let parity_band_cents = allowed_price_band_cents(signal_price_cents, slippage_bps, tick_size);
-    let parity_delta_cents = price_parity_delta_cents(signal_price_cents, submit_price_cents, is_buy);
+    let parity_delta_cents =
+        price_parity_delta_cents(signal_price_cents, submit_price_cents, is_buy);
     if parity_delta_cents > parity_band_cents + 1e-9 {
         return Err("live_price_parity_band_exhausted".to_string());
     }
@@ -266,8 +275,8 @@ pub(super) fn can_retry_on_liquidity(reason: &str) -> bool {
         || r.contains("unmatched")
         || r.contains("no match")
         || r.contains("empty book");
-    let timeout_like_liquidity =
-        r.contains("timeout") && (r.contains("match") || r.contains("liquidity") || r.contains("maker"));
+    let timeout_like_liquidity = r.contains("timeout")
+        && (r.contains("match") || r.contains("liquidity") || r.contains("maker"));
     explicit_liquidity || timeout_like_liquidity
 }
 
@@ -566,6 +575,9 @@ pub(super) struct PendingFillMeta {
     fill_price_cents: Option<f64>,
     fill_quote_usdc: Option<f64>,
     fill_size_shares: Option<f64>,
+    reported_fill_quote_usdc: Option<f64>,
+    reported_fill_size_shares: Option<f64>,
+    size_guard_triggered: bool,
     fee_usdc: f64,
     slippage_usdc: f64,
 }
@@ -680,13 +692,50 @@ pub(super) fn extract_pending_fill_meta(
             "size",
         ],
     );
-    let fill_size_shares = size_candidates.into_iter().find(|v| *v > 0.0);
+    let reported_fill_size_shares = size_candidates.into_iter().find(|v| *v > 0.0);
+    let original_size_shares = collect_candidates(fill, &["original_size_shares", "original_size"])
+        .into_iter()
+        .find(|v| *v > 0.0);
+    let mut fill_size_shares = reported_fill_size_shares;
+    let mut size_guard_triggered = false;
+    if pending.size_locked {
+        let size_ceiling = [Some(pending.order_size_shares), original_size_shares]
+            .into_iter()
+            .flatten()
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .min_by(|a, b| a.total_cmp(b));
+        if let (Some(reported), Some(max_shares)) = (reported_fill_size_shares, size_ceiling) {
+            let slack = (max_shares * 0.002).max(0.02);
+            if reported > max_shares + slack {
+                fill_size_shares = Some(max_shares);
+                size_guard_triggered = true;
+            }
+        }
+    }
+    let reported_quote_from_size =
+        if let (Some(px_c), Some(sz)) = (fill_price_cents, reported_fill_size_shares) {
+            Some((px_c / 100.0) * sz)
+        } else {
+            None
+        };
+    let reported_fill_quote_usdc = quote_direct.or(reported_quote_from_size);
     let quote_from_size = if let (Some(px_c), Some(sz)) = (fill_price_cents, fill_size_shares) {
         Some((px_c / 100.0) * sz)
     } else {
         None
     };
-    let fill_quote_usdc = quote_direct.or(quote_from_size);
+    let fill_quote_usdc = if size_guard_triggered {
+        quote_from_size
+            .or_else(|| {
+                pending
+                    .quote_size_usdc
+                    .is_finite()
+                    .then_some(pending.quote_size_usdc)
+            })
+            .filter(|v| *v > 0.0)
+    } else {
+        reported_fill_quote_usdc.or(quote_from_size)
+    };
 
     let fee_usdc = collect_candidates(
         fill,
@@ -701,25 +750,28 @@ pub(super) fn extract_pending_fill_meta(
         .map(normalize_usdc_amount)
         .fold(0.0, |acc, v| acc + v);
 
-    let inferred_slippage_usdc = if let (Some(px_c), Some(quote)) = (fill_price_cents, fill_quote_usdc)
-    {
-        let expected_c = pending.price_cents.max(0.01);
-        let shares = quote / (px_c / 100.0).max(0.0001);
-        let action = pending.action.to_ascii_lowercase();
-        let adverse_cents = if action == "enter" || action == "add" {
-            (px_c - expected_c).max(0.0)
+    let inferred_slippage_usdc =
+        if let (Some(px_c), Some(quote)) = (fill_price_cents, fill_quote_usdc) {
+            let expected_c = pending.price_cents.max(0.01);
+            let shares = quote / (px_c / 100.0).max(0.0001);
+            let action = pending.action.to_ascii_lowercase();
+            let adverse_cents = if action == "enter" || action == "add" {
+                (px_c - expected_c).max(0.0)
+            } else {
+                (expected_c - px_c).max(0.0)
+            };
+            ((adverse_cents / 100.0) * shares).max(0.0)
         } else {
-            (expected_c - px_c).max(0.0)
+            0.0
         };
-        ((adverse_cents / 100.0) * shares).max(0.0)
-    } else {
-        0.0
-    };
 
     PendingFillMeta {
         fill_price_cents,
         fill_quote_usdc,
         fill_size_shares,
+        reported_fill_quote_usdc,
+        reported_fill_size_shares,
+        size_guard_triggered,
         fee_usdc,
         slippage_usdc: explicit_slippage_usdc.max(inferred_slippage_usdc),
     }
