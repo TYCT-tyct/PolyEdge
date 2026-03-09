@@ -1,9 +1,11 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MarketDescriptor {
@@ -185,6 +187,65 @@ fn retry_after_delay_ms(headers: &reqwest::header::HeaderMap, fallback_ms: u64) 
         .unwrap_or(fallback_ms)
 }
 
+fn discovery_rate_limit_window_ms() -> u64 {
+    std::env::var("POLYEDGE_DISCOVERY_RATE_LIMIT_WINDOW_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(10_000)
+        .clamp(1_000, 60_000)
+}
+
+fn discovery_rate_limit_max_requests() -> usize {
+    std::env::var("POLYEDGE_DISCOVERY_MAX_REQUESTS_PER_WINDOW")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(80)
+        .clamp(1, 500)
+}
+
+fn discovery_rate_limit_state() -> &'static tokio::sync::Mutex<VecDeque<Instant>> {
+    static STATE: OnceLock<tokio::sync::Mutex<VecDeque<Instant>>> = OnceLock::new();
+    STATE.get_or_init(|| tokio::sync::Mutex::new(VecDeque::new()))
+}
+
+async fn wait_for_discovery_rate_limit(request_kind: &str) {
+    let max_requests = discovery_rate_limit_max_requests();
+    let window = Duration::from_millis(discovery_rate_limit_window_ms());
+    loop {
+        let maybe_wait = {
+            let mut state = discovery_rate_limit_state().lock().await;
+            let now = Instant::now();
+            while let Some(front) = state.front().copied() {
+                if now.duration_since(front) >= window {
+                    state.pop_front();
+                } else {
+                    break;
+                }
+            }
+            if state.len() < max_requests {
+                state.push_back(now);
+                None
+            } else {
+                state
+                    .front()
+                    .copied()
+                    .map(|front| window.saturating_sub(now.duration_since(front)))
+            }
+        };
+        let Some(wait) = maybe_wait else {
+            return;
+        };
+        tracing::warn!(
+            request_kind,
+            wait_ms = wait.as_millis() as u64,
+            max_requests = max_requests,
+            window_ms = window.as_millis() as u64,
+            "gamma discovery client-side throttle"
+        );
+        tokio::time::sleep(wait.max(Duration::from_millis(1))).await;
+    }
+}
+
 impl MarketDiscovery {
     pub fn new(cfg: DiscoveryConfig) -> Self {
         let user_agent = std::env::var("POLYEDGE_DISCOVERY_USER_AGENT")
@@ -215,6 +276,7 @@ impl MarketDiscovery {
         let mut backoff_ms = discovery_retry_base_ms();
 
         for attempt in 0..=max_retries {
+            wait_for_discovery_rate_limit(request_kind).await;
             let response = self.http.get(endpoint).query(query).send().await;
             match response {
                 Ok(resp) => {

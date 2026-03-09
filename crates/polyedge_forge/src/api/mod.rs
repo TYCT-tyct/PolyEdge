@@ -6,7 +6,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
@@ -16,13 +16,13 @@ use axum::{Json, Router};
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use futures::StreamExt;
 use market_discovery::{DiscoveryConfig, MarketDescriptor, MarketDiscovery};
-use polymarket_client_sdk::POLYGON;
-use polymarket_client_sdk::auth::Credentials as PmCredentials;
 use polymarket_client_sdk::auth::state::Authenticated as PmAuthenticated;
+use polymarket_client_sdk::auth::Credentials as PmCredentials;
 use polymarket_client_sdk::auth::{
     LocalSigner as PmLocalSigner, Normal as PmNormal, Signer as PmSigner,
 };
 use polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest as PmOrderBookSummaryRequest;
+use polymarket_client_sdk::clob::types::request::TradesRequest as PmTradesRequest;
 use polymarket_client_sdk::clob::types::{
     Amount as PmAmount, Side as PmSide, SignatureType as PmSignatureType,
 };
@@ -31,10 +31,11 @@ use polymarket_client_sdk::clob::types::{
 };
 use polymarket_client_sdk::clob::{Client as PmClient, Config as PmConfig};
 use polymarket_client_sdk::types::{Address as PmAddress, Decimal as PmDecimal, U256 as PmU256};
+use polymarket_client_sdk::POLYGON;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use tokio::sync::{RwLock, Semaphore, mpsc};
+use serde_json::{json, Value};
+use tokio::sync::{mpsc, RwLock, Semaphore};
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
@@ -411,6 +412,8 @@ struct LivePendingOrder {
     round_id: String,
     decision_key: String,
     #[serde(default)]
+    intent_id: String,
+    #[serde(default)]
     decision_id: String,
     price_cents: f64,
     quote_size_usdc: f64,
@@ -425,6 +428,10 @@ struct LivePendingOrder {
     submitted_ts_ms: i64,
     #[serde(default)]
     ack_ts_ms: i64,
+    #[serde(default)]
+    decision_ts_ms: i64,
+    #[serde(default)]
+    trigger_ts_ms: i64,
     cancel_after_ms: i64,
     #[serde(default)]
     cancel_due_at_ms: i64,
@@ -433,6 +440,8 @@ struct LivePendingOrder {
     retry_count: u8,
     #[serde(default)]
     size_locked: bool,
+    #[serde(default)]
+    accepted_trade_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -774,6 +783,16 @@ fn normalize_runtime_signal_decisions(
                     )),
                 );
             }
+            let has_intent_id = obj
+                .get("intent_id")
+                .and_then(Value::as_str)
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
+            if !has_intent_id {
+                if let Some(decision_id) = obj.get("decision_id").cloned() {
+                    obj.insert("intent_id".to_string(), decision_id);
+                }
+            }
             Some(decision)
         })
         .collect()
@@ -951,17 +970,44 @@ fn summarize_live_price_parity(orders: &[Value]) -> Value {
     let signal_vs_submit = collect_price_trace_delta_values_cents(orders, "signal_vs_submit_cents");
     let signal_vs_accepted =
         collect_price_trace_delta_values_cents(orders, "signal_vs_accepted_cents");
+    let parity_anchor_vs_submit =
+        collect_price_trace_delta_values_cents(orders, "parity_anchor_vs_submit_cents");
+    let parity_anchor_vs_accepted =
+        collect_price_trace_delta_values_cents(orders, "parity_anchor_vs_accepted_cents");
+    let paper_exec_vs_submit =
+        collect_price_trace_delta_values_cents(orders, "paper_exec_vs_submit_cents");
+    let paper_exec_vs_accepted =
+        collect_price_trace_delta_values_cents(orders, "paper_exec_vs_accepted_cents");
     json!({
         "signal_vs_submit_cents": price_drift_stats_json(&signal_vs_submit),
-        "signal_vs_accepted_cents": price_drift_stats_json(&signal_vs_accepted)
+        "signal_vs_accepted_cents": price_drift_stats_json(&signal_vs_accepted),
+        "parity_anchor_vs_submit_cents": price_drift_stats_json(&parity_anchor_vs_submit),
+        "parity_anchor_vs_accepted_cents": price_drift_stats_json(&parity_anchor_vs_accepted),
+        "paper_exec_vs_submit_cents": price_drift_stats_json(&paper_exec_vs_submit),
+        "paper_exec_vs_accepted_cents": price_drift_stats_json(&paper_exec_vs_accepted)
     })
 }
 
 fn extract_decision_id(node: &Value) -> Option<String> {
-    node.get("decision_id")
+    node.get("intent_id")
         .and_then(Value::as_str)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        .or_else(|| {
+            node.get("decision").and_then(|decision| {
+                decision
+                    .get("intent_id")
+                    .and_then(Value::as_str)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+        })
+        .or_else(|| {
+            node.get("decision_id")
+                .and_then(Value::as_str)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
         .or_else(|| {
             node.get("decision").and_then(|decision| {
                 decision
@@ -1006,32 +1052,253 @@ fn build_live_fill_decision_map(events: &[Value]) -> (HashMap<String, Value>, Va
             continue;
         };
         let ts_ms = ev.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
-        let should_replace = by_decision
-            .get(&decision_id)
-            .and_then(|prev| prev.get("ts_ms").and_then(Value::as_i64))
-            .map(|prev_ts| ts_ms >= prev_ts)
-            .unwrap_or(true);
-        if !should_replace {
-            continue;
-        }
-
-        by_decision.insert(
-            decision_id.clone(),
+        let fill_ts_ms = ev
+            .get("fill_ts_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or(ts_ms);
+        let fill_size_shares = ev
+            .get("fill_size_shares")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let fill_quote_usdc = ev
+            .get("fill_quote_usdc")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let fill_fee_cents = ev
+            .get("fill_fee_cents")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let actual_fee_cents = ev
+            .get("actual_fee_cents")
+            .and_then(Value::as_f64)
+            .or_else(|| ev.get("fill_fee_cents").and_then(Value::as_f64))
+            .unwrap_or(0.0);
+        let fill_slippage_cents = ev
+            .get("fill_slippage_cents")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let actual_slippage_cents = ev
+            .get("actual_slippage_cents")
+            .and_then(Value::as_f64)
+            .or_else(|| ev.get("fill_slippage_cents").and_then(Value::as_f64))
+            .unwrap_or(0.0);
+        let fill_cost_cents = ev
+            .get("fill_cost_cents")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let fill_pnl_cents_net = ev
+            .get("fill_pnl_cents_net")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let fill_price_cents = ev
+            .get("fill_price_cents")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite() && *v > 0.0);
+        let actual_fill_price_cents = ev
+            .get("actual_fill_price_cents")
+            .and_then(Value::as_f64)
+            .or(fill_price_cents)
+            .filter(|v| v.is_finite() && *v > 0.0);
+        let prev = by_decision.entry(decision_id.clone()).or_insert_with(|| {
             json!({
-                "decision_id": decision_id,
+                "intent_id": ev.get("intent_id").cloned().unwrap_or_else(|| json!(decision_id.clone())),
+                "decision_id": decision_id.clone(),
                 "ts_ms": ts_ms,
-                "order_id": ev.get("order_id").cloned().unwrap_or(Value::Null),
+                "fill_ts_ms": fill_ts_ms,
                 "action": ev.get("action").cloned().unwrap_or(Value::Null),
                 "side": ev.get("side").cloned().unwrap_or(Value::Null),
-                "fill_price_cents": ev.get("fill_price_cents").cloned().unwrap_or(Value::Null),
-                "fill_quote_usdc": ev.get("fill_quote_usdc").cloned().unwrap_or(Value::Null),
-                "fill_size_shares": ev.get("fill_size_shares").cloned().unwrap_or(Value::Null),
-                "fill_fee_cents": ev.get("fill_fee_cents").cloned().unwrap_or(Value::Null),
-                "fill_slippage_cents": ev.get("fill_slippage_cents").cloned().unwrap_or(Value::Null),
-                "fill_cost_cents": ev.get("fill_cost_cents").cloned().unwrap_or(Value::Null),
-                "fill_pnl_cents_net": ev.get("fill_pnl_cents_net").cloned().unwrap_or(Value::Null)
-            }),
+                "order_id": ev.get("order_id").cloned().unwrap_or(Value::Null),
+                "order_ids": [],
+                "fill_event_count": 0_u64,
+                "fill_price_cents": Value::Null,
+                "actual_fill_price_cents": Value::Null,
+                "fill_quote_usdc": 0.0,
+                "fill_size_shares": 0.0,
+                "fill_fee_cents": 0.0,
+                "actual_fee_cents": 0.0,
+                "fill_slippage_cents": Value::Null,
+                "actual_slippage_cents": Value::Null,
+                "fill_cost_cents": 0.0,
+                "fill_pnl_cents_net": 0.0,
+                "ack_to_fill_ms": Value::Null,
+                "submit_to_fill_ms": Value::Null,
+                "signal_to_fill_ms": Value::Null,
+                "trigger_to_fill_ms": Value::Null
+            })
+        });
+
+        let Some(obj) = prev.as_object_mut() else {
+            continue;
+        };
+        let prev_size = obj
+            .get("fill_size_shares")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let total_size = prev_size + fill_size_shares.max(0.0);
+        let prev_fill_count = obj
+            .get("fill_event_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        obj.insert(
+            "fill_event_count".to_string(),
+            json!(prev_fill_count.saturating_add(1)),
         );
+        obj.insert(
+            "fill_quote_usdc".to_string(),
+            json!(
+                obj.get("fill_quote_usdc")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+                    + fill_quote_usdc.max(0.0)
+            ),
+        );
+        obj.insert("fill_size_shares".to_string(), json!(total_size));
+        obj.insert(
+            "fill_fee_cents".to_string(),
+            json!(
+                obj.get("fill_fee_cents")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+                    + fill_fee_cents.max(0.0)
+            ),
+        );
+        obj.insert(
+            "actual_fee_cents".to_string(),
+            json!(
+                obj.get("actual_fee_cents")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+                    + actual_fee_cents.max(0.0)
+            ),
+        );
+        obj.insert(
+            "fill_cost_cents".to_string(),
+            json!(
+                obj.get("fill_cost_cents")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+                    + fill_cost_cents
+            ),
+        );
+        obj.insert(
+            "fill_pnl_cents_net".to_string(),
+            json!(
+                obj.get("fill_pnl_cents_net")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+                    + fill_pnl_cents_net
+            ),
+        );
+        if fill_ts_ms >= obj.get("fill_ts_ms").and_then(Value::as_i64).unwrap_or(0) {
+            obj.insert("ts_ms".to_string(), json!(ts_ms));
+            obj.insert("fill_ts_ms".to_string(), json!(fill_ts_ms));
+            obj.insert(
+                "order_id".to_string(),
+                ev.get("order_id").cloned().unwrap_or(Value::Null),
+            );
+            obj.insert(
+                "ack_to_fill_ms".to_string(),
+                ev.get("ack_to_fill_ms").cloned().unwrap_or(Value::Null),
+            );
+            obj.insert(
+                "submit_to_fill_ms".to_string(),
+                ev.get("submit_to_fill_ms").cloned().unwrap_or(Value::Null),
+            );
+            obj.insert(
+                "signal_to_fill_ms".to_string(),
+                ev.get("signal_to_fill_ms").cloned().unwrap_or(Value::Null),
+            );
+            obj.insert(
+                "trigger_to_fill_ms".to_string(),
+                ev.get("trigger_to_fill_ms").cloned().unwrap_or(Value::Null),
+            );
+        }
+        if let Some(order_ids) = obj.get_mut("order_ids").and_then(Value::as_array_mut) {
+            if let Some(order_id) = ev
+                .get("order_id")
+                .and_then(Value::as_str)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                if !order_ids
+                    .iter()
+                    .any(|existing| existing.as_str() == Some(order_id))
+                {
+                    order_ids.push(json!(order_id));
+                }
+            }
+        }
+        if total_size > 0.0 {
+            if let Some(price) = fill_price_cents {
+                let prev_avg = obj
+                    .get("fill_price_cents")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(price);
+                let next_avg = if prev_size > 0.0 {
+                    ((prev_avg * prev_size) + (price * fill_size_shares.max(0.0))) / total_size
+                } else {
+                    price
+                };
+                obj.insert("fill_price_cents".to_string(), json!(next_avg));
+            }
+            if let Some(price) = actual_fill_price_cents {
+                let prev_avg = obj
+                    .get("actual_fill_price_cents")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(price);
+                let next_avg = if prev_size > 0.0 {
+                    ((prev_avg * prev_size) + (price * fill_size_shares.max(0.0))) / total_size
+                } else {
+                    price
+                };
+                obj.insert("actual_fill_price_cents".to_string(), json!(next_avg));
+            }
+            if actual_slippage_cents.is_finite() {
+                let prev_avg = obj
+                    .get("actual_slippage_cents")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(actual_slippage_cents);
+                let next_avg = if prev_size > 0.0 {
+                    ((prev_avg * prev_size) + (actual_slippage_cents * fill_size_shares.max(0.0)))
+                        / total_size
+                } else {
+                    actual_slippage_cents
+                };
+                obj.insert("actual_slippage_cents".to_string(), json!(next_avg));
+            }
+            if fill_slippage_cents.is_finite() {
+                let prev_avg = obj
+                    .get("fill_slippage_cents")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(fill_slippage_cents);
+                let next_avg = if prev_size > 0.0 {
+                    ((prev_avg * prev_size) + (fill_slippage_cents * fill_size_shares.max(0.0)))
+                        / total_size
+                } else {
+                    fill_slippage_cents
+                };
+                obj.insert("fill_slippage_cents".to_string(), json!(next_avg));
+            }
+        } else {
+            if let Some(price) = fill_price_cents {
+                obj.insert("fill_price_cents".to_string(), json!(price));
+            }
+            if let Some(price) = actual_fill_price_cents {
+                obj.insert("actual_fill_price_cents".to_string(), json!(price));
+            }
+            if actual_slippage_cents.is_finite() {
+                obj.insert(
+                    "actual_slippage_cents".to_string(),
+                    json!(actual_slippage_cents),
+                );
+            }
+            if fill_slippage_cents.is_finite() {
+                obj.insert(
+                    "fill_slippage_cents".to_string(),
+                    json!(fill_slippage_cents),
+                );
+            }
+        }
     }
 
     let summary = json!({
@@ -1060,6 +1327,13 @@ fn enrich_paper_records_with_live_fills(
             continue;
         };
         if let Some(obj) = next.as_object_mut() {
+            obj.insert(
+                "intent_id".to_string(),
+                fill_row
+                    .get("intent_id")
+                    .cloned()
+                    .unwrap_or_else(|| fill_row.get("decision_id").cloned().unwrap_or(Value::Null)),
+            );
             obj.insert("live_fill".to_string(), fill_row.clone());
             obj.insert(
                 "live_fill_price_cents".to_string(),
@@ -1074,6 +1348,66 @@ fn enrich_paper_records_with_live_fills(
                     .get("fill_pnl_cents_net")
                     .cloned()
                     .unwrap_or(Value::Null),
+            );
+            obj.insert(
+                "actual_fill_price_cents".to_string(),
+                fill_row
+                    .get("actual_fill_price_cents")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+            obj.insert(
+                "actual_fee_cents".to_string(),
+                fill_row
+                    .get("actual_fee_cents")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+            obj.insert(
+                "actual_slippage_cents".to_string(),
+                fill_row
+                    .get("actual_slippage_cents")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+            obj.insert(
+                "fill_ts_ms".to_string(),
+                fill_row.get("fill_ts_ms").cloned().unwrap_or(Value::Null),
+            );
+            obj.insert(
+                "ack_to_fill_ms".to_string(),
+                fill_row
+                    .get("ack_to_fill_ms")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+            obj.insert(
+                "submit_to_fill_ms".to_string(),
+                fill_row
+                    .get("submit_to_fill_ms")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+            obj.insert(
+                "signal_to_fill_ms".to_string(),
+                fill_row
+                    .get("signal_to_fill_ms")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+            obj.insert(
+                "trigger_to_fill_ms".to_string(),
+                fill_row
+                    .get("trigger_to_fill_ms")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+            obj.insert(
+                "live_fill_event_count".to_string(),
+                fill_row
+                    .get("fill_event_count")
+                    .cloned()
+                    .unwrap_or_else(|| json!(1_u64)),
             );
         }
         matched = matched.saturating_add(1);
@@ -1116,6 +1450,11 @@ fn merge_current_summary_paper_records(
         }
         let mut row = decision.clone();
         if let Some(obj) = row.as_object_mut() {
+            if obj.get("intent_id").is_none() {
+                if let Some(decision_id) = obj.get("decision_id").cloned() {
+                    obj.insert("intent_id".to_string(), decision_id);
+                }
+            }
             obj.insert("paper_record_source".to_string(), json!("current_summary"));
             obj.insert("paper_record_virtual".to_string(), Value::Bool(true));
         }
@@ -1190,6 +1529,7 @@ fn build_live_order_lineage(events: &[Value], pending_rows: &[LivePendingOrder])
         .map(|(decision_id, row)| {
             let pending_count = row.pending_order_ids.len();
             json!({
+                "intent_id": decision_id.clone(),
                 "decision_id": decision_id,
                 "order_ids": row.order_ids.into_iter().collect::<Vec<_>>(),
                 "pending_order_ids": row.pending_order_ids.into_iter().collect::<Vec<_>>(),
@@ -1203,6 +1543,175 @@ fn build_live_order_lineage(events: &[Value], pending_rows: &[LivePendingOrder])
         .collect::<Vec<_>>();
     rows.sort_by_key(|row| {
         std::cmp::Reverse(row.get("last_ts_ms").and_then(Value::as_i64).unwrap_or(0))
+    });
+    rows
+}
+
+fn build_live_completed_records(
+    paper_records: &[Value],
+    fill_by_decision: &HashMap<String, Value>,
+    live_order_lineage: &[Value],
+) -> Vec<Value> {
+    let paper_by_decision = paper_records
+        .iter()
+        .filter_map(|row| extract_decision_id(row).map(|decision_id| (decision_id, row.clone())))
+        .collect::<HashMap<_, _>>();
+    let lineage_by_decision = live_order_lineage
+        .iter()
+        .filter_map(|row| extract_decision_id(row).map(|decision_id| (decision_id, row.clone())))
+        .collect::<HashMap<_, _>>();
+    let mut rows = fill_by_decision
+        .iter()
+        .map(|(decision_id, fill_row)| {
+            let mut next = paper_by_decision
+                .get(decision_id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    json!({
+                        "intent_id": fill_row
+                            .get("intent_id")
+                            .cloned()
+                            .unwrap_or_else(|| json!(decision_id)),
+                        "decision_id": decision_id,
+                    })
+                });
+            if let Some(obj) = next.as_object_mut() {
+                obj.insert(
+                    "intent_id".to_string(),
+                    fill_row
+                        .get("intent_id")
+                        .cloned()
+                        .unwrap_or_else(|| json!(decision_id)),
+                );
+                obj.insert("decision_id".to_string(), json!(decision_id));
+                obj.insert("live_fill".to_string(), fill_row.clone());
+                obj.insert(
+                    "fill_ts_ms".to_string(),
+                    fill_row.get("fill_ts_ms").cloned().unwrap_or(Value::Null),
+                );
+                obj.insert(
+                    "live_fill_price_cents".to_string(),
+                    fill_row
+                        .get("fill_price_cents")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                );
+                obj.insert(
+                    "actual_fill_price_cents".to_string(),
+                    fill_row
+                        .get("actual_fill_price_cents")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                );
+                obj.insert(
+                    "actual_fee_cents".to_string(),
+                    fill_row
+                        .get("actual_fee_cents")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                );
+                obj.insert(
+                    "actual_slippage_cents".to_string(),
+                    fill_row
+                        .get("actual_slippage_cents")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                );
+                obj.insert(
+                    "live_fill_pnl_cents_net".to_string(),
+                    fill_row
+                        .get("fill_pnl_cents_net")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                );
+                obj.insert(
+                    "fill_quote_usdc".to_string(),
+                    fill_row
+                        .get("fill_quote_usdc")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                );
+                obj.insert(
+                    "fill_size_shares".to_string(),
+                    fill_row
+                        .get("fill_size_shares")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                );
+                obj.insert(
+                    "live_fill_event_count".to_string(),
+                    fill_row
+                        .get("fill_event_count")
+                        .cloned()
+                        .unwrap_or_else(|| json!(1_u64)),
+                );
+                obj.insert("live_status".to_string(), json!("filled"));
+                if let Some(lineage_row) = lineage_by_decision.get(decision_id) {
+                    obj.insert(
+                        "order_ids".to_string(),
+                        lineage_row.get("order_ids").cloned().unwrap_or(Value::Null),
+                    );
+                    obj.insert(
+                        "pending_order_ids".to_string(),
+                        lineage_row
+                            .get("pending_order_ids")
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    );
+                    obj.insert(
+                        "pending_count".to_string(),
+                        lineage_row
+                            .get("pending_count")
+                            .cloned()
+                            .unwrap_or_else(|| json!(0_u64)),
+                    );
+                    obj.insert(
+                        "last_reason".to_string(),
+                        lineage_row
+                            .get("last_reason")
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    );
+                    obj.insert(
+                        "last_status".to_string(),
+                        lineage_row
+                            .get("last_status")
+                            .cloned()
+                            .unwrap_or_else(|| json!("filled")),
+                    );
+                    obj.insert(
+                        "last_ts_ms".to_string(),
+                        lineage_row
+                            .get("last_ts_ms")
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                fill_row.get("fill_ts_ms").cloned().unwrap_or(Value::Null)
+                            }),
+                    );
+                } else {
+                    obj.insert("order_ids".to_string(), fill_row.get("order_ids").cloned().unwrap_or_else(|| json!([])));
+                    obj.insert("pending_order_ids".to_string(), json!([]));
+                    obj.insert("pending_count".to_string(), json!(0_u64));
+                    obj.insert(
+                        "last_reason".to_string(),
+                        json!("rust_order_terminal_filled"),
+                    );
+                    obj.insert("last_status".to_string(), json!("filled"));
+                    obj.insert(
+                        "last_ts_ms".to_string(),
+                        fill_row.get("fill_ts_ms").cloned().unwrap_or(Value::Null),
+                    );
+                }
+            }
+            next
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|row| {
+        std::cmp::Reverse(
+            row.get("fill_ts_ms")
+                .and_then(Value::as_i64)
+                .unwrap_or_else(|| row.get("last_ts_ms").and_then(Value::as_i64).unwrap_or(0)),
+        )
     });
     rows
 }
@@ -2413,6 +2922,10 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         )
         .route("/api/strategy/autotune/set", post(strategy_autotune_set))
         .route("/api/strategy/live/reset", post(strategy_live_reset))
+        .route(
+            "/api/strategy/live/reconcile_resolved",
+            post(strategy_live_reconcile_resolved),
+        )
         .route("/api/strategy/live/control", post(strategy_live_control))
         .route("/api/strategy/live/events", get(strategy_live_events))
         .with_state(state.clone());
@@ -3424,6 +3937,11 @@ async fn live_runtime_loop(
                         );
                     let live_order_lineage =
                         build_live_order_lineage(&live_events_all, &pending_rows);
+                    let live_completed_records = build_live_completed_records(
+                        &paper_records_enriched,
+                        &live_fill_by_decision,
+                        &live_order_lineage,
+                    );
                     let live_realized_net_pnl_cents = state_machine.realized_pnl_usdc * 100.0;
                     let live_events = live_events_all
                         .iter()
@@ -3483,7 +4001,7 @@ async fn live_runtime_loop(
                         },
                         "decisions": selected_decisions,
                         "paper_records": paper_records_enriched,
-                        "live_records": execution_orders,
+                        "live_records": live_completed_records,
                         "order_lineage": live_order_lineage,
                         "parity_check": {
                             "status": execution_status.clone(),
@@ -4030,6 +4548,171 @@ mod tests {
                 .get("paper_record_virtual")
                 .and_then(Value::as_bool),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn build_live_fill_decision_map_aggregates_same_intent() {
+        let events = vec![
+            json!({
+                "intent_id": "intent-1",
+                "decision_id": "decision-a",
+                "order_id": "order-1",
+                "reason": "rust_order_terminal_filled",
+                "ts_ms": 100_i64,
+                "fill_ts_ms": 100_i64,
+                "action": "enter",
+                "side": "UP",
+                "fill_price_cents": 60.0,
+                "actual_fill_price_cents": 60.0,
+                "fill_quote_usdc": 1.2,
+                "fill_size_shares": 2.0,
+                "fill_fee_cents": 1.0,
+                "actual_fee_cents": 1.0,
+                "fill_slippage_cents": 0.2,
+                "actual_slippage_cents": 0.2,
+                "fill_cost_cents": 121.0,
+                "fill_pnl_cents_net": 3.0,
+                "ack_to_fill_ms": 40_i64,
+                "submit_to_fill_ms": 60_i64,
+                "signal_to_fill_ms": 90_i64,
+                "trigger_to_fill_ms": 70_i64
+            }),
+            json!({
+                "intent_id": "intent-1",
+                "decision_id": "decision-b",
+                "order_id": "order-2",
+                "reason": "rust_cancel_post_reconcile_filled",
+                "ts_ms": 200_i64,
+                "fill_ts_ms": 200_i64,
+                "action": "enter",
+                "side": "UP",
+                "fill_price_cents": 61.0,
+                "actual_fill_price_cents": 61.0,
+                "fill_quote_usdc": 1.83,
+                "fill_size_shares": 3.0,
+                "fill_fee_cents": 1.5,
+                "actual_fee_cents": 1.5,
+                "fill_slippage_cents": 0.4,
+                "actual_slippage_cents": 0.4,
+                "fill_cost_cents": 184.5,
+                "fill_pnl_cents_net": 4.0,
+                "ack_to_fill_ms": 55_i64,
+                "submit_to_fill_ms": 80_i64,
+                "signal_to_fill_ms": 120_i64,
+                "trigger_to_fill_ms": 95_i64
+            }),
+        ];
+
+        let (by_decision, summary) = build_live_fill_decision_map(&events);
+        assert_eq!(
+            summary.get("fill_event_count").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            summary.get("fill_decision_count").and_then(Value::as_u64),
+            Some(1)
+        );
+        let row = by_decision.get("intent-1").expect("aggregated fill row");
+        assert_eq!(row.get("order_id").and_then(Value::as_str), Some("order-2"));
+        assert_eq!(row.get("fill_event_count").and_then(Value::as_u64), Some(2));
+        assert_eq!(
+            row.get("fill_size_shares")
+                .and_then(Value::as_f64)
+                .map(|v| (v * 100.0).round() / 100.0),
+            Some(5.0)
+        );
+        assert_eq!(
+            row.get("fill_quote_usdc")
+                .and_then(Value::as_f64)
+                .map(|v| (v * 100.0).round() / 100.0),
+            Some(3.03)
+        );
+        assert_eq!(
+            row.get("actual_fill_price_cents")
+                .and_then(Value::as_f64)
+                .map(|v| (v * 100.0).round() / 100.0),
+            Some(60.6)
+        );
+        assert_eq!(
+            row.get("actual_fee_cents")
+                .and_then(Value::as_f64)
+                .map(|v| (v * 100.0).round() / 100.0),
+            Some(2.5)
+        );
+        assert_eq!(row.get("ack_to_fill_ms").and_then(Value::as_i64), Some(55));
+        assert_eq!(
+            row.get("order_ids")
+                .and_then(Value::as_array)
+                .map(|rows| rows.len()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn build_live_completed_records_materializes_filled_trade_rows() {
+        let paper_records = vec![json!({
+            "intent_id": "intent-1",
+            "decision_id": "intent-1",
+            "action": "exit",
+            "side": "UP",
+            "round_id": "SOLUSDT_5m_1",
+            "paper_record_source": "current_summary",
+            "paper_record_virtual": true,
+            "paper_exit_exec_price_cents": 63.0
+        })];
+        let fill_by_decision = HashMap::from([(
+            "intent-1".to_string(),
+            json!({
+                "intent_id": "intent-1",
+                "decision_id": "intent-1",
+                "action": "exit",
+                "side": "UP",
+                "fill_ts_ms": 222_i64,
+                "fill_price_cents": 63.0,
+                "actual_fill_price_cents": 63.0,
+                "fill_quote_usdc": 3.15,
+                "fill_size_shares": 5.0,
+                "actual_fee_cents": 0.0,
+                "actual_slippage_cents": 0.0,
+                "fill_pnl_cents_net": -45.0,
+                "fill_event_count": 1_u64,
+                "order_ids": ["order-1"]
+            }),
+        )]);
+        let live_order_lineage = vec![json!({
+            "intent_id": "intent-1",
+            "decision_id": "intent-1",
+            "order_ids": ["order-1"],
+            "pending_order_ids": [],
+            "pending_count": 0,
+            "last_reason": "rust_order_terminal_filled",
+            "last_status": "filled",
+            "last_ts_ms": 222_i64
+        })];
+
+        let rows =
+            build_live_completed_records(&paper_records, &fill_by_decision, &live_order_lineage);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.get("live_status").and_then(Value::as_str), Some("filled"));
+        assert_eq!(
+            row.get("actual_fill_price_cents").and_then(Value::as_f64),
+            Some(63.0)
+        );
+        assert_eq!(
+            row.get("live_fill_pnl_cents_net").and_then(Value::as_f64),
+            Some(-45.0)
+        );
+        assert_eq!(
+            row.get("order_ids")
+                .and_then(Value::as_array)
+                .map(|rows| rows.len()),
+            Some(1)
+        );
+        assert_eq!(
+            row.get("paper_record_source").and_then(Value::as_str),
+            Some("current_summary")
         );
     }
 

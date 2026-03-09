@@ -32,6 +32,36 @@ fn test_book(min_order_size: f64) -> GatewayBookSnapshot {
     }
 }
 
+fn test_api_state() -> ApiState {
+    let gateway_http_client = reqwest::Client::builder()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    ApiState {
+        ch_url: None,
+        redis_prefix: "test".to_string(),
+        redis_client: None,
+        redis_manager: None,
+        chart_cache: Arc::new(RwLock::new(HashMap::new())),
+        live_position_states: Arc::new(RwLock::new(HashMap::new())),
+        live_decision_guard: Arc::new(RwLock::new(HashMap::new())),
+        live_events: Arc::new(RwLock::new(VecDeque::new())),
+        live_event_seq: Arc::new(RwLock::new(0)),
+        live_pending_orders: Arc::new(RwLock::new(HashMap::new())),
+        live_runtime_snapshots: Arc::new(RwLock::new(HashMap::new())),
+        live_runtime_controls: Arc::new(RwLock::new(HashMap::new())),
+        live_persist_inflight: Arc::new(RwLock::new(HashSet::new())),
+        live_execution_aggr_states: Arc::new(RwLock::new(HashMap::new())),
+        live_rust_executor: Arc::new(RwLock::new(None)),
+        live_rust_book_cache: Arc::new(RwLock::new(HashMap::new())),
+        runtime_alert_throttle: Arc::new(RwLock::new(HashMap::new())),
+        runtime_daily_report_sent: Arc::new(RwLock::new(HashSet::new())),
+        strategy_heavy_slots: Arc::new(Semaphore::new(1)),
+        strategy_live_source_slots: Arc::new(Semaphore::new(4)),
+        runtime_event_samples: Arc::new(RwLock::new(HashMap::new())),
+        gateway_http_client: Arc::new(gateway_http_client),
+    }
+}
+
 #[test]
 fn taker_buy_uses_buy_amount_mode_with_min_order_size_floor() {
     let decision = json!({
@@ -293,6 +323,100 @@ fn price_parity_band_blocks_entry_when_fresh_price_exceeds_paper_band() {
 }
 
 #[test]
+fn price_parity_anchors_to_paper_exec_when_available() {
+    let decision = json!({
+        "action": "enter",
+        "side": "UP",
+        "price_cents": 50.0,
+        "signal_price_cents": 50.0,
+        "paper_entry_exec_price_cents": 59.4,
+        "quote_size_usdc": 5.0,
+        "max_slippage_bps": 20.0
+    });
+    let book = GatewayBookSnapshot {
+        token_id: "yes".to_string(),
+        min_order_size: 0.01,
+        tick_size: 0.01,
+        best_bid: Some(0.59),
+        best_ask: Some(0.60),
+        best_bid_size: Some(100.0),
+        best_ask_size: Some(100.0),
+        bid_depth_top3: Some(300.0),
+        ask_depth_top3: Some(300.0),
+    };
+    let payload = try_decision_to_live_payload(
+        &decision,
+        &test_target(),
+        &test_exec_cfg(),
+        Some(&book),
+        None,
+    )
+    .expect("paper exec anchor should keep submit within parity band");
+    assert_eq!(
+        payload
+            .get("price_parity")
+            .and_then(|v| v.get("parity_anchor_source"))
+            .and_then(Value::as_str),
+        Some("paper_entry_exec_price_cents")
+    );
+    assert_eq!(
+        payload
+            .get("price_parity")
+            .and_then(|v| v.get("parity_anchor_price_cents"))
+            .and_then(Value::as_f64)
+            .map(|v| (v * 10.0).round() / 10.0),
+        Some(59.4)
+    );
+}
+
+#[test]
+fn exit_price_parity_anchors_to_paper_exit_exec_when_available() {
+    let decision = json!({
+        "action": "exit",
+        "side": "DOWN",
+        "price_cents": 62.0,
+        "signal_price_cents": 62.0,
+        "paper_exit_exec_price_cents": 58.0,
+        "position_size_shares": 5.0,
+        "max_slippage_bps": 25.0
+    });
+    let book = GatewayBookSnapshot {
+        token_id: "no".to_string(),
+        min_order_size: 0.01,
+        tick_size: 0.01,
+        best_bid: Some(0.58),
+        best_ask: Some(0.59),
+        best_bid_size: Some(100.0),
+        best_ask_size: Some(100.0),
+        bid_depth_top3: Some(300.0),
+        ask_depth_top3: Some(300.0),
+    };
+    let payload = try_decision_to_live_payload(
+        &decision,
+        &test_target(),
+        &test_exec_cfg(),
+        Some(&book),
+        None,
+    )
+    .expect("paper exit anchor should keep submit within parity band");
+    assert_eq!(
+        payload
+            .get("price_parity")
+            .and_then(|v| v.get("parity_anchor_source"))
+            .and_then(Value::as_str),
+        Some("paper_exit_exec_price_cents")
+    );
+    assert_eq!(
+        payload
+            .get("price_parity")
+            .and_then(|v| v.get("parity_anchor_price_cents"))
+            .and_then(Value::as_f64)
+            .map(|v| (v * 10.0).round() / 10.0),
+        Some(58.0)
+    );
+}
+
+#[test]
 fn execution_price_trace_includes_paper_exec_deltas() {
     let decision = json!({
         "action": "enter",
@@ -399,6 +523,7 @@ fn extract_fill_meta_prefers_size_matched_over_quote_backsolve() {
         side: "UP".to_string(),
         round_id: "r".to_string(),
         decision_key: "k".to_string(),
+        intent_id: "did".to_string(),
         decision_id: "did".to_string(),
         price_cents: 99.0,
         quote_size_usdc: 4.95,
@@ -408,11 +533,14 @@ fn extract_fill_meta_prefers_size_matched_over_quote_backsolve() {
         submit_reason: "test".to_string(),
         submitted_ts_ms: 0,
         ack_ts_ms: 0,
+        decision_ts_ms: 0,
+        trigger_ts_ms: 0,
         cancel_after_ms: 1000,
         cancel_due_at_ms: 0,
         terminal_due_at_ms: 4_000,
         retry_count: 0,
         size_locked: false,
+        accepted_trade_ids: Vec::new(),
     };
     let fill = json!({
         "event": "order_terminal",
@@ -441,6 +569,7 @@ fn extract_fill_meta_caps_locked_fill_size_to_order_size() {
         side: "UP".to_string(),
         round_id: "r".to_string(),
         decision_key: "k".to_string(),
+        intent_id: "did".to_string(),
         decision_id: "did".to_string(),
         price_cents: 99.0,
         quote_size_usdc: 4.95,
@@ -450,11 +579,14 @@ fn extract_fill_meta_caps_locked_fill_size_to_order_size() {
         submit_reason: "test".to_string(),
         submitted_ts_ms: 0,
         ack_ts_ms: 0,
+        decision_ts_ms: 0,
+        trigger_ts_ms: 0,
         cancel_after_ms: 1000,
         cancel_due_at_ms: 0,
         terminal_due_at_ms: 4_000,
         retry_count: 0,
         size_locked: true,
+        accepted_trade_ids: Vec::new(),
     };
     let fill = json!({
         "event": "order_terminal",
@@ -500,4 +632,311 @@ fn usdc_micro_roundtrip_is_stable() {
         (roundtrip - 12.345_678).abs() < 1e-9,
         "micro-usdc roundtrip should be stable, got {roundtrip}"
     );
+}
+
+#[test]
+fn usdc_micro_roundtrip_preserves_negative_values() {
+    let v = -0.450_000_4;
+    let micros = usdc_to_micros(v);
+    let roundtrip = micros_to_usdc(micros);
+    assert!(
+        (roundtrip + 0.45).abs() < 1e-9,
+        "negative micro-usdc roundtrip should be stable, got {roundtrip}"
+    );
+}
+
+#[test]
+fn canonical_post_order_amounts_map_buy_and_sell_sides_correctly() {
+    let (buy_shares, buy_quote) =
+        canonical_post_order_amounts(PmSide::Buy, 5.0, 3.6, 3.599_999, 5.142_856);
+    assert!((buy_shares - 5.142_856).abs() < 1e-6);
+    assert!((buy_quote - 3.599_999).abs() < 1e-6);
+
+    let (sell_shares, sell_quote) =
+        canonical_post_order_amounts(PmSide::Sell, 5.0, 3.15, 5.0, 3.15);
+    assert!((sell_shares - 5.0).abs() < 1e-9);
+    assert!((sell_quote - 3.15).abs() < 1e-9);
+}
+
+#[test]
+fn fill_event_prefers_trade_rows_over_raw_order_price() {
+    let order = polymarket_client_sdk::clob::types::response::OpenOrderResponse::builder()
+        .id("oid")
+        .status(PmOrderStatusType::Matched)
+        .owner(uuid::Uuid::nil())
+        .maker_address(PmAddress::ZERO)
+        .market(polymarket_client_sdk::types::B256::ZERO)
+        .asset_id(PmU256::ZERO)
+        .side(PmSide::Sell)
+        .original_size(PmDecimal::from_str("5").expect("decimal"))
+        .size_matched(PmDecimal::from_str("5").expect("decimal"))
+        .price(PmDecimal::from_str("0.01").expect("decimal"))
+        .associate_trades(vec!["trade-1".to_string()])
+        .outcome("YES")
+        .created_at(Utc::now())
+        .expiration(Utc::now())
+        .order_type(PmOrderType::FAK)
+        .build();
+    let trade = polymarket_client_sdk::clob::types::response::TradeResponse::builder()
+        .id("trade-1")
+        .taker_order_id("oid")
+        .market(polymarket_client_sdk::types::B256::ZERO)
+        .asset_id(PmU256::ZERO)
+        .side(PmSide::Sell)
+        .size(PmDecimal::from_str("5").expect("decimal"))
+        .fee_rate_bps(PmDecimal::ZERO)
+        .price(PmDecimal::from_str("0.63").expect("decimal"))
+        .status(polymarket_client_sdk::clob::types::TradeStatusType::Matched)
+        .match_time(Utc::now())
+        .last_update(Utc::now())
+        .outcome("YES")
+        .bucket_index(0)
+        .owner(uuid::Uuid::nil())
+        .maker_address(PmAddress::ZERO)
+        .maker_orders(Vec::new())
+        .transaction_hash(polymarket_client_sdk::types::B256::ZERO)
+        .trader_side(polymarket_client_sdk::clob::types::TraderSide::Taker)
+        .build();
+
+    let fill = fill_event_from_open_order(&order, &[trade]);
+    assert_eq!(fill.get("fill_source").and_then(Value::as_str), Some("trade_ids"));
+    assert_eq!(
+        fill.get("fill_price_cents").and_then(Value::as_f64),
+        Some(63.0)
+    );
+    assert_eq!(
+        fill.get("fill_quote_usdc").and_then(Value::as_f64),
+        Some(3.15)
+    );
+}
+
+#[tokio::test]
+async fn apply_pending_confirmation_exit_realizes_pnl() {
+    let state = test_api_state();
+    state
+        .put_live_position_state(
+            "SOLUSDT",
+            "5m",
+            LivePositionState {
+                symbol: "SOLUSDT".to_string(),
+                market_type: "5m".to_string(),
+                state: "in_position".to_string(),
+                side: Some("UP".to_string()),
+                entry_round_id: Some("SOLUSDT_5m_1".to_string()),
+                entry_market_id: Some("mkt".to_string()),
+                entry_token_id: Some("yes".to_string()),
+                entry_ts_ms: Some(1_000),
+                entry_price_cents: Some(72.0),
+                entry_quote_usdc: Some(3.6),
+                net_quote_usdc: 3.6,
+                vwap_entry_cents: Some(72.0),
+                last_action: Some("enter_UP".to_string()),
+                last_reason: Some("rust_order_terminal_filled".to_string()),
+                total_entries: 1,
+                total_exits: 0,
+                total_adds: 0,
+                open_add_layers: 0,
+                total_reduces: 0,
+                realized_pnl_usdc: 0.0,
+                last_fill_pnl_usdc: 0.0,
+                position_cost_usdc: 0.0,
+                position_size_shares: 5.0,
+                updated_ts_ms: 1_000,
+            },
+        )
+        .await;
+    let pending = LivePendingOrder {
+        symbol: "SOLUSDT".to_string(),
+        market_type: "5m".to_string(),
+        order_id: "oid".to_string(),
+        market_id: "mkt".to_string(),
+        token_id: "yes".to_string(),
+        action: "exit".to_string(),
+        side: "UP".to_string(),
+        round_id: "SOLUSDT_5m_1".to_string(),
+        decision_key: "k".to_string(),
+        intent_id: "intent-1".to_string(),
+        decision_id: "intent-1".to_string(),
+        price_cents: 1.0,
+        quote_size_usdc: 3.6,
+        order_size_shares: 5.0,
+        tif: "FAK".to_string(),
+        style: "taker".to_string(),
+        submit_reason: "stop_loss_wide_grace".to_string(),
+        submitted_ts_ms: 1_200,
+        ack_ts_ms: 1_250,
+        decision_ts_ms: 1_000,
+        trigger_ts_ms: 1_050,
+        cancel_after_ms: 1_000,
+        cancel_due_at_ms: 0,
+        terminal_due_at_ms: 4_000,
+        retry_count: 0,
+        size_locked: true,
+        accepted_trade_ids: vec!["trade-1".to_string()],
+    };
+    let fill = json!({
+        "fill_price_cents": 63.0,
+        "fill_quote_usdc": 3.15,
+        "fill_size_shares": 5.0
+    });
+
+    apply_pending_confirmation(&state, &pending, "rust_order_terminal_filled", Some(&fill)).await;
+
+    let next = state.get_live_position_state("SOLUSDT", "5m").await;
+    assert_eq!(next.state, "flat");
+    assert!(next.position_size_shares.abs() < 1e-9);
+    assert!(
+        (next.realized_pnl_usdc + 0.45).abs() < 1e-9,
+        "expected realized pnl of -0.45 usdc, got {}",
+        next.realized_pnl_usdc
+    );
+    assert!(
+        (next.last_fill_pnl_usdc + 0.45).abs() < 1e-9,
+        "expected last fill pnl of -0.45 usdc, got {}",
+        next.last_fill_pnl_usdc
+    );
+}
+
+#[tokio::test]
+async fn locked_exit_target_expired_is_rejected_before_submit() {
+    let target = LiveMarketTarget {
+        market_id: "1529923".to_string(),
+        symbol: "SOLUSDT".to_string(),
+        timeframe: "5m".to_string(),
+        token_id_yes: "yes".to_string(),
+        token_id_no: "no".to_string(),
+        end_date: Some("2026-03-09T03:50:00Z".to_string()),
+    };
+    let position = LivePositionState {
+        symbol: "SOLUSDT".to_string(),
+        market_type: "5m".to_string(),
+        state: "in_position".to_string(),
+        side: Some("DOWN".to_string()),
+        entry_round_id: Some("SOLUSDT_5m_1773027900000".to_string()),
+        entry_market_id: Some("1529923".to_string()),
+        entry_token_id: Some("24791353838135686396150788674032116106865477312181400776264735735012421228433".to_string()),
+        entry_ts_ms: Some(1773028009000),
+        entry_price_cents: Some(88.0),
+        entry_quote_usdc: Some(4.4),
+        net_quote_usdc: 4.4,
+        vwap_entry_cents: Some(88.0),
+        last_action: Some("enter".to_string()),
+        last_reason: Some("rust_order_terminal_filled".to_string()),
+        total_entries: 1,
+        total_exits: 0,
+        total_adds: 0,
+        open_add_layers: 0,
+        total_reduces: 0,
+        realized_pnl_usdc: 0.0,
+        last_fill_pnl_usdc: 0.0,
+        position_cost_usdc: 4.4,
+        position_size_shares: 5.0,
+        updated_ts_ms: 1773040388000,
+    };
+
+    let err = validate_locked_exit_target_tradable(&target, &position)
+        .await
+        .expect_err("expired locked market should be rejected before submit");
+    assert_eq!(err.reason, "locked_exit_market_expired");
+}
+
+#[test]
+fn resolved_outcome_marks_local_token_as_winning() {
+    let detail = GammaMarketDetail {
+        market_id: "1529923".to_string(),
+        condition_id: Some(
+            "0x1cdce4553d69a5fda87c776131673631e3e3c976b9d16ac2b4d4051e227b749a".to_string(),
+        ),
+        active: true,
+        closed: true,
+        enable_order_book: true,
+        end_date: Some("2026-03-09T03:50:00Z".to_string()),
+        token_ids: vec!["up".to_string(), "down".to_string()],
+        outcomes: vec!["Up".to_string(), "Down".to_string()],
+        outcome_prices: vec![0.0, 1.0],
+        uma_resolution_status: Some("resolved".to_string()),
+        slug: Some("sol-updown-5m-1773027900".to_string()),
+        question: Some("Solana Up or Down".to_string()),
+    };
+    let position = LivePositionState {
+        symbol: "SOLUSDT".to_string(),
+        market_type: "5m".to_string(),
+        state: "in_position".to_string(),
+        side: Some("DOWN".to_string()),
+        entry_round_id: Some("SOLUSDT_5m_1773027900000".to_string()),
+        entry_market_id: Some("1529923".to_string()),
+        entry_token_id: Some("down".to_string()),
+        entry_ts_ms: Some(1773028009000),
+        entry_price_cents: Some(88.0),
+        entry_quote_usdc: Some(4.4),
+        net_quote_usdc: 4.4,
+        vwap_entry_cents: Some(88.0),
+        last_action: Some("enter".to_string()),
+        last_reason: Some("rust_order_terminal_filled".to_string()),
+        total_entries: 1,
+        total_exits: 0,
+        total_adds: 0,
+        open_add_layers: 0,
+        total_reduces: 0,
+        realized_pnl_usdc: 0.0,
+        last_fill_pnl_usdc: 0.0,
+        position_cost_usdc: 4.4,
+        position_size_shares: 5.0,
+        updated_ts_ms: 1773040388000,
+    };
+
+    let resolution = analyze_resolved_position_outcome(Some(&detail), &position);
+    assert!(resolution.market_closed);
+    assert!(resolution.market_resolved);
+    assert_eq!(resolution.local_token_result, "winning");
+    assert_eq!(resolution.local_outcome_label.as_deref(), Some("Down"));
+    assert_eq!(resolution.winning_outcome_label.as_deref(), Some("Down"));
+    assert_eq!(resolution.winning_token_id.as_deref(), Some("down"));
+    assert_eq!(resolution.local_expected_claim_value_usdc, Some(5.0));
+}
+
+#[test]
+fn resolved_position_local_clear_requires_pause_and_resolution() {
+    assert!(can_clear_resolved_position_local_state(
+        true,
+        0,
+        LiveRuntimeControlMode::ForcePause,
+        true,
+        false
+    ));
+    assert!(!can_clear_resolved_position_local_state(
+        true,
+        1,
+        LiveRuntimeControlMode::ForcePause,
+        true,
+        false
+    ));
+    assert!(!can_clear_resolved_position_local_state(
+        true,
+        0,
+        LiveRuntimeControlMode::Normal,
+        true,
+        false
+    ));
+    assert!(!can_clear_resolved_position_local_state(
+        false,
+        0,
+        LiveRuntimeControlMode::ForcePause,
+        true,
+        false
+    ));
+    assert!(!can_clear_resolved_position_local_state(
+        true,
+        0,
+        LiveRuntimeControlMode::ForcePause,
+        false,
+        false
+    ));
+    assert!(can_clear_resolved_position_local_state(
+        true,
+        0,
+        LiveRuntimeControlMode::ForcePause,
+        false,
+        true
+    ));
 }

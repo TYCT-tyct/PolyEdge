@@ -4,6 +4,10 @@ set -euo pipefail
 REPO_DIR="${REPO_DIR:-/home/ubuntu/PolyEdge}"
 DATA_ROOT="${DATA_ROOT:-/data/polyedge-forge}"
 USER_NAME="${USER_NAME:-ubuntu}"
+POLYEDGE_RELEASE_COMMIT="${POLYEDGE_RELEASE_COMMIT:-local-dev}"
+DATA_RELEASE_ROOT="${DATA_RELEASE_ROOT:-/data/polyedge-releases}"
+HOME_RELEASE_ROOT="${HOME_RELEASE_ROOT:-/home/${USER_NAME}/polyedge-releases}"
+DASHBOARD_DIST="${DASHBOARD_DIST:-$REPO_DIR/heatmap_dashboard/dist}"
 ACTIVE_SYMBOLS="${ACTIVE_SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT}"
 ACTIVE_TIMEFRAMES="${ACTIVE_TIMEFRAMES:-5m,15m}"
 ACTIVE_SYMBOL_TIMEFRAMES="${ACTIVE_SYMBOL_TIMEFRAMES:-BTCUSDT:5m|15m,ETHUSDT:5m,SOLUSDT:5m,XRPUSDT:5m}"
@@ -28,25 +32,7 @@ DISCOVERY_MAX_PAST_MS="${DISCOVERY_MAX_PAST_MS:-240000}"
 ROUND_MIN_COVERAGE_RATIO="${ROUND_MIN_COVERAGE_RATIO:-0.70}"
 ROUND_MIN_SAMPLE_RATIO="${ROUND_MIN_SAMPLE_RATIO:-0.65}"
 
-echo "[forge-ireland] repo=$REPO_DIR data_root=$DATA_ROOT user=$USER_NAME"
-
-sudo systemctl stop \
-  polyedge-forge-ireland.service \
-  polyedge-forge-ireland-recorder.service \
-  polyedge-forge-ireland-api.service \
-  polyedge-data-backend-ireland.service \
-  polyedge-data-backend-api.service \
-  polyedge-recorder.service \
-  polyedge.service 2>/dev/null || true
-
-sudo systemctl disable \
-  polyedge-forge-ireland.service \
-  polyedge-forge-ireland-recorder.service \
-  polyedge-forge-ireland-api.service \
-  polyedge-data-backend-ireland.service \
-  polyedge-data-backend-api.service \
-  polyedge-recorder.service \
-  polyedge.service 2>/dev/null || true
+echo "[forge-ireland] repo=$REPO_DIR data_root=$DATA_ROOT user=$USER_NAME release_commit=$POLYEDGE_RELEASE_COMMIT"
 
 # Legacy dataset cleanup requested by operator.
 if [ -d /data/polyedge-data ]; then
@@ -87,12 +73,34 @@ fi
 # This prevents stale /dashboard bundles after backend-only deploys.
 if command -v npm >/dev/null 2>&1; then
   pushd "$REPO_DIR/heatmap_dashboard" >/dev/null
-  npm install --no-audit --no-fund
+  if [ -f package-lock.json ]; then
+    npm ci --no-audit --no-fund
+  else
+    npm install --no-audit --no-fund
+  fi
   npm run build
   popd >/dev/null
 else
   echo "[forge-ireland] warning: npm not found; dashboard dist may be stale"
 fi
+
+sudo systemctl stop \
+  polyedge-forge-ireland.service \
+  polyedge-forge-ireland-recorder.service \
+  polyedge-forge-ireland-api.service \
+  polyedge-data-backend-ireland.service \
+  polyedge-data-backend-api.service \
+  polyedge-recorder.service \
+  polyedge.service 2>/dev/null || true
+
+sudo systemctl disable \
+  polyedge-forge-ireland.service \
+  polyedge-forge-ireland-recorder.service \
+  polyedge-forge-ireland-api.service \
+  polyedge-data-backend-ireland.service \
+  polyedge-data-backend-api.service \
+  polyedge-recorder.service \
+  polyedge.service 2>/dev/null || true
 
 # Remove stale systemd drop-in overrides so deploy script remains source of truth.
 sudo rm -rf /etc/systemd/system/polyedge-forge-ireland-recorder.service.d
@@ -111,6 +119,7 @@ Type=simple
 User=$USER_NAME
 WorkingDirectory=$REPO_DIR
 Environment=RUST_LOG=info,polyedge_forge=debug
+Environment=POLYEDGE_RELEASE_COMMIT=$POLYEDGE_RELEASE_COMMIT
 Environment=POLYEDGE_MARKET_REFRESH_SEC=$MARKET_WS_REFRESH_SEC
 Environment=POLYEDGE_TARGET_MARKET_CACHE_FILE=/data/polyedge-forge/cache/target_market_cache.json
 Environment=POLYEDGE_DISCOVERY_NEAR_EXPIRY_ONLY=true
@@ -139,7 +148,7 @@ Environment=FORGE_ROUND_MIN_SAMPLE_RATIO=$ROUND_MIN_SAMPLE_RATIO
 Environment=FORGE_CHAINLINK_ENABLED=false
 Environment=POLYEDGE_ENABLE_CHAINLINK_ANCHOR=false
 Environment=POLYEDGE_MARKET_STALE_RECONNECT_RATIO=0.75
-ExecStart=$REPO_DIR/target/release/polyedge_forge ireland-recorder --data-root $DATA_ROOT --udp-bind 0.0.0.0:9801 --sample-ms 100 --supported-symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT --active-symbols $ACTIVE_SYMBOLS --active-timeframes $ACTIVE_TIMEFRAMES --active-symbol-timeframes $ACTIVE_SYMBOL_TIMEFRAMES --discovery-refresh-sec $DISCOVERY_REFRESH_SEC --clickhouse-url http://127.0.0.1:8123 --clickhouse-database polyedge_forge --clickhouse-snapshot-table snapshot_100ms --clickhouse-round-table rounds --clickhouse-snapshot-ttl-days 14 --clickhouse-processed-ttl-days 14 --clickhouse-round-ttl-days 180 --redis-url redis://127.0.0.1:6379/0 --redis-prefix forge --redis-ttl-sec 7200 --sink-batch-size 200 --sink-flush-ms 1000 --sink-queue-cap 20000 --disable-api --dashboard-dist /home/ubuntu/PolyEdge/heatmap_dashboard/dist
+ExecStart=$REPO_DIR/target/release/polyedge_forge ireland-recorder --data-root $DATA_ROOT --udp-bind 0.0.0.0:9801 --sample-ms 100 --supported-symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT --active-symbols $ACTIVE_SYMBOLS --active-timeframes $ACTIVE_TIMEFRAMES --active-symbol-timeframes $ACTIVE_SYMBOL_TIMEFRAMES --discovery-refresh-sec $DISCOVERY_REFRESH_SEC --clickhouse-url http://127.0.0.1:8123 --clickhouse-database polyedge_forge --clickhouse-snapshot-table snapshot_100ms --clickhouse-round-table rounds --clickhouse-snapshot-ttl-days 14 --clickhouse-processed-ttl-days 14 --clickhouse-round-ttl-days 180 --redis-url redis://127.0.0.1:6379/0 --redis-prefix forge --redis-ttl-sec 7200 --sink-batch-size 200 --sink-flush-ms 1000 --sink-queue-cap 20000 --disable-api --dashboard-dist $DASHBOARD_DIST
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -161,6 +170,7 @@ Type=simple
 User=$USER_NAME
 WorkingDirectory=$REPO_DIR
 Environment=RUST_LOG=info,polyedge_forge=debug
+Environment=POLYEDGE_RELEASE_COMMIT=$POLYEDGE_RELEASE_COMMIT
 Environment=FORGE_FEV1_RUNTIME_MARKETS=$RUNTIME_MARKETS
 Environment=FORGE_FEV1_RUNTIME_LOOKBACK_MINUTES=$RUNTIME_LOOKBACK_MINUTES
 Environment=FORGE_FEV1_RUNTIME_LOOP_MS=450
@@ -176,7 +186,7 @@ Environment=FORGE_STRATEGY_MAX_POINTS_SHORT=140000
 Environment=FORGE_STRATEGY_MAX_POINTS_HARD_CAP=320000
 Environment=MALLOC_TRIM_THRESHOLD_=131072
 EnvironmentFile=-$REPO_DIR/.env
-ExecStart=$REPO_DIR/target/release/polyedge_forge ireland-api --bind 0.0.0.0:9810 --clickhouse-url http://127.0.0.1:8123 --redis-url redis://127.0.0.1:6379/0 --redis-prefix forge --dashboard-dist /home/ubuntu/PolyEdge/heatmap_dashboard/dist
+ExecStart=$REPO_DIR/target/release/polyedge_forge ireland-api --bind 0.0.0.0:9810 --clickhouse-url http://127.0.0.1:8123 --redis-url redis://127.0.0.1:6379/0 --redis-prefix forge --dashboard-dist $DASHBOARD_DIST
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -323,6 +333,9 @@ UNIT
 sudo install -m 0755 "$REPO_DIR/scripts/forge/ireland_disk_guard.sh" /usr/local/bin/polyedge-ireland-disk-guard.sh
 sudo cp "$REPO_DIR/ops/systemd/polyedge-ireland-disk-guard.service" /etc/systemd/system/
 sudo cp "$REPO_DIR/ops/systemd/polyedge-ireland-disk-guard.timer" /etc/systemd/system/
+sudo sed -i "s#^Environment=REPO_DIR=.*#Environment=REPO_DIR=$REPO_DIR#" /etc/systemd/system/polyedge-ireland-disk-guard.service
+sudo sed -i "s#^Environment=DATA_RELEASE_ROOT=.*#Environment=DATA_RELEASE_ROOT=$DATA_RELEASE_ROOT#" /etc/systemd/system/polyedge-ireland-disk-guard.service
+sudo sed -i "s#^Environment=HOME_RELEASE_ROOT=.*#Environment=HOME_RELEASE_ROOT=$HOME_RELEASE_ROOT#" /etc/systemd/system/polyedge-ireland-disk-guard.service
 
 sudo systemctl daemon-reload
 sudo systemctl enable polyedge-forge-ireland-recorder.service

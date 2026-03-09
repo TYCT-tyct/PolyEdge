@@ -24,11 +24,40 @@ pub(super) fn pm_is_terminal_reject(status: &PmOrderStatusType) -> bool {
 
 pub(super) fn fill_event_from_open_order(
     order: &polymarket_client_sdk::clob::types::response::OpenOrderResponse,
+    trades: &[polymarket_client_sdk::clob::types::response::TradeResponse],
 ) -> Value {
-    let fill_price = pm_dec_to_f64(&order.price).max(0.0001);
-    let fill_size = pm_dec_to_f64(&order.size_matched).max(0.0);
-    let fill_quote = (fill_price * fill_size).max(0.0);
+    let raw_fill_price = pm_dec_to_f64(&order.price).max(0.0001);
+    let raw_fill_size = pm_dec_to_f64(&order.size_matched).max(0.0);
+    let raw_fill_quote = (raw_fill_price * raw_fill_size).max(0.0);
     let original_size = pm_dec_to_f64(&order.original_size).max(0.0);
+    let trade_size = trades
+        .iter()
+        .map(|trade| pm_dec_to_f64(&trade.size).max(0.0))
+        .sum::<f64>();
+    let trade_quote = trades
+        .iter()
+        .map(|trade| pm_dec_to_f64(&trade.size).max(0.0) * pm_dec_to_f64(&trade.price).max(0.0))
+        .sum::<f64>();
+    let trade_avg_price = if trade_size > 0.0 {
+        trade_quote / trade_size
+    } else {
+        0.0
+    };
+    let fill_price = if trade_avg_price > 0.0 {
+        trade_avg_price
+    } else {
+        raw_fill_price
+    };
+    let fill_size = if trade_size > 0.0 {
+        trade_size
+    } else {
+        raw_fill_size
+    };
+    let fill_quote = if trade_quote > 0.0 {
+        trade_quote
+    } else {
+        raw_fill_quote
+    };
     json!({
         "event": "order_terminal",
         "state": "filled",
@@ -36,11 +65,115 @@ pub(super) fn fill_event_from_open_order(
         "fill_price_cents": fill_price * 100.0,
         "fill_quote_usdc": fill_quote,
         "fill_size_shares": fill_size,
+        "raw_order_price_cents": raw_fill_price * 100.0,
+        "raw_order_size_shares": raw_fill_size,
+        "raw_order_quote_usdc": raw_fill_quote,
+        "fill_source": if trade_size > 0.0 { "trade_ids" } else { "open_order" },
+        "trade_ids": trades.iter().map(|trade| trade.id.clone()).collect::<Vec<_>>(),
         "original_size_shares": original_size,
         "size_matched": fill_size,
         "matched_size": fill_size,
         "associate_trades": order.associate_trades,
     })
+}
+
+fn canonical_post_order_amounts(
+    side: PmSide,
+    requested_size_shares: f64,
+    requested_notional_usdc: f64,
+    making_amount: f64,
+    taking_amount: f64,
+) -> (f64, f64) {
+    match side {
+        PmSide::Buy => (
+            if taking_amount > 0.0 {
+                taking_amount
+            } else {
+                requested_size_shares.max(0.0)
+            },
+            if making_amount > 0.0 {
+                making_amount
+            } else {
+                requested_notional_usdc.max(0.0)
+            },
+        ),
+        PmSide::Sell => (
+            if making_amount > 0.0 {
+                making_amount
+            } else {
+                requested_size_shares.max(0.0)
+            },
+            if taking_amount > 0.0 {
+                taking_amount
+            } else {
+                requested_notional_usdc.max(0.0)
+            },
+        ),
+        _ => (
+            requested_size_shares.max(0.0),
+            requested_notional_usdc.max(0.0),
+        ),
+    }
+}
+
+fn parse_trade_ids_from_submit_response(submit_response: Option<&Value>) -> Vec<String> {
+    submit_response
+        .and_then(|resp| resp.get("trade_ids"))
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+async fn fetch_trade_rows_for_order(
+    ctx: &Arc<RustExecutorContext>,
+    pending: &LivePendingOrder,
+    order: &polymarket_client_sdk::clob::types::response::OpenOrderResponse,
+) -> Vec<polymarket_client_sdk::clob::types::response::TradeResponse> {
+    let mut trade_ids = pending
+        .accepted_trade_ids
+        .iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect::<BTreeSet<_>>();
+    for trade_id in &order.associate_trades {
+        let trade_id = trade_id.trim();
+        if !trade_id.is_empty() {
+            trade_ids.insert(trade_id.to_string());
+        }
+    }
+    let mut out = Vec::<polymarket_client_sdk::clob::types::response::TradeResponse>::new();
+    for trade_id in trade_ids {
+        let request = PmTradesRequest::builder().id(trade_id.clone()).build();
+        let Ok(page) = ctx.client.trades(&request, None).await else {
+            continue;
+        };
+        if let Some(trade) = page
+            .data
+            .into_iter()
+            .find(|trade| trade.id.trim() == trade_id)
+        {
+            out.push(trade);
+        }
+    }
+    out
+}
+
+async fn build_terminal_fill_event(
+    ctx: &Arc<RustExecutorContext>,
+    pending: &LivePendingOrder,
+    order: &polymarket_client_sdk::clob::types::response::OpenOrderResponse,
+) -> Value {
+    let trades = fetch_trade_rows_for_order(ctx, pending, order).await;
+    fill_event_from_open_order(order, &trades)
 }
 
 fn is_exit_like_action(action: &str) -> bool {
@@ -111,6 +244,8 @@ async fn force_pause_for_locked_market_submit_error(
     decision: &Value,
     decision_key: &str,
     target: &LiveMarketTarget,
+    guard_reason: &str,
+    control_note_prefix: &str,
     detail: Value,
 ) {
     let now_ms = Utc::now().timestamp_millis();
@@ -123,7 +258,8 @@ async fn force_pause_for_locked_market_submit_error(
         control.updated_at_ms = now_ms;
         control.completed_at_ms = None;
         control.note = Some(format!(
-            "locked_market_missing:{}:{}",
+            "{}:{}:{}",
+            control_note_prefix,
             target.market_id,
             decision
                 .get("decision_id")
@@ -150,7 +286,7 @@ async fn force_pause_for_locked_market_submit_error(
                 "round_id": decision.get("round_id").and_then(Value::as_str),
                 "decision_id": decision.get("decision_id").and_then(Value::as_str),
                 "decision_key": decision_key,
-                "reason": "locked_market_orderbook_missing_force_pause",
+                "reason": guard_reason,
                 "runtime_mode": control.mode,
                 "runtime_note": control.note,
                 "detail": detail
@@ -167,6 +303,7 @@ fn build_pending_from_accepted_submission(
     decision: &Value,
     effective_target: &LiveMarketTarget,
     payload: &Value,
+    submit_response: Option<&Value>,
     order_id: &str,
     submitted_ts_ms: i64,
     ack_ts_ms: i64,
@@ -229,6 +366,13 @@ fn build_pending_from_accepted_submission(
             })
         })
         .unwrap_or(false);
+    let intent_id = decision
+        .get("intent_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or(decision_id)
+        .to_string();
     LivePendingOrder {
         symbol: symbol.trim().to_ascii_uppercase(),
         market_type: market_type.to_string(),
@@ -243,6 +387,7 @@ fn build_pending_from_accepted_submission(
             .unwrap_or_default()
             .to_string(),
         decision_key: decision_key.to_string(),
+        intent_id,
         decision_id: decision_id.to_string(),
         price_cents,
         quote_size_usdc,
@@ -256,6 +401,14 @@ fn build_pending_from_accepted_submission(
             .to_string(),
         submitted_ts_ms,
         ack_ts_ms: ack_ts_ms.max(submitted_ts_ms),
+        decision_ts_ms: decision
+            .get("ts_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+        trigger_ts_ms: decision
+            .get("trigger_ts_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
         cancel_after_ms,
         cancel_due_at_ms: if maker_tif {
             ack_ts_ms
@@ -269,6 +422,7 @@ fn build_pending_from_accepted_submission(
             .saturating_add(terminal_after_ms),
         retry_count: 0,
         size_locked,
+        accepted_trade_ids: parse_trade_ids_from_submit_response(submit_response),
     }
 }
 
@@ -649,35 +803,22 @@ pub(super) async fn submit_rust_order(
     let accepted = resp.success && resp.error_msg.as_deref().unwrap_or_default().is_empty();
     let making_amount = pm_dec_to_f64(&resp.making_amount);
     let taking_amount = pm_dec_to_f64(&resp.taking_amount);
-    let accepted_size = if use_market_buy_amount {
-        if taking_amount > 0.0 {
-            taking_amount
-        } else {
-            size
-        }
-    } else if making_amount > 0.0 {
-        making_amount
-    } else {
-        size
-    };
-    let effective_notional = if use_market_buy_amount {
-        if making_amount > 0.0 {
-            making_amount
-        } else {
-            requested_notional
-        }
-    } else if taking_amount > 0.0 {
-        taking_amount
-    } else {
-        size * price
-    };
+    let (accepted_size_shares, accepted_quote_usdc) = canonical_post_order_amounts(
+        pm_side,
+        size,
+        requested_notional,
+        making_amount,
+        taking_amount,
+    );
     Ok(json!({
         "accepted": accepted,
         "order_id": resp.order_id,
         "status": format!("{}", resp.status),
         "error_msg": resp.error_msg,
-        "accepted_size": accepted_size,
-        "effective_notional": effective_notional,
+        "accepted_size": accepted_size_shares,
+        "accepted_size_shares": accepted_size_shares,
+        "accepted_quote_usdc": accepted_quote_usdc,
+        "effective_notional": accepted_quote_usdc,
         "making_amount": making_amount,
         "taking_amount": taking_amount,
         "requested_notional_usdc": requested_notional,
@@ -1054,6 +1195,42 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                 continue;
             }
         };
+        if is_exit_like_action(&action) {
+            if let Err(guard) =
+                validate_locked_exit_target_tradable(&prepared.effective_target, position_state)
+                    .await
+            {
+                let target_token_id = token_id_for_decision(&prepared.decision, &prepared.effective_target)
+                    .map(str::to_string);
+                force_pause_for_locked_market_submit_error(
+                    state,
+                    position_state,
+                    &prepared.decision,
+                    &gated.decision_key,
+                    &prepared.effective_target,
+                    "locked_market_untradable_force_pause",
+                    "locked_market_untradable",
+                    json!({
+                        "target_market_id": prepared.effective_target.market_id,
+                        "target_token_id": target_token_id,
+                        "guard": guard.detail
+                    }),
+                )
+                .await;
+                out.push(json!({
+                    "ok": false,
+                    "accepted": false,
+                    "decision_key": gated.decision_key,
+                    "decision": prepared.decision,
+                    "reason": guard.reason,
+                    "target_market_id": prepared.effective_target.market_id,
+                    "target_end_date": prepared.effective_target.end_date,
+                    "executor": "rust_sdk",
+                    "detail": guard.detail
+                }));
+                continue;
+            }
+        }
         let decision_id = prepared
             .decision
             .get("decision_id")
@@ -1207,6 +1384,11 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
             "symbol": position_state.symbol,
             "market_type": position_state.market_type,
             "decision_key": gated.decision_key,
+            "intent_id": prepared
+                .decision
+                .get("intent_id")
+                .cloned()
+                .unwrap_or_else(|| json!(decision_id.clone())),
             "decision_id": decision_id,
             "decision": prepared.decision,
             "order_id": final_order_id,
@@ -1246,6 +1428,7 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                         &prepared.decision,
                         &prepared.effective_target,
                         &attempt_payload,
+                        final_response.as_ref(),
                         order_id,
                         submit_start_ts_ms,
                         ack_ts_ms,
@@ -1270,6 +1453,11 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                     "action": prepared.decision.get("action").and_then(Value::as_str).unwrap_or("unknown"),
                     "side": prepared.decision.get("side").and_then(Value::as_str).unwrap_or("unknown"),
                     "round_id": prepared.decision.get("round_id").and_then(Value::as_str),
+                    "intent_id": prepared
+                        .decision
+                        .get("intent_id")
+                        .cloned()
+                        .unwrap_or_else(|| json!(decision_id.clone())),
                     "decision_id": decision_id,
                     "decision_key": gated.decision_key,
                     "reason": submit_event_reason,
@@ -1281,9 +1469,13 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                     "request_quote_usdc": request_quote,
                     "final_size_shares": final_size,
                     "final_quote_usdc": final_quote,
-                    "accepted_size_shares": final_response.as_ref().and_then(|resp| resp.get("accepted_size")).cloned().unwrap_or(Value::Null),
+                    "accepted_size_shares": final_response.as_ref().and_then(|resp| resp.get("accepted_size_shares")).cloned().unwrap_or(Value::Null),
+                    "accepted_quote_usdc": final_response.as_ref().and_then(|resp| resp.get("accepted_quote_usdc")).cloned().unwrap_or(Value::Null),
+                    "venue_making_amount": final_response.as_ref().and_then(|resp| resp.get("making_amount")).cloned().unwrap_or(Value::Null),
+                    "venue_taking_amount": final_response.as_ref().and_then(|resp| resp.get("taking_amount")).cloned().unwrap_or(Value::Null),
                     "making_amount": final_response.as_ref().and_then(|resp| resp.get("making_amount")).cloned().unwrap_or(Value::Null),
                     "taking_amount": final_response.as_ref().and_then(|resp| resp.get("taking_amount")).cloned().unwrap_or(Value::Null),
+                    "trade_ids": final_response.as_ref().and_then(|resp| resp.get("trade_ids")).cloned().unwrap_or_else(|| json!([])),
                     "signal_to_submit_ms": signal_to_submit_ms,
                     "signal_to_ack_ms": signal_to_ack_ms,
                     "submit_to_ack_ms": submit_to_ack_ms,
@@ -1313,6 +1505,8 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                     &prepared.decision,
                     &gated.decision_key,
                     &prepared.effective_target,
+                    "locked_market_orderbook_missing_force_pause",
+                    "locked_market_missing",
                     json!({
                         "reject_reason": final_reject_reason,
                         "error": final_error,
@@ -1358,7 +1552,9 @@ pub(super) async fn reconcile_rust_reports(state: &ApiState, exec_cfg: &LiveExec
         };
         if pm_is_terminal_fill(&order.status) {
             let _ = state.remove_pending_order(&row.order_id).await;
-            let fill_event = fill_event_from_open_order(&order);
+            let fill_ts_ms = Utc::now().timestamp_millis();
+            let mut fill_event = build_terminal_fill_event(&ctx, &row, &order).await;
+            merge_fill_time_metrics(&mut fill_event, fill_ts_ms, &row);
             let fill_meta = extract_pending_fill_meta(Some(&fill_event), &row);
             apply_pending_confirmation(
                 state,
@@ -1400,11 +1596,18 @@ pub(super) async fn reconcile_rust_reports(state: &ApiState, exec_cfg: &LiveExec
                         "action": row.action,
                         "side": row.side,
                         "round_id": row.round_id,
+                        "intent_id": row.intent_id,
                         "decision_id": row.decision_id,
                         "decision_key": row.decision_key,
                         "reason": "rust_order_terminal_filled",
                         "order_id": row.order_id,
+                        "fill_ts_ms": fill_ts_ms,
+                        "ack_to_fill_ms": if row.ack_ts_ms > 0 { Some(fill_ts_ms.saturating_sub(row.ack_ts_ms)) } else { None::<i64> },
+                        "submit_to_fill_ms": if row.submitted_ts_ms > 0 { Some(fill_ts_ms.saturating_sub(row.submitted_ts_ms)) } else { None::<i64> },
+                        "signal_to_fill_ms": if row.decision_ts_ms > 0 { Some(fill_ts_ms.saturating_sub(row.decision_ts_ms)) } else { None::<i64> },
+                        "trigger_to_fill_ms": if row.trigger_ts_ms > 0 { Some(fill_ts_ms.saturating_sub(row.trigger_ts_ms)) } else { None::<i64> },
                         "fill_price_cents": fill_price_cents,
+                        "actual_fill_price_cents": fill_price_cents,
                         "fill_quote_usdc": fill_quote_usdc,
                         "fill_size_shares": fill_size_shares,
                         "reported_fill_quote_usdc": fill_meta.reported_fill_quote_usdc,
@@ -1412,7 +1615,9 @@ pub(super) async fn reconcile_rust_reports(state: &ApiState, exec_cfg: &LiveExec
                         "size_guard_triggered": fill_meta.size_guard_triggered,
                         "expected_order_size_shares": row.order_size_shares,
                         "fill_fee_cents": fill_fee_cents,
+                        "actual_fee_cents": fill_fee_cents,
                         "fill_slippage_cents": fill_slippage_cents,
+                        "actual_slippage_cents": fill_slippage_cents,
                         "fill_cost_cents": fill_cost_cents,
                         "fill_pnl_cents_net": ps_after.last_fill_pnl_usdc * 100.0,
                         "position_realized_pnl_cents": ps_after.realized_pnl_usdc * 100.0
@@ -1493,7 +1698,9 @@ pub(super) async fn handle_pending_timeouts_rust(state: &ApiState, exec_cfg: &Li
             match ctx.client.order(&row.order_id).await {
                 Ok(order) if pm_is_terminal_fill(&order.status) => {
                     let _ = state.remove_pending_order(&row.order_id).await;
-                    let fill_event = fill_event_from_open_order(&order);
+                    let fill_ts_ms = Utc::now().timestamp_millis();
+                    let mut fill_event = build_terminal_fill_event(&ctx, &row, &order).await;
+                    merge_fill_time_metrics(&mut fill_event, fill_ts_ms, &row);
                     apply_pending_confirmation(
                         state,
                         &row,
@@ -1510,10 +1717,12 @@ pub(super) async fn handle_pending_timeouts_rust(state: &ApiState, exec_cfg: &Li
                                 "action": row.action,
                                 "side": row.side,
                                 "round_id": row.round_id,
+                                "intent_id": row.intent_id,
                                 "decision_id": row.decision_id,
                                 "decision_key": row.decision_key,
                                 "reason": "rust_terminal_timeout_reconciled_fill",
                                 "order_id": row.order_id,
+                                "fill_ts_ms": fill_ts_ms,
                                 "status": format!("{}", order.status)
                             }),
                         )
@@ -1590,7 +1799,9 @@ pub(super) async fn handle_pending_timeouts_rust(state: &ApiState, exec_cfg: &Li
             Ok(resp) => match ctx.client.order(&row.order_id).await {
                 Ok(order) if pm_is_terminal_fill(&order.status) => {
                     let _ = state.remove_pending_order(&row.order_id).await;
-                    let fill_event = fill_event_from_open_order(&order);
+                    let fill_ts_ms = Utc::now().timestamp_millis();
+                    let mut fill_event = build_terminal_fill_event(&ctx, &row, &order).await;
+                    merge_fill_time_metrics(&mut fill_event, fill_ts_ms, &row);
                     apply_pending_confirmation(
                         state,
                         &row,
@@ -1607,10 +1818,12 @@ pub(super) async fn handle_pending_timeouts_rust(state: &ApiState, exec_cfg: &Li
                                 "action": row.action,
                                 "side": row.side,
                                 "round_id": row.round_id,
+                                "intent_id": row.intent_id,
                                 "decision_id": row.decision_id,
                                 "decision_key": row.decision_key,
                                 "reason": "rust_cancel_post_reconcile_filled",
                                 "order_id": row.order_id,
+                                "fill_ts_ms": fill_ts_ms,
                                 "cancelled": resp.canceled,
                                 "not_cancelled": resp.not_canceled,
                                 "status": format!("{}", order.status)

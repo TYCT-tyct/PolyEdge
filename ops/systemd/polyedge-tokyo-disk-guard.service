@@ -8,4 +8,5 @@ User=root
 Environment=ROOT_USAGE_PCT=85
 Environment=JOURNAL_KEEP=200M
 Environment=REPO_DIR=/home/ubuntu/PolyEdge
+Environment=RELEASE_ROOT=/home/ubuntu/polyedge-releases
 ExecStart=/usr/bin/env bash /usr/local/bin/polyedge-tokyo-disk-guard.sh

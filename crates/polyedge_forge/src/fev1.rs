@@ -161,6 +161,7 @@ fn build_entry_decision(
         id.push_str(tag.trim());
     }
     json!({
+        "intent_id": id.clone(),
         "decision_id": id,
         "action": "enter",
         "side": side.as_str(),
@@ -796,6 +797,7 @@ impl SimulationCoreState {
                         ("FAK", "taker", 1_000_i64, 22.0_f64)
                     };
                 self.signal_decisions.push(json!({
+                    "intent_id": decision_id("exit", pos.side, &sample.round_id, sample.ts_ms),
                     "decision_id": decision_id("exit", pos.side, &sample.round_id, sample.ts_ms),
                     "action": "exit",
                     "side": pos.side.as_str(),
@@ -803,6 +805,10 @@ impl SimulationCoreState {
                     "ts_ms": sample.ts_ms,
                     "reason": final_reason,
                     "price_cents": bid_raw.clamp(1.0, 99.0),
+                    "paper_exit_exec_price_cents": exit_exec.clamp(1.0, 99.0),
+                    "paper_exit_fee_cents": exit_fee.max(0.0),
+                    "paper_exit_slippage_cents": cfg.slippage_cents_per_side.max(0.0),
+                    "paper_exit_impact_cents": exit_impact_cents.max(0.0),
                     "remaining_ms": sample.remaining_ms,
                     "tif": exit_tif,
                     "style": exit_style,

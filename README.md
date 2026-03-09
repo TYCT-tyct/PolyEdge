@@ -63,3 +63,15 @@ Runtime/live parameter presets are in:
 - `scripts/forge/live_execution_profiles.env`
 
 Use `COMMON` + one profile block (`SHADOW`, `CANARY`, or `FULL`) to keep rollout reproducible.
+
+## Deploy Forge
+
+Use the exact-commit deploy wrapper from Windows after pushing your release commit to GitHub:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\forge\deploy_forge_release.ps1 -Target both
+```
+
+Deployment details are documented in:
+
+- `scripts/forge/DEPLOY_FORGE_RELEASE.md`

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use core_types::{
     BookDelta, BookLevel, BookSide, BookSnapshot, BookTop, BookUpdate, DynStream, MarketFeed,
     OrderbookStateDigest, PolymarketBookWsFeed,
@@ -598,8 +598,8 @@ fn timeframe_to_ms(timeframe: &str) -> Option<i64> {
     }
 }
 
-fn target_market_cache()
--> &'static tokio::sync::RwLock<HashMap<String, HashMap<String, MarketState>>> {
+fn target_market_cache(
+) -> &'static tokio::sync::RwLock<HashMap<String, HashMap<String, MarketState>>> {
     static CACHE: OnceLock<tokio::sync::RwLock<HashMap<String, HashMap<String, MarketState>>>> =
         OnceLock::new();
     CACHE.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))

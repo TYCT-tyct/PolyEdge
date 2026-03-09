@@ -446,6 +446,237 @@ pub(super) async fn strategy_live_reset(
 }
 
 #[derive(Debug, Deserialize)]
+pub(super) struct StrategyLiveReconcileResolvedRequest {
+    market_type: Option<String>,
+    action: Option<String>,
+    note: Option<String>,
+    force: Option<bool>,
+}
+
+fn flattened_reconciled_position(
+    position: &LivePositionState,
+    now_ms: i64,
+    reason: &str,
+) -> LivePositionState {
+    let mut next = position.clone();
+    next.state = "flat".to_string();
+    next.side = None;
+    next.entry_round_id = None;
+    next.entry_market_id = None;
+    next.entry_token_id = None;
+    next.entry_ts_ms = None;
+    next.entry_price_cents = None;
+    next.entry_quote_usdc = None;
+    next.net_quote_usdc = 0.0;
+    next.vwap_entry_cents = None;
+    next.last_action = Some("reconcile_resolved".to_string());
+    next.last_reason = Some(reason.to_string());
+    next.open_add_layers = 0;
+    next.position_cost_usdc = 0.0;
+    next.position_size_shares = 0.0;
+    next.updated_ts_ms = now_ms;
+    next
+}
+
+pub(super) async fn strategy_live_reconcile_resolved(
+    State(state): State<ApiState>,
+    Json(body): Json<StrategyLiveReconcileResolvedRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let market_type = resolve_strategy_market_type(body.market_type.as_deref())?;
+    let runtime_cfg = LiveRuntimeConfig::from_env();
+    let runtime_symbol = runtime_cfg.symbol;
+    let action = body
+        .action
+        .as_deref()
+        .unwrap_or("status")
+        .trim()
+        .to_ascii_lowercase();
+    if action != "status" && action != "clear_local" {
+        return Err(ApiError::bad_request(
+            "invalid action (allowed: status|clear_local)",
+        ));
+    }
+    let force = body.force.unwrap_or(false);
+    let note = body
+        .note
+        .as_ref()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let now_ms = Utc::now().timestamp_millis();
+    let control = state
+        .get_live_runtime_control(&runtime_symbol, market_type)
+        .await;
+    let position = state
+        .get_live_position_state(&runtime_symbol, market_type)
+        .await;
+    let pending_orders = state
+        .list_pending_orders_for_market(&runtime_symbol, market_type)
+        .await;
+    let pending_count = pending_orders.len();
+
+    let mut gamma_detail = None;
+    let mut locked_target = None;
+    if position.position_size_shares > 0.0 {
+        locked_target = build_position_locked_target(market_type, &position);
+        if let Some(market_id) = position.entry_market_id.as_deref() {
+            gamma_detail = fetch_gamma_market_detail(market_id).await;
+        }
+    }
+
+    let resolution = analyze_resolved_position_outcome(gamma_detail.as_ref(), &position);
+    let wallet = live_runtime_wallet_address();
+    let masked_wallet = wallet.as_deref().map(mask_wallet_address);
+    let matched_positions = if let Some(wallet) = wallet.as_deref() {
+        match fetch_data_api_user_positions(wallet).await {
+            Ok(rows) => {
+                let filtered = rows
+                    .into_iter()
+                    .filter(|row| {
+                        let token_match = position
+                            .entry_token_id
+                            .as_deref()
+                            .map(|token| row.asset == token)
+                            .unwrap_or(false);
+                        let condition_match = gamma_detail
+                            .as_ref()
+                            .and_then(|detail| detail.condition_id.as_deref())
+                            .and_then(|condition| row.condition_id.as_deref().map(|v| v == condition))
+                            .unwrap_or(false);
+                        token_match || condition_match
+                    })
+                    .collect::<Vec<_>>();
+                (Some(filtered), None::<String>)
+            }
+            Err(err) => (None, Some(err)),
+        }
+    } else {
+        (None, Some("runtime wallet missing".to_string()))
+    };
+    let venue_check_available = matched_positions.0.is_some();
+    let can_clear_local = can_clear_resolved_position_local_state(
+        resolution.market_resolved || resolution.market_closed,
+        pending_count,
+        control.mode,
+        venue_check_available,
+        force,
+    );
+
+    let mut cleared_local = false;
+    if action == "clear_local" {
+        if position.position_size_shares <= 0.0 || position.side.is_none() {
+            return Err(ApiError::bad_request("no local open live position to reconcile"));
+        }
+        if matches!(control.mode, LiveRuntimeControlMode::Normal) {
+            return Err(ApiError::bad_request(
+                "live runtime must be paused before clear_local reconcile",
+            ));
+        }
+        if pending_count > 0 {
+            return Err(ApiError::bad_request(
+                "cannot clear_local while pending orders still exist",
+            ));
+        }
+        if !(resolution.market_resolved || resolution.market_closed) {
+            return Err(ApiError::bad_request(
+                "market is not resolved/closed; clear_local reconcile refused",
+            ));
+        }
+        if !can_clear_local {
+            return Err(ApiError::bad_request(
+                "venue claim check unavailable; retry later or use force=true to clear local state only",
+            ));
+        }
+        let next = flattened_reconciled_position(
+            &position,
+            now_ms,
+            "resolved_position_local_clear",
+        );
+        state
+            .put_live_position_state(&runtime_symbol, market_type, next.clone())
+            .await;
+        state
+            .append_live_event(
+                &runtime_symbol,
+                market_type,
+                json!({
+                    "event_type": "reconcile",
+                    "action": "reconcile_resolved",
+                    "accepted": true,
+                    "reason": "resolved_position_local_clear",
+                    "side": position.side.clone(),
+                    "detail": {
+                        "force": force,
+                        "pending_count": pending_count,
+                        "entry_market_id": position.entry_market_id.clone(),
+                        "entry_token_id": position.entry_token_id.clone(),
+                        "resolution": resolution.clone(),
+                        "note": note.clone()
+                    }
+                }),
+            )
+            .await;
+        persist_live_runtime_state(&state, &runtime_symbol, market_type).await;
+        cleared_local = true;
+    }
+
+    let local_position_after = state
+        .get_live_position_state(&runtime_symbol, market_type)
+        .await;
+    let matched_rows = matched_positions
+        .0
+        .clone()
+        .unwrap_or_default();
+    let locked_target_json = locked_target.as_ref().map(|target| {
+        json!({
+            "market_id": target.market_id,
+            "symbol": target.symbol,
+            "timeframe": target.timeframe,
+            "token_id_yes": target.token_id_yes,
+            "token_id_no": target.token_id_no,
+            "end_date": target.end_date
+        })
+    });
+    Ok(Json(json!({
+        "ok": true,
+        "symbol": runtime_symbol,
+        "market_type": market_type,
+        "action": action,
+        "force": force,
+        "control": control,
+        "pending_orders": pending_count,
+        "locked_target": locked_target_json,
+        "local_position_before": position,
+        "local_position_after": local_position_after,
+        "gamma_market": gamma_detail.as_ref().map(|detail| json!({
+            "market_id": detail.market_id,
+            "condition_id": detail.condition_id,
+            "slug": detail.slug,
+            "question": detail.question,
+            "active": detail.active,
+            "closed": detail.closed,
+            "enable_order_book": detail.enable_order_book,
+            "end_date": detail.end_date,
+            "uma_resolution_status": detail.uma_resolution_status,
+            "outcomes": detail.outcomes,
+            "outcome_prices": detail.outcome_prices,
+            "token_ids": detail.token_ids
+        })),
+        "resolution": resolution,
+        "venue_claim_check": {
+            "wallet_present": wallet.is_some(),
+            "wallet_masked": masked_wallet,
+            "positions_status": if venue_check_available { "ok" } else { "unavailable" },
+            "positions_error": matched_positions.1,
+            "matching_positions_count": matched_rows.len(),
+            "matching_positions": matched_rows
+        },
+        "can_clear_local": can_clear_local,
+        "cleared_local": cleared_local,
+        "note": note.clone()
+    })))
+}
+
+#[derive(Debug, Deserialize)]
 pub(super) struct StrategyLiveControlRequest {
     market_type: Option<String>,
     action: String,

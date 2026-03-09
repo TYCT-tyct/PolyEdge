@@ -20,8 +20,8 @@ fn floor_lot_size(size: f64) -> f64 {
 const USDC_MICRO_SCALE_F64: f64 = 1_000_000.0;
 
 pub(super) fn usdc_to_micros(value: f64) -> i64 {
-    let clamped = if value.is_finite() { value.max(0.0) } else { 0.0 };
-    (clamped * USDC_MICRO_SCALE_F64).round() as i64
+    let normalized = if value.is_finite() { value } else { 0.0 };
+    (normalized * USDC_MICRO_SCALE_F64).round() as i64
 }
 
 pub(super) fn micros_to_usdc(value: i64) -> f64 {
@@ -178,11 +178,39 @@ const LIVE_SIGNAL_ENTRY_FRESHNESS_MS_MAX: i64 = 60_000;
 const LIVE_SIGNAL_EXIT_FRESHNESS_MS_DEFAULT: i64 = 5_000;
 const LIVE_SIGNAL_EXIT_FRESHNESS_MS_MIN: i64 = 500;
 const LIVE_SIGNAL_EXIT_FRESHNESS_MS_MAX: i64 = 120_000;
+const LIVE_LOCKED_EXIT_MARKET_GRACE_MS_DEFAULT: i64 = 60_000;
+const LIVE_LOCKED_EXIT_MARKET_GRACE_MS_MIN: i64 = 0;
+const LIVE_LOCKED_EXIT_MARKET_GRACE_MS_MAX: i64 = 10 * 60_000;
+const LIVE_GAMMA_MARKET_DETAIL_CACHE_TTL_MS_DEFAULT: i64 = 3_000;
+const LIVE_GAMMA_MARKET_DETAIL_CACHE_TTL_MS_MIN: i64 = 250;
+const LIVE_GAMMA_MARKET_DETAIL_CACHE_TTL_MS_MAX: i64 = 60_000;
 
 #[derive(Debug, Clone)]
 struct CachedLiveMarketTarget {
     fetched_at_ms: i64,
     target: LiveMarketTarget,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct GammaMarketDetail {
+    pub(super) market_id: String,
+    pub(super) condition_id: Option<String>,
+    pub(super) active: bool,
+    pub(super) closed: bool,
+    pub(super) enable_order_book: bool,
+    pub(super) end_date: Option<String>,
+    pub(super) token_ids: Vec<String>,
+    pub(super) outcomes: Vec<String>,
+    pub(super) outcome_prices: Vec<f64>,
+    pub(super) uma_resolution_status: Option<String>,
+    pub(super) slug: Option<String>,
+    pub(super) question: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedGammaMarketDetail {
+    fetched_at_ms: i64,
+    detail: GammaMarketDetail,
 }
 
 fn live_market_target_cache(
@@ -449,6 +477,17 @@ pub(super) fn live_signal_exit_freshness_ms() -> i64 {
         )
 }
 
+fn live_locked_exit_market_grace_ms() -> i64 {
+    std::env::var("FORGE_FEV1_LOCKED_EXIT_MARKET_GRACE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(LIVE_LOCKED_EXIT_MARKET_GRACE_MS_DEFAULT)
+        .clamp(
+            LIVE_LOCKED_EXIT_MARKET_GRACE_MS_MIN,
+            LIVE_LOCKED_EXIT_MARKET_GRACE_MS_MAX,
+        )
+}
+
 fn live_fixed_entry_size_shares() -> Option<f64> {
     std::env::var("FORGE_FEV1_FIXED_ENTRY_SIZE_SHARES")
         .ok()
@@ -484,6 +523,25 @@ fn live_market_token_cache() -> &'static tokio::sync::RwLock<HashMap<String, (St
     CACHE.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
 }
 
+fn live_gamma_market_detail_cache(
+) -> &'static tokio::sync::RwLock<HashMap<String, CachedGammaMarketDetail>> {
+    static CACHE: std::sync::OnceLock<
+        tokio::sync::RwLock<HashMap<String, CachedGammaMarketDetail>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
+}
+
+fn live_gamma_market_detail_cache_ttl_ms() -> i64 {
+    std::env::var("FORGE_FEV1_GAMMA_MARKET_DETAIL_CACHE_TTL_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(LIVE_GAMMA_MARKET_DETAIL_CACHE_TTL_MS_DEFAULT)
+        .clamp(
+            LIVE_GAMMA_MARKET_DETAIL_CACHE_TTL_MS_MIN,
+            LIVE_GAMMA_MARKET_DETAIL_CACHE_TTL_MS_MAX,
+        )
+}
+
 fn live_gamma_market_url_base() -> String {
     std::env::var("FORGE_FEV1_GAMMA_MARKET_URL_BASE")
         .ok()
@@ -499,8 +557,30 @@ fn live_gamma_market_http_client() -> &'static reqwest::Client {
             .connect_timeout(Duration::from_millis(500))
             .timeout(Duration::from_millis(1_200))
             .pool_max_idle_per_host(4)
+            .user_agent("PolyEdge-Forge/0.1 (+resolved-reconcile)")
             .build()
             .expect("build gamma market http client")
+    })
+}
+
+fn live_polymarket_data_api_url_base() -> String {
+    std::env::var("FORGE_FEV1_DATA_API_URL_BASE")
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "https://data-api.polymarket.com".to_string())
+}
+
+fn live_polymarket_data_api_http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(800))
+            .timeout(Duration::from_millis(2_500))
+            .pool_max_idle_per_host(2)
+            .user_agent("Mozilla/5.0 PolyEdge-Forge/0.1")
+            .build()
+            .expect("build polymarket data api http client")
     })
 }
 
@@ -525,13 +605,249 @@ fn parse_token_array_field(v: &Value, key: &str) -> Vec<String> {
     Vec::new()
 }
 
-async fn resolve_token_ids_from_gamma_market_detail(
-    market_id: &str,
-) -> Option<(String, String)> {
+fn parse_f64_array_field(v: &Value, key: &str) -> Vec<f64> {
+    if let Some(arr) = v.get(key).and_then(Value::as_array) {
+        return arr
+            .iter()
+            .filter_map(parse_json_number_like)
+            .collect::<Vec<_>>();
+    }
+    if let Some(raw) = v.get(key).and_then(Value::as_str) {
+        if let Ok(arr) = serde_json::from_str::<Vec<Value>>(raw) {
+            return arr
+                .iter()
+                .filter_map(parse_json_number_like)
+                .collect::<Vec<_>>();
+        }
+        if let Ok(arr) = serde_json::from_str::<Vec<String>>(raw) {
+            return arr
+                .into_iter()
+                .filter_map(|s| s.trim().parse::<f64>().ok())
+                .collect::<Vec<_>>();
+        }
+    }
+    Vec::new()
+}
+
+fn parse_json_number_like(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn parse_json_bool_like(v: &Value) -> Option<bool> {
+    match v {
+        Value::Bool(v) => Some(*v),
+        Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => Some(true),
+            "false" | "0" | "no" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct DataApiUserPosition {
+    pub(super) asset: String,
+    pub(super) condition_id: Option<String>,
+    pub(super) size: Option<f64>,
+    pub(super) avg_price: Option<f64>,
+    pub(super) current_value: Option<f64>,
+    pub(super) cash_pnl: Option<f64>,
+    pub(super) realized_pnl: Option<f64>,
+    pub(super) cur_price: Option<f64>,
+    pub(super) redeemable: Option<bool>,
+    pub(super) mergeable: Option<bool>,
+    pub(super) title: Option<String>,
+    pub(super) slug: Option<String>,
+    pub(super) outcome: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub(super) struct ResolvedPositionOutcome {
+    pub(super) market_closed: bool,
+    pub(super) market_resolved: bool,
+    pub(super) local_token_result: String,
+    pub(super) local_outcome_label: Option<String>,
+    pub(super) winning_outcome_label: Option<String>,
+    pub(super) winning_token_id: Option<String>,
+    pub(super) local_expected_claim_value_usdc: Option<f64>,
+}
+
+fn parse_data_api_user_position(v: &Value) -> Option<DataApiUserPosition> {
+    let asset = v
+        .get("asset")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    Some(DataApiUserPosition {
+        asset,
+        condition_id: v
+            .get("conditionId")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        size: v.get("size").and_then(parse_json_number_like),
+        avg_price: v.get("avgPrice").and_then(parse_json_number_like),
+        current_value: v.get("currentValue").and_then(parse_json_number_like),
+        cash_pnl: v.get("cashPnl").and_then(parse_json_number_like),
+        realized_pnl: v.get("realizedPnl").and_then(parse_json_number_like),
+        cur_price: v.get("curPrice").and_then(parse_json_number_like),
+        redeemable: v.get("redeemable").and_then(parse_json_bool_like),
+        mergeable: v.get("mergeable").and_then(parse_json_bool_like),
+        title: v
+            .get("title")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        slug: v
+            .get("slug")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        outcome: v
+            .get("outcome")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+    })
+}
+
+pub(super) async fn fetch_data_api_user_positions(
+    user: &str,
+) -> Result<Vec<DataApiUserPosition>, String> {
+    let user = user.trim();
+    if user.is_empty() {
+        return Err("missing user wallet".to_string());
+    }
+    let base = live_polymarket_data_api_url_base();
+    let url = format!("{base}/positions");
+    let client = live_polymarket_data_api_http_client();
+    let resp = client
+        .get(url)
+        .query(&[("user", user), ("sizeThreshold", "0.0001")])
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("positions request failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("positions request failed: {}", status));
+    }
+    let payload = resp
+        .json::<Value>()
+        .await
+        .map_err(|e| format!("positions json parse failed: {e}"))?;
+    let arr = payload
+        .as_array()
+        .ok_or_else(|| "positions payload was not an array".to_string())?;
+    Ok(arr
+        .iter()
+        .filter_map(parse_data_api_user_position)
+        .collect::<Vec<_>>())
+}
+
+pub(super) fn analyze_resolved_position_outcome(
+    detail: Option<&GammaMarketDetail>,
+    position_state: &LivePositionState,
+) -> ResolvedPositionOutcome {
+    let mut market_resolved = false;
+    let mut market_closed = false;
+    let mut local_token_result = "unknown".to_string();
+    let mut local_outcome_label = None;
+    let mut winning_outcome_label = None;
+    let mut winning_token_id = None;
+    let mut local_expected_claim_value_usdc = None;
+
+    if let Some(detail) = detail {
+        market_closed = detail.closed;
+        market_resolved = detail
+            .uma_resolution_status
+            .as_deref()
+            .map(|s| s.eq_ignore_ascii_case("resolved"))
+            .unwrap_or(false);
+        let winning_index = detail.outcome_prices.iter().position(|price| *price >= 0.999);
+        if let Some(idx) = winning_index {
+            winning_outcome_label = detail.outcomes.get(idx).cloned();
+            winning_token_id = detail.token_ids.get(idx).cloned();
+        }
+        if let Some(local_token_id) = position_state.entry_token_id.as_deref() {
+            if let Some(local_idx) = detail
+                .token_ids
+                .iter()
+                .position(|token| token == local_token_id)
+            {
+                local_outcome_label = detail.outcomes.get(local_idx).cloned();
+                local_token_result = match winning_index {
+                    Some(win_idx) if win_idx == local_idx => {
+                        local_expected_claim_value_usdc =
+                            Some(position_state.position_size_shares.max(0.0));
+                        "winning".to_string()
+                    }
+                    Some(_) => "losing".to_string(),
+                    None if market_resolved => "resolved_unknown".to_string(),
+                    None => "unknown".to_string(),
+                };
+            }
+        }
+    }
+
+    ResolvedPositionOutcome {
+        market_closed,
+        market_resolved,
+        local_token_result,
+        local_outcome_label,
+        winning_outcome_label,
+        winning_token_id,
+        local_expected_claim_value_usdc,
+    }
+}
+
+pub(super) fn can_clear_resolved_position_local_state(
+    market_resolved: bool,
+    pending_count: usize,
+    control_mode: LiveRuntimeControlMode,
+    venue_check_available: bool,
+    force: bool,
+) -> bool {
+    if !market_resolved || pending_count > 0 {
+        return false;
+    }
+    if matches!(control_mode, LiveRuntimeControlMode::Normal) {
+        return false;
+    }
+    venue_check_available || force
+}
+
+pub(super) fn live_runtime_wallet_address() -> Option<String> {
+    std::env::var("FORGE_FEV1_FUNDER")
+        .ok()
+        .or_else(|| std::env::var("FORGE_FEV1_PROXY_WALLET").ok())
+        .or_else(|| std::env::var("FORGE_FEV1_ADDRESS").ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+pub(super) fn mask_wallet_address(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() <= 10 {
+        return trimmed.to_string();
+    }
+    format!("{}...{}", &trimmed[..6], &trimmed[trimmed.len() - 4..])
+}
+
+pub(super) async fn fetch_gamma_market_detail(market_id: &str) -> Option<GammaMarketDetail> {
+    let now_ms = Utc::now().timestamp_millis();
+    let ttl_ms = live_gamma_market_detail_cache_ttl_ms();
     {
-        let cache = live_market_token_cache().read().await;
-        if let Some(v) = cache.get(market_id) {
-            return Some(v.clone());
+        let cache = live_gamma_market_detail_cache().read().await;
+        if let Some(cached) = cache.get(market_id) {
+            if now_ms.saturating_sub(cached.fetched_at_ms) <= ttl_ms {
+                return Some(cached.detail.clone());
+            }
         }
     }
 
@@ -543,11 +859,72 @@ async fn resolve_token_ids_from_gamma_market_detail(
         return None;
     }
     let detail = resp.json::<Value>().await.ok()?;
-    let token_ids = parse_token_array_field(&detail, "clobTokenIds");
+    let parsed = GammaMarketDetail {
+        market_id: market_id.to_string(),
+        condition_id: detail
+            .get("conditionId")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        active: detail.get("active").and_then(Value::as_bool).unwrap_or(false),
+        closed: detail.get("closed").and_then(Value::as_bool).unwrap_or(false),
+        enable_order_book: detail
+            .get("enableOrderBook")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        end_date: detail
+            .get("endDate")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        token_ids: parse_token_array_field(&detail, "clobTokenIds"),
+        outcomes: parse_token_array_field(&detail, "outcomes"),
+        outcome_prices: parse_f64_array_field(&detail, "outcomePrices"),
+        uma_resolution_status: detail
+            .get("umaResolutionStatus")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        slug: detail
+            .get("slug")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        question: detail
+            .get("question")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+    };
+    {
+        let mut cache = live_gamma_market_detail_cache().write().await;
+        cache.insert(
+            market_id.to_string(),
+            CachedGammaMarketDetail {
+                fetched_at_ms: now_ms,
+                detail: parsed.clone(),
+            },
+        );
+    }
+    Some(parsed)
+}
+
+async fn resolve_token_ids_from_gamma_market_detail(
+    market_id: &str,
+) -> Option<(String, String)> {
+    {
+        let cache = live_market_token_cache().read().await;
+        if let Some(v) = cache.get(market_id) {
+            return Some(v.clone());
+        }
+    }
+
+    let detail = fetch_gamma_market_detail(market_id).await?;
+    let token_ids = detail.token_ids.clone();
     if token_ids.len() < 2 {
         return None;
     }
-    let outcomes = parse_token_array_field(&detail, "outcomes");
+    let outcomes = detail.outcomes.clone();
 
     let mut up_idx = None;
     let mut down_idx = None;

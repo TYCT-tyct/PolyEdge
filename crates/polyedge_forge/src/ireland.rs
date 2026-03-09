@@ -14,10 +14,10 @@ use reqwest::Client;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
-use crate::api::{ApiConfig, run_api_server};
+use crate::api::{run_api_server, ApiConfig};
 use crate::cli::{IrelandApiArgs, IrelandRecorderArgs};
 use crate::common::{parse_lower_csv, parse_timestamp_ms, parse_upper_csv, timeframe_to_ms};
-use crate::db_sink::{DbEvent, DbSinkConfig, normalize_opt_url, run_db_sink};
+use crate::db_sink::{normalize_opt_url, run_db_sink, DbEvent, DbSinkConfig};
 use crate::market_data_exchange::{
     market_in_sampling_window, market_pair_key, trim_candidate_pool,
 };

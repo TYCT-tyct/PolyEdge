@@ -200,6 +200,7 @@ pub(super) async fn apply_pending_confirmation(
                     "action": pending.action,
                     "side": pending.side,
                     "round_id": pending.round_id,
+                    "intent_id": pending.intent_id,
                     "decision_id": pending.decision_id,
                     "decision_key": pending.decision_key,
                     "reason": "fill_size_guard_force_pause",
@@ -397,6 +398,134 @@ fn build_effective_target_for_decision(
         effective.end_date = end_date_iso_from_ms(end_ms);
     }
     effective
+}
+
+#[derive(Debug, Clone)]
+struct LockedExitTargetGuard {
+    reason: &'static str,
+    detail: Value,
+}
+
+async fn validate_locked_exit_target_tradable(
+    target: &LiveMarketTarget,
+    position_state: &LivePositionState,
+) -> Result<(), LockedExitTargetGuard> {
+    if position_state.position_size_shares <= 0.0 {
+        return Ok(());
+    }
+    let market_id = target.market_id.trim();
+    let token_id = position_state
+        .entry_token_id
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let now_ms = Utc::now().timestamp_millis();
+    let grace_ms = live_locked_exit_market_grace_ms();
+
+    if market_id.is_empty() {
+        return Err(LockedExitTargetGuard {
+            reason: "locked_exit_market_missing",
+            detail: json!({
+                "reason": "locked_exit_market_missing",
+                "now_ms": now_ms,
+                "position_size_shares": position_state.position_size_shares
+            }),
+        });
+    }
+    if token_id.is_empty() {
+        return Err(LockedExitTargetGuard {
+            reason: "locked_exit_token_missing",
+            detail: json!({
+                "reason": "locked_exit_token_missing",
+                "market_id": market_id,
+                "now_ms": now_ms,
+                "position_size_shares": position_state.position_size_shares
+            }),
+        });
+    }
+
+    if let Some(end_ms) = parse_end_date_ms(target.end_date.as_deref()) {
+        if now_ms > end_ms.saturating_add(grace_ms) {
+            return Err(LockedExitTargetGuard {
+                reason: "locked_exit_market_expired",
+                detail: json!({
+                    "reason": "locked_exit_market_expired",
+                    "market_id": market_id,
+                    "target_end_date": target.end_date,
+                    "now_ms": now_ms,
+                    "grace_ms": grace_ms,
+                    "token_id": token_id
+                }),
+            });
+        }
+    }
+
+    let Some(detail) = fetch_gamma_market_detail(market_id).await else {
+        return Ok(());
+    };
+    if detail.closed {
+        return Err(LockedExitTargetGuard {
+            reason: "locked_exit_market_closed",
+            detail: json!({
+                "reason": "locked_exit_market_closed",
+                "market_id": market_id,
+                "gamma_market_id": detail.market_id,
+                "gamma_active": detail.active,
+                "gamma_closed": detail.closed,
+                "enable_order_book": detail.enable_order_book,
+                "target_end_date": target.end_date,
+                "gamma_end_date": detail.end_date,
+                "token_id": token_id
+            }),
+        });
+    }
+    if !detail.enable_order_book {
+        return Err(LockedExitTargetGuard {
+            reason: "locked_exit_orderbook_disabled",
+            detail: json!({
+                "reason": "locked_exit_orderbook_disabled",
+                "market_id": market_id,
+                "gamma_market_id": detail.market_id,
+                "gamma_active": detail.active,
+                "gamma_closed": detail.closed,
+                "enable_order_book": detail.enable_order_book,
+                "gamma_end_date": detail.end_date,
+                "token_id": token_id
+            }),
+        });
+    }
+    if !detail.token_ids.is_empty() && !detail.token_ids.iter().any(|id| id == &token_id) {
+        return Err(LockedExitTargetGuard {
+            reason: "locked_exit_token_mismatch",
+            detail: json!({
+                "reason": "locked_exit_token_mismatch",
+                "market_id": market_id,
+                "gamma_market_id": detail.market_id,
+                "token_id": token_id,
+                "gamma_token_ids": detail.token_ids,
+                "gamma_end_date": detail.end_date
+            }),
+        });
+    }
+    if let Some(end_ms) = parse_end_date_ms(detail.end_date.as_deref()) {
+        if now_ms > end_ms.saturating_add(grace_ms) {
+            return Err(LockedExitTargetGuard {
+                reason: "locked_exit_market_expired",
+                detail: json!({
+                    "reason": "locked_exit_market_expired",
+                    "market_id": market_id,
+                    "gamma_market_id": detail.market_id,
+                    "target_end_date": target.end_date,
+                    "gamma_end_date": detail.end_date,
+                    "now_ms": now_ms,
+                    "grace_ms": grace_ms,
+                    "token_id": token_id
+                }),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn should_bypass_round_match_for_locked_exit(

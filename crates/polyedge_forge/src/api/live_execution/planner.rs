@@ -1,5 +1,124 @@
 fn decision_signal_price_cents(decision: &Value) -> Option<f64> {
     decision
+        .get("signal_price_cents")
+        .and_then(Value::as_f64)
+        .or_else(|| decision.get("price_cents").and_then(Value::as_f64))
+        .filter(|v| v.is_finite() && *v > 0.0)
+}
+
+fn decision_action(decision: &Value) -> String {
+    decision
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn decision_paper_exec_anchor(decision: &Value) -> Option<(&'static str, f64)> {
+    let action = decision_action(decision);
+    let preferred_key = if matches!(action.as_str(), "exit" | "reduce") {
+        "paper_exit_exec_price_cents"
+    } else {
+        "paper_entry_exec_price_cents"
+    };
+    let fallback_key = if preferred_key == "paper_exit_exec_price_cents" {
+        "paper_entry_exec_price_cents"
+    } else {
+        "paper_exit_exec_price_cents"
+    };
+    decision
+        .get(preferred_key)
+        .and_then(Value::as_f64)
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| (preferred_key, v))
+        .or_else(|| {
+            decision
+                .get(fallback_key)
+                .and_then(Value::as_f64)
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .map(|v| (fallback_key, v))
+        })
+}
+
+fn decision_parity_anchor(decision: &Value) -> Option<(&'static str, f64)> {
+    decision_paper_exec_anchor(decision)
+        .or_else(|| decision_signal_price_cents(decision).map(|v| ("signal_price_cents", v)))
+}
+
+fn decision_intent_id(decision: &Value) -> Option<String> {
+    decision
+        .get("intent_id")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            decision
+                .get("decision_id")
+                .and_then(Value::as_str)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+}
+
+fn valid_positive_f64(v: Option<f64>) -> Option<f64> {
+    v.filter(|x| x.is_finite() && *x > 0.0)
+}
+
+fn event_fill_time_metrics(fill_ts_ms: i64, pending: &LivePendingOrder) -> Value {
+    let fill_ts_ms = fill_ts_ms.max(0);
+    let ack_to_fill_ms = if pending.ack_ts_ms > 0 {
+        Some(fill_ts_ms.saturating_sub(pending.ack_ts_ms))
+    } else {
+        None
+    };
+    let submit_to_fill_ms = if pending.submitted_ts_ms > 0 {
+        Some(fill_ts_ms.saturating_sub(pending.submitted_ts_ms))
+    } else {
+        None
+    };
+    let signal_to_fill_ms = if pending.decision_ts_ms > 0 {
+        Some(fill_ts_ms.saturating_sub(pending.decision_ts_ms))
+    } else {
+        None
+    };
+    let trigger_to_fill_ms = if pending.trigger_ts_ms > 0 {
+        Some(fill_ts_ms.saturating_sub(pending.trigger_ts_ms))
+    } else {
+        None
+    };
+    json!({
+        "fill_ts_ms": fill_ts_ms,
+        "ack_to_fill_ms": ack_to_fill_ms,
+        "submit_to_fill_ms": submit_to_fill_ms,
+        "signal_to_fill_ms": signal_to_fill_ms,
+        "trigger_to_fill_ms": trigger_to_fill_ms
+    })
+}
+
+pub(super) fn merge_fill_time_metrics(
+    node: &mut Value,
+    fill_ts_ms: i64,
+    pending: &LivePendingOrder,
+) {
+    if let Some(obj) = node.as_object_mut() {
+        if let Some(metrics) = event_fill_time_metrics(fill_ts_ms, pending).as_object() {
+            for (k, v) in metrics {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
+}
+
+fn latency_delta_cents(lhs: Option<f64>, rhs: Option<f64>) -> Option<f64> {
+    match (lhs, rhs) {
+        (Some(a), Some(b)) => Some(b - a),
+        _ => None,
+    }
+}
+
+fn decision_signal_price_cents_legacy(decision: &Value) -> Option<f64> {
+    decision
         .get("price_cents")
         .and_then(Value::as_f64)
         .filter(|v| v.is_finite() && *v > 0.0)
@@ -144,12 +263,15 @@ pub(super) fn try_decision_to_live_payload(
         }
     }
     let taker_like = style == "taker" || matches!(tif.as_str(), "FAK" | "FOK");
-    let signal_price_cents = decision_signal_price_cents(decision).unwrap_or(price * 100.0);
+    let (parity_anchor_source, parity_anchor_cents) =
+        decision_parity_anchor(decision).unwrap_or_else(|| ("submit_price_cents", price * 100.0));
+    let signal_price_cents = decision_signal_price_cents(decision)
+        .or_else(|| decision_signal_price_cents_legacy(decision));
     let submit_price_cents = (price * 100.0).clamp(0.0, 100.0);
     let tick_size = book.map(|b| b.tick_size).unwrap_or(0.01);
-    let parity_band_cents = allowed_price_band_cents(signal_price_cents, slippage_bps, tick_size);
+    let parity_band_cents = allowed_price_band_cents(parity_anchor_cents, slippage_bps, tick_size);
     let parity_delta_cents =
-        price_parity_delta_cents(signal_price_cents, submit_price_cents, is_buy);
+        price_parity_delta_cents(parity_anchor_cents, submit_price_cents, is_buy);
     if parity_delta_cents > parity_band_cents + 1e-9 {
         return Err("live_price_parity_band_exhausted".to_string());
     }
@@ -186,10 +308,13 @@ pub(super) fn try_decision_to_live_payload(
         "max_slippage_bps": slippage_bps,
         "execution_notes": notes,
         "cache_key": cache_key,
+        "intent_id": decision_intent_id(decision).unwrap_or_default(),
         "action": action,
         "signal_side": side,
         "price_parity": {
             "signal_price_cents": signal_price_cents,
+            "parity_anchor_price_cents": parity_anchor_cents,
+            "parity_anchor_source": parity_anchor_source,
             "submit_price_cents": submit_price_cents,
             "max_slippage_bps": slippage_bps,
             "tick_size": tick_size,
@@ -515,13 +640,17 @@ pub(super) fn build_execution_price_trace(
     final_request: &Value,
     response: Option<&Value>,
 ) -> Value {
-    let signal_price_cents = decision
-        .get("signal_price_cents")
-        .and_then(Value::as_f64)
-        .or_else(|| decision.get("price_cents").and_then(Value::as_f64));
-    let paper_exec_price_cents = decision
+    let signal_price_cents = decision_signal_price_cents(decision);
+    let paper_entry_exec_price_cents = decision
         .get("paper_entry_exec_price_cents")
         .and_then(Value::as_f64);
+    let paper_exit_exec_price_cents = decision
+        .get("paper_exit_exec_price_cents")
+        .and_then(Value::as_f64);
+    let (paper_exec_source, paper_exec_price_cents) =
+        decision_paper_exec_anchor(decision).unwrap_or(("paper_exec_price_cents", 0.0));
+    let (parity_anchor_source, parity_anchor_price_cents) =
+        decision_parity_anchor(decision).unwrap_or_else(|| ("submit_price_cents", 0.0));
     let book_price_cents = request
         .get("price_parity")
         .and_then(|v| v.get("submit_price_cents"))
@@ -538,25 +667,32 @@ pub(super) fn build_execution_price_trace(
         .and_then(|v| v.get("price").and_then(Value::as_f64))
         .map(|v| (v * 100.0).clamp(0.0, 100.0))
         .or(final_submit_price_cents);
-    let signal_vs_submit_cents = match (signal_price_cents, submit_price_cents) {
-        (Some(signal), Some(submit)) => Some(submit - signal),
-        _ => None,
-    };
-    let signal_vs_accepted_cents = match (signal_price_cents, accepted_price_cents) {
-        (Some(signal), Some(accepted)) => Some(accepted - signal),
-        _ => None,
-    };
-    let paper_exec_vs_submit_cents = match (paper_exec_price_cents, submit_price_cents) {
-        (Some(exec), Some(submit)) => Some(submit - exec),
-        _ => None,
-    };
-    let paper_exec_vs_accepted_cents = match (paper_exec_price_cents, accepted_price_cents) {
-        (Some(exec), Some(accepted)) => Some(accepted - exec),
-        _ => None,
-    };
+    let signal_vs_submit_cents = latency_delta_cents(signal_price_cents, submit_price_cents);
+    let signal_vs_accepted_cents = latency_delta_cents(signal_price_cents, accepted_price_cents);
+    let paper_exec_vs_submit_cents = latency_delta_cents(
+        valid_positive_f64(Some(paper_exec_price_cents)),
+        submit_price_cents,
+    );
+    let paper_exec_vs_accepted_cents = latency_delta_cents(
+        valid_positive_f64(Some(paper_exec_price_cents)),
+        accepted_price_cents,
+    );
+    let parity_anchor_vs_submit_cents = latency_delta_cents(
+        valid_positive_f64(Some(parity_anchor_price_cents)),
+        submit_price_cents,
+    );
+    let parity_anchor_vs_accepted_cents = latency_delta_cents(
+        valid_positive_f64(Some(parity_anchor_price_cents)),
+        accepted_price_cents,
+    );
     json!({
         "signal_price_cents": signal_price_cents,
-        "paper_entry_exec_price_cents": paper_exec_price_cents,
+        "paper_entry_exec_price_cents": paper_entry_exec_price_cents,
+        "paper_exit_exec_price_cents": paper_exit_exec_price_cents,
+        "paper_exec_price_cents": valid_positive_f64(Some(paper_exec_price_cents)),
+        "paper_exec_source": paper_exec_source,
+        "parity_anchor_price_cents": valid_positive_f64(Some(parity_anchor_price_cents)),
+        "parity_anchor_source": parity_anchor_source,
         "book_price_cents": book_price_cents,
         "submit_price_cents": submit_price_cents,
         "final_submit_price_cents": final_submit_price_cents,
@@ -564,6 +700,8 @@ pub(super) fn build_execution_price_trace(
         "fill_price_cents": Value::Null,
         "signal_vs_submit_cents": signal_vs_submit_cents,
         "signal_vs_accepted_cents": signal_vs_accepted_cents,
+        "parity_anchor_vs_submit_cents": parity_anchor_vs_submit_cents,
+        "parity_anchor_vs_accepted_cents": parity_anchor_vs_accepted_cents,
         "paper_exec_vs_submit_cents": paper_exec_vs_submit_cents,
         "paper_exec_vs_accepted_cents": paper_exec_vs_accepted_cents,
         "price_parity": request.get("price_parity").cloned().unwrap_or(Value::Null),
