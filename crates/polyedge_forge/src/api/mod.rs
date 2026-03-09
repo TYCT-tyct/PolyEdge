@@ -1733,7 +1733,7 @@ struct LiveRuntimeWakeEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct LiveExecutionAggState {
+pub(crate) struct LiveExecutionAggState {
     market_type: String,
     entry_slippage_mult: f64,
     exit_slippage_mult: f64,
@@ -1746,6 +1746,16 @@ struct LiveExecutionAggState {
     attempts_ema: f64,
     sample_count: u64,
     last_error: Option<String>,
+    #[serde(default)]
+    entry_liquidity_reject_round_id: Option<String>,
+    #[serde(default)]
+    entry_liquidity_reject_side: Option<String>,
+    #[serde(default)]
+    entry_liquidity_reject_count: u32,
+    #[serde(default)]
+    entry_liquidity_reject_first_ts_ms: i64,
+    #[serde(default)]
+    entry_liquidity_reject_last_ts_ms: i64,
     updated_ts_ms: i64,
 }
 
@@ -1762,7 +1772,40 @@ impl LiveExecutionAggState {
             attempts_ema: 0.0,
             sample_count: 0,
             last_error: None,
+            entry_liquidity_reject_round_id: None,
+            entry_liquidity_reject_side: None,
+            entry_liquidity_reject_count: 0,
+            entry_liquidity_reject_first_ts_ms: 0,
+            entry_liquidity_reject_last_ts_ms: 0,
             updated_ts_ms: Utc::now().timestamp_millis(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_liquidity_rejects(
+        market_type: &str,
+        round_id: &str,
+        side: &str,
+        reject_count: u32,
+        now_ms: i64,
+    ) -> Self {
+        Self {
+            market_type: market_type.to_string(),
+            entry_slippage_mult: 1.0,
+            exit_slippage_mult: 1.0,
+            reject_ema: 0.5,
+            submit_delta_ema_cents: 0.0,
+            accepted_delta_ema_cents: 0.0,
+            latency_ema_ms: 0.0,
+            attempts_ema: 1.0,
+            sample_count: reject_count as u64,
+            last_error: Some("no orders found to match with FAK order".to_string()),
+            entry_liquidity_reject_round_id: Some(round_id.to_string()),
+            entry_liquidity_reject_side: Some(side.to_ascii_uppercase()),
+            entry_liquidity_reject_count: reject_count,
+            entry_liquidity_reject_first_ts_ms: now_ms.saturating_sub(1_500),
+            entry_liquidity_reject_last_ts_ms: now_ms,
+            updated_ts_ms: now_ms,
         }
     }
 }
@@ -2228,7 +2271,7 @@ impl ApiState {
         });
     }
 
-    async fn get_live_execution_aggr_state(
+    pub(super) async fn get_live_execution_aggr_state(
         &self,
         symbol: &str,
         market_type: &str,
@@ -2239,6 +2282,18 @@ impl ApiState {
             .entry(scope_key)
             .or_insert_with(|| LiveExecutionAggState::new(market_type))
             .clone()
+    }
+
+    #[cfg(test)]
+    pub(super) async fn set_live_execution_aggr_state(
+        &self,
+        symbol: &str,
+        market_type: &str,
+        state: LiveExecutionAggState,
+    ) {
+        let mut store = self.live_execution_aggr_states.write().await;
+        let scope_key = runtime_scope_key(symbol, market_type);
+        store.insert(scope_key, state);
     }
 
     #[allow(dead_code)]
@@ -2291,6 +2346,16 @@ impl ApiState {
                 .unwrap_or_default()
                 .to_ascii_lowercase();
             let is_exit_like = is_live_exit_action(&action);
+            let round_id = row
+                .get("decision")
+                .and_then(|v| v.get("round_id"))
+                .and_then(Value::as_str)
+                .map(|v| v.to_string());
+            let side = row
+                .get("decision")
+                .and_then(|v| v.get("side"))
+                .and_then(Value::as_str)
+                .map(|v| v.to_ascii_uppercase());
             let accepted = row
                 .get("accepted")
                 .and_then(Value::as_bool)
@@ -2316,6 +2381,11 @@ impl ApiState {
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0)
                 .max(0.0);
+            let event_ts_ms = row
+                .get("ack_ts_ms")
+                .and_then(Value::as_i64)
+                .or_else(|| row.get("submitted_ts_ms").and_then(Value::as_i64))
+                .unwrap_or_else(|| Utc::now().timestamp_millis());
             let attempts = row
                 .get("attempts")
                 .and_then(Value::as_array)
@@ -2380,6 +2450,49 @@ impl ApiState {
             }
             if !accepted && !err.is_empty() {
                 st.last_error = Some(err);
+            }
+            if !is_exit_like {
+                let window_ms = live_entry_liquidity_reject_window_ms();
+                if !accepted
+                    && st
+                        .last_error
+                        .as_deref()
+                        .map(is_liquidity_reject_reason)
+                        .unwrap_or(false)
+                {
+                    let same_round = st
+                        .entry_liquidity_reject_round_id
+                        .as_deref()
+                        .zip(round_id.as_deref())
+                        .map(|(a, b)| a == b)
+                        .unwrap_or(false);
+                    let same_side = st
+                        .entry_liquidity_reject_side
+                        .as_deref()
+                        .zip(side.as_deref())
+                        .map(|(a, b)| a.eq_ignore_ascii_case(b))
+                        .unwrap_or(false);
+                    let within_window = st.entry_liquidity_reject_last_ts_ms > 0
+                        && event_ts_ms
+                            .saturating_sub(st.entry_liquidity_reject_last_ts_ms)
+                            <= window_ms;
+                    if same_round && same_side && within_window {
+                        st.entry_liquidity_reject_count =
+                            st.entry_liquidity_reject_count.saturating_add(1);
+                    } else {
+                        st.entry_liquidity_reject_round_id = round_id.clone();
+                        st.entry_liquidity_reject_side = side.clone();
+                        st.entry_liquidity_reject_count = 1;
+                        st.entry_liquidity_reject_first_ts_ms = event_ts_ms;
+                    }
+                    st.entry_liquidity_reject_last_ts_ms = event_ts_ms;
+                } else if accepted {
+                    st.entry_liquidity_reject_round_id = None;
+                    st.entry_liquidity_reject_side = None;
+                    st.entry_liquidity_reject_count = 0;
+                    st.entry_liquidity_reject_first_ts_ms = 0;
+                    st.entry_liquidity_reject_last_ts_ms = 0;
+                }
             }
         }
         st.updated_ts_ms = Utc::now().timestamp_millis();

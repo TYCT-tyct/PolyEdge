@@ -175,6 +175,12 @@ const LIVE_ALLOW_ADDS_DEFAULT: bool = true;
 const LIVE_SIGNAL_ENTRY_FRESHNESS_MS_DEFAULT: i64 = 2_000;
 const LIVE_SIGNAL_ENTRY_FRESHNESS_MS_MIN: i64 = 200;
 const LIVE_SIGNAL_ENTRY_FRESHNESS_MS_MAX: i64 = 60_000;
+const LIVE_ENTRY_LIQUIDITY_REJECT_WINDOW_MS_DEFAULT: i64 = 5_000;
+const LIVE_ENTRY_LIQUIDITY_REJECT_WINDOW_MS_MIN: i64 = 500;
+const LIVE_ENTRY_LIQUIDITY_REJECT_WINDOW_MS_MAX: i64 = 60_000;
+const LIVE_ENTRY_LIQUIDITY_REJECT_LIMIT_DEFAULT: u32 = 4;
+const LIVE_ENTRY_LIQUIDITY_REJECT_LIMIT_MIN: u32 = 1;
+const LIVE_ENTRY_LIQUIDITY_REJECT_LIMIT_MAX: u32 = 100;
 const LIVE_SIGNAL_EXIT_FRESHNESS_MS_DEFAULT: i64 = 5_000;
 const LIVE_SIGNAL_EXIT_FRESHNESS_MS_MIN: i64 = 500;
 const LIVE_SIGNAL_EXIT_FRESHNESS_MS_MAX: i64 = 120_000;
@@ -463,6 +469,28 @@ pub(super) fn live_signal_entry_freshness_ms() -> i64 {
         .clamp(
             LIVE_SIGNAL_ENTRY_FRESHNESS_MS_MIN,
             LIVE_SIGNAL_ENTRY_FRESHNESS_MS_MAX,
+        )
+}
+
+pub(super) fn live_entry_liquidity_reject_window_ms() -> i64 {
+    std::env::var("FORGE_FEV1_LIVE_ENTRY_LIQUIDITY_REJECT_WINDOW_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(LIVE_ENTRY_LIQUIDITY_REJECT_WINDOW_MS_DEFAULT)
+        .clamp(
+            LIVE_ENTRY_LIQUIDITY_REJECT_WINDOW_MS_MIN,
+            LIVE_ENTRY_LIQUIDITY_REJECT_WINDOW_MS_MAX,
+        )
+}
+
+pub(super) fn live_entry_liquidity_reject_limit() -> u32 {
+    std::env::var("FORGE_FEV1_LIVE_ENTRY_LIQUIDITY_REJECT_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(LIVE_ENTRY_LIQUIDITY_REJECT_LIMIT_DEFAULT)
+        .clamp(
+            LIVE_ENTRY_LIQUIDITY_REJECT_LIMIT_MIN,
+            LIVE_ENTRY_LIQUIDITY_REJECT_LIMIT_MAX,
         )
 }
 

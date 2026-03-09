@@ -798,6 +798,48 @@ async fn apply_pending_confirmation_exit_realizes_pnl() {
 }
 
 #[tokio::test]
+async fn gate_live_decisions_blocks_entry_after_liquidity_reject_limit() {
+    let state = test_api_state();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    state
+        .set_live_execution_aggr_state(
+            "SOLUSDT",
+            "5m",
+            crate::api::LiveExecutionAggState::for_test_liquidity_rejects(
+                "5m",
+                "SOLUSDT_5m_1",
+                "DOWN",
+                4,
+                now_ms,
+            ),
+        )
+        .await;
+    let decision = json!({
+        "action": "enter",
+        "side": "DOWN",
+        "round_id": "SOLUSDT_5m_1",
+        "ts_ms": now_ms,
+        "decision_id": "intent-1"
+    });
+    let (accepted, skipped, _) = gate_live_decisions(
+        &state,
+        "SOLUSDT",
+        "5m",
+        &[decision],
+        true,
+    )
+    .await;
+    assert!(accepted.is_empty());
+    assert_eq!(
+        skipped
+            .first()
+            .and_then(|v| v.get("reason"))
+            .and_then(Value::as_str),
+        Some("entry_liquidity_reject_limit_reached")
+    );
+}
+
+#[tokio::test]
 async fn locked_exit_target_expired_is_rejected_before_submit() {
     let target = LiveMarketTarget {
         market_id: "1529923".to_string(),

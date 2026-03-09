@@ -419,6 +419,45 @@ pub(super) async fn gate_live_decisions(
             }));
             continue;
         }
+        if matches!(action.as_str(), "enter" | "add") {
+            let aggr = state
+                .get_live_execution_aggr_state(symbol, market_type)
+                .await;
+            let reject_limit = live_entry_liquidity_reject_limit();
+            let reject_window_ms = live_entry_liquidity_reject_window_ms();
+            let decision_round_id = normalized
+                .get("round_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let same_round = aggr
+                .entry_liquidity_reject_round_id
+                .as_deref()
+                .map(|v| v == decision_round_id)
+                .unwrap_or(false);
+            let same_side = aggr
+                .entry_liquidity_reject_side
+                .as_deref()
+                .map(|v| v.eq_ignore_ascii_case(&side))
+                .unwrap_or(false);
+            let within_window = aggr.entry_liquidity_reject_last_ts_ms > 0
+                && now_ms
+                    .saturating_sub(aggr.entry_liquidity_reject_last_ts_ms)
+                    <= reject_window_ms;
+            if same_round
+                && same_side
+                && within_window
+                && aggr.entry_liquidity_reject_count >= reject_limit
+            {
+                skipped.push(json!({
+                    "reason": "entry_liquidity_reject_limit_reached",
+                    "entry_liquidity_reject_count": aggr.entry_liquidity_reject_count,
+                    "entry_liquidity_reject_limit": reject_limit,
+                    "entry_liquidity_reject_window_ms": reject_window_ms,
+                    "decision": normalized
+                }));
+                continue;
+            }
+        }
         if mark_attempts
             && matches!(action.as_str(), "enter" | "add")
             && require_fixed_entry_size
