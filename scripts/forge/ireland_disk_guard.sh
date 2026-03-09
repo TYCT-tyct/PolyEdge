@@ -84,6 +84,15 @@ prune_cargo_cache() {
 prune_misc() {
   log "vacuum journal to $JOURNAL_KEEP"
   journalctl --vacuum-size="$JOURNAL_KEEP" >/dev/null 2>&1 || true
+  if [[ -d /var/log/clickhouse-server ]]; then
+    log "truncate active clickhouse logs"
+    truncate -s 0 /var/log/clickhouse-server/clickhouse-server.log 2>/dev/null || true
+    truncate -s 0 /var/log/clickhouse-server/clickhouse-server.err.log 2>/dev/null || true
+    log "prune old clickhouse archived logs"
+    find /var/log/clickhouse-server -type f -name '*.gz' -mtime +2 -delete || true
+  fi
+  log "prune stale clickhouse backups"
+  find /var/lib -maxdepth 1 -type d -name 'clickhouse.bak.*' -mtime +3 -exec rm -rf {} + || true
   log "apt clean"
   apt-get clean >/dev/null 2>&1 || true
   rm -rf /var/tmp/* /tmp/* 2>/dev/null || true
