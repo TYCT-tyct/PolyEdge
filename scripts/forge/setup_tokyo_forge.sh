@@ -19,6 +19,7 @@ cd "$REPO_DIR"
 
 sudo systemctl stop polyedge-feeder.service polyedge-data-backend-tokyo.service 2>/dev/null || true
 sudo systemctl disable polyedge-feeder.service polyedge-data-backend-tokyo.service 2>/dev/null || true
+sudo rm -rf /etc/systemd/system/polyedge-forge-tokyo.service.d
 
 sudo tee /etc/systemd/system/polyedge-forge-tokyo.service >/dev/null <<UNIT
 [Unit]

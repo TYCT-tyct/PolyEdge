@@ -201,16 +201,40 @@ function Invoke-RemoteScript {
         [string]$ScriptBody
     )
 
-    $sshArgs = @(
-        "-i", $KeyPath,
-        "-o", "BatchMode=yes",
-        "-o", "StrictHostKeyChecking=accept-new",
-        "$User@$RemoteHost",
-        "bash -s"
-    )
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = "ssh"
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.UseShellExecute = $false
+    $null = $startInfo.ArgumentList.Add("-i")
+    $null = $startInfo.ArgumentList.Add($KeyPath)
+    $null = $startInfo.ArgumentList.Add("-o")
+    $null = $startInfo.ArgumentList.Add("BatchMode=yes")
+    $null = $startInfo.ArgumentList.Add("-o")
+    $null = $startInfo.ArgumentList.Add("StrictHostKeyChecking=accept-new")
+    $null = $startInfo.ArgumentList.Add("$User@$RemoteHost")
+    $null = $startInfo.ArgumentList.Add("bash -s")
 
-    $ScriptBody | & ssh @sshArgs
-    if ($LASTEXITCODE -ne 0) {
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $null = $process.Start()
+
+    $process.StandardInput.Write($ScriptBody)
+    $process.StandardInput.Close()
+
+    $stdout = $process.StandardOutput.ReadToEnd()
+    $stderr = $process.StandardError.ReadToEnd()
+    $process.WaitForExit()
+
+    if ($stdout) {
+        [Console]::Out.Write($stdout)
+    }
+    if ($stderr) {
+        [Console]::Error.Write($stderr)
+    }
+
+    if ($process.ExitCode -ne 0) {
         throw "Remote deploy failed on $RemoteHost."
     }
 }
