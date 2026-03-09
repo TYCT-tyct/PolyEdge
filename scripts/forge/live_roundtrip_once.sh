@@ -9,11 +9,29 @@ ENTRY_TIMEOUT_SEC="${ENTRY_TIMEOUT_SEC:-420}"
 EXIT_TIMEOUT_SEC="${EXIT_TIMEOUT_SEC:-420}"
 POLL_SEC="${POLL_SEC:-2}"
 PROFILE_OVERRIDE="${PROFILE_OVERRIDE:-}"
+BACKUP_FILE="${BACKUP_FILE:-/tmp/polyedge-live-roundtrip-env-backup.txt}"
+RESTORE_SERVICE_ON_EXIT=0
+
+remember_env() {
+  local key="$1"
+  local file="$2"
+  if [[ -f "$BACKUP_FILE" ]] && grep -q "^${key}|" "$BACKUP_FILE" 2>/dev/null; then
+    return 0
+  fi
+  if grep -q "^${key}=" "$file" 2>/dev/null; then
+    local value
+    value="$(grep "^${key}=" "$file" | head -n1 | cut -d= -f2-)"
+    printf '%s|set|%s\n' "$key" "$value" >>"$BACKUP_FILE"
+  else
+    printf '%s|unset|\n' "$key" >>"$BACKUP_FILE"
+  fi
+}
 
 upsert_env() {
   local key="$1"
   local value="$2"
   local file="$3"
+  remember_env "$key" "$file"
   if grep -q "^${key}=" "$file" 2>/dev/null; then
     sed -i "s#^${key}=.*#${key}=${value}#g" "$file"
   else
@@ -21,10 +39,38 @@ upsert_env() {
   fi
 }
 
+remove_env() {
+  local key="$1"
+  local file="$2"
+  remember_env "$key" "$file"
+  if grep -q "^${key}=" "$file" 2>/dev/null; then
+    sed -i "/^${key}=/d" "$file"
+  fi
+}
+
+restore_env() {
+  local file="$1"
+  [[ -f "$BACKUP_FILE" ]] || return 0
+  tac "$BACKUP_FILE" | while IFS='|' read -r key mode value; do
+    sed -i "/^${key}=/d" "$file"
+    if [[ "$mode" == "set" ]]; then
+      printf '%s=%s\n' "$key" "$value" >>"$file"
+    fi
+  done
+}
+
 restart_api() {
   sudo systemctl restart "$SERVICE_NAME"
   sleep 2
 }
+
+cleanup() {
+  restore_env "$ENV_FILE"
+  if [[ "$RESTORE_SERVICE_ON_EXIT" -eq 1 ]]; then
+    restart_api || true
+  fi
+}
+trap cleanup EXIT
 
 fetch_position_field() {
   local field="$1"
@@ -38,6 +84,7 @@ fetch_position_field() {
 }
 
 echo "[roundtrip] ensure live mode enabled (profile is not overridden by default)"
+rm -f "$BACKUP_FILE"
 if [[ -n "$PROFILE_OVERRIDE" ]]; then
   echo "[roundtrip] override profile -> $PROFILE_OVERRIDE"
   upsert_env "FORGE_STRATEGY_BASE_PROFILE" "$PROFILE_OVERRIDE" "$ENV_FILE"
@@ -49,10 +96,13 @@ upsert_env "FORGE_FEV1_LIVE_ENABLED" "true" "$ENV_FILE"
 upsert_env "FORGE_FEV1_LIVE_EXECUTE" "true" "$ENV_FILE"
 upsert_env "FORGE_FEV1_RUNTIME_DRAIN_ONLY" "false" "$ENV_FILE"
 upsert_env "FORGE_FEV1_RUNTIME_MAX_ORDERS" "1" "$ENV_FILE"
+remove_env "FORGE_FEV1_LIVE_MAX_COMPLETED_TRADES" "$ENV_FILE"
+remove_env "FORGE_FEV1_LIVE_MAX_COMPLETED_TRADES_BY_SCOPE" "$ENV_FILE"
 upsert_env "FORGE_FEV1_RUNTIME_MARKETS" "5m" "$ENV_FILE"
 upsert_env "FORGE_FEV1_MIN_QUOTE_USDC" "0.01" "$ENV_FILE"
 upsert_env "FORGE_FEV1_RUNTIME_QUOTE_USDC" "0.01" "$ENV_FILE"
 upsert_env "FORGE_FEV1_LIVE_QUOTE_FROM_PRICE" "true" "$ENV_FILE"
+RESTORE_SERVICE_ON_EXIT=1
 restart_api
 
 echo "[roundtrip] wait for entry..."
