@@ -104,6 +104,19 @@ struct ChartCacheEntry {
     payload: Value,
 }
 
+/// Classification of entry attempt outcomes for kill-switch tracking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryAttemptReason {
+    /// Successfully built and submitted payload
+    Success,
+    /// Price exceeded parity band - systematic execution quality issue (triggers halt)
+    ParityExhausted,
+    /// No orders found / one-sided book - market microstructure (doesn't trigger halt)
+    LiquidityEmpty,
+    /// Infrastructure failure: timeout, 5xx, network error (doesn't trigger halt)
+    InfraError,
+}
+
 /// Three-layer automated kill switch for a trading scope.
 /// Layer 1: Risk (daily loss / drawdown limits)
 /// Layer 2: Execution quality (parity_band_exhaustion rate)
@@ -128,6 +141,12 @@ struct LiveKillSwitchState {
     entry_attempt_count: u32,
     /// Layer 2: timestamp window start for execution quality
     exec_quality_window_start_ms: i64,
+    /// Layer 2: separate tracking for liquidity-empty failures (no orders found, book empty)
+    /// These are market microstructure issues, NOT system failures - don't trigger halt
+    liquidity_empty_count: u32,
+    /// Layer 2: separate tracking for infrastructure failures (timeout, 5xx, network)
+    /// These are transient issues - don't trigger halt
+    infra_error_count: u32,
     /// Layer 3: rolling trade outcomes (true=win, false=loss) - last 50 trades
     rolling_outcomes: VecDeque<bool>,
 }
@@ -144,6 +163,8 @@ impl LiveKillSwitchState {
             parity_exhausted_count: 0,
             entry_attempt_count: 0,
             exec_quality_window_start_ms: now_ms,
+            liquidity_empty_count: 0,
+            infra_error_count: 0,
             rolling_outcomes: VecDeque::with_capacity(50),
         }
     }
@@ -202,16 +223,49 @@ impl LiveKillSwitchState {
         self.parity_exhausted_count as f64 / self.entry_attempt_count as f64
     }
 
-    fn record_entry_attempt(&mut self, now_ms: i64, parity_exhausted: bool) {
+    /// Rate of liquidity-empty failures (market microstructure issues - doesn't trigger halt)
+    fn liquidity_empty_rate(&self) -> f64 {
+        if self.entry_attempt_count == 0 {
+            return 0.0;
+        }
+        self.liquidity_empty_count as f64 / self.entry_attempt_count as f64
+    }
+
+    /// Rate of infrastructure failures (transient - doesn't trigger halt)
+    fn infra_error_rate(&self) -> f64 {
+        if self.entry_attempt_count == 0 {
+            return 0.0;
+        }
+        self.infra_error_count as f64 / self.entry_attempt_count as f64
+    }
+
+    /// Record an entry attempt with specific failure classification.
+    /// - parity_exhausted: price exceeded parity band (systematic execution quality issue)
+    /// - liquidity_empty: no orders found / one-sided book (market microstructure)
+    /// - infra_error: timeout / 5xx / network (transient infrastructure)
+    fn record_entry_attempt(&mut self, now_ms: i64, reason: EntryAttemptReason) {
         // Reset window after 10 minutes
         if now_ms - self.exec_quality_window_start_ms > 600_000 {
             self.parity_exhausted_count = 0;
+            self.liquidity_empty_count = 0;
+            self.infra_error_count = 0;
             self.entry_attempt_count = 0;
             self.exec_quality_window_start_ms = now_ms;
         }
         self.entry_attempt_count = self.entry_attempt_count.saturating_add(1);
-        if parity_exhausted {
-            self.parity_exhausted_count = self.parity_exhausted_count.saturating_add(1);
+        match reason {
+            EntryAttemptReason::ParityExhausted => {
+                self.parity_exhausted_count = self.parity_exhausted_count.saturating_add(1);
+            }
+            EntryAttemptReason::LiquidityEmpty => {
+                self.liquidity_empty_count = self.liquidity_empty_count.saturating_add(1);
+            }
+            EntryAttemptReason::InfraError => {
+                self.infra_error_count = self.infra_error_count.saturating_add(1);
+            }
+            EntryAttemptReason::Success => {
+                // No counter increment - success is implicit in the rate calculation
+            }
         }
     }
 
@@ -242,7 +296,7 @@ fn ks_parity_exhaustion_rate_limit() -> f64 {
     std::env::var("FORGE_KS_PARITY_EXHAUSTION_RATE")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
-        .unwrap_or(0.40)
+        .unwrap_or(0.55)  // Increased from 0.40 - now only counts true parity failures
         .clamp(0.1, 0.95)
 }
 
@@ -266,7 +320,7 @@ fn ks_halt_resume_ms() -> i64 {
     std::env::var("FORGE_KS_HALT_RESUME_MS")
         .ok()
         .and_then(|v| v.trim().parse::<i64>().ok())
-        .unwrap_or(4 * 3_600_000)
+        .unwrap_or(10 * 60_000)  // 10 minutes - reduced from 4 hours (now halts are more precise)
         .clamp(60_000, 24 * 3_600_000)
 }
 
@@ -2523,34 +2577,78 @@ impl ApiState {
         store.get(&key).and_then(|s| s.halt_reason.clone())
     }
 
-    pub(super) async fn ks_record_entry_attempt(
+    /// Classify an error reason into EntryAttemptReason.
+    fn classify_entry_failure(reason: &str) -> EntryAttemptReason {
+        let r = reason.trim().to_ascii_lowercase();
+        // Parity exhaustion - price exceeded band
+        if r.contains("parity_band_exhausted") {
+            return EntryAttemptReason::ParityExhausted;
+        }
+        // Infrastructure errors
+        if r.contains("timeout") || r.contains("5") || r.contains("network")
+            || r.contains("connection") || r.contains("503") || r.contains("502") {
+            return EntryAttemptReason::InfraError;
+        }
+        // Liquidity empty - market microstructure issues (not a system failure)
+        if r.contains("no orders found") || r.contains("one_sided_book")
+            || r.contains("liquidity_empty") || r.contains("insufficient_book_depth")
+            || r.contains("no top1") || r.contains("liquidity no top1") {
+            return EntryAttemptReason::LiquidityEmpty;
+        }
+        // Unknown - treat as liquidity empty for safety (don't trigger halt)
+        EntryAttemptReason::LiquidityEmpty
+    }
+
+    /// Record entry attempt from an error string. Automatically classifies the failure type.
+    pub(super) async fn ks_record_entry_attempt_from_error(
         &self,
         symbol: &str,
         market_type: &str,
-        parity_exhausted: bool,
+        error_reason: Option<&str>,
     ) {
+        let reason = error_reason
+            .map(Self::classify_entry_failure)
+            .unwrap_or(EntryAttemptReason::Success);
+        
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut store = self.live_kill_switch.write().await;
         let key = runtime_scope_key(symbol, market_type);
         let ks = store
             .entry(key)
             .or_insert_with(|| LiveKillSwitchState::new(now_ms));
-        ks.record_entry_attempt(now_ms, parity_exhausted);
-        // Check Layer 2: execution quality
-        let rate = ks.parity_exhaustion_rate();
-        let limit = ks_parity_exhaustion_rate_limit();
-        if !ks.is_halted(now_ms) && ks.entry_attempt_count >= 10 && rate > limit {
-            let resume_ms = now_ms + ks_halt_resume_ms();
-            ks.halt(
-                now_ms,
-                &format!(
-                    "layer2_parity_exhaustion_rate:{:.1}%_over_limit:{:.1}%",
-                    rate * 100.0,
-                    limit * 100.0
-                ),
-                Some(resume_ms),
-            );
+        ks.record_entry_attempt(now_ms, reason);
+        
+        // Only parity exhaustion triggers Layer 2 halt - not liquidity_empty or infra_error
+        if reason == EntryAttemptReason::ParityExhausted {
+            // Check Layer 2: execution quality (only for parity failures)
+            let rate = ks.parity_exhaustion_rate();
+            let limit = ks_parity_exhaustion_rate_limit();
+            let min_samples = 12;  // Increased from 10 for more stable rate
+            if !ks.is_halted(now_ms) && ks.entry_attempt_count >= min_samples && rate > limit {
+                let resume_ms = now_ms + ks_halt_resume_ms();
+                ks.halt(
+                    now_ms,
+                    &format!(
+                        "layer2_parity_exhaustion_rate:{:.1}%_over_limit:{:.1}%_samples:{}",
+                        rate * 100.0,
+                        limit * 100.0,
+                        ks.entry_attempt_count
+                    ),
+                    Some(resume_ms),
+                );
+            }
         }
+    }
+
+    /// Record successful entry attempt.
+    pub(super) async fn ks_record_entry_success(&self, symbol: &str, market_type: &str) {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut store = self.live_kill_switch.write().await;
+        let key = runtime_scope_key(symbol, market_type);
+        let ks = store
+            .entry(key)
+            .or_insert_with(|| LiveKillSwitchState::new(now_ms));
+        ks.record_entry_attempt(now_ms, EntryAttemptReason::Success);
     }
 
     pub(super) async fn ks_record_trade_outcome(

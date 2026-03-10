@@ -50,6 +50,10 @@ pub(super) struct GatewayBookSnapshot {
     best_ask_size: Option<f64>,
     bid_depth_top3: Option<f64>,
     ask_depth_top3: Option<f64>,
+    /// Number of bid levels in the order book (for one-sided book detection)
+    bid_levels: Option<usize>,
+    /// Number of ask levels in the order book (for one-sided book detection)
+    ask_levels: Option<usize>,
 }
 
 include!("live_execution/config.rs");

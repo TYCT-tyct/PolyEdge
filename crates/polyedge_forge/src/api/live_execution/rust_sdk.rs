@@ -614,6 +614,8 @@ pub(super) async fn fetch_rust_book_snapshot(
         best_ask_size,
         bid_depth_top3,
         ask_depth_top3,
+        bid_levels: Some(book.bids.len()),
+        ask_levels: Some(book.asks.len()),
     })
 }
 
@@ -1240,29 +1242,85 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
             .unwrap_or_else(|| gated.decision_key.clone());
         let token_id = token_id_for_decision(&prepared.decision, &prepared.effective_target)
             .map(str::to_string);
-        let book_snapshot = if let Some(token_id) = token_id.clone() {
-            get_or_fetch_book_snapshot_cached(state, &ctx, &token_id, &mut book_cache).await
+        
+        // =========================================================================
+        // P2: Entry uses forced fresh book (not cached) to avoid stale liquidity data
+        // Exit continues using cached book for speed
+        // =========================================================================
+        let is_entry_action = !is_exit_like_action(&action);
+        let book_snapshot = if let Some(ref tid) = token_id {
+            if is_entry_action {
+                // Entry: force fresh book fetch, don't use cache
+                fetch_rust_book_snapshot(&ctx, tid).await
+            } else {
+                // Exit: use cached book for speed
+                get_or_fetch_book_snapshot_cached(state, &ctx, tid, &mut book_cache).await
+            }
         } else {
             None
         };
-        let payload = match try_decision_to_live_payload(
+        
+        let remaining_ms = prepared.decision.get("remaining_ms").and_then(Value::as_i64);
+        
+        // First payload build attempt
+        let mut payload_result = try_decision_to_live_payload(
             &prepared.decision,
             &prepared.effective_target,
             exec_cfg,
             book_snapshot.as_ref(),
             None,
-        ) {
-            Ok(payload) => payload,
+        );
+        
+        // =========================================================================
+        // P2 Retry: On liquidity_empty failure, retry once with fresh book after 80ms
+        // Only retry if: (1) failure is liquidity-related, (2) remaining >= 20s
+        // =========================================================================
+        if is_entry_action && payload_result.is_err() {
+            let first_error = payload_result.as_ref().err()
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            let is_liquidity_error = first_error.contains("liquidity_empty") 
+                || first_error.contains("one_sided_book")
+                || first_error.contains("no orders found");
+            
+            // Check remaining_ms for retry eligibility (don't retry in final 15s)
+            let can_retry = remaining_ms
+                .map(|rm| rm >= 15_000)
+                .unwrap_or(false);
+            
+            if is_liquidity_error && can_retry {
+                // Wait 80ms then fetch fresh book for retry
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                
+                let retry_book = if let Some(ref tid) = token_id {
+                    fetch_rust_book_snapshot(&ctx, tid).await
+                } else {
+                    None
+                };
+                
+                // Retry with fresh book
+                payload_result = try_decision_to_live_payload(
+                    &prepared.decision,
+                    &prepared.effective_target,
+                    exec_cfg,
+                    retry_book.as_ref(),
+                    None,
+                );
+            }
+        }
+        
+        let payload = match payload_result {
+            Ok(p) => p,
             Err(reason) => {
-                // Track parity-band exhaustion for kill-switch Layer 2
-                let is_parity_exhaust = reason.contains("parity_band_exhausted");
+                // Track failure type for kill-switch Layer 2
+                // Only parity_band_exhausted triggers halt - no_orders_found is market microstructure
                 let is_entry = !is_exit_like_action(&action);
                 if is_entry {
                     state
-                        .ks_record_entry_attempt(
+                        .ks_record_entry_attempt_from_error(
                             &position_state.symbol,
                             &position_state.market_type,
-                            is_parity_exhaust,
+                            Some(&reason),
                         )
                         .await;
                 }
@@ -1277,13 +1335,12 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                 continue;
             }
         };
-        // Track successful payload build as entry attempt (not exhausted)
+        // Track successful payload build as entry attempt
         if !is_exit_like_action(&action) {
             state
-                .ks_record_entry_attempt(
+                .ks_record_entry_success(
                     &position_state.symbol,
                     &position_state.market_type,
-                    false,
                 )
                 .await;
         }

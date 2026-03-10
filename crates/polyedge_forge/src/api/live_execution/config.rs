@@ -490,6 +490,48 @@ pub(super) fn live_entry_liquidity_reject_limit() -> u32 {
         )
 }
 
+// =========================================================================
+// P3: Dual parity band config
+// Normal: 1.1c (default) - standard parity protection
+// Aggressive: 1.6c - for high confidence signals (score >= 0.8) or near round close (remaining <= 120s)
+// =========================================================================
+const LIVE_ENTRY_PARITY_BAND_NORMAL_CENTS_DEFAULT: f64 = 1.1;
+const LIVE_ENTRY_PARITY_BAND_AGGRESSIVE_CENTS_DEFAULT: f64 = 1.6;
+const LIVE_ENTRY_PARITY_BAND_AGGRESSIVE_REMAINING_MS: i64 = 120_000;
+const LIVE_ENTRY_PARITY_BAND_AGGRESSIVE_SCORE: f64 = 0.80;
+
+pub(super) fn live_entry_parity_band_normal_cents() -> f64 {
+    std::env::var("FORGE_FEV1_LIVE_ENTRY_PARITY_BAND_NORMAL_CENTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(LIVE_ENTRY_PARITY_BAND_NORMAL_CENTS_DEFAULT)
+        .clamp(0.5, 5.0)
+}
+
+pub(super) fn live_entry_parity_band_aggressive_cents() -> f64 {
+    std::env::var("FORGE_FEV1_LIVE_ENTRY_PARITY_BAND_AGGRESSIVE_CENTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(LIVE_ENTRY_PARITY_BAND_AGGRESSIVE_CENTS_DEFAULT)
+        .clamp(0.5, 5.0)
+}
+
+pub(super) fn live_entry_parity_band_aggressive_remaining_ms() -> i64 {
+    std::env::var("FORGE_FEV1_LIVE_ENTRY_PARITY_BAND_AGGRESSIVE_REMAINING_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(LIVE_ENTRY_PARITY_BAND_AGGRESSIVE_REMAINING_MS)
+        .clamp(30_000, 300_000)
+}
+
+pub(super) fn live_entry_parity_band_aggressive_score() -> f64 {
+    std::env::var("FORGE_FEV1_LIVE_ENTRY_PARITY_BAND_AGGRESSIVE_SCORE")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(LIVE_ENTRY_PARITY_BAND_AGGRESSIVE_SCORE)
+        .clamp(0.5, 0.99)
+}
+
 pub(super) fn live_signal_exit_freshness_ms() -> i64 {
     std::env::var("FORGE_FEV1_LIVE_SIGNAL_EXIT_FRESHNESS_MS")
         .ok()

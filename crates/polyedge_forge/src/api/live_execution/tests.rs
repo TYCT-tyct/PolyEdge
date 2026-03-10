@@ -29,6 +29,8 @@ fn test_book(min_order_size: f64) -> GatewayBookSnapshot {
         best_ask_size: Some(100.0),
         bid_depth_top3: Some(300.0),
         ask_depth_top3: Some(300.0),
+        bid_levels: Some(3),
+        ask_levels: Some(3),
     }
 }
 
@@ -311,6 +313,8 @@ fn price_parity_band_blocks_entry_when_fresh_price_exceeds_paper_band() {
         best_ask_size: Some(100.0),
         bid_depth_top3: Some(300.0),
         ask_depth_top3: Some(300.0),
+        bid_levels: Some(3),
+        ask_levels: Some(3),
     };
     let err = try_decision_to_live_payload(
         &decision,
@@ -344,6 +348,8 @@ fn price_parity_anchors_to_paper_exec_when_available() {
         best_ask_size: Some(100.0),
         bid_depth_top3: Some(300.0),
         ask_depth_top3: Some(300.0),
+        bid_levels: Some(3),
+        ask_levels: Some(3),
     };
     let payload = try_decision_to_live_payload(
         &decision,
@@ -391,6 +397,8 @@ fn exit_price_parity_anchors_to_paper_exit_exec_when_available() {
         best_ask_size: Some(100.0),
         bid_depth_top3: Some(300.0),
         ask_depth_top3: Some(300.0),
+        bid_levels: Some(3),
+        ask_levels: Some(3),
     };
     let payload = try_decision_to_live_payload(
         &decision,

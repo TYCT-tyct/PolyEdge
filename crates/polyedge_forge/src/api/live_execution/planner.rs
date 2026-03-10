@@ -124,11 +124,35 @@ fn decision_signal_price_cents_legacy(decision: &Value) -> Option<f64> {
         .filter(|v| v.is_finite() && *v > 0.0)
 }
 
-fn allowed_price_band_cents(signal_price_cents: f64, slippage_bps: f64, tick_size: f64) -> f64 {
-    let signal = signal_price_cents.max(0.0);
-    let bps_band = signal * slippage_bps.max(0.0) / 10_000.0;
-    let tick_band = (tick_size.max(0.0001) * 100.0).max(0.01);
-    (bps_band + tick_band).max(tick_band)
+fn allowed_price_band_cents(
+    signal_price_cents: f64,
+    slippage_bps: f64,
+    tick_size: f64,
+    remaining_ms: Option<i64>,
+    score: Option<f64>,
+) -> f64 {
+    let normal_band = {
+        let signal = signal_price_cents.max(0.0);
+        let bps_band = signal * slippage_bps.max(0.0) / 10_000.0;
+        let tick_band = (tick_size.max(0.0001) * 100.0).max(0.01);
+        (bps_band + tick_band).max(tick_band)
+    };
+
+    // Check if we should use aggressive band
+    let use_aggressive = remaining_ms
+        .map(|rm| rm <= live_entry_parity_band_aggressive_remaining_ms())
+        .unwrap_or(false)
+        || score
+            .map(|s| s >= live_entry_parity_band_aggressive_score())
+            .unwrap_or(false);
+
+    if use_aggressive {
+        // Use aggressive band (wider) for high confidence / near close
+        let aggressive = live_entry_parity_band_aggressive_cents();
+        return aggressive.max(normal_band); // Never use less than normal
+    }
+
+    normal_band
 }
 
 fn price_parity_delta_cents(signal_price_cents: f64, submit_price_cents: f64, is_buy: bool) -> f64 {
@@ -157,6 +181,24 @@ pub(super) fn try_decision_to_live_payload(
         .unwrap_or_default()
         .to_ascii_uppercase();
     let is_exit_like = action == "exit" || action == "reduce";
+
+    // =========================================================================
+    // P1: Close window hard gate - reject entry in final 10 seconds
+    // Rationale: Maker liquidity withdraws ~10s before round close to avoid
+    // settlement arbitrage. Reduced from 12s to 10s to capture more opportunity.
+    // =========================================================================
+    const ENTRY_CLOSE_WINDOW_MS: i64 = 10_000;
+    if !is_exit_like {
+        if let Some(remaining_ms) = decision.get("remaining_ms").and_then(Value::as_i64) {
+            if remaining_ms < ENTRY_CLOSE_WINDOW_MS {
+                return Err(format!(
+                    "entry_close_window_guard:remaining_ms:{}_limit:{}",
+                    remaining_ms, ENTRY_CLOSE_WINDOW_MS
+                ));
+            }
+        }
+    }
+
     let (gateway_side, token_id, mut slippage_bps) = match (action.as_str(), side.as_str()) {
         ("enter", "UP") | ("add", "UP") => (
             "buy_yes",
@@ -269,11 +311,51 @@ pub(super) fn try_decision_to_live_payload(
         .or_else(|| decision_signal_price_cents_legacy(decision));
     let submit_price_cents = (price * 100.0).clamp(0.0, 100.0);
     let tick_size = book.map(|b| b.tick_size).unwrap_or(0.01);
-    let parity_band_cents = allowed_price_band_cents(parity_anchor_cents, slippage_bps, tick_size);
+
+    // Get remaining_ms and score for aggressive parity band determination
+    let remaining_ms = decision.get("remaining_ms").and_then(Value::as_i64);
+    let score = decision.get("score").and_then(Value::as_f64);
+
+    let parity_band_cents = allowed_price_band_cents(
+        parity_anchor_cents,
+        slippage_bps,
+        tick_size,
+        remaining_ms,
+        score,
+    );
     let parity_delta_cents =
         price_parity_delta_cents(parity_anchor_cents, submit_price_cents, is_buy);
     if parity_delta_cents > parity_band_cents + 1e-9 {
         return Err("live_price_parity_band_exhausted".to_string());
+    }
+    // =========================================================================
+    // P2: Empty book pre-check (entry only)
+    // Check for market microstructure issues before submitting FAK:
+    // - Opponent side must have at least 1 level with non-zero size
+    // - Both sides must have at least 1 level (no one-sided book)
+    // These are "liquidity_empty" failures - market structure issues, not system failures
+    // =========================================================================
+    if !is_exit_like {
+        if let Some(book) = book {
+            // Check opponent side top1 exists
+            let opp_top1_size = if is_buy {
+                book.ask_depth_top3.and_then(|d| Some(d > 0.0))
+            } else {
+                book.bid_depth_top3.and_then(|d| Some(d > 0.0))
+            };
+            if opp_top1_size == Some(false) {
+                return Err("liquidity_empty_no_top1".to_string());
+            }
+            // Check both sides have levels (one-sided book = market closed/auction)
+            if let (Some(bid_levels), Some(ask_levels)) = (book.bid_levels, book.ask_levels) {
+                if bid_levels == 0 || ask_levels == 0 {
+                    return Err(format!(
+                        "one_sided_book:bids:{}_asks:{}",
+                        bid_levels, ask_levels
+                    ));
+                }
+            }
+        }
     }
     // --- Book depth pre-check (entry only) ---
     // Warn if available depth is less than 50% of our order size.
@@ -296,31 +378,10 @@ pub(super) fn try_decision_to_live_payload(
             }
         }
     }
-    // --- Pre-trade edge gate (entry only) ---
-    // Only enter when model edge clearly exceeds estimated execution cost.
-    // edge_prob from signal: how much p_fair_up exceeds current p_up
-    // fee at 50c is ~1.56¢/share; at other prices it's less.
-    // We require edge_prob > spread_cost + estimated_fee_rate to avoid negative-EV trades.
-    if !is_exit_like {
-        if let Some(edge_prob) = decision
-            .get("edge_prob")
-            .and_then(Value::as_f64)
-            .filter(|v| v.is_finite())
-        {
-            // Convert edge_prob (probability space) to cents at current price
-            // edge_cents ≈ edge_prob * 100 (since probability → cents is linear at mid)
-            let edge_cents = edge_prob.abs() * 100.0;
-            // Estimate one-way cost: fee (official formula gives ~1.56¢ at 50¢) + half-spread
-            let half_spread_cents = tick_size * 100.0 * 0.5;
-            let est_fee_cents =
-                submit_price_cents * (1.0 - submit_price_cents / 100.0).powi(2) * 0.25;
-            let min_edge_cents = half_spread_cents + est_fee_cents;
-            if edge_cents < min_edge_cents * 0.5 {
-                // Edge is less than half of estimated cost - very poor EV, skip
-                return Err("entry_edge_below_cost_floor".to_string());
-            }
-        }
-    }
+    // =========================================================================
+    // NOTE: Edge gate (profitability check) was removed per user constraint
+    // "Live 不做 profitability gate，不做第二套策略"
+    // =========================================================================
     let floor_notional_usdc = quantize_usdc_micros((size * price).max(0.0));
     let requested_notional_usdc =
         ceil_quote_amount_usdc(quantize_usdc_micros(quote_size.max(floor_notional_usdc)));
