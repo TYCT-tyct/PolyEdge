@@ -21,24 +21,24 @@ usage_pct() {
   df -P / | awk 'NR==2 {gsub("%","",$5); print $5+0}'
 }
 
-active_release_short() {
+active_release_prefix() {
   local env_line commit
   env_line="$(systemctl show polyedge-forge-ireland-api.service -p Environment --value 2>/dev/null || true)"
   commit="$(printf '%s\n' "$env_line" | tr ' ' '\n' | sed -n 's/^POLYEDGE_RELEASE_COMMIT=//p' | head -n1)"
   if [[ -n "$commit" ]]; then
-    printf '%s' "${commit:0:7}"
+    printf '%s-' "${commit:0:7}"
   fi
 }
 
 prune_release_root() {
   local root="$1"
-  local keep="$2"
+  local keep_prefix="$2"
   [[ -d "$root" ]] || return
   while IFS= read -r dir; do
     [[ -d "$dir" ]] || continue
     local base
     base="$(basename "$dir")"
-    if [[ -n "$keep" && "$base" == "$keep" ]]; then
+    if [[ -n "$keep_prefix" && "$base" == "$keep_prefix"* ]]; then
       log "trim active release source tree: $dir"
       rm -rf "$dir/src"
       continue
@@ -101,7 +101,7 @@ prune_misc() {
 main() {
   local before after active
   before="$(usage_pct)"
-  active="$(active_release_short)"
+  active="$(active_release_prefix)"
   log "root usage before=${before}% threshold=${ROOT_USAGE_PCT}% active_release=${active:-none}"
 
   if (( before < ROOT_USAGE_PCT )); then
