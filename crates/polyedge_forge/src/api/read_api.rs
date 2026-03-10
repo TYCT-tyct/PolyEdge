@@ -1,4 +1,57 @@
 use super::*;
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+pub(super) struct HistoryQueryParams {
+    lookback_minutes: Option<u32>,
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ChartQueryParams {
+    market_type: String,
+    minutes: Option<u32>,
+    max_points: Option<u32>,
+    symbol: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct CollectorMetricsQueryParams {
+    symbol: Option<String>,
+    window_sec: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct RoundQueryParams {
+    market_type: String,
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct AvailableRoundsQueryParams {
+    market_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct RoundChartQueryParams {
+    round_id: String,
+    market_type: Option<String>,
+    max_points: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct HeatmapQueryParams {
+    market_type: String,
+    lookback_hours: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct AccuracyQueryParams {
+    market_type: String,
+    window: Option<u32>,
+    lookback_hours: Option<u32>,
+    limit: Option<u32>,
+}
 
 pub(super) async fn root_redirect() -> Redirect {
     Redirect::temporary("/dashboard/")
