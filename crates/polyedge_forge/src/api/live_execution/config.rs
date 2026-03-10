@@ -145,11 +145,8 @@ const LIVE_ENTRY_MAKER_MAX_WAIT_MS_MAX: i64 = 3_000;
 const LIVE_ENTRY_FAK_TTL_MS_DEFAULT: i64 = 650;
 const LIVE_ENTRY_FAK_TTL_MS_MIN: i64 = 400;
 const LIVE_ENTRY_FAK_TTL_MS_MAX: i64 = 2_000;
-#[cfg(test)]
 const LIVE_ENTRY_FAK_SLIPPAGE_BOOST_BPS_DEFAULT: f64 = 16.0;
-#[cfg(test)]
 const LIVE_ENTRY_FAK_SLIPPAGE_BOOST_BPS_MIN: f64 = 0.0;
-#[cfg(test)]
 const LIVE_ENTRY_FAK_SLIPPAGE_BOOST_BPS_MAX: f64 = 120.0;
 const LIVE_CANCEL_FAILURE_FORCE_PAUSE_EXIT_THRESHOLD: u8 = 2;
 const LIVE_CANCEL_FAILURE_FORCE_PAUSE_OTHER_THRESHOLD: u8 = 3;
@@ -323,7 +320,6 @@ fn live_entry_fak_ttl_ms() -> i64 {
         .clamp(LIVE_ENTRY_FAK_TTL_MS_MIN, LIVE_ENTRY_FAK_TTL_MS_MAX)
 }
 
-#[cfg(test)]
 fn live_entry_fak_slippage_boost_bps() -> f64 {
     std::env::var("FORGE_FEV1_ENTRY_FAK_SLIPPAGE_BOOST_BPS")
         .ok()

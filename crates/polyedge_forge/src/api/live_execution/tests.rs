@@ -59,6 +59,7 @@ fn test_api_state() -> ApiState {
         strategy_live_source_slots: Arc::new(Semaphore::new(4)),
         runtime_event_samples: Arc::new(RwLock::new(HashMap::new())),
         gateway_http_client: Arc::new(gateway_http_client),
+        live_kill_switch: Arc::new(RwLock::new(HashMap::new())),
     }
 }
 

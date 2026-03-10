@@ -1254,6 +1254,18 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
         ) {
             Ok(payload) => payload,
             Err(reason) => {
+                // Track parity-band exhaustion for kill-switch Layer 2
+                let is_parity_exhaust = reason.contains("parity_band_exhausted");
+                let is_entry = !is_exit_like_action(&action);
+                if is_entry {
+                    state
+                        .ks_record_entry_attempt(
+                            &position_state.symbol,
+                            &position_state.market_type,
+                            is_parity_exhaust,
+                        )
+                        .await;
+                }
                 out.push(json!({
                     "ok": false,
                     "accepted": false,
@@ -1265,6 +1277,16 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                 continue;
             }
         };
+        // Track successful payload build as entry attempt (not exhausted)
+        if !is_exit_like_action(&action) {
+            state
+                .ks_record_entry_attempt(
+                    &position_state.symbol,
+                    &position_state.market_type,
+                    false,
+                )
+                .await;
+        }
         let attempt_payload = payload.clone();
         let mut attempts = Vec::<Value>::with_capacity(2);
         let mut accepted = false;
@@ -1497,6 +1519,123 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_ascii_lowercase();
+            // --- Entry liquidity retry ---
+            // If entry was rejected due to liquidity (not auth/balance/invalid),
+            // attempt one retry with boosted slippage and fresh book price.
+            if !is_exit_like_action(&action_lc) && can_retry_on_liquidity(reject_text) {
+                if let Some(retry_payload) = build_retry_payload(&payload, reject_text, 0) {
+                    // Fetch a fresh book snapshot for the retry price
+                    let retry_book = if let Some(tid) = token_id.clone() {
+                        get_or_fetch_book_snapshot_cached(state, &ctx, &tid, &mut book_cache).await
+                    } else {
+                        None
+                    };
+                    // Rebuild payload with fresh book price if available
+                    let final_retry_payload = if let Some(ref fresh_book) = retry_book {
+                        let fresh_price = if is_buy_action(&action_lc) {
+                            fresh_book.best_ask
+                        } else {
+                            fresh_book.best_bid
+                        };
+                        if let Some(px) = fresh_price.filter(|v| v.is_finite() && *v > 0.0) {
+                            let tick = fresh_book.tick_size.max(0.0001);
+                            let is_buy = is_buy_action(&action_lc);
+                            let snapped = round_to_tick(px.clamp(0.01, 0.99), tick, is_buy);
+                            let mut rp = retry_payload.clone();
+                            if let Some(obj) = rp.as_object_mut() {
+                                obj.insert("price".to_string(), json!(snapped));
+                                obj.insert("retry_fresh_book".to_string(), json!(true));
+                            }
+                            rp
+                        } else {
+                            retry_payload
+                        }
+                    } else {
+                        retry_payload
+                    };
+                    let retry_started_ts_ms = Utc::now().timestamp_millis();
+                    let retry_started = Instant::now();
+                    // Short pause to avoid hammering the exchange
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    match submit_rust_order(&ctx, &final_retry_payload).await {
+                        Ok(retry_resp) => {
+                            let retry_completed_ts_ms = Utc::now().timestamp_millis();
+                            let retry_accept = retry_resp
+                                .get("accepted")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false);
+                            let retry_reject = if retry_accept {
+                                String::new()
+                            } else {
+                                extract_rust_reject_reason(&retry_resp, None)
+                            };
+                            state
+                                .append_live_event(
+                                    &position_state.symbol,
+                                    &position_state.market_type,
+                                    json!({
+                                        "accepted": retry_accept,
+                                        "action": action_lc,
+                                        "side": prepared.decision.get("side").and_then(Value::as_str).unwrap_or("unknown"),
+                                        "round_id": prepared.decision.get("round_id").and_then(Value::as_str),
+                                        "decision_id": decision_id,
+                                        "decision_key": gated.decision_key,
+                                        "reason": if retry_accept { "entry_liquidity_retry_accepted" } else { "entry_liquidity_retry_rejected" },
+                                        "original_reject": reject_text,
+                                        "retry_reject": if retry_reject.is_empty() { Value::Null } else { json!(retry_reject) },
+                                        "retry_latency_ms": retry_started.elapsed().as_millis() as u64,
+                                        "retry_started_ts_ms": retry_started_ts_ms,
+                                        "retry_completed_ts_ms": retry_completed_ts_ms,
+                                        "retry_price": final_retry_payload.get("price"),
+                                        "retry_slippage_bps": final_retry_payload.get("max_slippage_bps"),
+                                        "fresh_book_used": retry_book.is_some(),
+                                    }),
+                                )
+                                .await;
+                            if retry_accept {
+                                if let Some(retry_order_id) = retry_resp
+                                    .get("order_id")
+                                    .or_else(|| retry_resp.get("id"))
+                                    .and_then(Value::as_str)
+                                    .map(|v| v.trim().to_string())
+                                    .filter(|v| !v.is_empty())
+                                {
+                                    let pending = build_pending_from_accepted_submission(
+                                        &position_state.symbol,
+                                        &position_state.market_type,
+                                        &gated.decision_key,
+                                        &decision_id,
+                                        &prepared.decision,
+                                        &prepared.effective_target,
+                                        &final_retry_payload,
+                                        Some(&retry_resp),
+                                        &retry_order_id,
+                                        retry_started_ts_ms,
+                                        retry_completed_ts_ms,
+                                    );
+                                    state.upsert_pending_order(pending).await;
+                                }
+                            }
+                        }
+                        Err(retry_err) => {
+                            state
+                                .append_live_event(
+                                    &position_state.symbol,
+                                    &position_state.market_type,
+                                    json!({
+                                        "accepted": false,
+                                        "action": action_lc,
+                                        "decision_id": decision_id,
+                                        "decision_key": gated.decision_key,
+                                        "reason": "entry_liquidity_retry_error",
+                                        "error": retry_err,
+                                    }),
+                                )
+                                .await;
+                        }
+                    }
+                }
+            }
             if is_exit_like_action(&action_lc) && is_locked_market_missing_submit_error(reject_text)
             {
                 force_pause_for_locked_market_submit_error(

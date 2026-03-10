@@ -275,6 +275,52 @@ pub(super) fn try_decision_to_live_payload(
     if parity_delta_cents > parity_band_cents + 1e-9 {
         return Err("live_price_parity_band_exhausted".to_string());
     }
+    // --- Book depth pre-check (entry only) ---
+    // Warn if available depth is less than 50% of our order size.
+    // For exits we skip this guard - we always need to exit regardless of depth.
+    if !is_exit_like {
+        if let Some(book) = book {
+            let depth_side = if is_buy {
+                book.ask_depth_top3
+            } else {
+                book.bid_depth_top3
+            };
+            if let Some(depth) = depth_side {
+                if depth > 0.0 && size > 0.0 && depth < size * 0.5 {
+                    notes.push(format!("thin_book_depth:{:.3}vs{:.3}", depth, size));
+                    // Hard reject if depth is catastrophically thin (< 10% of order)
+                    if depth < size * 0.1 {
+                        return Err("insufficient_book_depth".to_string());
+                    }
+                }
+            }
+        }
+    }
+    // --- Pre-trade edge gate (entry only) ---
+    // Only enter when model edge clearly exceeds estimated execution cost.
+    // edge_prob from signal: how much p_fair_up exceeds current p_up
+    // fee at 50c is ~1.56¢/share; at other prices it's less.
+    // We require edge_prob > spread_cost + estimated_fee_rate to avoid negative-EV trades.
+    if !is_exit_like {
+        if let Some(edge_prob) = decision
+            .get("edge_prob")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite())
+        {
+            // Convert edge_prob (probability space) to cents at current price
+            // edge_cents ≈ edge_prob * 100 (since probability → cents is linear at mid)
+            let edge_cents = edge_prob.abs() * 100.0;
+            // Estimate one-way cost: fee (official formula gives ~1.56¢ at 50¢) + half-spread
+            let half_spread_cents = tick_size * 100.0 * 0.5;
+            let est_fee_cents =
+                submit_price_cents * (1.0 - submit_price_cents / 100.0).powi(2) * 0.25;
+            let min_edge_cents = half_spread_cents + est_fee_cents;
+            if edge_cents < min_edge_cents * 0.5 {
+                // Edge is less than half of estimated cost - very poor EV, skip
+                return Err("entry_edge_below_cost_floor".to_string());
+            }
+        }
+    }
     let floor_notional_usdc = quantize_usdc_micros((size * price).max(0.0));
     let requested_notional_usdc =
         ceil_quote_amount_usdc(quantize_usdc_micros(quote_size.max(floor_notional_usdc)));
@@ -322,6 +368,21 @@ pub(super) fn try_decision_to_live_payload(
             "parity_delta_cents": parity_delta_cents,
             "within_band": true
         },
+        "edge_gate": {
+            "edge_prob": decision.get("edge_prob").and_then(Value::as_f64),
+            "submit_price_cents": submit_price_cents,
+            "is_entry": !is_exit_like
+        },
+        "depth_meta": if let Some(book) = book {
+            let depth_side = if is_buy { book.ask_depth_top3 } else { book.bid_depth_top3 };
+            json!({
+                "order_size": size,
+                "available_depth": depth_side,
+                "depth_coverage_ratio": depth_side.map(|d| if size > 0.0 { d / size } else { 0.0 })
+            })
+        } else {
+            Value::Null
+        },
         "book_meta": if let Some(book) = book {
             json!({
                 "token_id": book.token_id,
@@ -357,6 +418,11 @@ pub(super) fn decision_to_live_payload(
     try_decision_to_live_payload(decision, target, exec_cfg, book, quote_size_override).ok()
 }
 
+/// True when the gateway_side is a buy (buy_yes / buy_no).
+pub(super) fn is_buy_action(action_lc: &str) -> bool {
+    action_lc == "enter" || action_lc == "add"
+}
+
 pub(super) fn extract_rust_reject_reason(payload: &Value, fallback_error: Option<&str>) -> String {
     payload
         .get("error_msg")
@@ -369,7 +435,6 @@ pub(super) fn extract_rust_reject_reason(payload: &Value, fallback_error: Option
         .to_string()
 }
 
-#[cfg(test)]
 pub(super) fn can_retry_on_liquidity(reason: &str) -> bool {
     let r = reason.to_ascii_lowercase();
     let non_retryable = r.contains("unauthorized")
@@ -461,7 +526,6 @@ pub(super) fn apply_emergency_exit_overrides(decision: &mut Value, exec_cfg: &Li
     }
 }
 
-#[cfg(test)]
 pub(super) fn build_retry_payload(current: &Value, reason: &str, attempt: usize) -> Option<Value> {
     if attempt >= 2 || !can_retry_on_liquidity(reason) {
         return None;
@@ -685,6 +749,32 @@ pub(super) fn build_execution_price_trace(
         valid_positive_f64(Some(parity_anchor_price_cents)),
         accepted_price_cents,
     );
+    // MRG = Model-Reality Gap: positive means live execution was WORSE (more expensive
+    // for entries, cheaper for exits) than the paper model predicted.
+    // This is the key calibration metric for validating paper simulation accuracy.
+    let action = decision
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("enter")
+        .to_ascii_lowercase();
+    let is_entry = matches!(action.as_str(), "enter" | "add");
+    let mrg_cents: Option<f64> = match (
+        valid_positive_f64(Some(paper_exec_price_cents)),
+        accepted_price_cents,
+    ) {
+        (Some(paper), Some(accepted)) if paper > 0.0 && accepted > 0.0 => {
+            if is_entry {
+                // Entry MRG: positive = live paid more than paper modeled (bad)
+                Some(accepted - paper)
+            } else {
+                // Exit MRG: positive = live received less than paper modeled (bad)
+                Some(paper - accepted)
+            }
+        }
+        _ => None,
+    };
+    let mrg_bps: Option<f64> = mrg_cents
+        .and_then(|m| valid_positive_f64(Some(paper_exec_price_cents)).map(|p| (m / p) * 10_000.0));
     json!({
         "signal_price_cents": signal_price_cents,
         "paper_entry_exec_price_cents": paper_entry_exec_price_cents,
@@ -705,6 +795,15 @@ pub(super) fn build_execution_price_trace(
         "paper_exec_vs_submit_cents": paper_exec_vs_submit_cents,
         "paper_exec_vs_accepted_cents": paper_exec_vs_accepted_cents,
         "price_parity": request.get("price_parity").cloned().unwrap_or(Value::Null),
+        // MRG fields — primary calibration metrics for canary validation
+        "mrg_cents": mrg_cents,
+        "mrg_bps": mrg_bps,
+        "mrg_direction": if is_entry { "entry" } else { "exit" },
+        "mrg_interpretation": mrg_cents.map(|m| {
+            if m.abs() < 0.05 { json!("neutral") }
+            else if (m > 0.0 && is_entry) || (m > 0.0 && !is_entry) { json!("worse_than_paper") }
+            else { json!("better_than_paper") }
+        }).unwrap_or(Value::Null),
     })
 }
 

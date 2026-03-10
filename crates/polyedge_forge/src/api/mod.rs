@@ -94,12 +94,180 @@ struct ApiState {
     strategy_live_source_slots: Arc<Semaphore>,
     runtime_event_samples: Arc<RwLock<HashMap<String, RuntimeEventSampleBuffer>>>,
     gateway_http_client: Arc<reqwest::Client>,
+    /// Three-layer kill switch state per trading scope (symbol|market_type).
+    live_kill_switch: Arc<RwLock<HashMap<String, LiveKillSwitchState>>>,
 }
 
 #[derive(Clone)]
 struct ChartCacheEntry {
     created_at: Instant,
     payload: Value,
+}
+
+/// Three-layer automated kill switch for a trading scope.
+/// Layer 1: Risk (daily loss / drawdown limits)
+/// Layer 2: Execution quality (parity_band_exhaustion rate)
+/// Layer 3: Signal quality (rolling win rate)
+#[derive(Debug, Clone)]
+struct LiveKillSwitchState {
+    /// When this kill switch was activated (None = not active)
+    halted_since_ms: Option<i64>,
+    /// Human-readable reason for the halt
+    halt_reason: Option<String>,
+    /// Resume after this timestamp (None = manual resume required)
+    resume_after_ms: Option<i64>,
+    /// Layer 1: cumulative realised PnL since daily reset (in cents)
+    daily_pnl_cents: f64,
+    /// Layer 1: peak cumulative PnL since daily reset
+    daily_peak_pnl_cents: f64,
+    /// Layer 1: timestamp of daily reset
+    daily_reset_ts_ms: i64,
+    /// Layer 2: rolling count of parity_band_exhausted in exec-quality window
+    parity_exhausted_count: u32,
+    /// Layer 2: rolling count of total entry attempts in exec-quality window
+    entry_attempt_count: u32,
+    /// Layer 2: timestamp window start for execution quality
+    exec_quality_window_start_ms: i64,
+    /// Layer 3: rolling trade outcomes (true=win, false=loss) - last 50 trades
+    rolling_outcomes: VecDeque<bool>,
+}
+
+impl LiveKillSwitchState {
+    fn new(now_ms: i64) -> Self {
+        Self {
+            halted_since_ms: None,
+            halt_reason: None,
+            resume_after_ms: None,
+            daily_pnl_cents: 0.0,
+            daily_peak_pnl_cents: 0.0,
+            daily_reset_ts_ms: now_ms,
+            parity_exhausted_count: 0,
+            entry_attempt_count: 0,
+            exec_quality_window_start_ms: now_ms,
+            rolling_outcomes: VecDeque::with_capacity(50),
+        }
+    }
+
+    fn is_halted(&self, now_ms: i64) -> bool {
+        match (self.halted_since_ms, self.resume_after_ms) {
+            (Some(_), Some(resume)) => now_ms < resume,
+            (Some(_), None) => true,
+            _ => false,
+        }
+    }
+
+    fn halt(&mut self, now_ms: i64, reason: &str, resume_after_ms: Option<i64>) {
+        self.halted_since_ms = Some(now_ms);
+        self.halt_reason = Some(reason.to_string());
+        self.resume_after_ms = resume_after_ms;
+        tracing::warn!(
+            reason = reason,
+            resume_after_ms = resume_after_ms,
+            "live kill switch activated"
+        );
+    }
+
+    fn record_trade_outcome(&mut self, net_pnl_cents: f64) {
+        let win = net_pnl_cents > 0.0;
+        self.rolling_outcomes.push_back(win);
+        while self.rolling_outcomes.len() > 50 {
+            self.rolling_outcomes.pop_front();
+        }
+        self.daily_pnl_cents += net_pnl_cents;
+        if self.daily_pnl_cents > self.daily_peak_pnl_cents {
+            self.daily_peak_pnl_cents = self.daily_pnl_cents;
+        }
+    }
+
+    fn rolling_win_rate(&self, min_trades: usize) -> Option<f64> {
+        if self.rolling_outcomes.len() < min_trades {
+            return None;
+        }
+        let wins = self.rolling_outcomes.iter().filter(|&&w| w).count();
+        Some(wins as f64 / self.rolling_outcomes.len() as f64)
+    }
+
+    fn daily_drawdown_cents(&self) -> f64 {
+        (self.daily_peak_pnl_cents - self.daily_pnl_cents).max(0.0)
+    }
+
+    fn daily_loss_cents(&self) -> f64 {
+        (-self.daily_pnl_cents).max(0.0)
+    }
+
+    fn parity_exhaustion_rate(&self) -> f64 {
+        if self.entry_attempt_count == 0 {
+            return 0.0;
+        }
+        self.parity_exhausted_count as f64 / self.entry_attempt_count as f64
+    }
+
+    fn record_entry_attempt(&mut self, now_ms: i64, parity_exhausted: bool) {
+        // Reset window after 10 minutes
+        if now_ms - self.exec_quality_window_start_ms > 600_000 {
+            self.parity_exhausted_count = 0;
+            self.entry_attempt_count = 0;
+            self.exec_quality_window_start_ms = now_ms;
+        }
+        self.entry_attempt_count = self.entry_attempt_count.saturating_add(1);
+        if parity_exhausted {
+            self.parity_exhausted_count = self.parity_exhausted_count.saturating_add(1);
+        }
+    }
+
+    fn reset_daily(&mut self, now_ms: i64) {
+        self.daily_pnl_cents = 0.0;
+        self.daily_peak_pnl_cents = 0.0;
+        self.daily_reset_ts_ms = now_ms;
+    }
+}
+
+fn ks_daily_loss_limit_cents() -> f64 {
+    std::env::var("FORGE_KS_DAILY_LOSS_LIMIT_CENTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(200.0)
+        .max(10.0)
+}
+
+fn ks_daily_drawdown_limit_cents() -> f64 {
+    std::env::var("FORGE_KS_DAILY_DRAWDOWN_LIMIT_CENTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(150.0)
+        .max(10.0)
+}
+
+fn ks_parity_exhaustion_rate_limit() -> f64 {
+    std::env::var("FORGE_KS_PARITY_EXHAUSTION_RATE")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(0.40)
+        .clamp(0.1, 0.95)
+}
+
+fn ks_min_rolling_win_rate() -> f64 {
+    std::env::var("FORGE_KS_MIN_ROLLING_WIN_RATE")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(0.42)
+        .clamp(0.1, 0.8)
+}
+
+fn ks_win_rate_min_trades() -> usize {
+    std::env::var("FORGE_KS_WIN_RATE_MIN_TRADES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(20)
+        .clamp(5, 200)
+}
+
+fn ks_halt_resume_ms() -> i64 {
+    std::env::var("FORGE_KS_HALT_RESUME_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(4 * 3_600_000)
+        .clamp(60_000, 24 * 3_600_000)
 }
 
 #[derive(Clone)]
@@ -978,13 +1146,57 @@ fn summarize_live_price_parity(orders: &[Value]) -> Value {
         collect_price_trace_delta_values_cents(orders, "paper_exec_vs_submit_cents");
     let paper_exec_vs_accepted =
         collect_price_trace_delta_values_cents(orders, "paper_exec_vs_accepted_cents");
+    // MRG: Model-Reality Gap — collected from price_trace.mrg_cents per order
+    let mrg_values: Vec<f64> = orders
+        .iter()
+        .filter_map(|order| {
+            order
+                .get("price_trace")
+                .and_then(|pt| pt.get("mrg_cents"))
+                .and_then(Value::as_f64)
+                .filter(|v| v.is_finite())
+        })
+        .collect();
+    let mrg_stats = price_drift_stats_json(&mrg_values);
+    // Parity band exhaustion rate
+    let total_entry_attempts = orders
+        .iter()
+        .filter(|o| {
+            o.get("action")
+                .or_else(|| o.get("decision").and_then(|d| d.get("action")))
+                .and_then(Value::as_str)
+                .map(|a| matches!(a.to_ascii_lowercase().as_str(), "enter" | "add"))
+                .unwrap_or(false)
+        })
+        .count();
+    let parity_exhausted_count = orders
+        .iter()
+        .filter(|o| {
+            o.get("reason")
+                .and_then(Value::as_str)
+                .map(|r| r.contains("parity_band_exhausted"))
+                .unwrap_or(false)
+        })
+        .count();
+    let parity_exhaustion_rate = if total_entry_attempts > 0 {
+        parity_exhausted_count as f64 / total_entry_attempts as f64
+    } else {
+        0.0
+    };
     json!({
         "signal_vs_submit_cents": price_drift_stats_json(&signal_vs_submit),
         "signal_vs_accepted_cents": price_drift_stats_json(&signal_vs_accepted),
         "parity_anchor_vs_submit_cents": price_drift_stats_json(&parity_anchor_vs_submit),
         "parity_anchor_vs_accepted_cents": price_drift_stats_json(&parity_anchor_vs_accepted),
         "paper_exec_vs_submit_cents": price_drift_stats_json(&paper_exec_vs_submit),
-        "paper_exec_vs_accepted_cents": price_drift_stats_json(&paper_exec_vs_accepted)
+        "paper_exec_vs_accepted_cents": price_drift_stats_json(&paper_exec_vs_accepted),
+        // MRG summary — key canary validation metric
+        "mrg_cents": mrg_stats,
+        "mrg_sample_count": mrg_values.len(),
+        // Execution quality
+        "parity_exhaustion_rate": parity_exhaustion_rate,
+        "parity_exhausted_count": parity_exhausted_count,
+        "entry_attempt_count": total_entry_attempts,
     })
 }
 
@@ -2296,6 +2508,142 @@ impl ApiState {
         store.insert(scope_key, state);
     }
 
+    // --- Kill Switch API ---
+
+    pub(super) async fn ks_is_halted(&self, symbol: &str, market_type: &str) -> bool {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let store = self.live_kill_switch.read().await;
+        let key = runtime_scope_key(symbol, market_type);
+        store.get(&key).map(|s| s.is_halted(now_ms)).unwrap_or(false)
+    }
+
+    pub(super) async fn ks_halt_reason(&self, symbol: &str, market_type: &str) -> Option<String> {
+        let store = self.live_kill_switch.read().await;
+        let key = runtime_scope_key(symbol, market_type);
+        store.get(&key).and_then(|s| s.halt_reason.clone())
+    }
+
+    pub(super) async fn ks_record_entry_attempt(
+        &self,
+        symbol: &str,
+        market_type: &str,
+        parity_exhausted: bool,
+    ) {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut store = self.live_kill_switch.write().await;
+        let key = runtime_scope_key(symbol, market_type);
+        let ks = store
+            .entry(key)
+            .or_insert_with(|| LiveKillSwitchState::new(now_ms));
+        ks.record_entry_attempt(now_ms, parity_exhausted);
+        // Check Layer 2: execution quality
+        let rate = ks.parity_exhaustion_rate();
+        let limit = ks_parity_exhaustion_rate_limit();
+        if !ks.is_halted(now_ms) && ks.entry_attempt_count >= 10 && rate > limit {
+            let resume_ms = now_ms + ks_halt_resume_ms();
+            ks.halt(
+                now_ms,
+                &format!(
+                    "layer2_parity_exhaustion_rate:{:.1}%_over_limit:{:.1}%",
+                    rate * 100.0,
+                    limit * 100.0
+                ),
+                Some(resume_ms),
+            );
+        }
+    }
+
+    pub(super) async fn ks_record_trade_outcome(
+        &self,
+        symbol: &str,
+        market_type: &str,
+        net_pnl_cents: f64,
+    ) {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut store = self.live_kill_switch.write().await;
+        let key = runtime_scope_key(symbol, market_type);
+        let ks = store
+            .entry(key)
+            .or_insert_with(|| LiveKillSwitchState::new(now_ms));
+        // Reset daily if >24h since last reset
+        if now_ms - ks.daily_reset_ts_ms > 86_400_000 {
+            ks.reset_daily(now_ms);
+        }
+        ks.record_trade_outcome(net_pnl_cents);
+        if ks.is_halted(now_ms) {
+            return;
+        }
+        let resume_ms = now_ms + ks_halt_resume_ms();
+        // Layer 1a: daily loss limit
+        let loss = ks.daily_loss_cents();
+        if loss > ks_daily_loss_limit_cents() {
+            ks.halt(
+                now_ms,
+                &format!("layer1_daily_loss:{:.1}c_limit:{:.1}c", loss, ks_daily_loss_limit_cents()),
+                Some(resume_ms),
+            );
+            return;
+        }
+        // Layer 1b: daily drawdown limit
+        let dd = ks.daily_drawdown_cents();
+        if dd > ks_daily_drawdown_limit_cents() {
+            ks.halt(
+                now_ms,
+                &format!("layer1_daily_drawdown:{:.1}c_limit:{:.1}c", dd, ks_daily_drawdown_limit_cents()),
+                Some(resume_ms),
+            );
+            return;
+        }
+        // Layer 3: rolling win rate
+        let min_trades = ks_win_rate_min_trades();
+        if let Some(wr) = ks.rolling_win_rate(min_trades) {
+            if wr < ks_min_rolling_win_rate() {
+                ks.halt(
+                    now_ms,
+                    &format!(
+                        "layer3_rolling_win_rate:{:.1}%_below_min:{:.1}%_over_{}_trades",
+                        wr * 100.0,
+                        ks_min_rolling_win_rate() * 100.0,
+                        ks.rolling_outcomes.len()
+                    ),
+                    Some(resume_ms),
+                );
+            }
+        }
+    }
+
+    pub(super) async fn ks_snapshot(&self, symbol: &str, market_type: &str) -> Value {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let store = self.live_kill_switch.read().await;
+        let key = runtime_scope_key(symbol, market_type);
+        if let Some(ks) = store.get(&key) {
+            json!({
+                "halted": ks.is_halted(now_ms),
+                "halt_reason": ks.halt_reason,
+                "halted_since_ms": ks.halted_since_ms,
+                "resume_after_ms": ks.resume_after_ms,
+                "daily_pnl_cents": ks.daily_pnl_cents,
+                "daily_loss_cents": ks.daily_loss_cents(),
+                "daily_drawdown_cents": ks.daily_drawdown_cents(),
+                "daily_reset_ts_ms": ks.daily_reset_ts_ms,
+                "parity_exhaustion_rate": ks.parity_exhaustion_rate(),
+                "entry_attempt_count": ks.entry_attempt_count,
+                "parity_exhausted_count": ks.parity_exhausted_count,
+                "rolling_trade_count": ks.rolling_outcomes.len(),
+                "rolling_win_rate": ks.rolling_win_rate(1),
+                "thresholds": {
+                    "daily_loss_limit_cents": ks_daily_loss_limit_cents(),
+                    "daily_drawdown_limit_cents": ks_daily_drawdown_limit_cents(),
+                    "parity_exhaustion_rate_limit": ks_parity_exhaustion_rate_limit(),
+                    "min_rolling_win_rate": ks_min_rolling_win_rate(),
+                    "win_rate_min_trades": ks_win_rate_min_trades(),
+                }
+            })
+        } else {
+            json!({ "halted": false, "initialized": false })
+        }
+    }
+
     #[allow(dead_code)]
     async fn apply_aggressiveness_to_execution_cfg(
         &self,
@@ -2862,6 +3210,7 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         strategy_live_source_slots: Arc::new(Semaphore::new(strategy_live_source_slots)),
         runtime_event_samples: Arc::new(RwLock::new(HashMap::new())),
         gateway_http_client: Arc::new(gateway_http_client),
+        live_kill_switch: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let mut app = Router::new()
@@ -3416,6 +3765,21 @@ async fn live_runtime_loop(
                 effective_live_execute = false;
                 effective_drain_only = true;
             }
+            // --- Three-layer kill switch check ---
+            // Only blocks NEW entries; exits are always allowed (drain_only = true).
+            if effective_live_execute {
+                let ks_halted = state.ks_is_halted(runtime_symbol, market_type).await;
+                if ks_halted {
+                    let reason = state.ks_halt_reason(runtime_symbol, market_type).await;
+                    effective_drain_only = true;
+                    tracing::warn!(
+                        symbol = runtime_symbol,
+                        market_type = market_type,
+                        reason = ?reason,
+                        "live kill switch active: new entries blocked, exits still allowed"
+                    );
+                }
+            }
             if effective_live_execute && !live_submit_allowed {
                 effective_live_execute = false;
             }
@@ -3916,6 +4280,30 @@ async fn live_runtime_loop(
                         &live_fill_by_decision,
                         &live_order_lineage,
                     );
+                    // Feed completed trade outcomes to kill-switch (Layer 1 + Layer 3)
+                    // We track newly completed trades each cycle to avoid double-counting.
+                    for record in &live_completed_records {
+                        // Only process completed (exit-filled) records
+                        let has_exit_fill = record
+                            .get("live_fill")
+                            .and_then(|f| f.get("action"))
+                            .and_then(Value::as_str)
+                            .map(|a| a.eq_ignore_ascii_case("exit") || a.eq_ignore_ascii_case("reduce"))
+                            .unwrap_or(false);
+                        if !has_exit_fill {
+                            continue;
+                        }
+                        // Use live fill net_pnl if available, fall back to paper net_pnl
+                        let net_pnl = record
+                            .get("live_fill")
+                            .and_then(|f| f.get("net_pnl_cents"))
+                            .and_then(Value::as_f64)
+                            .or_else(|| record.get("net_pnl_cents").and_then(Value::as_f64))
+                            .unwrap_or(0.0);
+                        state
+                            .ks_record_trade_outcome(runtime_symbol, market_type, net_pnl)
+                            .await;
+                    }
                     let live_realized_net_pnl_cents = state_machine.realized_pnl_usdc * 100.0;
                     let live_events = live_events_all
                         .iter()
@@ -4020,6 +4408,7 @@ async fn live_runtime_loop(
                             "mode": execution_mode,
                             "orders": aggr_orders
                         },
+                        "kill_switch": state.ks_snapshot(runtime_symbol, market_type).await,
                         "state_machine": state_machine,
                         "events": live_events
                     });
