@@ -384,9 +384,6 @@ fn strategy_profile_from_alias_strict(
     Ok((profile, strategy_cfg_for_profile_name(profile)))
 }
 
-fn strategy_profile_from_alias(raw: &str) -> Option<(&'static str, StrategyRuntimeConfig)> {
-    strategy_profile_from_alias_strict(raw).ok()
-}
 fn strategy_profile_name_from_alias(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "profit_max" | "manual_profit_max" | "max" | "fev1_manual_profit_max_2026_02_27" => {

@@ -2705,17 +2705,11 @@ struct CollectorMetricsQueryParams {
 struct RoundQueryParams {
     market_type: String,
     limit: Option<u32>,
-    symbol: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AvailableRoundsQueryParams {
     market_type: String,
-    symbol: Option<String>,
-    date: Option<String>,
-    limit: Option<u32>,
-    days_limit: Option<u32>,
-    include_rounds: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2723,33 +2717,20 @@ struct RoundChartQueryParams {
     round_id: String,
     market_type: Option<String>,
     max_points: Option<u32>,
-    symbol: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct HeatmapQueryParams {
     market_type: String,
     lookback_hours: Option<u32>,
-    symbol: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AccuracyQueryParams {
     market_type: String,
-    symbol: Option<String>,
     window: Option<u32>,
     lookback_hours: Option<u32>,
     limit: Option<u32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StatsQueryParams {
-    symbol: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WsLiveQueryParams {
-    symbol: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
