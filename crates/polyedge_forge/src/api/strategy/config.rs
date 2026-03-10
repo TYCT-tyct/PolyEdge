@@ -745,48 +745,6 @@ fn strategy_fixed_guard_payload(cfg: &StrategyRuntimeConfig, profile_name: &str)
     })
 }
 
-#[allow(dead_code)]
-pub(super) fn strategy_backup_baseline_config() -> StrategyRuntimeConfig {
-    StrategyRuntimeConfig {
-        entry_threshold_base: 0.599103,
-        entry_threshold_cap: 0.828918,
-        spread_limit_prob: 0.022381,
-        entry_edge_prob: 0.03,
-        entry_min_potential_cents: 10.32355,
-        entry_max_price_cents: 72.915692,
-        min_hold_ms: 3_702,
-        stop_loss_cents: 4.369163,
-        reverse_signal_threshold: -0.6368297565445915,
-        reverse_signal_ticks: 1,
-        trail_activate_profit_cents: 2.2,
-        trail_drawdown_cents: 2.265089,
-        take_profit_near_max_cents: 87.74805411830562,
-        endgame_take_profit_cents: 86.18788390856207,
-        endgame_remaining_ms: 13_670,
-        liquidity_widen_prob: 0.08860501062699792,
-        cooldown_ms: 0,
-        max_entries_per_round: 10,
-        max_exec_spread_cents: 1.48597,
-        slippage_cents_per_side: 0.06918614011422781,
-        fee_cents_per_side: 0.0,
-        emergency_wide_spread_penalty_ratio: 0.27217322622042583,
-        stop_loss_grace_ticks: 2,
-        stop_loss_hard_mult: 1.45,
-        stop_loss_reverse_extra_ticks: 1,
-        loss_cluster_limit: 3,
-        loss_cluster_cooldown_ms: 25_000,
-        noise_gate_enabled: true,
-        noise_gate_threshold_add: 0.03,
-        noise_gate_edge_add: 0.008,
-        noise_gate_spread_scale: 0.9,
-        vic_enabled: true,
-        vic_target_entries_per_hour: 14.0,
-        vic_deadband_ratio: 0.08,
-        vic_threshold_relax_max: 0.02,
-        vic_edge_relax_max: 0.008,
-        vic_spread_relax_max: 0.12,
-    }
-}
 
 fn strategy_profit_max_config() -> StrategyRuntimeConfig {
     StrategyRuntimeConfig {

@@ -192,47 +192,11 @@ fn build_entry_decision(
     })
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionTarget {
-    Paper,
-    Live,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OrderAction {
-    Enter,
-    Exit,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct OrderIntent {
-    pub ts_ms: i64,
-    pub round_id: String,
-    pub side: Side,
-    pub action: OrderAction,
-    pub price_cents: f64,
-    pub quote_size_usdc: f64,
-    pub reason: String,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct OrderResult {
-    pub accepted: bool,
-    pub request_id: String,
-    pub reason: String,
-}
-
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct ExecutionGate {
     pub live_enabled: bool,
 }
 
-#[allow(dead_code)]
 impl ExecutionGate {
     pub fn from_env() -> Self {
         let live_enabled = std::env::var("FORGE_FEV1_LIVE_ENABLED")
@@ -245,39 +209,6 @@ impl ExecutionGate {
             })
             .unwrap_or(false);
         Self { live_enabled }
-    }
-}
-
-#[allow(dead_code)]
-pub trait LiveOrderGateway {
-    fn submit(&self, intent: &OrderIntent) -> OrderResult;
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Default)]
-pub struct DisabledLiveGateway;
-
-impl LiveOrderGateway for DisabledLiveGateway {
-    fn submit(&self, _intent: &OrderIntent) -> OrderResult {
-        OrderResult {
-            accepted: false,
-            request_id: "live-disabled".to_string(),
-            reason: "FORGE_FEV1_LIVE_ENABLED=false".to_string(),
-        }
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Default)]
-pub struct ArmedSimulatedGateway;
-
-impl LiveOrderGateway for ArmedSimulatedGateway {
-    fn submit(&self, intent: &OrderIntent) -> OrderResult {
-        OrderResult {
-            accepted: true,
-            request_id: format!("sim-{}-{}", intent.action as u8, intent.ts_ms),
-            reason: "accepted".to_string(),
-        }
     }
 }
 
