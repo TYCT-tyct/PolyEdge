@@ -2681,24 +2681,6 @@ const LIVE_SNAPSHOT_FALLBACK_MAX_AGE_MS: i64 = 12_000;
 const LIVE_ROUND_END_GRACE_MS: i64 = 1_500;
 const RESOLVED_UP_PRICE_CENTS: f64 = 99.0;
 const RESOLVED_DOWN_PRICE_CENTS: f64 = 0.0;
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StrategyPaperSource {
-    Replay,
-    Live,
-    Auto,
-}
-
-fn parse_strategy_paper_source(raw: Option<&str>) -> StrategyPaperSource {
-    match raw
-        .map(|v| v.trim().to_ascii_lowercase())
-        .unwrap_or_else(|| "replay".to_string())
-        .as_str()
-    {
-        "live" => StrategyPaperSource::Live,
-        "auto" => StrategyPaperSource::Auto,
-        _ => StrategyPaperSource::Replay,
-    }
-}
 
 #[derive(Debug, Deserialize)]
 struct StrategyOptimizeQueryParams {

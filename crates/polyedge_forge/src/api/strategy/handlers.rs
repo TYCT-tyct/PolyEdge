@@ -1,5 +1,24 @@
 use serde::Deserialize;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrategyPaperSource {
+    Replay,
+    Live,
+    Auto,
+}
+
+fn parse_strategy_paper_source(raw: Option<&str>) -> StrategyPaperSource {
+    match raw
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "replay".to_string())
+        .as_str()
+    {
+        "live" => StrategyPaperSource::Live,
+        "auto" => StrategyPaperSource::Auto,
+        _ => StrategyPaperSource::Replay,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub(super) struct StrategyPaperQueryParams {
     source: Option<String>,
