@@ -3464,7 +3464,7 @@ async fn live_runtime_background_maintenance(state: ApiState, bootstrap: LiveRun
                 book_prewarm_at.insert(market.clone(), now_ms);
             }
         }
-        tokio::time::sleep(Duration::from_millis(120)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await; // OPTIMIZED: 120ms -> 50ms for faster prewarming
     }
 }
 
@@ -4213,6 +4213,7 @@ async fn live_runtime_loop(
                             &base_exec_cfg,
                         )
                         .await;
+                    
                     if effective_live_execute || pending_before_count > 0 {
                         reconcile_live_reports(&state, &exec_cfg_tuned).await;
                         handle_live_pending_timeouts(&state, &exec_cfg_tuned).await;
@@ -4220,6 +4221,17 @@ async fn live_runtime_loop(
 
                     let decision_pool_count = paper_decisions.len();
                     let candidate_count = selected_decisions.len();
+                    
+                    // OPTIMIZATION: Aggressive book prewarming when candidates exist
+                    // This ensures books are fresh for fast execution
+                    if candidate_count > 0 {
+                        if let Ok(target) = resolve_live_market_target_fast_with_state(
+                            &state, runtime_symbol, market_type,
+                        ).await {
+                            let _ = prewarm_rust_books_for_target(&state, &target).await;
+                        }
+                    }
+                    
                     let (gated, mut state_skipped, position_for_submit) = gate_live_decisions(
                         &state,
                         runtime_symbol,
