@@ -1051,15 +1051,21 @@ fn select_live_execution_candidates(
     );
     let fresh_signal_count = count_fresh_live_decisions(paper_decisions, latest_ts_ms, drain_only);
     let current_entry_available = current_live_entry_decision.is_some();
-    // Layer 1: 禁用 current_summary fallback
-    // 宁可错过一次入场机会，也不要产生孤儿仓位
-    // Paper 认为不该入场，Live 就不入场
+    // Layer 1: current_summary fallback
+    // 当 pool 为空时，使用 current_live_entry_decision 作为兜底
     if selected_from_pool.is_empty() && !drain_only && prefer_action.is_none() {
-        // 禁用 current_summary fallback - 不再兜底
+        if let Some(current_entry) = current_live_entry_decision {
+            return (
+                vec![current_entry],
+                1,
+                "current_summary_fallback",
+                true,
+            );
+        }
         return (
             Vec::new(),
             0,
-            "pool_empty_no_current_summary_fallback",
+            "pool_empty_no_current_entry",
             false,
         );
     }
@@ -4899,10 +4905,9 @@ mod tests {
     }
 
     #[test]
-    fn select_live_execution_candidates_no_fallback_when_pool_empty() {
-        // Layer 1: 禁用 current_summary fallback
-        // 当 paper_decisions pool 为空时，不再 fallback 到 current_summary
-        // 宁可错过，不要产生孤儿仓位
+    fn select_live_execution_candidates_uses_fallback_when_pool_empty() {
+        // Layer 1: 启用 current_summary fallback
+        // 当 paper_decisions pool 为空时，使用 current_summary 作为兜底
         let paper_decisions = vec![json!({
             "action": "enter",
             "side": "DOWN",
@@ -4931,11 +4936,32 @@ mod tests {
                 false,
                 None,
             );
-        // 验证：pool 为空时返回空，不再 fallback
+        // 验证：pool 为空时，使用 current_summary fallback
+        assert_eq!(selected.len(), 1);
+        assert_eq!(candidate_source, "current_summary_fallback");
+        assert_eq!(fresh_count, 1);
+        assert!(current_entry_available);
+    }
+
+    #[test]
+    fn select_live_execution_candidates_returns_empty_when_pool_and_current_entry_both_empty() {
+        // 当 pool 为空且没有 current_entry 时，返回空
+        let paper_decisions = vec![];
+        let current_live_entry_decision: Option<Value> = None;
+        let (selected, fresh_count, candidate_source, current_entry_available) =
+            select_live_execution_candidates(
+                &paper_decisions,
+                current_live_entry_decision,
+                250_000_i64,
+                1,
+                false,
+                None,
+            );
+        // 验证：两者都为空时返回空
         assert_eq!(selected.len(), 0);
-        assert_eq!(candidate_source, "pool_empty_no_current_summary_fallback");
-        // fresh_count 为 0 因为 pool 为空
+        assert_eq!(candidate_source, "pool_empty_no_current_entry");
         assert_eq!(fresh_count, 0);
+        assert!(!current_entry_available);
     }
 
     #[test]

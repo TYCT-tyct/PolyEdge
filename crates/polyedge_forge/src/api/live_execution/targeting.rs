@@ -385,10 +385,16 @@ pub(super) async fn gate_live_decisions(
                 .get("signal_source")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
+            // For current_summary signals, use entry_score (edge_score is the same value)
+            let entry_score = normalized
+                .get("entry_score")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            // Fallback to score for other signal types
             let score = normalized
                 .get("score")
                 .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
+                .unwrap_or(entry_score);
             // Use hardcoded values here to avoid needing config import in hot path
             // These match the config values: min_score=0.7, min_remaining=30s
             signal_source.eq_ignore_ascii_case("current_summary") && score.abs() >= 0.70
