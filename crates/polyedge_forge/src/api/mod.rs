@@ -704,8 +704,8 @@ impl LiveRuntimeConfig {
         let loop_interval_ms = std::env::var("FORGE_FEV1_RUNTIME_LOOP_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(60) // OPTIMIZED: Reduced from 180ms to 60ms for faster signal detection
-            .clamp(60, 10_000);
+            .unwrap_or(40) // OPTIMIZED: 40ms for ultra-fast event-driven loop
+            .clamp(10, 10_000);
         let lookback_minutes = std::env::var("FORGE_FEV1_RUNTIME_LOOKBACK_MINUTES")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
@@ -3753,7 +3753,7 @@ async fn live_runtime_loop(
         } else {
             cfg.loop_interval_ms
         };
-        let wait_ms = wait_budget_ms.clamp(8, cfg.loop_interval_ms.max(8));
+        let wait_ms = wait_budget_ms.clamp(1, cfg.loop_interval_ms);
         let first_wake_event = tokio::select! {
             maybe = wake_rx.recv() => maybe,
             _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => None,
