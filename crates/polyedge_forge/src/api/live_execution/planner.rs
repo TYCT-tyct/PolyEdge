@@ -1003,7 +1003,9 @@ pub(super) fn extract_pending_fill_meta(
             .filter(|v| v.is_finite() && *v > 0.0)
             .min_by(|a, b| a.total_cmp(b));
         if let (Some(reported), Some(max_shares)) = (reported_fill_size_shares, size_ceiling) {
-            let slack = (max_shares * 0.002).max(0.02);
+            // Layer 3: Polymarket FAK 正常溢出约 2%，放宽容差避免误触发
+            // 保持 0.15 shares 最小值（防止小仓位被忽略）
+            let slack = (max_shares * 0.03).max(0.15);
             if reported > max_shares + slack {
                 fill_size_shares = Some(max_shares);
                 size_guard_triggered = true;

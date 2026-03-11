@@ -1051,15 +1051,17 @@ fn select_live_execution_candidates(
     );
     let fresh_signal_count = count_fresh_live_decisions(paper_decisions, latest_ts_ms, drain_only);
     let current_entry_available = current_live_entry_decision.is_some();
+    // Layer 1: 禁用 current_summary fallback
+    // 宁可错过一次入场机会，也不要产生孤儿仓位
+    // Paper 认为不该入场，Live 就不入场
     if selected_from_pool.is_empty() && !drain_only && prefer_action.is_none() {
-        if let Some(current_decision) = current_live_entry_decision {
-            return (
-                vec![current_decision],
-                fresh_signal_count.max(1),
-                "current_summary",
-                true,
-            );
-        }
+        // 禁用 current_summary fallback - 不再兜底
+        return (
+            Vec::new(),
+            0,
+            "pool_empty_no_current_summary_fallback",
+            false,
+        );
     }
     let effective_fresh_count = if current_entry_available {
         fresh_signal_count.max(1)
@@ -4885,7 +4887,10 @@ mod tests {
     }
 
     #[test]
-    fn select_live_execution_candidates_falls_back_to_current_summary_entry() {
+    fn select_live_execution_candidates_no_fallback_when_pool_empty() {
+        // Layer 1: 禁用 current_summary fallback
+        // 当 paper_decisions pool 为空时，不再 fallback 到 current_summary
+        // 宁可错过，不要产生孤儿仓位
         let paper_decisions = vec![json!({
             "action": "enter",
             "side": "DOWN",
@@ -4914,14 +4919,11 @@ mod tests {
                 false,
                 None,
             );
-        assert_eq!(selected.len(), 1);
-        assert_eq!(
-            selected[0].get("decision_id").and_then(Value::as_str),
-            Some("summary-decision")
-        );
-        assert_eq!(fresh_count, 1);
-        assert_eq!(candidate_source, "current_summary");
-        assert!(current_entry_available);
+        // 验证：pool 为空时返回空，不再 fallback
+        assert_eq!(selected.len(), 0);
+        assert_eq!(candidate_source, "pool_empty_no_current_summary_fallback");
+        // fresh_count 为 0 因为 pool 为空
+        assert_eq!(fresh_count, 0);
     }
 
     #[test]
