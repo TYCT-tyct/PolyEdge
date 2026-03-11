@@ -876,6 +876,7 @@ pub(super) struct PendingFillMeta {
     reported_fill_quote_usdc: Option<f64>,
     reported_fill_size_shares: Option<f64>,
     size_guard_triggered: bool,
+    underfill_detected: bool,
     fee_usdc: f64,
     slippage_usdc: f64,
 }
@@ -996,6 +997,7 @@ pub(super) fn extract_pending_fill_meta(
         .find(|v| *v > 0.0);
     let mut fill_size_shares = reported_fill_size_shares;
     let mut size_guard_triggered = false;
+    let mut underfill_detected = false;
     if pending.size_locked {
         let size_ceiling = [Some(pending.order_size_shares), original_size_shares]
             .into_iter()
@@ -1007,8 +1009,13 @@ pub(super) fn extract_pending_fill_meta(
             // 保持 0.15 shares 最小值（防止小仓位被忽略）
             let slack = (max_shares * 0.03).max(0.15);
             if reported > max_shares + slack {
+                // Overfill: cap to expected size
                 fill_size_shares = Some(max_shares);
                 size_guard_triggered = true;
+            } else if reported < max_shares - slack {
+                // Underfill: detect but don't cap - log for observability
+                // 使用与 overfill 相同的阈值 (3%) 来检测 underfill
+                underfill_detected = true;
             }
         }
     }
@@ -1072,6 +1079,7 @@ pub(super) fn extract_pending_fill_meta(
         reported_fill_quote_usdc,
         reported_fill_size_shares,
         size_guard_triggered,
+        underfill_detected,
         fee_usdc,
         slippage_usdc: explicit_slippage_usdc.max(inferred_slippage_usdc),
     }

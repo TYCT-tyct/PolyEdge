@@ -220,6 +220,35 @@ pub(super) async fn apply_pending_confirmation(
             )
             .await;
     }
+    // Underfill detection: log for observability but don't pause
+    // Underfill 可能表明流动性问题或交易所问题，需要监控
+    if fill_meta.underfill_detected {
+        state
+            .append_live_event(
+                &pending.symbol,
+                &pending.market_type,
+                json!({
+                    "accepted": true,
+                    "event_type": "warning",
+                    "action": pending.action,
+                    "side": pending.side,
+                    "round_id": pending.round_id,
+                    "intent_id": pending.intent_id,
+                    "decision_id": pending.decision_id,
+                    "decision_key": pending.decision_key,
+                    "reason": "underfill_detected",
+                    "order_id": pending.order_id,
+                    "detail": {
+                        "requested_size_shares": pending.order_size_shares,
+                        "reported_fill_size_shares": fill_meta.reported_fill_size_shares,
+                        "fill_shortfall_shares": pending.order_size_shares - fill_meta.reported_fill_size_shares.unwrap_or(0.0),
+                        "requested_quote_usdc": pending.quote_size_usdc,
+                        "reported_fill_quote_usdc": fill_meta.reported_fill_quote_usdc
+                    }
+                }),
+            )
+            .await;
+    }
 }
 
 pub(super) async fn apply_pending_revert(
