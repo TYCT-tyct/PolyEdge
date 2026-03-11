@@ -1089,3 +1089,91 @@ async fn resolve_token_ids_from_gamma_market_detail(
     }
     Some((yes_token, no_token))
 }
+
+// ============================================================================
+// MAKER STRATEGY: For better prices when spread is tight
+// ============================================================================
+const LIVE_MAKER_ENABLED_DEFAULT: bool = false; // Disabled by default, enable for better prices
+const LIVE_MAKER_SPREAD_THRESHOLD_CENTS_DEFAULT: f64 = 1.0; // Use maker when spread < 1c
+const LIVE_MAKER_MIN_REMAINING_MS_DEFAULT: i64 = 60_000; // Need at least 60s remaining
+const LIVE_MAKER_TTL_MS_DEFAULT: i64 = 2000; // 2s TTL for maker orders
+const LIVE_MAKER_MAX_SLIPPAGE_BPS_DEFAULT: f64 = 10.0; // Max slippage for maker
+
+pub(super) fn live_maker_enabled() -> bool {
+    std::env::var("FORGE_FEV1_LIVE_MAKER_ENABLED")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(LIVE_MAKER_ENABLED_DEFAULT)
+}
+
+pub(super) fn live_maker_spread_threshold_cents() -> f64 {
+    std::env::var("FORGE_FEV1_LIVE_MAKER_SPREAD_THRESHOLD_CENTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(LIVE_MAKER_SPREAD_THRESHOLD_CENTS_DEFAULT)
+        .clamp(0.5, 5.0)
+}
+
+pub(super) fn live_maker_min_remaining_ms() -> i64 {
+    std::env::var("FORGE_FEV1_LIVE_MAKER_MIN_REMAINING_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(LIVE_MAKER_MIN_REMAINING_MS_DEFAULT)
+        .clamp(30_000, 300_000)
+}
+
+pub(super) fn live_maker_ttl_ms() -> i64 {
+    std::env::var("FORGE_FEV1_LIVE_MAKER_TTL_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(LIVE_MAKER_TTL_MS_DEFAULT)
+        .clamp(500, 10_000)
+}
+
+pub(super) fn live_maker_max_slippage_bps() -> f64 {
+    std::env::var("FORGE_FEV1_LIVE_MAKER_MAX_SLIPPAGE_BPS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(LIVE_MAKER_MAX_SLIPPAGE_BPS_DEFAULT)
+        .clamp(1.0, 50.0)
+}
+
+// ============================================================================
+// PRE-COMPUTED ORDER TEMPLATE: For ultra-fast execution
+// ============================================================================
+const LIVE_PRECOMPUTE_ENABLED_DEFAULT: bool = true;
+const LIVE_PRECOMPUTE_TTL_MS_DEFAULT: i64 = 5_000; // 5s TTL for pre-computed templates
+
+pub(super) fn live_precompute_enabled() -> bool {
+    std::env::var("FORGE_FEV1_LIVE_PRECOMPUTE_ENABLED")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(LIVE_PRECOMPUTE_ENABLED_DEFAULT)
+}
+
+pub(super) fn live_precompute_ttl_ms() -> i64 {
+    std::env::var("FORGE_FEV1_LIVE_PRECOMPUTE_TTL_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(LIVE_PRECOMPUTE_TTL_MS_DEFAULT)
+        .clamp(1_000, 30_000)
+}
+
+// Check if we should use maker strategy for a given spread and remaining time
+pub(super) fn should_use_maker_strategy(spread_cents: f64, remaining_ms: i64) -> bool {
+    if !live_maker_enabled() {
+        return false;
+    }
+    spread_cents <= live_maker_spread_threshold_cents() 
+        && remaining_ms >= live_maker_min_remaining_ms()
+}

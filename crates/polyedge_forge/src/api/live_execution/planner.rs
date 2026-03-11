@@ -6,6 +6,15 @@ fn decision_signal_price_cents(decision: &Value) -> Option<f64> {
         .filter(|v| v.is_finite() && *v > 0.0)
 }
 
+// ============================================================================
+// HELPER: Calculate spread from book snapshot for maker strategy
+// ============================================================================
+fn calculate_spread_cents(book: &GatewayBookSnapshot) -> f64 {
+    let best_bid = book.best_bid.unwrap_or(0.0);
+    let best_ask = book.best_ask.unwrap_or(100.0);
+    (best_ask - best_bid) * 100.0 // Convert from proportion to cents
+}
+
 fn decision_action(decision: &Value) -> String {
     decision
         .get("action")
@@ -199,7 +208,8 @@ pub(super) fn try_decision_to_live_payload(
         }
     }
 
-    let (gateway_side, token_id, mut slippage_bps) = match (action.as_str(), side.as_str()) {
+    let (gateway_side, token_id, mut default_slippage_bps) = match (action.as_str(), side.as_str())
+    {
         ("enter", "UP") | ("add", "UP") => (
             "buy_yes",
             target.token_id_yes.as_str(),
@@ -231,8 +241,41 @@ pub(super) fn try_decision_to_live_payload(
     }
     price_cents = price_cents.clamp(1.0, 99.0);
     let mut price = (price_cents / 100.0).clamp(0.01, 0.99);
-    let tif = "FAK".to_string();
-    let style = "taker".to_string();
+
+    // =========================================================================
+    // MAKER STRATEGY: Use GTC with post_only when spread is tight and time remaining
+    // This provides better prices at the cost of potentially not filling
+    // =========================================================================
+    let remaining_ms = decision
+        .get("remaining_ms")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+
+    // Check if we should use maker strategy
+    let (tif, style, actual_slippage_bps) = if !is_exit_like {
+        // For entries, check if maker strategy applies
+        if let Some(book_snapshot) = book {
+            let spread = calculate_spread_cents(&book_snapshot);
+            if should_use_maker_strategy(spread, remaining_ms) {
+                // Use GTC with post_only (maker) for better price
+                (
+                    "GTC".to_string(),
+                    "maker".to_string(),
+                    live_maker_max_slippage_bps(), // Lower slippage for maker
+                )
+            } else {
+                // Use FAK (taker) as default
+                ("FAK".to_string(), "taker".to_string(), default_slippage_bps)
+            }
+        } else {
+            // No book, use default taker
+            ("FAK".to_string(), "taker".to_string(), default_slippage_bps)
+        }
+    } else {
+        // For exits, always use taker (need to get out fast)
+        ("FAK".to_string(), "taker".to_string(), default_slippage_bps)
+    };
+
     let mut quote_size = quote_size_override.unwrap_or_else(|| {
         decision
             .get("quote_size_usdc")
@@ -275,20 +318,30 @@ pub(super) fn try_decision_to_live_payload(
         size = forced_size_shares.unwrap_or_else(|| (quote_size / price).max(size_floor));
     }
     size = round_lot_size(size.max(size_floor));
-    let ttl_ms = decision
-        .get("ttl_ms")
-        .and_then(Value::as_i64)
-        .unwrap_or(if is_exit_like {
-            900
-        } else {
-            live_entry_fak_ttl_ms()
-        })
-        .clamp(300, 30_000);
-    slippage_bps = decision
+
+    // Use TIF-specific TTL: maker (GTC) vs taker (FAK)
+    let ttl_ms = if tif == "GTC" {
+        // Maker order - use longer TTL
+        live_maker_ttl_ms()
+    } else {
+        // Taker order - use FAK TTL
+        decision
+            .get("ttl_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or(if is_exit_like {
+                900
+            } else {
+                live_entry_fak_ttl_ms()
+            })
+            .clamp(300, 30_000)
+    };
+
+    default_slippage_bps = decision
         .get("max_slippage_bps")
         .and_then(Value::as_f64)
-        .unwrap_or(slippage_bps)
+        .unwrap_or(default_slippage_bps)
         .clamp(0.0, 500.0);
+    let mut slippage_bps = default_slippage_bps;
     if let Some(force) = exec_cfg.force_slippage_bps {
         slippage_bps = force.clamp(0.0, 500.0);
     }
@@ -318,7 +371,7 @@ pub(super) fn try_decision_to_live_payload(
 
     let parity_band_cents = allowed_price_band_cents(
         parity_anchor_cents,
-        slippage_bps,
+        default_slippage_bps,
         tick_size,
         remaining_ms,
         score,
@@ -412,7 +465,7 @@ pub(super) fn try_decision_to_live_payload(
         "tif": tif,
         "style": style,
         "ttl_ms": ttl_ms,
-        "max_slippage_bps": slippage_bps,
+        "max_slippage_bps": default_slippage_bps,
         "execution_notes": notes,
         "cache_key": cache_key,
         "intent_id": decision_intent_id(decision).unwrap_or_default(),
@@ -423,7 +476,7 @@ pub(super) fn try_decision_to_live_payload(
             "parity_anchor_price_cents": parity_anchor_cents,
             "parity_anchor_source": parity_anchor_source,
             "submit_price_cents": submit_price_cents,
-            "max_slippage_bps": slippage_bps,
+            "max_slippage_bps": default_slippage_bps,
             "tick_size": tick_size,
             "allowed_band_cents": parity_band_cents,
             "parity_delta_cents": parity_delta_cents,
