@@ -126,7 +126,7 @@ const LIVE_MARKET_TARGET_ACTIVE_CACHE_MAX_AGE_MS_MAX: i64 = 600_000;
 const LIVE_MARKET_TARGET_RESOLVE_ATTEMPTS_DEFAULT: i64 = 5;
 const LIVE_MARKET_TARGET_RESOLVE_ATTEMPTS_MIN: i64 = 1;
 const LIVE_MARKET_TARGET_RESOLVE_ATTEMPTS_MAX: i64 = 8;
-const LIVE_MARKET_TARGET_RESOLVE_RETRY_MS_DEFAULT: i64 = 220;
+const LIVE_MARKET_TARGET_RESOLVE_RETRY_MS_DEFAULT: i64 = 50; // OPTIMIZED: Reduced from 220ms to 50ms for faster resolution
 const LIVE_MARKET_TARGET_RESOLVE_RETRY_MS_MIN: i64 = 0;
 const LIVE_MARKET_TARGET_RESOLVE_RETRY_MS_MAX: i64 = 2_000;
 const LIVE_MARKET_TARGET_SWITCH_GUARD_MS_DEFAULT: i64 = 2_500;
@@ -169,7 +169,7 @@ const LIVE_MAX_COMPLETED_TRADES_DEFAULT: usize = 0;
 const LIVE_MAX_COMPLETED_TRADES_MIN: usize = 0;
 const LIVE_MAX_COMPLETED_TRADES_MAX: usize = 1_000;
 const LIVE_ALLOW_ADDS_DEFAULT: bool = true;
-const LIVE_SIGNAL_ENTRY_FRESHNESS_MS_DEFAULT: i64 = 2_000;
+const LIVE_SIGNAL_ENTRY_FRESHNESS_MS_DEFAULT: i64 = 5_000; // OPTIMIZED: Increased from 2s to 5s for short-window markets
 const LIVE_SIGNAL_ENTRY_FRESHNESS_MS_MIN: i64 = 200;
 const LIVE_SIGNAL_ENTRY_FRESHNESS_MS_MAX: i64 = 60_000;
 const LIVE_ENTRY_LIQUIDITY_REJECT_WINDOW_MS_DEFAULT: i64 = 5_000;
@@ -488,6 +488,74 @@ pub(super) fn live_entry_liquidity_reject_limit() -> u32 {
             LIVE_ENTRY_LIQUIDITY_REJECT_LIMIT_MIN,
             LIVE_ENTRY_LIQUIDITY_REJECT_LIMIT_MAX,
         )
+}
+
+// ============================================================================
+// FAST PATH OPTIMIZATION: For short-window current_summary signals
+// Reduces checks for high-confidence signals to improve latency
+// ============================================================================
+const LIVE_FAST_PATH_ENABLED_DEFAULT: bool = true;
+const LIVE_FAST_PATH_MIN_SCORE_DEFAULT: f64 = 0.70; // Skip extra checks if score >= 0.7
+const LIVE_FAST_PATH_MIN_REMAINING_MS_DEFAULT: i64 = 30_000; // Skip extra checks if > 30s remaining
+
+pub(super) fn live_fast_path_enabled() -> bool {
+    std::env::var("FORGE_FEV1_LIVE_FAST_PATH_ENABLED")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(LIVE_FAST_PATH_ENABLED_DEFAULT)
+}
+
+pub(super) fn live_fast_path_min_score() -> f64 {
+    std::env::var("FORGE_FEV1_LIVE_FAST_PATH_MIN_SCORE")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(LIVE_FAST_PATH_MIN_SCORE_DEFAULT)
+        .clamp(0.5, 0.95)
+}
+
+pub(super) fn live_fast_path_min_remaining_ms() -> i64 {
+    std::env::var("FORGE_FEV1_LIVE_FAST_PATH_MIN_REMAINING_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(LIVE_FAST_PATH_MIN_REMAINING_MS_DEFAULT)
+        .clamp(10_000, 120_000)
+}
+
+/// Check if a decision qualifies for fast path optimization
+pub(super) fn decision_qualifies_for_fast_path(decision: &Value, remaining_ms: i64) -> bool {
+    if !live_fast_path_enabled() {
+        return false;
+    }
+    
+    // Must be a current_summary signal
+    let signal_source = decision
+        .get("signal_source")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if !signal_source.eq_ignore_ascii_case("current_summary") {
+        return false;
+    }
+    
+    // Must have high confidence score
+    let score = decision
+        .get("score")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    if score.abs() < live_fast_path_min_score() {
+        return false;
+    }
+    
+    // Must have enough remaining time
+    if remaining_ms < live_fast_path_min_remaining_ms() {
+        return false;
+    }
+    
+    true
 }
 
 // =========================================================================

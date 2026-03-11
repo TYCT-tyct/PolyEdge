@@ -704,7 +704,7 @@ impl LiveRuntimeConfig {
         let loop_interval_ms = std::env::var("FORGE_FEV1_RUNTIME_LOOP_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(180)
+            .unwrap_or(60) // OPTIMIZED: Reduced from 180ms to 60ms for faster signal detection
             .clamp(60, 10_000);
         let lookback_minutes = std::env::var("FORGE_FEV1_RUNTIME_LOOKBACK_MINUTES")
             .ok()
@@ -892,7 +892,7 @@ fn runtime_target_prewarm_ms() -> i64 {
     std::env::var("FORGE_FEV1_RUNTIME_TARGET_PREWARM_MS")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(40_000)
+        .unwrap_or(10_000) // OPTIMIZED: Reduced from 40s to 10s for more frequent prewarming
         .clamp(5_000, 120_000)
 }
 
