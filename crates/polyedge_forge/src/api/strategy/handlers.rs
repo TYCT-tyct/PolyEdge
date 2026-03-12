@@ -461,6 +461,14 @@ pub(super) async fn strategy_live_reset(
         controls.clear();
     }
     {
+        let mut aggr = state.live_execution_aggr_states.write().await;
+        aggr.clear();
+    }
+    {
+        let mut kill_switch = state.live_kill_switch.write().await;
+        kill_switch.clear();
+    }
+    {
         let mut inflight = state.live_persist_inflight.write().await;
         inflight.clear();
     }
