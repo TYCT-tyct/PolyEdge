@@ -614,6 +614,54 @@ fn extract_fill_meta_caps_locked_fill_size_to_order_size() {
 }
 
 #[test]
+fn extract_fill_meta_locked_exit_reprices_from_quote_when_raw_price_is_inverted() {
+    let pending = LivePendingOrder {
+        symbol: "BTCUSDT".to_string(),
+        market_type: "5m".to_string(),
+        order_id: "oid".to_string(),
+        market_id: "mkt".to_string(),
+        token_id: "down".to_string(),
+        action: "exit".to_string(),
+        side: "DOWN".to_string(),
+        round_id: "r".to_string(),
+        decision_key: "k".to_string(),
+        intent_id: "did".to_string(),
+        decision_id: "did".to_string(),
+        price_cents: 1.0,
+        quote_size_usdc: 4.95,
+        order_size_shares: 5.1,
+        tif: "FAK".to_string(),
+        style: "taker".to_string(),
+        submit_reason: "test".to_string(),
+        submitted_ts_ms: 0,
+        ack_ts_ms: 0,
+        decision_ts_ms: 0,
+        trigger_ts_ms: 0,
+        cancel_after_ms: 1000,
+        cancel_due_at_ms: 0,
+        terminal_due_at_ms: 4_000,
+        retry_count: 0,
+        size_locked: true,
+        accepted_trade_ids: Vec::new(),
+    };
+    let fill = json!({
+        "event": "order_terminal",
+        "state": "filled",
+        "fill_price_cents": 1.0,
+        "fill_quote_usdc": 4.95
+    });
+    let meta = extract_pending_fill_meta(Some(&fill), &pending);
+    assert_eq!(meta.fill_size_shares, Some(5.1));
+    assert!(
+        (meta.fill_price_cents.unwrap_or_default() - 97.0588235294).abs() < 1e-6,
+        "expected repriced fill cents near 97.0588, got {:?}",
+        meta.fill_price_cents
+    );
+    assert_eq!(meta.fill_quote_usdc, Some(4.95));
+    assert!(!meta.size_guard_triggered);
+}
+
+#[test]
 fn locked_market_missing_submit_error_detects_orderbook_missing() {
     assert!(is_locked_market_missing_submit_error(
         "post_order failed: Status: error(400 Bad Request) making POST call to /order with {\"error\":\"the orderbook 123 does not exist\"}"

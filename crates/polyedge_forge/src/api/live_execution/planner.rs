@@ -1012,7 +1012,7 @@ pub(super) fn extract_pending_fill_meta(
     )
     .into_iter()
     .find(|v| *v > 0.0);
-    let fill_price_cents =
+    let mut fill_price_cents =
         price_cents_direct.or_else(|| price_prob.map(|v| if v <= 1.5 { v * 100.0 } else { v }));
 
     let quote_direct = collect_candidates(
@@ -1051,12 +1051,16 @@ pub(super) fn extract_pending_fill_meta(
     let mut fill_size_shares = reported_fill_size_shares;
     let mut size_guard_triggered = false;
     let mut underfill_detected = false;
-    if pending.size_locked {
-        let size_ceiling = [Some(pending.order_size_shares), original_size_shares]
+    let size_ceiling = if pending.size_locked {
+        [Some(pending.order_size_shares), original_size_shares]
             .into_iter()
             .flatten()
             .filter(|v| v.is_finite() && *v > 0.0)
-            .min_by(|a, b| a.total_cmp(b));
+            .min_by(|a, b| a.total_cmp(b))
+    } else {
+        None
+    };
+    if pending.size_locked {
         if let (Some(reported), Some(max_shares)) = (reported_fill_size_shares, size_ceiling) {
             // Layer 3: Polymarket FAK 正常溢出约 2%，放宽容差避免误触发
             // 保持 0.15 shares 最小值（防止小仓位被忽略）
@@ -1096,6 +1100,25 @@ pub(super) fn extract_pending_fill_meta(
     } else {
         reported_fill_quote_usdc.or(quote_from_size)
     };
+
+    if let (Some(max_shares), Some(quote)) = (size_ceiling, fill_quote_usdc) {
+        let slack = (max_shares * 0.03).max(0.15);
+        let price_for_implied_size = fill_price_cents.unwrap_or_default().max(0.01);
+        let implied_size = quote / (price_for_implied_size / 100.0).max(0.0001);
+        if implied_size.is_finite() && implied_size > max_shares + slack {
+            let implied_price_cents = (quote / max_shares) * 100.0;
+            if implied_price_cents.is_finite() && implied_price_cents > 0.0 {
+                fill_size_shares = Some(max_shares);
+                fill_price_cents = Some(implied_price_cents.clamp(0.01, 99.99));
+            }
+        } else if fill_size_shares.is_none() {
+            let implied_price_cents = (quote / max_shares) * 100.0;
+            if implied_price_cents.is_finite() && implied_price_cents > 0.0 {
+                fill_size_shares = Some(max_shares);
+                fill_price_cents = Some(implied_price_cents.clamp(0.01, 99.99));
+            }
+        }
+    }
 
     let fee_usdc = collect_candidates(
         fill,
