@@ -111,6 +111,109 @@ fn taker_buy_uses_buy_amount_mode_with_min_order_size_floor() {
     assert_eq!(mode, "buy_usdc");
 }
 
+fn env_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+struct ScopedEnvVar {
+    key: &'static str,
+    prev: Option<String>,
+}
+
+impl ScopedEnvVar {
+    fn set(key: &'static str, value: &str) -> Self {
+        let prev = std::env::var(key).ok();
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, prev }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(prev) = &self.prev {
+                std::env::set_var(self.key, prev);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+}
+
+#[test]
+fn fixed_entry_quote_uses_buy_amount_mode_without_size_lock() {
+    let _guard = env_lock().lock().expect("env lock");
+    let _fixed_quote = ScopedEnvVar::set("FORGE_FEV1_FIXED_ENTRY_QUOTE_USDC", "5");
+    let _fixed_shares = ScopedEnvVar::set("FORGE_FEV1_FIXED_ENTRY_SIZE_SHARES", "");
+
+    let decision = json!({
+        "action": "enter",
+        "side": "UP",
+        "price_cents": 50.0,
+        "quote_size_usdc": 1.0
+    });
+    let payload = decision_to_live_payload(
+        &decision,
+        &test_target(),
+        &test_exec_cfg(),
+        Some(&test_book(5.0)),
+        None,
+    )
+    .expect("payload");
+
+    assert_eq!(
+        payload.get("buy_amount_usdc").and_then(Value::as_f64),
+        Some(5.0)
+    );
+    assert_eq!(
+        payload.get("amount_mode").and_then(Value::as_str),
+        Some("buy_usdc")
+    );
+    let notes = payload
+        .get("execution_notes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        notes.iter().any(|v| v.as_str() == Some("force_entry_fixed_quote")),
+        "expected fixed quote note, got {notes:?}"
+    );
+    assert!(
+        !notes.iter().any(|v| v.as_str() == Some("force_entry_fixed_size")),
+        "fixed quote entry should not size-lock, got {notes:?}"
+    );
+}
+
+#[tokio::test]
+async fn gate_live_decisions_accepts_fixed_entry_quote_when_required() {
+    let _guard = env_lock().lock().expect("env lock");
+    let _require = ScopedEnvVar::set("FORGE_FEV1_REQUIRE_FIXED_ENTRY_SIZE", "true");
+    let _fixed_quote = ScopedEnvVar::set("FORGE_FEV1_FIXED_ENTRY_QUOTE_USDC", "5");
+    let _fixed_shares = ScopedEnvVar::set("FORGE_FEV1_FIXED_ENTRY_SIZE_SHARES", "");
+
+    let state = test_api_state();
+    let decision = json!({
+        "action": "enter",
+        "side": "DOWN",
+        "round_id": "SOLUSDT_5m_1",
+        "ts_ms": chrono::Utc::now().timestamp_millis(),
+        "decision_id": "intent-quote-1"
+    });
+    let (accepted, skipped, _) = gate_live_decisions(
+        &state,
+        "SOLUSDT",
+        "5m",
+        &[decision],
+        true,
+    )
+    .await;
+    assert_eq!(accepted.len(), 1, "expected fixed USD sizing to satisfy gate");
+    assert!(skipped.is_empty(), "unexpected skips: {skipped:?}");
+}
+
 #[test]
 fn entry_payload_normalizes_legacy_maker_input_to_fak_taker() {
     let decision = json!({

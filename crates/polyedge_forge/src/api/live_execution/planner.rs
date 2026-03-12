@@ -282,6 +282,14 @@ pub(super) fn try_decision_to_live_payload(
             .and_then(Value::as_f64)
             .unwrap_or(exec_cfg.min_quote_usdc)
     });
+    let fixed_entry_quote_usdc = if !is_exit_like {
+        live_fixed_entry_quote_usdc()
+    } else {
+        None
+    };
+    if let Some(fixed_quote) = fixed_entry_quote_usdc {
+        quote_size = fixed_quote;
+    }
     quote_size = quantize_usdc_micros(quote_size.max(exec_cfg.min_quote_usdc));
     let mut notes: Vec<String> = Vec::with_capacity(3);
     let is_buy = gateway_side.starts_with("buy_");
@@ -356,6 +364,8 @@ pub(super) fn try_decision_to_live_payload(
         } else {
             notes.push("force_entry_fixed_size".to_string());
         }
+    } else if fixed_entry_quote_usdc.is_some() {
+        notes.push("force_entry_fixed_quote".to_string());
     }
     let taker_like = style == "taker" || matches!(tif.as_str(), "FAK" | "FOK");
     let (parity_anchor_source, parity_anchor_cents) =

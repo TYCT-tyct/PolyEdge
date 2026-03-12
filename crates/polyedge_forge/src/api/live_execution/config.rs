@@ -162,6 +162,8 @@ const LIVE_ROUND_TARGET_MATCH_TOLERANCE_MS_MAX: i64 = 120_000;
 const LIVE_REQUIRE_FIXED_ENTRY_SIZE_DEFAULT: bool = true;
 const LIVE_FIXED_ENTRY_SIZE_SHARES_MIN: f64 = 0.0;
 const LIVE_FIXED_ENTRY_SIZE_SHARES_MAX: f64 = 1_000.0;
+const LIVE_FIXED_ENTRY_QUOTE_USDC_MIN: f64 = 0.0;
+const LIVE_FIXED_ENTRY_QUOTE_USDC_MAX: f64 = 1_000.0;
 const LIVE_MAX_OPEN_POSITIONS_DEFAULT: usize = 1;
 const LIVE_MAX_OPEN_POSITIONS_MIN: usize = 1;
 const LIVE_MAX_OPEN_POSITIONS_MAX: usize = 4;
@@ -382,6 +384,18 @@ fn live_require_fixed_entry_size() -> bool {
             )
         })
         .unwrap_or(LIVE_REQUIRE_FIXED_ENTRY_SIZE_DEFAULT)
+}
+
+fn live_fixed_entry_quote_usdc() -> Option<f64> {
+    std::env::var("FORGE_FEV1_FIXED_ENTRY_QUOTE_USDC")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .map(|v| v.clamp(LIVE_FIXED_ENTRY_QUOTE_USDC_MIN, LIVE_FIXED_ENTRY_QUOTE_USDC_MAX))
+        .filter(|v| *v > 0.0)
+}
+
+fn live_has_fixed_entry_sizing() -> bool {
+    live_fixed_entry_size_shares().is_some() || live_fixed_entry_quote_usdc().is_some()
 }
 
 fn live_max_open_positions() -> usize {

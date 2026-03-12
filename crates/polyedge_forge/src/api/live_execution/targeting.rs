@@ -353,7 +353,6 @@ pub(super) async fn gate_live_decisions(
     let max_completed_trades = live_max_completed_trades_for_scope(symbol, market_type);
     let allow_add_orders = live_allow_add_orders();
     let require_fixed_entry_size = live_require_fixed_entry_size();
-    let fixed_entry_size_shares = live_fixed_entry_size_shares();
     
     // OPTIMIZATION: Parallelize 4 state queries to reduce latency (~50-150ms savings)
     // Run all 4 queries concurrently instead of sequentially
@@ -501,11 +500,11 @@ pub(super) async fn gate_live_decisions(
         if mark_attempts
             && matches!(action.as_str(), "enter" | "add")
             && require_fixed_entry_size
-            && fixed_entry_size_shares.is_none()
+            && !live_has_fixed_entry_sizing()
         {
             skipped.push(json!({
                 "reason": "fixed_entry_size_required",
-                "required_env": "FORGE_FEV1_FIXED_ENTRY_SIZE_SHARES",
+                "required_env": "FORGE_FEV1_FIXED_ENTRY_SIZE_SHARES or FORGE_FEV1_FIXED_ENTRY_QUOTE_USDC",
                 "decision": normalized
             }));
             continue;
