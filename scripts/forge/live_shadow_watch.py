@@ -139,7 +139,9 @@ def main() -> int:
                 or safe_len(payload.get("signal_decisions"))
             )
             decision_pool_count = int(
-                shadow_eval.get("decision_pool_count")
+                shadow_eval.get("ledger_signal_count")
+                or shadow_eval.get("decision_pool_count")
+                or gated.get("ledger_signal_count")
                 or gated.get("decision_pool_count")
                 or signal_decision_count
             )
@@ -252,6 +254,7 @@ def main() -> int:
                 "status": status,
                 "mode": mode,
                 "signal_decision_count": signal_decision_count,
+                "ledger_signal_count": decision_pool_count,
                 "decision_pool_count": decision_pool_count,
                 "fresh_signal_count": fresh_signal_count,
                 "candidate_count": candidate_count,
@@ -314,6 +317,10 @@ def main() -> int:
         "signal_decision_count": {
             "avg": avg(signal_decision_count_series),
             "sum": signal_decision_total,
+        },
+        "ledger_signal_count": {
+            "avg": avg(decision_pool_count_series),
+            "sum": decision_pool_total,
         },
         "decision_pool_count": {
             "avg": avg(decision_pool_count_series),

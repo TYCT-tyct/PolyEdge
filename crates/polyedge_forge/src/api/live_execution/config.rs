@@ -170,7 +170,6 @@ const LIVE_MAX_OPEN_POSITIONS_MAX: usize = 4;
 const LIVE_MAX_COMPLETED_TRADES_DEFAULT: usize = 0;
 const LIVE_MAX_COMPLETED_TRADES_MIN: usize = 0;
 const LIVE_MAX_COMPLETED_TRADES_MAX: usize = 1_000;
-const LIVE_ALLOW_ADDS_DEFAULT: bool = true;
 const LIVE_SIGNAL_ENTRY_FRESHNESS_MS_DEFAULT: i64 = 5_000; // OPTIMIZED: Increased from 2s to 5s for short-window markets
 const LIVE_SIGNAL_ENTRY_FRESHNESS_MS_MIN: i64 = 200;
 const LIVE_SIGNAL_ENTRY_FRESHNESS_MS_MAX: i64 = 60_000;
@@ -459,18 +458,6 @@ fn live_max_completed_trades_for_scope(symbol: &str, market_type: &str) -> usize
     default_limit
 }
 
-fn live_allow_add_orders() -> bool {
-    std::env::var("FORGE_FEV1_LIVE_ALLOW_ADDS")
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(LIVE_ALLOW_ADDS_DEFAULT)
-}
-
 pub(super) fn live_signal_entry_freshness_ms() -> i64 {
     std::env::var("FORGE_FEV1_LIVE_SIGNAL_ENTRY_FRESHNESS_MS")
         .ok()
@@ -504,91 +491,14 @@ pub(super) fn live_entry_liquidity_reject_limit() -> u32 {
         )
 }
 
-// ============================================================================
-// FAST PATH OPTIMIZATION: For short-window current_summary signals
-// Reduces checks for high-confidence signals to improve latency
-// ============================================================================
-const LIVE_FAST_PATH_ENABLED_DEFAULT: bool = true;
-const LIVE_FAST_PATH_MIN_SCORE_DEFAULT: f64 = 0.70; // Skip extra checks if score >= 0.7
-const LIVE_FAST_PATH_MIN_REMAINING_MS_DEFAULT: i64 = 30_000; // Skip extra checks if > 30s remaining
-
-pub(super) fn live_fast_path_enabled() -> bool {
-    std::env::var("FORGE_FEV1_LIVE_FAST_PATH_ENABLED")
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(LIVE_FAST_PATH_ENABLED_DEFAULT)
-}
-
-pub(super) fn live_fast_path_min_score() -> f64 {
-    std::env::var("FORGE_FEV1_LIVE_FAST_PATH_MIN_SCORE")
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .unwrap_or(LIVE_FAST_PATH_MIN_SCORE_DEFAULT)
-        .clamp(0.5, 0.95)
-}
-
-pub(super) fn live_fast_path_min_remaining_ms() -> i64 {
-    std::env::var("FORGE_FEV1_LIVE_FAST_PATH_MIN_REMAINING_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .unwrap_or(LIVE_FAST_PATH_MIN_REMAINING_MS_DEFAULT)
-        .clamp(10_000, 120_000)
-}
-
-/// Check if a decision qualifies for fast path optimization
-pub(super) fn decision_qualifies_for_fast_path(decision: &Value, remaining_ms: i64) -> bool {
-    if !live_fast_path_enabled() {
-        return false;
-    }
-    
-    // Must be a current_summary signal
-    let signal_source = decision
-        .get("signal_source")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    if !signal_source.eq_ignore_ascii_case("current_summary") {
-        return false;
-    }
-    
-    // Must have high confidence score
-    let score = decision
-        .get("score")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-    if score.abs() < live_fast_path_min_score() {
-        return false;
-    }
-    
-    // Must have enough remaining time
-    if remaining_ms < live_fast_path_min_remaining_ms() {
-        return false;
-    }
-    
-    true
-}
-
 // =========================================================================
 // P3: Dual parity band config
 // Normal: 1.1c (default) - standard parity protection
 // Aggressive: 1.6c - for high confidence signals (score >= 0.8) or near round close (remaining <= 120s)
 // =========================================================================
-const LIVE_ENTRY_PARITY_BAND_NORMAL_CENTS_DEFAULT: f64 = 1.1;
 const LIVE_ENTRY_PARITY_BAND_AGGRESSIVE_CENTS_DEFAULT: f64 = 1.6;
 const LIVE_ENTRY_PARITY_BAND_AGGRESSIVE_REMAINING_MS: i64 = 120_000;
 const LIVE_ENTRY_PARITY_BAND_AGGRESSIVE_SCORE: f64 = 0.80;
-
-pub(super) fn live_entry_parity_band_normal_cents() -> f64 {
-    std::env::var("FORGE_FEV1_LIVE_ENTRY_PARITY_BAND_NORMAL_CENTS")
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .unwrap_or(LIVE_ENTRY_PARITY_BAND_NORMAL_CENTS_DEFAULT)
-        .clamp(0.5, 5.0)
-}
 
 pub(super) fn live_entry_parity_band_aggressive_cents() -> f64 {
     std::env::var("FORGE_FEV1_LIVE_ENTRY_PARITY_BAND_AGGRESSIVE_CENTS")
@@ -1155,32 +1065,6 @@ pub(super) fn live_maker_max_slippage_bps() -> f64 {
         .and_then(|v| v.trim().parse::<f64>().ok())
         .unwrap_or(LIVE_MAKER_MAX_SLIPPAGE_BPS_DEFAULT)
         .clamp(1.0, 50.0)
-}
-
-// ============================================================================
-// PRE-COMPUTED ORDER TEMPLATE: For ultra-fast execution
-// ============================================================================
-const LIVE_PRECOMPUTE_ENABLED_DEFAULT: bool = true;
-const LIVE_PRECOMPUTE_TTL_MS_DEFAULT: i64 = 5_000; // 5s TTL for pre-computed templates
-
-pub(super) fn live_precompute_enabled() -> bool {
-    std::env::var("FORGE_FEV1_LIVE_PRECOMPUTE_ENABLED")
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(LIVE_PRECOMPUTE_ENABLED_DEFAULT)
-}
-
-pub(super) fn live_precompute_ttl_ms() -> i64 {
-    std::env::var("FORGE_FEV1_LIVE_PRECOMPUTE_TTL_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .unwrap_or(LIVE_PRECOMPUTE_TTL_MS_DEFAULT)
-        .clamp(1_000, 30_000)
 }
 
 // Check if we should use maker strategy for a given spread and remaining time

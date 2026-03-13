@@ -29,7 +29,7 @@ def main() -> None:
                     payload = json.load(response)
                 current = payload.get("current") or {}
                 shadow = ((payload.get("live_execution") or {}).get("summary") or {}).get("shadow_eval") or {}
-                decision = current.get("live_entry_decision") or {}
+                decision = current.get("active_signal") or current.get("live_entry_decision") or {}
                 action = current.get("suggested_action") or "UNKNOWN"
                 row.update(
                     {
@@ -40,7 +40,7 @@ def main() -> None:
                         "entry_threshold": current.get("entry_threshold"),
                         "current_ts_ms": current.get("timestamp_ms"),
                         "live_entry_available": current.get("live_entry_available"),
-                        "live_entry_decision_ts_ms": decision.get("ts_ms"),
+                        "active_signal_ts_ms": decision.get("ts_ms"),
                         "trigger_ts_ms": shadow.get("trigger_ts_ms"),
                         "signal_price_cents": current.get("signal_price_cents"),
                         "paper_entry_exec_price_cents": current.get("paper_entry_exec_price_cents"),
@@ -63,7 +63,7 @@ def main() -> None:
                     reason_counts[reason] = reason_counts.get(reason, 0) + 1
                 if action in ("ENTER_UP", "ENTER_DOWN"):
                     current_ts_ms = row.get("current_ts_ms")
-                    decision_ts_ms = row.get("live_entry_decision_ts_ms")
+                    decision_ts_ms = row.get("active_signal_ts_ms")
                     row["delta_current_vs_decision_ms"] = (
                         None
                         if current_ts_ms is None or decision_ts_ms is None

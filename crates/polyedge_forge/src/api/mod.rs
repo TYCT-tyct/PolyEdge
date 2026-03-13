@@ -223,22 +223,6 @@ impl LiveKillSwitchState {
         self.parity_exhausted_count as f64 / self.entry_attempt_count as f64
     }
 
-    /// Rate of liquidity-empty failures (market microstructure issues - doesn't trigger halt)
-    fn liquidity_empty_rate(&self) -> f64 {
-        if self.entry_attempt_count == 0 {
-            return 0.0;
-        }
-        self.liquidity_empty_count as f64 / self.entry_attempt_count as f64
-    }
-
-    /// Rate of infrastructure failures (transient - doesn't trigger halt)
-    fn infra_error_rate(&self) -> f64 {
-        if self.entry_attempt_count == 0 {
-            return 0.0;
-        }
-        self.infra_error_count as f64 / self.entry_attempt_count as f64
-    }
-
     /// Record an entry attempt with specific failure classification.
     /// - parity_exhausted: price exceeded parity band (systematic execution quality issue)
     /// - liquidity_empty: no orders found / one-sided book (market microstructure)
@@ -296,7 +280,7 @@ fn ks_parity_exhaustion_rate_limit() -> f64 {
     std::env::var("FORGE_KS_PARITY_EXHAUSTION_RATE")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
-        .unwrap_or(0.55)  // Increased from 0.40 - now only counts true parity failures
+        .unwrap_or(0.55) // Increased from 0.40 - now only counts true parity failures
         .clamp(0.1, 0.95)
 }
 
@@ -320,7 +304,7 @@ fn ks_halt_resume_ms() -> i64 {
     std::env::var("FORGE_KS_HALT_RESUME_MS")
         .ok()
         .and_then(|v| v.trim().parse::<i64>().ok())
-        .unwrap_or(10 * 60_000)  // 10 minutes - reduced from 4 hours (now halts are more precise)
+        .unwrap_or(10 * 60_000) // 10 minutes - reduced from 4 hours (now halts are more precise)
         .clamp(60_000, 24 * 3_600_000)
 }
 
@@ -635,6 +619,8 @@ struct LivePendingOrder {
     decision_key: String,
     #[serde(default)]
     intent_id: String,
+    #[serde(default)]
+    attempt_id: String,
     #[serde(default)]
     decision_id: String,
     price_cents: f64,
@@ -970,6 +956,30 @@ fn normalize_runtime_signal_decisions(
         .into_iter()
         .filter_map(|mut decision| {
             let obj = decision.as_object_mut()?;
+            if let Some(action) = obj
+                .get("action")
+                .and_then(Value::as_str)
+                .map(|v| v.to_ascii_lowercase())
+            {
+                obj.insert("action".to_string(), json!(action));
+            }
+            if let Some(side) = obj
+                .get("side")
+                .and_then(Value::as_str)
+                .map(|v| v.to_ascii_uppercase())
+            {
+                obj.insert("side".to_string(), json!(side));
+            }
+            if obj
+                .get("price_cents")
+                .and_then(Value::as_f64)
+                .filter(|v| v.is_finite())
+                .is_none()
+            {
+                if let Some(signal_price) = obj.get("signal_price_cents").cloned() {
+                    obj.insert("price_cents".to_string(), signal_price);
+                }
+            }
             let quote_ok = obj
                 .get("quote_size_usdc")
                 .and_then(Value::as_f64)
@@ -979,40 +989,62 @@ fn normalize_runtime_signal_decisions(
                 obj.insert("quote_size_usdc".to_string(), json!(default_quote));
             }
 
+            let has_intent_id = obj
+                .get("intent_id")
+                .and_then(Value::as_str)
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
             let has_decision_id = obj
                 .get("decision_id")
                 .and_then(Value::as_str)
                 .map(|v| !v.trim().is_empty())
                 .unwrap_or(false);
             if !has_decision_id {
-                let action = obj
-                    .get("action")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_ascii_lowercase();
-                let side = obj
-                    .get("side")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_ascii_uppercase();
-                let round_id = obj.get("round_id").and_then(Value::as_str).unwrap_or("na");
-                let ts_ms = obj.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
-                obj.insert(
-                    "decision_id".to_string(),
-                    Value::String(format!(
-                        "fev1:{}:{}:{}:{}:{}",
-                        market_type, action, side, round_id, ts_ms
-                    )),
-                );
+                if let Some(intent_id) = obj.get("intent_id").cloned() {
+                    obj.insert("decision_id".to_string(), intent_id);
+                } else {
+                    let action = obj
+                        .get("action")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_ascii_lowercase();
+                    let side = obj
+                        .get("side")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_ascii_uppercase();
+                    let round_id = obj.get("round_id").and_then(Value::as_str).unwrap_or("na");
+                    let ts_ms = obj.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
+                    obj.insert(
+                        "decision_id".to_string(),
+                        Value::String(format!(
+                            "fev1:{}:{}:{}:{}:{}",
+                            market_type, action, side, round_id, ts_ms
+                        )),
+                    );
+                }
             }
-            let has_intent_id = obj
-                .get("intent_id")
-                .and_then(Value::as_str)
-                .map(|v| !v.trim().is_empty())
-                .unwrap_or(false);
             if !has_intent_id {
                 if let Some(decision_id) = obj.get("decision_id").cloned() {
                     obj.insert("intent_id".to_string(), decision_id);
+                }
+            }
+            if obj.get("signal_source").is_none() {
+                obj.insert("signal_source".to_string(), json!("signal_decision"));
+            }
+            let action = obj
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if action == "enter" && obj.get("paper_entry_exec_price_cents").is_none() {
+                if let Some(v) = obj.get("paper_expected_exec_price_cents").cloned() {
+                    obj.insert("paper_entry_exec_price_cents".to_string(), v);
+                }
+            }
+            if action == "exit" && obj.get("paper_exit_exec_price_cents").is_none() {
+                if let Some(v) = obj.get("paper_expected_exec_price_cents").cloned() {
+                    obj.insert("paper_exit_exec_price_cents".to_string(), v);
                 }
             }
             Some(decision)
@@ -1020,64 +1052,70 @@ fn normalize_runtime_signal_decisions(
         .collect()
 }
 
-fn normalize_current_live_entry_decision(
+fn normalize_current_active_signal(
     payload: &Value,
     market_type: &str,
     quote_usdc: f64,
 ) -> Option<Value> {
     let decision = payload
         .get("current")
-        .and_then(|v| v.get("live_entry_decision"))
+        .and_then(|v| v.get("active_signal"))
         .cloned()?;
-    normalize_runtime_signal_decisions(market_type, vec![decision], quote_usdc)
-        .into_iter()
-        .next()
+    let mut normalized =
+        normalize_runtime_signal_decisions(market_type, vec![decision], quote_usdc)
+            .into_iter()
+            .next()?;
+    if let Some(obj) = normalized.as_object_mut() {
+        obj.insert("signal_source".to_string(), json!("active_signal"));
+    }
+    Some(normalized)
 }
 
 fn select_live_execution_candidates(
-    paper_decisions: &[Value],
-    current_live_entry_decision: Option<Value>,
+    active_signal: Option<Value>,
     latest_ts_ms: i64,
     max_orders: usize,
     drain_only: bool,
     prefer_action: Option<&str>,
 ) -> (Vec<Value>, usize, &'static str, bool) {
-    let selected_from_pool = select_live_decisions(
-        paper_decisions,
-        latest_ts_ms,
-        max_orders,
-        drain_only,
-        prefer_action,
-    );
-    let fresh_signal_count = count_fresh_live_decisions(paper_decisions, latest_ts_ms, drain_only);
-    let current_entry_available = current_live_entry_decision.is_some();
-    // Layer 1: current_summary fallback
-    // 当 pool 为空时，使用 current_live_entry_decision 作为兜底
-    if selected_from_pool.is_empty() && !drain_only && prefer_action.is_none() {
-        if let Some(current_entry) = current_live_entry_decision {
-            return (
-                vec![current_entry],
-                1,
-                "current_summary_fallback",
-                true,
-            );
-        }
+    let Some(signal) = active_signal else {
+        return (Vec::new(), 0, "none", false);
+    };
+    let expires_at_ms = signal
+        .get("expires_at_ms")
+        .and_then(Value::as_i64)
+        .unwrap_or(i64::MAX);
+    let action = signal
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let current_entry_available = action == "enter" && expires_at_ms > latest_ts_ms;
+    if expires_at_ms <= latest_ts_ms {
+        return (Vec::new(), 0, "active_signal_expired", false);
+    }
+    if drain_only && action != "exit" {
         return (
             Vec::new(),
             0,
-            "pool_empty_no_current_entry",
-            false,
+            "active_signal_drain_only",
+            current_entry_available,
         );
     }
-    let effective_fresh_count = if current_entry_available {
-        fresh_signal_count.max(1)
-    } else {
-        fresh_signal_count
-    };
+    if let Some(prefer) = prefer_action {
+        if action != prefer.to_ascii_lowercase() {
+            return (
+                Vec::new(),
+                0,
+                "active_signal_prefer_action_mismatch",
+                current_entry_available,
+            );
+        }
+    }
     (
-        selected_from_pool,
-        effective_fresh_count,
-        "decision_pool",
+        vec![signal],
+        min(max_orders.max(1), 1),
+        "active_signal",
         current_entry_available,
     )
 }
@@ -1690,6 +1728,7 @@ fn enrich_paper_records_with_live_fills(
     (out, matched)
 }
 
+#[allow(dead_code)]
 fn merge_current_summary_paper_records(
     paper_records: &[Value],
     selected_decisions: &[Value],
@@ -1741,6 +1780,8 @@ fn merge_current_summary_paper_records(
 fn build_live_order_lineage(events: &[Value], pending_rows: &[LivePendingOrder]) -> Vec<Value> {
     #[derive(Default)]
     struct LineageAcc {
+        intent_id: String,
+        attempt_ids: BTreeSet<String>,
         order_ids: BTreeSet<String>,
         pending_order_ids: BTreeSet<String>,
         last_reason: String,
@@ -1756,6 +1797,21 @@ fn build_live_order_lineage(events: &[Value], pending_rows: &[LivePendingOrder])
         };
         let ts_ms = ev.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
         let row = acc.entry(decision_id).or_default();
+        if row.intent_id.trim().is_empty() {
+            row.intent_id = ev
+                .get("intent_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+        }
+        if let Some(attempt_id) = ev
+            .get("attempt_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            row.attempt_ids.insert(attempt_id.to_string());
+        }
         if let Some(order_id) = extract_order_id_from_live_event(ev) {
             row.order_ids.insert(order_id);
         }
@@ -1790,6 +1846,12 @@ fn build_live_order_lineage(events: &[Value], pending_rows: &[LivePendingOrder])
             continue;
         }
         let entry = acc.entry(row.decision_id.clone()).or_default();
+        if entry.intent_id.trim().is_empty() {
+            entry.intent_id = row.intent_id.clone();
+        }
+        if !row.attempt_id.trim().is_empty() {
+            entry.attempt_ids.insert(row.attempt_id.clone());
+        }
         if !row.order_id.trim().is_empty() {
             entry.order_ids.insert(row.order_id.clone());
             entry.pending_order_ids.insert(row.order_id.clone());
@@ -1803,8 +1865,9 @@ fn build_live_order_lineage(events: &[Value], pending_rows: &[LivePendingOrder])
         .map(|(decision_id, row)| {
             let pending_count = row.pending_order_ids.len();
             json!({
-                "intent_id": decision_id.clone(),
+                "intent_id": if row.intent_id.trim().is_empty() { decision_id.clone() } else { row.intent_id },
                 "decision_id": decision_id,
+                "attempt_ids": row.attempt_ids.into_iter().collect::<Vec<_>>(),
                 "order_ids": row.order_ids.into_iter().collect::<Vec<_>>(),
                 "pending_order_ids": row.pending_order_ids.into_iter().collect::<Vec<_>>(),
                 "pending_count": pending_count,
@@ -1955,15 +2018,18 @@ fn build_live_completed_records(
                     );
                     obj.insert(
                         "last_ts_ms".to_string(),
-                        lineage_row
-                            .get("last_ts_ms")
-                            .cloned()
-                            .unwrap_or_else(|| {
-                                fill_row.get("fill_ts_ms").cloned().unwrap_or(Value::Null)
-                            }),
+                        lineage_row.get("last_ts_ms").cloned().unwrap_or_else(|| {
+                            fill_row.get("fill_ts_ms").cloned().unwrap_or(Value::Null)
+                        }),
                     );
                 } else {
-                    obj.insert("order_ids".to_string(), fill_row.get("order_ids").cloned().unwrap_or_else(|| json!([])));
+                    obj.insert(
+                        "order_ids".to_string(),
+                        fill_row
+                            .get("order_ids")
+                            .cloned()
+                            .unwrap_or_else(|| json!([])),
+                    );
                     obj.insert("pending_order_ids".to_string(), json!([]));
                     obj.insert("pending_count".to_string(), json!(0_u64));
                     obj.insert(
@@ -2576,7 +2642,10 @@ impl ApiState {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let store = self.live_kill_switch.read().await;
         let key = runtime_scope_key(symbol, market_type);
-        store.get(&key).map(|s| s.is_halted(now_ms)).unwrap_or(false)
+        store
+            .get(&key)
+            .map(|s| s.is_halted(now_ms))
+            .unwrap_or(false)
     }
 
     pub(super) async fn ks_halt_reason(&self, symbol: &str, market_type: &str) -> Option<String> {
@@ -2593,14 +2662,23 @@ impl ApiState {
             return EntryAttemptReason::ParityExhausted;
         }
         // Infrastructure errors
-        if r.contains("timeout") || r.contains("5") || r.contains("network")
-            || r.contains("connection") || r.contains("503") || r.contains("502") {
+        if r.contains("timeout")
+            || r.contains("5")
+            || r.contains("network")
+            || r.contains("connection")
+            || r.contains("503")
+            || r.contains("502")
+        {
             return EntryAttemptReason::InfraError;
         }
         // Liquidity empty - market microstructure issues (not a system failure)
-        if r.contains("no orders found") || r.contains("one_sided_book")
-            || r.contains("liquidity_empty") || r.contains("insufficient_book_depth")
-            || r.contains("no top1") || r.contains("liquidity no top1") {
+        if r.contains("no orders found")
+            || r.contains("one_sided_book")
+            || r.contains("liquidity_empty")
+            || r.contains("insufficient_book_depth")
+            || r.contains("no top1")
+            || r.contains("liquidity no top1")
+        {
             return EntryAttemptReason::LiquidityEmpty;
         }
         // Unknown - treat as liquidity empty for safety (don't trigger halt)
@@ -2617,7 +2695,7 @@ impl ApiState {
         let reason = error_reason
             .map(Self::classify_entry_failure)
             .unwrap_or(EntryAttemptReason::Success);
-        
+
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut store = self.live_kill_switch.write().await;
         let key = runtime_scope_key(symbol, market_type);
@@ -2625,13 +2703,13 @@ impl ApiState {
             .entry(key)
             .or_insert_with(|| LiveKillSwitchState::new(now_ms));
         ks.record_entry_attempt(now_ms, reason);
-        
+
         // Only parity exhaustion triggers Layer 2 halt - not liquidity_empty or infra_error
         if reason == EntryAttemptReason::ParityExhausted {
             // Check Layer 2: execution quality (only for parity failures)
             let rate = ks.parity_exhaustion_rate();
             let limit = ks_parity_exhaustion_rate_limit();
-            let min_samples = 12;  // Increased from 10 for more stable rate
+            let min_samples = 12; // Increased from 10 for more stable rate
             if !ks.is_halted(now_ms) && ks.entry_attempt_count >= min_samples && rate > limit {
                 let resume_ms = now_ms + ks_halt_resume_ms();
                 ks.halt(
@@ -2685,7 +2763,11 @@ impl ApiState {
         if loss > ks_daily_loss_limit_cents() {
             ks.halt(
                 now_ms,
-                &format!("layer1_daily_loss:{:.1}c_limit:{:.1}c", loss, ks_daily_loss_limit_cents()),
+                &format!(
+                    "layer1_daily_loss:{:.1}c_limit:{:.1}c",
+                    loss,
+                    ks_daily_loss_limit_cents()
+                ),
                 Some(resume_ms),
             );
             return;
@@ -2695,7 +2777,11 @@ impl ApiState {
         if dd > ks_daily_drawdown_limit_cents() {
             ks.halt(
                 now_ms,
-                &format!("layer1_daily_drawdown:{:.1}c_limit:{:.1}c", dd, ks_daily_drawdown_limit_cents()),
+                &format!(
+                    "layer1_daily_drawdown:{:.1}c_limit:{:.1}c",
+                    dd,
+                    ks_daily_drawdown_limit_cents()
+                ),
                 Some(resume_ms),
             );
             return;
@@ -2927,8 +3013,7 @@ impl ApiState {
                         .map(|(a, b)| a.eq_ignore_ascii_case(b))
                         .unwrap_or(false);
                     let within_window = st.entry_liquidity_reject_last_ts_ms > 0
-                        && event_ts_ms
-                            .saturating_sub(st.entry_liquidity_reject_last_ts_ms)
+                        && event_ts_ms.saturating_sub(st.entry_liquidity_reject_last_ts_ms)
                             <= window_ms;
                     if same_round && same_side && within_window {
                         st.entry_liquidity_reject_count =
@@ -3470,7 +3555,7 @@ async fn live_runtime_background_maintenance(state: ApiState, bootstrap: LiveRun
                 book_prewarm_at.insert(market.clone(), now_ms);
             }
         }
-            tokio::time::sleep(Duration::from_millis(50)).await; // OPTIMIZED: 120ms -> 50ms for faster prewarming
+        tokio::time::sleep(Duration::from_millis(50)).await; // OPTIMIZED: 120ms -> 50ms for faster prewarming
     }
 }
 
@@ -4186,19 +4271,15 @@ async fn live_runtime_loop(
                         } else {
                             None
                         };
-                    let current_live_entry_decision = normalize_current_live_entry_decision(
-                        &payload,
-                        market_type,
-                        cfg.quote_usdc,
-                    );
+                    let active_signal =
+                        normalize_current_active_signal(&payload, market_type, cfg.quote_usdc);
                     let (
                         mut selected_decisions,
                         fresh_signal_count,
                         candidate_source,
                         current_entry_available,
                     ) = select_live_execution_candidates(
-                        &paper_decisions,
-                        current_live_entry_decision,
+                        active_signal,
                         latest_ts_ms,
                         cfg.max_orders.max(1),
                         effective_drain_only,
@@ -4219,25 +4300,29 @@ async fn live_runtime_loop(
                             &base_exec_cfg,
                         )
                         .await;
-                    
+
                     if effective_live_execute || pending_before_count > 0 {
                         reconcile_live_reports(&state, &exec_cfg_tuned).await;
                         handle_live_pending_timeouts(&state, &exec_cfg_tuned).await;
                     }
 
-                    let decision_pool_count = paper_decisions.len();
+                    let ledger_signal_count = paper_decisions.len();
                     let candidate_count = selected_decisions.len();
-                    
+
                     // OPTIMIZATION: Aggressive book prewarming when candidates exist
                     // This ensures books are fresh for fast execution
                     if candidate_count > 0 {
                         if let Ok(target) = resolve_live_market_target_fast_with_state(
-                            &state, runtime_symbol, market_type,
-                        ).await {
+                            &state,
+                            runtime_symbol,
+                            market_type,
+                        )
+                        .await
+                        {
                             let _ = prewarm_rust_books_for_target(&state, &target).await;
                         }
                     }
-                    
+
                     let (gated, mut state_skipped, position_for_submit) = gate_live_decisions(
                         &state,
                         runtime_symbol,
@@ -4384,8 +4469,7 @@ async fn live_runtime_loop(
                         .await;
                     let (live_fill_by_decision, live_fill_summary) =
                         build_live_fill_decision_map(&live_events_all);
-                    let paper_records =
-                        merge_current_summary_paper_records(&paper_decisions, &selected_decisions);
+                    let paper_records = paper_decisions.clone();
                     let (paper_records_enriched, paper_live_fill_count) =
                         enrich_paper_records_with_live_fills(
                             &paper_records,
@@ -4406,7 +4490,9 @@ async fn live_runtime_loop(
                             .get("live_fill")
                             .and_then(|f| f.get("action"))
                             .and_then(Value::as_str)
-                            .map(|a| a.eq_ignore_ascii_case("exit") || a.eq_ignore_ascii_case("reduce"))
+                            .map(|a| {
+                                a.eq_ignore_ascii_case("exit") || a.eq_ignore_ascii_case("reduce")
+                            })
                             .unwrap_or(false);
                         if !has_exit_fill {
                             continue;
@@ -4462,8 +4548,9 @@ async fn live_runtime_loop(
                                 "enabled": !effective_live_execute,
                                 "status": execution_status.clone(),
                                 "trigger_ts_ms": trigger_for_market.map(|v| v.ts_ms),
-                                "decision_pool_count": decision_pool_count,
-                                "raw_signal_count": decision_pool_count,
+                                "ledger_signal_count": ledger_signal_count,
+                                "decision_pool_count": ledger_signal_count,
+                                "raw_signal_count": ledger_signal_count,
                                 "fresh_signal_count": fresh_signal_count,
                                 "candidate_count": candidate_count,
                                 "candidate_source": candidate_source,
@@ -4507,8 +4594,9 @@ async fn live_runtime_loop(
                         },
                         "execution_policy": live_execution_policy_meta(),
                         "gated": {
-                            "decision_pool_count": decision_pool_count,
-                            "raw_signal_count": decision_pool_count,
+                            "ledger_signal_count": ledger_signal_count,
+                            "decision_pool_count": ledger_signal_count,
+                            "raw_signal_count": ledger_signal_count,
                             "fresh_signal_count": fresh_signal_count,
                             "candidate_count": candidate_count,
                             "selected_count": submitted_decisions.len(),
@@ -4878,89 +4966,51 @@ mod tests {
     }
 
     #[test]
-    fn select_live_decisions_skips_replay_force_close_reasons() {
-        let decisions = vec![json!({
-            "action": "exit",
-            "side": "UP",
-            "round_id": "r-1",
-            "ts_ms": 1_000_i64,
-            "reason": "end_of_samples_force_close"
-        })];
-        let selected = select_live_decisions(&decisions, 1_100, 1, false, Some("exit"));
-        assert!(selected.is_empty());
-    }
-
-    #[test]
-    fn select_live_decisions_does_not_fallback_to_stale_non_drain_decision() {
-        let decisions = vec![json!({
-            "action": "enter",
-            "side": "UP",
-            "round_id": "old-round",
-            "ts_ms": 1_000_i64,
-            "reason": "fev1_signal_entry"
-        })];
-        let latest_ts_ms = 250_000_i64;
-        let selected = select_live_decisions(&decisions, latest_ts_ms, 1, false, Some("enter"));
-        assert!(selected.is_empty());
-    }
-
-    #[test]
-    fn select_live_execution_candidates_uses_fallback_when_pool_empty() {
-        // Layer 1: 启用 current_summary fallback
-        // 当 paper_decisions pool 为空时，使用 current_summary 作为兜底
-        let paper_decisions = vec![json!({
-            "action": "enter",
-            "side": "DOWN",
-            "round_id": "old-round",
-            "ts_ms": 1_000_i64,
-            "reason": "fev1_signal_entry",
-            "decision_id": "old-decision",
-            "quote_size_usdc": 1.0
-        })];
-        let current_live_entry_decision = Some(json!({
+    fn select_live_execution_candidates_uses_active_signal_only() {
+        let active_signal = Some(json!({
             "action": "enter",
             "side": "DOWN",
             "round_id": "r-1",
             "ts_ms": 250_000_i64,
-            "reason": "fev1_current_summary_entry",
-            "decision_id": "summary-decision",
-            "quote_size_usdc": 1.0,
+            "expires_at_ms": 250_300_i64,
+            "reason": "fev1_signal_entry",
+            "intent_id": "intent-1",
+            "quote_size_usdc": 5.0,
             "price_cents": 51.2
         }));
         let (selected, fresh_count, candidate_source, current_entry_available) =
-            select_live_execution_candidates(
-                &paper_decisions,
-                current_live_entry_decision,
-                250_000_i64,
-                1,
-                false,
-                None,
-            );
-        // 验证：pool 为空时，使用 current_summary fallback
+            select_live_execution_candidates(active_signal, 250_000_i64, 1, false, None);
         assert_eq!(selected.len(), 1);
-        assert_eq!(candidate_source, "current_summary_fallback");
+        assert_eq!(candidate_source, "active_signal");
         assert_eq!(fresh_count, 1);
         assert!(current_entry_available);
     }
 
     #[test]
-    fn select_live_execution_candidates_returns_empty_when_pool_and_current_entry_both_empty() {
-        // 当 pool 为空且没有 current_entry 时，返回空
-        let paper_decisions = vec![];
-        let current_live_entry_decision: Option<Value> = None;
+    fn select_live_execution_candidates_returns_empty_when_active_signal_missing() {
         let (selected, fresh_count, candidate_source, current_entry_available) =
-            select_live_execution_candidates(
-                &paper_decisions,
-                current_live_entry_decision,
-                250_000_i64,
-                1,
-                false,
-                None,
-            );
-        // 验证：两者都为空时返回空
+            select_live_execution_candidates(None, 250_000_i64, 1, false, None);
         assert_eq!(selected.len(), 0);
-        assert_eq!(candidate_source, "pool_empty_no_current_entry");
+        assert_eq!(candidate_source, "none");
         assert_eq!(fresh_count, 0);
+        assert!(!current_entry_available);
+    }
+
+    #[test]
+    fn select_live_execution_candidates_rejects_expired_active_signal() {
+        let active_signal = Some(json!({
+            "action": "enter",
+            "side": "UP",
+            "round_id": "r-1",
+            "ts_ms": 100_i64,
+            "expires_at_ms": 150_i64,
+            "intent_id": "intent-expired"
+        }));
+        let (selected, fresh_count, candidate_source, current_entry_available) =
+            select_live_execution_candidates(active_signal, 250_i64, 1, false, None);
+        assert!(selected.is_empty());
+        assert_eq!(fresh_count, 0);
+        assert_eq!(candidate_source, "active_signal_expired");
         assert!(!current_entry_available);
     }
 
@@ -5196,7 +5246,10 @@ mod tests {
             build_live_completed_records(&paper_records, &fill_by_decision, &live_order_lineage);
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
-        assert_eq!(row.get("live_status").and_then(Value::as_str), Some("filled"));
+        assert_eq!(
+            row.get("live_status").and_then(Value::as_str),
+            Some("filled")
+        );
         assert_eq!(
             row.get("actual_fill_price_cents").and_then(Value::as_f64),
             Some(63.0)

@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 
 use serde_json::{json, Value};
@@ -6,7 +7,76 @@ const OFFICIAL_TAKER_FEE_MAX_RATE: f64 = 0.25;
 const OFFICIAL_TAKER_FEE_EXPONENT: f64 = 2.0;
 const MAX_BLOCKED_EXIT_STREAK: usize = 3;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Intent action types - only Enter/Exit allowed (no Add/Reduce)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IntentAction {
+    Enter,
+    Exit,
+}
+
+/// Intent size representation - using micros to avoid float issues
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum IntentSize {
+    /// Fixed quote in micros: FixedQuoteUsdcMicros(5_000_000) = $5.00
+    FixedQuoteUsdcMicros(u64),
+    FullPosition,
+}
+
+/// ActiveIntent - Strategy layer immutable signal truth
+/// This is the ONLY real-time signal source for both Paper and Live
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveIntent {
+    /// Unique identifier: fev1:{market}:{action}:{side}:{round_id}:{ts_ms}
+    pub intent_id: String,
+    /// Position ID: pos:{entry_intent_id}, fixed at entry, reused by exit
+    pub position_id: String,
+    /// Action: Enter or Exit
+    pub action: IntentAction,
+    /// Direction: UP or DOWN (strategy layer semantics)
+    pub side: Side,
+    /// Size specification
+    pub size: IntentSize,
+    /// Round identifier
+    pub round_id: String,
+    /// Signal generation timestamp
+    pub ts_ms: i64,
+    /// Expiration: ts_ms + TTL
+    pub expires_at_ms: i64,
+    /// Remaining time in market
+    pub remaining_ms: i64,
+    /// Reason for the intent (signal_enter, stop_loss, take_profit, etc.)
+    pub reason: String,
+    /// Signal trigger price: side-specific book touch price
+    /// Enter + UP: ask_yes * 100
+    /// Enter + DOWN: ask_no * 100
+    /// Exit + UP: bid_yes * 100
+    /// Exit + DOWN: bid_no * 100
+    pub signal_price_cents: f64,
+    /// Price cents (alias for live execution compatibility)
+    pub price_cents: f64,
+    /// Paper expected execution anchor at signal time (touch + fee + slippage + impact)
+    pub paper_expected_exec_price_cents: f64,
+    /// Paper entry exec price (for live execution compatibility)
+    pub paper_entry_exec_price_cents: Option<f64>,
+    /// Paper exit exec price (for live execution compatibility)
+    pub paper_exit_exec_price_cents: Option<f64>,
+    /// Paper fee estimate at signal time
+    pub paper_fee_cents: f64,
+    /// Paper slippage estimate at signal time
+    pub paper_slippage_cents: f64,
+    /// Paper impact estimate at signal time
+    pub paper_impact_cents: f64,
+    /// Signal score
+    pub score: f64,
+    /// Signal confidence
+    pub confidence: f64,
+    /// Quote size in USDC (for live execution compatibility)
+    pub quote_size_usdc: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
 pub enum Side {
     Up,
     Down,
@@ -126,6 +196,69 @@ fn decision_id(action: &str, side: Side, round_id: &str, ts_ms: i64) -> String {
         round_id,
         ts_ms
     )
+}
+
+fn active_intent_ttl_ms(env_key: &str, default_ms: i64) -> i64 {
+    std::env::var(env_key)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default_ms)
+}
+
+fn active_intent_entry_ttl_ms() -> i64 {
+    active_intent_ttl_ms("FORGE_SIGNAL_ENTRY_TTL_MS", 300)
+}
+
+fn active_intent_exit_ttl_ms() -> i64 {
+    active_intent_ttl_ms("FORGE_SIGNAL_EXIT_TTL_MS", 800)
+}
+
+fn compat_live_entry_decision_from_active_intent(intent: Option<&ActiveIntent>) -> Option<Value> {
+    let intent = intent?;
+    if intent.action != IntentAction::Enter {
+        return None;
+    }
+    let (entry_tif, entry_style, entry_ttl_ms, entry_slippage_bps) =
+        entry_execution_policy(intent.remaining_ms, intent.score.abs());
+    let paper_entry_exec_price_cents = intent
+        .paper_entry_exec_price_cents
+        .unwrap_or(intent.paper_expected_exec_price_cents)
+        .clamp(1.0, 99.0);
+    Some(json!({
+        "intent_id": intent.intent_id,
+        "decision_id": intent.intent_id,
+        "position_id": intent.position_id,
+        "action": "enter",
+        "side": intent.side.as_str(),
+        "round_id": intent.round_id,
+        "ts_ms": intent.ts_ms,
+        "expires_at_ms": intent.expires_at_ms,
+        "remaining_ms": intent.remaining_ms,
+        "reason": intent.reason,
+        "signal_source": "active_signal",
+        "price_cents": intent.signal_price_cents.clamp(1.0, 99.0),
+        "signal_price_cents": intent.signal_price_cents.clamp(1.0, 99.0),
+        "paper_entry_raw_price_cents": intent.signal_price_cents.clamp(1.0, 99.0),
+        "paper_expected_exec_price_cents": intent.paper_expected_exec_price_cents.clamp(1.0, 99.0),
+        "paper_entry_exec_price_cents": paper_entry_exec_price_cents,
+        "paper_entry_fee_cents": intent.paper_fee_cents.max(0.0),
+        "paper_entry_slippage_cents": intent.paper_slippage_cents.max(0.0),
+        "paper_entry_impact_cents": intent.paper_impact_cents.max(0.0),
+        "paper_entry_total_cost_cents": (
+            intent.paper_fee_cents.max(0.0)
+                + intent.paper_slippage_cents.max(0.0)
+                + intent.paper_impact_cents.max(0.0)
+        ),
+        "entry_score": intent.score.abs(),
+        "edge_score": intent.score.abs(),
+        "confidence": intent.confidence,
+        "quote_size_usdc": intent.quote_size_usdc.max(0.0),
+        "tif": entry_tif,
+        "style": entry_style,
+        "ttl_ms": entry_ttl_ms,
+        "max_slippage_bps": entry_slippage_bps
+    }))
 }
 
 fn entry_execution_policy(
@@ -484,6 +617,9 @@ struct SimulationCoreState {
     session_start_ts_ms: i64,
     last_sample: Option<Sample>,
     sample_count: usize,
+    /// Current active intent - the ONLY real-time signal source
+    /// Generated at each tick based on pre-change position
+    last_active_intent: Option<ActiveIntent>,
 }
 
 impl SimulationCoreState {
@@ -519,6 +655,7 @@ impl SimulationCoreState {
             session_start_ts_ms,
             last_sample: None,
             sample_count: 0,
+            last_active_intent: None,
         }
     }
 
@@ -545,6 +682,10 @@ impl SimulationCoreState {
         self.last_p_fair_up = signal.p_fair_up;
         self.last_edge_prob = signal.edge_prob;
         self.last_side = side.as_str();
+
+        // CRITICAL: Evaluate ActiveIntent BEFORE position changes
+        // This is the ONLY real-time signal source for both Paper and Live
+        self.last_active_intent = self.evaluate_active_intent(sample, cfg, fee_ctx);
 
         if let Some(pos) = self.position.as_mut() {
             let bid_raw = side_bid(sample, pos.side) * 100.0;
@@ -852,43 +993,282 @@ impl SimulationCoreState {
         self.sample_count = self.sample_count.saturating_add(1);
     }
 
-    fn current_live_entry_decision(
+    /// Evaluate ActiveIntent - the core decision function
+    /// MUST be called BEFORE position changes (based on pre-change position state)
+    /// This is the ONLY real-time signal source for both Paper and Live
+    fn evaluate_active_intent(
         &self,
+        sample: &Sample,
         cfg: &RuntimeConfig,
         fee_ctx: Option<&FeeModelContext>,
-    ) -> Option<Value> {
-        let sample = self.last_sample.as_ref()?;
-        if self.position.is_some()
-            || !self.last_confirmed
-            || self.last_score.abs() < self.last_entry_threshold
-        {
+    ) -> Option<ActiveIntent> {
+        let ts_ms = sample.ts_ms;
+        let round_id = sample.round_id.clone();
+
+        let entry_ttl_ms = active_intent_entry_ttl_ms();
+        let exit_ttl_ms = active_intent_exit_ttl_ms();
+
+        // Check: has position -> evaluate Exit
+        if let Some(pos_ref) = self.position.as_ref() {
+            let mut pos = pos_ref.clone();
+            let bid_raw = side_bid(sample, pos.side) * 100.0;
+            let spread_side_cents = side_spread(sample, pos.side) * 100.0;
+            let exit_fee = taker_fee_cents(bid_raw, pos.side, fee_ctx);
+            let mut exit_impact_cents =
+                execution_impact_cents(sample, pos.side, cfg, sample.remaining_ms, false);
+            let mut exit_exec =
+                bid_raw - cfg.slippage_cents_per_side - exit_fee - exit_impact_cents;
+            let pnl = exit_exec - pos.entry_price_cents;
+            if pnl > pos.peak_pnl_cents {
+                pos.peak_pnl_cents = pnl;
+            }
+            let drawdown = pos.peak_pnl_cents - pnl;
+            let held_ms = (ts_ms - pos.entry_ts_ms).max(0);
+            let trend_signed = self.last_score * pos.side.dir();
+            if trend_signed <= cfg.reverse_signal_threshold {
+                pos.reverse_streak = pos.reverse_streak.saturating_add(1);
+            } else {
+                pos.reverse_streak = 0;
+            }
+            let can_exit_now = held_ms >= cfg.min_hold_ms;
+            let mut exit_reason: Option<&str> = None;
+
+            if sample.round_id != pos.entry_round_id {
+                exit_reason = Some("round_rollover");
+            } else if bid_raw >= cfg.take_profit_near_max_cents {
+                exit_reason = Some("near_max_take_profit");
+            } else if sample.remaining_ms <= cfg.endgame_remaining_ms
+                && bid_raw >= cfg.endgame_take_profit_cents
+            {
+                exit_reason = Some("endgame_take_profit");
+            } else if can_exit_now && milli_cents(pnl) <= -milli_cents(cfg.stop_loss_cents) {
+                let can_fill_now = spread_side_cents <= cfg.max_exec_spread_cents;
+                if can_fill_now || cfg.stop_loss_grace_ticks == 0 {
+                    pos.soft_stop_pending_ticks = 0;
+                    exit_reason = Some("stop_loss");
+                } else {
+                    pos.soft_stop_pending_ticks = pos.soft_stop_pending_ticks.saturating_add(1);
+                    let hard_stop = -cfg.stop_loss_cents * cfg.stop_loss_hard_mult.max(1.0);
+                    let reverse_trigger = pos.reverse_streak
+                        >= cfg
+                            .reverse_signal_ticks
+                            .saturating_add(cfg.stop_loss_reverse_extra_ticks);
+                    let should_force = milli_cents(pnl) <= milli_cents(hard_stop)
+                        || reverse_trigger
+                        || sample.remaining_ms <= cfg.endgame_remaining_ms
+                        || pos.soft_stop_pending_ticks >= cfg.stop_loss_grace_ticks;
+                    if should_force {
+                        exit_reason = Some("stop_loss_wide_grace");
+                    }
+                }
+            } else if can_exit_now && pos.reverse_streak >= cfg.reverse_signal_ticks {
+                pos.soft_stop_pending_ticks = 0;
+                exit_reason = Some("signal_reverse");
+            } else if can_exit_now
+                && pos.peak_pnl_cents >= cfg.trail_activate_profit_cents
+                && drawdown >= cfg.trail_drawdown_cents
+            {
+                pos.soft_stop_pending_ticks = 0;
+                exit_reason = Some("trail_drawdown");
+            } else if can_exit_now && side_spread(sample, pos.side) >= cfg.liquidity_widen_prob {
+                pos.soft_stop_pending_ticks = 0;
+                exit_reason = Some("liquidity_widen");
+            } else {
+                pos.soft_stop_pending_ticks = 0;
+            }
+
+            if exit_reason.is_none() {
+                pos.blocked_exit_streak = 0;
+            }
+
+            if let Some(reason) = exit_reason {
+                let emergency = matches!(
+                    reason,
+                    "round_rollover"
+                        | "stop_loss"
+                        | "stop_loss_wide_grace"
+                        | "endgame_take_profit"
+                        | "signal_reverse"
+                );
+                let can_fill = spread_side_cents <= cfg.max_exec_spread_cents;
+                let mut escalated_for_blocked_exit = false;
+                if !can_fill && !emergency {
+                    pos.blocked_exit_streak = pos.blocked_exit_streak.saturating_add(1);
+                    if pos.blocked_exit_streak < MAX_BLOCKED_EXIT_STREAK {
+                        return None;
+                    }
+                    escalated_for_blocked_exit = true;
+                }
+                let emergency_penalty_cents = if !can_fill {
+                    (spread_side_cents - cfg.max_exec_spread_cents).max(0.0)
+                        * cfg.emergency_wide_spread_penalty_ratio
+                } else {
+                    0.0
+                };
+                if emergency || escalated_for_blocked_exit {
+                    exit_impact_cents =
+                        execution_impact_cents(sample, pos.side, cfg, sample.remaining_ms, true);
+                    exit_exec =
+                        bid_raw - cfg.slippage_cents_per_side - exit_fee - exit_impact_cents;
+                }
+                exit_exec -= emergency_penalty_cents;
+                let final_reason = if escalated_for_blocked_exit {
+                    "blocked_exit_escalation"
+                } else {
+                    reason
+                };
+                let intent_id = format!("fev1:exit:{}:{}:{}", pos.side.as_str(), round_id, ts_ms);
+                let position_id = format!(
+                    "pos:{}",
+                    decision_id("enter", pos.side, &pos.entry_round_id, pos.entry_ts_ms)
+                );
+                let signal_price_cents = bid_raw.clamp(1.0, 99.0);
+                let paper_expected_exec_price_cents = exit_exec.clamp(1.0, 99.0);
+
+                return Some(ActiveIntent {
+                    intent_id,
+                    position_id,
+                    action: IntentAction::Exit,
+                    side: pos.side,
+                    size: IntentSize::FullPosition,
+                    round_id,
+                    ts_ms,
+                    expires_at_ms: ts_ms + exit_ttl_ms,
+                    remaining_ms: sample.remaining_ms,
+                    reason: final_reason.to_string(),
+                    signal_price_cents,
+                    price_cents: signal_price_cents,
+                    paper_expected_exec_price_cents,
+                    paper_entry_exec_price_cents: None,
+                    paper_exit_exec_price_cents: Some(paper_expected_exec_price_cents),
+                    paper_fee_cents: exit_fee.max(0.0),
+                    paper_slippage_cents: cfg.slippage_cents_per_side.max(0.0),
+                    paper_impact_cents: exit_impact_cents.max(0.0),
+                    score: self.last_score.abs(),
+                    confidence: 1.0,
+                    quote_size_usdc: 0.0,
+                });
+            }
+
             return None;
         }
-        let side = if self.last_score >= 0.0 {
-            Side::Up
-        } else {
-            Side::Down
-        };
-        let ask_raw = side_ask(sample, side) * 100.0;
-        let entry_fee = taker_fee_cents(ask_raw, side, fee_ctx);
-        let entry_impact_cents =
-            execution_impact_cents(sample, side, cfg, sample.remaining_ms, false);
-        let entry_exec = ask_raw + cfg.slippage_cents_per_side + entry_fee + entry_impact_cents;
-        let entry_score = self.last_score.abs();
-        Some(build_entry_decision(
-            side,
-            &sample.round_id,
-            sample.ts_ms,
-            sample.remaining_ms,
-            ask_raw,
-            entry_exec,
-            entry_fee,
-            cfg.slippage_cents_per_side,
-            entry_impact_cents,
-            entry_score,
-            "fev1_current_summary_entry",
-            Some("current_summary"),
-        ))
+
+        // Check: no position -> evaluate Enter
+        if self.position.is_none() {
+            // Convert last_side (string) to Side type
+            let entry_side = if self.last_score >= 0.0 {
+                Side::Up
+            } else {
+                Side::Down
+            };
+
+            // Evaluate entry conditions
+            let ask_raw = side_ask(sample, entry_side) * 100.0;
+            let spread_side_cents = side_spread(sample, entry_side) * 100.0;
+
+            let dynamic =
+                entry_adjustments(ts_ms, cfg, self.session_start_ts_ms, self.total_entries);
+
+            let dynamic_entry_threshold = (self.last_entry_threshold + dynamic.threshold_add)
+                .clamp(
+                    cfg.entry_threshold_base * 0.65,
+                    cfg.entry_threshold_cap + 0.20,
+                );
+
+            let dynamic_edge_req =
+                (cfg.entry_edge_prob + dynamic.edge_add).clamp(0.001, cfg.entry_edge_prob + 0.2);
+            let dynamic_spread_limit_prob =
+                (cfg.spread_limit_prob * dynamic.spread_scale).clamp(0.003, 0.25);
+
+            let cooldown_ok = self.last_exit_ts_ms <= 0
+                || ts_ms.saturating_sub(self.last_exit_ts_ms) >= cfg.cooldown_ms;
+            let cluster_cooldown_ok = ts_ms >= self.loss_cluster_cooldown_until_ts_ms;
+
+            let round_entries = self.entries_by_round.get(&round_id).copied().unwrap_or(0);
+            let within_limit = round_entries < cfg.max_entries_per_round;
+
+            let directional_edge = self.last_edge_prob * entry_side.dir();
+            let edge_ok = directional_edge >= dynamic_edge_req;
+            let score_ok = self.last_score.abs() >= dynamic_entry_threshold;
+
+            let fair_conf = if entry_side == Side::Up {
+                self.last_p_fair_up
+            } else {
+                1.0 - self.last_p_fair_up
+            };
+            let confidence_ok = fair_conf >= 0.56;
+
+            let spread_ok = sample.spread_mid <= dynamic_spread_limit_prob
+                && spread_side_cents
+                    <= (cfg.max_exec_spread_cents * dynamic.spread_scale).clamp(0.5, 12.0);
+
+            let fee = taker_fee_cents(ask_raw, entry_side, fee_ctx);
+            let entry_impact_cents =
+                execution_impact_cents(sample, entry_side, cfg, sample.remaining_ms, false);
+            let entry_exec = ask_raw + cfg.slippage_cents_per_side + fee + entry_impact_cents;
+            let expected_potential = (99.0 - entry_exec).max(0.0);
+            let potential_ok = expected_potential >= cfg.entry_min_potential_cents;
+            let price_ok = entry_exec <= cfg.entry_max_price_cents;
+
+            if self.last_confirmed
+                && edge_ok
+                && score_ok
+                && confidence_ok
+                && spread_ok
+                && price_ok
+                && potential_ok
+                && cooldown_ok
+                && cluster_cooldown_ok
+                && within_limit
+            {
+                // Generate intent_id
+                let intent_id =
+                    format!("fev1:enter:{}:{}:{}", entry_side.as_str(), round_id, ts_ms);
+
+                // position_id = "pos:" + intent_id (fixed at entry)
+                let position_id = format!("pos:{}", intent_id);
+
+                let signal_price_cents = if entry_side == Side::Up {
+                    sample.ask_yes * 100.0
+                } else {
+                    sample.ask_no * 100.0
+                };
+
+                // paper_expected_exec_price_cents = touch + fee + slippage + impact
+                let paper_expected_exec_price_cents = entry_exec;
+
+                return Some(ActiveIntent {
+                    intent_id,
+                    position_id,
+                    action: IntentAction::Enter,
+                    side: entry_side,
+                    size: IntentSize::FixedQuoteUsdcMicros(5_000_000), // $5.00
+                    round_id,
+                    ts_ms,
+                    expires_at_ms: ts_ms + entry_ttl_ms,
+                    remaining_ms: sample.remaining_ms,
+                    reason: "fev1_signal_entry".to_string(),
+                    signal_price_cents: signal_price_cents.clamp(1.0, 99.0),
+                    price_cents: signal_price_cents.clamp(1.0, 99.0),
+                    paper_expected_exec_price_cents: paper_expected_exec_price_cents
+                        .clamp(1.0, 99.0),
+                    paper_entry_exec_price_cents: Some(
+                        paper_expected_exec_price_cents.clamp(1.0, 99.0),
+                    ),
+                    paper_exit_exec_price_cents: None,
+                    paper_fee_cents: fee.max(0.0),
+                    paper_slippage_cents: cfg.slippage_cents_per_side.max(0.0),
+                    paper_impact_cents: entry_impact_cents.max(0.0),
+                    score: self.last_score.abs(),
+                    confidence: fair_conf,
+                    quote_size_usdc: 5.0, // $5.00 fixed
+                });
+            }
+
+            return None; // No valid entry
+        }
+
+        None
     }
 
     fn push_signal_history(&mut self, p_up: f64, score: f64) {
@@ -1052,7 +1432,8 @@ impl SimulationCoreState {
         } else {
             0.0
         };
-        let current_live_entry_decision = self.current_live_entry_decision(cfg, fee_ctx);
+        let current_live_entry_decision =
+            compat_live_entry_decision_from_active_intent(self.last_active_intent.as_ref());
         let current_live_entry_available = current_live_entry_decision.is_some();
         let (
             current_signal_price_cents,
@@ -1079,20 +1460,38 @@ impl SimulationCoreState {
         } else {
             (None, None, None, None, None)
         };
-        let suggested_side = if self.last_confirmed {
-            self.last_side
-        } else {
-            "WAIT"
+        let suggested_side = self
+            .last_active_intent
+            .as_ref()
+            .map(|intent| intent.side.as_str())
+            .unwrap_or_else(|| {
+                if self.last_confirmed {
+                    self.last_side
+                } else {
+                    "WAIT"
+                }
+            });
+        let suggested_action = match self.last_active_intent.as_ref() {
+            Some(intent) if intent.action == IntentAction::Enter => {
+                if intent.side == Side::Up {
+                    "ENTER_UP"
+                } else {
+                    "ENTER_DOWN"
+                }
+            }
+            Some(intent) if intent.action == IntentAction::Exit => {
+                if intent.side == Side::Up {
+                    "EXIT_UP"
+                } else {
+                    "EXIT_DOWN"
+                }
+            }
+            _ if self.position.is_some() || trade_count > 0 => "HOLD",
+            _ => "WAIT",
         };
 
         let current = json!({
-            "suggested_action": if current_live_entry_available {
-                if self.last_side == "UP" { "ENTER_UP" } else { "ENTER_DOWN" }
-            } else if self.position.is_some() || trade_count > 0 {
-                "HOLD"
-            } else {
-                "WAIT"
-            },
+            "suggested_action": suggested_action,
             "suggested_side": suggested_side,
             "score": self.last_score,
             "entry_threshold": self.last_entry_threshold,
@@ -1117,6 +1516,9 @@ impl SimulationCoreState {
             "loss_cluster_cooldown_until_ts_ms": self.loss_cluster_cooldown_until_ts_ms,
             "live_entry_available": current_live_entry_available,
             "live_entry_decision": current_live_entry_decision,
+            // New: ActiveIntent as the ONLY real-time signal source
+            "active_signal_available": self.last_active_intent.is_some(),
+            "active_signal": self.last_active_intent.clone(),
             "signal_price_cents": current_signal_price_cents,
             "paper_entry_exec_price_cents": current_paper_entry_exec_price_cents,
             "paper_entry_fee_cents": current_paper_entry_fee_cents,
@@ -1405,7 +1807,7 @@ mod tests {
     }
 
     #[test]
-    fn current_summary_exposes_live_entry_decision_when_entry_is_active() {
+    fn current_payload_mirrors_active_signal_into_legacy_live_entry_decision() {
         let cfg = RuntimeConfig {
             entry_threshold_base: 0.40,
             entry_threshold_cap: 0.55,
@@ -1506,30 +1908,39 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true)
         );
+        let active_signal = run
+            .current
+            .get("active_signal")
+            .and_then(Value::as_object)
+            .expect("expected current active signal");
+        assert_eq!(
+            active_signal.get("action").and_then(Value::as_str),
+            Some("enter")
+        );
+        assert_eq!(
+            active_signal.get("side").and_then(Value::as_str),
+            Some("DOWN")
+        );
+        assert_eq!(
+            active_signal.get("reason").and_then(Value::as_str),
+            Some("fev1_signal_entry")
+        );
+        assert_eq!(
+            active_signal
+                .get("signal_price_cents")
+                .and_then(Value::as_f64),
+            Some(50.0)
+        );
         let live_entry_decision = run
             .current
             .get("live_entry_decision")
             .and_then(Value::as_object)
-            .expect("expected current live entry decision");
-        assert_eq!(
-            live_entry_decision.get("action").and_then(Value::as_str),
-            Some("enter")
-        );
-        assert_eq!(
-            live_entry_decision.get("side").and_then(Value::as_str),
-            Some("DOWN")
-        );
+            .expect("expected legacy compatibility live entry decision");
         assert_eq!(
             live_entry_decision
                 .get("signal_source")
                 .and_then(Value::as_str),
-            Some("current_summary")
-        );
-        assert_eq!(
-            live_entry_decision
-                .get("signal_price_cents")
-                .and_then(Value::as_f64),
-            Some(50.0)
+            Some("active_signal")
         );
         assert_eq!(
             run.current

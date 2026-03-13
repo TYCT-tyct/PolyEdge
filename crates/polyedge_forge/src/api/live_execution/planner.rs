@@ -252,7 +252,7 @@ pub(super) fn try_decision_to_live_payload(
         .unwrap_or(0);
 
     // Check if we should use maker strategy
-    let (tif, style, actual_slippage_bps) = if !is_exit_like {
+    let (tif, style, selected_slippage_bps) = if !is_exit_like {
         // For entries, check if maker strategy applies
         if let Some(book_snapshot) = book {
             let spread = calculate_spread_cents(&book_snapshot);
@@ -275,6 +275,7 @@ pub(super) fn try_decision_to_live_payload(
         // For exits, always use taker (need to get out fast)
         ("FAK".to_string(), "taker".to_string(), default_slippage_bps)
     };
+    default_slippage_bps = selected_slippage_bps;
 
     let mut quote_size = quote_size_override.unwrap_or_else(|| {
         decision
@@ -349,9 +350,8 @@ pub(super) fn try_decision_to_live_payload(
         .and_then(Value::as_f64)
         .unwrap_or(default_slippage_bps)
         .clamp(0.0, 500.0);
-    let mut slippage_bps = default_slippage_bps;
     if let Some(force) = exec_cfg.force_slippage_bps {
-        slippage_bps = force.clamp(0.0, 500.0);
+        default_slippage_bps = force.clamp(0.0, 500.0);
     }
     if let Some(forced) = forced_size_shares {
         size = if is_exit_like {

@@ -280,7 +280,9 @@ def main() -> int:
                     or safe_len(payload.get("signal_decisions"))
                 )
                 decision_pool_count = int(
-                    shadow_eval.get("decision_pool_count")
+                    shadow_eval.get("ledger_signal_count")
+                    or shadow_eval.get("decision_pool_count")
+                    or gated.get("ledger_signal_count")
                     or gated.get("decision_pool_count")
                     or raw_signal_count
                 )
@@ -377,6 +379,7 @@ def main() -> int:
                                 "win_rate_pct": summary.get("win_rate_pct"),
                                 "net_pnl_cents": summary.get("net_pnl_cents"),
                                 "raw_signal_count": raw_signal_count,
+                                "ledger_signal_count": decision_pool_count,
                                 "decision_pool_count": decision_pool_count,
                                 "fresh_signal_count": fresh_signal_count,
                                 "candidate_count": candidate_count,
@@ -435,6 +438,7 @@ def main() -> int:
             },
             "shadow_coverage": {
                 "raw_signal_sum": raw_signal_total,
+                "ledger_signal_sum": decision_pool_total,
                 "decision_pool_sum": decision_pool_total,
                 "fresh_signal_sum": fresh_signal_total,
                 "candidate_sum": candidate_total,

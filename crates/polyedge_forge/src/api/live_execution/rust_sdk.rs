@@ -300,6 +300,7 @@ fn build_pending_from_accepted_submission(
     market_type: &str,
     decision_key: &str,
     decision_id: &str,
+    attempt_id: &str,
     decision: &Value,
     effective_target: &LiveMarketTarget,
     payload: &Value,
@@ -388,6 +389,7 @@ fn build_pending_from_accepted_submission(
             .to_string(),
         decision_key: decision_key.to_string(),
         intent_id,
+        attempt_id: attempt_id.to_string(),
         decision_id: decision_id.to_string(),
         price_cents,
         quote_size_usdc,
@@ -1240,6 +1242,14 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| gated.decision_key.clone());
+        let intent_id = prepared
+            .decision
+            .get("intent_id")
+            .and_then(Value::as_str)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| decision_id.clone());
+        let attempt_id = format!("{}:attempt:{}", intent_id, uuid::Uuid::new_v4());
         let token_id = token_id_for_decision(&prepared.decision, &prepared.effective_target)
             .map(str::to_string);
         
@@ -1463,11 +1473,8 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
             "symbol": position_state.symbol,
             "market_type": position_state.market_type,
             "decision_key": gated.decision_key,
-            "intent_id": prepared
-                .decision
-                .get("intent_id")
-                .cloned()
-                .unwrap_or_else(|| json!(decision_id.clone())),
+            "intent_id": intent_id,
+            "attempt_id": attempt_id,
             "decision_id": decision_id,
             "decision": prepared.decision,
             "order_id": final_order_id,
@@ -1504,6 +1511,7 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                         &position_state.market_type,
                         &gated.decision_key,
                         &decision_id,
+                        &attempt_id,
                         &prepared.decision,
                         &prepared.effective_target,
                         &attempt_payload,
@@ -1532,11 +1540,8 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                     "action": prepared.decision.get("action").and_then(Value::as_str).unwrap_or("unknown"),
                     "side": prepared.decision.get("side").and_then(Value::as_str).unwrap_or("unknown"),
                     "round_id": prepared.decision.get("round_id").and_then(Value::as_str),
-                    "intent_id": prepared
-                        .decision
-                        .get("intent_id")
-                        .cloned()
-                        .unwrap_or_else(|| json!(decision_id.clone())),
+                    "intent_id": intent_id,
+                    "attempt_id": attempt_id,
                     "decision_id": decision_id,
                     "decision_key": gated.decision_key,
                     "reason": submit_event_reason,
@@ -1662,6 +1667,7 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                                         &position_state.market_type,
                                         &gated.decision_key,
                                         &decision_id,
+                                        &attempt_id,
                                         &prepared.decision,
                                         &prepared.effective_target,
                                         &final_retry_payload,

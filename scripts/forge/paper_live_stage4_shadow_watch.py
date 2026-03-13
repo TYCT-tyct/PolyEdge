@@ -58,7 +58,7 @@ def main() -> None:
                 latest = fetch_json(LATEST_URL)
                 current = (paper if isinstance(paper, dict) else {}).get("current") or {}
                 shadow = ((paper if isinstance(paper, dict) else {}).get("live_execution") or {}).get("summary", {}).get("shadow_eval") or {}
-                decision = current.get("live_entry_decision") or {}
+                decision = current.get("active_signal") or current.get("live_entry_decision") or {}
                 snapshot = latest_btc_5m_snapshot(latest)
 
                 row.update(
@@ -80,7 +80,10 @@ def main() -> None:
                 if current.get("suggested_action") in ("ENTER_UP", "ENTER_DOWN") and decision:
                     side = str(decision.get("side") or "")
                     signal_price = decision.get("signal_price_cents", decision.get("price_cents"))
-                    paper_exec_price = decision.get("paper_entry_exec_price_cents")
+                    paper_exec_price = decision.get(
+                        "paper_entry_exec_price_cents",
+                        decision.get("paper_expected_exec_price_cents"),
+                    )
                     paper_fee_cents = decision.get("paper_entry_fee_cents")
                     paper_slippage_cents = decision.get("paper_entry_slippage_cents")
                     paper_impact_cents = decision.get("paper_entry_impact_cents")

@@ -4,7 +4,7 @@ fn decision_round_matches_target(decision: &Value, target: &LiveMarketTarget) ->
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let is_entry_like = action == "enter" || action == "add";
+    let is_entry_like = action == "enter";
     let round_id = decision
         .get("round_id")
         .and_then(Value::as_str)
@@ -27,7 +27,7 @@ fn decision_round_matches_target(decision: &Value, target: &LiveMarketTarget) ->
 
 fn is_entry_action(action: &str) -> bool {
     let a = action.to_ascii_lowercase();
-    a == "enter" || a == "add"
+    a == "enter"
 }
 
 fn pending_cancel_due_ms(row: &LivePendingOrder) -> i64 {
@@ -313,6 +313,12 @@ async fn resolve_live_target_from_snapshot(
 }
 
 pub(super) fn live_decision_key(market_type: &str, decision: &Value) -> String {
+    // NEW: Prefer intent_id if available (from ActiveIntent)
+    if let Some(intent_id) = decision.get("intent_id").and_then(Value::as_str) {
+        return intent_id.to_string();
+    }
+    
+    // Fallback to legacy key generation
     let action = decision
         .get("action")
         .and_then(Value::as_str)
@@ -351,7 +357,6 @@ pub(super) async fn gate_live_decisions(
     let now_ms = Utc::now().timestamp_millis();
     let max_open_positions = live_max_open_positions();
     let max_completed_trades = live_max_completed_trades_for_scope(symbol, market_type);
-    let allow_add_orders = live_allow_add_orders();
     let require_fixed_entry_size = live_require_fixed_entry_size();
     
     // OPTIMIZATION: Parallelize 4 state queries to reduce latency (~50-150ms savings)
@@ -377,29 +382,7 @@ pub(super) async fn gate_live_decisions(
     for decision in decisions {
         let mut normalized = decision.clone();
         
-        // FAST PATH OPTIMIZATION: Check early if this decision qualifies for reduced checks
-        // This is a simple check that doesn't require additional async calls
-        let is_fast_path = {
-            let signal_source = normalized
-                .get("signal_source")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            // For current_summary signals, use entry_score (edge_score is the same value)
-            let entry_score = normalized
-                .get("entry_score")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-            // Fallback to score for other signal types
-            let score = normalized
-                .get("score")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(entry_score);
-            // Use hardcoded values here to avoid needing config import in hot path
-            // These match the config values: min_score=0.7, min_remaining=30s
-            signal_source.eq_ignore_ascii_case("current_summary") && score.abs() >= 0.70
-        };
-        
-        let mut action = normalized
+        let action = normalized
             .get("action")
             .and_then(Value::as_str)
             .unwrap_or_default()
@@ -413,23 +396,15 @@ pub(super) async fn gate_live_decisions(
             .as_deref()
             .map(|s| s.eq_ignore_ascii_case(&side))
             .unwrap_or(false);
-        if action == "enter" && virtual_side.is_some() && side_match {
-            action = "add".to_string();
-            if let Some(obj) = normalized.as_object_mut() {
-                obj.insert("action".to_string(), Value::String(action.clone()));
-            }
-        }
-        if !matches!(action.as_str(), "enter" | "add" | "reduce" | "exit") {
+        
+        // REMOVED: enter→add automatic rewrite
+        // Per codex design, targeting should ONLY reject, not rewrite signals
+        // ActiveIntent only supports Enter/Exit, no Add/Reduce at strategy layer
+        // If user wants Add support, it must be added at strategy layer, not execution layer
+        
+        if !matches!(action.as_str(), "enter" | "exit") {
             skipped.push(json!({
                 "reason": "invalid_action",
-                "decision": normalized
-            }));
-            continue;
-        }
-        if action == "add" && !allow_add_orders {
-            skipped.push(json!({
-                "reason": "add_disabled_by_env",
-                "required_env": "FORGE_FEV1_LIVE_ALLOW_ADDS=true",
                 "decision": normalized
             }));
             continue;
@@ -441,7 +416,7 @@ pub(super) async fn gate_live_decisions(
             }));
             continue;
         }
-        if matches!(action.as_str(), "enter" | "add")
+        if action == "enter"
             && max_completed_trades > 0
             && (position_state.total_exits as usize) >= max_completed_trades
         {
@@ -453,12 +428,7 @@ pub(super) async fn gate_live_decisions(
             }));
             continue;
         }
-        // FAST PATH OPTIMIZATION: Skip liquidity reject check for high-confidence current_summary signals
-        // This saves an async call to get_live_execution_aggr_state (~5-15ms)
-        if is_fast_path {
-            // Fast path: skip the liquidity reject check for current_summary signals
-            // These signals are already validated by the engine and are high confidence
-        } else if matches!(action.as_str(), "enter" | "add") {
+        if action == "enter" {
             let aggr = state
                 .get_live_execution_aggr_state(symbol, market_type)
                 .await;
@@ -498,7 +468,7 @@ pub(super) async fn gate_live_decisions(
             }
         }
         if mark_attempts
-            && matches!(action.as_str(), "enter" | "add")
+            && action == "enter"
             && require_fixed_entry_size
             && !live_has_fixed_entry_sizing()
         {
@@ -523,7 +493,7 @@ pub(super) async fn gate_live_decisions(
                 continue;
             }
         }
-        if matches!(action.as_str(), "enter" | "add")
+        if action == "enter"
             && position_state.state.eq_ignore_ascii_case("exit_pending")
         {
             skipped.push(json!({
@@ -533,21 +503,21 @@ pub(super) async fn gate_live_decisions(
             }));
             continue;
         }
-        if matches!(action.as_str(), "enter" | "add") && (has_enter_pending || has_exit_pending) {
+        if action == "enter" && (has_enter_pending || has_exit_pending) {
             skipped.push(json!({
                 "reason": if has_enter_pending { "enter_pending_exists" } else { "exit_pending_exists" },
                 "decision": normalized
             }));
             continue;
         }
-        if matches!(action.as_str(), "exit" | "reduce") && has_exit_pending {
+        if action == "exit" && has_exit_pending {
             skipped.push(json!({
                 "reason": "exit_pending_exists",
                 "decision": normalized
             }));
             continue;
         }
-        if matches!(action.as_str(), "exit" | "reduce") && has_enter_pending {
+        if action == "exit" && has_enter_pending {
             // Exit signals must not be blocked by entry pending.
             // Execution layer will actively cancel entry/add pendings first.
             if let Some(obj) = normalized.as_object_mut() {
@@ -563,18 +533,7 @@ pub(super) async fn gate_live_decisions(
                 true
             } else {
                 skipped.push(json!({
-                    "reason": "already_in_position",
-                    "state_side": virtual_side,
-                    "decision": normalized
-                }));
-                false
-            }
-        } else if action == "add" {
-            if side_match {
-                true
-            } else {
-                skipped.push(json!({
-                    "reason": if virtual_side.is_none() { "no_open_position_for_add" } else { "side_mismatch_for_add" },
+                    "reason": "already_has_position",
                     "state_side": virtual_side,
                     "decision": normalized
                 }));
@@ -584,7 +543,7 @@ pub(super) async fn gate_live_decisions(
             true
         } else {
             let reason = if virtual_side.is_none() {
-                "no_open_position"
+                "no_position_to_exit"
             } else {
                 "side_mismatch"
             };
@@ -610,7 +569,7 @@ pub(super) async fn gate_live_decisions(
             continue;
         }
         let opened_new_position = action == "enter" && virtual_side.is_none();
-        if matches!(action.as_str(), "enter" | "add") {
+        if action == "enter" {
             virtual_side = Some(side.clone());
             has_enter_pending = true;
         } else if action == "exit" {
@@ -630,132 +589,6 @@ pub(super) async fn gate_live_decisions(
 
     position_state.updated_ts_ms = now_ms;
     (accepted, skipped, position_state)
-}
-
-fn is_replay_only_reason(decision: &Value) -> bool {
-    decision
-        .get("reason")
-        .and_then(Value::as_str)
-        .map(|reason| {
-            reason
-                .trim()
-                .eq_ignore_ascii_case("end_of_samples_force_close")
-        })
-        .unwrap_or(false)
-}
-
-fn is_live_fresh_decision(decision: &Value, latest_ts_ms: i64, drain_only: bool) -> bool {
-    let action = decision
-        .get("action")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let freshness_ms = if action == "enter" || action == "add" {
-        live_signal_entry_freshness_ms()
-    } else {
-        live_signal_exit_freshness_ms()
-    };
-    let ts_ok = decision
-        .get("ts_ms")
-        .and_then(Value::as_i64)
-        .map(|ts| ts >= latest_ts_ms.saturating_sub(freshness_ms))
-        .unwrap_or(false);
-    let action_ok = if drain_only {
-        action == "exit" || action == "reduce"
-    } else {
-        true
-    };
-    let reason_ok = !is_replay_only_reason(decision);
-    ts_ok && action_ok && reason_ok
-}
-
-pub(super) fn count_fresh_live_decisions(
-    decisions: &[Value],
-    latest_ts_ms: i64,
-    drain_only: bool,
-) -> usize {
-    decisions
-        .iter()
-        .filter(|decision| is_live_fresh_decision(decision, latest_ts_ms, drain_only))
-        .count()
-}
-
-pub(super) fn select_live_decisions(
-    decisions: &[Value],
-    latest_ts_ms: i64,
-    max_orders: usize,
-    drain_only: bool,
-    prefer_action: Option<&str>,
-) -> Vec<Value> {
-
-    if decisions.is_empty() {
-        return Vec::new();
-    }
-    let latest_round = decisions
-        .iter()
-        .rev()
-        .find_map(|d| d.get("round_id").and_then(Value::as_str))
-        .unwrap_or_default()
-        .to_string();
-    let mut selected: Vec<Value> = decisions
-        .iter()
-        .filter(|d| {
-            let round_ok = d
-                .get("round_id")
-                .and_then(Value::as_str)
-                .map(|r| r == latest_round)
-                .unwrap_or(false);
-            let fresh_ok = is_live_fresh_decision(d, latest_ts_ms, drain_only);
-            if drain_only { round_ok || fresh_ok } else { fresh_ok }
-        })
-        .cloned()
-        .collect();
-    if selected.is_empty() {
-        if let Some(last) = decisions.iter().rev().find(|d| {
-            let action = d
-                .get("action")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            let freshness_ms = if action == "enter" || action == "add" {
-                live_signal_entry_freshness_ms()
-            } else {
-                live_signal_exit_freshness_ms()
-            };
-            let action_ok = if drain_only {
-                action == "exit" || action == "reduce"
-            } else {
-                d.get("ts_ms")
-                    .and_then(Value::as_i64)
-                    .map(|ts| ts >= latest_ts_ms.saturating_sub(freshness_ms))
-                    .unwrap_or(false)
-            };
-            action_ok && !is_replay_only_reason(d)
-        }) {
-            selected.push(last.clone());
-        }
-    }
-    selected.sort_by_key(|v| v.get("ts_ms").and_then(Value::as_i64).unwrap_or(0));
-    if selected.len() > max_orders {
-        if max_orders <= 1 {
-            let preferred = prefer_action
-                .and_then(|want| {
-                    selected.iter().rev().find(|v| {
-                        v.get("action")
-                            .and_then(Value::as_str)
-                            .map(|a| a.eq_ignore_ascii_case(want))
-                            .unwrap_or(false)
-                    })
-                })
-                .cloned();
-            if let Some(v) = preferred.or_else(|| selected.last().cloned()) {
-                selected = vec![v];
-            }
-        } else {
-            selected = selected[selected.len() - max_orders..].to_vec();
-        }
-    }
-    selected
 }
 
 fn live_market_target_cache_scope_key(symbol: &str, market_type: &str) -> String {

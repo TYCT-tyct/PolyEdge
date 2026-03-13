@@ -69,7 +69,7 @@ def main():
                     (paper if isinstance(paper, dict) else {}).get("live_execution") or {}
                 ).get("summary") or {}
                 shadow = live_exec.get("shadow_eval") or {}
-                decision = current.get("live_entry_decision") or {}
+                decision = current.get("active_signal") or current.get("live_entry_decision") or {}
                 snapshot = latest_btc_5m_snapshot(latest)
                 action = current.get("suggested_action") or "UNKNOWN"
                 trade_count = summary.get("trade_count")
@@ -85,9 +85,10 @@ def main():
                         "candidate_count": shadow.get("candidate_count"),
                         "candidate_source": shadow.get("candidate_source"),
                         "no_candidate_reason": shadow.get("no_candidate_reason"),
-                        "signal_price_cents": current.get("signal_price_cents"),
+                        "signal_price_cents": current.get("signal_price_cents", decision.get("signal_price_cents")),
                         "paper_entry_exec_price_cents": current.get(
-                            "paper_entry_exec_price_cents"
+                            "paper_entry_exec_price_cents",
+                            decision.get("paper_entry_exec_price_cents", decision.get("paper_expected_exec_price_cents")),
                         ),
                         "paper_entry_fee_cents": current.get("paper_entry_fee_cents"),
                         "paper_entry_slippage_cents": current.get(
