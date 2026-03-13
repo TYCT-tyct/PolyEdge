@@ -84,6 +84,7 @@ struct ApiState {
     live_pending_orders: Arc<RwLock<HashMap<String, LivePendingOrder>>>,
     live_runtime_snapshots: Arc<RwLock<HashMap<String, Value>>>,
     live_runtime_controls: Arc<RwLock<HashMap<String, LiveRuntimeControl>>>,
+    live_runtime_paper_reset_anchors: Arc<RwLock<HashMap<String, i64>>>,
     live_persist_inflight: Arc<RwLock<HashSet<String>>>,
     live_execution_aggr_states: Arc<RwLock<HashMap<String, LiveExecutionAggState>>>,
     live_rust_executor: Arc<RwLock<Option<Arc<RustExecutorContext>>>>,
@@ -2367,6 +2368,23 @@ impl ApiState {
         controls.insert(scope_key, next);
     }
 
+    async fn get_runtime_paper_reset_anchor(&self, symbol: &str, market_type: &str) -> Option<i64> {
+        let scope_key = runtime_scope_key(symbol, market_type);
+        let anchors = self.live_runtime_paper_reset_anchors.read().await;
+        anchors.get(&scope_key).copied().filter(|v| *v > 0)
+    }
+
+    async fn put_runtime_paper_reset_anchor(
+        &self,
+        symbol: &str,
+        market_type: &str,
+        reset_after_ms: i64,
+    ) {
+        let scope_key = runtime_scope_key(symbol, market_type);
+        let mut anchors = self.live_runtime_paper_reset_anchors.write().await;
+        anchors.insert(scope_key, reset_after_ms.max(0));
+    }
+
     #[allow(dead_code)]
     async fn check_and_mark_live_decision(
         &self,
@@ -3391,6 +3409,7 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         live_pending_orders: Arc::new(RwLock::new(HashMap::new())),
         live_runtime_snapshots: Arc::new(RwLock::new(HashMap::new())),
         live_runtime_controls: Arc::new(RwLock::new(HashMap::new())),
+        live_runtime_paper_reset_anchors: Arc::new(RwLock::new(HashMap::new())),
         live_persist_inflight: Arc::new(RwLock::new(HashSet::new())),
         live_execution_aggr_states: Arc::new(RwLock::new(HashMap::new())),
         live_rust_executor: Arc::new(RwLock::new(None)),
@@ -3507,6 +3526,17 @@ fn paper_ledger_key(redis_prefix: &str, symbol: &str, market_type: &str) -> Stri
     )
 }
 
+fn live_runtime_paper_reset_anchor_key(
+    redis_prefix: &str,
+    symbol: &str,
+    market_type: &str,
+) -> String {
+    format!(
+        "{redis_prefix}:fev1:paper:reset_anchor:{}:{market_type}",
+        symbol.trim().to_ascii_uppercase()
+    )
+}
+
 fn paper_ledger_max_trades() -> usize {
     std::env::var("FORGE_FEV1_PAPER_LEDGER_MAX_TRADES")
         .ok()
@@ -3517,6 +3547,43 @@ fn paper_ledger_max_trades() -> usize {
 
 fn extract_trade_row_id(row: &Value) -> Option<i64> {
     row.get("id").and_then(Value::as_i64)
+}
+
+fn trade_row_ts_ms(row: &Value) -> i64 {
+    row.get("entry_ts_ms")
+        .and_then(Value::as_i64)
+        .or_else(|| row.get("exit_ts_ms").and_then(Value::as_i64))
+        .or_else(|| row.get("ts_ms").and_then(Value::as_i64))
+        .unwrap_or(0)
+}
+
+fn decision_row_ts_ms(row: &Value) -> i64 {
+    row.get("ts_ms")
+        .and_then(Value::as_i64)
+        .or_else(|| row.get("timestamp_ms").and_then(Value::as_i64))
+        .unwrap_or(0)
+}
+
+fn filter_trade_rows_after_reset(rows: &[Value], reset_after_ms: Option<i64>) -> Vec<Value> {
+    match reset_after_ms.filter(|v| *v > 0) {
+        Some(reset_after_ms) => rows
+            .iter()
+            .filter(|row| trade_row_ts_ms(row) >= reset_after_ms)
+            .cloned()
+            .collect(),
+        None => rows.to_vec(),
+    }
+}
+
+fn filter_decision_rows_after_reset(rows: &[Value], reset_after_ms: Option<i64>) -> Vec<Value> {
+    match reset_after_ms.filter(|v| *v > 0) {
+        Some(reset_after_ms) => rows
+            .iter()
+            .filter(|row| decision_row_ts_ms(row) >= reset_after_ms)
+            .cloned()
+            .collect(),
+        None => rows.to_vec(),
+    }
 }
 
 fn merge_unique_trade_rows(existing: &[Value], fresh: &[Value], max_rows: usize) -> Vec<Value> {
@@ -3691,6 +3758,7 @@ fn build_paper_ledger_payload(
     runtime_payload: &Value,
     symbol: &str,
     market_type: &str,
+    reset_after_ms: Option<i64>,
 ) -> Value {
     let max_trades = paper_ledger_max_trades();
     let existing_trades = existing
@@ -3703,7 +3771,13 @@ fn build_paper_ledger_payload(
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    let merged_trades = merge_unique_trade_rows(existing_trades, fresh_trades, max_trades);
+    let filtered_existing_trades = filter_trade_rows_after_reset(existing_trades, reset_after_ms);
+    let filtered_fresh_trades = filter_trade_rows_after_reset(fresh_trades, reset_after_ms);
+    let merged_trades = merge_unique_trade_rows(
+        &filtered_existing_trades,
+        &filtered_fresh_trades,
+        max_trades,
+    );
 
     let existing_records = existing
         .and_then(|v| v.get("paper_records"))
@@ -3721,8 +3795,14 @@ fn build_paper_ledger_payload(
         })
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    let merged_records =
-        merge_unique_decision_rows(existing_records, fresh_records, max_trades * 4);
+    let filtered_existing_records =
+        filter_decision_rows_after_reset(existing_records, reset_after_ms);
+    let filtered_fresh_records = filter_decision_rows_after_reset(fresh_records, reset_after_ms);
+    let merged_records = merge_unique_decision_rows(
+        &filtered_existing_records,
+        &filtered_fresh_records,
+        max_trades * 4,
+    );
 
     let existing_live_records = existing
         .and_then(|v| v.get("live_records"))
@@ -3735,8 +3815,15 @@ fn build_paper_ledger_payload(
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    let merged_live_records =
-        merge_unique_decision_rows(existing_live_records, fresh_live_records, max_trades * 4);
+    let filtered_existing_live_records =
+        filter_decision_rows_after_reset(existing_live_records, reset_after_ms);
+    let filtered_fresh_live_records =
+        filter_decision_rows_after_reset(fresh_live_records, reset_after_ms);
+    let merged_live_records = merge_unique_decision_rows(
+        &filtered_existing_live_records,
+        &filtered_fresh_live_records,
+        max_trades * 4,
+    );
 
     json!({
         "source": "ledger",
@@ -3759,6 +3846,7 @@ fn build_paper_ledger_payload(
         "lookback_minutes": runtime_payload.get("lookback_minutes").cloned().unwrap_or_else(|| json!(0)),
         "lookback": runtime_payload.get("lookback").cloned().unwrap_or(Value::Null),
         "samples": runtime_payload.get("samples").cloned().unwrap_or_else(|| json!(0)),
+        "paper_reset_after_ms": reset_after_ms,
         "config_source": runtime_payload.get("config_source").cloned().unwrap_or(Value::Null),
         "baseline_profile": runtime_payload.get("baseline_profile").cloned().unwrap_or(Value::Null),
         "config": runtime_payload.get("config").cloned().unwrap_or(Value::Null),
@@ -3777,14 +3865,36 @@ async fn load_live_runtime_samples(
     lookback_minutes: u32,
     max_points: u32,
 ) -> Result<Arc<Vec<StrategySample>>, ApiError> {
+    let reset_after_ms = state
+        .get_runtime_paper_reset_anchor(symbol, market_type)
+        .await;
+    let filtered = |samples: Arc<Vec<StrategySample>>| -> Arc<Vec<StrategySample>> {
+        let Some(reset_after_ms) = reset_after_ms.filter(|v| *v > 0) else {
+            return samples;
+        };
+        Arc::new(
+            samples
+                .iter()
+                .filter(|row| row.ts_ms >= reset_after_ms)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+    };
     if let Some(samples) = state
         .get_runtime_event_samples(symbol, market_type, lookback_minutes, max_points)
         .await
     {
-        return Ok(samples);
+        return Ok(filtered(samples));
     }
-    load_strategy_samples_runtime_stream(state, symbol, market_type, lookback_minutes, max_points)
-        .await
+    let samples = load_strategy_samples_runtime_stream(
+        state,
+        symbol,
+        market_type,
+        lookback_minutes,
+        max_points,
+    )
+    .await?;
+    Ok(filtered(samples))
 }
 
 async fn prewarm_live_runtime_target_and_books(state: &ApiState, symbol: &str, market_type: &str) {
@@ -3965,6 +4075,15 @@ async fn restore_live_runtime_state(
                     .await;
             }
         }
+        let reset_anchor_key =
+            live_runtime_paper_reset_anchor_key(&state.redis_prefix, &cfg.symbol, market);
+        if let Some(v) = read_key_value(state, &reset_anchor_key).await? {
+            if let Some(reset_after_ms) = v.as_i64().filter(|v| *v > 0) {
+                state
+                    .put_runtime_paper_reset_anchor(&cfg.symbol, market, reset_after_ms)
+                    .await;
+            }
+        }
         let events_key = live_events_key(&state.redis_prefix, &cfg.symbol, market);
         if let Some(v) = read_key_value(state, &events_key).await? {
             if let Ok(rows) = serde_json::from_value::<Vec<Value>>(v) {
@@ -4048,8 +4167,16 @@ async fn persist_live_runtime_state(state: &ApiState, symbol: &str, market_type:
     if let Some(runtime_payload) = state.get_runtime_snapshot(symbol, market_type).await {
         let ledger_key = paper_ledger_key(&state.redis_prefix, symbol, market_type);
         let existing = read_key_value(state, &ledger_key).await.ok().flatten();
-        let ledger_payload =
-            build_paper_ledger_payload(existing.as_ref(), &runtime_payload, symbol, market_type);
+        let reset_after_ms = state
+            .get_runtime_paper_reset_anchor(symbol, market_type)
+            .await;
+        let ledger_payload = build_paper_ledger_payload(
+            existing.as_ref(),
+            &runtime_payload,
+            symbol,
+            market_type,
+            reset_after_ms,
+        );
         let _ = write_key_value(state, &ledger_key, &ledger_payload, Some(7 * 24 * 3600)).await;
     }
 }
@@ -5482,7 +5609,7 @@ mod tests {
         });
 
         let payload =
-            build_paper_ledger_payload(Some(&existing), &runtime_payload, "SOLUSDT", "5m");
+            build_paper_ledger_payload(Some(&existing), &runtime_payload, "SOLUSDT", "5m", None);
         assert_eq!(
             payload.get("source").and_then(Value::as_str),
             Some("ledger")

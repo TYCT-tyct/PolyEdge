@@ -668,10 +668,11 @@ pub(super) async fn strategy_paper_ledger(
     let symbol = resolve_strategy_symbol(params.symbol.as_deref())?;
     let max_trades = params.max_trades.map(|v| v.max(1) as usize).unwrap_or(200);
     let key = paper_ledger_key(&state.redis_prefix, symbol, market_type);
+    let reset_after_ms = state.get_runtime_paper_reset_anchor(symbol, market_type).await;
     let payload = if let Some(v) = read_key_value(&state, &key).await? {
         v
     } else if let Some(runtime_payload) = state.get_runtime_snapshot(symbol, market_type).await {
-        build_paper_ledger_payload(None, &runtime_payload, symbol, market_type)
+        build_paper_ledger_payload(None, &runtime_payload, symbol, market_type, reset_after_ms)
     } else {
         json!({
             "source": "ledger",
@@ -684,6 +685,7 @@ pub(super) async fn strategy_paper_ledger(
             "updated_at_ms": Utc::now().timestamp_millis(),
             "lookback_minutes": 0,
             "samples": 0,
+            "paper_reset_after_ms": reset_after_ms,
             "current": Value::Null,
             "summary": summarize_trade_rows(&[]),
             "trades": [],
@@ -714,10 +716,11 @@ pub(super) async fn strategy_execution_attribution(
     let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
     let symbol = resolve_strategy_symbol(params.symbol.as_deref())?;
     let key = paper_ledger_key(&state.redis_prefix, symbol, market_type);
+    let reset_after_ms = state.get_runtime_paper_reset_anchor(symbol, market_type).await;
     let ledger_payload = if let Some(v) = read_key_value(&state, &key).await? {
         v
     } else if let Some(runtime_payload) = state.get_runtime_snapshot(symbol, market_type).await {
-        build_paper_ledger_payload(None, &runtime_payload, symbol, market_type)
+        build_paper_ledger_payload(None, &runtime_payload, symbol, market_type, reset_after_ms)
     } else {
         json!({})
     };
@@ -857,6 +860,9 @@ pub(super) async fn strategy_live_reset(
     }
     for market in ["5m", "15m"] {
         state
+            .put_runtime_paper_reset_anchor(&runtime_cfg.symbol, market, now_ms)
+            .await;
+        state
             .put_live_position_state(
                 &runtime_cfg.symbol,
                 market,
@@ -892,6 +898,10 @@ pub(super) async fn strategy_live_reset(
         if delete_key(&state, &paper_ledger_key).await.is_ok() {
             deleted_keys.push(paper_ledger_key);
         }
+        let reset_anchor_key =
+            live_runtime_paper_reset_anchor_key(&state.redis_prefix, &runtime_cfg.symbol, market);
+        let _ = write_key_value(&state, &reset_anchor_key, &json!(now_ms), Some(7 * 24 * 3600)).await;
+        deleted_keys.push(reset_anchor_key);
     }
     let pending_key = live_pending_orders_key(&state.redis_prefix);
     if delete_key(&state, &pending_key).await.is_ok() {
