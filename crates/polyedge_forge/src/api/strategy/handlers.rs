@@ -26,6 +26,151 @@ fn strategy_response_view_meta(view_family: &str, view_label: &str) -> Value {
     })
 }
 
+fn runtime_view_meta(
+    forced_view_meta: Option<(&'static str, &'static str)>,
+) -> (&'static str, &'static str) {
+    forced_view_meta.unwrap_or(("runtime", "Runtime"))
+}
+
+fn build_runtime_bucketed_payload(
+    runtime_payload: &Value,
+    forced_view_meta: Option<(&'static str, &'static str)>,
+    cfg: &StrategyRuntimeConfig,
+    config_source: &str,
+    baseline_profile: &str,
+    config_resolution: Value,
+    lookback_minutes: u32,
+    max_points: u32,
+    samples: &[StrategySample],
+    run: Option<&StrategySimulationResult>,
+) -> Value {
+    let (view_family, view_label) = runtime_view_meta(forced_view_meta);
+    let runtime_defaults = LiveRuntimeConfig::from_env();
+    let fixed_guard = strategy_fixed_guard_payload(cfg, config_source);
+    let current = run
+        .map(|v| v.current.clone())
+        .or_else(|| runtime_payload.get("current").cloned())
+        .unwrap_or(Value::Null);
+    let summary = if let Some(v) = run {
+        json!({
+            "trade_count": v.trade_count,
+            "win_rate_pct": v.win_rate_pct,
+            "avg_pnl_cents": v.avg_pnl_cents,
+            "avg_duration_s": v.avg_duration_s,
+            "total_pnl_cents": v.total_pnl_cents,
+            "net_pnl_cents": v.net_pnl_cents,
+            "gross_pnl_cents": v.gross_pnl_cents,
+            "total_cost_cents": v.total_cost_cents,
+            "total_entry_fee_cents": v.total_entry_fee_cents,
+            "total_exit_fee_cents": v.total_exit_fee_cents,
+            "total_slippage_cents": v.total_slippage_cents,
+            "total_impact_cents": v.total_impact_cents,
+            "net_margin_pct": v.net_margin_pct,
+            "max_drawdown_cents": v.max_drawdown_cents,
+            "max_profit_trade_cents": v.max_profit_trade_cents,
+            "blocked_exits": v.blocked_exits,
+            "emergency_wide_exit_count": v.emergency_wide_exit_count,
+            "execution_penalty_cents_total": v.execution_penalty_cents_total,
+        })
+    } else {
+        json!({
+            "trade_count": 0,
+            "win_rate_pct": 0.0,
+            "avg_pnl_cents": 0.0,
+            "avg_duration_s": 0.0,
+            "total_pnl_cents": 0.0,
+            "net_pnl_cents": 0.0,
+            "gross_pnl_cents": 0.0,
+            "total_cost_cents": 0.0,
+            "total_entry_fee_cents": 0.0,
+            "total_exit_fee_cents": 0.0,
+            "total_slippage_cents": 0.0,
+            "total_impact_cents": 0.0,
+            "net_margin_pct": 0.0,
+            "max_drawdown_cents": 0.0,
+            "max_profit_trade_cents": 0.0,
+            "blocked_exits": 0,
+            "emergency_wide_exit_count": 0,
+            "execution_penalty_cents_total": 0.0,
+        })
+    };
+    let trades = run.map(|v| v.trades.clone()).unwrap_or_default();
+    let signal_decisions = run.map(|v| v.signal_decisions.clone()).unwrap_or_default();
+
+    json!({
+        "source": "runtime",
+        "view": strategy_response_view_meta(view_family, view_label),
+        "execution_target": "paper",
+        "live_enabled": runtime_payload
+            .get("live_enabled")
+            .cloned()
+            .unwrap_or_else(|| json!(fev1::ExecutionGate::from_env().live_enabled)),
+        "strategy_engine": "forge_fev1",
+        "strategy_alias": "FEV1",
+        "engine_version": "v1",
+        "market_type": runtime_payload
+            .get("market_type")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "symbol": runtime_payload.get("symbol").cloned().unwrap_or(Value::Null),
+        "lookback_minutes": lookback_minutes,
+        "sample_source_mode": "runtime_bucket_1s_from_snapshot_100ms",
+        "sample_resolution_ms": 1000,
+        "storage_source_mode": "snapshot_100ms",
+        "storage_resolution_ms": 100,
+        "lookback": strategy_lookback_meta_json(samples, false, lookback_minutes, max_points, 1000),
+        "runtime_defaults": {
+            "lookback_minutes": runtime_defaults.lookback_minutes,
+            "max_points": runtime_defaults.max_points,
+            "max_trades": runtime_defaults.max_trades,
+        },
+        "samples": samples.len(),
+        "config_source": config_source,
+        "baseline_profile": baseline_profile,
+        "config_resolution": config_resolution,
+        "fixed_guard": fixed_guard,
+        "config": strategy_cfg_json(cfg),
+        "paper_cost_model": strategy_paper_cost_model_json(cfg),
+        "current": current,
+        "summary": summary,
+        "trades": trades,
+        "signal_decisions": signal_decisions,
+        "runtime_current_raw": runtime_payload.get("current").cloned().unwrap_or(Value::Null),
+        "runtime_raw_summary": runtime_payload.get("summary").cloned().unwrap_or(Value::Null),
+        "runtime_raw_trade_count": runtime_payload
+            .get("summary")
+            .and_then(|v| v.get("trade_count"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "runtime_control": runtime_payload
+            .get("runtime_control")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "execution_aggressiveness": runtime_payload
+            .get("execution_aggressiveness")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "live_execute_requested": runtime_payload
+            .get("live_execute_requested")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "live_execute": runtime_payload.get("live_execute").cloned().unwrap_or(Value::Null),
+        "live_execute_block_reason": runtime_payload
+            .get("live_execute_block_reason")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "live_execution": runtime_payload
+            .get("live_execution")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "kill_switch": runtime_payload.get("kill_switch").cloned().unwrap_or(Value::Null),
+        "fixed_guard_runtime": runtime_payload
+            .get("fixed_guard")
+            .cloned()
+            .unwrap_or(Value::Null),
+    })
+}
+
 #[derive(Debug, Deserialize)]
 pub(super) struct StrategyPaperQueryParams {
     source: Option<String>,
@@ -316,6 +461,7 @@ async fn strategy_paper_impl(
 
     let mut source_fallback_error: Option<String> = None;
     let runtime_symbol = runtime_defaults.symbol.to_ascii_uppercase();
+    let mut runtime_snapshot: Option<Value> = None;
     if matches!(
         source_mode,
         StrategyPaperSource::Live | StrategyPaperSource::Auto
@@ -329,23 +475,36 @@ async fn strategy_paper_impl(
             }
             source_fallback_error = Some(mismatch_msg);
         } else if let Some(payload) = state.get_runtime_snapshot(symbol, market_type).await {
-                    let mut payload = payload;
-                    if let Some((family, label)) = forced_view_meta {
-                        if let Some(obj) = payload.as_object_mut() {
-                            obj.insert(
-                                "view".to_string(),
-                                strategy_response_view_meta(family, label),
-                            );
-                        }
-                    }
-                    return Ok(Json(payload));
-                } else {
+            runtime_snapshot = Some(payload);
+        } else {
             let warmup_msg = "live runtime warming up (no snapshot yet)";
             if matches!(source_mode, StrategyPaperSource::Live) {
                 return Err(ApiError::bad_request(warmup_msg));
             }
             source_fallback_error = Some(warmup_msg.to_string());
         }
+    }
+
+    if matches!(source_mode, StrategyPaperSource::Live) {
+        let runtime_payload = runtime_snapshot
+            .as_ref()
+            .ok_or_else(|| ApiError::bad_request("live runtime warming up (no snapshot yet)"))?;
+        let samples = load_live_runtime_samples(&state, symbol, market_type, lookback_minutes, max_points).await?;
+        let run = (samples.len() >= 20)
+            .then(|| run_strategy_simulation_with_fee_context(&samples, &cfg, max_trades, None));
+        let payload = build_runtime_bucketed_payload(
+            runtime_payload,
+            forced_view_meta,
+            &cfg,
+            &config_source,
+            baseline_profile,
+            config_resolution,
+            lookback_minutes,
+            max_points,
+            &samples,
+            run.as_ref(),
+        );
+        return Ok(Json(payload));
     }
 
     let samples = load_strategy_samples(
@@ -1407,4 +1566,80 @@ pub(super) async fn strategy_autotune_set(
         "previous_key": previous_key,
         "saved": saved_doc,
     })))
+}
+
+#[cfg(test)]
+mod handlers_runtime_view_tests {
+    use super::*;
+
+    #[test]
+    fn build_runtime_bucketed_payload_marks_runtime_as_bucketed_1s_view() {
+        let runtime_payload = json!({
+            "symbol": "SOLUSDT",
+            "market_type": "5m",
+            "current": {
+                "round_id": "SOLUSDT_5m_1",
+                "timestamp_ms": 1_700_000_000_000i64,
+                "suggested_action": "HOLD"
+            },
+            "summary": {
+                "trade_count": 7
+            },
+            "runtime_control": {
+                "mode": "paper_only"
+            }
+        });
+        let samples = vec![StrategySample {
+            ts_ms: 1_700_000_000_000,
+            round_id: "SOLUSDT_5m_1".to_string(),
+            remaining_ms: 120_000,
+            p_up: 0.51,
+            delta_pct: 0.0,
+            velocity: 0.0,
+            acceleration: 0.0,
+            bid_yes: 0.50,
+            ask_yes: 0.51,
+            bid_no: 0.49,
+            ask_no: 0.50,
+            spread_up: 0.01,
+            spread_down: 0.01,
+            spread_mid: 0.01,
+        }];
+
+        let payload = build_runtime_bucketed_payload(
+            &runtime_payload,
+            Some(("runtime", "Runtime Paper")),
+            &StrategyRuntimeConfig::default(),
+            "test",
+            "default",
+            json!({"mode": "test"}),
+            60,
+            600,
+            &samples,
+            None,
+        );
+
+        assert_eq!(payload.get("source").and_then(Value::as_str), Some("runtime"));
+        assert_eq!(
+            payload.get("sample_source_mode").and_then(Value::as_str),
+            Some("runtime_bucket_1s_from_snapshot_100ms")
+        );
+        assert_eq!(
+            payload.get("sample_resolution_ms").and_then(Value::as_i64),
+            Some(1000)
+        );
+        assert_eq!(
+            payload
+                .get("runtime_raw_trade_count")
+                .and_then(Value::as_i64),
+            Some(7)
+        );
+        assert_eq!(
+            payload
+                .get("current")
+                .and_then(|v| v.get("round_id"))
+                .and_then(Value::as_str),
+            Some("SOLUSDT_5m_1")
+        );
+    }
 }

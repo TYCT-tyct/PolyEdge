@@ -307,13 +307,17 @@ export interface StrategyLivePositionState {
 
 export interface StrategyPaperResponse {
   symbol?: string;
-  source?: "replay" | "live" | "auto" | string;
+  source?: "replay" | "live" | "runtime" | "ledger" | "auto" | string;
   view?: {
-    family?: "runtime" | "replay" | string;
+    family?: "runtime" | "replay" | "ledger" | string;
     label?: string;
   };
   source_fallback_error?: string | null;
   market_type: string;
+  sample_source_mode?: string;
+  sample_resolution_ms?: number;
+  storage_source_mode?: string;
+  storage_resolution_ms?: number;
   runtime_defaults?: {
     lookback_minutes?: number;
     max_points?: number;
@@ -488,6 +492,9 @@ export interface StrategyPaperResponse {
   };
   live_execute?: boolean;
   strategy_alias?: string;
+  runtime_current_raw?: Record<string, unknown> | null;
+  runtime_raw_summary?: Record<string, unknown> | null;
+  runtime_raw_trade_count?: number | null;
   trades: StrategyPaperTrade[];
 }
 

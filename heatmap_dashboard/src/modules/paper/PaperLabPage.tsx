@@ -597,7 +597,7 @@ export function PaperLabPage({
     : "回放研究";
   const loadingLabel = strategyLoading ? "计算中..." : viewTitle;
   const viewSummaryText = isRuntimePaperView
-    ? "当前展示的是运行中的模拟交易状态与运行期 Paper 交易，不混入回放历史。"
+    ? "当前展示的是运行中的模拟交易状态，但 Paper 统计已归一化到 1 秒 bucket，便于和回放研究直接对照；下方仍保留 raw runtime 状态。"
     : isRuntimeLiveView
     ? "当前展示的是运行中的真实执行链；下方 Paper 交易仅作为同一 Runtime 的模拟参考。"
     : isPaperLedgerView
@@ -1605,6 +1605,17 @@ export function PaperLabPage({
                 strategyPaper?.runtime_defaults?.lookback_minutes ?? "--"
               }m / ${strategyPaper?.runtime_defaults?.max_trades ?? "--"} trades`}
             </span>
+            <span>
+              sampling: {strategyPaper?.sample_source_mode ?? "--"}
+              {strategyPaper?.sample_resolution_ms != null
+                ? ` / ${strategyPaper.sample_resolution_ms}ms`
+                : ""}
+            </span>
+            {isRuntimePaperView || isRuntimeLiveView ? (
+              <span>
+                rawRuntimeTrades: {strategyPaper?.runtime_raw_trade_count ?? "--"}
+              </span>
+            ) : null}
             <span>
               maxEntries/round: {strategyPaper?.config?.max_entries_per_round ?? "--"}
             </span>
