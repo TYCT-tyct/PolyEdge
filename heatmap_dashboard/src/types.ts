@@ -308,6 +308,10 @@ export interface StrategyLivePositionState {
 export interface StrategyPaperResponse {
   symbol?: string;
   source?: "replay" | "live" | "auto" | string;
+  view?: {
+    family?: "runtime" | "replay" | string;
+    label?: string;
+  };
   source_fallback_error?: string | null;
   market_type: string;
   runtime_defaults?: {
@@ -485,4 +489,23 @@ export interface StrategyPaperResponse {
   live_execute?: boolean;
   strategy_alias?: string;
   trades: StrategyPaperTrade[];
+}
+
+export interface StrategyAttributionResponse {
+  source?: "attribution" | string;
+  view?: {
+    family?: "attribution" | string;
+    label?: string;
+  };
+  symbol?: string;
+  market_type: string;
+  updated_at_ms?: number;
+  paper_records: Record<string, unknown>[];
+  live_records: Record<string, unknown>[];
+  order_lineage: Record<string, unknown>[];
+  fills_summary?: Record<string, unknown>;
+  latency?: Record<string, unknown>;
+  position_summary: Array<Record<string, unknown>>;
+  runtime_control?: Record<string, unknown> | null;
+  current?: Record<string, unknown> | null;
 }

@@ -19,6 +19,13 @@ fn parse_strategy_paper_source(raw: Option<&str>) -> StrategyPaperSource {
     }
 }
 
+fn strategy_response_view_meta(view_family: &str, view_label: &str) -> Value {
+    json!({
+        "family": view_family,
+        "label": view_label,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 pub(super) struct StrategyPaperQueryParams {
     source: Option<String>,
@@ -69,11 +76,13 @@ pub(super) struct StrategyPaperQueryParams {
     vic_spread_relax_max: Option<f64>,
 }
 
-pub(super) async fn strategy_paper(
-    State(state): State<ApiState>,
-    Query(params): Query<StrategyPaperQueryParams>,
+async fn strategy_paper_impl(
+    state: ApiState,
+    params: StrategyPaperQueryParams,
+    forced_source: Option<StrategyPaperSource>,
+    forced_view_meta: Option<(&'static str, &'static str)>,
 ) -> Result<Json<Value>, ApiError> {
-    let source_mode = parse_strategy_paper_source(params.source.as_deref());
+    let source_mode = forced_source.unwrap_or_else(|| parse_strategy_paper_source(params.source.as_deref()));
     let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
     let symbol = resolve_strategy_symbol(params.symbol.as_deref())?;
     let prefer_live_doc = matches!(
@@ -97,6 +106,15 @@ pub(super) async fn strategy_paper(
             Ok(permit) => Some(permit),
             Err(_) => {
                 if let Some(payload) = state.get_runtime_snapshot(symbol, market_type).await {
+                    let mut payload = payload;
+                    if let Some((family, label)) = forced_view_meta {
+                        if let Some(obj) = payload.as_object_mut() {
+                            obj.insert(
+                                "view".to_string(),
+                                strategy_response_view_meta(family, label),
+                            );
+                        }
+                    }
                     return Ok(Json(payload));
                 }
                 return Err(ApiError::too_many_requests(
@@ -311,8 +329,17 @@ pub(super) async fn strategy_paper(
             }
             source_fallback_error = Some(mismatch_msg);
         } else if let Some(payload) = state.get_runtime_snapshot(symbol, market_type).await {
-            return Ok(Json(payload));
-        } else {
+                    let mut payload = payload;
+                    if let Some((family, label)) = forced_view_meta {
+                        if let Some(obj) = payload.as_object_mut() {
+                            obj.insert(
+                                "view".to_string(),
+                                strategy_response_view_meta(family, label),
+                            );
+                        }
+                    }
+                    return Ok(Json(payload));
+                } else {
             let warmup_msg = "live runtime warming up (no snapshot yet)";
             if matches!(source_mode, StrategyPaperSource::Live) {
                 return Err(ApiError::bad_request(warmup_msg));
@@ -331,8 +358,12 @@ pub(super) async fn strategy_paper(
     )
     .await?;
     if samples.len() < 20 {
-        return Ok(Json(json!({
+        let payload = json!({
             "source": "replay",
+            "view": strategy_response_view_meta(
+                forced_view_meta.map(|(family, _)| family).unwrap_or("replay"),
+                forced_view_meta.map(|(_, label)| label).unwrap_or("Replay Research"),
+            ),
             "sample_source_mode": "replay_bucket_1s_from_snapshot_100ms",
             "sample_resolution_ms": 1000,
             "storage_source_mode": "snapshot_100ms",
@@ -373,12 +404,17 @@ pub(super) async fn strategy_paper(
                 "max_drawdown_cents": 0.0,
             },
             "trades": [],
-        })));
+        });
+        return Ok(Json(payload));
     }
 
     let run = run_strategy_simulation_with_fee_context(&samples, &cfg, max_trades, None);
-    Ok(Json(json!({
+    let payload = json!({
         "source": "replay",
+            "view": strategy_response_view_meta(
+                forced_view_meta.map(|(family, _)| family).unwrap_or("replay"),
+                forced_view_meta.map(|(_, label)| label).unwrap_or("Replay Research"),
+            ),
             "sample_source_mode": "replay_bucket_1s_from_snapshot_100ms",
             "sample_resolution_ms": 1000,
             "storage_source_mode": "snapshot_100ms",
@@ -428,6 +464,186 @@ pub(super) async fn strategy_paper(
             "execution_penalty_cents_total": run.execution_penalty_cents_total,
         },
         "trades": run.trades,
+    });
+    Ok(Json(payload))
+}
+
+pub(super) async fn strategy_paper(
+    State(state): State<ApiState>,
+    Query(params): Query<StrategyPaperQueryParams>,
+) -> Result<Json<Value>, ApiError> {
+    strategy_paper_impl(state, params, None, None).await
+}
+
+pub(super) async fn strategy_runtime(
+    State(state): State<ApiState>,
+    Query(params): Query<StrategyPaperQueryParams>,
+) -> Result<Json<Value>, ApiError> {
+    strategy_paper_impl(
+        state,
+        params,
+        Some(StrategyPaperSource::Live),
+        Some(("runtime", "Runtime")),
+    )
+    .await
+}
+
+pub(super) async fn strategy_replay(
+    State(state): State<ApiState>,
+    Query(params): Query<StrategyPaperQueryParams>,
+) -> Result<Json<Value>, ApiError> {
+    strategy_paper_impl(
+        state,
+        params,
+        Some(StrategyPaperSource::Replay),
+        Some(("replay", "Replay Research")),
+    )
+    .await
+}
+
+pub(super) async fn strategy_paper_ledger(
+    State(state): State<ApiState>,
+    Query(params): Query<StrategyPaperQueryParams>,
+) -> Result<Json<Value>, ApiError> {
+    let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
+    let symbol = resolve_strategy_symbol(params.symbol.as_deref())?;
+    let max_trades = params.max_trades.map(|v| v.max(1) as usize).unwrap_or(200);
+    let key = paper_ledger_key(&state.redis_prefix, symbol, market_type);
+    let payload = if let Some(v) = read_key_value(&state, &key).await? {
+        v
+    } else if let Some(runtime_payload) = state.get_runtime_snapshot(symbol, market_type).await {
+        build_paper_ledger_payload(None, &runtime_payload, symbol, market_type)
+    } else {
+        json!({
+            "source": "ledger",
+            "view": {
+                "family": "ledger",
+                "label": "Paper Ledger",
+            },
+            "symbol": symbol,
+            "market_type": market_type,
+            "updated_at_ms": Utc::now().timestamp_millis(),
+            "lookback_minutes": 0,
+            "samples": 0,
+            "current": Value::Null,
+            "summary": summarize_trade_rows(&[]),
+            "trades": [],
+            "paper_records": [],
+            "live_records": [],
+        })
+    };
+    let mut payload = payload;
+    if let Some(obj) = payload.as_object_mut() {
+        if let Some(trades) = obj.get_mut("trades").and_then(Value::as_array_mut) {
+            let trim = trades.len().saturating_sub(max_trades);
+            if trim > 0 {
+                trades.drain(0..trim);
+            }
+        }
+        obj.insert(
+            "view".to_string(),
+            strategy_response_view_meta("ledger", "Paper Ledger"),
+        );
+    }
+    Ok(Json(payload))
+}
+
+pub(super) async fn strategy_execution_attribution(
+    State(state): State<ApiState>,
+    Query(params): Query<StrategyPaperQueryParams>,
+) -> Result<Json<Value>, ApiError> {
+    let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
+    let symbol = resolve_strategy_symbol(params.symbol.as_deref())?;
+    let key = paper_ledger_key(&state.redis_prefix, symbol, market_type);
+    let ledger_payload = if let Some(v) = read_key_value(&state, &key).await? {
+        v
+    } else if let Some(runtime_payload) = state.get_runtime_snapshot(symbol, market_type).await {
+        build_paper_ledger_payload(None, &runtime_payload, symbol, market_type)
+    } else {
+        json!({})
+    };
+
+    let paper_records = ledger_payload
+        .get("paper_records")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let live_events = state
+        .list_live_events(symbol, market_type, live_event_log_max())
+        .await;
+    let pending_rows = state.list_pending_orders_for_market(symbol, market_type).await;
+    let (fill_by_decision, fills_summary) = build_live_fill_decision_map(&live_events);
+    let live_order_lineage = build_live_order_lineage(&live_events, &pending_rows);
+    let live_records =
+        build_live_completed_records(&paper_records, &fill_by_decision, &live_order_lineage);
+
+    let mut by_position = HashMap::<String, (usize, f64, f64)>::new();
+    for row in &live_records {
+        let position_id = row
+            .get("position_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or("unassigned")
+            .to_string();
+        let paper_net = row
+            .get("pnl_net_cents")
+            .and_then(Value::as_f64)
+            .or_else(|| row.get("net_pnl_cents").and_then(Value::as_f64))
+            .unwrap_or(0.0);
+        let live_net = row
+            .get("live_fill_pnl_cents_net")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let entry = by_position.entry(position_id).or_insert((0, 0.0, 0.0));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 += paper_net;
+        entry.2 += live_net;
+    }
+    let mut position_summary = by_position
+        .into_iter()
+        .map(|(position_id, (count, paper_net, live_net))| {
+            json!({
+                "position_id": position_id,
+                "record_count": count,
+                "paper_realized_pnl_cents": paper_net,
+                "live_realized_pnl_cents": live_net,
+                "execution_drift_cents": live_net - paper_net,
+            })
+        })
+        .collect::<Vec<_>>();
+    position_summary.sort_by_key(|row| {
+        std::cmp::Reverse(row.get("record_count").and_then(Value::as_u64).unwrap_or(0))
+    });
+
+    let orders = live_events
+        .iter()
+        .filter(|row| {
+            row.get("signal_to_submit_ms").is_some()
+                || row.get("submit_to_ack_ms").is_some()
+                || row.get("order_latency_ms").is_some()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let latency = summarize_live_order_latency(&orders);
+
+    Ok(Json(json!({
+        "source": "attribution",
+        "view": {
+            "family": "attribution",
+            "label": "Execution Attribution",
+        },
+        "symbol": symbol,
+        "market_type": market_type,
+        "updated_at_ms": Utc::now().timestamp_millis(),
+        "paper_records": paper_records,
+        "live_records": live_records,
+        "order_lineage": live_order_lineage,
+        "fills_summary": fills_summary,
+        "latency": latency,
+        "position_summary": position_summary,
+        "runtime_control": ledger_payload.get("runtime_control").cloned().unwrap_or(Value::Null),
+        "current": ledger_payload.get("current").cloned().unwrap_or(Value::Null),
     })))
 }
 
@@ -511,6 +727,11 @@ pub(super) async fn strategy_live_reset(
             live_runtime_control_key(&state.redis_prefix, &runtime_cfg.symbol, market);
         if delete_key(&state, &control_key).await.is_ok() {
             deleted_keys.push(control_key);
+        }
+        let paper_ledger_key =
+            paper_ledger_key(&state.redis_prefix, &runtime_cfg.symbol, market);
+        if delete_key(&state, &paper_ledger_key).await.is_ok() {
+            deleted_keys.push(paper_ledger_key);
         }
     }
     let pending_key = live_pending_orders_key(&state.redis_prefix);

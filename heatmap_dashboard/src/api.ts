@@ -11,6 +11,7 @@ import type {
     RoundChartResponse,
     RoundsResponse,
     StatsResponse,
+    StrategyAttributionResponse,
     StrategyPaperResponse,
     WindowType,
     WsLivePayload
@@ -1031,18 +1032,21 @@ export interface StrategyPaperQueryOptions {
   timeoutMs?: number;
 }
 
-export async function getStrategyPaper(
-  marketType: MarketType = "5m",
-  options: StrategyPaperQueryOptions = {},
-  symbol: MarketSymbol = "BTCUSDT"
+async function requestStrategySnapshot(
+  path: string,
+  marketType: MarketType,
+  options: StrategyPaperQueryOptions,
+  symbol: MarketSymbol
 ): Promise<StrategyPaperResponse> {
   const qs = new URLSearchParams({
-    source: options.source ?? "replay",
-    profile: options.profile ?? "",
     symbol,
     market_type: marketType,
     full_history: options.fullHistory ? "true" : "false"
   });
+  if (options.source) {
+    qs.set("source", options.source);
+  }
+  qs.set("profile", options.profile ?? "");
   if (!options.profile) {
     qs.delete("profile");
   }
@@ -1086,7 +1090,7 @@ export async function getStrategyPaper(
     qs.set("live_entry_only", options.liveEntryOnly ? "true" : "false");
   }
   const payload = await requestJson<Record<string, unknown>>(
-    `/api/strategy/paper?${qs.toString()}`,
+    `${path}?${qs.toString()}`,
     options.timeoutMs ?? REQUEST_TIMEOUT_MS
   );
   if (typeof payload.error === "string" && payload.error.trim()) {
@@ -1096,6 +1100,61 @@ export async function getStrategyPaper(
     throw new Error("strategy paper response schema mismatch");
   }
   return payload;
+}
+
+export async function getStrategyPaper(
+  marketType: MarketType = "5m",
+  options: StrategyPaperQueryOptions = {},
+  symbol: MarketSymbol = "BTCUSDT"
+): Promise<StrategyPaperResponse> {
+  return requestStrategySnapshot("/api/strategy/paper", marketType, options, symbol);
+}
+
+export async function getStrategyRuntime(
+  marketType: MarketType = "5m",
+  options: StrategyPaperQueryOptions = {},
+  symbol: MarketSymbol = "BTCUSDT"
+): Promise<StrategyPaperResponse> {
+  return requestStrategySnapshot("/api/strategy/runtime", marketType, options, symbol);
+}
+
+export async function getStrategyReplay(
+  marketType: MarketType = "5m",
+  options: StrategyPaperQueryOptions = {},
+  symbol: MarketSymbol = "BTCUSDT"
+): Promise<StrategyPaperResponse> {
+  return requestStrategySnapshot("/api/strategy/replay", marketType, options, symbol);
+}
+
+export async function getStrategyPaperLedger(
+  marketType: MarketType = "5m",
+  options: StrategyPaperQueryOptions = {},
+  symbol: MarketSymbol = "BTCUSDT"
+): Promise<StrategyPaperResponse> {
+  return requestStrategySnapshot("/api/strategy/paper_ledger", marketType, options, symbol);
+}
+
+export async function getStrategyExecutionAttribution(
+  marketType: MarketType = "5m",
+  options: StrategyPaperQueryOptions = {},
+  symbol: MarketSymbol = "BTCUSDT"
+): Promise<StrategyAttributionResponse> {
+  const qs = new URLSearchParams({
+    symbol,
+    market_type: marketType,
+    full_history: options.fullHistory ? "true" : "false"
+  });
+  if (options.maxTrades != null) {
+    qs.set("max_trades", String(options.maxTrades));
+  }
+  const payload = await requestJson<Record<string, unknown>>(
+    `/api/strategy/execution_attribution?${qs.toString()}`,
+    options.timeoutMs ?? REQUEST_TIMEOUT_MS
+  );
+  if (typeof payload.error === "string" && payload.error.trim()) {
+    throw new Error(payload.error);
+  }
+  return payload as StrategyAttributionResponse;
 }
 
 export function connectLiveWs(

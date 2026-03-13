@@ -3425,6 +3425,13 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         .route("/api/heatmap", get(heatmap))
         .route("/api/accuracy_series", get(accuracy_series))
         .route("/api/strategy/paper", get(strategy_paper))
+        .route("/api/strategy/runtime", get(strategy_runtime))
+        .route("/api/strategy/replay", get(strategy_replay))
+        .route("/api/strategy/paper_ledger", get(strategy_paper_ledger))
+        .route(
+            "/api/strategy/execution_attribution",
+            get(strategy_execution_attribution),
+        )
         .route("/api/strategy/optimize", get(strategy_optimize))
         .route(
             "/api/strategy/autotune/latest",
@@ -3491,6 +3498,276 @@ fn live_runtime_control_key(redis_prefix: &str, symbol: &str, market_type: &str)
         "{redis_prefix}:fev1:live:runtime_control:{}:{market_type}",
         symbol.trim().to_ascii_uppercase()
     )
+}
+
+fn paper_ledger_key(redis_prefix: &str, symbol: &str, market_type: &str) -> String {
+    format!(
+        "{redis_prefix}:fev1:paper:ledger:{}:{market_type}",
+        symbol.trim().to_ascii_uppercase()
+    )
+}
+
+fn paper_ledger_max_trades() -> usize {
+    std::env::var("FORGE_FEV1_PAPER_LEDGER_MAX_TRADES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(5_000)
+        .clamp(100, 50_000)
+}
+
+fn extract_trade_row_id(row: &Value) -> Option<i64> {
+    row.get("id").and_then(Value::as_i64)
+}
+
+fn merge_unique_trade_rows(existing: &[Value], fresh: &[Value], max_rows: usize) -> Vec<Value> {
+    let mut merged = existing
+        .iter()
+        .filter_map(|row| extract_trade_row_id(row).map(|id| (id, row.clone())))
+        .collect::<HashMap<_, _>>();
+    for row in fresh {
+        if let Some(id) = extract_trade_row_id(row) {
+            merged.insert(id, row.clone());
+        }
+    }
+    let mut rows = merged.into_iter().collect::<Vec<_>>();
+    rows.sort_by_key(|(id, _)| *id);
+    let trim = rows.len().saturating_sub(max_rows);
+    rows.into_iter().skip(trim).map(|(_, row)| row).collect()
+}
+
+fn merge_unique_decision_rows(existing: &[Value], fresh: &[Value], max_rows: usize) -> Vec<Value> {
+    let mut merged = existing
+        .iter()
+        .filter_map(|row| extract_decision_id(row).map(|id| (id, row.clone())))
+        .collect::<HashMap<_, _>>();
+    for row in fresh {
+        if let Some(id) = extract_decision_id(row) {
+            merged.insert(id, row.clone());
+        }
+    }
+    let mut rows = merged.into_iter().map(|(_, row)| row).collect::<Vec<_>>();
+    rows.sort_by_key(|row| row.get("ts_ms").and_then(Value::as_i64).unwrap_or(0));
+    let trim = rows.len().saturating_sub(max_rows);
+    rows.into_iter().skip(trim).collect()
+}
+
+fn summarize_trade_rows(trades: &[Value]) -> Value {
+    if trades.is_empty() {
+        return json!({
+            "trade_count": 0,
+            "win_rate_pct": 0.0,
+            "avg_pnl_cents": 0.0,
+            "avg_duration_s": 0.0,
+            "total_pnl_cents": 0.0,
+            "net_pnl_cents": 0.0,
+            "gross_pnl_cents": 0.0,
+            "total_cost_cents": 0.0,
+            "total_entry_fee_cents": 0.0,
+            "total_exit_fee_cents": 0.0,
+            "total_slippage_cents": 0.0,
+            "total_impact_cents": 0.0,
+            "net_margin_pct": 0.0,
+            "max_drawdown_cents": 0.0,
+        });
+    }
+    let mut trade_count = 0usize;
+    let mut win_count = 0usize;
+    let mut total_net = 0.0_f64;
+    let mut total_gross = 0.0_f64;
+    let mut total_cost = 0.0_f64;
+    let mut total_entry_fee = 0.0_f64;
+    let mut total_exit_fee = 0.0_f64;
+    let mut total_slippage = 0.0_f64;
+    let mut total_impact = 0.0_f64;
+    let mut total_duration_s = 0.0_f64;
+    let mut equity = 0.0_f64;
+    let mut peak = 0.0_f64;
+    let mut max_drawdown = 0.0_f64;
+
+    for row in trades {
+        let pnl_net = row
+            .get("pnl_net_cents")
+            .and_then(Value::as_f64)
+            .or_else(|| row.get("pnl_cents").and_then(Value::as_f64))
+            .or_else(|| row.get("net_pnl_cents").and_then(Value::as_f64))
+            .unwrap_or(0.0);
+        let pnl_gross = row
+            .get("pnl_gross_cents")
+            .and_then(Value::as_f64)
+            .unwrap_or(pnl_net);
+        let cost = row
+            .get("total_cost_cents")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let entry_fee = row
+            .get("entry_fee_cents")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let exit_fee = row
+            .get("exit_fee_cents")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let slip = row
+            .get("entry_slippage_cents")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0)
+            + row
+                .get("exit_slippage_cents")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+            + row
+                .get("exit_emergency_penalty_cents")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+        let impact = row
+            .get("entry_impact_cents")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0)
+            + row
+                .get("exit_impact_cents")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+        let duration_s = row.get("duration_s").and_then(Value::as_f64).unwrap_or(0.0);
+
+        trade_count = trade_count.saturating_add(1);
+        if pnl_net >= 0.0 {
+            win_count = win_count.saturating_add(1);
+        }
+        total_net += pnl_net;
+        total_gross += pnl_gross;
+        total_cost += cost;
+        total_entry_fee += entry_fee;
+        total_exit_fee += exit_fee;
+        total_slippage += slip;
+        total_impact += impact;
+        total_duration_s += duration_s.max(0.0);
+
+        equity += pnl_net;
+        peak = peak.max(equity);
+        max_drawdown = max_drawdown.max((peak - equity).max(0.0));
+    }
+
+    let trade_count_f = trade_count as f64;
+    let win_rate_pct = if trade_count > 0 {
+        (win_count as f64 / trade_count_f) * 100.0
+    } else {
+        0.0
+    };
+    let avg_pnl_cents = if trade_count > 0 {
+        total_net / trade_count_f
+    } else {
+        0.0
+    };
+    let avg_duration_s = if trade_count > 0 {
+        total_duration_s / trade_count_f
+    } else {
+        0.0
+    };
+    let net_margin_pct = if total_gross.abs() > f64::EPSILON {
+        (total_net / total_gross) * 100.0
+    } else {
+        0.0
+    };
+    json!({
+        "trade_count": trade_count,
+        "win_rate_pct": win_rate_pct,
+        "avg_pnl_cents": avg_pnl_cents,
+        "avg_duration_s": avg_duration_s,
+        "total_pnl_cents": total_net,
+        "net_pnl_cents": total_net,
+        "gross_pnl_cents": total_gross,
+        "total_cost_cents": total_cost,
+        "total_entry_fee_cents": total_entry_fee,
+        "total_exit_fee_cents": total_exit_fee,
+        "total_slippage_cents": total_slippage,
+        "total_impact_cents": total_impact,
+        "net_margin_pct": net_margin_pct,
+        "max_drawdown_cents": max_drawdown,
+    })
+}
+
+fn build_paper_ledger_payload(
+    existing: Option<&Value>,
+    runtime_payload: &Value,
+    symbol: &str,
+    market_type: &str,
+) -> Value {
+    let max_trades = paper_ledger_max_trades();
+    let existing_trades = existing
+        .and_then(|v| v.get("trades"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let fresh_trades = runtime_payload
+        .get("trades")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let merged_trades = merge_unique_trade_rows(existing_trades, fresh_trades, max_trades);
+
+    let existing_records = existing
+        .and_then(|v| v.get("paper_records"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let fresh_records = runtime_payload
+        .get("live_execution")
+        .and_then(|v| v.get("paper_records"))
+        .and_then(Value::as_array)
+        .or_else(|| {
+            runtime_payload
+                .get("signal_decisions")
+                .and_then(Value::as_array)
+        })
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let merged_records =
+        merge_unique_decision_rows(existing_records, fresh_records, max_trades * 4);
+
+    let existing_live_records = existing
+        .and_then(|v| v.get("live_records"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let fresh_live_records = runtime_payload
+        .get("live_execution")
+        .and_then(|v| v.get("live_records"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let merged_live_records =
+        merge_unique_decision_rows(existing_live_records, fresh_live_records, max_trades * 4);
+
+    json!({
+        "source": "ledger",
+        "view": {
+            "family": "ledger",
+            "label": "Paper Ledger",
+        },
+        "symbol": runtime_payload
+            .get("symbol")
+            .cloned()
+            .unwrap_or_else(|| json!(runtime_scope_symbol(symbol))),
+        "market_type": runtime_payload
+            .get("market_type")
+            .cloned()
+            .unwrap_or_else(|| json!(market_type)),
+        "updated_at_ms": Utc::now().timestamp_millis(),
+        "runtime_defaults": runtime_payload.get("runtime_defaults").cloned().unwrap_or(Value::Null),
+        "runtime_control": runtime_payload.get("runtime_control").cloned().unwrap_or(Value::Null),
+        "execution_aggressiveness": runtime_payload.get("execution_aggressiveness").cloned().unwrap_or(Value::Null),
+        "lookback_minutes": runtime_payload.get("lookback_minutes").cloned().unwrap_or_else(|| json!(0)),
+        "lookback": runtime_payload.get("lookback").cloned().unwrap_or(Value::Null),
+        "samples": runtime_payload.get("samples").cloned().unwrap_or_else(|| json!(0)),
+        "config_source": runtime_payload.get("config_source").cloned().unwrap_or(Value::Null),
+        "baseline_profile": runtime_payload.get("baseline_profile").cloned().unwrap_or(Value::Null),
+        "config": runtime_payload.get("config").cloned().unwrap_or(Value::Null),
+        "current": runtime_payload.get("current").cloned().unwrap_or(Value::Null),
+        "summary": summarize_trade_rows(&merged_trades),
+        "trades": merged_trades,
+        "paper_records": merged_records,
+        "live_records": merged_live_records,
+    })
 }
 
 async fn load_live_runtime_samples(
@@ -3767,6 +4044,14 @@ async fn persist_live_runtime_state(state: &ApiState, symbol: &str, market_type:
         Some(live_event_log_ttl_sec()),
     )
     .await;
+
+    if let Some(runtime_payload) = state.get_runtime_snapshot(symbol, market_type).await {
+        let ledger_key = paper_ledger_key(&state.redis_prefix, symbol, market_type);
+        let existing = read_key_value(state, &ledger_key).await.ok().flatten();
+        let ledger_payload =
+            build_paper_ledger_payload(existing.as_ref(), &runtime_payload, symbol, market_type);
+        let _ = write_key_value(state, &ledger_key, &ledger_payload, Some(7 * 24 * 3600)).await;
+    }
 }
 
 async fn live_runtime_loop(
@@ -5099,6 +5384,140 @@ mod tests {
                 .get("paper_record_virtual")
                 .and_then(Value::as_bool),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn build_paper_ledger_payload_merges_trades_and_decision_rows() {
+        let existing = json!({
+            "trades": [
+                {
+                    "id": 1,
+                    "pnl_net_cents": 5.0,
+                    "pnl_gross_cents": 6.0,
+                    "total_cost_cents": 1.0,
+                    "entry_fee_cents": 0.2,
+                    "exit_fee_cents": 0.3,
+                    "entry_slippage_cents": 0.1,
+                    "exit_slippage_cents": 0.1,
+                    "entry_impact_cents": 0.0,
+                    "exit_impact_cents": 0.0,
+                    "duration_s": 10.0
+                }
+            ],
+            "paper_records": [
+                {
+                    "decision_id": "decision-1",
+                    "action": "enter",
+                    "side": "UP",
+                    "ts_ms": 100_i64
+                }
+            ],
+            "live_records": [
+                {
+                    "decision_id": "decision-1",
+                    "ts_ms": 200_i64
+                }
+            ]
+        });
+        let runtime_payload = json!({
+            "symbol": "SOLUSDT",
+            "market_type": "5m",
+            "lookback_minutes": 1440,
+            "samples": 321,
+            "current": {
+                "timestamp_ms": 123_456_i64,
+                "round_id": "SOLUSDT_5m_123000"
+            },
+            "trades": [
+                {
+                    "id": 1,
+                    "pnl_net_cents": 5.0,
+                    "pnl_gross_cents": 6.0,
+                    "total_cost_cents": 1.0,
+                    "entry_fee_cents": 0.2,
+                    "exit_fee_cents": 0.3,
+                    "entry_slippage_cents": 0.1,
+                    "exit_slippage_cents": 0.1,
+                    "entry_impact_cents": 0.0,
+                    "exit_impact_cents": 0.0,
+                    "duration_s": 10.0
+                },
+                {
+                    "id": 2,
+                    "pnl_net_cents": -3.0,
+                    "pnl_gross_cents": -2.5,
+                    "total_cost_cents": 0.5,
+                    "entry_fee_cents": 0.1,
+                    "exit_fee_cents": 0.2,
+                    "entry_slippage_cents": 0.1,
+                    "exit_slippage_cents": 0.1,
+                    "entry_impact_cents": 0.05,
+                    "exit_impact_cents": 0.05,
+                    "duration_s": 8.0
+                }
+            ],
+            "live_execution": {
+                "paper_records": [
+                    {
+                        "decision_id": "decision-1",
+                        "action": "enter",
+                        "side": "UP",
+                        "ts_ms": 100_i64
+                    },
+                    {
+                        "decision_id": "decision-2",
+                        "action": "exit",
+                        "side": "UP",
+                        "ts_ms": 220_i64
+                    }
+                ],
+                "live_records": [
+                    {
+                        "decision_id": "decision-2",
+                        "ts_ms": 300_i64
+                    }
+                ]
+            }
+        });
+
+        let payload =
+            build_paper_ledger_payload(Some(&existing), &runtime_payload, "SOLUSDT", "5m");
+        assert_eq!(
+            payload.get("source").and_then(Value::as_str),
+            Some("ledger")
+        );
+        assert_eq!(
+            payload
+                .get("summary")
+                .and_then(|v| v.get("trade_count"))
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            payload
+                .get("summary")
+                .and_then(|v| v.get("net_pnl_cents"))
+                .and_then(Value::as_f64),
+            Some(2.0)
+        );
+        assert_eq!(
+            payload
+                .get("paper_records")
+                .and_then(Value::as_array)
+                .map(|rows| rows.len()),
+            Some(2)
+        );
+        assert_eq!(
+            payload
+                .get("live_records")
+                .and_then(Value::as_array)
+                .map(|rows| rows.len()),
+            Some(2)
+        );
+        assert_eq!(
+            payload.get("symbol").and_then(Value::as_str),
+            Some("SOLUSDT")
         );
     }
 

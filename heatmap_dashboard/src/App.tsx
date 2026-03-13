@@ -1543,7 +1543,7 @@ export default function App() {
         <div className="hero-right">
           <div className="live-indicator">
             <span className={`dot ${isMarketView && wsStatus === "open" ? "ok" : ""}`} />
-            {isMarketView ? (wsStatus === "open" ? "实时连接" : "重连中") : "Paper视图"}
+            {isMarketView ? (wsStatus === "open" ? "实时连接" : "重连中") : "策略工作台"}
           </div>
           <div className="btn-group">
             {SYMBOL_OPTIONS.map((opt) => (
@@ -1561,7 +1561,7 @@ export default function App() {
               市场监控
             </button>
             <button className={viewMode === "paper" ? "active" : ""} onClick={() => setViewMode("paper")}>
-              我的测试 Paper
+              策略工作台
             </button>
           </div>
           <div className="btn-group">
@@ -1609,8 +1609,8 @@ export default function App() {
               <>
                 <span>时区: {formatTimeZoneLabel(timeMode)}</span>
                 <span>交易对: {selectedSymbol}</span>
-                <span>模式: Paper</span>
-                <span>Paper 页面不展示 WS / 采集状态</span>
+                <span>模式: 策略工作台</span>
+                <span>运行态与回放研究已拆分，不混入 WS / 采集状态卡</span>
               </>
             )}
           </div>
