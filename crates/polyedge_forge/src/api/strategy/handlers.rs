@@ -791,15 +791,32 @@ pub(super) async fn strategy_paper_ledger(
     let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
     let symbol = resolve_strategy_symbol(params.symbol.as_deref())?;
     let max_trades = params.max_trades.map(|v| v.max(1) as usize).unwrap_or(200);
-    let key = paper_ledger_key(&state.redis_prefix, symbol, market_type);
+    let lookback_minutes = params.lookback_minutes.unwrap_or(1440).max(1);
     let reset_after_ms = state.get_runtime_paper_reset_anchor(symbol, market_type).await;
-    let payload = if let Some(v) = read_key_value(&state, &key).await? {
-        v
-    } else if let Some(runtime_payload) = state.get_runtime_snapshot(symbol, market_type).await {
-        build_paper_ledger_payload(None, &runtime_payload, symbol, market_type, reset_after_ms)
+    let key = paper_ledger_key(&state.redis_prefix, symbol, market_type);
+    let redis_payload = read_key_value(&state, &key).await?;
+    let runtime_payload = state.get_runtime_snapshot(symbol, market_type).await;
+    let historical_trades = load_clickhouse_paper_ledger_trades(
+        &state,
+        symbol,
+        market_type,
+        lookback_minutes,
+        reset_after_ms,
+    )
+    .await?;
+    let payload = if !historical_trades.is_empty() || redis_payload.is_some() || runtime_payload.is_some() {
+        build_paper_ledger_payload_from_sources(
+            redis_payload.as_ref(),
+            runtime_payload.as_ref(),
+            &historical_trades,
+            symbol,
+            market_type,
+            reset_after_ms,
+        )
     } else {
         json!({
             "source": "ledger",
+            "history_source": "empty",
             "view": {
                 "family": "ledger",
                 "label": "Paper Ledger",
@@ -807,9 +824,10 @@ pub(super) async fn strategy_paper_ledger(
             "symbol": symbol,
             "market_type": market_type,
             "updated_at_ms": Utc::now().timestamp_millis(),
-            "lookback_minutes": 0,
+            "lookback_minutes": lookback_minutes,
             "samples": 0,
             "paper_reset_after_ms": reset_after_ms,
+            "historical_trade_count": 0,
             "current": Value::Null,
             "summary": summarize_trade_rows(&[]),
             "trades": [],

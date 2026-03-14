@@ -3672,6 +3672,30 @@ fn paper_ledger_key(redis_prefix: &str, symbol: &str, market_type: &str) -> Stri
     )
 }
 
+fn paper_ledger_clickhouse_database() -> String {
+    std::env::var("FORGE_CH_DATABASE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "polyedge_forge".to_string())
+}
+
+fn paper_ledger_clickhouse_table() -> String {
+    std::env::var("FORGE_CH_PAPER_LEDGER_TABLE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "paper_ledger_trades".to_string())
+}
+
+fn paper_ledger_clickhouse_ttl_days() -> u16 {
+    std::env::var("FORGE_CH_PAPER_LEDGER_TTL_DAYS")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(365)
+        .clamp(14, 3650)
+}
+
 fn live_runtime_paper_reset_anchor_key(
     redis_prefix: &str,
     symbol: &str,
@@ -3693,6 +3717,32 @@ fn paper_ledger_max_trades() -> usize {
 
 fn extract_trade_row_id(row: &Value) -> Option<i64> {
     row.get("id").and_then(Value::as_i64)
+}
+
+fn extract_trade_row_key(row: &Value) -> Option<String> {
+    let entry_ts_ms = row.get("entry_ts_ms").and_then(Value::as_i64).unwrap_or(0);
+    let exit_ts_ms = row.get("exit_ts_ms").and_then(Value::as_i64).unwrap_or(0);
+    let side = row
+        .get("side")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("unknown");
+    let round_id = row
+        .get("entry_round_id")
+        .and_then(Value::as_str)
+        .or_else(|| row.get("round_id").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("unassigned");
+    let row_id = extract_trade_row_id(row).unwrap_or(0);
+    if entry_ts_ms <= 0 && exit_ts_ms <= 0 && row_id <= 0 {
+        return None;
+    }
+    Some(format!(
+        "{}:{}:{}:{}:{}",
+        round_id, side, entry_ts_ms, exit_ts_ms, row_id
+    ))
 }
 
 fn trade_row_ts_ms(row: &Value) -> i64 {
@@ -3735,17 +3785,38 @@ fn filter_decision_rows_after_reset(rows: &[Value], reset_after_ms: Option<i64>)
 fn merge_unique_trade_rows(existing: &[Value], fresh: &[Value], max_rows: usize) -> Vec<Value> {
     let mut merged = existing
         .iter()
-        .filter_map(|row| extract_trade_row_id(row).map(|id| (id, row.clone())))
+        .filter_map(|row| extract_trade_row_key(row).map(|id| (id, row.clone())))
         .collect::<HashMap<_, _>>();
     for row in fresh {
-        if let Some(id) = extract_trade_row_id(row) {
+        if let Some(id) = extract_trade_row_key(row) {
             merged.insert(id, row.clone());
         }
     }
     let mut rows = merged.into_iter().collect::<Vec<_>>();
-    rows.sort_by_key(|(id, _)| *id);
+    rows.sort_by_key(|(_, row)| {
+        (
+            trade_row_ts_ms(row),
+            extract_trade_row_id(row).unwrap_or_default(),
+        )
+    });
     let trim = rows.len().saturating_sub(max_rows);
     rows.into_iter().skip(trim).map(|(_, row)| row).collect()
+}
+
+fn diff_trade_rows(existing: &[Value], merged: &[Value]) -> Vec<Value> {
+    let existing_keys = existing
+        .iter()
+        .filter_map(extract_trade_row_key)
+        .collect::<HashSet<_>>();
+    merged
+        .iter()
+        .filter(|row| {
+            extract_trade_row_key(row)
+                .map(|key| !existing_keys.contains(&key))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect()
 }
 
 fn merge_unique_decision_rows(existing: &[Value], fresh: &[Value], max_rows: usize) -> Vec<Value> {
@@ -3906,14 +3977,37 @@ fn build_paper_ledger_payload(
     market_type: &str,
     reset_after_ms: Option<i64>,
 ) -> Value {
+    build_paper_ledger_payload_from_sources(
+        existing,
+        Some(runtime_payload),
+        &[],
+        symbol,
+        market_type,
+        reset_after_ms,
+    )
+}
+
+fn build_paper_ledger_payload_from_sources(
+    existing: Option<&Value>,
+    runtime_payload: Option<&Value>,
+    historical_trades: &[Value],
+    symbol: &str,
+    market_type: &str,
+    reset_after_ms: Option<i64>,
+) -> Value {
     let max_trades = paper_ledger_max_trades();
-    let existing_trades = existing
-        .and_then(|v| v.get("trades"))
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
+    let base_payload = runtime_payload.or(existing);
+    let existing_trades = if historical_trades.is_empty() {
+        existing
+            .and_then(|v| v.get("trades"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    } else {
+        historical_trades
+    };
     let fresh_trades = runtime_payload
-        .get("trades")
+        .and_then(|v| v.get("trades"))
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
@@ -3931,12 +4025,12 @@ fn build_paper_ledger_payload(
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     let fresh_records = runtime_payload
-        .get("live_execution")
+        .and_then(|v| v.get("live_execution"))
         .and_then(|v| v.get("paper_records"))
         .and_then(Value::as_array)
         .or_else(|| {
             runtime_payload
-                .get("signal_decisions")
+                .and_then(|v| v.get("signal_decisions"))
                 .and_then(Value::as_array)
         })
         .map(Vec::as_slice)
@@ -3956,7 +4050,7 @@ fn build_paper_ledger_payload(
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     let fresh_live_records = runtime_payload
-        .get("live_execution")
+        .and_then(|v| v.get("live_execution"))
         .and_then(|v| v.get("live_records"))
         .and_then(Value::as_array)
         .map(Vec::as_slice)
@@ -3973,35 +4067,200 @@ fn build_paper_ledger_payload(
 
     json!({
         "source": "ledger",
+        "history_source": if historical_trades.is_empty() { "runtime_redis" } else { "clickhouse_plus_runtime" },
         "view": {
             "family": "ledger",
             "label": "Paper Ledger",
         },
-        "symbol": runtime_payload
-            .get("symbol")
+        "symbol": base_payload
+            .and_then(|v| v.get("symbol"))
             .cloned()
             .unwrap_or_else(|| json!(runtime_scope_symbol(symbol))),
-        "market_type": runtime_payload
-            .get("market_type")
+        "market_type": base_payload
+            .and_then(|v| v.get("market_type"))
             .cloned()
             .unwrap_or_else(|| json!(market_type)),
         "updated_at_ms": Utc::now().timestamp_millis(),
-        "runtime_defaults": runtime_payload.get("runtime_defaults").cloned().unwrap_or(Value::Null),
-        "runtime_control": runtime_payload.get("runtime_control").cloned().unwrap_or(Value::Null),
-        "execution_aggressiveness": runtime_payload.get("execution_aggressiveness").cloned().unwrap_or(Value::Null),
-        "lookback_minutes": runtime_payload.get("lookback_minutes").cloned().unwrap_or_else(|| json!(0)),
-        "lookback": runtime_payload.get("lookback").cloned().unwrap_or(Value::Null),
-        "samples": runtime_payload.get("samples").cloned().unwrap_or_else(|| json!(0)),
+        "runtime_defaults": base_payload.and_then(|v| v.get("runtime_defaults")).cloned().unwrap_or(Value::Null),
+        "runtime_control": base_payload.and_then(|v| v.get("runtime_control")).cloned().unwrap_or(Value::Null),
+        "execution_aggressiveness": base_payload.and_then(|v| v.get("execution_aggressiveness")).cloned().unwrap_or(Value::Null),
+        "lookback_minutes": base_payload.and_then(|v| v.get("lookback_minutes")).cloned().unwrap_or_else(|| json!(0)),
+        "lookback": base_payload.and_then(|v| v.get("lookback")).cloned().unwrap_or(Value::Null),
+        "samples": base_payload.and_then(|v| v.get("samples")).cloned().unwrap_or_else(|| json!(0)),
         "paper_reset_after_ms": reset_after_ms,
-        "config_source": runtime_payload.get("config_source").cloned().unwrap_or(Value::Null),
-        "baseline_profile": runtime_payload.get("baseline_profile").cloned().unwrap_or(Value::Null),
-        "config": runtime_payload.get("config").cloned().unwrap_or(Value::Null),
-        "current": runtime_payload.get("current").cloned().unwrap_or(Value::Null),
+        "historical_trade_count": merged_trades.len(),
+        "config_source": base_payload.and_then(|v| v.get("config_source")).cloned().unwrap_or(Value::Null),
+        "baseline_profile": base_payload.and_then(|v| v.get("baseline_profile")).cloned().unwrap_or(Value::Null),
+        "config": base_payload.and_then(|v| v.get("config")).cloned().unwrap_or(Value::Null),
+        "current": base_payload.and_then(|v| v.get("current")).cloned().unwrap_or(Value::Null),
         "summary": summarize_trade_rows(&merged_trades),
         "trades": merged_trades,
         "paper_records": merged_records,
         "live_records": merged_live_records,
     })
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PaperLedgerTradeInsertRow {
+    symbol: String,
+    market_type: String,
+    trade_key: String,
+    trade_id: i64,
+    side: String,
+    entry_round_id: String,
+    entry_ts_ms: i64,
+    exit_ts_ms: i64,
+    pnl_net_cents: f64,
+    trade_json: String,
+    persisted_at_ms: i64,
+}
+
+async fn ensure_paper_ledger_clickhouse_table(ch_url: &str) -> Result<(), ApiError> {
+    let db = paper_ledger_clickhouse_database();
+    let table = paper_ledger_clickhouse_table();
+    let ttl_days = paper_ledger_clickhouse_ttl_days();
+    execute_clickhouse_command(ch_url, &format!("CREATE DATABASE IF NOT EXISTS {}", db)).await?;
+    let create_sql = format!(
+        "CREATE TABLE IF NOT EXISTS {}.{} (
+            symbol LowCardinality(String),
+            market_type LowCardinality(String),
+            trade_key String,
+            trade_id Int64,
+            side LowCardinality(String),
+            entry_round_id String,
+            entry_ts_ms Int64,
+            exit_ts_ms Int64,
+            pnl_net_cents Float64,
+            trade_json String,
+            persisted_at_ms Int64,
+            ingested_at DateTime64(3, 'UTC') DEFAULT now64(3)
+        )
+        ENGINE = ReplacingMergeTree(persisted_at_ms)
+        PARTITION BY toYYYYMM(fromUnixTimestamp64Milli(exit_ts_ms))
+        ORDER BY (symbol, market_type, trade_key)
+        TTL fromUnixTimestamp64Milli(exit_ts_ms) + INTERVAL {} DAY DELETE",
+        db, table, ttl_days
+    );
+    execute_clickhouse_command(ch_url, &create_sql).await
+}
+
+async fn persist_paper_ledger_trades_to_clickhouse(
+    state: &ApiState,
+    symbol: &str,
+    market_type: &str,
+    rows: &[Value],
+) -> Result<(), ApiError> {
+    let Some(ch_url) = state.ch_url.as_deref() else {
+        return Ok(());
+    };
+    if rows.is_empty() {
+        return Ok(());
+    }
+    ensure_paper_ledger_clickhouse_table(ch_url).await?;
+    let db = paper_ledger_clickhouse_database();
+    let table = paper_ledger_clickhouse_table();
+    let query = format!("INSERT INTO {}.{} FORMAT JSONEachRow", db, table);
+    let persisted_at_ms = Utc::now().timestamp_millis();
+    let mut body = String::with_capacity(rows.len().saturating_mul(800));
+    for row in rows {
+        let Some(trade_key) = extract_trade_row_key(row) else {
+            continue;
+        };
+        let line = serde_json::to_string(&PaperLedgerTradeInsertRow {
+            symbol: runtime_scope_symbol(symbol),
+            market_type: market_type.to_ascii_lowercase(),
+            trade_key,
+            trade_id: extract_trade_row_id(row).unwrap_or_default(),
+            side: row
+                .get("side")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            entry_round_id: row
+                .get("entry_round_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            entry_ts_ms: row
+                .get("entry_ts_ms")
+                .and_then(Value::as_i64)
+                .unwrap_or_default(),
+            exit_ts_ms: row
+                .get("exit_ts_ms")
+                .and_then(Value::as_i64)
+                .unwrap_or_default(),
+            pnl_net_cents: row
+                .get("pnl_net_cents")
+                .and_then(Value::as_f64)
+                .or_else(|| row.get("pnl_cents").and_then(Value::as_f64))
+                .unwrap_or_default(),
+            trade_json: serde_json::to_string(row).unwrap_or_else(|_| "{}".to_string()),
+            persisted_at_ms,
+        })
+        .map_err(|e| ApiError::internal(format!("paper ledger row serialize failed: {}", e)))?;
+        body.push_str(&line);
+        body.push('\n');
+    }
+    if body.is_empty() {
+        return Ok(());
+    }
+    insert_clickhouse_json_each_row(ch_url, &query, body).await
+}
+
+async fn load_clickhouse_paper_ledger_trades(
+    state: &ApiState,
+    symbol: &str,
+    market_type: &str,
+    lookback_minutes: u32,
+    reset_after_ms: Option<i64>,
+) -> Result<Vec<Value>, ApiError> {
+    let Some(ch_url) = state.ch_url.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let db = paper_ledger_clickhouse_database();
+    let table = paper_ledger_clickhouse_table();
+    let safe_symbol = runtime_scope_symbol(symbol).replace('\'', "''");
+    let safe_market = market_type.trim().to_ascii_lowercase().replace('\'', "''");
+    let lookback_cutoff_ms = Utc::now()
+        .timestamp_millis()
+        .saturating_sub((lookback_minutes.max(1) as i64) * 60_000);
+    let cutoff_ms = reset_after_ms
+        .filter(|v| *v > 0)
+        .map(|v| v.max(lookback_cutoff_ms))
+        .unwrap_or(lookback_cutoff_ms);
+    let query = format!(
+        "SELECT trade_json
+         FROM {}.{} FINAL
+         WHERE symbol = '{}' AND market_type = '{}' AND exit_ts_ms >= {}
+         ORDER BY exit_ts_ms ASC
+         LIMIT {}
+         FORMAT JSON",
+        db,
+        table,
+        safe_symbol,
+        safe_market,
+        cutoff_ms,
+        paper_ledger_max_trades()
+    );
+    let json = match query_clickhouse_json(ch_url, &query).await {
+        Ok(v) => v,
+        Err(err) => {
+            let message = err.message.to_ascii_uppercase();
+            if message.contains("UNKNOWN_TABLE") || message.contains("UNKNOWN_DATABASE") {
+                return Ok(Vec::new());
+            }
+            return Err(err);
+        }
+    };
+    Ok(rows_from_json(json)
+        .into_iter()
+        .filter_map(|row| {
+            row.get("trade_json")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter_map(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .collect())
 }
 
 async fn load_live_runtime_samples(
@@ -4323,6 +4582,28 @@ async fn persist_live_runtime_state(state: &ApiState, symbol: &str, market_type:
             market_type,
             reset_after_ms,
         );
+        let existing_trades = existing
+            .as_ref()
+            .and_then(|v| v.get("trades"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let merged_trades = ledger_payload
+            .get("trades")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let new_trades = diff_trade_rows(existing_trades, merged_trades);
+        if let Err(err) =
+            persist_paper_ledger_trades_to_clickhouse(state, symbol, market_type, &new_trades).await
+        {
+            tracing::warn!(
+                symbol = symbol,
+                market_type = market_type,
+                error = %err.message,
+                "paper ledger clickhouse persist failed"
+            );
+        }
         let _ = write_key_value(state, &ledger_key, &ledger_payload, Some(7 * 24 * 3600)).await;
     }
 }
@@ -5904,6 +6185,115 @@ mod tests {
         assert_eq!(
             payload.get("symbol").and_then(Value::as_str),
             Some("SOLUSDT")
+        );
+    }
+
+    #[test]
+    fn merge_unique_trade_rows_uses_stable_trade_identity() {
+        let existing = vec![json!({
+            "id": 1,
+            "side": "UP",
+            "entry_round_id": "BTCUSDT_5m_1",
+            "entry_ts_ms": 1_000_i64,
+            "exit_ts_ms": 2_000_i64,
+            "pnl_net_cents": 1.0
+        })];
+        let fresh = vec![
+            json!({
+                "id": 1,
+                "side": "UP",
+                "entry_round_id": "BTCUSDT_5m_1",
+                "entry_ts_ms": 1_000_i64,
+                "exit_ts_ms": 2_000_i64,
+                "pnl_net_cents": 1.0
+            }),
+            json!({
+                "id": 1,
+                "side": "DOWN",
+                "entry_round_id": "BTCUSDT_5m_2",
+                "entry_ts_ms": 3_000_i64,
+                "exit_ts_ms": 4_000_i64,
+                "pnl_net_cents": -2.0
+            }),
+        ];
+        let merged = merge_unique_trade_rows(&existing, &fresh, 10);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn build_paper_ledger_payload_from_sources_merges_historical_and_runtime_tail() {
+        let existing = json!({
+            "paper_records": [
+                { "decision_id": "paper-1", "ts_ms": 111_i64 }
+            ],
+            "live_records": [
+                { "decision_id": "live-1", "ts_ms": 222_i64 }
+            ]
+        });
+        let historical_trades = vec![json!({
+            "id": 11,
+            "side": "UP",
+            "entry_round_id": "ETHUSDT_5m_hist",
+            "entry_ts_ms": 10_000_i64,
+            "exit_ts_ms": 12_000_i64,
+            "pnl_net_cents": 3.5,
+            "pnl_gross_cents": 4.0,
+            "total_cost_cents": 0.5,
+            "duration_s": 2.0
+        })];
+        let runtime_payload = json!({
+            "symbol": "ETHUSDT",
+            "market_type": "5m",
+            "lookback_minutes": 1440,
+            "samples": 1200,
+            "current": { "timestamp_ms": 123_000_i64, "round_id": "ETHUSDT_5m_now" },
+            "trades": [
+                {
+                    "id": 12,
+                    "side": "DOWN",
+                    "entry_round_id": "ETHUSDT_5m_now",
+                    "entry_ts_ms": 20_000_i64,
+                    "exit_ts_ms": 22_000_i64,
+                    "pnl_net_cents": -1.0,
+                    "pnl_gross_cents": -0.8,
+                    "total_cost_cents": 0.2,
+                    "duration_s": 2.0
+                }
+            ],
+            "live_execution": {
+                "paper_records": [
+                    { "decision_id": "paper-2", "ts_ms": 333_i64 }
+                ],
+                "live_records": [
+                    { "decision_id": "live-2", "ts_ms": 444_i64 }
+                ]
+            }
+        });
+        let payload = build_paper_ledger_payload_from_sources(
+            Some(&existing),
+            Some(&runtime_payload),
+            &historical_trades,
+            "ETHUSDT",
+            "5m",
+            None,
+        );
+        assert_eq!(
+            payload.get("history_source").and_then(Value::as_str),
+            Some("clickhouse_plus_runtime")
+        );
+        assert_eq!(
+            payload
+                .get("summary")
+                .and_then(|v| v.get("trade_count"))
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            payload
+                .get("trades")
+                .and_then(Value::as_array)
+                .map(|rows| rows.len()),
+            Some(2)
         );
     }
 

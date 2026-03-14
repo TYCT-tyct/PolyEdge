@@ -308,6 +308,8 @@ export interface StrategyLivePositionState {
 export interface StrategyPaperResponse {
   symbol?: string;
   source?: "replay" | "live" | "runtime" | "ledger" | "auto" | string;
+  history_source?: string;
+  historical_trade_count?: number;
   payload_mode?: "compact" | "full" | string;
   overview_mode?: string;
   details_available?: boolean;

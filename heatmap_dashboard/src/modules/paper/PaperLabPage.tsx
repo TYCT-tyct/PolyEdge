@@ -691,7 +691,7 @@ export function PaperLabPage({
     : isRuntimeLiveView
     ? "当前展示的是运行中的真实执行链。默认概览直接读取后台预计算快照，只展示轻量摘要；只有点开明细时才会重新计算并展开链路表格。"
     : isPaperLedgerView
-    ? "当前展示的是实时策略真正落下来的模拟账本，不再混入 Replay 重算结果。"
+    ? "当前展示的是长期 Paper 历史账本：优先读取 ClickHouse 持久化历史，再拼接当前 runtime 尚未落库的最新尾部，不再只看本次运行期累积。"
     : isAttributionView
     ? "当前展示的是同一批 intent 的 Paper 预期、真实成交、费用与延迟归因。"
     : "当前展示的是历史样本离线重算结果，用于研究，不代表当前 Runtime 正在交易。";
@@ -700,7 +700,7 @@ export function PaperLabPage({
     : isRuntimeLiveView
     ? "运行期 Paper 参考交易（最近 20 条）"
     : isPaperLedgerView
-    ? "Paper 历史账本（最近 20 条）"
+    ? "长期 Paper 历史账本（最近 20 条）"
     : "回放交易记录（最近 20 条）";
   const attributionCurrent = objCell(strategyAttribution?.current);
   const attributionRuntimeControl = objCell(strategyAttribution?.runtime_control);
@@ -779,6 +779,9 @@ export function PaperLabPage({
       <div className="status-row">
         <span>视图: {viewTitle}</span>
         <span>来源: {sourceLabel}</span>
+        {!isAttributionView && isPaperLedgerView ? (
+          <span>history: {strategyPaper?.history_source ?? "--"}</span>
+        ) : null}
         <span>symbol: {resolvedSymbol}</span>
         <span>market: {strategyMarketType}</span>
         {!isAttributionView && overviewMode ? <span>overview: {overviewMode}</span> : null}
@@ -1759,6 +1762,9 @@ export function PaperLabPage({
                 ? ` / ${strategyPaper.sample_resolution_ms}ms`
                 : ""}
             </span>
+            {isPaperLedgerView ? (
+              <span>historicalTrades: {strategyPaper?.historical_trade_count ?? "--"}</span>
+            ) : null}
             {isRuntimePaperView || isRuntimeLiveView ? (
               <span>
                 rawRuntimeTrades: {strategyPaper?.runtime_raw_trade_count ?? "--"}

@@ -171,6 +171,55 @@ pub(super) async fn query_clickhouse_json(ch_url: &str, query: &str) -> Result<V
     Err(ApiError::internal("clickhouse request failed unexpectedly"))
 }
 
+pub(super) async fn execute_clickhouse_command(ch_url: &str, query: &str) -> Result<(), ApiError> {
+    let resp = clickhouse_http_client()
+        .post(ch_url)
+        .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(query.to_string())
+        .send()
+        .await
+        .map_err(|e| ApiError::internal(format!("clickhouse command failed: {}", e)))?;
+    if resp.status().is_success() {
+        return Ok(());
+    }
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .unwrap_or_else(|_| "clickhouse body read failed".to_string());
+    Err(ApiError::internal(format!(
+        "clickhouse command failed status={} body={}",
+        status, body
+    )))
+}
+
+pub(super) async fn insert_clickhouse_json_each_row(
+    ch_url: &str,
+    query: &str,
+    body: String,
+) -> Result<(), ApiError> {
+    let resp = clickhouse_http_client()
+        .post(ch_url)
+        .query(&[("query", query)])
+        .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| ApiError::internal(format!("clickhouse insert failed: {}", e)))?;
+    if resp.status().is_success() {
+        return Ok(());
+    }
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .unwrap_or_else(|_| "clickhouse body read failed".to_string());
+    Err(ApiError::internal(format!(
+        "clickhouse insert failed status={} body={}",
+        status, body
+    )))
+}
+
 pub(super) fn is_safe_identifier(v: &str) -> bool {
     !v.is_empty()
         && v.len() <= 32
