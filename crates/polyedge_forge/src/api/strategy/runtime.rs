@@ -11,56 +11,6 @@ fn median_f64(values: &mut [f64]) -> Option<f64> {
     }
 }
 
-fn raw_sample_liquidity_score(
-    bid_yes: Option<f64>,
-    ask_yes: Option<f64>,
-    bid_no: Option<f64>,
-    ask_no: Option<f64>,
-) -> f64 {
-    let finite_ratio = [bid_yes, ask_yes, bid_no, ask_no]
-        .iter()
-        .filter(|v| v.map(|x| x.is_finite()).unwrap_or(false))
-        .count() as f64
-        / 4.0;
-    let monotonic_yes =
-        matches!((bid_yes, ask_yes), (Some(b), Some(a)) if a >= b && b >= 0.0 && a <= 1.0);
-    let monotonic_no =
-        matches!((bid_no, ask_no), (Some(b), Some(a)) if a >= b && b >= 0.0 && a <= 1.0);
-    let monotonic_ratio = match (monotonic_yes, monotonic_no) {
-        (true, true) => 1.0,
-        (true, false) | (false, true) => 0.5,
-        _ => 0.0,
-    };
-    let spread_up = match (bid_yes, ask_yes) {
-        (Some(b), Some(a)) if a >= b => (a - b).abs(),
-        _ => 0.08,
-    };
-    let spread_down = match (bid_no, ask_no) {
-        (Some(b), Some(a)) if a >= b => (a - b).abs(),
-        _ => 0.08,
-    };
-    let spread_quality = 1.0 - (((spread_up.max(spread_down)) - 0.02) / 0.06).clamp(0.0, 1.0);
-    let yes_mid = match (bid_yes, ask_yes) {
-        (Some(b), Some(a)) if a >= b => Some((a + b) * 0.5),
-        (Some(v), None) | (None, Some(v)) => Some(v),
-        _ => None,
-    };
-    let no_mid = match (bid_no, ask_no) {
-        (Some(b), Some(a)) if a >= b => Some((a + b) * 0.5),
-        (Some(v), None) | (None, Some(v)) => Some(v),
-        _ => None,
-    };
-    let complement_quality = match (yes_mid, no_mid) {
-        (Some(y), Some(n)) => 1.0 - (((y + n) - 1.0).abs() / 0.08).clamp(0.0, 1.0),
-        _ => 0.0,
-    };
-    (0.30 * finite_ratio
-        + 0.30 * monotonic_ratio
-        + 0.25 * spread_quality
-        + 0.15 * complement_quality)
-        .clamp(0.0, 1.0)
-}
-
 fn stable_band_from_mid_and_spread(
     p_up: f64,
     p_no_mid: f64,
@@ -112,9 +62,6 @@ pub(super) fn build_decision_samples_1s(samples: &[StrategySample]) -> Arc<Vec<S
         let mut deltas = window.iter().map(|v| v.delta_pct).collect::<Vec<_>>();
         let mut velocities = window.iter().map(|v| v.velocity).collect::<Vec<_>>();
         let mut accelerations = window.iter().map(|v| v.acceleration).collect::<Vec<_>>();
-        let liquidity_score = (window.iter().map(|v| v.liquidity_score).sum::<f64>()
-            / window.len() as f64)
-            .clamp(0.0, 1.0);
         let p_up = median_f64(&mut mids_up).unwrap_or(0.5).clamp(0.0, 1.0);
         let p_no_mid = (1.0 - p_up).clamp(0.0, 1.0);
         let spread_up = median_f64(&mut spreads_up).unwrap_or(0.012);
@@ -147,7 +94,6 @@ pub(super) fn build_decision_samples_1s(samples: &[StrategySample]) -> Arc<Vec<S
             spread_up,
             spread_down,
             spread_mid,
-            liquidity_score,
         });
     }
     if out.is_empty() {
@@ -181,7 +127,6 @@ pub(super) fn build_decision_samples_1s(samples: &[StrategySample]) -> Arc<Vec<S
             spread_up,
             spread_down,
             spread_mid,
-            liquidity_score: last.liquidity_score.clamp(0.0, 1.0),
         });
     }
     Arc::new(out)
@@ -234,8 +179,6 @@ pub(super) fn parse_strategy_rows(rows: Vec<Value>) -> Vec<StrategySample> {
             (Some(b), Some(a)) if a.is_finite() && b.is_finite() => (a - b).abs(),
             _ => 0.012,
         };
-        let liquidity_score =
-            raw_sample_liquidity_score(raw_bid_yes, raw_ask_yes, raw_bid_no, raw_ask_no);
         let (by, ay, bn, an, spread_up, spread_down, spread_mid) =
             stable_band_from_mid_and_spread(p_up, p_no_mid, raw_spread_up, raw_spread_down);
 
@@ -270,7 +213,6 @@ pub(super) fn parse_strategy_rows(rows: Vec<Value>) -> Vec<StrategySample> {
             spread_up,
             spread_down,
             spread_mid,
-            liquidity_score,
         });
     }
     out
@@ -338,8 +280,6 @@ pub(super) fn strategy_sample_from_snapshot_event(
     let spread_up = (ask_yes - bid_yes).abs().clamp(0.003, 0.04);
     let spread_down = (ask_no - bid_no).abs().clamp(0.003, 0.04);
     let spread_mid = ((spread_up + spread_down) * 0.5).clamp(0.001, 0.08);
-    let liquidity_score =
-        raw_sample_liquidity_score(Some(bid_yes), Some(ask_yes), Some(bid_no), Some(ask_no));
     let delta_pct = event
         .get("delta_pct_smooth")
         .and_then(Value::as_f64)
@@ -378,7 +318,6 @@ pub(super) fn strategy_sample_from_snapshot_event(
             spread_up,
             spread_down,
             spread_mid,
-            liquidity_score,
         },
     ))
 }
@@ -1301,7 +1240,6 @@ pub(super) fn map_sample_to_fev1(s: &StrategySample) -> fev1::Sample {
         spread_up: s.spread_up,
         spread_down: s.spread_down,
         spread_mid: s.spread_mid,
-        liquidity_score: s.liquidity_score,
     }
 }
 

@@ -115,7 +115,6 @@ pub struct Sample {
     pub spread_up: f64,
     pub spread_down: f64,
     pub spread_mid: f64,
-    pub liquidity_score: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -215,19 +214,6 @@ fn active_intent_entry_ttl_ms() -> i64 {
 
 fn active_intent_exit_ttl_ms() -> i64 {
     active_intent_ttl_ms("FORGE_SIGNAL_EXIT_TTL_MS", 5_000)
-}
-
-fn min_entry_liquidity_score() -> f64 {
-    std::env::var("FORGE_SIGNAL_MIN_ENTRY_LIQUIDITY_SCORE")
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|v| v.is_finite())
-        .unwrap_or(0.58)
-        .clamp(0.0, 1.0)
-}
-
-fn entry_liquidity_ok(sample: &Sample) -> bool {
-    sample.liquidity_score.is_finite() && sample.liquidity_score >= min_entry_liquidity_score()
 }
 
 fn compat_live_entry_decision_from_active_intent(intent: Option<&ActiveIntent>) -> Option<Value> {
@@ -950,7 +936,6 @@ impl SimulationCoreState {
             let confidence_ok = fair_conf >= 0.56;
             let spread_ok = sample.spread_mid <= dynamic_spread_limit_prob
                 && spread_side_cents <= dynamic_max_exec_spread;
-            let liquidity_ok = entry_liquidity_ok(sample);
             let fee = taker_fee_cents(ask_raw, side, fee_ctx);
             let entry_impact_cents =
                 execution_impact_cents(sample, side, cfg, sample.remaining_ms, false);
@@ -963,7 +948,6 @@ impl SimulationCoreState {
                 && score_ok
                 && confidence_ok
                 && spread_ok
-                && liquidity_ok
                 && price_ok
                 && potential_ok
                 && cooldown_ok
@@ -1225,7 +1209,6 @@ impl SimulationCoreState {
             let spread_ok = sample.spread_mid <= dynamic_spread_limit_prob
                 && spread_side_cents
                     <= (cfg.max_exec_spread_cents * dynamic.spread_scale).clamp(0.5, 12.0);
-            let liquidity_ok = entry_liquidity_ok(sample);
 
             let fee = taker_fee_cents(ask_raw, entry_side, fee_ctx);
             let entry_impact_cents =
@@ -1240,7 +1223,6 @@ impl SimulationCoreState {
                 && score_ok
                 && confidence_ok
                 && spread_ok
-                && liquidity_ok
                 && price_ok
                 && potential_ok
                 && cooldown_ok
@@ -1538,11 +1520,6 @@ impl SimulationCoreState {
             "delta_pct": self.last_delta_pct,
             "spread_up_cents": self.last_spread_up_cents,
             "spread_down_cents": self.last_spread_down_cents,
-            "liquidity_score": self
-                .last_sample
-                .as_ref()
-                .map(|sample| sample.liquidity_score)
-                .unwrap_or(0.0),
             "loss_cluster_streak": self.loss_cluster_streak,
             "loss_cluster_cooldown_until_ts_ms": self.loss_cluster_cooldown_until_ts_ms,
             "live_entry_available": current_live_entry_available,
@@ -1734,7 +1711,6 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
-                liquidity_score: 1.0,
             },
             Sample {
                 ts_ms: 2_000,
@@ -1751,7 +1727,6 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
-                liquidity_score: 1.0,
             },
             Sample {
                 ts_ms: 3_000,
@@ -1768,7 +1743,6 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
-                liquidity_score: 1.0,
             },
             Sample {
                 ts_ms: 4_000,
@@ -1785,7 +1759,6 @@ mod tests {
                 spread_up: 0.03,
                 spread_down: 0.03,
                 spread_mid: 0.03,
-                liquidity_score: 1.0,
             },
             Sample {
                 ts_ms: 5_000,
@@ -1802,7 +1775,6 @@ mod tests {
                 spread_up: 0.02,
                 spread_down: 0.02,
                 spread_mid: 0.02,
-                liquidity_score: 1.0,
             },
             Sample {
                 ts_ms: 6_000,
@@ -1819,7 +1791,6 @@ mod tests {
                 spread_up: 0.02,
                 spread_down: 0.02,
                 spread_mid: 0.02,
-                liquidity_score: 1.0,
             },
         ];
 
@@ -1899,7 +1870,6 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
-                liquidity_score: 1.0,
             },
             Sample {
                 ts_ms: 2_000,
@@ -1916,7 +1886,6 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
-                liquidity_score: 1.0,
             },
             Sample {
                 ts_ms: 3_000,
@@ -1933,7 +1902,6 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
-                liquidity_score: 1.0,
             },
         ];
 
@@ -2000,114 +1968,6 @@ mod tests {
     }
 
     #[test]
-    fn low_liquidity_blocks_entry_and_active_signal() {
-        let cfg = RuntimeConfig {
-            entry_threshold_base: 0.40,
-            entry_threshold_cap: 0.55,
-            spread_limit_prob: 0.02,
-            entry_edge_prob: 0.01,
-            entry_min_potential_cents: 1.0,
-            entry_max_price_cents: 95.0,
-            min_hold_ms: 0,
-            stop_loss_cents: 99.0,
-            reverse_signal_threshold: -0.95,
-            reverse_signal_ticks: 12,
-            trail_activate_profit_cents: 99.0,
-            trail_drawdown_cents: 99.0,
-            take_profit_near_max_cents: 99.9,
-            endgame_take_profit_cents: 99.9,
-            endgame_remaining_ms: 1_000,
-            liquidity_widen_prob: 0.02,
-            cooldown_ms: 0,
-            max_entries_per_round: 1,
-            max_exec_spread_cents: 2.0,
-            slippage_cents_per_side: 0.2,
-            emergency_wide_spread_penalty_ratio: 0.5,
-            stop_loss_grace_ticks: 1,
-            stop_loss_hard_mult: 1.4,
-            stop_loss_reverse_extra_ticks: 1,
-            loss_cluster_limit: 0,
-            loss_cluster_cooldown_ms: 0,
-            noise_gate_enabled: false,
-            noise_gate_threshold_add: 0.0,
-            noise_gate_edge_add: 0.0,
-            noise_gate_spread_scale: 1.0,
-            vic_enabled: false,
-            vic_target_entries_per_hour: 0.0,
-            vic_deadband_ratio: 0.08,
-            vic_threshold_relax_max: 0.0,
-            vic_edge_relax_max: 0.0,
-            vic_spread_relax_max: 0.0,
-        };
-        let samples = vec![
-            Sample {
-                ts_ms: 1_000,
-                round_id: "r-1".to_string(),
-                remaining_ms: 200_000,
-                p_up: 0.18,
-                delta_pct: -0.8,
-                velocity: -6.0,
-                acceleration: -2.0,
-                bid_yes: 0.49,
-                ask_yes: 0.50,
-                bid_no: 0.50,
-                ask_no: 0.51,
-                spread_up: 0.005,
-                spread_down: 0.005,
-                spread_mid: 0.005,
-                liquidity_score: 0.15,
-            },
-            Sample {
-                ts_ms: 2_000,
-                round_id: "r-1".to_string(),
-                remaining_ms: 199_000,
-                p_up: 0.18,
-                delta_pct: -0.8,
-                velocity: -6.0,
-                acceleration: -2.0,
-                bid_yes: 0.49,
-                ask_yes: 0.50,
-                bid_no: 0.50,
-                ask_no: 0.51,
-                spread_up: 0.005,
-                spread_down: 0.005,
-                spread_mid: 0.005,
-                liquidity_score: 0.15,
-            },
-            Sample {
-                ts_ms: 3_000,
-                round_id: "r-1".to_string(),
-                remaining_ms: 198_000,
-                p_up: 0.18,
-                delta_pct: -0.8,
-                velocity: -6.0,
-                acceleration: -2.0,
-                bid_yes: 0.50,
-                ask_yes: 0.51,
-                bid_no: 0.49,
-                ask_no: 0.50,
-                spread_up: 0.005,
-                spread_down: 0.005,
-                spread_mid: 0.005,
-                liquidity_score: 0.15,
-            },
-        ];
-
-        let run = simulate(&samples, &cfg, 32);
-        assert_eq!(run.trade_count, 0, "low-liquidity entry should be skipped");
-        assert_eq!(
-            run.current
-                .get("live_entry_available")
-                .and_then(Value::as_bool),
-            Some(false)
-        );
-        assert!(
-            run.current.get("active_signal").is_none_or(Value::is_null),
-            "active signal should not be emitted when entry liquidity is poor"
-        );
-    }
-
-    #[test]
     fn blocked_non_emergency_exits_are_escalated() {
         let cfg = RuntimeConfig {
             entry_threshold_base: 0.40,
@@ -2164,7 +2024,6 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
-                liquidity_score: 1.0,
             },
             Sample {
                 ts_ms: 2_000,
@@ -2181,7 +2040,6 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
-                liquidity_score: 1.0,
             },
             Sample {
                 ts_ms: 3_000,
@@ -2198,7 +2056,6 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
-                liquidity_score: 1.0,
             },
         ];
         for ts in [4_000_i64, 5_000_i64, 6_000_i64] {
@@ -2217,7 +2074,6 @@ mod tests {
                 spread_up: 0.03,
                 spread_down: 0.03,
                 spread_mid: 0.03,
-                liquidity_score: 1.0,
             });
         }
 
@@ -2323,7 +2179,6 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
-                liquidity_score: 1.0,
             },
             Sample {
                 ts_ms: 2_000,
@@ -2340,7 +2195,6 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
-                liquidity_score: 1.0,
             },
             Sample {
                 ts_ms: 3_000,
@@ -2357,7 +2211,6 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
-                liquidity_score: 1.0,
             },
         ];
         for ts in [4_000_i64, 5_000_i64] {
@@ -2376,7 +2229,6 @@ mod tests {
                 spread_up: 0.03,
                 spread_down: 0.03,
                 spread_mid: 0.03,
-                liquidity_score: 1.0,
             });
         }
 
@@ -2447,7 +2299,6 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
-                liquidity_score: 1.0,
             },
             Sample {
                 ts_ms: 2_000,
@@ -2464,7 +2315,6 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
-                liquidity_score: 1.0,
             },
             Sample {
                 ts_ms: 3_000,
@@ -2481,7 +2331,6 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
-                liquidity_score: 1.0,
             },
             Sample {
                 ts_ms: 4_000,
@@ -2498,7 +2347,6 @@ mod tests {
                 spread_up: 0.01,
                 spread_down: 0.01,
                 spread_mid: 0.01,
-                liquidity_score: 1.0,
             },
         ];
         for ts in [5_000_i64, 6_000_i64, 7_000_i64] {
@@ -2517,7 +2365,6 @@ mod tests {
                 spread_up: 0.005,
                 spread_down: 0.005,
                 spread_mid: 0.005,
-                liquidity_score: 1.0,
             });
         }
 
@@ -2590,7 +2437,6 @@ mod tests {
                 spread_up: 0.01,
                 spread_down: 0.01,
                 spread_mid: 0.01,
-                liquidity_score: 1.0,
             },
             Sample {
                 ts_ms: 2_000,
@@ -2607,7 +2453,6 @@ mod tests {
                 spread_up: 0.01,
                 spread_down: 0.01,
                 spread_mid: 0.01,
-                liquidity_score: 1.0,
             },
             Sample {
                 ts_ms: 3_000,
@@ -2624,7 +2469,6 @@ mod tests {
                 spread_up: 0.01,
                 spread_down: 0.01,
                 spread_mid: 0.01,
-                liquidity_score: 1.0,
             },
         ];
 
