@@ -2,8 +2,8 @@ import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState
 
 import {
   getStrategyExecutionAttribution,
+  getStrategyHistoricalPaper,
   getStrategyPaperLedger,
-  getStrategyReplay,
   getStrategyRuntime
 } from "../../api";
 import type {
@@ -383,7 +383,7 @@ export function PaperLabPage({
             }
           } else {
             const data = isReplayView
-              ? await getStrategyReplay(strategyMarketType, requestOptions, selectedSymbol)
+              ? await getStrategyHistoricalPaper(strategyMarketType, requestOptions, selectedSymbol)
               : isPaperLedgerView
               ? await getStrategyPaperLedger(strategyMarketType, requestOptions, selectedSymbol)
               : await getStrategyRuntime(strategyMarketType, requestOptions, selectedSymbol);
@@ -472,7 +472,7 @@ export function PaperLabPage({
           }
         } else {
           const payload = isReplayView
-            ? await getStrategyReplay(strategyMarketType, requestOptions, selectedSymbol)
+            ? await getStrategyHistoricalPaper(strategyMarketType, requestOptions, selectedSymbol)
             : isPaperLedgerView
             ? await getStrategyPaperLedger(strategyMarketType, requestOptions, selectedSymbol)
             : await getStrategyRuntime(strategyMarketType, requestOptions, selectedSymbol);

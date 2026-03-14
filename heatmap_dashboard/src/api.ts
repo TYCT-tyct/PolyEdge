@@ -1130,6 +1130,14 @@ export async function getStrategyReplay(
   return requestStrategySnapshot("/api/strategy/replay", marketType, options, symbol);
 }
 
+export async function getStrategyHistoricalPaper(
+  marketType: MarketType = "5m",
+  options: StrategyPaperQueryOptions = {},
+  symbol: MarketSymbol = "BTCUSDT"
+): Promise<StrategyPaperResponse> {
+  return requestStrategySnapshot("/api/strategy/history_paper", marketType, options, symbol);
+}
+
 export async function getStrategyPaperLedger(
   marketType: MarketType = "5m",
   options: StrategyPaperQueryOptions = {},

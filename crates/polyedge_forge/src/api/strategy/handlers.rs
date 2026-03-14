@@ -784,6 +784,23 @@ pub(super) async fn strategy_replay(
     .await
 }
 
+pub(super) async fn strategy_history_paper(
+    State(state): State<ApiState>,
+    Query(params): Query<StrategyPaperQueryParams>,
+) -> Result<Json<Value>, ApiError> {
+    let mut payload = strategy_paper_impl(
+        state,
+        params,
+        Some(StrategyPaperSource::Replay),
+        Some(("history_paper", "Historical Paper")),
+    )
+    .await?
+    .0;
+    payload["source"] = json!("historical_paper");
+    payload["history_source"] = json!("window_replay");
+    Ok(Json(payload))
+}
+
 pub(super) async fn strategy_paper_ledger(
     State(state): State<ApiState>,
     Query(params): Query<StrategyPaperQueryParams>,

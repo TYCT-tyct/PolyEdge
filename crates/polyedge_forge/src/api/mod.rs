@@ -3590,6 +3590,7 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         .route("/api/heatmap", get(heatmap))
         .route("/api/accuracy_series", get(accuracy_series))
         .route("/api/strategy/paper", get(strategy_paper))
+        .route("/api/strategy/history_paper", get(strategy_history_paper))
         .route("/api/strategy/runtime", get(strategy_runtime))
         .route("/api/strategy/replay", get(strategy_replay))
         .route("/api/strategy/paper_ledger", get(strategy_paper_ledger))
