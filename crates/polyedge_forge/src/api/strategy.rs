@@ -71,7 +71,12 @@ const STRATEGY_PROFILE_HI_WIN: &str = "fev1_manual_hi_win_2026_02_27";
 const STRATEGY_PROFILE_BALANCED: &str = "fev1_manual_balanced_2026_02_28";
 const STRATEGY_PROFILE_CAND_GROWTH_MIX: &str = "fev1_cand_growth_mix_2026_02_28";
 const STRATEGY_PROFILE_BTC_5M_BALANCE: &str = "btc5m_balance_2026_03_06";
+const STRATEGY_PROFILE_BTC_5M_OVERALL: &str = "btc5m_overall_2026_03_14";
+const STRATEGY_PROFILE_BTC_15M_OVERALL: &str = "btc15m_overall_2026_03_14";
+const STRATEGY_PROFILE_ETH_5M_OVERALL: &str = "eth5m_overall_2026_03_14";
 const STRATEGY_PROFILE_SOL_5M_SHARP: &str = "sol5m_sharp_2026_03_07";
+const STRATEGY_PROFILE_SOL_5M_OVERALL: &str = "sol5m_overall_2026_03_14";
+const STRATEGY_PROFILE_XRP_5M_OVERALL: &str = "xrp5m_overall_2026_03_14";
 
 #[derive(Clone)]
 struct StrategySampleCacheEntry {
