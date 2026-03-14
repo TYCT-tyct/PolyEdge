@@ -242,6 +242,30 @@ fn compact_strategy_payload(payload: &mut Value) {
     object.insert("payload_trimmed".to_string(), json!(trimmed));
 }
 
+fn build_runtime_snapshot_overview_payload(
+    runtime_payload: &Value,
+    forced_view_meta: Option<(&'static str, &'static str)>,
+    compact: bool,
+) -> Value {
+    let mut payload = runtime_payload.clone();
+    if let Some(object) = payload.as_object_mut() {
+        let (family, label) = runtime_view_meta(forced_view_meta);
+        object.insert(
+            "view".to_string(),
+            strategy_response_view_meta(family, label),
+        );
+        object.insert(
+            "overview_mode".to_string(),
+            json!("runtime_snapshot_fast_path"),
+        );
+        object.insert("details_available".to_string(), json!(true));
+    }
+    if compact {
+        compact_strategy_payload(&mut payload);
+    }
+    payload
+}
+
 #[derive(Debug, Deserialize)]
 pub(super) struct StrategyPaperQueryParams {
     source: Option<String>,
@@ -303,6 +327,23 @@ async fn strategy_paper_impl(
     let source_mode = forced_source.unwrap_or_else(|| parse_strategy_paper_source(params.source.as_deref()));
     let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
     let symbol = resolve_strategy_symbol(params.symbol.as_deref())?;
+    let runtime_defaults = LiveRuntimeConfig::from_env();
+    let runtime_symbol = runtime_defaults.symbol.to_ascii_uppercase();
+
+    if compact
+        && matches!(source_mode, StrategyPaperSource::Live)
+        && symbol.eq_ignore_ascii_case(&runtime_symbol)
+    {
+        if let Some(runtime_payload) = state.get_runtime_snapshot(symbol, market_type).await {
+            let payload = build_runtime_snapshot_overview_payload(
+                &runtime_payload,
+                forced_view_meta,
+                true,
+            );
+            return Ok(Json(payload));
+        }
+    }
+
     let prefer_live_doc = matches!(
         source_mode,
         StrategyPaperSource::Live | StrategyPaperSource::Auto
@@ -509,7 +550,6 @@ async fn strategy_paper_impl(
 
     let fixed_guard = strategy_fixed_guard_payload(&cfg, &config_source);
     let config_resolution = strategy_config_resolution_json(&resolved_cfg);
-    let runtime_defaults = LiveRuntimeConfig::from_env();
     let full_history = params.full_history.unwrap_or(false);
     let lookback_minutes = params
         .lookback_minutes
@@ -536,7 +576,6 @@ async fn strategy_paper_impl(
         .unwrap_or(usize::MAX);
 
     let mut source_fallback_error: Option<String> = None;
-    let runtime_symbol = runtime_defaults.symbol.to_ascii_uppercase();
     let mut runtime_snapshot: Option<Value> = None;
     if matches!(
         source_mode,
@@ -1811,6 +1850,48 @@ mod handlers_runtime_view_tests {
                 .and_then(Value::as_array)
                 .map(Vec::len),
             Some(STRATEGY_COMPACT_EVENT_ROWS)
+        );
+    }
+
+    #[test]
+    fn build_runtime_snapshot_overview_payload_marks_fast_path() {
+        let runtime_payload = json!({
+            "source": "runtime",
+            "symbol": "SOLUSDT",
+            "market_type": "5m",
+            "current": {
+                "round_id": "SOLUSDT_5m_1",
+                "suggested_action": "HOLD"
+            },
+            "summary": {
+                "trade_count": 3
+            },
+            "trades": (0..12).map(|idx| json!({"id": idx})).collect::<Vec<_>>()
+        });
+
+        let payload = build_runtime_snapshot_overview_payload(
+            &runtime_payload,
+            Some(("runtime", "Runtime Paper")),
+            true,
+        );
+
+        assert_eq!(
+            payload.get("overview_mode").and_then(Value::as_str),
+            Some("runtime_snapshot_fast_path")
+        );
+        assert_eq!(
+            payload
+                .get("view")
+                .and_then(|v| v.get("family"))
+                .and_then(Value::as_str),
+            Some("runtime")
+        );
+        assert_eq!(
+            payload
+                .get("trades")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(STRATEGY_COMPACT_TRADE_ROWS)
         );
     }
 }

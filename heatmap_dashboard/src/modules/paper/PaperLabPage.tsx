@@ -576,6 +576,8 @@ export function PaperLabPage({
   const runtimeControl = strategyPaper?.runtime_control;
   const executionAggr = strategyPaper?.execution_aggressiveness;
   const executionTarget = liveExecution?.execution_target;
+  const overviewMode = strategyPaper?.overview_mode;
+  const isSnapshotOverview = overviewMode === "runtime_snapshot_fast_path";
   const liveRealizedNetCents =
     numCell(liveSummary?.realized_net_pnl_cents) ??
     numCell(liveSummary?.fills?.realized_net_pnl_cents) ??
@@ -682,9 +684,9 @@ export function PaperLabPage({
     : "回放研究";
   const loadingLabel = strategyLoading ? "计算中..." : viewTitle;
   const viewSummaryText = isRuntimePaperView
-    ? "当前展示的是运行中的模拟交易状态，但 Paper 统计已归一化到 1 秒 bucket，便于和回放研究直接对照；下方仍保留 raw runtime 状态。"
+    ? "当前展示的是运行中的模拟交易状态。默认概览直接读取后台预计算快照，只展示轻量摘要；只有点开明细时才会重新计算并展开重表格。"
     : isRuntimeLiveView
-    ? "当前展示的是运行中的真实执行链；下方 Paper 交易仅作为同一 Runtime 的模拟参考。"
+    ? "当前展示的是运行中的真实执行链。默认概览直接读取后台预计算快照，只展示轻量摘要；只有点开明细时才会重新计算并展开链路表格。"
     : isPaperLedgerView
     ? "当前展示的是实时策略真正落下来的模拟账本，不再混入 Replay 重算结果。"
     : isAttributionView
@@ -776,6 +778,7 @@ export function PaperLabPage({
         <span>来源: {sourceLabel}</span>
         <span>symbol: {resolvedSymbol}</span>
         <span>market: {strategyMarketType}</span>
+        {!isAttributionView && overviewMode ? <span>overview: {overviewMode}</span> : null}
         <span>{detailOpen ? "details: on-demand loaded" : "details: overview only"}</span>
         {detailOpen ? (
           <span>{detailLoading ? "detail state: loading" : detailReady ? "detail state: ready" : "detail state: idle"}</span>
@@ -788,6 +791,8 @@ export function PaperLabPage({
           <small>
             {detailOpen
               ? "概览仍按轻量轮询更新，重表格和链路明细只在按需加载后展示。"
+              : isSnapshotOverview
+              ? "默认只读取后台预计算 runtime 快照，不在每轮轮询时重新跑一遍策略；需要逐笔和链路时再单独请求明细。"
               : "默认只加载摘要、当前动作和关键指标，避免每轮轮询都解析和渲染整包大表。"}
           </small>
         </div>

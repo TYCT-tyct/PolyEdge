@@ -309,6 +309,7 @@ export interface StrategyPaperResponse {
   symbol?: string;
   source?: "replay" | "live" | "runtime" | "ledger" | "auto" | string;
   payload_mode?: "compact" | "full" | string;
+  overview_mode?: string;
   details_available?: boolean;
   payload_trimmed?: boolean;
   view?: {
@@ -504,6 +505,7 @@ export interface StrategyPaperResponse {
 export interface StrategyAttributionResponse {
   source?: "attribution" | string;
   payload_mode?: "compact" | "full" | string;
+  overview_mode?: string;
   details_available?: boolean;
   payload_trimmed?: boolean;
   view?: {
