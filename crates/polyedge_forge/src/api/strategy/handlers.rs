@@ -1805,6 +1805,11 @@ mod handlers_runtime_view_tests {
             spread_down: 0.01,
             spread_mid: 0.01,
             liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
         }];
 
         let payload = build_runtime_bucketed_payload(

@@ -116,6 +116,11 @@ pub struct Sample {
     pub spread_down: f64,
     pub spread_mid: f64,
     pub liquidity_score: f64,
+    pub liquidity_sample_count: usize,
+    pub liquidity_valid_ratio: f64,
+    pub liquidity_parity_ratio: f64,
+    pub liquidity_spread_ratio: f64,
+    pub liquidity_entry_allowed: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -217,17 +222,27 @@ fn active_intent_exit_ttl_ms() -> i64 {
     active_intent_ttl_ms("FORGE_SIGNAL_EXIT_TTL_MS", 5_000)
 }
 
-fn min_entry_liquidity_score() -> f64 {
-    std::env::var("FORGE_SIGNAL_MIN_ENTRY_LIQUIDITY_SCORE")
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|v| v.is_finite())
-        .unwrap_or(0.58)
-        .clamp(0.0, 1.0)
+fn entry_liquidity_block_reason(sample: &Sample) -> Option<&'static str> {
+    if sample.liquidity_entry_allowed {
+        return None;
+    }
+    if sample.liquidity_sample_count == 0 {
+        return Some("no_liquidity_samples");
+    }
+    if sample.liquidity_valid_ratio < 0.67 {
+        return Some("unstable_two_sided_book");
+    }
+    if sample.liquidity_parity_ratio < 0.67 {
+        return Some("unstable_yes_no_parity");
+    }
+    if sample.liquidity_spread_ratio < 0.67 {
+        return Some("raw_spread_unstable");
+    }
+    Some("liquidity_blocked")
 }
 
 fn entry_liquidity_ok(sample: &Sample) -> bool {
-    sample.liquidity_score.is_finite() && sample.liquidity_score >= min_entry_liquidity_score()
+    sample.liquidity_entry_allowed
 }
 
 fn compat_live_entry_decision_from_active_intent(intent: Option<&ActiveIntent>) -> Option<Value> {
@@ -1543,6 +1558,35 @@ impl SimulationCoreState {
                 .as_ref()
                 .map(|sample| sample.liquidity_score)
                 .unwrap_or(0.0),
+            "liquidity_sample_count": self
+                .last_sample
+                .as_ref()
+                .map(|sample| sample.liquidity_sample_count)
+                .unwrap_or(0),
+            "liquidity_valid_ratio": self
+                .last_sample
+                .as_ref()
+                .map(|sample| sample.liquidity_valid_ratio)
+                .unwrap_or(0.0),
+            "liquidity_parity_ratio": self
+                .last_sample
+                .as_ref()
+                .map(|sample| sample.liquidity_parity_ratio)
+                .unwrap_or(0.0),
+            "liquidity_spread_ratio": self
+                .last_sample
+                .as_ref()
+                .map(|sample| sample.liquidity_spread_ratio)
+                .unwrap_or(0.0),
+            "liquidity_entry_allowed": self
+                .last_sample
+                .as_ref()
+                .map(|sample| sample.liquidity_entry_allowed)
+                .unwrap_or(false),
+            "liquidity_block_reason": self
+                .last_sample
+                .as_ref()
+                .and_then(entry_liquidity_block_reason),
             "loss_cluster_streak": self.loss_cluster_streak,
             "loss_cluster_cooldown_until_ts_ms": self.loss_cluster_cooldown_until_ts_ms,
             "live_entry_available": current_live_entry_available,
@@ -1735,6 +1779,11 @@ mod tests {
                 spread_down: 0.005,
                 spread_mid: 0.005,
                 liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
             },
             Sample {
                 ts_ms: 2_000,
@@ -1752,6 +1801,11 @@ mod tests {
                 spread_down: 0.005,
                 spread_mid: 0.005,
                 liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
             },
             Sample {
                 ts_ms: 3_000,
@@ -1769,6 +1823,11 @@ mod tests {
                 spread_down: 0.005,
                 spread_mid: 0.005,
                 liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
             },
             Sample {
                 ts_ms: 4_000,
@@ -1786,6 +1845,11 @@ mod tests {
                 spread_down: 0.03,
                 spread_mid: 0.03,
                 liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
             },
             Sample {
                 ts_ms: 5_000,
@@ -1803,6 +1867,11 @@ mod tests {
                 spread_down: 0.02,
                 spread_mid: 0.02,
                 liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
             },
             Sample {
                 ts_ms: 6_000,
@@ -1820,6 +1889,11 @@ mod tests {
                 spread_down: 0.02,
                 spread_mid: 0.02,
                 liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
             },
         ];
 
@@ -1900,6 +1974,11 @@ mod tests {
                 spread_down: 0.005,
                 spread_mid: 0.005,
                 liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
             },
             Sample {
                 ts_ms: 2_000,
@@ -1917,6 +1996,11 @@ mod tests {
                 spread_down: 0.005,
                 spread_mid: 0.005,
                 liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
             },
             Sample {
                 ts_ms: 3_000,
@@ -1934,6 +2018,11 @@ mod tests {
                 spread_down: 0.005,
                 spread_mid: 0.005,
                 liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
             },
         ];
 
@@ -2056,6 +2145,11 @@ mod tests {
                 spread_down: 0.005,
                 spread_mid: 0.005,
                 liquidity_score: 0.15,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 0.0,
+                liquidity_parity_ratio: 0.0,
+                liquidity_spread_ratio: 0.0,
+                liquidity_entry_allowed: false,
             },
             Sample {
                 ts_ms: 2_000,
@@ -2073,6 +2167,11 @@ mod tests {
                 spread_down: 0.005,
                 spread_mid: 0.005,
                 liquidity_score: 0.15,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 0.0,
+                liquidity_parity_ratio: 0.0,
+                liquidity_spread_ratio: 0.0,
+                liquidity_entry_allowed: false,
             },
             Sample {
                 ts_ms: 3_000,
@@ -2090,6 +2189,11 @@ mod tests {
                 spread_down: 0.005,
                 spread_mid: 0.005,
                 liquidity_score: 0.15,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 0.0,
+                liquidity_parity_ratio: 0.0,
+                liquidity_spread_ratio: 0.0,
+                liquidity_entry_allowed: false,
             },
         ];
 
@@ -2165,6 +2269,11 @@ mod tests {
                 spread_down: 0.005,
                 spread_mid: 0.005,
                 liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
             },
             Sample {
                 ts_ms: 2_000,
@@ -2182,6 +2291,11 @@ mod tests {
                 spread_down: 0.005,
                 spread_mid: 0.005,
                 liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
             },
             Sample {
                 ts_ms: 3_000,
@@ -2199,6 +2313,11 @@ mod tests {
                 spread_down: 0.005,
                 spread_mid: 0.005,
                 liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
             },
         ];
         for ts in [4_000_i64, 5_000_i64, 6_000_i64] {
@@ -2218,6 +2337,11 @@ mod tests {
                 spread_down: 0.03,
                 spread_mid: 0.03,
                 liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
             });
         }
 
@@ -2324,6 +2448,11 @@ mod tests {
                 spread_down: 0.005,
                 spread_mid: 0.005,
                 liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
             },
             Sample {
                 ts_ms: 2_000,
@@ -2341,6 +2470,11 @@ mod tests {
                 spread_down: 0.005,
                 spread_mid: 0.005,
                 liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
             },
             Sample {
                 ts_ms: 3_000,
@@ -2358,6 +2492,11 @@ mod tests {
                 spread_down: 0.005,
                 spread_mid: 0.005,
                 liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
             },
         ];
         for ts in [4_000_i64, 5_000_i64] {
@@ -2377,6 +2516,11 @@ mod tests {
                 spread_down: 0.03,
                 spread_mid: 0.03,
                 liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
             });
         }
 
@@ -2448,6 +2592,11 @@ mod tests {
                 spread_down: 0.005,
                 spread_mid: 0.005,
                 liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
             },
             Sample {
                 ts_ms: 2_000,
@@ -2465,6 +2614,11 @@ mod tests {
                 spread_down: 0.005,
                 spread_mid: 0.005,
                 liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
             },
             Sample {
                 ts_ms: 3_000,
@@ -2482,6 +2636,11 @@ mod tests {
                 spread_down: 0.005,
                 spread_mid: 0.005,
                 liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
             },
             Sample {
                 ts_ms: 4_000,
@@ -2499,6 +2658,11 @@ mod tests {
                 spread_down: 0.01,
                 spread_mid: 0.01,
                 liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
             },
         ];
         for ts in [5_000_i64, 6_000_i64, 7_000_i64] {
@@ -2518,6 +2682,11 @@ mod tests {
                 spread_down: 0.005,
                 spread_mid: 0.005,
                 liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
             });
         }
 
@@ -2591,6 +2760,11 @@ mod tests {
                 spread_down: 0.01,
                 spread_mid: 0.01,
                 liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
             },
             Sample {
                 ts_ms: 2_000,
@@ -2608,6 +2782,11 @@ mod tests {
                 spread_down: 0.01,
                 spread_mid: 0.01,
                 liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
             },
             Sample {
                 ts_ms: 3_000,
@@ -2625,6 +2804,11 @@ mod tests {
                 spread_down: 0.01,
                 spread_mid: 0.01,
                 liquidity_score: 1.0,
+                liquidity_sample_count: 1,
+                liquidity_valid_ratio: 1.0,
+                liquidity_parity_ratio: 1.0,
+                liquidity_spread_ratio: 1.0,
+                liquidity_entry_allowed: true,
             },
         ];
 

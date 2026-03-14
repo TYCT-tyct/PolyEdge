@@ -11,12 +11,20 @@ fn median_f64(values: &mut [f64]) -> Option<f64> {
     }
 }
 
-fn raw_sample_liquidity_score(
+fn raw_spread_ok(spread_up: f64, spread_down: f64) -> bool {
+    spread_up.is_finite()
+        && spread_down.is_finite()
+        && spread_up >= 0.0
+        && spread_down >= 0.0
+        && spread_up.max(spread_down) <= 0.08
+}
+
+fn raw_sample_liquidity_metrics(
     bid_yes: Option<f64>,
     ask_yes: Option<f64>,
     bid_no: Option<f64>,
     ask_no: Option<f64>,
-) -> f64 {
+) -> (f64, bool, bool, bool) {
     let finite_ratio = [bid_yes, ask_yes, bid_no, ask_no]
         .iter()
         .filter(|v| v.map(|x| x.is_finite()).unwrap_or(false))
@@ -39,6 +47,7 @@ fn raw_sample_liquidity_score(
         (Some(b), Some(a)) if a >= b => (a - b).abs(),
         _ => 0.08,
     };
+    let spread_ok = raw_spread_ok(spread_up, spread_down);
     let spread_quality = 1.0 - (((spread_up.max(spread_down)) - 0.02) / 0.06).clamp(0.0, 1.0);
     let yes_mid = match (bid_yes, ask_yes) {
         (Some(b), Some(a)) if a >= b => Some((a + b) * 0.5),
@@ -54,11 +63,29 @@ fn raw_sample_liquidity_score(
         (Some(y), Some(n)) => 1.0 - (((y + n) - 1.0).abs() / 0.08).clamp(0.0, 1.0),
         _ => 0.0,
     };
-    (0.30 * finite_ratio
+    let score = (0.30 * finite_ratio
         + 0.30 * monotonic_ratio
         + 0.25 * spread_quality
         + 0.15 * complement_quality)
-        .clamp(0.0, 1.0)
+        .clamp(0.0, 1.0);
+    let valid = monotonic_yes && monotonic_no;
+    let parity_ok = matches!((yes_mid, no_mid), (Some(y), Some(n)) if ((y + n) - 1.0).abs() <= 0.08);
+    (score, valid, parity_ok, spread_ok)
+}
+
+fn aggregated_liquidity_entry_allowed(
+    sample_count: usize,
+    valid_ratio: f64,
+    parity_ratio: f64,
+    spread_ratio: f64,
+) -> bool {
+    if sample_count == 0 {
+        return false;
+    }
+    if sample_count < 3 {
+        return valid_ratio >= 0.999 && parity_ratio >= 0.999 && spread_ratio >= 0.999;
+    }
+    valid_ratio >= 0.67 && parity_ratio >= 0.67 && spread_ratio >= 0.67
 }
 
 fn stable_band_from_mid_and_spread(
@@ -115,6 +142,31 @@ pub(super) fn build_decision_samples_1s(samples: &[StrategySample]) -> Arc<Vec<S
         let liquidity_score = (window.iter().map(|v| v.liquidity_score).sum::<f64>()
             / window.len() as f64)
             .clamp(0.0, 1.0);
+        let liquidity_valid_ratio = (window
+            .iter()
+            .filter(|v| v.liquidity_valid_ratio >= 0.999)
+            .count() as f64
+            / window.len() as f64)
+            .clamp(0.0, 1.0);
+        let liquidity_parity_ratio = (window
+            .iter()
+            .filter(|v| v.liquidity_parity_ratio >= 0.999)
+            .count() as f64
+            / window.len() as f64)
+            .clamp(0.0, 1.0);
+        let liquidity_spread_ratio = (window
+            .iter()
+            .filter(|v| v.liquidity_spread_ratio >= 0.999)
+            .count() as f64
+            / window.len() as f64)
+            .clamp(0.0, 1.0);
+        let liquidity_sample_count = window.len();
+        let liquidity_entry_allowed = aggregated_liquidity_entry_allowed(
+            liquidity_sample_count,
+            liquidity_valid_ratio,
+            liquidity_parity_ratio,
+            liquidity_spread_ratio,
+        );
         let p_up = median_f64(&mut mids_up).unwrap_or(0.5).clamp(0.0, 1.0);
         let p_no_mid = (1.0 - p_up).clamp(0.0, 1.0);
         let spread_up = median_f64(&mut spreads_up).unwrap_or(0.012);
@@ -148,6 +200,11 @@ pub(super) fn build_decision_samples_1s(samples: &[StrategySample]) -> Arc<Vec<S
             spread_down,
             spread_mid,
             liquidity_score,
+            liquidity_sample_count,
+            liquidity_valid_ratio,
+            liquidity_parity_ratio,
+            liquidity_spread_ratio,
+            liquidity_entry_allowed,
         });
     }
     if out.is_empty() {
@@ -182,6 +239,11 @@ pub(super) fn build_decision_samples_1s(samples: &[StrategySample]) -> Arc<Vec<S
             spread_down,
             spread_mid,
             liquidity_score: last.liquidity_score.clamp(0.0, 1.0),
+            liquidity_sample_count: last.liquidity_sample_count.max(1),
+            liquidity_valid_ratio: last.liquidity_valid_ratio.clamp(0.0, 1.0),
+            liquidity_parity_ratio: last.liquidity_parity_ratio.clamp(0.0, 1.0),
+            liquidity_spread_ratio: last.liquidity_spread_ratio.clamp(0.0, 1.0),
+            liquidity_entry_allowed: last.liquidity_entry_allowed,
         });
     }
     Arc::new(out)
@@ -234,8 +296,8 @@ pub(super) fn parse_strategy_rows(rows: Vec<Value>) -> Vec<StrategySample> {
             (Some(b), Some(a)) if a.is_finite() && b.is_finite() => (a - b).abs(),
             _ => 0.012,
         };
-        let liquidity_score =
-            raw_sample_liquidity_score(raw_bid_yes, raw_ask_yes, raw_bid_no, raw_ask_no);
+        let (liquidity_score, liquidity_valid, liquidity_parity_ok, liquidity_spread_ok) =
+            raw_sample_liquidity_metrics(raw_bid_yes, raw_ask_yes, raw_bid_no, raw_ask_no);
         let (by, ay, bn, an, spread_up, spread_down, spread_mid) =
             stable_band_from_mid_and_spread(p_up, p_no_mid, raw_spread_up, raw_spread_down);
 
@@ -271,6 +333,11 @@ pub(super) fn parse_strategy_rows(rows: Vec<Value>) -> Vec<StrategySample> {
             spread_down,
             spread_mid,
             liquidity_score,
+            liquidity_sample_count: 1,
+            liquidity_valid_ratio: if liquidity_valid { 1.0 } else { 0.0 },
+            liquidity_parity_ratio: if liquidity_parity_ok { 1.0 } else { 0.0 },
+            liquidity_spread_ratio: if liquidity_spread_ok { 1.0 } else { 0.0 },
+            liquidity_entry_allowed: liquidity_valid && liquidity_parity_ok && liquidity_spread_ok,
         });
     }
     out
@@ -338,8 +405,8 @@ pub(super) fn strategy_sample_from_snapshot_event(
     let spread_up = (ask_yes - bid_yes).abs().clamp(0.003, 0.04);
     let spread_down = (ask_no - bid_no).abs().clamp(0.003, 0.04);
     let spread_mid = ((spread_up + spread_down) * 0.5).clamp(0.001, 0.08);
-    let liquidity_score =
-        raw_sample_liquidity_score(Some(bid_yes), Some(ask_yes), Some(bid_no), Some(ask_no));
+    let (liquidity_score, liquidity_valid, liquidity_parity_ok, liquidity_spread_ok) =
+        raw_sample_liquidity_metrics(Some(bid_yes), Some(ask_yes), Some(bid_no), Some(ask_no));
     let delta_pct = event
         .get("delta_pct_smooth")
         .and_then(Value::as_f64)
@@ -379,6 +446,11 @@ pub(super) fn strategy_sample_from_snapshot_event(
             spread_down,
             spread_mid,
             liquidity_score,
+            liquidity_sample_count: 1,
+            liquidity_valid_ratio: if liquidity_valid { 1.0 } else { 0.0 },
+            liquidity_parity_ratio: if liquidity_parity_ok { 1.0 } else { 0.0 },
+            liquidity_spread_ratio: if liquidity_spread_ok { 1.0 } else { 0.0 },
+            liquidity_entry_allowed: liquidity_valid && liquidity_parity_ok && liquidity_spread_ok,
         },
     ))
 }
@@ -1302,6 +1374,11 @@ pub(super) fn map_sample_to_fev1(s: &StrategySample) -> fev1::Sample {
         spread_down: s.spread_down,
         spread_mid: s.spread_mid,
         liquidity_score: s.liquidity_score,
+        liquidity_sample_count: s.liquidity_sample_count,
+        liquidity_valid_ratio: s.liquidity_valid_ratio,
+        liquidity_parity_ratio: s.liquidity_parity_ratio,
+        liquidity_spread_ratio: s.liquidity_spread_ratio,
+        liquidity_entry_allowed: s.liquidity_entry_allowed,
     }
 }
 

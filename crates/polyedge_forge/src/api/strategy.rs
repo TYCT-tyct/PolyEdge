@@ -23,6 +23,11 @@ pub(super) struct StrategySample {
     pub(super) spread_down: f64,
     pub(super) spread_mid: f64,
     pub(super) liquidity_score: f64,
+    pub(super) liquidity_sample_count: usize,
+    pub(super) liquidity_valid_ratio: f64,
+    pub(super) liquidity_parity_ratio: f64,
+    pub(super) liquidity_spread_ratio: f64,
+    pub(super) liquidity_entry_allowed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
