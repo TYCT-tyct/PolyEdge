@@ -242,7 +242,7 @@ export function PaperLabPage({
     prefs.marketType ?? "5m"
   );
   const [strategyView, setStrategyView] = useState<StrategyWorkbenchView>(
-    prefs.view ?? "runtimePaper"
+    prefs.view ?? "replayLab"
   );
   const [errorText, setErrorText] = useState<string>("");
 
@@ -684,7 +684,7 @@ export function PaperLabPage({
     ? "Paper 账本"
     : isAttributionView
     ? "执行归因"
-    : "回放研究";
+    : "历史 Paper";
   const loadingLabel = strategyLoading ? "计算中..." : viewTitle;
   const viewSummaryText = isRuntimePaperView
     ? "当前展示的是运行中的模拟交易状态。默认概览直接读取后台预计算快照，只展示轻量摘要；只有点开明细时才会重新计算并展开重表格。"
@@ -694,14 +694,14 @@ export function PaperLabPage({
     ? "当前展示的是长期 Paper 历史账本：优先读取 ClickHouse 持久化历史，再拼接当前 runtime 尚未落库的最新尾部，不再只看本次运行期累积。"
     : isAttributionView
     ? "当前展示的是同一批 intent 的 Paper 预期、真实成交、费用与延迟归因。"
-    : "当前展示的是历史样本离线重算结果，用于研究，不代表当前 Runtime 正在交易。";
+    : "当前展示的是过去窗口历史样本重算后的历史 Paper。这就是过去那个版本的 Paper：按设定窗口回放过去数据，展示该窗口内策略会产生的交易、胜率、收益与回撤。";
   const tradeTableTitle = isRuntimePaperView
     ? "运行期 Paper 交易（最近 20 条）"
     : isRuntimeLiveView
     ? "运行期 Paper 参考交易（最近 20 条）"
     : isPaperLedgerView
     ? "长期 Paper 历史账本（最近 20 条）"
-    : "回放交易记录（最近 20 条）";
+    : "历史 Paper 交易记录（最近 20 条）";
   const attributionCurrent = objCell(strategyAttribution?.current);
   const attributionRuntimeControl = objCell(strategyAttribution?.runtime_control);
   const attributionFillsSummary = objCell(strategyAttribution?.fills_summary);
@@ -973,6 +973,12 @@ export function PaperLabPage({
         </div>
         <div className="btn-group">
           <button
+            className={isReplayView ? "active" : ""}
+            onClick={() => setStrategyView("replayLab")}
+          >
+            历史 Paper
+          </button>
+          <button
             className={isRuntimePaperView ? "active" : ""}
             onClick={() => setStrategyView("runtimePaper")}
           >
@@ -995,12 +1001,6 @@ export function PaperLabPage({
             onClick={() => setStrategyView("attribution")}
           >
             执行归因
-          </button>
-          <button
-            className={isReplayView ? "active" : ""}
-            onClick={() => setStrategyView("replayLab")}
-          >
-            回放研究
           </button>
         </div>
         <article className="info-card paper-quote-card">
@@ -1689,13 +1689,23 @@ export function PaperLabPage({
             </thead>
             <tbody>
               {tradeRows.map((t) => (
-                <tr key={`trade-${t.id}`}>
+                <tr
+                  key={`trade-${t.entry_round_id}-${t.entry_ts_ms}-${t.exit_ts_ms}-${t.side}`}
+                >
                   <td>
                     <span className={`chip ${t.side === "UP" ? "up" : "down"}`}>{t.side}</span>
                   </td>
                   <td>{shortRoundId(t.entry_round_id)}</td>
-                  <td>{formatClockTime(t.entry_ts_ms, timeMode)}</td>
-                  <td>{formatClockTime(t.exit_ts_ms, timeMode)}</td>
+                  <td>
+                    {isPaperLedgerView || isReplayView
+                      ? formatTime(t.entry_ts_ms, timeMode)
+                      : formatClockTime(t.entry_ts_ms, timeMode)}
+                  </td>
+                  <td>
+                    {isPaperLedgerView || isReplayView
+                      ? formatTime(t.exit_ts_ms, timeMode)
+                      : formatClockTime(t.exit_ts_ms, timeMode)}
+                  </td>
                   <td>
                     <div>{`${t.entry_price_raw_cents.toFixed(2)} → ${t.exit_price_raw_cents.toFixed(2)}`}</div>
                     <small className="muted">{`exec ${t.entry_price_cents.toFixed(2)} → ${t.exit_price_cents.toFixed(2)}`}</small>

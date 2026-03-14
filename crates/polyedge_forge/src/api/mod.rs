@@ -3721,7 +3721,6 @@ fn extract_trade_row_id(row: &Value) -> Option<i64> {
 
 fn extract_trade_row_key(row: &Value) -> Option<String> {
     let entry_ts_ms = row.get("entry_ts_ms").and_then(Value::as_i64).unwrap_or(0);
-    let exit_ts_ms = row.get("exit_ts_ms").and_then(Value::as_i64).unwrap_or(0);
     let side = row
         .get("side")
         .and_then(Value::as_str)
@@ -3735,13 +3734,20 @@ fn extract_trade_row_key(row: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .unwrap_or("unassigned");
-    let row_id = extract_trade_row_id(row).unwrap_or(0);
-    if entry_ts_ms <= 0 && exit_ts_ms <= 0 && row_id <= 0 {
+    let entry_price_raw_cents = row
+        .get("entry_price_raw_cents")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let entry_price_cents = row
+        .get("entry_price_cents")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    if entry_ts_ms <= 0 {
         return None;
     }
     Some(format!(
-        "{}:{}:{}:{}:{}",
-        round_id, side, entry_ts_ms, exit_ts_ms, row_id
+        "{}:{}:{}:{entry_price_raw_cents:.4}:{entry_price_cents:.4}",
+        round_id, side, entry_ts_ms
     ))
 }
 
@@ -6060,6 +6066,12 @@ mod tests {
             "trades": [
                 {
                     "id": 1,
+                    "side": "UP",
+                    "entry_round_id": "SOLUSDT_5m_round_1",
+                    "entry_ts_ms": 10_000_i64,
+                    "exit_ts_ms": 20_000_i64,
+                    "entry_price_raw_cents": 48.0,
+                    "entry_price_cents": 48.7,
                     "pnl_net_cents": 5.0,
                     "pnl_gross_cents": 6.0,
                     "total_cost_cents": 1.0,
@@ -6099,6 +6111,12 @@ mod tests {
             "trades": [
                 {
                     "id": 1,
+                    "side": "UP",
+                    "entry_round_id": "SOLUSDT_5m_round_1",
+                    "entry_ts_ms": 10_000_i64,
+                    "exit_ts_ms": 20_000_i64,
+                    "entry_price_raw_cents": 48.0,
+                    "entry_price_cents": 48.7,
                     "pnl_net_cents": 5.0,
                     "pnl_gross_cents": 6.0,
                     "total_cost_cents": 1.0,
@@ -6112,6 +6130,12 @@ mod tests {
                 },
                 {
                     "id": 2,
+                    "side": "DOWN",
+                    "entry_round_id": "SOLUSDT_5m_round_2",
+                    "entry_ts_ms": 30_000_i64,
+                    "exit_ts_ms": 38_000_i64,
+                    "entry_price_raw_cents": 52.0,
+                    "entry_price_cents": 52.8,
                     "pnl_net_cents": -3.0,
                     "pnl_gross_cents": -2.5,
                     "total_cost_cents": 0.5,
@@ -6195,29 +6219,39 @@ mod tests {
             "side": "UP",
             "entry_round_id": "BTCUSDT_5m_1",
             "entry_ts_ms": 1_000_i64,
+            "entry_price_raw_cents": 50.0,
+            "entry_price_cents": 50.8,
             "exit_ts_ms": 2_000_i64,
             "pnl_net_cents": 1.0
         })];
         let fresh = vec![
             json!({
-                "id": 1,
+                "id": 2,
                 "side": "UP",
                 "entry_round_id": "BTCUSDT_5m_1",
                 "entry_ts_ms": 1_000_i64,
-                "exit_ts_ms": 2_000_i64,
-                "pnl_net_cents": 1.0
+                "entry_price_raw_cents": 50.0,
+                "entry_price_cents": 50.8,
+                "exit_ts_ms": 2_500_i64,
+                "pnl_net_cents": 1.5
             }),
             json!({
                 "id": 1,
                 "side": "DOWN",
                 "entry_round_id": "BTCUSDT_5m_2",
                 "entry_ts_ms": 3_000_i64,
+                "entry_price_raw_cents": 49.0,
+                "entry_price_cents": 49.7,
                 "exit_ts_ms": 4_000_i64,
                 "pnl_net_cents": -2.0
             }),
         ];
         let merged = merge_unique_trade_rows(&existing, &fresh, 10);
         assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged[0].get("exit_ts_ms").and_then(Value::as_i64),
+            Some(2_500_i64)
+        );
     }
 
     #[test]
