@@ -346,6 +346,7 @@ pub(super) async fn gate_live_decisions(
     symbol: &str,
     market_type: &str,
     decisions: &[Value],
+    trigger_mode: &LiveTriggerMode,
     mark_attempts: bool,
 ) -> (Vec<LiveGatedDecision>, Vec<Value>, LivePositionState) {
     let now_ms = Utc::now().timestamp_millis();
@@ -413,7 +414,11 @@ pub(super) async fn gate_live_decisions(
             .as_deref()
             .map(|s| s.eq_ignore_ascii_case(&side))
             .unwrap_or(false);
-        if action == "enter" && virtual_side.is_some() && side_match {
+        if action == "enter"
+            && virtual_side.is_some()
+            && side_match
+            && trigger_mode.supports_enter_to_add_promotion()
+        {
             action = "add".to_string();
             if let Some(obj) = normalized.as_object_mut() {
                 obj.insert("action".to_string(), Value::String(action.clone()));
@@ -422,6 +427,14 @@ pub(super) async fn gate_live_decisions(
         if !matches!(action.as_str(), "enter" | "add" | "reduce" | "exit") {
             skipped.push(json!({
                 "reason": "invalid_action",
+                "decision": normalized
+            }));
+            continue;
+        }
+        if !trigger_mode.allows_live_action(&action) {
+            skipped.push(json!({
+                "reason": "trigger_mode_action_not_allowed",
+                "trigger_mode": trigger_mode.as_str(),
                 "decision": normalized
             }));
             continue;

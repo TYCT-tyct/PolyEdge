@@ -207,11 +207,105 @@ async fn gate_live_decisions_accepts_fixed_entry_quote_when_required() {
         "SOLUSDT",
         "5m",
         &[decision],
+        &LiveTriggerMode::SignalPool,
         true,
     )
     .await;
     assert_eq!(accepted.len(), 1, "expected fixed USD sizing to satisfy gate");
     assert!(skipped.is_empty(), "unexpected skips: {skipped:?}");
+}
+
+#[tokio::test]
+async fn gate_live_decisions_paper_mirror_rejects_add_action() {
+    let state = test_api_state();
+    let decision = json!({
+        "action": "add",
+        "side": "DOWN",
+        "round_id": "SOLUSDT_5m_1",
+        "ts_ms": chrono::Utc::now().timestamp_millis(),
+        "decision_id": "intent-add-1"
+    });
+    let (accepted, skipped, _) = gate_live_decisions(
+        &state,
+        "SOLUSDT",
+        "5m",
+        &[decision],
+        &LiveTriggerMode::PaperMirror,
+        true,
+    )
+    .await;
+    assert!(accepted.is_empty());
+    assert_eq!(
+        skipped
+            .first()
+            .and_then(|v| v.get("reason"))
+            .and_then(Value::as_str),
+        Some("trigger_mode_action_not_allowed")
+    );
+}
+
+#[tokio::test]
+async fn gate_live_decisions_paper_mirror_does_not_promote_enter_to_add() {
+    let _guard = env_lock().lock().expect("env lock");
+    let _require = ScopedEnvVar::set("FORGE_FEV1_REQUIRE_FIXED_ENTRY_SIZE", "false");
+    let state = test_api_state();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    state
+        .put_live_position_state(
+            "SOLUSDT",
+            "5m",
+            LivePositionState {
+                symbol: "SOLUSDT".to_string(),
+                market_type: "5m".to_string(),
+                state: "in_position".to_string(),
+                side: Some("DOWN".to_string()),
+                entry_round_id: Some("SOLUSDT_5m_prev".to_string()),
+                entry_market_id: None,
+                entry_token_id: None,
+                entry_ts_ms: Some(now_ms - 10_000),
+                entry_price_cents: Some(51.0),
+                entry_quote_usdc: Some(5.0),
+                net_quote_usdc: 5.0,
+                vwap_entry_cents: Some(51.0),
+                last_action: Some("enter".to_string()),
+                last_reason: Some("paper_commit".to_string()),
+                total_entries: 1,
+                total_exits: 0,
+                total_adds: 0,
+                open_add_layers: 0,
+                total_reduces: 0,
+                realized_pnl_usdc: 0.0,
+                last_fill_pnl_usdc: 0.0,
+                position_cost_usdc: 5.0,
+                position_size_shares: 1.0,
+                updated_ts_ms: now_ms,
+            },
+        )
+        .await;
+    let decision = json!({
+        "action": "enter",
+        "side": "DOWN",
+        "round_id": "SOLUSDT_5m_1",
+        "ts_ms": now_ms,
+        "decision_id": "intent-enter-1"
+    });
+    let (accepted, skipped, _) = gate_live_decisions(
+        &state,
+        "SOLUSDT",
+        "5m",
+        &[decision],
+        &LiveTriggerMode::PaperMirror,
+        true,
+    )
+    .await;
+    assert!(accepted.is_empty());
+    assert_eq!(
+        skipped
+            .first()
+            .and_then(|v| v.get("reason"))
+            .and_then(Value::as_str),
+        Some("already_in_position")
+    );
 }
 
 #[test]
@@ -986,6 +1080,7 @@ async fn gate_live_decisions_blocks_entry_after_liquidity_reject_limit() {
         "SOLUSDT",
         "5m",
         &[decision],
+        &LiveTriggerMode::SignalPool,
         true,
     )
     .await;

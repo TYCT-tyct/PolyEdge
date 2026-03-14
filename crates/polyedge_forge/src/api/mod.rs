@@ -696,6 +696,18 @@ impl LiveTriggerMode {
     fn allows_current_fallback(&self) -> bool {
         matches!(self, Self::SignalPool)
     }
+
+    fn allows_live_action(&self, action: &str) -> bool {
+        let action = action.trim().to_ascii_lowercase();
+        match self {
+            Self::SignalPool => matches!(action.as_str(), "enter" | "add" | "reduce" | "exit"),
+            Self::PaperMirror => matches!(action.as_str(), "enter" | "exit"),
+        }
+    }
+
+    fn supports_enter_to_add_promotion(&self) -> bool {
+        matches!(self, Self::SignalPool)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2349,8 +2361,56 @@ impl ApiState {
         now_ms: i64,
         mark_attempt: bool,
     ) -> bool {
+        {
+            let mut guard = self.live_decision_guard.write().await;
+            guard.retain(|_, ts| now_ms.saturating_sub(*ts) <= LIVE_DECISION_GUARD_TTL_MS);
+            if guard.contains_key(key) {
+                return true;
+            }
+        }
+
+        let redis_key = format!("{}:fev1:live:decision_guard:{key}", self.redis_prefix);
+        if let Some(mut conn) = self.redis_manager.clone() {
+            if mark_attempt {
+                let marked: redis::RedisResult<Option<String>> = redis::cmd("SET")
+                    .arg(&redis_key)
+                    .arg(now_ms)
+                    .arg("PX")
+                    .arg(LIVE_DECISION_GUARD_TTL_MS.max(1))
+                    .arg("NX")
+                    .query_async(&mut conn)
+                    .await;
+                match marked {
+                    Ok(Some(_)) => {
+                        let mut guard = self.live_decision_guard.write().await;
+                        guard.insert(key.to_string(), now_ms);
+                        return false;
+                    }
+                    Ok(None) => return true,
+                    Err(err) => {
+                        tracing::warn!(
+                            ?err,
+                            redis_key = %redis_key,
+                            "live decision redis guard set failed; falling back to process guard"
+                        );
+                    }
+                }
+            } else {
+                match conn.exists::<_, bool>(&redis_key).await {
+                    Ok(true) => return true,
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            ?err,
+                            redis_key = %redis_key,
+                            "live decision redis guard exists failed; falling back to process guard"
+                        );
+                    }
+                }
+            }
+        }
+
         let mut guard = self.live_decision_guard.write().await;
-        guard.retain(|_, ts| now_ms.saturating_sub(*ts) <= LIVE_DECISION_GUARD_TTL_MS);
         if guard.contains_key(key) {
             return true;
         }
@@ -4321,6 +4381,7 @@ async fn live_runtime_loop(
                         runtime_symbol,
                         market_type,
                         &selected_decisions,
+                        &live_trigger_mode,
                         effective_live_execute,
                     )
                     .await;
