@@ -693,8 +693,10 @@ struct LiveRuntimeConfig {
     max_orders: usize,
     drain_only: bool,
     quote_usdc: f64,
+    symbols: Vec<String>,
     symbol: String,
     markets: Vec<String>,
+    scoped_markets: HashMap<String, HashSet<String>>,
 }
 
 impl LiveRuntimeConfig {
@@ -765,14 +767,29 @@ impl LiveRuntimeConfig {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(1.0)
             .clamp(0.01, 500.0);
-        let symbol = std::env::var("FORGE_FEV1_RUNTIME_SYMBOL")
+        let mut symbols = Vec::<String>::new();
+        if let Some(symbol) = std::env::var("FORGE_FEV1_RUNTIME_SYMBOL")
             .ok()
             .and_then(|raw| normalize_runtime_symbol(&raw))
-            .or_else(|| {
-                std::env::var("FORGE_FEV1_RUNTIME_SYMBOLS")
-                    .ok()
-                    .and_then(|raw| raw.split(',').find_map(normalize_runtime_symbol))
-            })
+        {
+            symbols.push(symbol);
+        }
+        if let Ok(raw) = std::env::var("FORGE_FEV1_RUNTIME_SYMBOLS") {
+            for symbol in raw.split(',').filter_map(normalize_runtime_symbol) {
+                if !symbols
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(&symbol))
+                {
+                    symbols.push(symbol);
+                }
+            }
+        }
+        if symbols.is_empty() {
+            symbols.push(default_runtime_symbol());
+        }
+        let symbol = symbols
+            .first()
+            .cloned()
             .unwrap_or_else(default_runtime_symbol);
         let markets = std::env::var("FORGE_FEV1_RUNTIME_MARKETS")
             .ok()
@@ -784,6 +801,27 @@ impl LiveRuntimeConfig {
             })
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| vec!["5m".to_string()]);
+        let mut scoped_markets = HashMap::<String, HashSet<String>>::new();
+        if let Ok(raw) = std::env::var("FORGE_FEV1_RUNTIME_SYMBOL_TIMEFRAMES") {
+            for scope in raw.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+                let Some((raw_symbol, raw_markets)) = scope.split_once(':') else {
+                    continue;
+                };
+                let Some(symbol) = normalize_runtime_symbol(raw_symbol) else {
+                    continue;
+                };
+                for market in raw_markets
+                    .split('|')
+                    .map(|v| v.trim().to_ascii_lowercase())
+                    .filter(|v| v == "5m" || v == "15m")
+                {
+                    scoped_markets
+                        .entry(symbol.clone())
+                        .or_default()
+                        .insert(market);
+                }
+            }
+        }
         Self {
             enabled,
             live_execute,
@@ -794,10 +832,28 @@ impl LiveRuntimeConfig {
             max_orders,
             drain_only,
             quote_usdc,
+            symbols,
             symbol,
             markets,
+            scoped_markets,
         }
     }
+}
+
+fn runtime_scope_pairs(cfg: &LiveRuntimeConfig) -> Vec<(String, String)> {
+    let mut scopes = Vec::new();
+    for symbol in &cfg.symbols {
+        let allowed_markets = cfg.scoped_markets.get(symbol);
+        for market in &cfg.markets {
+            if let Some(allowed) = allowed_markets {
+                if !allowed.contains(market) {
+                    continue;
+                }
+            }
+            scopes.push((symbol.clone(), market.clone()));
+        }
+    }
+    scopes
 }
 
 #[derive(Debug, Clone)]
@@ -4325,9 +4381,12 @@ async fn live_runtime_background_maintenance(state: ApiState, bootstrap: LiveRun
         let now_ms = Utc::now().timestamp_millis();
         if now_ms.saturating_sub(last_env_refresh_ms) >= 1_000 {
             cfg = LiveRuntimeConfig::from_env();
-            target_keepalive_at
-                .retain(|k, _| cfg.markets.iter().any(|m| m.eq_ignore_ascii_case(k)));
-            book_prewarm_at.retain(|k, _| cfg.markets.iter().any(|m| m.eq_ignore_ascii_case(k)));
+            let scope_keys = runtime_scope_pairs(&cfg)
+                .into_iter()
+                .map(|(symbol, market)| runtime_scope_key(&symbol, &market))
+                .collect::<HashSet<_>>();
+            target_keepalive_at.retain(|k, _| scope_keys.contains(k));
+            book_prewarm_at.retain(|k, _| scope_keys.contains(k));
             last_env_refresh_ms = now_ms;
         }
         if !cfg.enabled {
@@ -4338,20 +4397,21 @@ async fn live_runtime_background_maintenance(state: ApiState, bootstrap: LiveRun
         let book_prewarm_ms = (LIVE_RUST_BOOK_CACHE_TTL_MS as i64)
             .saturating_sub(60)
             .max(120);
-        for market in &cfg.markets {
-            let last_target = target_keepalive_at.get(market).copied().unwrap_or(0);
-            let last_book = book_prewarm_at.get(market).copied().unwrap_or(0);
+        for (symbol, market) in runtime_scope_pairs(&cfg) {
+            let scope_key = runtime_scope_key(&symbol, &market);
+            let last_target = target_keepalive_at.get(&scope_key).copied().unwrap_or(0);
+            let last_book = book_prewarm_at.get(&scope_key).copied().unwrap_or(0);
             let due_target = now_ms.saturating_sub(last_target) >= target_keepalive_ms;
             let due_book = now_ms.saturating_sub(last_book) >= book_prewarm_ms;
             if !(due_target || due_book) {
                 continue;
             }
-            prewarm_live_runtime_target_and_books(&state, &cfg.symbol, market).await;
+            prewarm_live_runtime_target_and_books(&state, &symbol, &market).await;
             if due_target {
-                target_keepalive_at.insert(market.clone(), now_ms);
+                target_keepalive_at.insert(scope_key.clone(), now_ms);
             }
             if due_book {
-                book_prewarm_at.insert(market.clone(), now_ms);
+                book_prewarm_at.insert(scope_key, now_ms);
             }
         }
         tokio::time::sleep(Duration::from_millis(50)).await; // OPTIMIZED: 120ms -> 50ms for faster prewarming
@@ -4461,42 +4521,42 @@ async fn restore_live_runtime_state(
 ) -> Result<(), ApiError> {
     let mut restored_events = Vec::<Value>::new();
     let mut max_event_seq: u64 = 0;
-    for market in &cfg.markets {
-        let key = live_position_state_key(&state.redis_prefix, &cfg.symbol, market);
+    for (symbol, market) in runtime_scope_pairs(cfg) {
+        let key = live_position_state_key(&state.redis_prefix, &symbol, &market);
         if let Some(v) = read_key_value(state, &key).await? {
             if let Ok(parsed) = serde_json::from_value::<LivePositionState>(v) {
-                if parsed.symbol.eq_ignore_ascii_case(&cfg.symbol) {
+                if parsed.symbol.eq_ignore_ascii_case(&symbol) {
                     state
-                        .put_live_position_state(&cfg.symbol, market, parsed)
+                        .put_live_position_state(&symbol, &market, parsed)
                         .await;
                 } else {
                     tracing::warn!(
-                        market_type = market,
+                        market_type = %market,
                         persisted_symbol = %parsed.symbol,
-                        runtime_symbol = %cfg.symbol,
+                        runtime_symbol = %symbol,
                         "skip restoring live position state due to symbol mismatch"
                     );
                 }
             }
         }
-        let control_key = live_runtime_control_key(&state.redis_prefix, &cfg.symbol, market);
+        let control_key = live_runtime_control_key(&state.redis_prefix, &symbol, &market);
         if let Some(v) = read_key_value(state, &control_key).await? {
             if let Ok(parsed) = serde_json::from_value::<LiveRuntimeControl>(v) {
                 state
-                    .put_live_runtime_control(&cfg.symbol, market, parsed)
+                    .put_live_runtime_control(&symbol, &market, parsed)
                     .await;
             }
         }
         let reset_anchor_key =
-            live_runtime_paper_reset_anchor_key(&state.redis_prefix, &cfg.symbol, market);
+            live_runtime_paper_reset_anchor_key(&state.redis_prefix, &symbol, &market);
         if let Some(v) = read_key_value(state, &reset_anchor_key).await? {
             if let Some(reset_after_ms) = v.as_i64().filter(|v| *v > 0) {
                 state
-                    .put_runtime_paper_reset_anchor(&cfg.symbol, market, reset_after_ms)
+                    .put_runtime_paper_reset_anchor(&symbol, &market, reset_after_ms)
                     .await;
             }
         }
-        let events_key = live_events_key(&state.redis_prefix, &cfg.symbol, market);
+        let events_key = live_events_key(&state.redis_prefix, &symbol, &market);
         if let Some(v) = read_key_value(state, &events_key).await? {
             if let Ok(rows) = serde_json::from_value::<Vec<Value>>(v) {
                 for ev in rows {
@@ -4534,9 +4594,11 @@ async fn restore_live_runtime_state(
         let mut seq = state.live_event_seq.write().await;
         *seq = max_event_seq;
     }
-    state
-        .preload_runtime_event_samples_from_redis(&cfg.symbol, &cfg.markets)
-        .await;
+    for symbol in &cfg.symbols {
+        state
+            .preload_runtime_event_samples_from_redis(symbol, &cfg.markets)
+            .await;
+    }
     Ok(())
 }
 
@@ -4622,7 +4684,7 @@ async fn live_runtime_loop(
 ) {
     tracing::info!(
         markets = ?bootstrap.markets,
-        symbol = %bootstrap.symbol,
+        symbols = ?bootstrap.symbols,
         live_execute = bootstrap.live_execute,
         loop_ms = bootstrap.loop_interval_ms,
         "fev1 live runtime started"
@@ -4671,17 +4733,19 @@ async fn live_runtime_loop(
         let fast_margin = cached_fast_margin;
         let target_prewarm_ms = cached_target_prewarm_ms;
         let idle_force_poll_ms = cached_idle_force_poll_ms;
-        market_next_due_ms.retain(|k, _| cfg.markets.iter().any(|m| m.eq_ignore_ascii_case(k)));
-        strategy_engines.retain(|k, _| cfg.markets.iter().any(|m| m.eq_ignore_ascii_case(k)));
-        for market in &cfg.markets {
+        let scope_keys = runtime_scope_pairs(&cfg)
+            .into_iter()
+            .map(|(symbol, market)| runtime_scope_key(&symbol, &market))
+            .collect::<HashSet<_>>();
+        market_next_due_ms.retain(|k, _| scope_keys.contains(k));
+        strategy_engines.retain(|k, _| scope_keys.contains(k));
+        for (symbol, market) in runtime_scope_pairs(&cfg) {
             market_next_due_ms
-                .entry(market.to_string())
+                .entry(runtime_scope_key(&symbol, &market))
                 .or_insert(now_for_wait);
         }
-        let earliest_due_ms = cfg
-            .markets
-            .iter()
-            .filter_map(|m| market_next_due_ms.get(m))
+        let earliest_due_ms = market_next_due_ms
+            .values()
             .copied()
             .min()
             .unwrap_or(now_for_wait);
@@ -4705,43 +4769,47 @@ async fn live_runtime_loop(
                 }
             }
         }
-        let wake_markets: HashSet<String> = wake_events
+        let wake_scopes: HashSet<String> = wake_events
             .iter()
             .filter_map(|ev| {
-                if ev.symbol.eq_ignore_ascii_case(&cfg.symbol)
+                if cfg
+                    .symbols
+                    .iter()
+                    .any(|symbol| ev.symbol.eq_ignore_ascii_case(symbol))
                     && cfg
                         .markets
                         .iter()
                         .any(|m| m.eq_ignore_ascii_case(&ev.market_type))
                 {
-                    Some(ev.market_type.to_ascii_lowercase())
+                    Some(runtime_scope_key(&ev.symbol, &ev.market_type))
                 } else {
                     None
                 }
             })
             .collect();
-        let wake_event_scope_enabled = !wake_markets.is_empty();
+        let wake_event_scope_enabled = !wake_scopes.is_empty();
         if !cfg.enabled {
             let next_due = Utc::now()
                 .timestamp_millis()
                 .saturating_add(cfg.loop_interval_ms as i64);
-            for market in &cfg.markets {
-                market_next_due_ms.insert(market.to_string(), next_due);
+            for (symbol, market) in runtime_scope_pairs(&cfg) {
+                market_next_due_ms.insert(runtime_scope_key(&symbol, &market), next_due);
             }
             continue;
         }
 
-        for market in &cfg.markets {
+        for (runtime_symbol, market) in runtime_scope_pairs(&cfg) {
             let market_type = market.as_str();
-            let runtime_symbol = cfg.symbol.as_str();
+            let runtime_symbol = runtime_symbol.as_str();
+            let scope_key = runtime_scope_key(runtime_symbol, market_type);
             let trigger_for_market = wake_events.iter().rev().find(|ev| {
                 ev.market_type.eq_ignore_ascii_case(market_type)
                     && ev.symbol.eq_ignore_ascii_case(runtime_symbol)
             });
             let now_ms = Utc::now().timestamp_millis();
-            let is_wake_hit = wake_markets.contains(&market_type.to_ascii_lowercase());
+            let is_wake_hit = wake_scopes.contains(&scope_key);
             let due_at_ms = market_next_due_ms
-                .get(market_type)
+                .get(&scope_key)
                 .copied()
                 .unwrap_or(now_ms);
             let due_cycle = now_ms >= due_at_ms;
@@ -4824,14 +4892,14 @@ async fn live_runtime_loop(
                 .and_then(|ev| ev.sample_ts_ms)
                 .filter(|v| *v > 0);
             let last_eval_sample_ts = market_last_strategy_sample_ts_ms
-                .get(market_type)
+                .get(&scope_key)
                 .copied()
                 .unwrap_or(0);
             let duplicate_wake_sample = latest_event_sample_ts
                 .map(|ts| ts <= last_eval_sample_ts)
                 .unwrap_or(false);
             let last_eval_ms = market_last_strategy_eval_ms
-                .get(market_type)
+                .get(&scope_key)
                 .copied()
                 .unwrap_or(0);
             let force_poll_due = now_ms.saturating_sub(last_eval_ms) >= idle_force_poll_ms;
@@ -4844,7 +4912,7 @@ async fn live_runtime_loop(
                 && ((!is_wake_hit) || duplicate_wake_sample);
             if event_idle_skip {
                 let next_due = now_ms.saturating_add(idle_force_poll_ms);
-                market_next_due_ms.insert(market_type.to_string(), next_due);
+                market_next_due_ms.insert(scope_key.clone(), next_due);
                 continue;
             }
             let resolved_cfg = match strategy_resolve_effective_config(
@@ -4907,7 +4975,7 @@ async fn live_runtime_loop(
             {
                 Ok(samples) => {
                     let run = if samples.len() >= 20 {
-                        let rebuild = match strategy_engines.get(market_type) {
+                        let rebuild = match strategy_engines.get(&scope_key) {
                             Some(engine_state) => !engine_state.can_reuse(
                                 runtime_symbol,
                                 &strategy_cfg,
@@ -4918,7 +4986,7 @@ async fn live_runtime_loop(
                         };
                         if rebuild {
                             strategy_engines.insert(
-                                market_type.to_string(),
+                                scope_key.clone(),
                                 LiveRuntimeStrategyEngineState::bootstrap(
                                     runtime_symbol,
                                     strategy_cfg,
@@ -4926,10 +4994,10 @@ async fn live_runtime_loop(
                                     samples.clone(),
                                 ),
                             );
-                        } else if let Some(engine_state) = strategy_engines.get_mut(market_type) {
+                        } else if let Some(engine_state) = strategy_engines.get_mut(&scope_key) {
                             engine_state.update(samples.clone());
                         }
-                        strategy_engines.get(market_type).map(|engine_state| {
+                        strategy_engines.get(&scope_key).map(|engine_state| {
                             map_simulation_result(engine_state.engine.snapshot())
                         })
                     } else {
@@ -4950,7 +5018,7 @@ async fn live_runtime_loop(
                 Ok(mut payload) => {
                     let now = Utc::now();
                     let now_ms = now.timestamp_millis();
-                    market_last_strategy_eval_ms.insert(market_type.to_string(), now_ms);
+                    market_last_strategy_eval_ms.insert(scope_key.clone(), now_ms);
                     let current_round = payload
                         .get("current")
                         .and_then(|v| v.get("round_id"))
@@ -4967,11 +5035,11 @@ async fn live_runtime_loop(
                         .filter(|v| *v > 0)
                     {
                         market_last_strategy_sample_ts_ms
-                            .insert(market_type.to_string(), current_sample_ts);
+                            .insert(scope_key.clone(), current_sample_ts);
                     }
                     let round_switched = if let Some(round_id) = current_round.clone() {
                         if let Some(prev) =
-                            last_round_seen.insert(market_type.to_string(), round_id.clone())
+                            last_round_seen.insert(scope_key.clone(), round_id.clone())
                         {
                             prev != round_id
                         } else {
@@ -5594,7 +5662,7 @@ async fn live_runtime_loop(
                 Err(err) => {
                     let now = Utc::now();
                     let now_ms = now.timestamp_millis();
-                    market_last_strategy_eval_ms.insert(market_type.to_string(), now_ms);
+                    market_last_strategy_eval_ms.insert(scope_key.clone(), now_ms);
                     let msg = format!("runtime_cycle_error:{}", err.message);
                     state
                         .append_live_event(
@@ -5649,7 +5717,7 @@ async fn live_runtime_loop(
             let next_due = Utc::now()
                 .timestamp_millis()
                 .saturating_add(market_sleep_ms as i64);
-            market_next_due_ms.insert(market_type.to_string(), next_due);
+            market_next_due_ms.insert(scope_key, next_due);
         }
     }
 }

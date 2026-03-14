@@ -377,8 +377,23 @@ fn strategy_profile_name_from_alias(raw: &str) -> Option<&'static str> {
         "btc5m_balance" | "btc5m_balance_2026_03_06" | "fev1_btc5m_balance_2026_03_06" => {
             Some(STRATEGY_PROFILE_BTC_5M_BALANCE)
         }
+        "btc5m_overall" | "btc5m_overall_2026_03_14" | "fev1_btc5m_overall_2026_03_14" => {
+            Some(STRATEGY_PROFILE_BTC_5M_OVERALL)
+        }
+        "btc15m_overall" | "btc15m_overall_2026_03_14" | "fev1_btc15m_overall_2026_03_14" => {
+            Some(STRATEGY_PROFILE_BTC_15M_OVERALL)
+        }
+        "eth5m_overall" | "eth5m_overall_2026_03_14" | "fev1_eth5m_overall_2026_03_14" => {
+            Some(STRATEGY_PROFILE_ETH_5M_OVERALL)
+        }
         "sol5m_sharp" | "sol5m_sharp_2026_03_07" | "fev1_sol5m_sharp_2026_03_07" => {
             Some(STRATEGY_PROFILE_SOL_5M_SHARP)
+        }
+        "sol5m_overall" | "sol5m_overall_2026_03_14" | "fev1_sol5m_overall_2026_03_14" => {
+            Some(STRATEGY_PROFILE_SOL_5M_OVERALL)
+        }
+        "xrp5m_overall" | "xrp5m_overall_2026_03_14" | "fev1_xrp5m_overall_2026_03_14" => {
+            Some(STRATEGY_PROFILE_XRP_5M_OVERALL)
         }
         "cand_growth_mix" | "growth_mix" | "growth" | "fev1_cand_growth_mix_2026_02_28" => {
             Some(STRATEGY_PROFILE_CAND_GROWTH_MIX)
@@ -473,8 +488,11 @@ fn strategy_baseline_profile_from_inputs<'a>(
         return (profile, "env_base_profile");
     }
     match (symbol, market_type) {
-        ("BTCUSDT", "5m") => (STRATEGY_PROFILE_BTC_5M_BALANCE, "code_scope_default"),
-        ("SOLUSDT", "5m") => (STRATEGY_PROFILE_SOL_5M_SHARP, "code_scope_default"),
+        ("BTCUSDT", "5m") => (STRATEGY_PROFILE_BTC_5M_OVERALL, "code_scope_default"),
+        ("BTCUSDT", "15m") => (STRATEGY_PROFILE_BTC_15M_OVERALL, "code_scope_default"),
+        ("ETHUSDT", "5m") => (STRATEGY_PROFILE_ETH_5M_OVERALL, "code_scope_default"),
+        ("SOLUSDT", "5m") => (STRATEGY_PROFILE_SOL_5M_OVERALL, "code_scope_default"),
+        ("XRPUSDT", "5m") => (STRATEGY_PROFILE_XRP_5M_OVERALL, "code_scope_default"),
         _ => (strategy_select_profile_name(), "code_default"),
     }
 }
@@ -485,7 +503,12 @@ fn strategy_cfg_for_profile_name(profile: &str) -> StrategyRuntimeConfig {
         STRATEGY_PROFILE_HI_FREQ => strategy_hi_freq_config(),
         STRATEGY_PROFILE_BALANCED => strategy_balanced_config(),
         STRATEGY_PROFILE_BTC_5M_BALANCE => strategy_btc_5m_balance_config(),
+        STRATEGY_PROFILE_BTC_5M_OVERALL => strategy_btc_5m_overall_config(),
+        STRATEGY_PROFILE_BTC_15M_OVERALL => strategy_btc_15m_overall_config(),
+        STRATEGY_PROFILE_ETH_5M_OVERALL => strategy_eth_5m_overall_config(),
         STRATEGY_PROFILE_SOL_5M_SHARP => strategy_sol_5m_sharp_config(),
+        STRATEGY_PROFILE_SOL_5M_OVERALL => strategy_sol_5m_overall_config(),
+        STRATEGY_PROFILE_XRP_5M_OVERALL => strategy_xrp_5m_overall_config(),
         STRATEGY_PROFILE_CAND_GROWTH_MIX => strategy_cand_growth_mix_config(),
         _ => strategy_profit_max_config(),
     }
@@ -646,7 +669,7 @@ mod tests {
         );
         assert_eq!(
             strategy_baseline_profile_from_inputs("BTCUSDT", "5m", &HashMap::new(), None),
-            (STRATEGY_PROFILE_BTC_5M_BALANCE, "code_scope_default")
+            (STRATEGY_PROFILE_BTC_5M_OVERALL, "code_scope_default")
         );
     }
 
@@ -970,6 +993,133 @@ fn strategy_btc_5m_balance_config() -> StrategyRuntimeConfig {
         vic_spread_relax_max: 0.12,
     }
 }
+
+fn strategy_btc_5m_overall_config() -> StrategyRuntimeConfig {
+    StrategyRuntimeConfig {
+        entry_threshold_base: 0.7766538182918103,
+        entry_threshold_cap: 0.99,
+        spread_limit_prob: 0.04064424311196532,
+        entry_edge_prob: 0.035764431478854025,
+        entry_min_potential_cents: 9.758067232069616,
+        entry_max_price_cents: 82.29420573148103,
+        min_hold_ms: 0,
+        stop_loss_cents: 21.154206030200243,
+        reverse_signal_threshold: -0.12642467385409162,
+        reverse_signal_ticks: 1,
+        trail_activate_profit_cents: 24.94731465743872,
+        trail_drawdown_cents: 15.520372584806706,
+        take_profit_near_max_cents: 96.2158705280565,
+        endgame_take_profit_cents: 95.74221204070014,
+        endgame_remaining_ms: 24_492,
+        liquidity_widen_prob: 0.06458960245519976,
+        cooldown_ms: 0,
+        max_entries_per_round: 4,
+        max_exec_spread_cents: 1.6110526835779044,
+        slippage_cents_per_side: 0.10036573476058915,
+        fee_cents_per_side: 0.0,
+        emergency_wide_spread_penalty_ratio: 0.27344545764305883,
+        stop_loss_grace_ticks: 2,
+        stop_loss_hard_mult: 1.4005029108027514,
+        stop_loss_reverse_extra_ticks: 2,
+        loss_cluster_limit: 4,
+        loss_cluster_cooldown_ms: 26_187,
+        noise_gate_enabled: true,
+        noise_gate_threshold_add: 0.034871365371456686,
+        noise_gate_edge_add: 0.0,
+        noise_gate_spread_scale: 0.8922885861188254,
+        vic_enabled: true,
+        vic_target_entries_per_hour: 9.069542359564746,
+        vic_deadband_ratio: 0.08730620084158114,
+        vic_threshold_relax_max: 0.01718202129042508,
+        vic_edge_relax_max: 0.001313112533769329,
+        vic_spread_relax_max: 0.10905957970674482,
+    }
+}
+
+fn strategy_btc_15m_overall_config() -> StrategyRuntimeConfig {
+    StrategyRuntimeConfig {
+        entry_threshold_base: 0.8778426458424062,
+        entry_threshold_cap: 0.941154272220459,
+        spread_limit_prob: 0.030697169584239948,
+        entry_edge_prob: 0.0373510369141804,
+        entry_min_potential_cents: 19.444894824572977,
+        entry_max_price_cents: 65.17784700310176,
+        min_hold_ms: 13_318,
+        stop_loss_cents: 16.19499803756247,
+        reverse_signal_threshold: -0.10759786070417271,
+        reverse_signal_ticks: 6,
+        trail_activate_profit_cents: 27.22169453317154,
+        trail_drawdown_cents: 14.407083607976439,
+        take_profit_near_max_cents: 99.5,
+        endgame_take_profit_cents: 92.00909525733069,
+        endgame_remaining_ms: 17_462,
+        liquidity_widen_prob: 0.05898777652614458,
+        cooldown_ms: 0,
+        max_entries_per_round: 2,
+        max_exec_spread_cents: 1.8900439884608304,
+        slippage_cents_per_side: 0.07030273871496183,
+        fee_cents_per_side: 0.0,
+        emergency_wide_spread_penalty_ratio: 0.33841152785560147,
+        stop_loss_grace_ticks: 1,
+        stop_loss_hard_mult: 1.45,
+        stop_loss_reverse_extra_ticks: 0,
+        loss_cluster_limit: 3,
+        loss_cluster_cooldown_ms: 31_954,
+        noise_gate_enabled: false,
+        noise_gate_threshold_add: 0.031685627241599054,
+        noise_gate_edge_add: 0.017695551557187616,
+        noise_gate_spread_scale: 0.934087175186731,
+        vic_enabled: true,
+        vic_target_entries_per_hour: 14.0,
+        vic_deadband_ratio: 0.1473730768957631,
+        vic_threshold_relax_max: 0.029922359006625238,
+        vic_edge_relax_max: 0.006175244181024549,
+        vic_spread_relax_max: 0.07198948667525959,
+    }
+}
+
+fn strategy_eth_5m_overall_config() -> StrategyRuntimeConfig {
+    StrategyRuntimeConfig {
+        entry_threshold_base: 0.8203650702902981,
+        entry_threshold_cap: 0.9849918027705858,
+        spread_limit_prob: 0.030392489219250515,
+        entry_edge_prob: 0.026642089679754222,
+        entry_min_potential_cents: 20.154522797899034,
+        entry_max_price_cents: 68.2126276520896,
+        min_hold_ms: 0,
+        stop_loss_cents: 17.400294769260938,
+        reverse_signal_threshold: -0.05991064227301866,
+        reverse_signal_ticks: 3,
+        trail_activate_profit_cents: 27.87295634723643,
+        trail_drawdown_cents: 15.340040835594506,
+        take_profit_near_max_cents: 98.24233580547272,
+        endgame_take_profit_cents: 92.77349249743148,
+        endgame_remaining_ms: 21_892,
+        liquidity_widen_prob: 0.04226146485894885,
+        cooldown_ms: 5_482,
+        max_entries_per_round: 3,
+        max_exec_spread_cents: 1.980741378455773,
+        slippage_cents_per_side: 0.14515338668372577,
+        fee_cents_per_side: 0.0,
+        emergency_wide_spread_penalty_ratio: 0.3373239363932149,
+        stop_loss_grace_ticks: 3,
+        stop_loss_hard_mult: 1.45,
+        stop_loss_reverse_extra_ticks: 1,
+        loss_cluster_limit: 3,
+        loss_cluster_cooldown_ms: 26_440,
+        noise_gate_enabled: true,
+        noise_gate_threshold_add: 0.031188759277258792,
+        noise_gate_edge_add: 0.008,
+        noise_gate_spread_scale: 0.8919080701388968,
+        vic_enabled: true,
+        vic_target_entries_per_hour: 12.952097377413534,
+        vic_deadband_ratio: 0.08604096766634428,
+        vic_threshold_relax_max: 0.03519497381480163,
+        vic_edge_relax_max: 0.008,
+        vic_spread_relax_max: 0.09848855704142763,
+    }
+}
+
 fn strategy_sol_5m_sharp_config() -> StrategyRuntimeConfig {
     StrategyRuntimeConfig {
         entry_threshold_base: 0.7476638018261539,
@@ -1009,6 +1159,90 @@ fn strategy_sol_5m_sharp_config() -> StrategyRuntimeConfig {
         vic_threshold_relax_max: 0.02,
         vic_edge_relax_max: 0.008,
         vic_spread_relax_max: 0.12,
+    }
+}
+
+fn strategy_sol_5m_overall_config() -> StrategyRuntimeConfig {
+    StrategyRuntimeConfig {
+        entry_threshold_base: 0.7476638018261539,
+        entry_threshold_cap: 0.99,
+        spread_limit_prob: 0.034650575054196706,
+        entry_edge_prob: 0.046759447063392426,
+        entry_min_potential_cents: 8.144850247202086,
+        entry_max_price_cents: 77.06040438026302,
+        min_hold_ms: 0,
+        stop_loss_cents: 20.2357558174703,
+        reverse_signal_threshold: -0.11683398085856266,
+        reverse_signal_ticks: 2,
+        trail_activate_profit_cents: 29.073439116395964,
+        trail_drawdown_cents: 16.82299393297926,
+        take_profit_near_max_cents: 97.70093982981771,
+        endgame_take_profit_cents: 93.5644303775527,
+        endgame_remaining_ms: 20_281,
+        liquidity_widen_prob: 0.05963259775951625,
+        cooldown_ms: 2_147,
+        max_entries_per_round: 4,
+        max_exec_spread_cents: 1.6807376190292096,
+        slippage_cents_per_side: 0.10036573476058915,
+        fee_cents_per_side: 0.0,
+        emergency_wide_spread_penalty_ratio: 0.24004592137073613,
+        stop_loss_grace_ticks: 1,
+        stop_loss_hard_mult: 1.4884831491605701,
+        stop_loss_reverse_extra_ticks: 0,
+        loss_cluster_limit: 2,
+        loss_cluster_cooldown_ms: 20_815,
+        noise_gate_enabled: true,
+        noise_gate_threshold_add: 0.025626075399524984,
+        noise_gate_edge_add: 0.012429358397724034,
+        noise_gate_spread_scale: 0.9,
+        vic_enabled: true,
+        vic_target_entries_per_hour: 14.187921528784052,
+        vic_deadband_ratio: 0.08,
+        vic_threshold_relax_max: 0.014548408826398325,
+        vic_edge_relax_max: 0.008,
+        vic_spread_relax_max: 0.09270145980394476,
+    }
+}
+
+fn strategy_xrp_5m_overall_config() -> StrategyRuntimeConfig {
+    StrategyRuntimeConfig {
+        entry_threshold_base: 0.7575819023940004,
+        entry_threshold_cap: 0.9615721516952305,
+        spread_limit_prob: 0.02288590136402103,
+        entry_edge_prob: 0.06259309494575992,
+        entry_min_potential_cents: 12.370095762634644,
+        entry_max_price_cents: 75.52831419817902,
+        min_hold_ms: 286,
+        stop_loss_cents: 16.127324932603138,
+        reverse_signal_threshold: -0.1770513110145612,
+        reverse_signal_ticks: 2,
+        trail_activate_profit_cents: 24.99799978463737,
+        trail_drawdown_cents: 17.632807444464234,
+        take_profit_near_max_cents: 99.5,
+        endgame_take_profit_cents: 93.1420351179262,
+        endgame_remaining_ms: 24_778,
+        liquidity_widen_prob: 0.06143177168730615,
+        cooldown_ms: 2_671,
+        max_entries_per_round: 4,
+        max_exec_spread_cents: 1.6807376190292096,
+        slippage_cents_per_side: 0.10036573476058915,
+        fee_cents_per_side: 0.0,
+        emergency_wide_spread_penalty_ratio: 0.2,
+        stop_loss_grace_ticks: 0,
+        stop_loss_hard_mult: 1.0,
+        stop_loss_reverse_extra_ticks: 0,
+        loss_cluster_limit: 0,
+        loss_cluster_cooldown_ms: 0,
+        noise_gate_enabled: false,
+        noise_gate_threshold_add: 0.0,
+        noise_gate_edge_add: 0.0,
+        noise_gate_spread_scale: 0.5,
+        vic_enabled: false,
+        vic_target_entries_per_hour: 0.0,
+        vic_deadband_ratio: 0.0,
+        vic_threshold_relax_max: 0.0,
+        vic_edge_relax_max: 0.0,
+        vic_spread_relax_max: 0.0,
     }
 }
 
