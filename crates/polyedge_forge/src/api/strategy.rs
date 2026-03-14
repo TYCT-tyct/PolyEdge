@@ -22,6 +22,7 @@ pub(super) struct StrategySample {
     pub(super) spread_up: f64,
     pub(super) spread_down: f64,
     pub(super) spread_mid: f64,
+    pub(super) liquidity_score: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

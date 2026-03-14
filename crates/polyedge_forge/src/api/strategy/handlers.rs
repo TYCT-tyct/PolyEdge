@@ -1804,6 +1804,7 @@ mod handlers_runtime_view_tests {
             spread_up: 0.01,
             spread_down: 0.01,
             spread_mid: 0.01,
+            liquidity_score: 1.0,
         }];
 
         let payload = build_runtime_bucketed_payload(

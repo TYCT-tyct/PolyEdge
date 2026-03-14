@@ -5836,6 +5836,7 @@ mod tests {
                 spread_up: 0.02,
                 spread_down: 0.02,
                 spread_mid: 0.02,
+                liquidity_score: 1.0,
             },
             StrategySample {
                 ts_ms: 1_500,
@@ -5852,6 +5853,7 @@ mod tests {
                 spread_up: 0.04,
                 spread_down: 0.04,
                 spread_mid: 0.04,
+                liquidity_score: 0.15,
             },
             StrategySample {
                 ts_ms: 1_900,
@@ -5868,6 +5870,7 @@ mod tests {
                 spread_up: 0.02,
                 spread_down: 0.02,
                 spread_mid: 0.02,
+                liquidity_score: 1.0,
             },
             StrategySample {
                 ts_ms: 2_100,
@@ -5884,6 +5887,7 @@ mod tests {
                 spread_up: 0.02,
                 spread_down: 0.02,
                 spread_mid: 0.02,
+                liquidity_score: 1.0,
             },
         ];
         let decision = build_decision_samples_1s(&raw);
