@@ -4030,7 +4030,7 @@ async fn load_live_runtime_samples(
         .get_runtime_event_samples(symbol, market_type, lookback_minutes, max_points)
         .await
     {
-        return Ok(filtered(samples));
+        return Ok(build_decision_samples_1s(&filtered(samples)));
     }
     let samples = load_strategy_samples_runtime_stream(
         state,

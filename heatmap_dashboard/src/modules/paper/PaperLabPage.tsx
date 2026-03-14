@@ -668,7 +668,10 @@ export function PaperLabPage({
     isRuntimeLiveView && liveRealizedNetCents != null
       ? liveRealizedNetCents
       : summaryNet;
-  const tradeRows = (detailPaperPayload?.trades ?? []).slice(-20).reverse();
+  const visibleTradePayload = detailOpen && detailReady ? detailPaperPayload : strategyPaper;
+  const tradeRows = (visibleTradePayload?.trades ?? []).slice(-20).reverse();
+  const shouldRenderTradeTable =
+    !isAttributionView && (!isRuntimeLiveView || detailOpen || tradeRows.length > 0);
   const sourceLabel = isAttributionView
     ? strategyAttribution?.view?.label ?? strategyAttribution?.source ?? "--"
     : strategyPaper?.view?.label ?? strategyPaper?.source ?? "--";
@@ -1664,7 +1667,7 @@ export function PaperLabPage({
         </section>
       ) : null}
 
-      {!isAttributionView ? detailOpen && detailReady ? (
+      {shouldRenderTradeTable ? (
         <div className="table-wrap">
           <h3 className="table-title">{tradeTableTitle}</h3>
           <table className="history-table">
@@ -1715,7 +1718,7 @@ export function PaperLabPage({
             </tbody>
           </table>
         </div>
-      ) : (
+      ) : !isAttributionView ? (
         <section className="detail-placeholder">
           <h3>{tradeTableTitle}</h3>
           <p>

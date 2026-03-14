@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 const OFFICIAL_TAKER_FEE_MAX_RATE: f64 = 0.25;
 const OFFICIAL_TAKER_FEE_EXPONENT: f64 = 2.0;
 const MAX_BLOCKED_EXIT_STREAK: usize = 3;
+const MIN_WIDE_STOP_CONFIRM_TICKS: usize = 2;
 
 /// Intent action types - only Enter/Exit allowed (no Add/Reduce)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -725,15 +726,18 @@ impl SimulationCoreState {
                     exit_reason = Some("stop_loss");
                 } else {
                     pos.soft_stop_pending_ticks = pos.soft_stop_pending_ticks.saturating_add(1);
+                    let confirm_ticks = cfg.stop_loss_grace_ticks.max(MIN_WIDE_STOP_CONFIRM_TICKS);
                     let hard_stop = -cfg.stop_loss_cents * cfg.stop_loss_hard_mult.max(1.0);
                     let reverse_trigger = pos.reverse_streak
                         >= cfg
                             .reverse_signal_ticks
                             .saturating_add(cfg.stop_loss_reverse_extra_ticks);
-                    let should_force = milli_cents(pnl) <= milli_cents(hard_stop)
-                        || reverse_trigger
-                        || sample.remaining_ms <= cfg.endgame_remaining_ms
-                        || pos.soft_stop_pending_ticks >= cfg.stop_loss_grace_ticks;
+                    let confirm_ready = pos.soft_stop_pending_ticks >= confirm_ticks;
+                    let should_force = confirm_ready
+                        && (milli_cents(pnl) <= milli_cents(hard_stop)
+                            || reverse_trigger
+                            || sample.remaining_ms <= cfg.endgame_remaining_ms
+                            || pos.soft_stop_pending_ticks >= confirm_ticks);
                     if should_force {
                         exit_reason = Some("stop_loss_wide_grace");
                     }
@@ -1049,15 +1053,18 @@ impl SimulationCoreState {
                     exit_reason = Some("stop_loss");
                 } else {
                     pos.soft_stop_pending_ticks = pos.soft_stop_pending_ticks.saturating_add(1);
+                    let confirm_ticks = cfg.stop_loss_grace_ticks.max(MIN_WIDE_STOP_CONFIRM_TICKS);
                     let hard_stop = -cfg.stop_loss_cents * cfg.stop_loss_hard_mult.max(1.0);
                     let reverse_trigger = pos.reverse_streak
                         >= cfg
                             .reverse_signal_ticks
                             .saturating_add(cfg.stop_loss_reverse_extra_ticks);
-                    let should_force = milli_cents(pnl) <= milli_cents(hard_stop)
-                        || reverse_trigger
-                        || sample.remaining_ms <= cfg.endgame_remaining_ms
-                        || pos.soft_stop_pending_ticks >= cfg.stop_loss_grace_ticks;
+                    let confirm_ready = pos.soft_stop_pending_ticks >= confirm_ticks;
+                    let should_force = confirm_ready
+                        && (milli_cents(pnl) <= milli_cents(hard_stop)
+                            || reverse_trigger
+                            || sample.remaining_ms <= cfg.endgame_remaining_ms
+                            || pos.soft_stop_pending_ticks >= confirm_ticks);
                     if should_force {
                         exit_reason = Some("stop_loss_wide_grace");
                     }
