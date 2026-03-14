@@ -97,6 +97,7 @@ pub struct SimulationResult {
     pub current: Value,
     pub trades: Vec<Value>,
     pub all_trade_pnls: Vec<f64>,
+    pub paper_records: Vec<Value>,
     pub signal_decisions: Vec<Value>,
     pub trade_count: usize,
     pub win_rate_pct: f64,
@@ -458,6 +459,7 @@ struct SimulationCoreState {
     score_hist: VecDeque<f64>,
     position: Option<Position>,
     trades: Vec<Value>,
+    paper_records: Vec<Value>,
     signal_decisions: Vec<Value>,
     entries_by_round: HashMap<String, usize>,
     last_exit_ts_ms: i64,
@@ -493,6 +495,7 @@ impl SimulationCoreState {
             score_hist: VecDeque::with_capacity(24),
             position: None,
             trades: Vec::new(),
+            paper_records: Vec::new(),
             signal_decisions: Vec::new(),
             entries_by_round: HashMap::new(),
             last_exit_ts_ms: 0,
@@ -727,7 +730,7 @@ impl SimulationCoreState {
                     } else {
                         ("FAK", "taker", 1_000_i64, 22.0_f64)
                     };
-                self.signal_decisions.push(json!({
+                let exit_record = json!({
                     "intent_id": decision_id("exit", pos.side, &sample.round_id, sample.ts_ms),
                     "decision_id": decision_id("exit", pos.side, &sample.round_id, sample.ts_ms),
                     "action": "exit",
@@ -744,8 +747,12 @@ impl SimulationCoreState {
                     "tif": exit_tif,
                     "style": exit_style,
                     "ttl_ms": exit_ttl_ms,
-                    "max_slippage_bps": exit_slippage_bps
-                }));
+                    "max_slippage_bps": exit_slippage_bps,
+                    "paper_record_source": "paper_commit",
+                    "signal_source": "paper_commit"
+                });
+                self.paper_records.push(exit_record.clone());
+                self.signal_decisions.push(exit_record);
                 self.trade_id += 1;
                 self.position = None;
                 self.last_exit_ts_ms = sample.ts_ms;
@@ -825,7 +832,7 @@ impl SimulationCoreState {
                     soft_stop_pending_ticks: 0,
                 });
                 let entry_score = score.abs();
-                self.signal_decisions.push(build_entry_decision(
+                let entry_record = build_entry_decision(
                     side,
                     &sample.round_id,
                     sample.ts_ms,
@@ -838,7 +845,14 @@ impl SimulationCoreState {
                     entry_score,
                     "fev1_signal_entry",
                     None,
-                ));
+                );
+                let mut entry_record = entry_record;
+                if let Some(obj) = entry_record.as_object_mut() {
+                    obj.insert("paper_record_source".to_string(), json!("paper_commit"));
+                    obj.insert("signal_source".to_string(), json!("paper_commit"));
+                }
+                self.paper_records.push(entry_record.clone());
+                self.signal_decisions.push(entry_record);
                 *self
                     .entries_by_round
                     .entry(sample.round_id.clone())
@@ -1134,6 +1148,7 @@ impl SimulationCoreState {
             current,
             trades,
             all_trade_pnls,
+            paper_records: self.paper_records,
             signal_decisions: self.signal_decisions,
             trade_count,
             win_rate_pct,
@@ -1674,6 +1689,11 @@ mod tests {
             !run.signal_decisions.is_empty(),
             "expected signal decisions from simulation"
         );
+        assert_eq!(
+            run.paper_records.len(),
+            run.signal_decisions.len(),
+            "paper commit records should mirror legacy signal decisions"
+        );
         assert!(
             run.signal_decisions.iter().all(|d| {
                 d.get("decision_id")
@@ -1701,6 +1721,12 @@ mod tests {
             }),
             "expected at least one exit decision"
         );
+        assert!(run.paper_records.iter().all(|row| {
+            row.get("paper_record_source")
+                .and_then(Value::as_str)
+                .map(|v| v.eq_ignore_ascii_case("paper_commit"))
+                .unwrap_or(false)
+        }));
     }
 
     #[test]

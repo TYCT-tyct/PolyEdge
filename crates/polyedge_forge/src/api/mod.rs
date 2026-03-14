@@ -296,7 +296,7 @@ fn ks_parity_exhaustion_rate_limit() -> f64 {
     std::env::var("FORGE_KS_PARITY_EXHAUSTION_RATE")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
-        .unwrap_or(0.55)  // Increased from 0.40 - now only counts true parity failures
+        .unwrap_or(0.55) // Increased from 0.40 - now only counts true parity failures
         .clamp(0.1, 0.95)
 }
 
@@ -320,7 +320,7 @@ fn ks_halt_resume_ms() -> i64 {
     std::env::var("FORGE_KS_HALT_RESUME_MS")
         .ok()
         .and_then(|v| v.trim().parse::<i64>().ok())
-        .unwrap_or(10 * 60_000)  // 10 minutes - reduced from 4 hours (now halts are more precise)
+        .unwrap_or(10 * 60_000) // 10 minutes - reduced from 4 hours (now halts are more precise)
         .clamp(60_000, 24 * 3_600_000)
 }
 
@@ -667,6 +667,38 @@ struct LivePendingOrder {
 }
 
 #[derive(Debug, Clone)]
+enum LiveTriggerMode {
+    SignalPool,
+    PaperMirror,
+}
+
+impl LiveTriggerMode {
+    fn from_env() -> Self {
+        match std::env::var("FORGE_FEV1_LIVE_TRIGGER_MODE")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("paper_mirror") | Some("paper_commit_mirror") | Some("mirror") => {
+                Self::PaperMirror
+            }
+            _ => Self::SignalPool,
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::SignalPool => "signal_pool",
+            Self::PaperMirror => "paper_mirror",
+        }
+    }
+
+    fn allows_current_fallback(&self) -> bool {
+        matches!(self, Self::SignalPool)
+    }
+}
+
+#[derive(Debug, Clone)]
 struct LiveRuntimeConfig {
     enabled: bool,
     live_execute: bool,
@@ -679,6 +711,7 @@ struct LiveRuntimeConfig {
     quote_usdc: f64,
     symbol: String,
     markets: Vec<String>,
+    trigger_mode: LiveTriggerMode,
 }
 
 impl LiveRuntimeConfig {
@@ -768,6 +801,7 @@ impl LiveRuntimeConfig {
             })
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| vec!["5m".to_string()]);
+        let trigger_mode = LiveTriggerMode::from_env();
         Self {
             enabled,
             live_execute,
@@ -780,6 +814,7 @@ impl LiveRuntimeConfig {
             quote_usdc,
             symbol,
             markets,
+            trigger_mode,
         }
     }
 }
@@ -1041,6 +1076,7 @@ fn select_live_execution_candidates(
     max_orders: usize,
     drain_only: bool,
     prefer_action: Option<&str>,
+    allow_current_fallback: bool,
 ) -> (Vec<Value>, usize, &'static str, bool) {
     let selected_from_pool = select_live_decisions(
         paper_decisions,
@@ -1053,19 +1089,21 @@ fn select_live_execution_candidates(
     let current_entry_available = current_live_entry_decision.is_some();
     // Layer 1: current_summary fallback
     // 当 pool 为空时，使用 current_live_entry_decision 作为兜底
-    if selected_from_pool.is_empty() && !drain_only && prefer_action.is_none() {
+    if allow_current_fallback
+        && selected_from_pool.is_empty()
+        && !drain_only
+        && prefer_action.is_none()
+    {
         if let Some(current_entry) = current_live_entry_decision {
-            return (
-                vec![current_entry],
-                1,
-                "current_summary_fallback",
-                true,
-            );
+            return (vec![current_entry], 1, "current_summary_fallback", true);
         }
+        return (Vec::new(), 0, "pool_empty_no_current_entry", false);
+    }
+    if !allow_current_fallback && selected_from_pool.is_empty() {
         return (
             Vec::new(),
-            0,
-            "pool_empty_no_current_entry",
+            fresh_signal_count,
+            "paper_mirror_pool_empty",
             false,
         );
     }
@@ -1955,15 +1993,18 @@ fn build_live_completed_records(
                     );
                     obj.insert(
                         "last_ts_ms".to_string(),
-                        lineage_row
-                            .get("last_ts_ms")
-                            .cloned()
-                            .unwrap_or_else(|| {
-                                fill_row.get("fill_ts_ms").cloned().unwrap_or(Value::Null)
-                            }),
+                        lineage_row.get("last_ts_ms").cloned().unwrap_or_else(|| {
+                            fill_row.get("fill_ts_ms").cloned().unwrap_or(Value::Null)
+                        }),
                     );
                 } else {
-                    obj.insert("order_ids".to_string(), fill_row.get("order_ids").cloned().unwrap_or_else(|| json!([])));
+                    obj.insert(
+                        "order_ids".to_string(),
+                        fill_row
+                            .get("order_ids")
+                            .cloned()
+                            .unwrap_or_else(|| json!([])),
+                    );
                     obj.insert("pending_order_ids".to_string(), json!([]));
                     obj.insert("pending_count".to_string(), json!(0_u64));
                     obj.insert(
@@ -2576,7 +2617,10 @@ impl ApiState {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let store = self.live_kill_switch.read().await;
         let key = runtime_scope_key(symbol, market_type);
-        store.get(&key).map(|s| s.is_halted(now_ms)).unwrap_or(false)
+        store
+            .get(&key)
+            .map(|s| s.is_halted(now_ms))
+            .unwrap_or(false)
     }
 
     pub(super) async fn ks_halt_reason(&self, symbol: &str, market_type: &str) -> Option<String> {
@@ -2593,14 +2637,23 @@ impl ApiState {
             return EntryAttemptReason::ParityExhausted;
         }
         // Infrastructure errors
-        if r.contains("timeout") || r.contains("5") || r.contains("network")
-            || r.contains("connection") || r.contains("503") || r.contains("502") {
+        if r.contains("timeout")
+            || r.contains("5")
+            || r.contains("network")
+            || r.contains("connection")
+            || r.contains("503")
+            || r.contains("502")
+        {
             return EntryAttemptReason::InfraError;
         }
         // Liquidity empty - market microstructure issues (not a system failure)
-        if r.contains("no orders found") || r.contains("one_sided_book")
-            || r.contains("liquidity_empty") || r.contains("insufficient_book_depth")
-            || r.contains("no top1") || r.contains("liquidity no top1") {
+        if r.contains("no orders found")
+            || r.contains("one_sided_book")
+            || r.contains("liquidity_empty")
+            || r.contains("insufficient_book_depth")
+            || r.contains("no top1")
+            || r.contains("liquidity no top1")
+        {
             return EntryAttemptReason::LiquidityEmpty;
         }
         // Unknown - treat as liquidity empty for safety (don't trigger halt)
@@ -2617,7 +2670,7 @@ impl ApiState {
         let reason = error_reason
             .map(Self::classify_entry_failure)
             .unwrap_or(EntryAttemptReason::Success);
-        
+
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut store = self.live_kill_switch.write().await;
         let key = runtime_scope_key(symbol, market_type);
@@ -2625,13 +2678,13 @@ impl ApiState {
             .entry(key)
             .or_insert_with(|| LiveKillSwitchState::new(now_ms));
         ks.record_entry_attempt(now_ms, reason);
-        
+
         // Only parity exhaustion triggers Layer 2 halt - not liquidity_empty or infra_error
         if reason == EntryAttemptReason::ParityExhausted {
             // Check Layer 2: execution quality (only for parity failures)
             let rate = ks.parity_exhaustion_rate();
             let limit = ks_parity_exhaustion_rate_limit();
-            let min_samples = 12;  // Increased from 10 for more stable rate
+            let min_samples = 12; // Increased from 10 for more stable rate
             if !ks.is_halted(now_ms) && ks.entry_attempt_count >= min_samples && rate > limit {
                 let resume_ms = now_ms + ks_halt_resume_ms();
                 ks.halt(
@@ -2685,7 +2738,11 @@ impl ApiState {
         if loss > ks_daily_loss_limit_cents() {
             ks.halt(
                 now_ms,
-                &format!("layer1_daily_loss:{:.1}c_limit:{:.1}c", loss, ks_daily_loss_limit_cents()),
+                &format!(
+                    "layer1_daily_loss:{:.1}c_limit:{:.1}c",
+                    loss,
+                    ks_daily_loss_limit_cents()
+                ),
                 Some(resume_ms),
             );
             return;
@@ -2695,7 +2752,11 @@ impl ApiState {
         if dd > ks_daily_drawdown_limit_cents() {
             ks.halt(
                 now_ms,
-                &format!("layer1_daily_drawdown:{:.1}c_limit:{:.1}c", dd, ks_daily_drawdown_limit_cents()),
+                &format!(
+                    "layer1_daily_drawdown:{:.1}c_limit:{:.1}c",
+                    dd,
+                    ks_daily_drawdown_limit_cents()
+                ),
                 Some(resume_ms),
             );
             return;
@@ -2927,8 +2988,7 @@ impl ApiState {
                         .map(|(a, b)| a.eq_ignore_ascii_case(b))
                         .unwrap_or(false);
                     let within_window = st.entry_liquidity_reject_last_ts_ms > 0
-                        && event_ts_ms
-                            .saturating_sub(st.entry_liquidity_reject_last_ts_ms)
+                        && event_ts_ms.saturating_sub(st.entry_liquidity_reject_last_ts_ms)
                             <= window_ms;
                     if same_round && same_side && within_window {
                         st.entry_liquidity_reject_count =
@@ -3470,7 +3530,7 @@ async fn live_runtime_background_maintenance(state: ApiState, bootstrap: LiveRun
                 book_prewarm_at.insert(market.clone(), now_ms);
             }
         }
-            tokio::time::sleep(Duration::from_millis(50)).await; // OPTIMIZED: 120ms -> 50ms for faster prewarming
+        tokio::time::sleep(Duration::from_millis(50)).await; // OPTIMIZED: 120ms -> 50ms for faster prewarming
     }
 }
 
@@ -4146,14 +4206,26 @@ async fn live_runtime_loop(
                     }
 
                     let summary = payload.get("summary").cloned().unwrap_or(Value::Null);
+                    let raw_paper_records = payload
+                        .get("paper_records")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
                     let signal_decisions = payload
                         .get("signal_decisions")
                         .and_then(Value::as_array)
                         .cloned()
                         .unwrap_or_default();
+                    let live_trigger_mode = cfg.trigger_mode.clone();
+                    let decision_rows = if matches!(live_trigger_mode, LiveTriggerMode::PaperMirror)
+                    {
+                        raw_paper_records.clone()
+                    } else {
+                        signal_decisions.clone()
+                    };
                     let paper_decisions = normalize_runtime_signal_decisions(
                         market_type,
-                        signal_decisions,
+                        decision_rows,
                         cfg.quote_usdc,
                     );
                     let latest_ts_ms = payload
@@ -4186,11 +4258,12 @@ async fn live_runtime_loop(
                         } else {
                             None
                         };
-                    let current_live_entry_decision = normalize_current_live_entry_decision(
-                        &payload,
-                        market_type,
-                        cfg.quote_usdc,
-                    );
+                    let current_live_entry_decision = if live_trigger_mode.allows_current_fallback()
+                    {
+                        normalize_current_live_entry_decision(&payload, market_type, cfg.quote_usdc)
+                    } else {
+                        None
+                    };
                     let (
                         mut selected_decisions,
                         fresh_signal_count,
@@ -4203,6 +4276,7 @@ async fn live_runtime_loop(
                         cfg.max_orders.max(1),
                         effective_drain_only,
                         prefer_action,
+                        live_trigger_mode.allows_current_fallback(),
                     );
                     let trigger_ts_ms = trigger_for_market.map(|v| v.ts_ms);
                     if let Some(trigger_ts_ms) = trigger_ts_ms {
@@ -4219,7 +4293,7 @@ async fn live_runtime_loop(
                             &base_exec_cfg,
                         )
                         .await;
-                    
+
                     if effective_live_execute || pending_before_count > 0 {
                         reconcile_live_reports(&state, &exec_cfg_tuned).await;
                         handle_live_pending_timeouts(&state, &exec_cfg_tuned).await;
@@ -4227,17 +4301,21 @@ async fn live_runtime_loop(
 
                     let decision_pool_count = paper_decisions.len();
                     let candidate_count = selected_decisions.len();
-                    
+
                     // OPTIMIZATION: Aggressive book prewarming when candidates exist
                     // This ensures books are fresh for fast execution
                     if candidate_count > 0 {
                         if let Ok(target) = resolve_live_market_target_fast_with_state(
-                            &state, runtime_symbol, market_type,
-                        ).await {
+                            &state,
+                            runtime_symbol,
+                            market_type,
+                        )
+                        .await
+                        {
                             let _ = prewarm_rust_books_for_target(&state, &target).await;
                         }
                     }
-                    
+
                     let (gated, mut state_skipped, position_for_submit) = gate_live_decisions(
                         &state,
                         runtime_symbol,
@@ -4406,7 +4484,9 @@ async fn live_runtime_loop(
                             .get("live_fill")
                             .and_then(|f| f.get("action"))
                             .and_then(Value::as_str)
-                            .map(|a| a.eq_ignore_ascii_case("exit") || a.eq_ignore_ascii_case("reduce"))
+                            .map(|a| {
+                                a.eq_ignore_ascii_case("exit") || a.eq_ignore_ascii_case("reduce")
+                            })
                             .unwrap_or(false);
                         if !has_exit_fill {
                             continue;
@@ -4453,6 +4533,7 @@ async fn live_runtime_loop(
                         "summary": {
                             "decision_count": selected_decisions.len(),
                             "mode": if effective_live_execute { execution_mode.clone() } else { "paper_only".to_string() },
+                            "trigger_mode": live_trigger_mode.as_str(),
                             "latency": live_latency,
                             "price_parity": live_price_parity,
                             "realized_net_pnl_cents": live_realized_net_pnl_cents,
@@ -4935,6 +5016,7 @@ mod tests {
                 1,
                 false,
                 None,
+                true,
             );
         // 验证：pool 为空时，使用 current_summary fallback
         assert_eq!(selected.len(), 1);
@@ -4956,12 +5038,50 @@ mod tests {
                 1,
                 false,
                 None,
+                true,
             );
         // 验证：两者都为空时返回空
         assert_eq!(selected.len(), 0);
         assert_eq!(candidate_source, "pool_empty_no_current_entry");
         assert_eq!(fresh_count, 0);
         assert!(!current_entry_available);
+    }
+
+    #[test]
+    fn select_live_execution_candidates_disables_current_fallback_in_paper_mirror_mode() {
+        let paper_decisions = vec![json!({
+            "action": "enter",
+            "side": "DOWN",
+            "round_id": "old-round",
+            "ts_ms": 1_000_i64,
+            "reason": "paper_commit",
+            "decision_id": "paper-old",
+            "quote_size_usdc": 1.0
+        })];
+        let current_live_entry_decision = Some(json!({
+            "action": "enter",
+            "side": "DOWN",
+            "round_id": "r-1",
+            "ts_ms": 250_000_i64,
+            "reason": "fev1_current_summary_entry",
+            "decision_id": "summary-decision",
+            "quote_size_usdc": 1.0,
+            "price_cents": 51.2
+        }));
+        let (selected, fresh_count, candidate_source, current_entry_available) =
+            select_live_execution_candidates(
+                &paper_decisions,
+                current_live_entry_decision,
+                250_000_i64,
+                1,
+                false,
+                None,
+                false,
+            );
+        assert!(selected.is_empty());
+        assert_eq!(candidate_source, "paper_mirror_pool_empty");
+        assert_eq!(fresh_count, 0);
+        assert!(current_entry_available);
     }
 
     #[test]
@@ -5196,7 +5316,10 @@ mod tests {
             build_live_completed_records(&paper_records, &fill_by_decision, &live_order_lineage);
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
-        assert_eq!(row.get("live_status").and_then(Value::as_str), Some("filled"));
+        assert_eq!(
+            row.get("live_status").and_then(Value::as_str),
+            Some("filled")
+        );
         assert_eq!(
             row.get("actual_fill_price_cents").and_then(Value::as_f64),
             Some(63.0)

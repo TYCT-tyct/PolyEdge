@@ -228,6 +228,7 @@ pub(super) struct StrategySimulationResult {
     current: Value,
     trades: Vec<Value>,
     all_trade_pnls: Vec<f64>,
+    paper_records: Vec<Value>,
     signal_decisions: Vec<Value>,
     trade_count: usize,
     win_rate_pct: f64,
@@ -819,6 +820,7 @@ pub(super) async fn strategy_paper_live_from_samples(
                 "lookback_minutes": runtime_defaults.lookback_minutes,
                 "max_points": runtime_defaults.max_points,
                 "max_trades": runtime_defaults.max_trades,
+                "trigger_mode": runtime_defaults.trigger_mode.as_str(),
             },
             "live_execute_requested": live_execute,
             "live_execute": false,
@@ -854,6 +856,7 @@ pub(super) async fn strategy_paper_live_from_samples(
                 "execution_penalty_cents_total": 0.0,
             },
             "trades": [],
+            "paper_records": [],
             "signal_decisions": [],
             "live_execution": {
                 "summary": {
@@ -909,6 +912,7 @@ pub(super) async fn strategy_paper_live_from_samples(
     }
 
     let run = run.expect("run exists when samples >= 20");
+    let paper_records = run.paper_records.clone();
     Ok(json!({
         "source": "live",
         "execution_target": "live",
@@ -927,6 +931,7 @@ pub(super) async fn strategy_paper_live_from_samples(
             "lookback_minutes": runtime_defaults.lookback_minutes,
             "max_points": runtime_defaults.max_points,
             "max_trades": runtime_defaults.max_trades,
+            "trigger_mode": runtime_defaults.trigger_mode.as_str(),
         },
         "live_execute_requested": live_execute,
         "live_execute": live_execute_effective,
@@ -962,6 +967,7 @@ pub(super) async fn strategy_paper_live_from_samples(
             "execution_penalty_cents_total": run.execution_penalty_cents_total,
         },
         "trades": run.trades,
+        "paper_records": paper_records.clone(),
         "signal_decisions": run.signal_decisions,
         "live_execution": {
             "summary": {
@@ -975,7 +981,7 @@ pub(super) async fn strategy_paper_live_from_samples(
                 }
             },
             "decisions": [],
-            "paper_records": [],
+            "paper_records": paper_records,
             "live_records": [],
             "parity_check": {
                 "status": if live_execute_effective { "blocked_by_gate_or_state" } else { "dry_run" },
@@ -1196,6 +1202,7 @@ pub(super) fn map_simulation_result(run: fev1::SimulationResult) -> StrategySimu
         current: run.current,
         trades: run.trades,
         all_trade_pnls: run.all_trade_pnls,
+        paper_records: run.paper_records,
         signal_decisions: run.signal_decisions,
         trade_count: run.trade_count,
         win_rate_pct: run.win_rate_pct,
