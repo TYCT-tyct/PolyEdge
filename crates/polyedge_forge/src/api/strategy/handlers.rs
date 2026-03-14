@@ -887,6 +887,59 @@ pub(super) async fn strategy_paper_ledger(
     Ok(Json(payload))
 }
 
+pub(super) async fn strategy_intent_history(
+    State(state): State<ApiState>,
+    Query(params): Query<StrategyPaperQueryParams>,
+) -> Result<Json<Value>, ApiError> {
+    let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
+    let symbol = resolve_strategy_symbol(params.symbol.as_deref())?;
+    let compact = params.compact.unwrap_or(false);
+    let now_ms = Utc::now().timestamp_millis();
+    let runtime_payload = state.get_runtime_snapshot(symbol, market_type).await;
+    let current_active_signal = runtime_payload
+        .as_ref()
+        .and_then(|payload| payload.get("current"))
+        .and_then(|current| current.get("active_signal"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let recent_intents = state.recent_active_intents(symbol, market_type, now_ms).await;
+    let runtime_control = runtime_payload
+        .as_ref()
+        .and_then(|payload| payload.get("runtime_control"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let current_summary = runtime_payload
+        .as_ref()
+        .and_then(|payload| payload.get("current"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let active_signal_available = current_active_signal
+        .as_object()
+        .map(|obj| !obj.is_empty())
+        .unwrap_or_else(|| !current_active_signal.is_null());
+    let mut payload = json!({
+        "source": "intent_history",
+        "view": {
+            "family": "intent_history",
+            "label": "Intent History",
+        },
+        "symbol": symbol,
+        "market_type": market_type,
+        "updated_at_ms": now_ms,
+        "current": current_summary,
+        "current_active_signal": current_active_signal,
+        "active_signal_available": active_signal_available,
+        "recent_intents": recent_intents,
+        "recent_intent_count": recent_intents.len(),
+        "runtime_control": runtime_control,
+        "runtime_snapshot_available": runtime_payload.is_some(),
+    });
+    if compact {
+        compact_strategy_payload(&mut payload);
+    }
+    Ok(Json(payload))
+}
+
 pub(super) async fn strategy_execution_attribution(
     State(state): State<ApiState>,
     Query(params): Query<StrategyPaperQueryParams>,
@@ -1087,6 +1140,11 @@ pub(super) async fn strategy_live_reset(
             paper_ledger_key(&state.redis_prefix, &runtime_cfg.symbol, market);
         if delete_key(&state, &paper_ledger_key).await.is_ok() {
             deleted_keys.push(paper_ledger_key);
+        }
+        let recent_intents_key =
+            live_recent_intents_key(&state.redis_prefix, &runtime_cfg.symbol, market);
+        if delete_key(&state, &recent_intents_key).await.is_ok() {
+            deleted_keys.push(recent_intents_key);
         }
         let reset_anchor_key =
             live_runtime_paper_reset_anchor_key(&state.redis_prefix, &runtime_cfg.symbol, market);

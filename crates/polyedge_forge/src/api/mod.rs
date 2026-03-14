@@ -2634,6 +2634,38 @@ impl ApiState {
         store.insert(scope_key, payload);
     }
 
+    async fn persist_recent_active_intents(
+        &self,
+        symbol: &str,
+        market_type: &str,
+        queue: &VecDeque<Value>,
+    ) {
+        let key = live_recent_intents_key(&self.redis_prefix, symbol, market_type);
+        let ttl_sec = ((live_recent_intent_buffer_ttl_ms().max(1) as u64) / 1000).max(1) as u32;
+        let payload = Value::Array(queue.iter().cloned().collect());
+        let _ = write_key_value(self, &key, &payload, Some(ttl_sec)).await;
+    }
+
+    async fn load_persisted_recent_active_intents(
+        &self,
+        symbol: &str,
+        market_type: &str,
+        now_ms: i64,
+    ) -> Vec<Value> {
+        let key = live_recent_intents_key(&self.redis_prefix, symbol, market_type);
+        let Some(payload) = read_key_value(self, &key).await.ok().flatten() else {
+            return Vec::new();
+        };
+        payload
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|row| decision_effective_expires_at_ms(row) > now_ms)
+            .cloned()
+            .collect()
+    }
+
     async fn remember_recent_active_intent(&self, symbol: &str, market_type: &str, signal: &Value) {
         let Some(intent_id) = signal
             .get("intent_id")
@@ -2680,6 +2712,10 @@ impl ApiState {
         while queue.len() > max_rows {
             queue.pop_front();
         }
+        let persisted = queue.clone();
+        drop(store);
+        self.persist_recent_active_intents(symbol, market_type, &persisted)
+            .await;
     }
 
     async fn recent_active_intents(
@@ -2689,12 +2725,47 @@ impl ApiState {
         latest_ts_ms: i64,
     ) -> Vec<Value> {
         let scope_key = runtime_scope_key(symbol, market_type);
+        let persisted_rows = self
+            .load_persisted_recent_active_intents(symbol, market_type, latest_ts_ms)
+            .await;
         let mut store = self.live_recent_active_intents.write().await;
-        let Some(queue) = store.get_mut(&scope_key) else {
-            return Vec::new();
-        };
+        let queue = store.entry(scope_key).or_insert_with(VecDeque::new);
+        let mut persisted_by_intent = persisted_rows
+            .into_iter()
+            .filter_map(|row| {
+                let intent_id = row
+                    .get("intent_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)?;
+                Some((intent_id, row))
+            })
+            .collect::<HashMap<_, _>>();
         queue.retain(|row| decision_effective_expires_at_ms(row) > latest_ts_ms);
-        queue.iter().rev().cloned().collect()
+        for row in queue.iter() {
+            if let Some(intent_id) = row
+                .get("intent_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                persisted_by_intent.remove(intent_id);
+            }
+        }
+        for (_, row) in persisted_by_intent {
+            queue.push_back(row);
+        }
+        let max_rows = live_recent_intent_buffer_max();
+        while queue.len() > max_rows {
+            queue.pop_front();
+        }
+        let persisted = queue.clone();
+        let result = queue.iter().rev().cloned().collect();
+        drop(store);
+        self.persist_recent_active_intents(symbol, market_type, &persisted)
+            .await;
+        result
     }
 
     async fn upsert_runtime_event_sample(
@@ -3650,6 +3721,7 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         .route("/api/strategy/runtime", get(strategy_runtime))
         .route("/api/strategy/replay", get(strategy_replay))
         .route("/api/strategy/paper_ledger", get(strategy_paper_ledger))
+        .route("/api/strategy/intent_history", get(strategy_intent_history))
         .route(
             "/api/strategy/execution_attribution",
             get(strategy_execution_attribution),
@@ -3718,6 +3790,13 @@ fn live_events_key(redis_prefix: &str, symbol: &str, market_type: &str) -> Strin
 fn live_runtime_control_key(redis_prefix: &str, symbol: &str, market_type: &str) -> String {
     format!(
         "{redis_prefix}:fev1:live:runtime_control:{}:{market_type}",
+        symbol.trim().to_ascii_uppercase()
+    )
+}
+
+fn live_recent_intents_key(redis_prefix: &str, symbol: &str, market_type: &str) -> String {
+    format!(
+        "{redis_prefix}:fev1:live:recent_intents:{}:{market_type}",
         symbol.trim().to_ascii_uppercase()
     )
 }
