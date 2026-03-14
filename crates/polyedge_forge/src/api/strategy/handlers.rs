@@ -581,9 +581,25 @@ async fn strategy_paper_impl(
         source_mode,
         StrategyPaperSource::Live | StrategyPaperSource::Auto
     ) {
-        if !symbol.eq_ignore_ascii_case(&runtime_symbol) {
+        let runtime_symbol_allowed = runtime_defaults
+            .symbols
+            .iter()
+            .any(|configured| symbol.eq_ignore_ascii_case(configured));
+        let runtime_market_allowed = runtime_defaults
+            .scoped_markets
+            .get(symbol)
+            .map(|markets: &std::collections::HashSet<String>| markets.contains(market_type))
+            .unwrap_or_else(|| {
+                runtime_defaults
+                    .markets
+                    .iter()
+                    .any(|configured: &String| configured.eq_ignore_ascii_case(market_type))
+            });
+        if !runtime_symbol_allowed || !runtime_market_allowed {
             let mismatch_msg = format!(
-                "live runtime symbol mismatch: requested={symbol}, runtime={runtime_symbol}"
+                "live runtime scope mismatch: requested={symbol}:{market_type}, runtime_symbols={:?}, runtime_markets={:?}",
+                runtime_defaults.symbols,
+                runtime_defaults.markets
             );
             if matches!(source_mode, StrategyPaperSource::Live) {
                 return Err(ApiError::bad_request(mismatch_msg));
