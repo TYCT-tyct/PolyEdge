@@ -835,6 +835,10 @@ pub(super) async fn strategy_live_reset(
         snapshots.clear();
     }
     {
+        let mut recent_intents = state.live_recent_active_intents.write().await;
+        recent_intents.clear();
+    }
+    {
         let mut controls = state.live_runtime_controls.write().await;
         controls.clear();
     }

@@ -204,14 +204,15 @@ fn active_intent_ttl_ms(env_key: &str, default_ms: i64) -> i64 {
         .and_then(|v| v.trim().parse::<i64>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(default_ms)
+        .clamp(500, 15_000)
 }
 
 fn active_intent_entry_ttl_ms() -> i64 {
-    active_intent_ttl_ms("FORGE_SIGNAL_ENTRY_TTL_MS", 300)
+    active_intent_ttl_ms("FORGE_SIGNAL_ENTRY_TTL_MS", 3_000)
 }
 
 fn active_intent_exit_ttl_ms() -> i64 {
-    active_intent_ttl_ms("FORGE_SIGNAL_EXIT_TTL_MS", 800)
+    active_intent_ttl_ms("FORGE_SIGNAL_EXIT_TTL_MS", 5_000)
 }
 
 fn compat_live_entry_decision_from_active_intent(intent: Option<&ActiveIntent>) -> Option<Value> {

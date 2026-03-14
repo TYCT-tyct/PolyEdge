@@ -27,32 +27,8 @@ fn strategy_sample_cache_key(
     format!("{symbol}|{market_type}|{full_history}|{lookback_minutes}|{max_points}")
 }
 
-fn strategy_runtime_stream_enabled() -> bool {
-    strategy_env_bool("FORGE_STRATEGY_RUNTIME_STREAM_ENABLED", true)
-}
-
 fn strategy_runtime_event_cache_enabled() -> bool {
     strategy_env_bool("FORGE_STRATEGY_RUNTIME_EVENT_CACHE_ENABLED", true)
-}
-
-fn strategy_runtime_stream_reload_sec() -> u64 {
-    strategy_env_u32("FORGE_STRATEGY_RUNTIME_STREAM_RELOAD_SEC", 180, 10, 3_600) as u64
-}
-
-fn strategy_runtime_stream_delta_limit() -> u32 {
-    strategy_env_u32(
-        "FORGE_STRATEGY_RUNTIME_STREAM_DELTA_LIMIT",
-        6_000,
-        200,
-        50_000,
-    )
-}
-
-fn strategy_runtime_stream_cache()
--> &'static tokio::sync::RwLock<HashMap<String, StrategyRuntimeStreamState>> {
-    static CACHE: OnceLock<tokio::sync::RwLock<HashMap<String, StrategyRuntimeStreamState>>> =
-        OnceLock::new();
-    CACHE.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
 }
 
 fn strategy_enabled_markets() -> &'static Vec<String> {

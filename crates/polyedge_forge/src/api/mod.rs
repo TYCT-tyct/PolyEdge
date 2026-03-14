@@ -83,6 +83,7 @@ struct ApiState {
     live_event_seq: Arc<RwLock<u64>>,
     live_pending_orders: Arc<RwLock<HashMap<String, LivePendingOrder>>>,
     live_runtime_snapshots: Arc<RwLock<HashMap<String, Value>>>,
+    live_recent_active_intents: Arc<RwLock<HashMap<String, VecDeque<Value>>>>,
     live_runtime_controls: Arc<RwLock<HashMap<String, LiveRuntimeControl>>>,
     live_runtime_paper_reset_anchors: Arc<RwLock<HashMap<String, i64>>>,
     live_persist_inflight: Arc<RwLock<HashSet<String>>>,
@@ -325,6 +326,12 @@ const LIVE_EVENT_LOG_TTL_SEC_DEFAULT: u32 = 7 * 24 * 3600;
 const LIVE_EVENT_LOG_TTL_SEC_MIN: u32 = 3600;
 const LIVE_EVENT_LOG_TTL_SEC_MAX: u32 = 30 * 24 * 3600;
 const LIVE_RUST_BOOK_CACHE_TTL_MS: u64 = 260;
+const LIVE_RECENT_INTENT_BUFFER_MAX_DEFAULT: usize = 24;
+const LIVE_RECENT_INTENT_BUFFER_MAX_MIN: usize = 4;
+const LIVE_RECENT_INTENT_BUFFER_MAX_MAX: usize = 256;
+const LIVE_RECENT_INTENT_BUFFER_TTL_MS_DEFAULT: i64 = 4_000;
+const LIVE_RECENT_INTENT_BUFFER_TTL_MS_MIN: i64 = 1_000;
+const LIVE_RECENT_INTENT_BUFFER_TTL_MS_MAX: i64 = 15_000;
 const LIVE_RUST_BOOK_CACHE_MAX: usize = 512;
 const LIVE_ALERT_THROTTLE_DEFAULT_MS: i64 = 5 * 60_000;
 const RUNTIME_EVENT_SAMPLE_BUFFER_MAX_DEFAULT: usize = 140_000;
@@ -369,6 +376,28 @@ fn runtime_event_sample_buffer_max() -> usize {
         .clamp(
             RUNTIME_EVENT_SAMPLE_BUFFER_MAX_MIN,
             RUNTIME_EVENT_SAMPLE_BUFFER_MAX_MAX,
+        )
+}
+
+fn live_recent_intent_buffer_max() -> usize {
+    std::env::var("FORGE_FEV1_RECENT_INTENT_BUFFER_MAX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(LIVE_RECENT_INTENT_BUFFER_MAX_DEFAULT)
+        .clamp(
+            LIVE_RECENT_INTENT_BUFFER_MAX_MIN,
+            LIVE_RECENT_INTENT_BUFFER_MAX_MAX,
+        )
+}
+
+fn live_recent_intent_buffer_ttl_ms() -> i64 {
+    std::env::var("FORGE_FEV1_RECENT_INTENT_BUFFER_TTL_MS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(LIVE_RECENT_INTENT_BUFFER_TTL_MS_DEFAULT)
+        .clamp(
+            LIVE_RECENT_INTENT_BUFFER_TTL_MS_MIN,
+            LIVE_RECENT_INTENT_BUFFER_TTL_MS_MAX,
         )
 }
 
@@ -1072,51 +1101,112 @@ fn normalize_current_active_signal(
     Some(normalized)
 }
 
+fn decision_effective_expires_at_ms(decision: &Value) -> i64 {
+    decision
+        .get("expires_at_ms")
+        .and_then(Value::as_i64)
+        .unwrap_or(i64::MAX)
+}
+
 fn select_live_execution_candidates(
     active_signal: Option<Value>,
+    recent_intents: Vec<Value>,
     latest_ts_ms: i64,
     max_orders: usize,
     drain_only: bool,
     prefer_action: Option<&str>,
 ) -> (Vec<Value>, usize, &'static str, bool) {
-    let Some(signal) = active_signal else {
-        return (Vec::new(), 0, "none", false);
-    };
-    let expires_at_ms = signal
-        .get("expires_at_ms")
-        .and_then(Value::as_i64)
-        .unwrap_or(i64::MAX);
-    let action = signal
-        .get("action")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let current_entry_available = action == "enter" && expires_at_ms > latest_ts_ms;
-    if expires_at_ms <= latest_ts_ms {
-        return (Vec::new(), 0, "active_signal_expired", false);
+    let current_entry_available = active_signal
+        .as_ref()
+        .map(|signal| {
+            let action = signal
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            action == "enter" && decision_effective_expires_at_ms(signal) > latest_ts_ms
+        })
+        .unwrap_or(false);
+
+    let mut staged = Vec::<(Value, &'static str)>::new();
+    if let Some(signal) = active_signal {
+        staged.push((signal, "active_signal"));
     }
-    if drain_only && action != "exit" {
+    for signal in recent_intents {
+        staged.push((signal, "recent_intent_buffer"));
+    }
+
+    let mut fresh_count = 0usize;
+    let mut selected = Vec::<Value>::new();
+    let mut candidate_source = "none";
+    let mut saw_expired_active = false;
+    let mut saw_drain_reject = false;
+    let mut saw_prefer_mismatch = false;
+    let mut seen_intents = HashSet::<String>::new();
+
+    for (signal, source) in staged {
+        let intent_id = signal
+            .get("intent_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if !intent_id.is_empty() && !seen_intents.insert(intent_id) {
+            continue;
+        }
+        let expires_at_ms = decision_effective_expires_at_ms(&signal);
+        if expires_at_ms <= latest_ts_ms {
+            if source == "active_signal" {
+                saw_expired_active = true;
+            }
+            continue;
+        }
+        fresh_count = fresh_count.saturating_add(1);
+        let action = signal
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if drain_only && action != "exit" {
+            if source == "active_signal" {
+                saw_drain_reject = true;
+            }
+            continue;
+        }
+        if let Some(prefer) = prefer_action {
+            if action != prefer.to_ascii_lowercase() {
+                if source == "active_signal" {
+                    saw_prefer_mismatch = true;
+                }
+                continue;
+            }
+        }
+        selected.push(signal);
+        candidate_source = source;
+        break;
+    }
+
+    if !selected.is_empty() {
         return (
-            Vec::new(),
-            0,
-            "active_signal_drain_only",
+            selected,
+            min(max_orders.max(1), 1),
+            candidate_source,
             current_entry_available,
         );
     }
-    if let Some(prefer) = prefer_action {
-        if action != prefer.to_ascii_lowercase() {
-            return (
-                Vec::new(),
-                0,
-                "active_signal_prefer_action_mismatch",
-                current_entry_available,
-            );
-        }
-    }
+
+    let no_candidate_reason = if saw_expired_active {
+        "active_signal_expired"
+    } else if saw_drain_reject {
+        "active_signal_drain_only"
+    } else if saw_prefer_mismatch {
+        "active_signal_prefer_action_mismatch"
+    } else {
+        "none"
+    };
     (
-        vec![signal],
-        min(max_orders.max(1), 1),
-        "active_signal",
+        Vec::new(),
+        fresh_count,
+        no_candidate_reason,
         current_entry_available,
     )
 }
@@ -2488,6 +2578,69 @@ impl ApiState {
         store.insert(scope_key, payload);
     }
 
+    async fn remember_recent_active_intent(&self, symbol: &str, market_type: &str, signal: &Value) {
+        let Some(intent_id) = signal
+            .get("intent_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+        else {
+            return;
+        };
+        if intent_id.is_empty() {
+            return;
+        }
+        let now_ms = Utc::now().timestamp_millis();
+        let ts_ms = signal
+            .get("ts_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or(now_ms);
+        let buffer_ttl_ms = live_recent_intent_buffer_ttl_ms();
+        let buffer_expires_at_ms = signal
+            .get("expires_at_ms")
+            .and_then(Value::as_i64)
+            .map(|v| v.max(ts_ms.saturating_add(buffer_ttl_ms)))
+            .unwrap_or_else(|| ts_ms.saturating_add(buffer_ttl_ms));
+        if buffer_expires_at_ms <= now_ms {
+            return;
+        }
+        let mut buffered = signal.clone();
+        if let Some(obj) = buffered.as_object_mut() {
+            obj.insert("expires_at_ms".to_string(), json!(buffer_expires_at_ms));
+            obj.insert("signal_source".to_string(), json!("recent_intent_buffer"));
+        }
+        let scope_key = runtime_scope_key(symbol, market_type);
+        let mut store = self.live_recent_active_intents.write().await;
+        let queue = store.entry(scope_key).or_insert_with(VecDeque::new);
+        queue.retain(|row| {
+            let expires_at_ms = decision_effective_expires_at_ms(row);
+            let row_intent_id = row
+                .get("intent_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            expires_at_ms > now_ms && row_intent_id != intent_id
+        });
+        queue.push_back(buffered);
+        let max_rows = live_recent_intent_buffer_max();
+        while queue.len() > max_rows {
+            queue.pop_front();
+        }
+    }
+
+    async fn recent_active_intents(
+        &self,
+        symbol: &str,
+        market_type: &str,
+        latest_ts_ms: i64,
+    ) -> Vec<Value> {
+        let scope_key = runtime_scope_key(symbol, market_type);
+        let mut store = self.live_recent_active_intents.write().await;
+        let Some(queue) = store.get_mut(&scope_key) else {
+            return Vec::new();
+        };
+        queue.retain(|row| decision_effective_expires_at_ms(row) > latest_ts_ms);
+        queue.iter().rev().cloned().collect()
+    }
+
     async fn upsert_runtime_event_sample(
         &self,
         symbol: &str,
@@ -2518,15 +2671,7 @@ impl ApiState {
             });
         for sample in samples {
             entry.updated_at_ms = sample.ts_ms;
-            if let Some(last) = entry.samples.back_mut() {
-                if last.round_id == sample.round_id && last.ts_ms / 1000 == sample.ts_ms / 1000 {
-                    *last = sample;
-                } else {
-                    entry.samples.push_back(sample);
-                }
-            } else {
-                entry.samples.push_back(sample);
-            }
+            entry.samples.push_back(sample);
         }
         let max_points = runtime_event_sample_buffer_max();
         while entry.samples.len() > max_points {
@@ -3408,6 +3553,7 @@ pub async fn run_api_server(cfg: ApiConfig) -> Result<()> {
         live_event_seq: Arc::new(RwLock::new(0)),
         live_pending_orders: Arc::new(RwLock::new(HashMap::new())),
         live_runtime_snapshots: Arc::new(RwLock::new(HashMap::new())),
+        live_recent_active_intents: Arc::new(RwLock::new(HashMap::new())),
         live_runtime_controls: Arc::new(RwLock::new(HashMap::new())),
         live_runtime_paper_reset_anchors: Arc::new(RwLock::new(HashMap::new())),
         live_persist_inflight: Arc::new(RwLock::new(HashSet::new())),
@@ -4503,8 +4649,8 @@ async fn live_runtime_loop(
                     };
                     strategy_paper_live_from_samples(
                         runtime_req,
-                        "runtime_stream_100ms",
-                        100,
+                        "runtime_bucket_1s_from_snapshot_100ms",
+                        1000,
                         samples,
                         run,
                     )
@@ -4685,6 +4831,14 @@ async fn live_runtime_loop(
                         };
                     let active_signal =
                         normalize_current_active_signal(&payload, market_type, cfg.quote_usdc);
+                    if let Some(signal) = active_signal.as_ref() {
+                        state
+                            .remember_recent_active_intent(runtime_symbol, market_type, signal)
+                            .await;
+                    }
+                    let recent_intents = state
+                        .recent_active_intents(runtime_symbol, market_type, latest_ts_ms)
+                        .await;
                     let (
                         mut selected_decisions,
                         fresh_signal_count,
@@ -4692,6 +4846,7 @@ async fn live_runtime_loop(
                         current_entry_available,
                     ) = select_live_execution_candidates(
                         active_signal,
+                        recent_intents.clone(),
                         latest_ts_ms,
                         cfg.max_orders.max(1),
                         effective_drain_only,
@@ -5005,13 +5160,14 @@ async fn live_runtime_loop(
                             }
                         },
                         "execution_policy": live_execution_policy_meta(),
-                        "gated": {
-                            "ledger_signal_count": ledger_signal_count,
-                            "decision_pool_count": ledger_signal_count,
-                            "raw_signal_count": ledger_signal_count,
-                            "fresh_signal_count": fresh_signal_count,
-                            "candidate_count": candidate_count,
-                            "selected_count": submitted_decisions.len(),
+                            "gated": {
+                                "ledger_signal_count": ledger_signal_count,
+                                "decision_pool_count": ledger_signal_count,
+                                "raw_signal_count": ledger_signal_count,
+                                "fresh_signal_count": fresh_signal_count,
+                                "recent_intent_buffer_count": recent_intents.len(),
+                                "candidate_count": candidate_count,
+                                "selected_count": submitted_decisions.len(),
                             "submitted_count": live_submitted_count,
                             "state_skipped_count": state_skipped_count,
                             "skipped_count": skipped_decisions.len(),
@@ -5307,6 +5463,82 @@ mod tests {
     }
 
     #[test]
+    fn build_decision_samples_1s_suppresses_single_spike_inside_second() {
+        let raw = vec![
+            StrategySample {
+                ts_ms: 1_100,
+                round_id: "BTCUSDT_5m_r1".to_string(),
+                remaining_ms: 150_000,
+                p_up: 0.60,
+                delta_pct: 0.2,
+                velocity: 1.0,
+                acceleration: 0.1,
+                bid_yes: 0.59,
+                ask_yes: 0.61,
+                bid_no: 0.39,
+                ask_no: 0.41,
+                spread_up: 0.02,
+                spread_down: 0.02,
+                spread_mid: 0.02,
+            },
+            StrategySample {
+                ts_ms: 1_500,
+                round_id: "BTCUSDT_5m_r1".to_string(),
+                remaining_ms: 149_600,
+                p_up: 0.60,
+                delta_pct: 0.2,
+                velocity: 1.0,
+                acceleration: 0.1,
+                bid_yes: 0.01,
+                ask_yes: 0.99,
+                bid_no: 0.01,
+                ask_no: 0.99,
+                spread_up: 0.04,
+                spread_down: 0.04,
+                spread_mid: 0.04,
+            },
+            StrategySample {
+                ts_ms: 1_900,
+                round_id: "BTCUSDT_5m_r1".to_string(),
+                remaining_ms: 149_200,
+                p_up: 0.61,
+                delta_pct: 0.22,
+                velocity: 1.1,
+                acceleration: 0.1,
+                bid_yes: 0.60,
+                ask_yes: 0.62,
+                bid_no: 0.38,
+                ask_no: 0.40,
+                spread_up: 0.02,
+                spread_down: 0.02,
+                spread_mid: 0.02,
+            },
+            StrategySample {
+                ts_ms: 2_100,
+                round_id: "BTCUSDT_5m_r1".to_string(),
+                remaining_ms: 148_900,
+                p_up: 0.61,
+                delta_pct: 0.23,
+                velocity: 1.2,
+                acceleration: 0.2,
+                bid_yes: 0.60,
+                ask_yes: 0.62,
+                bid_no: 0.38,
+                ask_no: 0.40,
+                spread_up: 0.02,
+                spread_down: 0.02,
+                spread_mid: 0.02,
+            },
+        ];
+        let decision = build_decision_samples_1s(&raw);
+        assert_eq!(decision.len(), 1);
+        let sample = &decision[0];
+        assert!(sample.bid_yes > 0.55, "bid_yes={}", sample.bid_yes);
+        assert!(sample.ask_yes < 0.65, "ask_yes={}", sample.ask_yes);
+        assert!(sample.spread_up <= 0.03, "spread_up={}", sample.spread_up);
+    }
+
+    #[test]
     fn decision_payload_uses_decision_execution_fields() {
         let decision = json!({
             "action": "enter",
@@ -5391,7 +5623,14 @@ mod tests {
             "price_cents": 51.2
         }));
         let (selected, fresh_count, candidate_source, current_entry_available) =
-            select_live_execution_candidates(active_signal, 250_000_i64, 1, false, None);
+            select_live_execution_candidates(
+                active_signal,
+                Vec::new(),
+                250_000_i64,
+                1,
+                false,
+                None,
+            );
         assert_eq!(selected.len(), 1);
         assert_eq!(candidate_source, "active_signal");
         assert_eq!(fresh_count, 1);
@@ -5401,7 +5640,7 @@ mod tests {
     #[test]
     fn select_live_execution_candidates_returns_empty_when_active_signal_missing() {
         let (selected, fresh_count, candidate_source, current_entry_available) =
-            select_live_execution_candidates(None, 250_000_i64, 1, false, None);
+            select_live_execution_candidates(None, Vec::new(), 250_000_i64, 1, false, None);
         assert_eq!(selected.len(), 0);
         assert_eq!(candidate_source, "none");
         assert_eq!(fresh_count, 0);
@@ -5419,10 +5658,30 @@ mod tests {
             "intent_id": "intent-expired"
         }));
         let (selected, fresh_count, candidate_source, current_entry_available) =
-            select_live_execution_candidates(active_signal, 250_i64, 1, false, None);
+            select_live_execution_candidates(active_signal, Vec::new(), 250_i64, 1, false, None);
         assert!(selected.is_empty());
         assert_eq!(fresh_count, 0);
         assert_eq!(candidate_source, "active_signal_expired");
+        assert!(!current_entry_available);
+    }
+
+    #[test]
+    fn select_live_execution_candidates_falls_back_to_recent_intent_buffer() {
+        let buffered = vec![json!({
+            "action": "enter",
+            "side": "UP",
+            "round_id": "r-1",
+            "ts_ms": 10_000_i64,
+            "expires_at_ms": 14_000_i64,
+            "intent_id": "intent-buffered",
+            "quote_size_usdc": 5.0,
+            "price_cents": 48.5
+        })];
+        let (selected, fresh_count, candidate_source, current_entry_available) =
+            select_live_execution_candidates(None, buffered, 12_000_i64, 1, false, None);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(fresh_count, 1);
+        assert_eq!(candidate_source, "recent_intent_buffer");
         assert!(!current_entry_available);
     }
 

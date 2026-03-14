@@ -50,6 +50,7 @@ fn test_api_state() -> ApiState {
         live_event_seq: Arc::new(RwLock::new(0)),
         live_pending_orders: Arc::new(RwLock::new(HashMap::new())),
         live_runtime_snapshots: Arc::new(RwLock::new(HashMap::new())),
+        live_recent_active_intents: Arc::new(RwLock::new(HashMap::new())),
         live_runtime_controls: Arc::new(RwLock::new(HashMap::new())),
         live_runtime_paper_reset_anchors: Arc::new(RwLock::new(HashMap::new())),
         live_persist_inflight: Arc::new(RwLock::new(HashSet::new())),

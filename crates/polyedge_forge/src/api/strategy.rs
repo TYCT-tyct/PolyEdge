@@ -79,13 +79,6 @@ struct StrategySampleCacheEntry {
     samples: Arc<Vec<StrategySample>>,
 }
 
-#[derive(Clone)]
-struct StrategyRuntimeStreamState {
-    updated_at: Instant,
-    last_ts_ms: i64,
-    samples: Arc<Vec<StrategySample>>,
-}
-
 include!("strategy/config.rs");
 include!("strategy/runtime.rs");
 include!("strategy/handlers.rs");

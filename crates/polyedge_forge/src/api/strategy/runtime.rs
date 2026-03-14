@@ -1,3 +1,137 @@
+fn median_f64(values: &mut [f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = values.len() / 2;
+    if values.len() % 2 == 0 {
+        Some((values[mid - 1] + values[mid]) * 0.5)
+    } else {
+        Some(values[mid])
+    }
+}
+
+fn stable_band_from_mid_and_spread(
+    p_up: f64,
+    p_no_mid: f64,
+    spread_up: f64,
+    spread_down: f64,
+) -> (f64, f64, f64, f64, f64, f64, f64) {
+    let spread_up = spread_up.clamp(0.003, 0.04);
+    let spread_down = spread_down.clamp(0.003, 0.04);
+    let mut bid_yes = (p_up - spread_up * 0.5).clamp(0.0, 1.0);
+    let mut ask_yes = (p_up + spread_up * 0.5).clamp(0.0, 1.0);
+    if bid_yes > ask_yes {
+        std::mem::swap(&mut bid_yes, &mut ask_yes);
+    }
+    let mut bid_no = (p_no_mid - spread_down * 0.5).clamp(0.0, 1.0);
+    let mut ask_no = (p_no_mid + spread_down * 0.5).clamp(0.0, 1.0);
+    if bid_no > ask_no {
+        std::mem::swap(&mut bid_no, &mut ask_no);
+    }
+    let spread_mid = ((spread_up + spread_down) * 0.5).clamp(0.001, 0.08);
+    (
+        bid_yes, ask_yes, bid_no, ask_no, spread_up, spread_down, spread_mid,
+    )
+}
+
+pub(super) fn build_decision_samples_1s(samples: &[StrategySample]) -> Arc<Vec<StrategySample>> {
+    if samples.is_empty() {
+        return Arc::new(Vec::new());
+    }
+    let latest_bucket_sec = samples.last().map(|v| v.ts_ms / 1000).unwrap_or_default();
+    let mut out = Vec::<StrategySample>::new();
+    let mut idx = 0usize;
+    while idx < samples.len() {
+        let start = idx;
+        let round_id = samples[idx].round_id.clone();
+        let bucket_sec = samples[idx].ts_ms / 1000;
+        while idx < samples.len()
+            && samples[idx].round_id == round_id
+            && samples[idx].ts_ms / 1000 == bucket_sec
+        {
+            idx += 1;
+        }
+        if bucket_sec == latest_bucket_sec {
+            continue;
+        }
+        let window = &samples[start..idx];
+        let mut mids_up = window.iter().map(|v| v.p_up).collect::<Vec<_>>();
+        let mut spreads_up = window.iter().map(|v| v.spread_up).collect::<Vec<_>>();
+        let mut spreads_down = window.iter().map(|v| v.spread_down).collect::<Vec<_>>();
+        let mut deltas = window.iter().map(|v| v.delta_pct).collect::<Vec<_>>();
+        let mut velocities = window.iter().map(|v| v.velocity).collect::<Vec<_>>();
+        let mut accelerations = window.iter().map(|v| v.acceleration).collect::<Vec<_>>();
+        let p_up = median_f64(&mut mids_up).unwrap_or(0.5).clamp(0.0, 1.0);
+        let p_no_mid = (1.0 - p_up).clamp(0.0, 1.0);
+        let spread_up = median_f64(&mut spreads_up).unwrap_or(0.012);
+        let spread_down = median_f64(&mut spreads_down).unwrap_or(0.012);
+        let delta_pct = median_f64(&mut deltas).unwrap_or(0.0);
+        let velocity = median_f64(&mut velocities).unwrap_or(0.0);
+        let acceleration = median_f64(&mut accelerations).unwrap_or(0.0);
+        let latest = window.last().expect("window non-empty");
+        let (
+            bid_yes,
+            ask_yes,
+            bid_no,
+            ask_no,
+            spread_up,
+            spread_down,
+            spread_mid,
+        ) = stable_band_from_mid_and_spread(p_up, p_no_mid, spread_up, spread_down);
+        out.push(StrategySample {
+            ts_ms: latest.ts_ms,
+            round_id: round_id.clone(),
+            remaining_ms: latest.remaining_ms.max(0),
+            p_up,
+            delta_pct,
+            velocity,
+            acceleration,
+            bid_yes,
+            ask_yes,
+            bid_no,
+            ask_no,
+            spread_up,
+            spread_down,
+            spread_mid,
+        });
+    }
+    if out.is_empty() {
+        let last = samples.last().expect("samples non-empty");
+        let (
+            bid_yes,
+            ask_yes,
+            bid_no,
+            ask_no,
+            spread_up,
+            spread_down,
+            spread_mid,
+        ) = stable_band_from_mid_and_spread(
+            last.p_up.clamp(0.0, 1.0),
+            (1.0 - last.p_up).clamp(0.0, 1.0),
+            last.spread_up,
+            last.spread_down,
+        );
+        out.push(StrategySample {
+            ts_ms: last.ts_ms,
+            round_id: last.round_id.clone(),
+            remaining_ms: last.remaining_ms.max(0),
+            p_up: last.p_up.clamp(0.0, 1.0),
+            delta_pct: last.delta_pct,
+            velocity: last.velocity,
+            acceleration: last.acceleration,
+            bid_yes,
+            ask_yes,
+            bid_no,
+            ask_no,
+            spread_up,
+            spread_down,
+            spread_mid,
+        });
+    }
+    Arc::new(out)
+}
+
 pub(super) fn parse_strategy_rows(rows: Vec<Value>) -> Vec<StrategySample> {
     let mut out = Vec::<StrategySample>::new();
     for row in rows {
@@ -45,21 +179,8 @@ pub(super) fn parse_strategy_rows(rows: Vec<Value>) -> Vec<StrategySample> {
             (Some(b), Some(a)) if a.is_finite() && b.is_finite() => (a - b).abs(),
             _ => 0.012,
         };
-        let spread_up = raw_spread_up.clamp(0.003, 0.04);
-        let spread_down = raw_spread_down.clamp(0.003, 0.04);
-        // Use a synthetic tradable band around smoothed mids to suppress occasional bad top-of-book spikes.
-        let mut by = (p_up - spread_up * 0.5).clamp(0.0, 1.0);
-        let mut ay = (p_up + spread_up * 0.5).clamp(0.0, 1.0);
-        if by > ay {
-            std::mem::swap(&mut by, &mut ay);
-        }
-        let mut bn = (p_no_mid - spread_down * 0.5).clamp(0.0, 1.0);
-        let mut an = (p_no_mid + spread_down * 0.5).clamp(0.0, 1.0);
-        if bn > an {
-            std::mem::swap(&mut bn, &mut an);
-        }
-
-        let spread_mid = ((spread_up + spread_down) * 0.5).clamp(0.001, 0.08);
+        let (by, ay, bn, an, spread_up, spread_down, spread_mid) =
+            stable_band_from_mid_and_spread(p_up, p_no_mid, raw_spread_up, raw_spread_down);
 
         let delta_pct = row_f64(&row, "delta_pct_smooth")
             .or_else(|| row_f64(&row, "delta_pct"))
@@ -76,28 +197,6 @@ pub(super) fn parse_strategy_rows(rows: Vec<Value>) -> Vec<StrategySample> {
         let velocity = row_f64(&row, "velocity_bps_per_sec").unwrap_or(0.0);
         let acceleration = row_f64(&row, "acceleration").unwrap_or(0.0);
         let remaining_ms = row_i64(&row, "remaining_ms").unwrap_or(0).max(0);
-
-        if let Some(last) = out.last_mut() {
-            if last.round_id == round_id && last.ts_ms / 1000 == ts_ms / 1000 {
-                *last = StrategySample {
-                    ts_ms,
-                    round_id,
-                    remaining_ms,
-                    p_up,
-                    delta_pct,
-                    velocity,
-                    acceleration,
-                    bid_yes: by,
-                    ask_yes: ay,
-                    bid_no: bn,
-                    ask_no: an,
-                    spread_up,
-                    spread_down,
-                    spread_mid,
-                };
-                continue;
-            }
-        }
 
         out.push(StrategySample {
             ts_ms,
@@ -717,11 +816,11 @@ pub(super) struct StrategyPaperLiveReq<'a> {
 
 #[allow(dead_code)]
 pub(super) async fn strategy_paper_live(req: StrategyPaperLiveReq<'_>) -> Result<Value, ApiError> {
-    let sample_resolution_ms = if req.full_history { 1000 } else { 100 };
+    let sample_resolution_ms = 1000;
     let sample_source_mode = if req.full_history {
-        "replay_bucket_1s"
+        "replay_bucket_1s_from_snapshot_100ms"
     } else {
-        "runtime_stream_100ms"
+        "runtime_bucket_1s_from_snapshot_100ms"
     };
     let samples = if req.full_history {
         load_strategy_samples(
@@ -1298,32 +1397,31 @@ pub(super) async fn load_strategy_samples(
     } else {
         format!("AND ts_ireland_sample_ms >= {from_ms}")
     };
+    let closed_before_ms = (Utc::now().timestamp_millis() / 1000) * 1000;
     let q = format!(
         "SELECT *
          FROM (
             SELECT
-                intDiv(ts_ireland_sample_ms, 1000) * 1000 AS ts_ms,
+                max(ts_ireland_sample_ms) AS ts_ms,
                 argMax(round_id, ts_ireland_sample_ms) AS round_id,
                 argMax(remaining_ms, ts_ireland_sample_ms) AS remaining_ms,
-                argMax(mid_yes, ts_ireland_sample_ms) AS mid_yes,
-                argMax(mid_yes_smooth, ts_ireland_sample_ms) AS mid_yes_smooth,
-                argMax(mid_no, ts_ireland_sample_ms) AS mid_no,
-                argMax(mid_no_smooth, ts_ireland_sample_ms) AS mid_no_smooth,
-                argMax(bid_yes, ts_ireland_sample_ms) AS bid_yes,
-                argMax(ask_yes, ts_ireland_sample_ms) AS ask_yes,
-                argMax(bid_no, ts_ireland_sample_ms) AS bid_no,
-                argMax(ask_no, ts_ireland_sample_ms) AS ask_no,
-                argMax(delta_pct, ts_ireland_sample_ms) AS delta_pct,
-                argMax(delta_pct_smooth, ts_ireland_sample_ms) AS delta_pct_smooth,
-                argMax(velocity_bps_per_sec, ts_ireland_sample_ms) AS velocity_bps_per_sec,
-                argMax(acceleration, ts_ireland_sample_ms) AS acceleration,
-                argMax(binance_price, ts_ireland_sample_ms) AS binance_price,
-                argMax(target_price, ts_ireland_sample_ms) AS target_price
+                quantileExact(0.5)(coalesce(mid_yes_smooth, mid_yes)) AS mid_yes_smooth,
+                quantileExact(0.5)(coalesce(mid_no_smooth, mid_no)) AS mid_no_smooth,
+                quantileExact(0.5)(coalesce(bid_yes, coalesce(mid_yes_smooth, mid_yes))) AS bid_yes,
+                quantileExact(0.5)(coalesce(ask_yes, coalesce(mid_yes_smooth, mid_yes))) AS ask_yes,
+                quantileExact(0.5)(coalesce(bid_no, coalesce(mid_no_smooth, mid_no))) AS bid_no,
+                quantileExact(0.5)(coalesce(ask_no, coalesce(mid_no_smooth, mid_no))) AS ask_no,
+                quantileExact(0.5)(coalesce(delta_pct_smooth, delta_pct, 0.0)) AS delta_pct_smooth,
+                quantileExact(0.5)(coalesce(velocity_bps_per_sec, 0.0)) AS velocity_bps_per_sec,
+                quantileExact(0.5)(coalesce(acceleration, 0.0)) AS acceleration,
+                quantileExact(0.5)(coalesce(binance_price, 0.0)) AS binance_price,
+                quantileExact(0.5)(coalesce(target_price, 0.0)) AS target_price
             FROM polyedge_forge.snapshot_100ms
             WHERE symbol='{symbol}'
               AND timeframe='{market_type}'
+              AND ts_ireland_sample_ms < {closed_before_ms}
               {ts_filter}
-            GROUP BY ts_ms
+            GROUP BY intDiv(ts_ireland_sample_ms, 1000)
             ORDER BY ts_ms DESC
             LIMIT {max_points}
          )
@@ -1369,152 +1467,14 @@ pub(super) async fn load_strategy_samples_runtime_stream(
     max_points: u32,
 ) -> Result<Arc<Vec<StrategySample>>, ApiError> {
     if strategy_runtime_event_cache_enabled() {
-        if let Some(samples) = state
+        if let Some(raw_samples) = state
             .get_runtime_event_samples(symbol, market_type, lookback_minutes, max_points)
             .await
         {
-            if samples.len() >= 20 {
-                return Ok(samples);
+            if raw_samples.len() >= 20 {
+                return Ok(build_decision_samples_1s(&raw_samples));
             }
         }
     }
-    if !strategy_runtime_stream_enabled() {
-        return load_strategy_samples(
-            state,
-            symbol,
-            market_type,
-            false,
-            lookback_minutes,
-            max_points,
-        )
-        .await;
-    }
-    let Some(ch_url) = state.ch_url.as_deref() else {
-        return Err(ApiError::internal("clickhouse not configured"));
-    };
-
-    let now_ms = Utc::now().timestamp_millis();
-    let from_ms = now_ms.saturating_sub(i64::from(lookback_minutes) * 60_000);
-    let key = format!("{symbol}|{market_type}|{lookback_minutes}|{max_points}");
-    let reload_after = Duration::from_secs(strategy_runtime_stream_reload_sec());
-    let delta_limit = strategy_runtime_stream_delta_limit();
-
-    let cached = {
-        let cache = strategy_runtime_stream_cache().read().await;
-        cache.get(&key).cloned()
-    };
-
-    let bootstrap = cached
-        .as_ref()
-        .map(|v| v.updated_at.elapsed() > reload_after)
-        .unwrap_or(true);
-
-    if bootstrap {
-        let q = format!(
-            "SELECT *
-             FROM (
-                SELECT
-                    ts_ireland_sample_ms AS ts_ms,
-                    round_id,
-                    remaining_ms,
-                    mid_yes,
-                    mid_yes_smooth,
-                    mid_no,
-                    mid_no_smooth,
-                    bid_yes,
-                    ask_yes,
-                    bid_no,
-                    ask_no,
-                    delta_pct,
-                    delta_pct_smooth,
-                    velocity_bps_per_sec,
-                    acceleration,
-                    binance_price,
-                    target_price
-                FROM polyedge_forge.snapshot_100ms
-                WHERE symbol='{symbol}'
-                  AND timeframe='{market_type}'
-                  AND ts_ireland_sample_ms >= {from_ms}
-                ORDER BY ts_ireland_sample_ms DESC
-                LIMIT {max_points}
-             )
-             ORDER BY ts_ms ASC
-             FORMAT JSON"
-        );
-        let rows = rows_from_json(query_clickhouse_json(ch_url, &q).await?);
-        let samples = Arc::new(parse_strategy_rows(rows));
-        let last_ts_ms = samples.last().map(|v| v.ts_ms).unwrap_or(from_ms);
-        let mut cache = strategy_runtime_stream_cache().write().await;
-        cache.insert(
-            key,
-            StrategyRuntimeStreamState {
-                updated_at: Instant::now(),
-                last_ts_ms,
-                samples: samples.clone(),
-            },
-        );
-        return Ok(samples);
-    }
-
-    let state_before = cached.expect("cached checked above");
-    let q = format!(
-        "SELECT
-            ts_ireland_sample_ms AS ts_ms,
-            round_id,
-            remaining_ms,
-            mid_yes,
-            mid_yes_smooth,
-            mid_no,
-            mid_no_smooth,
-            bid_yes,
-            ask_yes,
-            bid_no,
-            ask_no,
-            delta_pct,
-            delta_pct_smooth,
-            velocity_bps_per_sec,
-            acceleration,
-            binance_price,
-            target_price
-         FROM polyedge_forge.snapshot_100ms
-         WHERE symbol='{symbol}'
-           AND timeframe='{market_type}'
-           AND ts_ireland_sample_ms > {}
-           AND ts_ireland_sample_ms >= {from_ms}
-         ORDER BY ts_ireland_sample_ms ASC
-         LIMIT {delta_limit}
-         FORMAT JSON",
-        state_before.last_ts_ms
-    );
-    let rows = rows_from_json(query_clickhouse_json(ch_url, &q).await?);
-    let delta = parse_strategy_rows(rows);
-
-    let mut merged = (*state_before.samples).clone();
-    let mut last_ts_ms = state_before.last_ts_ms;
-    for s in delta {
-        if s.ts_ms > last_ts_ms {
-            last_ts_ms = s.ts_ms;
-            merged.push(s);
-        }
-    }
-    merged.retain(|v| v.ts_ms >= from_ms);
-    let max_points_usize = max_points as usize;
-    if merged.len() > max_points_usize {
-        let remove_n = merged.len().saturating_sub(max_points_usize);
-        merged.drain(0..remove_n);
-    }
-    if let Some(v) = merged.last() {
-        last_ts_ms = v.ts_ms;
-    }
-    let samples = Arc::new(merged);
-    let mut cache = strategy_runtime_stream_cache().write().await;
-    cache.insert(
-        key,
-        StrategyRuntimeStreamState {
-            updated_at: Instant::now(),
-            last_ts_ms,
-            samples: samples.clone(),
-        },
-    );
-    Ok(samples)
+    load_strategy_samples(state, symbol, market_type, false, lookback_minutes, max_points).await
 }
