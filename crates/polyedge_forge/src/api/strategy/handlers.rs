@@ -1337,6 +1337,7 @@ pub(super) async fn strategy_live_reconcile_resolved(
 
 #[derive(Debug, Deserialize)]
 pub(super) struct StrategyLiveControlRequest {
+    symbol: Option<String>,
     market_type: Option<String>,
     action: String,
     note: Option<String>,
@@ -1348,7 +1349,11 @@ pub(super) async fn strategy_live_control(
 ) -> Result<Json<Value>, ApiError> {
     let market_type = resolve_strategy_market_type(body.market_type.as_deref())?;
     let runtime_cfg = LiveRuntimeConfig::from_env();
-    let runtime_symbol = runtime_cfg.symbol;
+    let runtime_symbol = if body.symbol.is_some() {
+        resolve_strategy_symbol(body.symbol.as_deref())?.to_string()
+    } else {
+        resolve_strategy_symbol(Some(runtime_cfg.symbol.as_str()))?.to_string()
+    };
     let action = body.action.trim().to_ascii_lowercase();
     if action.is_empty() {
         return Err(ApiError::bad_request("action is required"));
@@ -1451,6 +1456,7 @@ pub(super) async fn strategy_live_control(
 
 #[derive(Debug, Deserialize)]
 pub(super) struct StrategyLiveEventsQueryParams {
+    symbol: Option<String>,
     market_type: Option<String>,
     limit: Option<u32>,
     since_ts_ms: Option<i64>,
@@ -1497,7 +1503,12 @@ pub(super) async fn strategy_live_events(
     Query(params): Query<StrategyLiveEventsQueryParams>,
 ) -> Result<Json<Value>, ApiError> {
     let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
-    let runtime_symbol = LiveRuntimeConfig::from_env().symbol;
+    let runtime_cfg = LiveRuntimeConfig::from_env();
+    let runtime_symbol = if params.symbol.is_some() {
+        resolve_strategy_symbol(params.symbol.as_deref())?.to_string()
+    } else {
+        resolve_strategy_symbol(Some(runtime_cfg.symbol.as_str()))?.to_string()
+    };
     let limit = params.limit.unwrap_or(400).clamp(1, 5000) as usize;
     let since_ts_ms = params.since_ts_ms.unwrap_or(0);
     let order_id_filter = params

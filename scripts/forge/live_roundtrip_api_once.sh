@@ -93,6 +93,7 @@ req = urllib.request.Request(
     "$BASE_URL/api/strategy/live/control",
     data=json.dumps({
         "action": "$action",
+        "symbol": "$SYMBOL",
         "market_type": "$MARKET_TYPE",
         "note": "$note",
     }).encode(),
