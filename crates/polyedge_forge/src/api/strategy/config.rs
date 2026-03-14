@@ -385,7 +385,8 @@ fn strategy_profile_from_alias_strict(
 }
 
 fn strategy_profile_name_from_alias(raw: &str) -> Option<&'static str> {
-    match raw.trim().to_ascii_lowercase().as_str() {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
         "profit_max" | "manual_profit_max" | "max" | "fev1_manual_profit_max_2026_02_27" => {
             Some(STRATEGY_PROFILE_PROFIT_MAX)
         }
@@ -407,7 +408,85 @@ fn strategy_profile_name_from_alias(raw: &str) -> Option<&'static str> {
         "cand_growth_mix" | "growth_mix" | "growth" | "fev1_cand_growth_mix_2026_02_28" => {
             Some(STRATEGY_PROFILE_CAND_GROWTH_MIX)
         }
-        _ => None,
+        _ => strategy_dynamic_profile_spec(&normalized).map(|spec| spec.name),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StrategyDynamicProfileSpec {
+    name: &'static str,
+    cfg: StrategyRuntimeConfig,
+}
+
+fn strategy_dynamic_profile_spec(raw: &str) -> Option<&'static StrategyDynamicProfileSpec> {
+    strategy_dynamic_profile_specs().get(raw.trim())
+}
+
+fn strategy_dynamic_profile_specs() -> &'static HashMap<String, StrategyDynamicProfileSpec> {
+    static SPECS: OnceLock<HashMap<String, StrategyDynamicProfileSpec>> = OnceLock::new();
+    SPECS.get_or_init(load_strategy_dynamic_profile_specs)
+}
+
+fn load_strategy_dynamic_profile_specs() -> HashMap<String, StrategyDynamicProfileSpec> {
+    let mut out = HashMap::new();
+    let dir = match strategy_profile_dir() {
+        Ok(v) => v,
+        Err(_) => return out,
+    };
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(v) => v,
+        Err(_) => return out,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(filename) = path.file_name().and_then(|v| v.to_str()) else {
+            continue;
+        };
+        if !filename.ends_with(".full.json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let Some(stem) = filename.strip_suffix(".full.json") else {
+            continue;
+        };
+        let profile_name = Box::leak(stem.to_string().into_boxed_str());
+        let wrapped = json!({ "config": parsed });
+        let cfg = strategy_cfg_from_payload(strategy_hi_win_config(), &wrapped);
+        let spec = StrategyDynamicProfileSpec {
+            name: profile_name,
+            cfg,
+        };
+        out.insert(profile_name.to_ascii_lowercase(), spec);
+        if let Some(profile_alias) = wrapped
+            .get("config")
+            .and_then(|v| v.get("profile"))
+            .and_then(Value::as_str)
+        {
+            out.insert(profile_alias.trim().to_ascii_lowercase(), spec);
+        }
+    }
+    out
+}
+
+fn strategy_profile_dir() -> Result<std::path::PathBuf, ()> {
+    let mut dir = std::env::current_dir().map_err(|_| ())?;
+    loop {
+        let candidate = dir.join("configs").join("strategy-profiles");
+        if candidate.is_dir() {
+            return Ok(candidate);
+        }
+        if !dir.pop() {
+            return Err(());
+        }
     }
 }
 
@@ -511,7 +590,9 @@ fn strategy_cfg_for_profile_name(profile: &str) -> StrategyRuntimeConfig {
         STRATEGY_PROFILE_BTC_5M_BALANCE => strategy_btc_5m_balance_config(),
         STRATEGY_PROFILE_SOL_5M_SHARP => strategy_sol_5m_sharp_config(),
         STRATEGY_PROFILE_CAND_GROWTH_MIX => strategy_cand_growth_mix_config(),
-        _ => strategy_profit_max_config(),
+        _ => strategy_dynamic_profile_spec(profile)
+            .map(|spec| spec.cfg)
+            .unwrap_or_else(strategy_profit_max_config),
     }
 }
 
@@ -678,6 +759,15 @@ mod tests {
     fn strict_profile_alias_rejects_unknown_values() {
         assert!(strategy_profile_from_alias_strict("sol5m_sharp").is_ok());
         assert!(strategy_profile_from_alias_strict("definitely_not_a_profile").is_err());
+    }
+
+    #[test]
+    fn file_backed_profile_aliases_are_available_for_scope_overrides() {
+        let (profile_name, profile_cfg) =
+            strategy_profile_from_alias_strict("xrp5m_overall_2026_03_14").unwrap();
+        assert_eq!(profile_name, "xrp5m_overall_2026_03_14");
+        assert_eq!(profile_cfg.max_entries_per_round, 4);
+        assert!(profile_cfg.entry_max_price_cents > 70.0);
     }
 }
 
