@@ -5837,11 +5837,6 @@ mod tests {
                 spread_down: 0.02,
                 spread_mid: 0.02,
                 liquidity_score: 1.0,
-                liquidity_sample_count: 1,
-                liquidity_valid_ratio: 1.0,
-                liquidity_parity_ratio: 1.0,
-                liquidity_spread_ratio: 1.0,
-                liquidity_entry_allowed: true,
             },
             StrategySample {
                 ts_ms: 1_500,
@@ -5859,11 +5854,6 @@ mod tests {
                 spread_down: 0.04,
                 spread_mid: 0.04,
                 liquidity_score: 0.15,
-                liquidity_sample_count: 1,
-                liquidity_valid_ratio: 0.0,
-                liquidity_parity_ratio: 0.0,
-                liquidity_spread_ratio: 0.0,
-                liquidity_entry_allowed: false,
             },
             StrategySample {
                 ts_ms: 1_900,
@@ -5881,11 +5871,6 @@ mod tests {
                 spread_down: 0.02,
                 spread_mid: 0.02,
                 liquidity_score: 1.0,
-                liquidity_sample_count: 1,
-                liquidity_valid_ratio: 1.0,
-                liquidity_parity_ratio: 1.0,
-                liquidity_spread_ratio: 1.0,
-                liquidity_entry_allowed: true,
             },
             StrategySample {
                 ts_ms: 2_100,
@@ -5903,11 +5888,6 @@ mod tests {
                 spread_down: 0.02,
                 spread_mid: 0.02,
                 liquidity_score: 1.0,
-                liquidity_sample_count: 1,
-                liquidity_valid_ratio: 1.0,
-                liquidity_parity_ratio: 1.0,
-                liquidity_spread_ratio: 1.0,
-                liquidity_entry_allowed: true,
             },
         ];
         let decision = build_decision_samples_1s(&raw);
