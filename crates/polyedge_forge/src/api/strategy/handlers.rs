@@ -171,10 +171,82 @@ fn build_runtime_bucketed_payload(
     })
 }
 
+const STRATEGY_COMPACT_TRADE_ROWS: usize = 8;
+const STRATEGY_COMPACT_DECISION_ROWS: usize = 12;
+const STRATEGY_COMPACT_EVENT_ROWS: usize = 16;
+
+fn trim_recent_array(value: &mut Value, keep: usize) -> bool {
+    let Some(rows) = value.as_array_mut() else {
+        return false;
+    };
+    if rows.len() <= keep {
+        return false;
+    }
+    let trim = rows.len().saturating_sub(keep);
+    rows.drain(0..trim);
+    true
+}
+
+fn trim_object_array_field(
+    object: &mut serde_json::Map<String, Value>,
+    field: &str,
+    keep: usize,
+) -> bool {
+    object
+        .get_mut(field)
+        .map(|value| trim_recent_array(value, keep))
+        .unwrap_or(false)
+}
+
+fn compact_live_execution_payload(value: &mut Value) -> bool {
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    let mut trimmed = false;
+    trimmed |= trim_object_array_field(object, "decisions", STRATEGY_COMPACT_DECISION_ROWS);
+    trimmed |= trim_object_array_field(object, "paper_records", STRATEGY_COMPACT_DECISION_ROWS);
+    trimmed |= trim_object_array_field(object, "live_records", STRATEGY_COMPACT_DECISION_ROWS);
+    trimmed |= trim_object_array_field(object, "order_lineage", STRATEGY_COMPACT_DECISION_ROWS);
+    trimmed |= trim_object_array_field(object, "events", STRATEGY_COMPACT_EVENT_ROWS);
+    if let Some(gated) = object.get_mut("gated").and_then(Value::as_object_mut) {
+        trimmed |= trim_object_array_field(
+            gated,
+            "submitted_decisions",
+            STRATEGY_COMPACT_DECISION_ROWS,
+        );
+        trimmed |=
+            trim_object_array_field(gated, "skipped_decisions", STRATEGY_COMPACT_DECISION_ROWS);
+    }
+    if let Some(execution) = object.get_mut("execution").and_then(Value::as_object_mut) {
+        trimmed |= trim_object_array_field(execution, "orders", STRATEGY_COMPACT_EVENT_ROWS);
+    }
+    trimmed
+}
+
+fn compact_strategy_payload(payload: &mut Value) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    let mut trimmed = false;
+    trimmed |= trim_object_array_field(object, "trades", STRATEGY_COMPACT_TRADE_ROWS);
+    trimmed |= trim_object_array_field(object, "signal_decisions", STRATEGY_COMPACT_DECISION_ROWS);
+    trimmed |= trim_object_array_field(object, "paper_records", STRATEGY_COMPACT_DECISION_ROWS);
+    trimmed |= trim_object_array_field(object, "live_records", STRATEGY_COMPACT_DECISION_ROWS);
+    trimmed |= trim_object_array_field(object, "order_lineage", STRATEGY_COMPACT_DECISION_ROWS);
+    trimmed |= trim_object_array_field(object, "position_summary", STRATEGY_COMPACT_DECISION_ROWS);
+    if let Some(live_execution) = object.get_mut("live_execution") {
+        trimmed |= compact_live_execution_payload(live_execution);
+    }
+    object.insert("payload_mode".to_string(), json!("compact"));
+    object.insert("details_available".to_string(), json!(true));
+    object.insert("payload_trimmed".to_string(), json!(trimmed));
+}
+
 #[derive(Debug, Deserialize)]
 pub(super) struct StrategyPaperQueryParams {
     source: Option<String>,
     profile: Option<String>,
+    compact: Option<bool>,
     market_type: Option<String>,
     symbol: Option<String>,
     lookback_minutes: Option<u32>,
@@ -227,6 +299,7 @@ async fn strategy_paper_impl(
     forced_source: Option<StrategyPaperSource>,
     forced_view_meta: Option<(&'static str, &'static str)>,
 ) -> Result<Json<Value>, ApiError> {
+    let compact = params.compact.unwrap_or(false);
     let source_mode = forced_source.unwrap_or_else(|| parse_strategy_paper_source(params.source.as_deref()));
     let market_type = resolve_strategy_market_type(params.market_type.as_deref())?;
     let symbol = resolve_strategy_symbol(params.symbol.as_deref())?;
@@ -259,6 +332,9 @@ async fn strategy_paper_impl(
                                 strategy_response_view_meta(family, label),
                             );
                         }
+                    }
+                    if compact {
+                        compact_strategy_payload(&mut payload);
                     }
                     return Ok(Json(payload));
                 }
@@ -492,7 +568,7 @@ async fn strategy_paper_impl(
         let samples = load_live_runtime_samples(&state, symbol, market_type, lookback_minutes, max_points).await?;
         let run = (samples.len() >= 20)
             .then(|| run_strategy_simulation_with_fee_context(&samples, &cfg, max_trades, None));
-        let payload = build_runtime_bucketed_payload(
+        let mut payload = build_runtime_bucketed_payload(
             runtime_payload,
             forced_view_meta,
             &cfg,
@@ -504,6 +580,9 @@ async fn strategy_paper_impl(
             &samples,
             run.as_ref(),
         );
+        if compact {
+            compact_strategy_payload(&mut payload);
+        }
         return Ok(Json(payload));
     }
 
@@ -517,7 +596,7 @@ async fn strategy_paper_impl(
     )
     .await?;
     if samples.len() < 20 {
-        let payload = json!({
+        let mut payload = json!({
             "source": "replay",
             "view": strategy_response_view_meta(
                 forced_view_meta.map(|(family, _)| family).unwrap_or("replay"),
@@ -564,11 +643,14 @@ async fn strategy_paper_impl(
             },
             "trades": [],
         });
+        if compact {
+            compact_strategy_payload(&mut payload);
+        }
         return Ok(Json(payload));
     }
 
     let run = run_strategy_simulation_with_fee_context(&samples, &cfg, max_trades, None);
-    let payload = json!({
+    let mut payload = json!({
         "source": "replay",
             "view": strategy_response_view_meta(
                 forced_view_meta.map(|(family, _)| family).unwrap_or("replay"),
@@ -624,6 +706,9 @@ async fn strategy_paper_impl(
         },
         "trades": run.trades,
     });
+    if compact {
+        compact_strategy_payload(&mut payload);
+    }
     Ok(Json(payload))
 }
 
@@ -705,6 +790,9 @@ pub(super) async fn strategy_paper_ledger(
             "view".to_string(),
             strategy_response_view_meta("ledger", "Paper Ledger"),
         );
+    }
+    if params.compact.unwrap_or(false) {
+        compact_strategy_payload(&mut payload);
     }
     Ok(Json(payload))
 }
@@ -789,7 +877,7 @@ pub(super) async fn strategy_execution_attribution(
         .collect::<Vec<_>>();
     let latency = summarize_live_order_latency(&orders);
 
-    Ok(Json(json!({
+    let mut payload = json!({
         "source": "attribution",
         "view": {
             "family": "attribution",
@@ -798,6 +886,10 @@ pub(super) async fn strategy_execution_attribution(
         "symbol": symbol,
         "market_type": market_type,
         "updated_at_ms": Utc::now().timestamp_millis(),
+        "paper_record_count": paper_records.len(),
+        "live_record_count": live_records.len(),
+        "order_lineage_count": live_order_lineage.len(),
+        "position_count": position_summary.len(),
         "paper_records": paper_records,
         "live_records": live_records,
         "order_lineage": live_order_lineage,
@@ -806,7 +898,11 @@ pub(super) async fn strategy_execution_attribution(
         "position_summary": position_summary,
         "runtime_control": ledger_payload.get("runtime_control").cloned().unwrap_or(Value::Null),
         "current": ledger_payload.get("current").cloned().unwrap_or(Value::Null),
-    })))
+    });
+    if params.compact.unwrap_or(false) {
+        compact_strategy_payload(&mut payload);
+    }
+    Ok(Json(payload))
 }
 
 pub(super) async fn strategy_live_reset(
@@ -1654,6 +1750,67 @@ mod handlers_runtime_view_tests {
                 .and_then(|v| v.get("round_id"))
                 .and_then(Value::as_str),
             Some("SOLUSDT_5m_1")
+        );
+    }
+
+    #[test]
+    fn compact_strategy_payload_trims_heavy_arrays() {
+        let mut payload = json!({
+            "trades": (0..20).map(|idx| json!({"id": idx})).collect::<Vec<_>>(),
+            "signal_decisions": (0..20).map(|idx| json!({"decision_id": idx})).collect::<Vec<_>>(),
+            "paper_records": (0..20).map(|idx| json!({"decision_id": idx})).collect::<Vec<_>>(),
+            "position_summary": (0..20).map(|idx| json!({"position_id": idx})).collect::<Vec<_>>(),
+            "live_execution": {
+                "events": (0..25).map(|idx| json!({"event_seq": idx})).collect::<Vec<_>>(),
+                "execution": {
+                    "orders": (0..25).map(|idx| json!({"decision_id": idx})).collect::<Vec<_>>()
+                }
+            }
+        });
+
+        compact_strategy_payload(&mut payload);
+
+        assert_eq!(
+            payload.get("payload_mode").and_then(Value::as_str),
+            Some("compact")
+        );
+        assert_eq!(
+            payload
+                .get("trades")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(STRATEGY_COMPACT_TRADE_ROWS)
+        );
+        assert_eq!(
+            payload
+                .get("signal_decisions")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(STRATEGY_COMPACT_DECISION_ROWS)
+        );
+        assert_eq!(
+            payload
+                .get("position_summary")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(STRATEGY_COMPACT_DECISION_ROWS)
+        );
+        assert_eq!(
+            payload
+                .get("live_execution")
+                .and_then(|v| v.get("events"))
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(STRATEGY_COMPACT_EVENT_ROWS)
+        );
+        assert_eq!(
+            payload
+                .get("live_execution")
+                .and_then(|v| v.get("execution"))
+                .and_then(|v| v.get("orders"))
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(STRATEGY_COMPACT_EVENT_ROWS)
         );
     }
 }

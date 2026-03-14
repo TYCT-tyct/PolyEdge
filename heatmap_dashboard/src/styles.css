@@ -369,6 +369,90 @@ body {
   font-family: "JetBrains Mono", monospace;
 }
 
+.detail-toggle {
+  border: 1px solid var(--panel-border);
+  background: linear-gradient(180deg, rgba(24, 37, 60, 0.94) 0%, rgba(13, 22, 39, 0.96) 100%);
+  color: #d7e8ff;
+  border-radius: 10px;
+  padding: 6px 11px;
+  font-size: 11px;
+  font-family: "JetBrains Mono", monospace;
+  line-height: 1;
+  cursor: pointer;
+  transition: border-color 180ms ease, color 180ms ease, box-shadow 180ms ease, transform 180ms ease;
+}
+
+.detail-toggle:hover {
+  border-color: rgba(56, 189, 248, 0.55);
+  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.16);
+}
+
+.detail-toggle.active {
+  border-color: rgba(245, 158, 11, 0.6);
+  color: #fff3d6;
+  box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.16);
+}
+
+.detail-toggle.ghost {
+  background: rgba(15, 23, 42, 0.78);
+  color: var(--muted);
+}
+
+.detail-banner {
+  margin-top: 10px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid rgba(56, 189, 248, 0.22);
+  border-radius: 12px;
+  background: linear-gradient(180deg, rgba(11, 18, 33, 0.78) 0%, rgba(9, 15, 28, 0.88) 100%);
+  padding: 10px 12px;
+}
+
+.detail-banner strong {
+  display: block;
+  color: #dcecff;
+  font-size: 12px;
+  font-family: "JetBrains Mono", monospace;
+}
+
+.detail-banner small {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  line-height: 1.55;
+  font-size: 12px;
+}
+
+.detail-error {
+  color: var(--down);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.detail-placeholder {
+  margin-top: 10px;
+  border: 1px dashed rgba(148, 163, 184, 0.3);
+  border-radius: 14px;
+  background: rgba(11, 17, 30, 0.52);
+  padding: 18px 20px;
+}
+
+.detail-placeholder h3 {
+  margin: 0;
+  color: #d6e6ff;
+  font-size: 14px;
+  font-family: "Poppins", "Noto Sans SC", sans-serif;
+}
+
+.detail-placeholder p {
+  margin: 8px 0 0;
+  color: var(--muted);
+  line-height: 1.65;
+  font-size: 12px;
+}
+
 .btn-group button {
   border: 1px solid var(--panel-border);
   background: rgba(20, 31, 52, 0.82);

@@ -1015,6 +1015,7 @@ export async function getAccuracySeries(
 export interface StrategyPaperQueryOptions {
   source?: "replay" | "live" | "auto";
   profile?: string;
+  compact?: boolean;
   lookbackMinutes?: number;
   maxTrades?: number;
   fullHistory?: boolean;
@@ -1049,6 +1050,9 @@ async function requestStrategySnapshot(
   qs.set("profile", options.profile ?? "");
   if (!options.profile) {
     qs.delete("profile");
+  }
+  if (options.compact != null) {
+    qs.set("compact", options.compact ? "true" : "false");
   }
   if (options.lookbackMinutes != null) {
     qs.set("lookback_minutes", String(options.lookbackMinutes));
@@ -1146,6 +1150,9 @@ export async function getStrategyExecutionAttribution(
   });
   if (options.maxTrades != null) {
     qs.set("max_trades", String(options.maxTrades));
+  }
+  if (options.compact != null) {
+    qs.set("compact", options.compact ? "true" : "false");
   }
   const payload = await requestJson<Record<string, unknown>>(
     `/api/strategy/execution_attribution?${qs.toString()}`,

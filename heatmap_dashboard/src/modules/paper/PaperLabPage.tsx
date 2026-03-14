@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   getStrategyExecutionAttribution,
@@ -28,6 +28,7 @@ const STRATEGY_POLL_MAX_MS = 20_000;
 const STRATEGY_REPLAY_POLL_MIN_MS = 12_000;
 const STRATEGY_REPLAY_POLL_MAX_MS = 30_000;
 const STRATEGY_REPLAY_TIMEOUT_MS = 25_000;
+const STRATEGY_DETAIL_TIMEOUT_MS = 25_000;
 const STRATEGY_PREFS_STORAGE_KEY = "polyedge.strategy.prefs.v5";
 const PAPER_LOOKBACK_MINUTES = 1440;
 
@@ -196,57 +197,6 @@ function objCell(v: unknown): Record<string, unknown> | null {
   return v != null && typeof v === "object" ? (v as Record<string, unknown>) : null;
 }
 
-function compactStrategyPayload(payload: StrategyPaperResponse): StrategyPaperResponse {
-  const trimmedTrades = payload.trades.length > 60 ? payload.trades.slice(-60) : payload.trades;
-  const live = payload.live_execution;
-  if (!live) {
-    return { ...payload, trades: trimmedTrades };
-  }
-  const compactLive = {
-    ...live,
-    decisions:
-      live.decisions && live.decisions.length > 80
-        ? live.decisions.slice(live.decisions.length - 80)
-        : live.decisions,
-    paper_records:
-      live.paper_records && live.paper_records.length > 60
-        ? live.paper_records.slice(live.paper_records.length - 60)
-        : live.paper_records,
-    live_records:
-      live.live_records && live.live_records.length > 60
-        ? live.live_records.slice(live.live_records.length - 60)
-        : live.live_records,
-    order_lineage:
-      live.order_lineage && live.order_lineage.length > 80
-        ? live.order_lineage.slice(live.order_lineage.length - 80)
-        : live.order_lineage,
-    events:
-      live.events && live.events.length > 50
-        ? live.events.slice(live.events.length - 50)
-        : live.events,
-    gated: live.gated
-      ? {
-          ...live.gated,
-          submitted_decisions:
-            live.gated.submitted_decisions &&
-            live.gated.submitted_decisions.length > 60
-              ? live.gated.submitted_decisions.slice(
-                  live.gated.submitted_decisions.length - 60
-                )
-              : live.gated.submitted_decisions,
-          skipped_decisions:
-            live.gated.skipped_decisions &&
-            live.gated.skipped_decisions.length > 60
-              ? live.gated.skipped_decisions.slice(
-                  live.gated.skipped_decisions.length - 60
-                )
-              : live.gated.skipped_decisions
-        }
-      : live.gated
-  };
-  return { ...payload, trades: trimmedTrades, live_execution: compactLive };
-}
-
 function describeStrategyError(
   view: StrategyWorkbenchView,
   message: string,
@@ -280,6 +230,14 @@ export function PaperLabPage({
   const [strategyAttribution, setStrategyAttribution] =
     useState<StrategyAttributionResponse | null>(null);
   const [strategyLoading, setStrategyLoading] = useState<boolean>(false);
+  const [detailOpen, setDetailOpen] = useState<boolean>(false);
+  const [strategyPaperDetail, setStrategyPaperDetail] =
+    useState<StrategyPaperResponse | null>(null);
+  const [strategyAttributionDetail, setStrategyAttributionDetail] =
+    useState<StrategyAttributionResponse | null>(null);
+  const [detailLoading, setDetailLoading] = useState<boolean>(false);
+  const [detailError, setDetailError] = useState<string>("");
+  const [detailRefreshToken, setDetailRefreshToken] = useState<number>(0);
   const [strategyMarketType, setStrategyMarketType] = useState<MarketType>(
     prefs.marketType ?? "5m"
   );
@@ -289,7 +247,9 @@ export function PaperLabPage({
   const [errorText, setErrorText] = useState<string>("");
 
   const strategyInFlightRef = useRef<boolean>(false);
+  const detailInFlightRef = useRef<boolean>(false);
   const strategySigRef = useRef<string>("");
+  const detailSigRef = useRef<string>("");
   const strategyUnchangedRef = useRef<number>(0);
   const strategyHasLoadedRef = useRef<boolean>(false);
 
@@ -300,6 +260,8 @@ export function PaperLabPage({
   const isPaperLedgerView = strategyView === "paperLedger";
   const isAttributionView = strategyView === "attribution";
   const isRuntimeView = isRuntimePaperView || isRuntimeLiveView;
+  const deferredStrategyPaperDetail = useDeferredValue(strategyPaperDetail);
+  const deferredStrategyAttributionDetail = useDeferredValue(strategyAttributionDetail);
 
   useEffect(() => {
     writeStrategyUiPrefs({
@@ -307,6 +269,26 @@ export function PaperLabPage({
       view: strategyView
     });
   }, [strategyMarketType, strategyView]);
+
+  useEffect(() => {
+    setDetailOpen(false);
+    setDetailError("");
+    setDetailLoading(false);
+    setStrategyPaperDetail(null);
+    setStrategyAttributionDetail(null);
+    detailSigRef.current = "";
+  }, [selectedSymbol, strategyMarketType, strategyView]);
+
+  useEffect(() => {
+    if (detailOpen) {
+      return;
+    }
+    detailSigRef.current = "";
+    setDetailError("");
+    setDetailLoading(false);
+    setStrategyPaperDetail(null);
+    setStrategyAttributionDetail(null);
+  }, [detailOpen]);
 
   useEffect(() => {
     let alive = true;
@@ -377,6 +359,7 @@ export function PaperLabPage({
         const requestTimeoutMs = isReplayView ? STRATEGY_REPLAY_TIMEOUT_MS : undefined;
         const requestOptions = {
           ...STRATEGY_PAPER_PROFILE,
+          compact: true,
           lookbackMinutes: PAPER_LOOKBACK_MINUTES,
           timeoutMs: requestTimeoutMs,
           ...(isRuntimeView ? STRATEGY_LIVE_PROFILE : {})
@@ -393,8 +376,10 @@ export function PaperLabPage({
             changed = nextSig !== strategySigRef.current;
             if (changed) {
               strategySigRef.current = nextSig;
-              setStrategyAttribution(attribution);
-              setStrategyPaper(null);
+              startTransition(() => {
+                setStrategyAttribution(attribution);
+                setStrategyPaper(null);
+              });
             }
           } else {
             const data = isReplayView
@@ -402,13 +387,14 @@ export function PaperLabPage({
               : isPaperLedgerView
               ? await getStrategyPaperLedger(strategyMarketType, requestOptions, selectedSymbol)
               : await getStrategyRuntime(strategyMarketType, requestOptions, selectedSymbol);
-            const compactData = compactStrategyPayload(data);
-            nextSig = strategyPaperSignature(compactData);
+            nextSig = strategyPaperSignature(data);
             changed = nextSig !== strategySigRef.current;
             if (changed) {
               strategySigRef.current = nextSig;
-              setStrategyPaper(compactData);
-              setStrategyAttribution(null);
+              startTransition(() => {
+                setStrategyPaper(data);
+                setStrategyAttribution(null);
+              });
             }
           }
           strategyHasLoadedRef.current = true;
@@ -444,6 +430,92 @@ export function PaperLabPage({
     isRuntimeView,
     strategyEnabled,
     selectedSymbol,
+    strategyMarketType,
+    strategyView
+  ]);
+
+  useEffect(() => {
+    let alive = true;
+    if (!strategyEnabled || !detailOpen) {
+      return () => {
+        alive = false;
+      };
+    }
+
+    const loadDetails = async () => {
+      if (!alive || detailInFlightRef.current) {
+        return;
+      }
+      detailInFlightRef.current = true;
+      setDetailLoading(true);
+      try {
+        const requestOptions = {
+          ...STRATEGY_PAPER_PROFILE,
+          compact: false,
+          lookbackMinutes: PAPER_LOOKBACK_MINUTES,
+          timeoutMs: STRATEGY_DETAIL_TIMEOUT_MS,
+          ...(isRuntimeView ? STRATEGY_LIVE_PROFILE : {})
+        };
+        if (isAttributionView) {
+          const attribution = await getStrategyExecutionAttribution(
+            strategyMarketType,
+            requestOptions,
+            selectedSymbol
+          );
+          const nextSig = strategyAttributionSignature(attribution);
+          if (nextSig !== detailSigRef.current) {
+            detailSigRef.current = nextSig;
+            startTransition(() => {
+              setStrategyAttributionDetail(attribution);
+              setStrategyPaperDetail(null);
+            });
+          }
+        } else {
+          const payload = isReplayView
+            ? await getStrategyReplay(strategyMarketType, requestOptions, selectedSymbol)
+            : isPaperLedgerView
+            ? await getStrategyPaperLedger(strategyMarketType, requestOptions, selectedSymbol)
+            : await getStrategyRuntime(strategyMarketType, requestOptions, selectedSymbol);
+          const nextSig = strategyPaperSignature(payload);
+          if (nextSig !== detailSigRef.current) {
+            detailSigRef.current = nextSig;
+            startTransition(() => {
+              setStrategyPaperDetail(payload);
+              setStrategyAttributionDetail(null);
+            });
+          }
+        }
+        if (alive) {
+          setDetailError("");
+        }
+      } catch (err) {
+        if (alive) {
+          const message = err instanceof Error ? err.message : String(err);
+          setDetailError(
+            describeStrategyError(strategyView, message, selectedSymbol, strategyMarketType)
+          );
+        }
+      } finally {
+        detailInFlightRef.current = false;
+        if (alive) {
+          setDetailLoading(false);
+        }
+      }
+    };
+
+    void loadDetails();
+    return () => {
+      alive = false;
+    };
+  }, [
+    detailOpen,
+    detailRefreshToken,
+    isAttributionView,
+    isPaperLedgerView,
+    isReplayView,
+    isRuntimeView,
+    selectedSymbol,
+    strategyEnabled,
     strategyMarketType,
     strategyView
   ]);
@@ -486,6 +558,18 @@ export function PaperLabPage({
   const idleMinutes =
     lastTradeTs != null ? Math.max(0, (nowTs - lastTradeTs) / 60_000) : null;
   const liveExecution = strategyPaper?.live_execution;
+  const detailPaperPayload = detailOpen
+    ? deferredStrategyPaperDetail ?? strategyPaper
+    : null;
+  const detailAttributionPayload = detailOpen
+    ? deferredStrategyAttributionDetail ?? strategyAttribution
+    : null;
+  const detailAvailable = isAttributionView
+    ? (strategyAttribution?.details_available ?? true)
+    : (strategyPaper?.details_available ?? true);
+  const detailReady = isAttributionView
+    ? strategyAttributionDetail != null
+    : strategyPaperDetail != null;
   const liveSummary = liveExecution?.summary;
   const liveParity = liveExecution?.parity_check;
   const liveState = liveExecution?.state_machine;
@@ -502,12 +586,13 @@ export function PaperLabPage({
   const liveFillDecisionCount = numCell(liveSummary?.fills?.fill_decision_count);
   const liveFillCostCents = numCell(liveSummary?.fills?.total_fill_cost_cents);
   const livePaperFillCount = numCell(liveSummary?.paper_live_fill_count);
-  const liveEvents = (liveExecution?.events ?? []).slice(-20).reverse();
-  const liveOrders = (liveExecution?.execution?.orders ?? []).slice(-20).reverse();
-  const livePaperRecords = (liveExecution?.paper_records ?? [])
+  const liveDetailExecution = detailPaperPayload?.live_execution;
+  const liveEvents = (liveDetailExecution?.events ?? []).slice(-20).reverse();
+  const liveOrders = (liveDetailExecution?.execution?.orders ?? []).slice(-20).reverse();
+  const livePaperRecords = (liveDetailExecution?.paper_records ?? [])
     .slice(-20)
     .reverse();
-  const liveOrderLineage = (liveExecution?.order_lineage ?? [])
+  const liveOrderLineage = (liveDetailExecution?.order_lineage ?? [])
     .slice(-20)
     .reverse();
   const lineagePendingDecisionCount = liveOrderLineage.filter((row) => {
@@ -581,7 +666,7 @@ export function PaperLabPage({
     isRuntimeLiveView && liveRealizedNetCents != null
       ? liveRealizedNetCents
       : summaryNet;
-  const tradeRows = (strategyPaper?.trades ?? []).slice(-20).reverse();
+  const tradeRows = (detailPaperPayload?.trades ?? []).slice(-20).reverse();
   const sourceLabel = isAttributionView
     ? strategyAttribution?.view?.label ?? strategyAttribution?.source ?? "--"
     : strategyPaper?.view?.label ?? strategyPaper?.source ?? "--";
@@ -620,16 +705,16 @@ export function PaperLabPage({
   const attributionSubmitToAck = objCell(attributionLatency?.submit_to_ack_ms);
   const attributionOrderLatency = objCell(attributionLatency?.order_latency_ms);
   const attributionActiveSignal = objCell(attributionCurrent?.active_signal);
-  const attributionPaperRecords = [...(strategyAttribution?.paper_records ?? [])]
+  const attributionPaperRecords = [...(detailAttributionPayload?.paper_records ?? [])]
     .slice(-20)
     .reverse();
-  const attributionLiveRecords = [...(strategyAttribution?.live_records ?? [])]
+  const attributionLiveRecords = [...(detailAttributionPayload?.live_records ?? [])]
     .slice(-20)
     .reverse();
-  const attributionOrderLineage = [...(strategyAttribution?.order_lineage ?? [])]
+  const attributionOrderLineage = [...(detailAttributionPayload?.order_lineage ?? [])]
     .slice(-20)
     .reverse();
-  const attributionPositionSummary = [...(strategyAttribution?.position_summary ?? [])].slice(
+  const attributionPositionSummary = [...(detailAttributionPayload?.position_summary ?? [])].slice(
     0,
     20
   );
@@ -665,6 +750,24 @@ export function PaperLabPage({
         </div>
         <div className="panel-actions">
           <span className="loading-chip">{loadingLabel}</span>
+          {detailAvailable ? (
+            <>
+              <button
+                className={`detail-toggle ${detailOpen ? "active" : ""}`}
+                onClick={() => setDetailOpen((prev) => !prev)}
+              >
+                {detailOpen ? "收起明细" : "加载明细"}
+              </button>
+              {detailOpen ? (
+                <button
+                  className="detail-toggle ghost"
+                  onClick={() => setDetailRefreshToken((token) => token + 1)}
+                >
+                  {detailLoading ? "刷新中..." : "刷新明细"}
+                </button>
+              ) : null}
+            </>
+          ) : null}
         </div>
       </header>
 
@@ -673,6 +776,22 @@ export function PaperLabPage({
         <span>来源: {sourceLabel}</span>
         <span>symbol: {resolvedSymbol}</span>
         <span>market: {strategyMarketType}</span>
+        <span>{detailOpen ? "details: on-demand loaded" : "details: overview only"}</span>
+        {detailOpen ? (
+          <span>{detailLoading ? "detail state: loading" : detailReady ? "detail state: ready" : "detail state: idle"}</span>
+        ) : null}
+      </div>
+
+      <div className="detail-banner">
+        <div>
+          <strong>{detailOpen ? "明细模式" : "轻量概览模式"}</strong>
+          <small>
+            {detailOpen
+              ? "概览仍按轻量轮询更新，重表格和链路明细只在按需加载后展示。"
+              : "默认只加载摘要、当前动作和关键指标，避免每轮轮询都解析和渲染整包大表。"}
+          </small>
+        </div>
+        {detailError ? <span className="detail-error">{detailError}</span> : null}
       </div>
 
       {isAttributionView ? (
@@ -884,7 +1003,7 @@ export function PaperLabPage({
         </article>
       </div>
 
-      {isAttributionView ? (
+      {isAttributionView ? detailOpen && detailReady ? (
         <section className="live-execution-wrap">
           <div className="live-block-grid">
             <article className="live-block">
@@ -943,11 +1062,11 @@ export function PaperLabPage({
                 </li>
                 <li>
                   <span>paper records</span>
-                  <strong>{strategyAttribution?.paper_records.length ?? 0}</strong>
+                  <strong>{strategyAttribution?.paper_record_count ?? strategyAttribution?.paper_records.length ?? 0}</strong>
                 </li>
                 <li>
                   <span>live records</span>
-                  <strong>{strategyAttribution?.live_records.length ?? 0}</strong>
+                  <strong>{strategyAttribution?.live_record_count ?? strategyAttribution?.live_records.length ?? 0}</strong>
                 </li>
               </ul>
             </article>
@@ -1130,9 +1249,16 @@ export function PaperLabPage({
             </div>
           </div>
         </section>
+      ) : (
+        <section className="detail-placeholder">
+          <h3>执行归因明细按需加载</h3>
+          <p>
+            当前只轮询归因摘要和延迟概览，位置级归因、成交对照和 lineage 表格会在你主动打开明细后再拉取。
+          </p>
+        </section>
       ) : null}
 
-      {isRuntimeLiveView ? (
+      {isRuntimeLiveView ? detailOpen && detailReady ? (
         <section className="live-execution-wrap">
           <div className="info-cards compact live-kpi-grid">
             <article className="info-card">
@@ -1524,9 +1650,16 @@ export function PaperLabPage({
             </div>
           </div>
         </section>
+      ) : (
+        <section className="detail-placeholder">
+          <h3>实时 Live 明细按需加载</h3>
+          <p>
+            默认只更新执行摘要、控制状态和关键 KPI，真实下单记录、链路事件和 lineage 仅在打开明细后加载，避免轮询时整页卡顿。
+          </p>
+        </section>
       ) : null}
 
-      {!isAttributionView ? (
+      {!isAttributionView ? detailOpen && detailReady ? (
         <div className="table-wrap">
           <h3 className="table-title">{tradeTableTitle}</h3>
           <table className="history-table">
@@ -1577,6 +1710,13 @@ export function PaperLabPage({
             </tbody>
           </table>
         </div>
+      ) : (
+        <section className="detail-placeholder">
+          <h3>{tradeTableTitle}</h3>
+          <p>
+            交易表默认不参与轮询渲染。需要逐笔检查时再加载明细，这样运行中的概览卡片会保持更顺滑。
+          </p>
+        </section>
       ) : null}
 
       <footer className="status-row">

@@ -308,6 +308,9 @@ export interface StrategyLivePositionState {
 export interface StrategyPaperResponse {
   symbol?: string;
   source?: "replay" | "live" | "runtime" | "ledger" | "auto" | string;
+  payload_mode?: "compact" | "full" | string;
+  details_available?: boolean;
+  payload_trimmed?: boolean;
   view?: {
     family?: "runtime" | "replay" | "ledger" | string;
     label?: string;
@@ -500,6 +503,9 @@ export interface StrategyPaperResponse {
 
 export interface StrategyAttributionResponse {
   source?: "attribution" | string;
+  payload_mode?: "compact" | "full" | string;
+  details_available?: boolean;
+  payload_trimmed?: boolean;
   view?: {
     family?: "attribution" | string;
     label?: string;
@@ -507,6 +513,10 @@ export interface StrategyAttributionResponse {
   symbol?: string;
   market_type: string;
   updated_at_ms?: number;
+  paper_record_count?: number;
+  live_record_count?: number;
+  order_lineage_count?: number;
+  position_count?: number;
   paper_records: Record<string, unknown>[];
   live_records: Record<string, unknown>[];
   order_lineage: Record<string, unknown>[];
