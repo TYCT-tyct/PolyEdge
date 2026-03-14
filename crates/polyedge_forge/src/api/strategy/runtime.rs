@@ -1405,22 +1405,39 @@ pub(super) async fn load_strategy_samples(
                 max(ts_ireland_sample_ms) AS ts_ms,
                 argMax(round_id, ts_ireland_sample_ms) AS round_id,
                 argMax(remaining_ms, ts_ireland_sample_ms) AS remaining_ms,
-                quantileExact(0.5)(coalesce(mid_yes_smooth, mid_yes)) AS mid_yes_smooth,
-                quantileExact(0.5)(coalesce(mid_no_smooth, mid_no)) AS mid_no_smooth,
-                quantileExact(0.5)(coalesce(bid_yes, coalesce(mid_yes_smooth, mid_yes))) AS bid_yes,
-                quantileExact(0.5)(coalesce(ask_yes, coalesce(mid_yes_smooth, mid_yes))) AS ask_yes,
-                quantileExact(0.5)(coalesce(bid_no, coalesce(mid_no_smooth, mid_no))) AS bid_no,
-                quantileExact(0.5)(coalesce(ask_no, coalesce(mid_no_smooth, mid_no))) AS ask_no,
-                quantileExact(0.5)(coalesce(delta_pct_smooth, delta_pct, 0.0)) AS delta_pct_smooth,
-                quantileExact(0.5)(coalesce(velocity_bps_per_sec, 0.0)) AS velocity_bps_per_sec,
-                quantileExact(0.5)(coalesce(acceleration, 0.0)) AS acceleration,
-                quantileExact(0.5)(coalesce(binance_price, 0.0)) AS binance_price,
-                quantileExact(0.5)(coalesce(target_price, 0.0)) AS target_price
-            FROM polyedge_forge.snapshot_100ms
-            WHERE symbol='{symbol}'
-              AND timeframe='{market_type}'
-              AND ts_ireland_sample_ms < {closed_before_ms}
-              {ts_filter}
+                quantileExact(0.5)(mid_yes_value) AS mid_yes_smooth,
+                quantileExact(0.5)(mid_no_value) AS mid_no_smooth,
+                quantileExact(0.5)(bid_yes_value) AS bid_yes,
+                quantileExact(0.5)(ask_yes_value) AS ask_yes,
+                quantileExact(0.5)(bid_no_value) AS bid_no,
+                quantileExact(0.5)(ask_no_value) AS ask_no,
+                quantileExact(0.5)(delta_pct_value) AS delta_pct_smooth,
+                quantileExact(0.5)(velocity_value) AS velocity_bps_per_sec,
+                quantileExact(0.5)(acceleration_value) AS acceleration,
+                quantileExact(0.5)(binance_price_value) AS binance_price,
+                quantileExact(0.5)(target_price_value) AS target_price
+            FROM (
+                SELECT
+                    ts_ireland_sample_ms,
+                    round_id,
+                    remaining_ms,
+                    coalesce(mid_yes_smooth, mid_yes) AS mid_yes_value,
+                    coalesce(mid_no_smooth, mid_no) AS mid_no_value,
+                    coalesce(bid_yes, coalesce(mid_yes_smooth, mid_yes)) AS bid_yes_value,
+                    coalesce(ask_yes, coalesce(mid_yes_smooth, mid_yes)) AS ask_yes_value,
+                    coalesce(bid_no, coalesce(mid_no_smooth, mid_no)) AS bid_no_value,
+                    coalesce(ask_no, coalesce(mid_no_smooth, mid_no)) AS ask_no_value,
+                    coalesce(delta_pct_smooth, delta_pct, 0.0) AS delta_pct_value,
+                    coalesce(velocity_bps_per_sec, 0.0) AS velocity_value,
+                    coalesce(acceleration, 0.0) AS acceleration_value,
+                    coalesce(binance_price, 0.0) AS binance_price_value,
+                    coalesce(target_price, 0.0) AS target_price_value
+                FROM polyedge_forge.snapshot_100ms
+                WHERE symbol='{symbol}'
+                  AND timeframe='{market_type}'
+                  AND ts_ireland_sample_ms < {closed_before_ms}
+                  {ts_filter}
+            )
             GROUP BY intDiv(ts_ireland_sample_ms, 1000)
             ORDER BY ts_ms DESC
             LIMIT {max_points}
