@@ -9,7 +9,7 @@ MODE="${MODE:-overall}" # overall|highwin
 SYMBOL="${SYMBOL:-BTCUSDT}"
 MARKET_TYPE="${MARKET_TYPE:-5m}"
 SEED_CONFIG="${SEED_CONFIG:-configs/strategy-profiles/manual_balanced_2026_02_28.full.json}"
-BASE_URL="${BASE_URL:-http://127.0.0.1:9810}"
+BASE_URL="${BASE_URL:-http://127.0.0.1:9830}"
 
 LOOKBACKS="${LOOKBACKS:-720,1440,2880,4320}"
 MAX_TRADES="${MAX_TRADES:-1100}"

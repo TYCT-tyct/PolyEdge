@@ -141,7 +141,7 @@ def main() -> int:
             "for multiple symbols without sending real orders."
         )
     )
-    parser.add_argument("--base-url", default="http://127.0.0.1:9810")
+    parser.add_argument("--base-url", default="http://127.0.0.1:9830")
     parser.add_argument("--market-type", default="5m")
     parser.add_argument("--symbols", default=",".join(DEFAULT_SYMBOLS))
     parser.add_argument("--duration-sec", type=int, default=14_400)

@@ -140,7 +140,7 @@ def score_window(m: dict, min_trades: int, trade_target: int, win_floor: float) 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Compare cand_v2 against all profiles under unified baseline.")
-    ap.add_argument("--base-url", default="http://127.0.0.1:9810")
+    ap.add_argument("--base-url", default="http://127.0.0.1:9830")
     ap.add_argument("--symbol", default="BTCUSDT")
     ap.add_argument("--market-type", default="5m")
     ap.add_argument("--lookbacks", default="720,1440,2880")

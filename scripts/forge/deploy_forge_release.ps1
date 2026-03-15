@@ -277,7 +277,7 @@ systemctl is-active --quiet polyedge-forge-ireland-recorder.service
 systemctl is-active --quiet polyedge-forge-ireland-api.service
 systemctl show polyedge-forge-ireland-recorder.service -p Environment --value | grep -q "POLYEDGE_RELEASE_COMMIT=$COMMIT"
 systemctl show polyedge-forge-ireland-api.service -p Environment --value | grep -q "POLYEDGE_RELEASE_COMMIT=$COMMIT"
-curl -fsS http://127.0.0.1:9810/health/live >/dev/null
+curl -fsS http://127.0.0.1:9830/health/live >/dev/null
 systemctl --no-pager --full status polyedge-forge-ireland-recorder.service | sed -n '1,5p'
 systemctl --no-pager --full status polyedge-forge-ireland-api.service | sed -n '1,5p'
 '@

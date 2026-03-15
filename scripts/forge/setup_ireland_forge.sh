@@ -186,7 +186,7 @@ Environment=FORGE_STRATEGY_MAX_POINTS_SHORT=140000
 Environment=FORGE_STRATEGY_MAX_POINTS_HARD_CAP=320000
 Environment=MALLOC_TRIM_THRESHOLD_=131072
 EnvironmentFile=-$REPO_DIR/.env
-ExecStart=$REPO_DIR/target/release/polyedge_forge ireland-api --bind 0.0.0.0:9810 --clickhouse-url http://127.0.0.1:8123 --redis-url redis://127.0.0.1:6379/0 --redis-prefix forge --dashboard-dist $DASHBOARD_DIST
+ExecStart=$REPO_DIR/target/release/polyedge_forge ireland-api --bind 0.0.0.0:9830 --clickhouse-url http://127.0.0.1:8123 --redis-url redis://127.0.0.1:6379/0 --redis-prefix forge --dashboard-dist $DASHBOARD_DIST
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -204,7 +204,7 @@ set -euo pipefail
 
 RECORDER_SERVICE="polyedge-forge-ireland-recorder.service"
 API_SERVICE="polyedge-forge-ireland-api.service"
-API_URL="http://127.0.0.1:9810/health/live"
+API_URL="http://127.0.0.1:9830/health/live"
 MAX_API_RSS_MB=4500
 API_MAX_TIME_SEC="${HEALTHCHECK_API_MAX_TIME_SEC:-6}"
 API_FAIL_THRESHOLD="${HEALTHCHECK_API_FAIL_THRESHOLD:-3}"

@@ -4,7 +4,7 @@ set -euo pipefail
 ENV_FILE="${ENV_FILE:-/home/ubuntu/PolyEdge/.env}"
 SERVICE_NAME="${SERVICE_NAME:-polyedge-forge-ireland-api.service}"
 POSITION_KEY="${POSITION_KEY:-forge:fev1:live:position:5m}"
-LIVE_URL="${LIVE_URL:-http://127.0.0.1:9810/api/strategy/paper?market_type=5m&source=live}"
+LIVE_URL="${LIVE_URL:-http://127.0.0.1:9830/api/strategy/paper?market_type=5m&source=live}"
 ENTRY_TIMEOUT_SEC="${ENTRY_TIMEOUT_SEC:-420}"
 EXIT_TIMEOUT_SEC="${EXIT_TIMEOUT_SEC:-420}"
 POLL_SEC="${POLL_SEC:-2}"

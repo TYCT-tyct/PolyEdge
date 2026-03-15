@@ -5,8 +5,8 @@ import traceback
 import urllib.request
 from datetime import datetime
 
-PAPER_URL = "http://127.0.0.1:9810/api/strategy/paper?market_type=5m&source=live&symbol=BTCUSDT"
-LATEST_URL = "http://127.0.0.1:9810/api/latest/all"
+PAPER_URL = "http://127.0.0.1:9830/api/strategy/paper?market_type=5m&source=live&symbol=BTCUSDT"
+LATEST_URL = "http://127.0.0.1:9830/api/latest/all"
 
 
 def fetch_json(url: str):

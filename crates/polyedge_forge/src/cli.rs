@@ -106,7 +106,7 @@ pub struct IrelandRecorderArgs {
     pub round_start_tolerance_ms: i64,
     #[arg(long, env = "FORGE_ROUND_END_TOLERANCE_MS", default_value_t = 10_000)]
     pub round_end_tolerance_ms: i64,
-    #[arg(long, env = "FORGE_API_BIND", default_value = "0.0.0.0:9810")]
+    #[arg(long, env = "FORGE_API_BIND", default_value = "0.0.0.0:9830")]
     pub api_bind: String,
     #[arg(long, env = "FORGE_DISABLE_API", default_value_t = false)]
     pub disable_api: bool,
@@ -120,7 +120,7 @@ pub struct IrelandRecorderArgs {
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct IrelandApiArgs {
-    #[arg(long, env = "FORGE_API_BIND", default_value = "0.0.0.0:9810")]
+    #[arg(long, env = "FORGE_API_BIND", default_value = "0.0.0.0:9830")]
     pub bind: String,
     #[arg(long, env = "FORGE_CH_URL", default_value = "http://127.0.0.1:8123")]
     pub clickhouse_url: String,

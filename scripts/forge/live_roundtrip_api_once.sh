@@ -3,7 +3,7 @@ set -euo pipefail
 
 ENV_FILE="${ENV_FILE:?ENV_FILE is required}"
 SERVICE_NAME="${SERVICE_NAME:-polyedge-forge-ireland-api.service}"
-BASE_URL="${BASE_URL:-http://127.0.0.1:9810}"
+BASE_URL="${BASE_URL:-http://127.0.0.1:9830}"
 REDIS_PREFIX="${REDIS_PREFIX:-forge}"
 SYMBOL="${SYMBOL:-SOLUSDT}"
 MARKET_TYPE="${MARKET_TYPE:-5m}"

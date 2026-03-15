@@ -397,7 +397,7 @@ def save_json(path: Path, payload: dict) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Full paper-only hyperparameter search for FEV1 strategy.")
-    ap.add_argument("--base-url", default="http://127.0.0.1:9810")
+    ap.add_argument("--base-url", default="http://127.0.0.1:9830")
     ap.add_argument("--symbol", default="BTCUSDT")
     ap.add_argument("--market-type", default="5m")
     ap.add_argument("--seed-glob", default="configs/strategy-profiles/*.full.json")

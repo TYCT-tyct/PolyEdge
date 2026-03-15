@@ -41,13 +41,13 @@ Only the Forge paper-only search toolchain is supported now.
 Search locally or on Ireland against the real Forge paper endpoint:
 
 ```bash
-python scripts/forge/strategy_search_paper_full.py --base-url http://127.0.0.1:9810 --symbol BTCUSDT --market-type 5m
+python scripts/forge/strategy_search_paper_full.py --base-url http://127.0.0.1:9830 --symbol BTCUSDT --market-type 5m
 ```
 
 Compare candidates under one unified scoring baseline:
 
 ```bash
-python scripts/forge/compare_profiles.py --base-url http://127.0.0.1:9810 --symbol BTCUSDT --market-type 5m
+python scripts/forge/compare_profiles.py --base-url http://127.0.0.1:9830 --symbol BTCUSDT --market-type 5m
 ```
 
 A/B compare two configs against the same paper window:

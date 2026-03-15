@@ -4,8 +4,8 @@ import time
 import urllib.request
 
 
-PAPER_URL = "http://127.0.0.1:9810/api/strategy/paper?market_type=5m&source=live&symbol=BTCUSDT"
-LATEST_URL = "http://127.0.0.1:9810/api/latest/all"
+PAPER_URL = "http://127.0.0.1:9830/api/strategy/paper?market_type=5m&source=live&symbol=BTCUSDT"
+LATEST_URL = "http://127.0.0.1:9830/api/latest/all"
 OUT_DIR = pathlib.Path(r"C:\Users\Shini\AppData\Local\Temp\paper_live_stage4_shadow_watch")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 WATCH_PATH = OUT_DIR / "watch.jsonl"

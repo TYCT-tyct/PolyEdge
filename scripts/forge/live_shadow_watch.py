@@ -46,7 +46,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Poll Forge live shadow snapshot and summarize decision coverage / skip reasons."
     )
-    parser.add_argument("--base-url", default="http://127.0.0.1:9810")
+    parser.add_argument("--base-url", default="http://127.0.0.1:9830")
     parser.add_argument("--market-type", default="5m")
     parser.add_argument("--symbol", default="BTCUSDT")
     parser.add_argument("--duration-sec", type=int, default=180)

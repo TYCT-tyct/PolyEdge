@@ -137,8 +137,8 @@ def load_cfg(path: str | None) -> dict | None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="A/B compare strategy paper metrics under same query window.")
-    ap.add_argument("--url-a", default="http://127.0.0.1:9810")
-    ap.add_argument("--url-b", default="http://127.0.0.1:9810")
+    ap.add_argument("--url-a", default="http://127.0.0.1:9830")
+    ap.add_argument("--url-b", default="http://127.0.0.1:9830")
     ap.add_argument("--symbol", default="BTCUSDT")
     ap.add_argument("--market-type", default="5m")
     ap.add_argument(
