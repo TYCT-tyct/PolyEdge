@@ -3635,7 +3635,8 @@ async fn live_runtime_snapshot_event_listener(
     let Some(client) = state.redis_client.clone() else {
         return;
     };
-    let channel = live_snapshot_event_channel(&state.redis_prefix);
+    let snapshot_prefix = live_snapshot_redis_prefix(&state.redis_prefix);
+    let channel = live_snapshot_event_channel(&snapshot_prefix);
     loop {
         match client.get_async_pubsub().await {
             Ok(mut pubsub) => {

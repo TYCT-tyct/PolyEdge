@@ -139,6 +139,7 @@ const LIVE_MARKET_TARGET_SNAPSHOT_STALE_MAX_AGE_MS_DEFAULT: i64 = 45_000;
 const LIVE_MARKET_TARGET_SNAPSHOT_STALE_MAX_AGE_MS_MIN: i64 = 5_000;
 const LIVE_MARKET_TARGET_SNAPSHOT_STALE_MAX_AGE_MS_MAX: i64 = 300_000;
 const LIVE_TARGET_CACHE_FILE_DEFAULT: &str = "/data/polyedge-forge/cache/target_market_cache.json";
+const LIVE_SNAPSHOT_REDIS_PREFIX_ENV: &str = "FORGE_FEV1_LIVE_SNAPSHOT_REDIS_PREFIX";
 const LIVE_ENTRY_MAKER_MAX_WAIT_MS_DEFAULT: i64 = 850;
 const LIVE_ENTRY_MAKER_MAX_WAIT_MS_MIN: i64 = 500;
 const LIVE_ENTRY_MAKER_MAX_WAIT_MS_MAX: i64 = 3_000;
@@ -339,6 +340,14 @@ fn live_target_cache_file_path() -> String {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| LIVE_TARGET_CACHE_FILE_DEFAULT.to_string())
+}
+
+pub(super) fn live_snapshot_redis_prefix(default_prefix: &str) -> String {
+    std::env::var(LIVE_SNAPSHOT_REDIS_PREFIX_ENV)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default_prefix.trim().to_string())
 }
 
 fn live_gtd_min_future_guard_sec() -> i64 {

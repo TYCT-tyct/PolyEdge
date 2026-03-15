@@ -144,6 +144,23 @@ impl Drop for ScopedEnvVar {
 }
 
 #[test]
+fn live_snapshot_prefix_defaults_to_runtime_prefix() {
+    let _guard = env_lock().lock().expect("env lock");
+    let _snapshot_prefix = ScopedEnvVar::set("FORGE_FEV1_LIVE_SNAPSHOT_REDIS_PREFIX", "");
+    assert_eq!(live_snapshot_redis_prefix("forge9820"), "forge9820");
+    assert_eq!(live_snapshot_event_channel("forge9820"), "forge9820:snapshot:events");
+}
+
+#[test]
+fn live_snapshot_prefix_can_override_runtime_prefix() {
+    let _guard = env_lock().lock().expect("env lock");
+    let _snapshot_prefix = ScopedEnvVar::set("FORGE_FEV1_LIVE_SNAPSHOT_REDIS_PREFIX", "forge");
+    let prefix = live_snapshot_redis_prefix("forge9820");
+    assert_eq!(prefix, "forge");
+    assert_eq!(live_snapshot_event_channel(&prefix), "forge:snapshot:events");
+}
+
+#[test]
 fn fixed_entry_quote_uses_buy_amount_mode_without_size_lock() {
     let _guard = env_lock().lock().expect("env lock");
     let _fixed_quote = ScopedEnvVar::set("FORGE_FEV1_FIXED_ENTRY_QUOTE_USDC", "5");

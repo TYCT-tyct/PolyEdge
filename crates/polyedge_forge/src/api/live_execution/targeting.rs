@@ -132,6 +132,8 @@ async fn resolve_live_target_from_snapshot(
     market_type: &str,
     now_ms: i64,
 ) -> Option<LiveMarketTarget> {
+    let snapshot_prefix = live_snapshot_redis_prefix(&state.redis_prefix);
+
     async fn try_snapshot_candidate(
         _state: &ApiState,
         symbol: &str,
@@ -193,7 +195,7 @@ async fn resolve_live_target_from_snapshot(
 
     let symbol_key = format!(
         "{}:snapshot:latest:{}:{market_type}",
-        state.redis_prefix,
+        snapshot_prefix,
         symbol.trim().to_ascii_uppercase()
     );
     if let Ok(snapshot_json) = read_key_json(state, &symbol_key).await {
@@ -213,7 +215,7 @@ async fn resolve_live_target_from_snapshot(
         }
     }
 
-    let tf_key = format!("{}:snapshot:latest:tf:{market_type}", state.redis_prefix);
+    let tf_key = format!("{}:snapshot:latest:tf:{market_type}", snapshot_prefix);
     if let Ok(tf_snapshot_json) = read_key_json(state, &tf_key).await {
         let tf_snapshot = tf_snapshot_json.0;
         let mut symbol_rows: Vec<&Value> = match tf_snapshot.as_array() {
@@ -247,7 +249,7 @@ async fn resolve_live_target_from_snapshot(
 
     let pattern = format!(
         "{}:snapshot:latest:{}:{}:*",
-        state.redis_prefix,
+        snapshot_prefix,
         symbol.trim().to_ascii_uppercase(),
         market_type
     );
