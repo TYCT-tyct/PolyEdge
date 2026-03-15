@@ -129,6 +129,54 @@ fn canonical_post_order_amounts(
     }
 }
 
+fn matched_venue_position_size_shares(
+    rows: &[DataApiUserPosition],
+    detail: Option<&GammaMarketDetail>,
+    position_state: &LivePositionState,
+) -> Option<f64> {
+    let token_id = position_state
+        .entry_token_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())?;
+    let condition_id = detail
+        .and_then(|value| value.condition_id.as_deref())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    rows.iter()
+        .filter(|row| {
+            let token_match = row.asset == token_id;
+            let condition_match = condition_id
+                .zip(row.condition_id.as_deref())
+                .map(|(lhs, rhs)| lhs == rhs.trim())
+                .unwrap_or(false);
+            token_match || condition_match
+        })
+        .filter_map(|row| row.size)
+        .filter(|size| size.is_finite() && *size > 0.0)
+        .max_by(|lhs, rhs| lhs.partial_cmp(rhs).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+async fn resolve_exit_size_override_from_venue(
+    position_state: &LivePositionState,
+) -> Option<f64> {
+    if position_state.position_size_shares <= 0.0 {
+        return None;
+    }
+    let wallet = live_runtime_wallet_address()?;
+    let market_id = position_state
+        .entry_market_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let gamma_detail = match market_id {
+        Some(market_id) => fetch_gamma_market_detail(market_id).await,
+        None => None,
+    };
+    let rows = fetch_data_api_user_positions(wallet.as_str()).await.ok()?;
+    matched_venue_position_size_shares(&rows, gamma_detail.as_ref(), position_state)
+}
+
 fn parse_trade_ids_from_submit_response(submit_response: Option<&Value>) -> Vec<String> {
     submit_response
         .and_then(|resp| resp.get("trade_ids"))
@@ -1138,11 +1186,46 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
     let exit_quote_override = position_state
         .entry_quote_usdc
         .and_then(|v| if v > 0.0 { Some(v) } else { None });
-    let exit_size_override = if position_state.position_size_shares > 0.0 {
-        Some(position_state.position_size_shares)
+    let venue_exit_size_override = if position_state.position_size_shares > 0.0 {
+        resolve_exit_size_override_from_venue(position_state).await
     } else {
         None
     };
+    let exit_size_override = venue_exit_size_override.or_else(|| {
+        if position_state.position_size_shares > 0.0 {
+            Some(position_state.position_size_shares)
+        } else {
+            None
+        }
+    });
+    if let Some(venue_size) = venue_exit_size_override {
+        let local_size = position_state.position_size_shares.max(0.0);
+        if (venue_size - local_size).abs() > 0.0001 {
+            let mut next = position_state.clone();
+            next.position_size_shares = venue_size;
+            next.updated_ts_ms = Utc::now().timestamp_millis();
+            let symbol = next.symbol.clone();
+            let market_type = next.market_type.clone();
+            state
+                .put_live_position_state(&symbol, &market_type, next)
+                .await;
+            state
+                .append_live_event(
+                    &position_state.symbol,
+                    &position_state.market_type,
+                    json!({
+                        "accepted": true,
+                        "action": "exit_size_sync",
+                        "side": position_state.side.clone(),
+                        "round_id": position_state.entry_round_id.clone(),
+                        "reason": "venue_position_size_override",
+                        "local_position_size_shares": local_size,
+                        "venue_position_size_shares": venue_size
+                    }),
+                )
+                .await;
+        }
+    }
 
     for gated in decisions {
         let action = gated

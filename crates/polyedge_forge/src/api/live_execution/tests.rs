@@ -1295,6 +1295,61 @@ fn entry_decision_market_override_replaces_scope_target() {
 }
 
 #[test]
+fn matched_venue_position_size_uses_token_or_condition_match() {
+    let rows = vec![
+        DataApiUserPosition {
+            asset: "other-token".to_string(),
+            condition_id: Some("cond-1".to_string()),
+            size: Some(1.25),
+            avg_price: None,
+            current_value: None,
+            cash_pnl: None,
+            realized_pnl: None,
+            cur_price: None,
+            redeemable: None,
+            mergeable: None,
+            title: None,
+            slug: None,
+            outcome: None,
+        },
+        DataApiUserPosition {
+            asset: "token-down".to_string(),
+            condition_id: Some("cond-2".to_string()),
+            size: Some(4.94701),
+            avg_price: None,
+            current_value: None,
+            cash_pnl: None,
+            realized_pnl: None,
+            cur_price: None,
+            redeemable: None,
+            mergeable: None,
+            title: None,
+            slug: None,
+            outcome: None,
+        },
+    ];
+    let detail = GammaMarketDetail {
+        market_id: "1582934".to_string(),
+        condition_id: Some("cond-2".to_string()),
+        active: true,
+        closed: false,
+        enable_order_book: true,
+        end_date: Some("2026-03-15T03:10:00Z".to_string()),
+        token_ids: vec!["token-up".to_string(), "token-down".to_string()],
+        outcomes: vec!["Up".to_string(), "Down".to_string()],
+        outcome_prices: vec![0.2, 0.8],
+        uma_resolution_status: None,
+        slug: Some("sol-updown-5m-1773543900".to_string()),
+        question: Some("Solana Up or Down".to_string()),
+    };
+    let mut position = LivePositionState::flat("SOLUSDT", "5m", 0);
+    position.entry_token_id = Some("token-down".to_string());
+    position.position_size_shares = 5.0;
+    let size = matched_venue_position_size_shares(&rows, Some(&detail), &position);
+    assert_eq!(size, Some(4.94701));
+}
+
+#[test]
 fn resolved_outcome_marks_local_token_as_winning() {
     let detail = GammaMarketDetail {
         market_id: "1529923".to_string(),
