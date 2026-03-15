@@ -1278,6 +1278,7 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
         } else {
             None
         };
+        let mut effective_book_snapshot = book_snapshot.clone();
         
         let remaining_ms = prepared.decision.get("remaining_ms").and_then(Value::as_i64);
         
@@ -1316,6 +1317,7 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                 } else {
                     None
                 };
+                effective_book_snapshot = retry_book.clone();
                 
                 // Retry with fresh book
                 payload_result = try_decision_to_live_payload(
@@ -1357,7 +1359,19 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                             "decision_key": gated.decision_key,
                             "reason": reason,
                             "executor": "rust_sdk",
-                            "stage": "payload_build"
+                            "stage": "payload_build",
+                            "detail": {
+                                "target_market_id": prepared.effective_target.market_id,
+                                "target_end_date": prepared.effective_target.end_date,
+                                "token_id_yes": prepared.effective_target.token_id_yes,
+                                "token_id_no": prepared.effective_target.token_id_no,
+                                "selected_token_id": token_id,
+                                "decision_price_cents": prepared.decision.get("price_cents"),
+                                "signal_price_cents": prepared.decision.get("signal_price_cents"),
+                                "paper_entry_exec_price_cents": prepared.decision.get("paper_entry_exec_price_cents"),
+                                "paper_exit_exec_price_cents": prepared.decision.get("paper_exit_exec_price_cents"),
+                                "book_snapshot": effective_book_snapshot
+                            }
                         }),
                     )
                     .await;
