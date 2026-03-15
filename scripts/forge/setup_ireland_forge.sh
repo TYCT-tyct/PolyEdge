@@ -8,6 +8,7 @@ POLYEDGE_RELEASE_COMMIT="${POLYEDGE_RELEASE_COMMIT:-local-dev}"
 DATA_RELEASE_ROOT="${DATA_RELEASE_ROOT:-/data/polyedge-releases}"
 HOME_RELEASE_ROOT="${HOME_RELEASE_ROOT:-/home/${USER_NAME}/polyedge-releases}"
 DASHBOARD_DIST="${DASHBOARD_DIST:-$REPO_DIR/heatmap_dashboard/dist}"
+FORGE_IRELAND_ROLE="${FORGE_IRELAND_ROLE:-both}"
 ACTIVE_SYMBOLS="${ACTIVE_SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT}"
 ACTIVE_TIMEFRAMES="${ACTIVE_TIMEFRAMES:-5m,15m}"
 ACTIVE_SYMBOL_TIMEFRAMES="${ACTIVE_SYMBOL_TIMEFRAMES:-BTCUSDT:5m|15m,ETHUSDT:5m,SOLUSDT:5m,XRPUSDT:5m}"
@@ -32,7 +33,24 @@ DISCOVERY_MAX_PAST_MS="${DISCOVERY_MAX_PAST_MS:-240000}"
 ROUND_MIN_COVERAGE_RATIO="${ROUND_MIN_COVERAGE_RATIO:-0.70}"
 ROUND_MIN_SAMPLE_RATIO="${ROUND_MIN_SAMPLE_RATIO:-0.65}"
 
-echo "[forge-ireland] repo=$REPO_DIR data_root=$DATA_ROOT user=$USER_NAME release_commit=$POLYEDGE_RELEASE_COMMIT"
+case "$FORGE_IRELAND_ROLE" in
+  both|api|recorder) ;;
+  *)
+    echo "[forge-ireland] invalid FORGE_IRELAND_ROLE=$FORGE_IRELAND_ROLE" >&2
+    exit 1
+    ;;
+esac
+
+INSTALL_RECORDER=false
+INSTALL_API=false
+if [ "$FORGE_IRELAND_ROLE" = "both" ] || [ "$FORGE_IRELAND_ROLE" = "recorder" ]; then
+  INSTALL_RECORDER=true
+fi
+if [ "$FORGE_IRELAND_ROLE" = "both" ] || [ "$FORGE_IRELAND_ROLE" = "api" ]; then
+  INSTALL_API=true
+fi
+
+echo "[forge-ireland] repo=$REPO_DIR data_root=$DATA_ROOT user=$USER_NAME role=$FORGE_IRELAND_ROLE release_commit=$POLYEDGE_RELEASE_COMMIT"
 
 # Legacy dataset cleanup requested by operator.
 if [ -d /data/polyedge-data ]; then
@@ -69,9 +87,8 @@ if [ -f "$ENV_FILE" ]; then
   upsert_env "FORGE_MARKET_STALE_GUARD_MS" "300" "$ENV_FILE"
 fi
 
-# Always rebuild dashboard static assets before restarting API service.
-# This prevents stale /dashboard bundles after backend-only deploys.
-if command -v npm >/dev/null 2>&1; then
+# 只在 API 角色发布时重建 dashboard，避免 recorder-only 发布浪费时间。
+if [ "$INSTALL_API" = true ] && command -v npm >/dev/null 2>&1; then
   pushd "$REPO_DIR/heatmap_dashboard" >/dev/null
   if [ -f package-lock.json ]; then
     npm ci --no-audit --no-fund
@@ -81,31 +98,40 @@ if command -v npm >/dev/null 2>&1; then
   npm run build
   popd >/dev/null
 else
-  echo "[forge-ireland] warning: npm not found; dashboard dist may be stale"
+  if [ "$INSTALL_API" = true ]; then
+    echo "[forge-ireland] warning: npm not found; dashboard dist may be stale"
+  fi
 fi
 
-sudo systemctl stop \
-  polyedge-forge-ireland.service \
-  polyedge-forge-ireland-recorder.service \
-  polyedge-forge-ireland-api.service \
-  polyedge-data-backend-ireland.service \
-  polyedge-data-backend-api.service \
-  polyedge-recorder.service \
-  polyedge.service 2>/dev/null || true
+if [ "$FORGE_IRELAND_ROLE" = "both" ]; then
+  sudo systemctl stop \
+    polyedge-forge-ireland.service \
+    polyedge-forge-ireland-recorder.service \
+    polyedge-forge-ireland-api.service \
+    polyedge-data-backend-ireland.service \
+    polyedge-data-backend-api.service \
+    polyedge-recorder.service \
+    polyedge.service 2>/dev/null || true
 
-sudo systemctl disable \
-  polyedge-forge-ireland.service \
-  polyedge-forge-ireland-recorder.service \
-  polyedge-forge-ireland-api.service \
-  polyedge-data-backend-ireland.service \
-  polyedge-data-backend-api.service \
-  polyedge-recorder.service \
-  polyedge.service 2>/dev/null || true
+  sudo systemctl disable \
+    polyedge-forge-ireland.service \
+    polyedge-forge-ireland-recorder.service \
+    polyedge-forge-ireland-api.service \
+    polyedge-data-backend-ireland.service \
+    polyedge-data-backend-api.service \
+    polyedge-recorder.service \
+    polyedge.service 2>/dev/null || true
+fi
 
 # Remove stale systemd drop-in overrides so deploy script remains source of truth.
-sudo rm -rf /etc/systemd/system/polyedge-forge-ireland-recorder.service.d
-sudo rm -rf /etc/systemd/system/polyedge-forge-ireland-api.service.d
+if [ "$INSTALL_RECORDER" = true ]; then
+  sudo rm -rf /etc/systemd/system/polyedge-forge-ireland-recorder.service.d
+fi
+if [ "$INSTALL_API" = true ]; then
+  sudo rm -rf /etc/systemd/system/polyedge-forge-ireland-api.service.d
+fi
 
+if [ "$INSTALL_RECORDER" = true ]; then
 sudo tee /etc/systemd/system/polyedge-forge-ireland-recorder.service >/dev/null <<UNIT
 [Unit]
 Description=PolyEdge Forge Ireland Recorder
@@ -156,7 +182,9 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 UNIT
+fi
 
+if [ "$INSTALL_API" = true ]; then
 sudo tee /etc/systemd/system/polyedge-forge-ireland-api.service >/dev/null <<UNIT
 [Unit]
 Description=PolyEdge Forge Ireland API + Dashboard
@@ -196,6 +224,7 @@ MemoryMax=7G
 [Install]
 WantedBy=multi-user.target
 UNIT
+fi
 
 # Self-healing healthcheck: restart recorder when API stalls or snapshots stop updating.
 sudo tee /usr/local/bin/polyedge_forge_healthcheck.sh >/dev/null <<'HC'
@@ -338,15 +367,23 @@ sudo sed -i "s#^Environment=DATA_RELEASE_ROOT=.*#Environment=DATA_RELEASE_ROOT=$
 sudo sed -i "s#^Environment=HOME_RELEASE_ROOT=.*#Environment=HOME_RELEASE_ROOT=$HOME_RELEASE_ROOT#" /etc/systemd/system/polyedge-ireland-disk-guard.service
 
 sudo systemctl daemon-reload
-sudo systemctl enable polyedge-forge-ireland-recorder.service
-sudo systemctl enable polyedge-forge-ireland-api.service
-sudo systemctl restart polyedge-forge-ireland-recorder.service
-sudo systemctl restart polyedge-forge-ireland-api.service
+if [ "$INSTALL_RECORDER" = true ]; then
+  sudo systemctl enable polyedge-forge-ireland-recorder.service
+  sudo systemctl restart polyedge-forge-ireland-recorder.service
+fi
+if [ "$INSTALL_API" = true ]; then
+  sudo systemctl enable polyedge-forge-ireland-api.service
+  sudo systemctl restart polyedge-forge-ireland-api.service
+fi
 sudo systemctl enable --now polyedge-forge-healthcheck.timer
 sudo systemctl enable --now polyedge-ireland-disk-guard.timer
-sudo systemctl --no-pager --full status polyedge-forge-ireland-recorder.service | sed -n '1,25p'
-sudo systemctl --no-pager --full status polyedge-forge-ireland-api.service | sed -n '1,25p'
+if [ "$INSTALL_RECORDER" = true ]; then
+  sudo systemctl --no-pager --full status polyedge-forge-ireland-recorder.service | sed -n '1,25p'
+fi
+if [ "$INSTALL_API" = true ]; then
+  sudo systemctl --no-pager --full status polyedge-forge-ireland-api.service | sed -n '1,25p'
+fi
 sudo systemctl --no-pager --full status polyedge-forge-healthcheck.timer | sed -n '1,20p'
 sudo systemctl --no-pager --full status polyedge-ireland-disk-guard.timer | sed -n '1,15p'
 
-echo "[forge-ireland] done"
+echo "[forge-ireland] done role=$FORGE_IRELAND_ROLE"

@@ -57,3 +57,4 @@ scripts/forge/           Forge 运维与部署脚本
 - 2026-03-15：部署脚本发送远端 bash 前统一去除 BOM/CRLF。
 - 2026-03-15：新增 `forge_tokyo_relay` 与 `forge_wire`，东京从 `polyedge_forge` 中独立。
 - 2026-03-15：移除 ireland recorder 的内嵌 API 启动参数与分支。
+- 2026-03-15：Ireland 部署支持 `api` / `recorder` / `both` 角色化发布，避免 API 改动顺手重启 recorder。

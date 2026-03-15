@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("ireland", "tokyo", "both")]
+    [ValidateSet("ireland", "ireland-api", "ireland-recorder", "tokyo", "both")]
     [string]$Target = "both",
 
     [string]$Commit = "HEAD",
@@ -123,7 +123,8 @@ function New-RemoteDeployScript {
         [string]$ReleaseRoot,
         [string]$SetupScriptRelativePath,
         [string]$TargetName,
-        [string]$PostChecks
+        [string]$PostChecks,
+        [string]$ExtraExports = ""
     )
 
     $template = @'
@@ -182,6 +183,7 @@ fi
 
 export REPO_DIR="$RELEASE_DIR"
 export POLYEDGE_RELEASE_COMMIT="$COMMIT"
+__EXTRA_EXPORTS__
 bash "$RELEASE_DIR/$SETUP_SCRIPT"
 
 __POST_CHECKS__
@@ -198,6 +200,7 @@ echo "[deploy] release_dir=$RELEASE_DIR"
         Replace("__RELEASE_ROOT__", $ReleaseRoot).
         Replace("__SETUP_SCRIPT__", $SetupScriptRelativePath).
         Replace("__TARGET_NAME__", $TargetName).
+        Replace("__EXTRA_EXPORTS__", $ExtraExports.Trim()).
         Replace("__POST_CHECKS__", $PostChecks.Trim())
 }
 
@@ -287,6 +290,19 @@ systemctl --no-pager --full status polyedge-forge-ireland-recorder.service | sed
 systemctl --no-pager --full status polyedge-forge-ireland-api.service | sed -n '1,5p'
 '@
 
+$irelandApiPostChecks = @'
+systemctl is-active --quiet polyedge-forge-ireland-api.service
+systemctl show polyedge-forge-ireland-api.service -p Environment --value | grep -q "POLYEDGE_RELEASE_COMMIT=$COMMIT"
+curl -fsS http://127.0.0.1:9830/health/live >/dev/null
+systemctl --no-pager --full status polyedge-forge-ireland-api.service | sed -n '1,5p'
+'@
+
+$irelandRecorderPostChecks = @'
+systemctl is-active --quiet polyedge-forge-ireland-recorder.service
+systemctl show polyedge-forge-ireland-recorder.service -p Environment --value | grep -q "POLYEDGE_RELEASE_COMMIT=$COMMIT"
+systemctl --no-pager --full status polyedge-forge-ireland-recorder.service | sed -n '1,5p'
+'@
+
 $tokyoPostChecks = @'
 systemctl is-active --quiet polyedge-forge-tokyo.service
 systemctl show polyedge-forge-tokyo.service -p Environment --value | grep -q "POLYEDGE_RELEASE_COMMIT=$COMMIT"
@@ -295,6 +311,8 @@ systemctl --no-pager --full status polyedge-forge-tokyo.service | sed -n '1,5p'
 
 $deployQueue = switch ($Target) {
     "ireland" { @("ireland") }
+    "ireland-api" { @("ireland-api") }
+    "ireland-recorder" { @("ireland-recorder") }
     "tokyo" { @("tokyo") }
     default { @("tokyo", "ireland") }
 }
@@ -313,6 +331,36 @@ foreach ($targetName in $deployQueue) {
                 -SetupScriptRelativePath "scripts/forge/setup_ireland_forge.sh" `
                 -TargetName "ireland" `
                 -PostChecks $irelandPostChecks
+            Invoke-RemoteScript -RemoteHost $IrelandHost -User $IrelandUser -KeyPath $IrelandKeyPath -ScriptBody $script
+        }
+        "ireland-api" {
+            Assert-FileExists -PathToCheck $IrelandKeyPath
+            Write-Step "Deploying commit $shortSha to Ireland API"
+            $script = New-RemoteDeployScript `
+                -CommitSha $resolvedCommit `
+                -ShortSha $shortSha `
+                -Timestamp $timestamp `
+                -BootstrapRepoPath $BootstrapRepo `
+                -ReleaseRoot $IrelandReleaseRoot `
+                -SetupScriptRelativePath "scripts/forge/setup_ireland_forge.sh" `
+                -TargetName "ireland-api" `
+                -PostChecks $irelandApiPostChecks `
+                -ExtraExports 'export FORGE_IRELAND_ROLE="api"'
+            Invoke-RemoteScript -RemoteHost $IrelandHost -User $IrelandUser -KeyPath $IrelandKeyPath -ScriptBody $script
+        }
+        "ireland-recorder" {
+            Assert-FileExists -PathToCheck $IrelandKeyPath
+            Write-Step "Deploying commit $shortSha to Ireland recorder"
+            $script = New-RemoteDeployScript `
+                -CommitSha $resolvedCommit `
+                -ShortSha $shortSha `
+                -Timestamp $timestamp `
+                -BootstrapRepoPath $BootstrapRepo `
+                -ReleaseRoot $IrelandReleaseRoot `
+                -SetupScriptRelativePath "scripts/forge/setup_ireland_forge.sh" `
+                -TargetName "ireland-recorder" `
+                -PostChecks $irelandRecorderPostChecks `
+                -ExtraExports 'export FORGE_IRELAND_ROLE="recorder"'
             Invoke-RemoteScript -RemoteHost $IrelandHost -User $IrelandUser -KeyPath $IrelandKeyPath -ScriptBody $script
         }
         "tokyo" {

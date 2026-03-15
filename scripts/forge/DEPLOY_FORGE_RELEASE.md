@@ -12,7 +12,7 @@ The script enforces the deployment baseline that production must come from GitHu
 2. Refuses to deploy a dirty worktree by default.
 3. Resolves a full commit SHA.
 4. Fetches `origin` locally and refuses to deploy commits that are not already on GitHub.
-5. SSHes to Ireland and/or Tokyo.
+5. SSHes to Ireland API / Ireland recorder / Tokyo as requested.
 6. Fetches `origin` on the remote bootstrap repo.
 7. Creates an immutable release worktree at an exact commit.
 8. Copies the bootstrap repo `.env` into the release directory when present.
@@ -32,7 +32,7 @@ The script enforces the deployment baseline that production must come from GitHu
 
 ## Examples
 
-Deploy both Tokyo then Ireland using the current `HEAD` commit:
+Deploy both Tokyo then the full Ireland stack using the current `HEAD` commit:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\forge\deploy_forge_release.ps1 -Target both
@@ -42,6 +42,18 @@ Deploy only Ireland for a specific commit:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\forge\deploy_forge_release.ps1 -Target ireland -Commit dc4d6e0
+```
+
+Deploy only Ireland API for a specific commit:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\forge\deploy_forge_release.ps1 -Target ireland-api -Commit dc4d6e0
+```
+
+Deploy only Ireland recorder for a specific commit:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\forge\deploy_forge_release.ps1 -Target ireland-recorder -Commit dc4d6e0
 ```
 
 Emergency override for a dirty worktree. Avoid this unless you are intentionally deploying an already-pushed non-HEAD commit:
@@ -72,6 +84,7 @@ That keeps disk guard pruning and runtime version introspection aligned with the
 
 ## Notes
 
-- The setup scripts now build before stopping services, which reduces avoidable downtime on failed builds.
+- The setup scripts now support role-targeted Ireland deploys via `FORGE_IRELAND_ROLE=api|recorder|both`.
+- Ireland API-only deploys rebuild dashboard assets; recorder-only deploys skip that work.
 - The Ireland setup script now uses the release directory for dashboard assets instead of a hardcoded mutable repo path.
 - This script does not create commits and does not push to GitHub for you. Commit and push first, then deploy.
