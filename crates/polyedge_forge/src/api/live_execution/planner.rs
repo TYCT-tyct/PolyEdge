@@ -319,6 +319,12 @@ pub(super) fn try_decision_to_live_payload(
     let mut notes: Vec<String> = Vec::with_capacity(3);
     let is_buy = gateway_side.starts_with("buy_");
     let paper_commit_entry = decision_is_paper_commit_entry(decision);
+    let paper_exec_anchor_entry = !is_exit_like
+        && decision
+            .get("paper_entry_exec_price_cents")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .is_some();
     let (parity_anchor_source, parity_anchor_cents) =
         decision_parity_anchor(decision).unwrap_or_else(|| ("submit_price_cents", price * 100.0));
     let signal_price_cents = decision_signal_price_cents(decision)
@@ -360,7 +366,7 @@ pub(super) fn try_decision_to_live_payload(
             );
             let candidate_delta_cents =
                 price_parity_delta_cents(parity_anchor_cents, candidate_submit_cents, is_buy);
-            if paper_commit_entry && candidate_delta_cents > candidate_band_cents + 1e-9 {
+            if paper_exec_anchor_entry && candidate_delta_cents > candidate_band_cents + 1e-9 {
                 notes.push(format!(
                     "skip_book_anchor_parity:{:.4}>{:.4}",
                     candidate_delta_cents, candidate_band_cents
