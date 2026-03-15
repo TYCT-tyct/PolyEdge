@@ -1350,6 +1350,27 @@ fn entry_decision_market_override_replaces_scope_target() {
 }
 
 #[test]
+fn build_position_locked_target_uses_position_side_token_only() {
+    let mut down_position = LivePositionState::flat("SOLUSDT", "5m", 0);
+    down_position.state = "in_position".to_string();
+    down_position.side = Some("DOWN".to_string());
+    down_position.entry_market_id = Some("1582934".to_string());
+    down_position.entry_round_id = Some("SOLUSDT_5m_1773543900000".to_string());
+    down_position.entry_token_id = Some("token-down".to_string());
+    let down_target =
+        build_position_locked_target("5m", &down_position).expect("down locked target");
+    assert_eq!(down_target.token_id_yes, "");
+    assert_eq!(down_target.token_id_no, "token-down");
+
+    let mut up_position = down_position.clone();
+    up_position.side = Some("UP".to_string());
+    up_position.entry_token_id = Some("token-up".to_string());
+    let up_target = build_position_locked_target("5m", &up_position).expect("up locked target");
+    assert_eq!(up_target.token_id_yes, "token-up");
+    assert_eq!(up_target.token_id_no, "");
+}
+
+#[test]
 fn matched_venue_position_size_uses_token_or_condition_match() {
     let rows = vec![
         DataApiUserPosition {

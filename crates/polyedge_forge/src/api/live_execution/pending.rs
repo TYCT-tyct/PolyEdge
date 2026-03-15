@@ -773,7 +773,12 @@ pub(super) fn build_position_locked_target(
     if market_id.is_empty() || token_id.is_empty() {
         return None;
     }
-    let (token_id_yes, token_id_no) = (token_id.clone(), token_id.clone());
+    let side = position_state.side.as_deref()?.trim().to_ascii_uppercase();
+    let (token_id_yes, token_id_no) = match side.as_str() {
+        "UP" => (token_id.clone(), String::new()),
+        "DOWN" => (String::new(), token_id.clone()),
+        _ => return None,
+    };
     let symbol = position_state.symbol.trim().to_ascii_uppercase();
     let symbol = if !symbol.is_empty() {
         symbol
