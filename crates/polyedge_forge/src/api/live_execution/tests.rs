@@ -1266,6 +1266,35 @@ async fn locked_exit_target_expired_is_rejected_before_submit() {
 }
 
 #[test]
+fn entry_decision_market_override_replaces_scope_target() {
+    let target = LiveMarketTarget {
+        market_id: "old-market".to_string(),
+        symbol: "SOLUSDT".to_string(),
+        timeframe: "5m".to_string(),
+        token_id_yes: "old-yes".to_string(),
+        token_id_no: "old-no".to_string(),
+        end_date: Some("2026-03-15T02:55:00Z".to_string()),
+    };
+    let decision = json!({
+        "action": "enter",
+        "side": "DOWN",
+        "market_id": "1582888",
+        "token_id_yes": "yes-1582888",
+        "token_id_no": "no-1582888",
+        "target_end_date": "2026-03-15T03:00:00Z"
+    });
+    let effective = build_effective_target_for_decision(
+        &target,
+        &decision,
+        &LivePositionState::flat("SOLUSDT", "5m", 0),
+    );
+    assert_eq!(effective.market_id, "1582888");
+    assert_eq!(effective.token_id_yes, "yes-1582888");
+    assert_eq!(effective.token_id_no, "no-1582888");
+    assert_eq!(effective.end_date.as_deref(), Some("2026-03-15T03:00:00Z"));
+}
+
+#[test]
 fn resolved_outcome_marks_local_token_as_winning() {
     let detail = GammaMarketDetail {
         market_id: "1529923".to_string(),

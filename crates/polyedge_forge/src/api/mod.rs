@@ -1067,6 +1067,96 @@ fn normalize_runtime_signal_decisions(
         .collect()
 }
 
+fn decision_live_target(
+    decision: &Value,
+    fallback_symbol: &str,
+    market_type: &str,
+) -> Option<LiveMarketTarget> {
+    let market_id = decision
+        .get("market_id")
+        .or_else(|| decision.get("target_market_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())?
+        .to_string();
+    let token_id_yes = decision
+        .get("token_id_yes")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())?
+        .to_string();
+    let token_id_no = decision
+        .get("token_id_no")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())?
+        .to_string();
+    let end_date = decision
+        .get("target_end_date")
+        .or_else(|| decision.get("end_date"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
+    let symbol = decision
+        .get("symbol")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_ascii_uppercase())
+        .unwrap_or_else(|| fallback_symbol.trim().to_ascii_uppercase());
+    Some(LiveMarketTarget {
+        market_id,
+        symbol,
+        timeframe: market_type.to_string(),
+        token_id_yes,
+        token_id_no,
+        end_date,
+    })
+}
+
+fn attach_live_target_to_decisions(decisions: &mut [Value], target: &LiveMarketTarget) {
+    for decision in decisions {
+        let Some(obj) = decision.as_object_mut() else {
+            continue;
+        };
+        let market_missing = obj
+            .get("market_id")
+            .and_then(Value::as_str)
+            .map(|v| v.trim().is_empty())
+            .unwrap_or(true);
+        if market_missing {
+            obj.insert("market_id".to_string(), json!(target.market_id));
+        }
+        let yes_missing = obj
+            .get("token_id_yes")
+            .and_then(Value::as_str)
+            .map(|v| v.trim().is_empty())
+            .unwrap_or(true);
+        if yes_missing {
+            obj.insert("token_id_yes".to_string(), json!(target.token_id_yes));
+        }
+        let no_missing = obj
+            .get("token_id_no")
+            .and_then(Value::as_str)
+            .map(|v| v.trim().is_empty())
+            .unwrap_or(true);
+        if no_missing {
+            obj.insert("token_id_no".to_string(), json!(target.token_id_no));
+        }
+        let end_missing = obj
+            .get("target_end_date")
+            .and_then(Value::as_str)
+            .map(|v| v.trim().is_empty())
+            .unwrap_or(true);
+        if end_missing {
+            if let Some(end_date) = target.end_date.as_deref() {
+                obj.insert("target_end_date".to_string(), json!(end_date));
+            }
+        }
+    }
+}
+
 fn normalize_current_live_entry_decision(
     payload: &Value,
     market_type: &str,
@@ -4365,17 +4455,27 @@ async fn live_runtime_loop(
 
                     let decision_pool_count = paper_decisions.len();
                     let candidate_count = selected_decisions.len();
-
-                    // OPTIMIZATION: Aggressive book prewarming when candidates exist
-                    // This ensures books are fresh for fast execution
-                    if candidate_count > 0 {
-                        if let Ok(target) = resolve_live_market_target_fast_with_state(
+                    let mut preferred_live_target =
+                        selected_decisions.iter().find_map(|decision| {
+                            decision_live_target(decision, runtime_symbol, market_type)
+                        });
+                    if preferred_live_target.is_none() && candidate_count > 0 {
+                        preferred_live_target = resolve_live_market_target_fast_with_state(
                             &state,
                             runtime_symbol,
                             market_type,
                         )
                         .await
-                        {
+                        .ok();
+                    }
+                    if let Some(target) = preferred_live_target.as_ref() {
+                        attach_live_target_to_decisions(&mut selected_decisions, target);
+                    }
+
+                    // OPTIMIZATION: Aggressive book prewarming when candidates exist
+                    // This ensures books are fresh for fast execution
+                    if candidate_count > 0 {
+                        if let Some(target) = preferred_live_target.as_ref() {
                             let _ = prewarm_rust_books_for_target(&state, &target).await;
                         }
                     }
@@ -4408,6 +4508,12 @@ async fn live_runtime_loop(
                         build_position_locked_target(market_type, &position_for_submit)
                     {
                         Some(locked_target)
+                    } else if let Some(target) = gated.iter().find_map(|gated| {
+                        decision_live_target(&gated.decision, runtime_symbol, market_type)
+                    }) {
+                        Some(target)
+                    } else if let Some(target) = preferred_live_target.clone() {
+                        Some(target)
                     } else {
                         resolve_live_market_target_fast_with_state(
                             &state,
@@ -5188,6 +5294,57 @@ mod tests {
         assert_eq!(
             normalized[0].get("quote_size_usdc").and_then(Value::as_f64),
             Some(1.2)
+        );
+    }
+
+    #[test]
+    fn decision_live_target_reads_embedded_market_fields() {
+        let decision = json!({
+            "market_id": "1582888",
+            "token_id_yes": "yes-1582888",
+            "token_id_no": "no-1582888",
+            "target_end_date": "2026-03-15T03:00:00Z"
+        });
+        let target = decision_live_target(&decision, "SOLUSDT", "5m").expect("target");
+        assert_eq!(target.market_id, "1582888");
+        assert_eq!(target.symbol, "SOLUSDT");
+        assert_eq!(target.timeframe, "5m");
+        assert_eq!(target.token_id_yes, "yes-1582888");
+        assert_eq!(target.token_id_no, "no-1582888");
+        assert_eq!(target.end_date.as_deref(), Some("2026-03-15T03:00:00Z"));
+    }
+
+    #[test]
+    fn attach_live_target_to_decisions_backfills_missing_market_fields() {
+        let target = LiveMarketTarget {
+            market_id: "1582888".to_string(),
+            symbol: "SOLUSDT".to_string(),
+            timeframe: "5m".to_string(),
+            token_id_yes: "yes-1582888".to_string(),
+            token_id_no: "no-1582888".to_string(),
+            end_date: Some("2026-03-15T03:00:00Z".to_string()),
+        };
+        let mut decisions = vec![json!({
+            "action": "enter",
+            "side": "DOWN"
+        })];
+        attach_live_target_to_decisions(&mut decisions, &target);
+        let row = &decisions[0];
+        assert_eq!(
+            row.get("market_id").and_then(Value::as_str),
+            Some("1582888")
+        );
+        assert_eq!(
+            row.get("token_id_yes").and_then(Value::as_str),
+            Some("yes-1582888")
+        );
+        assert_eq!(
+            row.get("token_id_no").and_then(Value::as_str),
+            Some("no-1582888")
+        );
+        assert_eq!(
+            row.get("target_end_date").and_then(Value::as_str),
+            Some("2026-03-15T03:00:00Z")
         );
     }
 

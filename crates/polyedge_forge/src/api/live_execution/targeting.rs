@@ -810,6 +810,22 @@ async fn resolve_live_market_target_inner(
     let resolve_retry_ms = live_market_target_resolve_retry_ms();
     let switch_guard_ms = live_market_target_switch_guard_ms();
     let mut cached_entry: Option<CachedLiveMarketTarget> = None;
+    if let Some(state) = state {
+        if let Some(target) =
+            resolve_live_target_from_snapshot(state, symbol, market_type, now_ms).await
+        {
+            let mut cache = live_market_target_cache().write().await;
+            let cache_key = live_market_target_cache_scope_key(symbol, market_type);
+            cache.insert(
+                cache_key,
+                CachedLiveMarketTarget {
+                    fetched_at_ms: Utc::now().timestamp_millis(),
+                    target: target.clone(),
+                },
+            );
+            return Ok(target);
+        }
+    }
     {
         let cache = live_market_target_cache().read().await;
         let cache_key = live_market_target_cache_scope_key(symbol, market_type);
@@ -821,20 +837,6 @@ async fn resolve_live_market_target_inner(
             if age_ms <= cache_ttl_ms && end_ms >= now_ms {
                 return Ok(cached.target.clone());
             }
-        }
-    }
-    if let Some(state) = state {
-        if let Some(target) = resolve_live_target_from_snapshot(state, symbol, market_type, now_ms).await {
-            let mut cache = live_market_target_cache().write().await;
-            let cache_key = live_market_target_cache_scope_key(symbol, market_type);
-            cache.insert(
-                cache_key,
-                CachedLiveMarketTarget {
-                    fetched_at_ms: Utc::now().timestamp_millis(),
-                    target: target.clone(),
-                },
-            );
-            return Ok(target);
         }
     }
 

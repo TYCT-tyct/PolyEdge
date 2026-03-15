@@ -377,12 +377,50 @@ fn apply_pending_target_override(target: &mut LiveMarketTarget, row: &LivePendin
     }
 }
 
+fn apply_decision_target_override(target: &mut LiveMarketTarget, decision: &Value) {
+    let market_id = decision
+        .get("market_id")
+        .or_else(|| decision.get("target_market_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    if let Some(market_id) = market_id {
+        target.market_id = market_id.to_string();
+    }
+    let token_id_yes = decision
+        .get("token_id_yes")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    if let Some(token_id_yes) = token_id_yes {
+        target.token_id_yes = token_id_yes.to_string();
+    }
+    let token_id_no = decision
+        .get("token_id_no")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    if let Some(token_id_no) = token_id_no {
+        target.token_id_no = token_id_no.to_string();
+    }
+    let end_date = decision
+        .get("target_end_date")
+        .or_else(|| decision.get("end_date"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    if let Some(end_date) = end_date {
+        target.end_date = Some(end_date.to_string());
+    }
+}
+
 fn build_effective_target_for_decision(
     target: &LiveMarketTarget,
     decision: &Value,
     position_state: &LivePositionState,
 ) -> LiveMarketTarget {
     let mut effective = target.clone();
+    apply_decision_target_override(&mut effective, decision);
     let action = decision
         .get("action")
         .and_then(Value::as_str)
