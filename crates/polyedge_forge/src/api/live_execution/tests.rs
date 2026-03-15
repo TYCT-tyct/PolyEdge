@@ -34,6 +34,19 @@ fn test_book(min_order_size: f64) -> GatewayBookSnapshot {
     }
 }
 
+#[test]
+fn normalize_book_snapshot_values_from_cents_scale() {
+    assert_eq!(normalize_book_probability(62.0, true), Some(0.62));
+    assert_eq!(normalize_book_probability(99.0, true), Some(0.99));
+    assert_eq!(normalize_book_tick_size(1.0, true), 0.01);
+}
+
+#[test]
+fn normalize_book_snapshot_values_from_probability_scale() {
+    assert_eq!(normalize_book_probability(0.62, false), Some(0.62));
+    assert_eq!(normalize_book_tick_size(0.01, false), 0.01);
+}
+
 fn test_api_state() -> ApiState {
     let gateway_http_client = reqwest::Client::builder()
         .build()

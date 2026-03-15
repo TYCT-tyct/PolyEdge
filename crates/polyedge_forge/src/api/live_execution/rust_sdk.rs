@@ -2,6 +2,19 @@ pub(super) fn pm_dec_to_f64(v: &PmDecimal) -> f64 {
     v.to_string().parse::<f64>().unwrap_or(0.0)
 }
 
+fn normalize_book_probability(raw: f64, cents_scale: bool) -> Option<f64> {
+    if !raw.is_finite() || raw <= 0.0 {
+        return None;
+    }
+    let normalized = if cents_scale { raw / 100.0 } else { raw };
+    Some(normalized.clamp(0.0, 1.0))
+}
+
+fn normalize_book_tick_size(raw: f64, cents_scale: bool) -> f64 {
+    let normalized = if cents_scale { raw / 100.0 } else { raw };
+    normalized.max(0.0001)
+}
+
 pub(super) fn pm_order_type_from_tif(tif: &str) -> PmOrderType {
     match tif.to_ascii_uppercase().as_str() {
         "FOK" => PmOrderType::FOK,
@@ -586,10 +599,16 @@ pub(super) async fn fetch_rust_book_snapshot(
     let token = PmU256::from_str(token_id).ok()?;
     let req = PmOrderBookSummaryRequest::builder().token_id(token).build();
     let book = ctx.client.order_book(&req).await.ok()?;
-    let best_bid = book.bids.first().map(|l| pm_dec_to_f64(&l.price));
-    let best_ask = book.asks.first().map(|l| pm_dec_to_f64(&l.price));
+    let raw_best_bid = book.bids.first().map(|l| pm_dec_to_f64(&l.price));
+    let raw_best_ask = book.asks.first().map(|l| pm_dec_to_f64(&l.price));
     let best_bid_size = book.bids.first().map(|l| pm_dec_to_f64(&l.size));
     let best_ask_size = book.asks.first().map(|l| pm_dec_to_f64(&l.size));
+    let raw_tick_size = pm_dec_to_f64(&book.tick_size.as_decimal());
+    let cents_scale = raw_tick_size >= 1.0
+        || raw_best_bid.map(|v| v > 1.0).unwrap_or(false)
+        || raw_best_ask.map(|v| v > 1.0).unwrap_or(false);
+    let best_bid = raw_best_bid.and_then(|v| normalize_book_probability(v, cents_scale));
+    let best_ask = raw_best_ask.and_then(|v| normalize_book_probability(v, cents_scale));
     let bid_depth_top3 = Some(
         book.bids
             .iter()
@@ -607,7 +626,7 @@ pub(super) async fn fetch_rust_book_snapshot(
     Some(GatewayBookSnapshot {
         token_id: token_id.to_string(),
         min_order_size: pm_dec_to_f64(&book.min_order_size).max(0.0001),
-        tick_size: pm_dec_to_f64(&book.tick_size.as_decimal()).max(0.0001),
+        tick_size: normalize_book_tick_size(raw_tick_size, cents_scale),
         best_bid,
         best_ask,
         best_bid_size,
