@@ -487,6 +487,9 @@ fn can_retry_only_on_liquidity_like_errors() {
     assert!(can_retry_on_liquidity(
         "no orders found to match with FAK order"
     ));
+    assert!(can_retry_on_liquidity(
+        "post_order failed: Status: error(400 Bad Request) making POST call to /order with {\"error\":\"no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found.\"}"
+    ));
     assert!(!can_retry_on_liquidity(
         "unauthorized: invalid api key or signature"
     ));

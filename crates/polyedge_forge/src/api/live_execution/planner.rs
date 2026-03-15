@@ -618,6 +618,18 @@ pub(super) fn extract_rust_reject_reason(payload: &Value, fallback_error: Option
 
 pub(super) fn can_retry_on_liquidity(reason: &str) -> bool {
     let r = reason.to_ascii_lowercase();
+    let explicit_liquidity = r.contains("no orders found to match")
+        || r.contains("insufficient liquidity")
+        || r.contains("cannot be matched")
+        || r.contains("would not fill")
+        || r.contains("unmatched")
+        || r.contains("no match")
+        || r.contains("empty book");
+    let timeout_like_liquidity = r.contains("timeout")
+        && (r.contains("match") || r.contains("liquidity") || r.contains("maker"));
+    if explicit_liquidity || timeout_like_liquidity {
+        return true;
+    }
     let non_retryable = r.contains("unauthorized")
         || r.contains("forbidden")
         || r.contains("signature")
@@ -639,16 +651,7 @@ pub(super) fn can_retry_on_liquidity(reason: &str) -> bool {
     if non_retryable {
         return false;
     }
-    let explicit_liquidity = r.contains("no orders found to match")
-        || r.contains("insufficient liquidity")
-        || r.contains("cannot be matched")
-        || r.contains("would not fill")
-        || r.contains("unmatched")
-        || r.contains("no match")
-        || r.contains("empty book");
-    let timeout_like_liquidity = r.contains("timeout")
-        && (r.contains("match") || r.contains("liquidity") || r.contains("maker"));
-    explicit_liquidity || timeout_like_liquidity
+    false
 }
 
 pub(super) fn is_live_exit_action(action: &str) -> bool {
