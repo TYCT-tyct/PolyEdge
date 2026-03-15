@@ -3546,7 +3546,10 @@ async fn load_live_runtime_samples(
 }
 
 async fn prewarm_live_runtime_target_and_books(state: &ApiState, symbol: &str, market_type: &str) {
-    let Ok(target) = resolve_live_market_target_with_state(state, symbol, market_type).await else {
+    // Background prewarm is best-effort only. Keep it on cache/snapshot data and avoid
+    // falling back to full market discovery, which competes with submit latency.
+    let Ok(target) = resolve_live_market_target_fast_with_state(state, symbol, market_type).await
+    else {
         return;
     };
     let _ = prewarm_rust_books_for_target(state, &target).await;
