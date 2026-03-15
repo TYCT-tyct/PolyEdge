@@ -1,5 +1,6 @@
 pub(super) fn parse_strategy_rows(rows: Vec<Value>) -> Vec<StrategySample> {
     let mut out = Vec::<StrategySample>::new();
+    let mut round_target_anchor = std::collections::HashMap::<String, f64>::new();
     for row in rows {
         let ts_ms = row_i64(&row, "ts_ms").unwrap_or(0);
         if ts_ms <= 0 {
@@ -61,11 +62,26 @@ pub(super) fn parse_strategy_rows(rows: Vec<Value>) -> Vec<StrategySample> {
 
         let spread_mid = ((spread_up + spread_down) * 0.5).clamp(0.001, 0.08);
 
+        let binance_price = row_f64(&row, "binance_price").filter(|v| v.is_finite() && *v > 0.0);
+        let target_anchor = if let Some(target) =
+            row_f64(&row, "target_price").filter(|v| v.is_finite() && *v > 0.0)
+        {
+            round_target_anchor.insert(round_id.clone(), target);
+            Some(target)
+        } else if let Some(anchor) = round_target_anchor.get(&round_id).copied() {
+            Some(anchor)
+        } else if let Some(anchor) = binance_price {
+            round_target_anchor.insert(round_id.clone(), anchor);
+            Some(anchor)
+        } else {
+            None
+        };
+
         let delta_pct = row_f64(&row, "delta_pct_smooth")
             .or_else(|| row_f64(&row, "delta_pct"))
             .or_else(|| {
-                let px = row_f64(&row, "binance_price")?;
-                let tp = row_f64(&row, "target_price")?;
+                let px = binance_price?;
+                let tp = target_anchor?;
                 if tp > 0.0 {
                     Some(((px - tp) / tp) * 100.0)
                 } else {
@@ -117,6 +133,49 @@ pub(super) fn parse_strategy_rows(rows: Vec<Value>) -> Vec<StrategySample> {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod runtime_parse_tests {
+    use super::parse_strategy_rows;
+    use serde_json::json;
+
+    #[test]
+    fn parse_strategy_rows_uses_round_open_binance_anchor_when_target_missing() {
+        let rows = vec![
+            json!({
+                "ts_ms": 1_000_i64,
+                "round_id": "SOLUSDT_5m_1000",
+                "remaining_ms": 250_000_i64,
+                "mid_yes": 0.50,
+                "mid_no": 0.50,
+                "bid_yes": 0.49,
+                "ask_yes": 0.51,
+                "bid_no": 0.49,
+                "ask_no": 0.51,
+                "binance_price": 88.47,
+                "target_price": null
+            }),
+            json!({
+                "ts_ms": 2_000_i64,
+                "round_id": "SOLUSDT_5m_1000",
+                "remaining_ms": 249_000_i64,
+                "mid_yes": 0.54,
+                "mid_no": 0.46,
+                "bid_yes": 0.53,
+                "ask_yes": 0.55,
+                "bid_no": 0.45,
+                "ask_no": 0.47,
+                "binance_price": 89.47,
+                "target_price": null
+            }),
+        ];
+
+        let parsed = parse_strategy_rows(rows);
+        assert_eq!(parsed.len(), 2);
+        let delta = parsed[1].delta_pct;
+        assert!((delta - ((89.47 - 88.47) / 88.47 * 100.0)).abs() < 1e-9);
+    }
 }
 
 pub(super) fn strategy_sample_from_snapshot_event(

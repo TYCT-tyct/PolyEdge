@@ -661,6 +661,24 @@ fn stabilize_book_quotes(
     })
 }
 
+fn resolve_round_target_price(
+    target_anchor_by_round: &mut HashMap<String, f64>,
+    round_id: &str,
+    target_price: Option<f64>,
+    binance_price: Option<f64>,
+) -> Option<f64> {
+    if let Some(target) = target_price.filter(|v| v.is_finite() && *v > 0.0) {
+        target_anchor_by_round.insert(round_id.to_string(), target);
+        return Some(target);
+    }
+    if let Some(anchor) = target_anchor_by_round.get(round_id).copied() {
+        return Some(anchor);
+    }
+    let anchor = binance_price.filter(|v| v.is_finite() && *v > 0.0)?;
+    target_anchor_by_round.insert(round_id.to_string(), anchor);
+    Some(anchor)
+}
+
 async fn flush_round_commit(
     commit: RoundCommit,
     sink_tx: Option<&mpsc::Sender<DbEvent>>,
@@ -1758,7 +1776,30 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                         .filter(|v| v.is_finite() && *v > 0.0);
                     let round_start = market.start_ts_ms;
                     let round_id = format!("{}_{}_{}", market.symbol, market.timeframe, round_start);
-                    let mut target_price = market.target_price;
+                    let had_round_anchor = target_anchor_by_round.contains_key(&round_id);
+                    let mut target_price = resolve_round_target_price(
+                        &mut target_anchor_by_round,
+                        &round_id,
+                        market.target_price,
+                        binance_price,
+                    );
+                    if market.target_price.is_none()
+                        && !had_round_anchor
+                        && target_price == binance_price
+                    {
+                        log_ingest(
+                            &persist_tx,
+                            "warn",
+                            "target_price",
+                            &format!(
+                                "source=binance_round_open_fallback symbol={} tf={} round_id={} target={}",
+                                market.symbol,
+                                market.timeframe,
+                                round_id,
+                                target_price.unwrap_or(0.0)
+                            ),
+                        );
+                    }
                     if target_price.is_none() {
                         let cache_key =
                             format!("{}|{}|{}", market.symbol, market.timeframe, market.start_ts_ms);
@@ -1818,15 +1859,12 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
                             }
                         }
                     }
-                    if target_price.is_none() {
-                        if let Some(anchor) = target_anchor_by_round.get(&round_id).copied() {
-                            target_price = Some(anchor);
-                        }
-                    } else if let Some(target) = target_price
-                        .filter(|v| v.is_finite() && *v > 0.0)
-                    {
-                        target_anchor_by_round.insert(round_id.clone(), target);
-                    }
+                    target_price = resolve_round_target_price(
+                        &mut target_anchor_by_round,
+                        &round_id,
+                        target_price,
+                        binance_price,
+                    );
                     if switch_snapshot.degraded {
                         let warn_at = stale_book_warn_by_pair.entry(pair_key.clone()).or_insert(0);
                         if now_ms.saturating_sub(*warn_at) >= INPUT_STALE_WARN_THROTTLE_MS {
@@ -3911,5 +3949,24 @@ mod tests {
         assert!(round_meta_is_fresh(rid, 1772280000000, 60_000));
         assert!(round_meta_is_fresh(rid, 1772280060000, 60_000));
         assert!(!round_meta_is_fresh(rid, 1772280060001, 60_000));
+    }
+
+    #[test]
+    fn resolve_round_target_price_uses_round_open_binance_anchor_when_market_target_missing() {
+        let mut anchors = HashMap::new();
+        let resolved =
+            resolve_round_target_price(&mut anchors, "SOLUSDT_5m_1000", None, Some(88.47));
+        assert_eq!(resolved, Some(88.47));
+        assert_eq!(anchors.get("SOLUSDT_5m_1000").copied(), Some(88.47));
+    }
+
+    #[test]
+    fn resolve_round_target_price_keeps_existing_round_anchor_when_price_moves() {
+        let mut anchors = HashMap::new();
+        anchors.insert("SOLUSDT_5m_1000".to_string(), 88.47);
+        let resolved =
+            resolve_round_target_price(&mut anchors, "SOLUSDT_5m_1000", None, Some(89.12));
+        assert_eq!(resolved, Some(88.47));
+        assert_eq!(anchors.get("SOLUSDT_5m_1000").copied(), Some(88.47));
     }
 }
