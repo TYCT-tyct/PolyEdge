@@ -655,6 +655,53 @@ fn paper_commit_entry_uses_wider_parity_band() {
 }
 
 #[test]
+fn paper_commit_entry_keeps_paper_limit_when_book_anchor_is_pathological() {
+    let decision = json!({
+        "action": "enter",
+        "side": "DOWN",
+        "price_cents": 73.0,
+        "signal_price_cents": 73.0,
+        "paper_entry_exec_price_cents": 74.2,
+        "paper_record_source": "paper_commit",
+        "signal_source": "paper_commit",
+        "quote_size_usdc": 5.0,
+        "max_slippage_bps": 24.0
+    });
+    let book = GatewayBookSnapshot {
+        token_id: "down".to_string(),
+        min_order_size: 5.0,
+        tick_size: 0.01,
+        best_bid: Some(0.01),
+        best_ask: Some(0.99),
+        best_bid_size: Some(5000.0),
+        best_ask_size: Some(5000.0),
+        bid_depth_top3: Some(5000.0),
+        ask_depth_top3: Some(5000.0),
+        bid_levels: Some(10),
+        ask_levels: Some(10),
+    };
+    let payload = try_decision_to_live_payload(
+        &decision,
+        &test_target(),
+        &test_exec_cfg(),
+        Some(&book),
+        None,
+    )
+    .expect("paper commit mirror entry should keep paper limit instead of anchoring to pathological book");
+    assert_eq!(payload.get("price").and_then(Value::as_f64), Some(0.73));
+    let notes = payload
+        .get("execution_notes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(notes.iter().any(|v| {
+        v.as_str()
+            .map(|s| s.starts_with("skip_book_anchor_parity:"))
+            .unwrap_or(false)
+    }));
+}
+
+#[test]
 fn exit_price_parity_anchors_to_paper_exit_exec_when_available() {
     let decision = json!({
         "action": "exit",

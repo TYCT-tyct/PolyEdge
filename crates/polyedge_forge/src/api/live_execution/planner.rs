@@ -318,6 +318,13 @@ pub(super) fn try_decision_to_live_payload(
     quote_size = quantize_usdc_micros(quote_size.max(exec_cfg.min_quote_usdc));
     let mut notes: Vec<String> = Vec::with_capacity(3);
     let is_buy = gateway_side.starts_with("buy_");
+    let paper_commit_entry = decision_is_paper_commit_entry(decision);
+    let (parity_anchor_source, parity_anchor_cents) =
+        decision_parity_anchor(decision).unwrap_or_else(|| ("submit_price_cents", price * 100.0));
+    let signal_price_cents = decision_signal_price_cents(decision)
+        .or_else(|| decision_signal_price_cents_legacy(decision));
+    let remaining_ms = decision.get("remaining_ms").and_then(Value::as_i64);
+    let score = decision.get("score").and_then(Value::as_f64);
     let fixed_entry_size_shares = if !is_exit_like {
         live_fixed_entry_size_shares()
     } else {
@@ -341,12 +348,31 @@ pub(super) fn try_decision_to_live_payload(
         let tick_size = book.tick_size.max(0.0001);
         let best_px = if is_buy { book.best_ask } else { book.best_bid };
         if let Some(best_px) = best_px.filter(|v| v.is_finite() && *v > 0.0) {
-            price = round_to_tick(best_px.clamp(0.01, 0.99), tick_size, is_buy);
-            notes.push(if is_buy {
-                "anchor_taker_to_best_ask".to_string()
+            let candidate_price = round_to_tick(best_px.clamp(0.01, 0.99), tick_size, is_buy);
+            let candidate_submit_cents = (candidate_price * 100.0).clamp(0.0, 100.0);
+            let candidate_band_cents = allowed_price_band_cents(
+                parity_anchor_cents,
+                default_slippage_bps,
+                tick_size,
+                remaining_ms,
+                score,
+                paper_commit_entry,
+            );
+            let candidate_delta_cents =
+                price_parity_delta_cents(parity_anchor_cents, candidate_submit_cents, is_buy);
+            if paper_commit_entry && candidate_delta_cents > candidate_band_cents + 1e-9 {
+                notes.push(format!(
+                    "skip_book_anchor_parity:{:.4}>{:.4}",
+                    candidate_delta_cents, candidate_band_cents
+                ));
             } else {
-                "anchor_taker_to_best_bid".to_string()
-            });
+                price = candidate_price;
+                notes.push(if is_buy {
+                    "anchor_taker_to_best_ask".to_string()
+                } else {
+                    "anchor_taker_to_best_bid".to_string()
+                });
+            }
         }
         size = forced_size_shares.unwrap_or_else(|| (quote_size / price).max(size_floor));
     }
@@ -393,17 +419,8 @@ pub(super) fn try_decision_to_live_payload(
         notes.push("force_entry_fixed_quote".to_string());
     }
     let taker_like = style == "taker" || matches!(tif.as_str(), "FAK" | "FOK");
-    let (parity_anchor_source, parity_anchor_cents) =
-        decision_parity_anchor(decision).unwrap_or_else(|| ("submit_price_cents", price * 100.0));
-    let signal_price_cents = decision_signal_price_cents(decision)
-        .or_else(|| decision_signal_price_cents_legacy(decision));
     let submit_price_cents = (price * 100.0).clamp(0.0, 100.0);
     let tick_size = book.map(|b| b.tick_size).unwrap_or(0.01);
-    let paper_commit_entry = decision_is_paper_commit_entry(decision);
-
-    // Get remaining_ms and score for aggressive parity band determination
-    let remaining_ms = decision.get("remaining_ms").and_then(Value::as_i64);
-    let score = decision.get("score").and_then(Value::as_f64);
 
     let parity_band_cents = allowed_price_band_cents(
         parity_anchor_cents,
