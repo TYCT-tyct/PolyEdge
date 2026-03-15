@@ -754,6 +754,58 @@ fn exit_price_parity_anchors_to_paper_exit_exec_when_available() {
 }
 
 #[test]
+fn exit_price_parity_bypass_allows_live_flatten_on_extreme_book() {
+    let decision = json!({
+        "action": "exit",
+        "side": "DOWN",
+        "price_cents": 72.0,
+        "signal_price_cents": 72.0,
+        "paper_exit_exec_price_cents": 68.39,
+        "position_size_shares": 5.0,
+        "max_slippage_bps": 22.0
+    });
+    let book = GatewayBookSnapshot {
+        token_id: "no".to_string(),
+        min_order_size: 5.0,
+        tick_size: 0.01,
+        best_bid: Some(0.01),
+        best_ask: Some(0.99),
+        best_bid_size: Some(6031.68),
+        best_ask_size: Some(6109.05),
+        bid_depth_top3: Some(6333.23),
+        ask_depth_top3: Some(6495.40),
+        bid_levels: Some(77),
+        ask_levels: Some(20),
+    };
+    let payload = try_decision_to_live_payload(
+        &decision,
+        &test_target(),
+        &test_exec_cfg(),
+        Some(&book),
+        None,
+    )
+    .expect("exit should prefer flattening over parity rejection");
+    assert_eq!(payload.get("price").and_then(Value::as_f64), Some(0.01));
+    assert_eq!(
+        payload
+            .get("price_parity")
+            .and_then(|v| v.get("within_band"))
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    let notes = payload
+        .get("execution_notes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(notes.iter().any(|v| {
+        v.as_str()
+            .map(|s| s.starts_with("exit_parity_bypass:"))
+            .unwrap_or(false)
+    }));
+}
+
+#[test]
 fn execution_price_trace_includes_paper_exec_deltas() {
     let decision = json!({
         "action": "enter",

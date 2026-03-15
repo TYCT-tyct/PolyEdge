@@ -438,15 +438,23 @@ pub(super) fn try_decision_to_live_payload(
     );
     let parity_delta_cents =
         price_parity_delta_cents(parity_anchor_cents, submit_price_cents, is_buy);
-    if parity_delta_cents > parity_band_cents + 1e-9 {
-        return Err(format!(
-            "live_price_parity_band_exhausted:delta={:.4}:allowed={:.4}:anchor={:.4}:submit={:.4}:source={}",
-            parity_delta_cents,
-            parity_band_cents,
-            parity_anchor_cents,
-            submit_price_cents,
-            parity_anchor_source
-        ));
+    let parity_within_band = parity_delta_cents <= parity_band_cents + 1e-9;
+    if !parity_within_band {
+        if is_exit_like {
+            notes.push(format!(
+                "exit_parity_bypass:{:.4}>{:.4}",
+                parity_delta_cents, parity_band_cents
+            ));
+        } else {
+            return Err(format!(
+                "live_price_parity_band_exhausted:delta={:.4}:allowed={:.4}:anchor={:.4}:submit={:.4}:source={}",
+                parity_delta_cents,
+                parity_band_cents,
+                parity_anchor_cents,
+                submit_price_cents,
+                parity_anchor_source
+            ));
+        }
     }
     // =========================================================================
     // P2: Empty book pre-check (entry only)
@@ -547,7 +555,7 @@ pub(super) fn try_decision_to_live_payload(
             "tick_size": tick_size,
             "allowed_band_cents": parity_band_cents,
             "parity_delta_cents": parity_delta_cents,
-            "within_band": true
+            "within_band": parity_within_band
         },
         "edge_gate": {
             "edge_prob": decision.get("edge_prob").and_then(Value::as_f64),
