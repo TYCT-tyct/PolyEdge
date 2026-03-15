@@ -227,7 +227,12 @@ function Invoke-RemoteScript {
     $process.StartInfo = $startInfo
     $null = $process.Start()
 
-    $process.StandardInput.Write($ScriptBody)
+    $normalizedScript = $ScriptBody -replace "`r`n", "`n" -replace "`r", "`n"
+    if ($normalizedScript.Length -gt 0 -and $normalizedScript[0] -eq [char]0xfeff) {
+        $normalizedScript = $normalizedScript.Substring(1)
+    }
+
+    $process.StandardInput.Write($normalizedScript)
     $process.StandardInput.Close()
 
     $stdout = $process.StandardOutput.ReadToEnd()
