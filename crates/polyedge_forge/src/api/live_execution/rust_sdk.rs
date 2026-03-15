@@ -1324,6 +1324,24 @@ pub(super) async fn execute_live_orders_via_rust_sdk(
                         )
                         .await;
                 }
+                state
+                    .append_live_event(
+                        &position_state.symbol,
+                        &position_state.market_type,
+                        json!({
+                            "accepted": false,
+                            "action": action,
+                            "side": prepared.decision.get("side").and_then(Value::as_str),
+                            "round_id": prepared.decision.get("round_id").and_then(Value::as_str),
+                            "intent_id": prepared.decision.get("intent_id").and_then(Value::as_str),
+                            "decision_id": prepared.decision.get("decision_id").and_then(Value::as_str),
+                            "decision_key": gated.decision_key,
+                            "reason": reason,
+                            "executor": "rust_sdk",
+                            "stage": "payload_build"
+                        }),
+                    )
+                    .await;
                 out.push(json!({
                     "ok": false,
                     "accepted": false,
