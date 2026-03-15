@@ -55,6 +55,22 @@ fn decision_parity_anchor(decision: &Value) -> Option<(&'static str, f64)> {
         .or_else(|| decision_signal_price_cents(decision).map(|v| ("signal_price_cents", v)))
 }
 
+fn decision_is_paper_commit_entry(decision: &Value) -> bool {
+    if decision_action(decision) != "enter" {
+        return false;
+    }
+    let signal_source = decision
+        .get("signal_source")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let paper_record_source = decision
+        .get("paper_record_source")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    signal_source.eq_ignore_ascii_case("paper_commit")
+        || paper_record_source.eq_ignore_ascii_case("paper_commit")
+}
+
 fn decision_intent_id(decision: &Value) -> Option<String> {
     decision
         .get("intent_id")
@@ -139,6 +155,7 @@ fn allowed_price_band_cents(
     tick_size: f64,
     remaining_ms: Option<i64>,
     score: Option<f64>,
+    paper_commit_entry: bool,
 ) -> f64 {
     let normal_band = {
         let signal = signal_price_cents.max(0.0);
@@ -158,7 +175,15 @@ fn allowed_price_band_cents(
     if use_aggressive {
         // Use aggressive band (wider) for high confidence / near close
         let aggressive = live_entry_parity_band_aggressive_cents();
-        return aggressive.max(normal_band); // Never use less than normal
+        let band = aggressive.max(normal_band);
+        if paper_commit_entry {
+            return band.max(live_entry_parity_band_paper_commit_cents());
+        }
+        return band;
+    }
+
+    if paper_commit_entry {
+        return normal_band.max(live_entry_parity_band_paper_commit_cents());
     }
 
     normal_band
@@ -374,6 +399,7 @@ pub(super) fn try_decision_to_live_payload(
         .or_else(|| decision_signal_price_cents_legacy(decision));
     let submit_price_cents = (price * 100.0).clamp(0.0, 100.0);
     let tick_size = book.map(|b| b.tick_size).unwrap_or(0.01);
+    let paper_commit_entry = decision_is_paper_commit_entry(decision);
 
     // Get remaining_ms and score for aggressive parity band determination
     let remaining_ms = decision.get("remaining_ms").and_then(Value::as_i64);
@@ -385,11 +411,19 @@ pub(super) fn try_decision_to_live_payload(
         tick_size,
         remaining_ms,
         score,
+        paper_commit_entry,
     );
     let parity_delta_cents =
         price_parity_delta_cents(parity_anchor_cents, submit_price_cents, is_buy);
     if parity_delta_cents > parity_band_cents + 1e-9 {
-        return Err("live_price_parity_band_exhausted".to_string());
+        return Err(format!(
+            "live_price_parity_band_exhausted:delta={:.4}:allowed={:.4}:anchor={:.4}:submit={:.4}:source={}",
+            parity_delta_cents,
+            parity_band_cents,
+            parity_anchor_cents,
+            submit_price_cents,
+            parity_anchor_source
+        ));
     }
     // =========================================================================
     // P2: Empty book pre-check (entry only)

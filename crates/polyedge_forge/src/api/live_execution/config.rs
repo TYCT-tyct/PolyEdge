@@ -579,6 +579,7 @@ pub(super) fn decision_qualifies_for_fast_path(decision: &Value, remaining_ms: i
 // =========================================================================
 const LIVE_ENTRY_PARITY_BAND_NORMAL_CENTS_DEFAULT: f64 = 1.1;
 const LIVE_ENTRY_PARITY_BAND_AGGRESSIVE_CENTS_DEFAULT: f64 = 1.6;
+const LIVE_ENTRY_PARITY_BAND_PAPER_COMMIT_CENTS_DEFAULT: f64 = 4.0;
 const LIVE_ENTRY_PARITY_BAND_AGGRESSIVE_REMAINING_MS: i64 = 120_000;
 const LIVE_ENTRY_PARITY_BAND_AGGRESSIVE_SCORE: f64 = 0.80;
 
@@ -596,6 +597,14 @@ pub(super) fn live_entry_parity_band_aggressive_cents() -> f64 {
         .and_then(|v| v.trim().parse::<f64>().ok())
         .unwrap_or(LIVE_ENTRY_PARITY_BAND_AGGRESSIVE_CENTS_DEFAULT)
         .clamp(0.5, 5.0)
+}
+
+pub(super) fn live_entry_parity_band_paper_commit_cents() -> f64 {
+    std::env::var("FORGE_FEV1_LIVE_ENTRY_PARITY_BAND_PAPER_COMMIT_CENTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(LIVE_ENTRY_PARITY_BAND_PAPER_COMMIT_CENTS_DEFAULT)
+        .clamp(1.0, 12.0)
 }
 
 pub(super) fn live_entry_parity_band_aggressive_remaining_ms() -> i64 {

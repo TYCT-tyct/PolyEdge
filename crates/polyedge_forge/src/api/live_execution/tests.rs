@@ -521,7 +521,7 @@ fn price_parity_band_blocks_entry_when_fresh_price_exceeds_paper_band() {
         None,
     )
     .expect_err("fresh repricing should reject parity exhaustion");
-    assert_eq!(err, "live_price_parity_band_exhausted");
+    assert!(err.contains("live_price_parity_band_exhausted"));
 }
 
 #[test]
@@ -570,6 +570,57 @@ fn price_parity_anchors_to_paper_exec_when_available() {
             .and_then(Value::as_f64)
             .map(|v| (v * 10.0).round() / 10.0),
         Some(59.4)
+    );
+}
+
+#[test]
+fn paper_commit_entry_uses_wider_parity_band() {
+    let decision = json!({
+        "action": "enter",
+        "side": "UP",
+        "price_cents": 54.0,
+        "signal_price_cents": 54.0,
+        "paper_entry_exec_price_cents": 56.0,
+        "paper_record_source": "paper_commit",
+        "signal_source": "paper_commit",
+        "quote_size_usdc": 5.0,
+        "max_slippage_bps": 20.0
+    });
+    let book = GatewayBookSnapshot {
+        token_id: "yes".to_string(),
+        min_order_size: 0.01,
+        tick_size: 0.01,
+        best_bid: Some(0.58),
+        best_ask: Some(0.595),
+        best_bid_size: Some(100.0),
+        best_ask_size: Some(100.0),
+        bid_depth_top3: Some(300.0),
+        ask_depth_top3: Some(300.0),
+        bid_levels: Some(3),
+        ask_levels: Some(3),
+    };
+    let payload = try_decision_to_live_payload(
+        &decision,
+        &test_target(),
+        &test_exec_cfg(),
+        Some(&book),
+        None,
+    )
+    .expect("paper commit mirror entry should tolerate a wider live repricing band");
+    assert_eq!(
+        payload
+            .get("price_parity")
+            .and_then(|v| v.get("parity_anchor_source"))
+            .and_then(Value::as_str),
+        Some("paper_entry_exec_price_cents")
+    );
+    assert_eq!(
+        payload
+            .get("price_parity")
+            .and_then(|v| v.get("allowed_band_cents"))
+            .and_then(Value::as_f64)
+            .map(|v| (v * 10.0).round() / 10.0),
+        Some(4.0)
     );
 }
 
