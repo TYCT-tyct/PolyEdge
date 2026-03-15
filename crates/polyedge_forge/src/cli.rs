@@ -9,25 +9,8 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    TokyoRelay(TokyoRelayArgs),
     IrelandRecorder(Box<IrelandRecorderArgs>),
     IrelandApi(Box<IrelandApiArgs>),
-}
-
-#[derive(clap::Args, Debug, Clone)]
-pub struct TokyoRelayArgs {
-    #[arg(
-        long,
-        env = "FORGE_SYMBOLS",
-        default_value = "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT"
-    )]
-    pub symbols: String,
-    #[arg(long, env = "FORGE_TOKYO_BIND", default_value = "0.0.0.0:0")]
-    pub bind: String,
-    #[arg(long, env = "FORGE_IRELAND_UDP", default_value = "10.0.3.123:9801")]
-    pub ireland_udp: String,
-    #[arg(long, env = "FORGE_UDP_REDUNDANCY", default_value_t = 2)]
-    pub redundancy: u8,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -106,16 +89,6 @@ pub struct IrelandRecorderArgs {
     pub round_start_tolerance_ms: i64,
     #[arg(long, env = "FORGE_ROUND_END_TOLERANCE_MS", default_value_t = 10_000)]
     pub round_end_tolerance_ms: i64,
-    #[arg(long, env = "FORGE_API_BIND", default_value = "0.0.0.0:9830")]
-    pub api_bind: String,
-    #[arg(long, env = "FORGE_DISABLE_API", default_value_t = false)]
-    pub disable_api: bool,
-    #[arg(
-        long,
-        env = "FORGE_DASHBOARD_DIST",
-        default_value = "/home/ubuntu/PolyEdge/heatmap_dashboard/dist"
-    )]
-    pub dashboard_dist: String,
 }
 
 #[derive(clap::Args, Debug, Clone)]

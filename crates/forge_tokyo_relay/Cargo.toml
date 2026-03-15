@@ -1,5 +1,5 @@
 [package]
-name = "polyedge_forge"
+name = "forge_tokyo_relay"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
@@ -7,24 +7,15 @@ authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-axum = { workspace = true, features = ["ws"] }
 chrono.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
 core_types = { path = "../core_types" }
-feed_polymarket = { path = "../feed_polymarket" }
 feed_reference = { path = "../feed_reference" }
 forge_wire = { path = "../forge_wire" }
 futures.workspace = true
-market_discovery = { path = "../market_discovery" }
-reqwest.workspace = true
-redis = { version = "0.28", features = ["tokio-comp", "connection-manager"] }
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-tower-http = { version = "0.6", features = ["fs"] }
-uuid.workspace = true
-polymarket-client-sdk = { version = "0.4.3", features = ["clob"] }

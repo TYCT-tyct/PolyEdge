@@ -1,0 +1,9 @@
+[package]
+name = "forge_wire"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true

@@ -1,14 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TokyoBinanceWire {
-    pub ts_tokyo_recv_ms: i64,
-    pub ts_tokyo_send_ms: i64,
-    pub ts_exchange_ms: i64,
-    pub symbol: String,
-    pub binance_price: f64,
-}
-
 #[derive(Debug, Clone)]
 pub struct TokyoBinanceLocal {
     pub ts_tokyo_recv_ms: i64,

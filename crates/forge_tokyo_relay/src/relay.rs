@@ -5,19 +5,26 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use core_types::RefPriceWsFeed;
 use feed_reference::MultiSourceRefFeed;
+use forge_wire::TokyoBinanceWire;
 use futures::StreamExt;
 use tokio::net::UdpSocket;
 use tokio::time::sleep;
 
-use crate::cli::TokyoRelayArgs;
+use crate::cli::Cli;
 use crate::common::parse_upper_csv;
-use crate::models::TokyoBinanceWire;
 
-pub async fn run_tokyo_relay(args: TokyoRelayArgs) -> Result<()> {
+/* -----------------------------
+ * 模块：东京 relay
+ * 职责：采集参考价格并转发到爱尔兰 recorder
+ * 边界：只处理东京输入与 UDP 输出，不接触交易/API 语义
+ * ----------------------------- */
+
+pub async fn run(args: Cli) -> Result<()> {
     let symbols = parse_upper_csv(&args.symbols);
     if symbols.is_empty() {
         anyhow::bail!("FORGE_SYMBOLS is empty");
     }
+
     let target: SocketAddr = args
         .ireland_udp
         .parse()
@@ -34,7 +41,6 @@ pub async fn run_tokyo_relay(args: TokyoRelayArgs) -> Result<()> {
         "tokyo relay started"
     );
 
-    // 指数退避重连参数
     const BACKOFF_BASE_MS: u64 = 500;
     const BACKOFF_MAX_MS: u64 = 30_000;
     let mut backoff_ms = BACKOFF_BASE_MS;
@@ -43,9 +49,9 @@ pub async fn run_tokyo_relay(args: TokyoRelayArgs) -> Result<()> {
     loop {
         let feed = MultiSourceRefFeed::new(Duration::from_millis(25));
         let mut stream = match feed.stream_ticks_ws(symbols.clone()).await {
-            Ok(s) => {
+            Ok(stream) => {
                 backoff_ms = BACKOFF_BASE_MS;
-                s
+                stream
             }
             Err(err) => {
                 tracing::warn!(?err, backoff_ms, "tokyo relay ws connect failed, retrying");
@@ -58,7 +64,7 @@ pub async fn run_tokyo_relay(args: TokyoRelayArgs) -> Result<()> {
         loop {
             let Some(next) = stream.next().await else {
                 tracing::warn!(backoff_ms, "binance stream ended, reconnecting");
-                break; // 退出内层 loop，进入外层重连
+                break;
             };
             let tick = match next {
                 Ok(v) => v,
@@ -71,7 +77,7 @@ pub async fn run_tokyo_relay(args: TokyoRelayArgs) -> Result<()> {
                 continue;
             }
             let symbol = tick.symbol.to_ascii_uppercase();
-            if !symbols.iter().any(|s| s == &symbol) {
+            if !symbols.iter().any(|item| item == &symbol) {
                 continue;
             }
 
@@ -89,6 +95,7 @@ pub async fn run_tokyo_relay(args: TokyoRelayArgs) -> Result<()> {
                     tracing::warn!(?err, "tokyo relay udp send failed");
                 }
             }
+
             sent = sent.saturating_add(1);
             if sent.is_multiple_of(500) {
                 tracing::info!(sent, "tokyo relay sent packets");

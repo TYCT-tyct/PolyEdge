@@ -8,6 +8,8 @@ PolyEdge is now a Forge-first repository. Legacy latency-arbitrage stacks and si
 - `crates/core_types` - shared domain types
 - `crates/feed_polymarket` - Polymarket feed adapter
 - `crates/feed_reference` - reference feed adapter
+- `crates/forge_tokyo_relay` - standalone Tokyo collector relay
+- `crates/forge_wire` - stable Tokyo/Ireland wire schema
 - `crates/market_discovery` - market discovery logic
 - `heatmap_dashboard` - frontend dashboard
 - `scripts/forge` - Forge-only ops and deployment scripts
@@ -24,7 +26,7 @@ cargo run -p polyedge_forge -- ireland-api
 ```
 
 ```bash
-cargo run -p polyedge_forge -- tokyo-relay
+cargo run -p forge_tokyo_relay --
 ```
 
 ## Build Dashboard

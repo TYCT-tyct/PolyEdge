@@ -15,7 +15,7 @@ if [ -d /var/lib/polyedge-data ]; then
 fi
 
 cd "$REPO_DIR"
-~/.cargo/bin/cargo build -p polyedge_forge --release
+~/.cargo/bin/cargo build -p forge_tokyo_relay --release
 
 sudo systemctl stop polyedge-feeder.service polyedge-data-backend-tokyo.service 2>/dev/null || true
 sudo systemctl disable polyedge-feeder.service polyedge-data-backend-tokyo.service 2>/dev/null || true
@@ -31,9 +31,9 @@ Wants=network-online.target
 Type=simple
 User=$USER_NAME
 WorkingDirectory=$REPO_DIR
-Environment=RUST_LOG=info,polyedge_forge=debug
+Environment=RUST_LOG=info,forge_tokyo_relay=debug
 Environment=POLYEDGE_RELEASE_COMMIT=$POLYEDGE_RELEASE_COMMIT
-ExecStart=$REPO_DIR/target/release/polyedge_forge tokyo-relay --symbols $TOKYO_SYMBOLS --bind 0.0.0.0:0 --ireland-udp $IRELAND_PRIVATE_UDP --redundancy 2
+ExecStart=$REPO_DIR/target/release/forge_tokyo_relay --symbols $TOKYO_SYMBOLS --bind 0.0.0.0:0 --ireland-udp $IRELAND_PRIVATE_UDP --redundancy 2
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576

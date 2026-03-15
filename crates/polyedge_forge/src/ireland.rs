@@ -8,6 +8,7 @@ use chrono::Utc;
 use core_types::{BookTop, MarketFeed, RefPriceWsFeed};
 use feed_polymarket::PolymarketFeed;
 use feed_reference::MultiSourceRefFeed;
+use forge_wire::TokyoBinanceWire;
 use futures::StreamExt;
 use market_discovery::{DiscoveryConfig, MarketDescriptor, MarketDiscovery};
 use reqwest::Client;
@@ -23,8 +24,7 @@ use crate::market_data_exchange::{
 };
 use crate::market_switch::resolve_switch_snapshot;
 use crate::models::{
-    ChainlinkLocal, MarketMeta, MotionState, PersistEvent, RoundRow, SnapshotRow,
-    TokyoBinanceLocal, TokyoBinanceWire,
+    ChainlinkLocal, MarketMeta, MotionState, PersistEvent, RoundRow, SnapshotRow, TokyoBinanceLocal,
 };
 use crate::persist::{log_ingest, persist_event};
 
@@ -805,7 +805,6 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
         motion_state_cap = motion_state_cap,
         target_cache_cap = target_cache_cap,
         round_state_cap = round_state_cap,
-        api_bind = %args.api_bind,
         clickhouse_url = %args.clickhouse_url,
         clickhouse_snapshot_ttl_days = args.clickhouse_snapshot_ttl_days,
         clickhouse_processed_ttl_days = args.clickhouse_processed_ttl_days,
@@ -848,21 +847,6 @@ pub async fn run_ireland_recorder(args: IrelandRecorderArgs) -> Result<()> {
     } else {
         None
     };
-
-    if !args.disable_api && !args.api_bind.trim().is_empty() {
-        let api_cfg = ApiConfig {
-            bind: args.api_bind.clone(),
-            clickhouse_url: normalize_opt_url(&args.clickhouse_url),
-            redis_url: normalize_opt_url(&args.redis_url),
-            redis_prefix: args.redis_prefix.clone(),
-            dashboard_dist_dir: Some(args.dashboard_dist.clone()),
-        };
-        tokio::spawn(async move {
-            if let Err(err) = run_api_server(api_cfg).await {
-                tracing::error!(?err, "forge api server exited");
-            }
-        });
-    }
 
     let (commit_tx, mut commit_rx) = mpsc::channel::<RoundCommit>(64);
     let commit_sink = sink_tx.clone();

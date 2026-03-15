@@ -10,7 +10,6 @@ mod market_data_exchange;
 mod market_switch;
 mod models;
 mod persist;
-mod tokyo;
 
 use anyhow::Result;
 use clap::Parser;
@@ -25,7 +24,6 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::TokyoRelay(args) => tokyo::run_tokyo_relay(args).await,
         Command::IrelandRecorder(args) => ireland::run_ireland_recorder(*args).await,
         Command::IrelandApi(args) => ireland::run_ireland_api(*args).await,
     }
